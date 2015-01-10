@@ -58,3 +58,23 @@ const advice = /needs restart/;
 const status = /changed — restart to apply/;
 
 let html = fieldHtml(field({}));
+ok("an untouched restart setting carries the advice", advice.test(html));
+ok("and does not claim to be waiting", !status.test(html), html.slice(0, 200));
+
+html = fieldHtml(field({ pending_restart: true }));
+ok("a written one says it is waiting", status.test(html), html.slice(0, 240));
+ok("and drops the advice, rather than showing both", !advice.test(html), html.slice(0, 240));
+
+html = fieldHtml(field({ applies: "live", pending_restart: false }));
+ok("a live setting carries neither", !advice.test(html) && !status.test(html),
+   html.slice(0, 200));
+
+/* The one that would make this a decoration: a live setting can never be pending, so if the
+   renderer ever showed the status badge for one, the flag would be meaningless. */
+html = fieldHtml(field({ applies: "live", pending_restart: true }));
+ok("the renderer shows what it is given, so the flag is the thing to get right",
+   status.test(html), html.slice(0, 200));
+
+/* Offered, stored, resolved -- and read by nothing in this build. Without the badge the field is
+   indistinguishable from one that works: it takes a value, confirms it, and the deployment
+   behaves the same either way. */
