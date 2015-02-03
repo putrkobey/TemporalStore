@@ -1,0 +1,25 @@
+<!doctype html><meta charset='utf-8'><title>What MatrixArk Really Gets From Codex</title><style>body{font-family:Inter,Segoe UI,Arial,sans-serif;max-width:1120px;margin:32px auto;padding:0 24px;color:#172033;line-height:1.45}pre{white-space:pre-wrap;background:#f6f8fb;border:1px solid #dde5f0;padding:14px;overflow:auto;border-radius:8px}</style><pre># What MatrixArk Really Gets From Codex
+
+Date: 2026-06-23
+
+## Short Answer
+
+Codex does not natively send MatrixArk this full schema:
+
+```json
+{
+  &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;...&quot;}],
+  &quot;scope&quot;: {
+    &quot;account_id&quot;: &quot;acct_acme&quot;,
+    &quot;tenant_id&quot;: &quot;tenant_prod&quot;,
+    &quot;user_id&quot;: &quot;user_123&quot;,
+    &quot;session_id&quot;: &quot;codex_thread_456&quot;
+  }
+}
+```
+
+That is the MatrixArk normalized envelope. The Codex hook receives a raw hook payload from Codex plus the hook event name. Our hook wrapper then constructs the MatrixArk envelope.
+
+## Raw Codex Hook Input
+
+For `UserPromptSubmit`, the useful raw field is usually one of these text-like fields:
