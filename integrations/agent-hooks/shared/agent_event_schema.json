@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixark.ai/schemas/agent_event.schema.json",
+  "title": "MatrixArk Agent Event",
+  "type": "object",
+  "required": ["agent", "event", "session_id", "role", "text", "timestamp_ms"],
+  "properties": {
+    "agent": { "type": "string" },
+    "event": { "type": "string" },
+    "hook_type": { "type": "string" },
