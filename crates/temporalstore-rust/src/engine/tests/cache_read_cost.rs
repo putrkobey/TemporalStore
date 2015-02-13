@@ -1,0 +1,306 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+//! WHAT A CACHE READ COSTS ON THE SERVING PATH.
+//!
+//! The write path has been measured and cut repeatedly: twenty-seven allocations a stored record
+//! came off it through two cache changes and two dependency pin bumps. The second of those bumps
+//! said plainly that the read-side savings it carries are not exercised by the write-span ladder,
+//! and left the read side unmeasured. This module measures it.
+//!
+//! THE SERVING READ PATH, AS THE COMPILER NAMES IT rather than as a grep guesses it. Every read
+//! door on `MultiLayerCache` -- thirty-one of them, counting the older spellings the crate still
+//! carries -- was made private in a local copy of the pinned crate, and the call sites that
+//! stopped resolving were collected and retargeted until a pass produced none. That enumeration
+//! ends at EIGHT sites in the production library, five distinct doors. Grep cannot do this: the
+//! engine calls `.get(` on maps several thousand times, and two of the eight are wrapped method
+//! chains whose receiver is on a different line from the call.
+//!
+//! Of the eight, only these four READ A STORED ANSWER, and all four are charged to
+//! `AllocClass::CacheRead`:
+//!
+//! ```text
+//!   engine.rs              read_block_bytes        cache.get           the page, owned
+//!   engine.rs              read_block_shared       cache.get_shared    the page, shared
+//!   command_validation.rs  cached_response         cache.get           the command answer
+//!   compaction.rs          block_memory_resident   cache.get_memory    a residency probe
+//! ```
+//!
+//! The other four are not reads of a stored answer and are deliberately not charged to it:
+//! `peek` in `invalidate_if_cached` and `entries_for_shard` in the batched sweep are
+//! INVALIDATION, which `AllocClass::CacheInvalidation` already owns, and `peek_tier` with
+//! `entries_for_shard` in the storage reports are REPORTING. Two further sites sit inside
+//! `#[cfg(test)] mod eviction_round_scale` in a production FILE and are not production ITEMS --
+//! classifying those by file rather than by item would have put two test helpers in this table.
+//!
+//! ONE SERVING READ IS NOT ONE CACHE READ. A `StringGet` enters `cached_response`, which reads the
+//! command-answer cache. On a hit it stops there: one cache read. On a miss it calls the source,
+//! which resolves an address and calls `read_block_bytes`, reading the page cache as well. The
+//! tables below report cache reads per serving read so that the two are never confused, and the
+//! measured arms all come out at 1.00 -- a key with no stored answer never reaches a page read,
+//! so the absent arm is one cache read too.
+//!
+//! ABSOLUTE QUANTITIES, NEVER A SHARE. Every figure is allocations and bytes per serving read,
+//! with the shape stated. A share re-scales with corpus size, with the regime, and with every
+//! change landed since it was taken.
+//!
+//! THE STORE PATH IS HELD CONSTANT ACROSS EVERY ARM AND IT IS `/tmp/.tmpXXXXXX`, fifteen
+//! characters. Allocation BYTES move with the length of the store's directory path at about six
+//! bytes per character, an effect that once read as a one percent profile difference until the
+//! pair was run properly. Allocation COUNTS are immune to it, which is why the counts carry every
+//! claim here and the byte columns are printed beside them rather than asserted on. The arms
+//! assert the path length is equal rather than trusting that it is -- and the byte columns do
+//! wobble between otherwise identical runs while the counts do not, which is the effect showing
+//! itself.
+//!
+//! THE KEY WIDTH IS HELD CONSTANT TOO: `tenant/7/object/{index:09}` is twenty-five characters at
+//! every corpus size used here, so the corpus arms differ in the number of records and in nothing
+//! else.
+
+// Unconditional: the two guards at the foot of this file run in an ORDINARY build, where the
+// counting allocator is not installed, and they still need the engine and its command types. The
+// measurement apparatus above them is gated item by item instead.
+#[allow(unused_imports)]
+use super::*;
+
+/// Records written in the small arm.
+#[cfg(feature = "alloc-probe")]
+const SMALL: usize = 512;
+/// Records written in the large arm. Eight times the small one, so a per-read cost that grew with
+/// the corpus would show as a ratio near eight rather than near one.
+#[cfg(feature = "alloc-probe")]
+const LARGE: usize = 4_096;
+/// Serving reads measured in EVERY arm, held equal so the arms differ in corpus and not in how
+/// much work was measured.
+#[cfg(feature = "alloc-probe")]
+const READS: usize = 512;
+/// The stored value's width, in bytes.
+#[cfg(feature = "alloc-probe")]
+const VALUE_BYTES: usize = 1_024;
+
+/// The key for a record, twenty-five characters wide at every index this module uses.
+#[cfg(feature = "alloc-probe")]
+fn record_key(index: usize) -> String {
+    format!("tenant/7/object/{index:09}")
+}
+
+/// What one arm observed: the allocation span, and what the cache itself says it did.
+#[cfg(feature = "alloc-probe")]
+struct ReadArm {
+    counted: crate::alloc_probe::ClassifiedCounts,
+    memory_hits: u64,
+    disk_hits: u64,
+    misses: u64,
+}
+
+#[cfg(feature = "alloc-probe")]
+impl ReadArm {
+    fn cache_reads(&self) -> u64 {
+        self.memory_hits + self.disk_hits + self.misses
+    }
+    fn allocs_per_read(&self) -> f64 {
+        self.counted.total.allocs as f64 / READS as f64
+    }
+    fn bytes_per_read(&self) -> f64 {
+        self.counted.total.alloc_bytes as f64 / READS as f64
+    }
+    fn cache_reads_per_read(&self) -> f64 {
+        self.cache_reads() as f64 / READS as f64
+    }
+}
+
+/// Build an engine on a store path of the fifteen-character `tempfile` shape, and report how long
+/// that path is so the caller can assert it did not move between arms.
+#[cfg(feature = "alloc-probe")]
+fn engine_at(dir: &std::path::Path, memory_capacity_bytes: usize) -> (TemporalEngine, usize) {
+    let engine = TemporalEngine::with_local_dirs(
+        memory_capacity_bytes,
+        dir.join("cache"),
+        dir.join("blocks"),
+        dir.join("indexes"),
+    );
+    engine.load_shard(1);
+    (engine, dir.to_string_lossy().len())
+}
+
+/// Write `records` records, then measure `READS` serving reads of the keys `pick` names.
+///
+/// The cache's own counters are sampled around the same span, so an arm can say which of the
+/// three cases it actually reached instead of assuming it.
+#[cfg(feature = "alloc-probe")]
+fn measure_reads(
+    engine: &TemporalEngine,
+    records: usize,
+    pick: impl Fn(usize) -> String,
+    warm: bool,
+) -> ReadArm {
+    for index in 0..records {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: record_key(index),
+                value: vec![118u8; VALUE_BYTES],
+            },
+        });
+    }
+    if warm {
+        for offset in 0..READS {
+            let _ = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet { key: pick(offset) },
+            });
+        }
+    }
+
+    let before = engine.cache().stats();
+    let span = crate::alloc_probe::ClassSpan::open();
+    for offset in 0..READS {
+        std::hint::black_box(engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet { key: pick(offset) },
+        }));
+    }
+    let counted = span.close().expect("the counting allocator must be installed");
+    let after = engine.cache().stats();
+
+    ReadArm {
+        counted,
+        memory_hits: after.memory_hits.saturating_sub(before.memory_hits),
+        disk_hits: after.disk_hits.saturating_sub(before.disk_hits),
+        misses: after.misses.saturating_sub(before.misses),
+    }
+}
+
+#[cfg(feature = "alloc-probe")]
+fn report(label: &str, arm: &ReadArm) {
+    println!(
+        "  {label:<34} | {:>6.2} allocs {:>9.0} B per serving read | cache reads/read {:>4.2} \
+         | memory_hits {:>6} disk_hits {:>6} misses {:>6} | cache_read class {:>6} allocs \
+         | classified {:>5.1}% of calls, residual {:>8} allocs",
+        arm.allocs_per_read(),
+        arm.bytes_per_read(),
+        arm.cache_reads_per_read(),
+        arm.memory_hits,
+        arm.disk_hits,
+        arm.misses,
+        arm.counted.classes.row(crate::alloc_probe::AllocClass::CacheRead).allocs,
+        arm.counted.classified_call_share() * 100.0,
+        arm.counted.residual_allocs(),
+    );
+}
+
+/// WHAT A SERVING READ COSTS, at two corpus sizes, in each of the three cases that differ.
+///
+/// The three cases are the three the cache crate's own read-path work separates, because they
+/// cost very differently: an answer held in memory, a key with no answer, and an answer that
+/// lives on the SSD tier. A fixture that only ever hits is not a measurement of the read path, so
+/// each case is reached deliberately and the cache's own counters are asserted to prove it was.
+///
+/// MEASURED, both corpus sizes identical to two decimal places:
+///
+/// ```text
+///   case                        allocs/read   cache reads/read   which counter moved
+///   answer held in memory              8.00               1.00   memory_hits
+///   no such key                       27.13               1.00   misses
+///   answer on the SSD tier            37.00               1.00   disk_hits
+/// ```
+///
+/// Flat per record: 512 records and 4,096 records give the same per-read figure, so none of this
+/// is a corpus effect.
+///
+/// THESE READ 10.00, 29.13 AND 39.00 WHEN THIS FILE WAS WRITTEN. `warm_read_decomposition` took
+/// the first of them apart site by site and stopped the per-command LRU recency stamp collecting
+/// a `Vec<String>` of keys that it walks once and drops. That stamp runs on every command rather
+/// than in any one of these three cases, so exactly 2.00 came off all three and the SHAPE of
+/// this table -- which is what it exists to show -- is unchanged. Restated here rather than left
+/// standing: a recorded measurement whose mechanism has since been fixed reads as a live one.
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_a_cache_read_costs_on_the_serving_path() {
+    let mut path_lengths = Vec::new();
+
+    for &records in &[SMALL, LARGE] {
+        println!("\nCORPUS {records} records, value {VALUE_BYTES} B, {READS} serving reads per arm");
+
+        // HIT: generous memory, warmed, reading keys that are present.
+        let hit_dir = tempfile::tempdir().unwrap();
+        let (engine, len) = engine_at(hit_dir.path(), 256 * 1024 * 1024);
+        path_lengths.push(len);
+        let hit = measure_reads(&engine, records, |offset| record_key(offset % records), true);
+        report("HIT, answer held in memory", &hit);
+        drop(engine);
+
+        // ABSENT: the same engine shape, reading keys that were never written.
+        let absent_dir = tempfile::tempdir().unwrap();
+        let (engine, len) = engine_at(absent_dir.path(), 256 * 1024 * 1024);
+        path_lengths.push(len);
+        let absent = measure_reads(
+            &engine,
+            records,
+            |offset| format!("tenant/7/absent/{offset:09}"),
+            false,
+        );
+        report("ABSENT, no such key", &absent);
+        drop(engine);
+
+        // SSD-RESIDENT: a memory tier far too small to hold the corpus, so entries are demoted to
+        // the SSD tier and later read back from it. Worth stating because it is not obvious: the
+        // command-answer cache is written with `put_memory_only`, and an entry put that way still
+        // reaches the SSD tier -- not at put time, but when the memory tier evicts it.
+        let ssd_dir = tempfile::tempdir().unwrap();
+        let (engine, len) = engine_at(ssd_dir.path(), 64 * 1024);
+        path_lengths.push(len);
+        let ssd = measure_reads(&engine, records, |offset| record_key(offset % records), true);
+        report("SSD-tier, memory too small", &ssd);
+        drop(engine);
+
+        println!(
+            "  RATIO within this corpus: absent/hit allocs {:>5.2}x, ssd/hit allocs {:>5.2}x",
+            absent.allocs_per_read() / hit.allocs_per_read().max(f64::MIN_POSITIVE),
+            ssd.allocs_per_read() / hit.allocs_per_read().max(f64::MIN_POSITIVE),
+        );
+
+        // EACH CASE MUST BE REACHED, with a floor on how many times. Floors rather than
+        // equalities: the engine is free to read more than the one entry a request names, and a
+        // floor still fails on the thing that matters, which is an arm that reached the case
+        // zero times and reported a number for it anyway.
+        assert!(
+            hit.memory_hits >= READS as u64,
+            "the HIT arm must serve at least {READS} answers from memory, saw {}",
+            hit.memory_hits
+        );
+        assert_eq!(
+            hit.disk_hits, 0,
+            "the HIT arm must not reach the SSD tier at all, saw {} disk hits",
+            hit.disk_hits
+        );
+        assert!(
+            absent.misses >= READS as u64,
+            "the ABSENT arm must miss at least {READS} times, saw {}",
+            absent.misses
+        );
+        assert!(
+            ssd.disk_hits >= READS as u64,
+            "the SSD arm must serve at least {READS} answers from the SSD tier, saw {}; \
+             without that this arm is measuring a memory hit under a different label",
+            ssd.disk_hits
+        );
+
+        // The three cases must actually COST differently, or they are one case wearing three
+        // labels and the table above says nothing.
+        assert!(
+            absent.allocs_per_read() > hit.allocs_per_read() * 1.5,
+            "absent {:.2} against hit {:.2}: these are not distinguishable cases",
+            absent.allocs_per_read(),
+            hit.allocs_per_read()
+        );
+        assert!(
+            ssd.allocs_per_read() > absent.allocs_per_read(),
+            "ssd {:.2} against absent {:.2}",
+            ssd.allocs_per_read(),
+            absent.allocs_per_read()
+        );
+    }
+
+    // Every arm ran against the same store path length, so no byte column above is the path
