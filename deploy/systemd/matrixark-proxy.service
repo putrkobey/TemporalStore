@@ -1,0 +1,12 @@
+# Canonical systemd unit for the TemporalStore proxy.
+# Installed to /etc/systemd/system/matrixark-proxy.service on the node.
+# ExecStart runs THROUGH the config launcher; explicit Environment= still wins.
+# Requires python3 on the node for the loader (a stdlib-only script).
+[Unit]
+Description=TemporalStore proxy
+After=network-online.target matrixark-metaserver.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/temporalstore
