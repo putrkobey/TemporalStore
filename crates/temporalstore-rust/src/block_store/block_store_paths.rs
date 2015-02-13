@@ -57,23 +57,3 @@ pub(super) fn delayed_destroy_path(root: &Path, block_slab_id: u64) -> PathBuf {
 
 pub(super) fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
-        if let Ok(dir) = File::open(parent) {
-            dir.sync_all()?;
-            DIRECTORY_FSYNCS.fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    Ok(())
-}
-
-pub(super) fn sync_dir(path: &Path) -> std::io::Result<()> {
-    if let Ok(dir) = File::open(path) {
-        dir.sync_all()?;
-        DIRECTORY_FSYNCS.fetch_add(1, Ordering::Relaxed);
-    }
-    Ok(())
-}
-
-pub(super) fn now_unix_ms() -> u64 {
-    system_time_unix_ms(std::time::SystemTime::now()).unwrap_or_default()
-}
-

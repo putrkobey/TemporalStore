@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MatrixArk Management Portal</title>
+    <link rel="stylesheet" href="./management-portal.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">MatrixArk</p>
+          <h1>Management Portal</h1>
+        </div>
+        <div class="toolbar">
+          <a class="button-link" href="./index.html">Operations</a>
+          <a class="button-link" href="./access-management.html">Access</a>
+          <a class="button-link" href="./ingestion-dashboard.html">Ingestion</a>
+          <a class="button-link" href="./matrixark-api-reference.html">API</a>
+        </div>
+      </header>
+
+      <section class="panel portal-hero-panel">
+        <div class="panel-head">
+          <div>
+            <h2>User Backend Portal</h2>
+            <p>Registration, API-key application, agent setup, scoped context inventory, topology, metrics, and audit in one MatrixArk backend view.</p>
+          </div>
+          <span id="portal-status" class="status-pill"><span class="dot"></span>loading</span>
+        </div>
+        <div class="portal-scope-grid" aria-label="Portal scope">
+          <label>Account ID<input id="portal-account" value="acct_local" /></label>
+          <label>Tenant ID<input id="portal-tenant" value="tenant_codex" /></label>
+          <label>User ID<input id="portal-user" value="local_user" /></label>
+          <label>Session ID<input id="portal-session" placeholder="optional" /></label>
+          <label>Agent<select id="portal-agent"><option value="codex">Codex</option><option value="claude">Claude Code</option><option value="cursor">Cursor</option><option value="kiro">Kiro</option><option value="windsurf">Windsurf</option><option value="generic">Generic MCP</option></select></label>
+          <label>Login Provider<select id="portal-provider"><option value="google">Google / Gmail</option><option value="github">GitHub</option><option value="okta">Okta</option><option value="azure_ad">Azure AD</option></select></label>
+          <label>Email<input id="portal-email" value="local_user@gmail.com" /></label>
+          <label>Mode<select id="portal-mode"><option value="local">Local free deployment</option><option value="cloud">MatrixArk Cloud</option><option value="hybrid">Hybrid</option></select></label>
+          <label>Page Size<input id="portal-page-size" type="number" min="1" max="50" value="10" /></label>
+        </div>
+        <div class="toolbar section-gap">
+          <button id="portal-refresh" type="button">Refresh Live Portal</button>
+          <button id="portal-copy" type="button">Copy Request</button>
+        </div>
+      </section>
+
+      <section id="codex-hook-query" class="layout context-layout">
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <div>
+              <h2>Codex Hook Message Query</h2>
+              <p>Query top K user messages directly from and Rust TemporalStore hook projections, with synthetic/probe rows filtered by default.</p>
+            </div>
+            <span id="hook-query-status" class="status-pill"><span class="dot"></span>idle</span>
+          </div>
+          <div class="portal-scope-grid hook-query-controls" aria-label="Codex hook query controls">
+            <label>Top K<input id="hook-top-k" type="number" min="1" max="200" value="3" /></label>
+            <label>Backend<select id="hook-backend"><option value="both">and Rust</option><option value="native">only</option><option value="rust">Rust only</option><option value="rust-service">Rust service</option><option value="rust-local">Rust local proxy</option></select></label>
+            <label>Prefix<input id="hook-prefix" placeholder="auto: native-live-v2 / rust-live-v2" /></label>
+            <label>Scan Limit<input id="hook-scan-limit" type="number" min="1" max="5000" value="500" /></label>
+            <label>Message Filter<select id="hook-real-user-only"><option value="true">real user messages only</option><option value="false">all roles with text</option></select></label>
+            <label>Synthetic Rows<select id="hook-include-synthetic"><option value="false">hide probes/debug</option><option value="true">include probes/debug</option></select></label>
+          </div>
+          <div class="toolbar section-gap">
+            <button id="hook-query-refresh" type="button">Query Hook Messages</button>
+            <button id="hook-query-copy" type="button">Copy Query</button>
+          </div>
+          <div id="hook-query-summary" class="portal-hook-summary"></div>
+          <div class="table-wrap dashboard-table-wrap"><table><thead id="hook-query-head"></thead><tbody id="hook-query-body"></tbody></table></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head compact"><h2>Hook Row Details</h2></div>
+          <pre id="hook-query-details">Select a hook row to inspect the raw serving-store metadata.</pre>
+          <div class="panel-head compact section-gap"><h2>/ Rust Comparison</h2></div>
+          <div id="hook-query-comparison" class="metric-list"></div>
+        </article>
+      </section>
+
+      <section class="summary-grid" aria-label="Portal metrics">
+        <article><span>Users</span><strong id="portal-users">1</strong><small>local, SSO, or service principals</small></article>
+        <article><span>API Keys</span><strong id="portal-keys">2</strong><small>active, expiring, revoked</small></article>
+        <article><span>Context Graph</span><strong id="portal-nodes">7</strong><small>nodes with summaries</small></article>
+        <article><span>Ingested Items</span><strong id="portal-items">12</strong><small>messages, resources, skills</small></article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Quick Start</h2>
+            <p>Memoria-style onboarding for coding agents: sign in, get a key, connect MCP, verify memory calls.</p>
+          </div>
+        </div>
+        <div class="portal-quickstart-grid">
+          <article><span>1</span><strong>Register or sign in</strong><p>Use Google/Gmail, GitHub, Okta, Azure AD, or local login. MatrixArk maps the external subject to an internal user.</p></article>
+          <article><span>2</span><strong>Apply for key</strong><p>Issue a scoped API key for context ingest/retrieve/feedback/replay, resources, and skills.</p></article>
+          <article><span>3</span><strong>Connect agent</strong><p>Copy the one-liner or HTTP MCP snippet for Codex, Claude, Cursor, Kiro, or generic MCP clients.</p></article>
+          <article><span>4</span><strong>Verify</strong><p>Ask the agent to retrieve MatrixArk context or list resources. The portal shows key usage and audit logs.</p></article>
+        </div>
+      </section>
+
+
+      <section class="layout context-layout">
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <div>
+              <h2>Account Control Plane</h2>
+              <p>Production signup, SSO, API-key lifecycle, RBAC, and tenant isolation flows for local, cloud, and hybrid deployments.</p>
+            </div>
+            <span class="badge">production</span>
+          </div>
+          <div class="portal-platform-grid" id="portal-account-plane"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head compact"><h2>Auth Readiness</h2></div>
+          <div class="metric-list" id="portal-auth-readiness"></div>
+        </article>
+      </section>
+
+      <section class="layout context-layout">
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <div>
+              <h2>Operations Command Center</h2>
+              <p>Shared SLOs, token efficiency, backend health, ingestion lag, summary freshness, and audit posture for every account and agent.</p>
+            </div>
+          </div>
+          <div class="portal-slo-grid" id="portal-slo-grid"></div>
+          <div class="portal-ops-grid section-gap">
+            <article><strong>Alerts</strong><div class="metric-list" id="portal-alerts"></div></article>
+            <article><strong>Backend Health</strong><div class="metric-list" id="portal-backend-health"></div></article>
+            <article><strong>Token Efficiency</strong><div class="metric-list" id="portal-token-efficiency"></div></article>
+          </div>
+        </article>
+        <article class="panel">
+          <div class="panel-head compact"><h2>Audit Posture</h2></div>
+          <div class="metric-list" id="portal-audit-posture"></div>
+        </article>
+      </section>
+
+
+      <section class="layout">
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <div>
+              <h2>Security And Governance</h2>
+              <p>Portal reads are scoped before data is returned. API keys are returned once, stored as hashes, and every admin, key, SSO, replay, and portal operation is audited.</p>
+            </div>
+            <span class="badge">Governance</span>
+          </div>
+          <div class="portal-ops-grid">
+            <article><strong>Scope First</strong><p>Account, tenant, user, and session constraints are enforced before dashboard rows, topology, resources, skills, audits, or ContextPacks are returned.</p></article>
+            <article><strong>Hash-Only Keys</strong><p>Raw MatrixArk API keys are only shown at creation. Metadata stores api_key_hash plus key id, role, scopes, allow-lists, status, and expiration.</p></article>
+            <article><strong>Audit Everywhere</strong><p>Admin actions, key operations, SSO mapping/login, portal reads, backend metrics, retrieval, feedback, replay, and denied auth attempts produce audit records.</p></article>
+          </div>
+        </article>
+        <article class="panel">
+          <div class="panel-head compact"><h2>Roles And Service Keys</h2></div>
+          <div class="metric-list">
+            <div class="metric-row"><span>Human roles</span><strong>owner / admin / operator / developer / viewer</strong></div>
+            <div class="metric-row"><span>Agent keys</span><strong>service or local_agent with scoped capabilities</strong></div>
+            <div class="metric-row"><span>Isolation</span><strong>allowed_user_ids and allowed_session_ids</strong></div>
+            <div class="metric-row"><span>Portal scope</span><strong>portal:read</strong></div>
+          </div>
+        </article>
+      </section>
+
+      <section class="layout context-layout">
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <div>
+              <h2>Prometheus Observability</h2>
+              <p>Backend metrics panels for and Rust with storage mode, readiness, token pressure, import lag, model fallback flags, and audit write health.</p>
+            </div>
+            <span class="badge">Prometheus</span>
+          </div>
+          <div id="portal-backend-identity" class="portal-backend-strip"></div>
+          <div id="portal-prometheus-panels" class="portal-prometheus-grid"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head compact"><h2>Alert Posture</h2></div>
+          <div id="portal-alert-posture" class="portal-alert-card-list"></div>
+          <div class="panel-head compact section-gap"><h2>Model Fallback Flags</h2></div>
+          <div id="portal-model-fallbacks" class="metric-list"></div>
+        </article>
+      </section>
+
+      <section class="layout context-layout">
+        <article class="panel panel-wide">
+          <div class="panel-head"><div><h2>Metadata Store</h2><p>Account, tenant, user, SSO, API-key, and admin audit metadata can live in record-log local mode, MySQL, MatrixKV SQL, or the legacy MatrixKV SQL alias. Context records, embeddings, resources, and skills still live in TemporalStore.</p></div></div>
+          <div class="portal-scope-grid" aria-label="Metadata backend">
+            <label>Metadata Backend<select id="portal-metadata-backend"><option value="record_log">Record log / local</option><option value="mysql">MySQL</option><option value="matrixkv_sql">MatrixKV SQL</option><option value="matrixkv_sql">MatrixKV SQL</option></select></label>
+          </div>
+          <div class="portal-install-grid">
+            <article><strong>Runtime env</strong><pre id="portal-metadata-env"></pre></article>
+            <article><strong>SQL schema</strong><pre id="portal-metadata-schema"></pre></article>
+            <article><strong>Policy</strong><div class="metric-list" id="portal-metadata-policy"></div></article>
+          </div>
+        </article>
+        <article class="panel">
+          <div class="panel-head compact"><h2>Active Metadata Backend</h2></div>
+          <div class="metric-list" id="portal-metadata-active"></div>
+        </article>
+      </section>
+
+      <section class="layout context-layout">
+        <article class="panel panel-wide">
+          <div class="panel-head"><div><h2>Registration, SSO, And API Keys</h2><p>Register local users, link Gmail/GitHub/enterprise SSO, issue scoped keys, rotate/revoke them, and inspect redacted inventory without exposing raw key material.</p></div></div>
+          <div class="portal-action-grid">
+            <article><strong>Production signup</strong><span>Create account, tenant, user, first scoped API key, and audit record in one trusted onboarding flow.</span><pre id="portal-register-payload"></pre></article>
+            <article><strong>SSO callback</strong><span>Trusted Google/Gmail, GitHub, Okta, or Azure AD gateways send verified claims; MatrixArk stores mapped identity metadata only.</span><pre id="portal-sso-payload"></pre></article>
+            <article><strong>Link external identity</strong><span>Store the provider subject and email without trusting caller-supplied user ids blindly.</span><pre id="portal-link-payload"></pre></article>
+            <article><strong>Apply for API key</strong><span>One-call onboarding for coding agents and service workers.</span><pre id="portal-key-payload"></pre></article>
+            <article><strong>Key lifecycle</strong><span>Create, list, rotate, revoke, expire, and inspect redacted keys with scopes, allow-lists, last-used time, and usage count.</span><pre id="portal-key-management-payload"></pre></article>
+            <article><strong>Policy decision</strong><span>Every context call is checked against account, tenant, user, session, role, scopes, and key state.</span><pre id="portal-policy-decision"></pre></article>
+          </div>
+        </article>
+        <article class="panel">
+          <div class="panel-head compact"><h2>Portal Request</h2></div>
+          <pre id="portal-request"></pre>
+        </article>
+      </section>
+
+      <section class="layout context-layout">
+        <article class="panel panel-wide">
+          <div class="panel-head"><div><h2>Token And Usage Monitoring</h2><p>Track prompt pressure, selected versus dropped context, API-key usage, and per-stage latency from the same portal.</p></div></div>
+          <div class="portal-token-grid" id="portal-token-metrics"></div>
+        </article>
+        <article class="panel">
+          <div class="panel-head compact"><h2>Cost And Limits</h2></div>
+          <div class="metric-list" id="portal-limit-policy"></div>
+        </article>
+      </section>
+      <section class="layout context-layout">
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <div>
+              <h2>Context Debugger</h2>
+              <p>Inspect what Codex exposed locally, what MatrixArk retrieved remotely, how tokens were spent, and why refs were selected or dropped.</p>
+            </div>
+            <span class="badge">debug</span>
+          </div>
+          <div class="portal-debug-kpis" id="portal-debug-kpis"></div>
+          <div class="portal-debug-grid">
+            <article>
+              <strong>Codex Local Context Visibility</strong>
+              <div class="metric-list" id="portal-context-visibility"></div>
+            </article>
+            <article>
+              <strong>ContextPack Token Accounting</strong>
+              <pre id="portal-pack-debug"></pre>
+            </article>
+            <article>
+              <strong>Pipeline Stage Timings</strong>
+              <div class="metric-list" id="portal-stage-debug"></div>
+            </article>
+            <article>
+              <strong>Selected And Dropped Refs</strong>
+              <pre id="portal-ref-debug"></pre>
+            </article>
+            <article>
+              <h2>ContextPack Audit Debugger</h2>
+              <pre id="portal-contextpack-debugger"></pre>
+            </article>
+          </div>
+        </article>
+        <article class="panel">
+          <div class="panel-head compact"><h2>Debug Commands</h2></div>
+          <pre id="portal-debug-request"></pre>
+          <div class="metric-list section-gap" id="portal-token-scenarios"></div>
+          <div class="metric-list section-gap" id="portal-replay-links"></div>
+        </article>
+      </section>
+
+      <section class="layout context-layout">
+        <article class="panel panel-wide">
+          <div class="panel-head"><div><h2>Agent Install Snippets</h2><p>Copy one command or an HTTP MCP config. Agents send what they know; MatrixArk resolves and enforces final identity.</p></div></div>
