@@ -1,0 +1,6 @@
+aws_region       = "us-west-2"
+eks_cluster_name = "existing-eks-cluster-name"
+image            = "123456789012.dkr.ecr.us-west-2.amazonaws.com/temporalstore-rust:latest"
+
+# Optional:
+# aws_profile        = "default"
