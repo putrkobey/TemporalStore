@@ -1,0 +1,37 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  scrape_timeout: 10s
+
+rule_files:
+  - /etc/prometheus/temporalstore-alerts.yml
+  - /etc/prometheus/matrixark-gateway-alerts.yml
+  # `up`, per scrape job. Every other file here is written against metrics a process emits,
+  # so every rule in them needs that process to be answering; this one is what is left when
+  # it is not.
+  - /etc/prometheus/scrape-target-alerts.yml
+  # Raft, the metaserver, the proxy, the stores and replication. These pair with
+  # docs/ops/temporalstore-dashboard.json and query the engine job below; without that job every
+  # rule here evaluates against nothing, and a rule with no series never fires.
+  - /etc/prometheus/temporalstore-engine-alerts.yml
+
+scrape_configs:
+  - job_name: temporalstore_node_exporter
+    static_configs:
+      - targets:
+          - node-exporter:9100
+
+  # The customer-facing /v1 edge. Aggregate counters only -- no keys, no tenant identifiers -- so it
+  # needs no credentials, the way an exporter normally does not. The two gauges worth alerting on
+  # (matrixark_gateway_embedding_semantic, matrixark_gateway_extraction_model_active) are the only
+  # signals that catch a deployment whose model fallbacks have silently engaged: every other series
+  # here looks healthy while retrieval runs on hash vectors.
+  - job_name: matrixark_gateway
+    metrics_path: /v1/metrics
+    static_configs:
+      - targets:
+          - gateway:8080
+
+  # The engine's own Prometheus output, which is a different surface from both the gateway's
+  # /v1/metrics and the /vars sidecar above. Each process serves /metrics on the same listener it
+  # serves its service routes on, so these are the service ports from config/temporalstore.toml:
