@@ -1,0 +1,9 @@
+# Canonical systemd unit for the MatrixArk /v1 HTTP gateway.
+# Installed to /etc/systemd/system/matrixark-gateway.service on the node.
+#
+# ExecStart runs THROUGH the config launcher: with_config.sh reads the canonical
+# TOML, exports every mapped env var that is not already set, then exec's the
+# gateway. Any Environment= / EnvironmentFile= set below (or in a drop-in) still
+# wins, because systemd applies them before ExecStart runs.
+[Unit]
+Description=MatrixArk /v1 HTTP gateway
