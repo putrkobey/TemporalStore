@@ -323,3 +323,165 @@ fn persist_on_a_key_whose_deadline_has_passed_reports_what_it_removed() {
 // =====================================================================================
 // THREE: `EXPIRE key 0` discards the key.
 // =====================================================================================
+
+/// A relative expiry of ZERO discards the key, exactly as a negative one does.
+///
+/// THE LINE. `expire_response` in the RESP layer opens with `if ttl <= 0 { discard_key_now(..) }`.
+/// Narrowing it to `if ttl < 0` sends a zero down the ordinary path instead, as
+/// `CommonExpire { ttl_ms: 0 }` -- a deadline of "now plus nothing".
+///
+/// WHY NO ANSWER CHANGES. Both routes reply 1. The discard replies 1 because the key was
+/// there; the deadline-of-now replies 1 because the command was accepted. And both leave the
+/// key unreadable, because a deadline equal to the instant has already passed, so the very
+/// next `GET` collects it lazily and answers nil. A test written on the reply, or on a
+/// following read, is satisfied by either.
+///
+/// WHAT ACTUALLY DIFFERS is the shard. A discard removes the record now. A deadline of now
+/// leaves the record sitting in `strings` with an entry in `expires_at_ms`, waiting for
+/// something to come and collect it -- so the key the caller asked to discard is still
+/// occupying the store, and is still there to be resurrected by anything that clears its
+/// deadline before a read arrives.
+///
+/// WHY ZERO AND NOT NEGATIVE. The existing guard on this surface covers `EXPIRE k -1` and the
+/// absolute spellings. Zero is the only value the two comparisons disagree on, and no test
+/// used it. The negative case is asserted below as the control that makes the claim mean
+/// something.
+///
+/// THE TWO HALVES ARE COUNTED SEPARATELY. `EXPIRE` and `PEXPIRE` are two verbs through the one
+/// function, and one combined "nothing survived" count reads full from whichever is fixed
+/// first.
+#[test]
+fn a_relative_expiry_of_zero_discards_the_key() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+
+    fn seed(engine: &TemporalEngine, key: &str) {
+        assert_eq!(
+            RespValue::SimpleString("OK".to_string()),
+            resp(engine, &["SET", key, "v"]),
+            "DENOMINATOR: {key} has to be there before a zero expiry can discard it",
+        );
+        let (record, _) = shard_state(engine, key);
+        assert!(record, "DENOMINATOR: and the shard has to be holding it");
+    }
+
+    // ---- THE TWO HALVES, EACH COUNTED --------------------------------------------------
+    let mut attempted = 0usize;
+    let mut survivors = 0usize;
+    let mut survivor_names: Vec<&str> = Vec::new();
+
+    for (label, key, verb) in [
+        ("EXPIRE with a relative time of zero", "zero:expire", "EXPIRE"),
+        ("PEXPIRE with a relative time of zero", "zero:pexpire", "PEXPIRE"),
+    ] {
+        seed(&engine, key);
+        attempted += 1;
+        assert_eq!(
+            RespValue::Integer(1),
+            resp(&engine, &[verb, key, "0"]),
+            "{label}: the key was there, so the reply is 1",
+        );
+        // THE SHARD IS ASKED FIRST AND THE ORDER IS LOAD-BEARING. `GET` and `PTTL` both run
+        // lazy expiry, so either of them would collect the record this is trying to observe
+        // and the claim would hold for the wrong reason.
+        let (record, deadline) = shard_state(&engine, key);
+        if record || deadline {
+            survivors += 1;
+            survivor_names.push(label);
+        }
+    }
+
+    assert_eq!(
+        2, attempted,
+        "VACUITY FLOOR: both spellings must have been exercised, and only {attempted} were",
+    );
+    assert_eq!(
+        0, survivors,
+        "{survivors} of {attempted} zero-length expiries left the key in the shard: \
+         {survivor_names:?}. A zero relative time is a request to discard the key now, and a \
+         record still sitting in `strings` under a deadline of `now` is not a discarded key -- \
+         it is a key waiting to be collected, which still occupies the store and is still \
+         there for anything that clears its deadline to bring back. Every reply was 1 and \
+         every following GET answers nil either way, so the shard is the only place this is \
+         visible.",
+    );
+
+    // ---- CONTROL: a NEGATIVE time discards too, which is the already-guarded half --------
+    // Without this, a discard that had stopped working entirely would be indistinguishable
+    // from the two claims above passing.
+    seed(&engine, "zero:negative");
+    assert_eq!(
+        RespValue::Integer(1),
+        resp(&engine, &["EXPIRE", "zero:negative", "-1"]),
+    );
+    let (record, deadline) = shard_state(&engine, "zero:negative");
+    assert!(
+        !record && !deadline,
+        "CONTROL: a negative relative time still discards. If this fails the discard is broken \
+         outright and the claims above were not about zero at all.",
+    );
+
+    // ---- CONTROL: a POSITIVE time arms a deadline and KEEPS the record -------------------
+    // This is what stops the fix from being "discard whatever you are given".
+    seed(&engine, "zero:positive");
+    assert_eq!(
+        RespValue::Integer(1),
+        resp(&engine, &["EXPIRE", "zero:positive", "3600"]),
+    );
+    let (record, deadline) = shard_state(&engine, "zero:positive");
+    assert!(
+        record && deadline,
+        "CONTROL: an hour out must leave the record in place WITH a deadline recorded. This is \
+         the denominator for both `!deadline` claims above: without it they would also hold if \
+         the expiry index never recorded anything at all.",
+    );
+
+    // ---- CONTROL: zero on a key that is not there answers 0, not an error ----------------
+    assert_eq!(
+        RespValue::Integer(0),
+        resp(&engine, &["EXPIRE", "zero:absent", "0"]),
+        "CONTROL: discarding something already gone is a no-op that succeeded",
+    );
+}
+
+// =====================================================================================
+// FOUR: validation treats a deadline EQUAL to the instant as passed.
+// =====================================================================================
+
+/// A key whose stored deadline is exactly the current instant is already gone, and
+/// `EXPIRE` on it must be refused rather than resurrect it.
+///
+/// THE LINE. `validate_command_preconditions` pre-checks `Command::CommonExpire` with
+/// `*expires_at <= resolve_now_ms()`. Narrowing it to `<` changes the answer in exactly one
+/// millisecond -- the one where the stored deadline equals the clock -- and in no other.
+///
+/// WHY IT IS NOT ALREADY COVERED. Inverting this comparison is killed by three tests, and the
+/// boundary by none. There is a guard on the equal-to-the-instant boundary elsewhere on this
+/// surface, but it is on the EXECUTOR's comparison in `remove_if_expired`. This is a second,
+/// separate comparison, in a different function, reached earlier, and it decides something
+/// else: not "collect this key" but "refuse this command". A guard on one says nothing about
+/// the other, which is how a boundary can be guarded and still survive.
+///
+/// WHAT THE NARROWED COMPARISON DOES. Validation lets the command through, execution collects
+/// the expired record on the way past, finds no record left to arm, and reports success -- so
+/// the caller is told 1, "the deadline is set", about a key that no longer exists. The honest
+/// answer is 0.
+///
+/// WHY THE CLOCK IS FROZEN. The instant cannot be hit by timing. `resolve_now_ms` answers the
+/// replay clock when one is installed, so `ReplayClockGuard` pins it and the comparison is
+/// exact rather than a race.
+///
+/// THE THREE CASES ARE COUNTED SEPARATELY. One combined "refused" count reads full from the
+/// past case alone -- which the narrowing does not change -- and says nothing about the
+/// boundary, which is the whole subject.
+#[test]
+fn expire_on_a_key_whose_deadline_is_exactly_now_is_refused() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+
+    for key in ["validate:past", "validate:equal", "validate:future"] {
+        assert_eq!(
+            RespValue::SimpleString("OK".to_string()),
+            resp(&engine, &["SET", key, "v"]),
+            "DENOMINATOR: {key} must exist, or every refusal below is just 'no such key'",
+        );
