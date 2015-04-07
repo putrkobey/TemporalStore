@@ -1,0 +1,32 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+use std::os::raw::c_char;
+use std::ptr;
+
+use crate::direct_client::Client;
+use crate::direct_ffi::*;
+use crate::direct_helpers::{check, cstring};
+use crate::{ControlStatePrecision, ControlStateWindow, Result};
+
+impl Client {
+    pub fn control_state_increment(
+        &self,
+        key: &str,
+        amount: i64,
+        ttl_seconds: u64,
+        precision: ControlStatePrecision,
+        uuid: &str,
+        occur_time_seconds: u64,
+    ) -> Result<()> {
+        let key = cstring(key)?;
+        let uuid = cstring(uuid)?;
+        let mut error: *mut c_char = ptr::null_mut();
+        let code = unsafe {
+            temporalstore_control_state_increment(
+                self.raw,
+                key.as_ptr(),
+                amount,
+                ttl_seconds,
+                precision as i32,
+                uuid.as_ptr(),
