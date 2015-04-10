@@ -26,12 +26,3 @@ scrape_configs:
   # (matrixark_gateway_embedding_semantic, matrixark_gateway_extraction_model_active) are the only
   # signals that catch a deployment whose model fallbacks have silently engaged: every other series
   # here looks healthy while retrieval runs on hash vectors.
-  - job_name: matrixark_gateway
-    metrics_path: /v1/metrics
-    static_configs:
-      - targets:
-          - gateway:8080
-
-  # The engine's own Prometheus output, which is a different surface from both the gateway's
-  # /v1/metrics and the /vars sidecar above. Each process serves /metrics on the same listener it
-  # serves its service routes on, so these are the service ports from config/temporalstore.toml:
