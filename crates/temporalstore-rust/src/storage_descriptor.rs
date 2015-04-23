@@ -61,3 +61,67 @@ pub struct BlockHeader {
     #[prost(uint64, tag = "5")]
     pub data_size: u64,
     #[prost(uint64, tag = "6")]
+    pub timestamp_ms: u64,
+    #[prost(bytes = "vec", tag = "7")]
+    pub key: Vec<u8>,
+    #[prost(uint32, tag = "8")]
+    pub model_id: u32,
+    #[prost(enumeration = "BlockCompression", tag = "9")]
+    pub compress: i32,
+    /// The block's bytes live in the WAL record at [`Self::wal_sequence`], not in a slab. Set
+    /// for every block that has not been dumped yet.
+    #[prost(bool, tag = "10")]
+    pub block_in_wal: bool,
+    /// Blocks for one object are ordered by this. It is derived from the log sequence, so a
+    /// later write always wins.
+    #[prost(uint64, tag = "11")]
+    pub version: u64,
+    /// Position in the WAL when the block was written.
+    #[prost(uint64, tag = "12")]
+    pub wal_sequence: u64,
+}
+
+/// One slab in a stream's chain.
+///
+/// `truncated_offset` is how a stream records that its head has been logically discarded
+/// without rewriting the slab.
+#[derive(Clone, PartialEq, Message)]
+pub struct SlabInfo {
+    #[prost(uint64, tag = "1")]
+    pub slab_id: u64,
+    #[prost(uint64, tag = "2")]
+    pub start_offset: u64,
+    #[prost(uint64, tag = "3")]
+    pub slab_start_offset: u64,
+    #[prost(uint64, tag = "4")]
+    pub slab_end_offset: u64,
+    #[prost(uint64, tag = "5")]
+    pub end_record_sequence: u64,
+    #[prost(uint64, tag = "6")]
+    pub freeze_ms: u64,
+    #[prost(uint64, tag = "7")]
+    pub end_offset: u64,
+    #[prost(uint64, tag = "8")]
+    pub truncated_offset: u64,
+}
+
+/// The header written at the front of every slab.
+///
+/// It names the whole chain (`data_slabs`), which is what lets a reopen rebuild the stream
+/// from the last slab alone rather than scanning all of them.
+#[derive(Clone, PartialEq, Message)]
+pub struct SlabHeader {
+    #[prost(fixed64, tag = "1")]
+    pub magic: u64,
+    #[prost(uint64, tag = "2")]
+    pub slab_id: u64,
+    #[prost(bytes = "vec", tag = "3")]
+    pub slab_name: Vec<u8>,
+    #[prost(uint64, tag = "4")]
+    pub timestamp_ms: u64,
+    #[prost(uint32, tag = "5")]
+    pub version: u32,
+    #[prost(uint64, tag = "6")]
+    pub start_record_sequence: u64,
+    #[prost(bytes = "vec", tag = "7")]
+    pub client_token: Vec<u8>,
