@@ -1,0 +1,217 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+//! Per-shard read and write rate limits.
+//!
+//! One token bucket per direction. A bucket is defined by a rate (tokens per second) and a burst
+//! (how many tokens may accumulate while idle), and a rate of zero means the direction is not
+//! limited at all -- which is the default, so a deployment that sets nothing behaves exactly as it
+//! did before this existed.
+
+use std::collections::HashMap;
+use std::time::Instant;
+
+use crate::types::ShardId;
+
+/// Which direction a command consumes from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QuotaKind {
+    Read,
+    Write,
+}
+
+/// A token bucket that never waits: it either has the tokens or it does not.
+///
+/// Tokens are not counted. What is stored is a point in time that consumption has been charged up
+/// to, so the tokens available at any moment are however much time has passed since it, capped at
+/// the burst. Charging N tokens moves that point forward by N token-times. Nothing accumulates
+/// while idle beyond the cap, and no timer has to run to refill anything.
+#[derive(Debug)]
+pub(crate) struct TokenBucket {
+    rate: u64,
+    burst: u64,
+    per_token_ns: i128,
+    per_burst_ns: i128,
+    /// Consumption is charged up to here, as nanoseconds since `origin`. Starts one full burst
+    /// BEHIND the origin, which is what makes a new bucket start full: the tokens available are
+    /// however much time separates this point from now, and at the origin that is a whole burst.
+    /// Signed for that reason -- an unsigned zero would mean a new bucket had nothing in it, and
+    /// the first request against it would be refused.
+    charged_ns: i128,
+    origin: Instant,
+}
+
+impl TokenBucket {
+    pub(crate) fn new(rate: u64, burst: u64) -> Self {
+        // A burst of zero would mean nothing may ever accumulate, so a caller sending at exactly
+        // the rate would still be refused on any jitter. One second of credit is the useful
+        // default and matches what a rate alone implies.
+        let burst = if burst == 0 { rate } else { burst };
+        let per_token_ns: i128 = if rate == 0 {
+            0
+        } else {
+            1_000_000_000i128 / rate as i128
+        };
+        let per_burst_ns = per_token_ns * burst as i128;
+        Self {
+            rate,
+            burst,
+            per_token_ns,
+            per_burst_ns,
+            charged_ns: -per_burst_ns,
+            origin: Instant::now(),
+        }
+    }
+
+    pub(crate) fn rate(&self) -> u64 {
+        self.rate
+    }
+
+    pub(crate) fn burst(&self) -> u64 {
+        self.burst
+    }
+
+    fn now_ns(&self) -> i128 {
+        self.origin.elapsed().as_nanos() as i128
+    }
+
+    /// Take `tokens` if they are there. Returns false without waiting if they are not.
+    pub(crate) fn try_consume(&mut self, tokens: u64) -> bool {
+        self.try_consume_at(tokens, self.now_ns())
+    }
+
+    fn try_consume_at(&mut self, tokens: u64, now_ns: i128) -> bool {
+        if self.rate == 0 {
+            return true;
+        }
+        // Credit older than one burst is gone -- that is what the cap means.
+        let floor = now_ns - self.per_burst_ns;
+        let from = self.charged_ns.max(floor);
+        let charged_to = from + tokens as i128 * self.per_token_ns;
+        if charged_to > now_ns {
+            return false;
+        }
+        self.charged_ns = charged_to;
+        true
+    }
+
+    /// How many tokens are available right now. Diagnostics only.
+    pub(crate) fn available(&self) -> u64 {
+        if self.rate == 0 || self.per_token_ns == 0 {
+            return u64::MAX;
+        }
+        let now_ns = self.now_ns();
+        if now_ns <= self.charged_ns {
+            return 0;
+        }
+        let idle = (now_ns - self.charged_ns).min(self.per_burst_ns);
+        (idle / self.per_token_ns) as u64
+    }
+}
+
+/// What a shard's limits are. Zero qps means that direction is not limited.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ShardQuotaConfig {
+    pub read_qps: u64,
+    pub read_burst: u64,
+    pub write_qps: u64,
+    pub write_burst: u64,
+}
+
+impl ShardQuotaConfig {
+    /// The default limits, from the environment. Absent or zero means unlimited.
+    pub fn from_env() -> Self {
+        let read = |name: &str| -> u64 {
+            std::env::var(name)
+                .ok()
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        Self {
+            read_qps: read("TS_SHARD_READ_QPS"),
+            read_burst: read("TS_SHARD_READ_BURST"),
+            write_qps: read("TS_SHARD_WRITE_QPS"),
+            write_burst: read("TS_SHARD_WRITE_BURST"),
+        }
+    }
+
+    pub fn is_unlimited(&self) -> bool {
+        self.read_qps == 0 && self.write_qps == 0
+    }
+}
+
+/// What a shard's limit has allowed and refused.
+///
+/// Both halves, not just refusals: a refusal count with no denominator says nothing about whether
+/// the limit is close or miles away. Only shards that HAVE a limit carry these -- an unlimited
+/// shard has nothing to count, and keeping it that way is what lets the fast path stay on a read
+/// lock.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuotaCounters {
+    pub read_allowed: u64,
+    pub read_refused: u64,
+    pub write_allowed: u64,
+    pub write_refused: u64,
+}
+
+/// The buckets for one shard.
+#[derive(Debug)]
+pub(crate) struct ShardQuota {
+    read: Option<TokenBucket>,
+    write: Option<TokenBucket>,
+    counters: QuotaCounters,
+}
+
+impl ShardQuota {
+    pub(crate) fn new(config: ShardQuotaConfig) -> Self {
+        Self {
+            read: (config.read_qps > 0)
+                .then(|| TokenBucket::new(config.read_qps, config.read_burst)),
+            write: (config.write_qps > 0)
+                .then(|| TokenBucket::new(config.write_qps, config.write_burst)),
+            counters: QuotaCounters::default(),
+        }
+    }
+
+    pub(crate) fn counters(&self) -> QuotaCounters {
+        self.counters
+    }
+
+    /// Take one token for `kind`. An unlimited direction always succeeds.
+    pub(crate) fn try_consume(&mut self, kind: QuotaKind) -> bool {
+        let bucket = match kind {
+            QuotaKind::Read => self.read.as_mut(),
+            QuotaKind::Write => self.write.as_mut(),
+        };
+        let allowed = match bucket {
+            Some(bucket) => bucket.try_consume(1),
+            None => true,
+        };
+        match (kind, allowed) {
+            (QuotaKind::Read, true) => self.counters.read_allowed += 1,
+            (QuotaKind::Read, false) => self.counters.read_refused += 1,
+            (QuotaKind::Write, true) => self.counters.write_allowed += 1,
+            (QuotaKind::Write, false) => self.counters.write_refused += 1,
+        }
+        allowed
+    }
+
+    pub(crate) fn limit_of(&self, kind: QuotaKind) -> Option<(u64, u64)> {
+        let bucket = match kind {
+            QuotaKind::Read => self.read.as_ref(),
+            QuotaKind::Write => self.write.as_ref(),
+        };
+        bucket.map(|bucket| (bucket.rate(), bucket.burst()))
+    }
+}
+
+/// Every shard's limits, so they can be changed on a running service.
+#[derive(Debug, Default)]
+pub(crate) struct QuotaTable {
+    by_shard: HashMap<ShardId, ShardQuota>,
+    configured: HashMap<ShardId, ShardQuotaConfig>,
+}
+
+impl QuotaTable {
+    /// Replace a shard's limits. Rebuilding the bucket resets its credit, which is the honest
+    /// behaviour for a new limit: credit accumulated under the old rate means nothing under the
