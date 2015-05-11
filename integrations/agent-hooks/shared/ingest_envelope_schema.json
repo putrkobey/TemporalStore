@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://matrixark.ai/schemas/ingest_envelope.schema.json",
+  "title": "MatrixArk Ingest Envelope",
+  "description": "Canonical request schema for ALL non-agent ingestion into MatrixArk / TemporalStore. Every non-agent ingest call (kind in {message, feedback, resource, skill, business_data}) is normalized by tools/matrixark_mcp_core.py::normalize_envelope (via resolve_ingest_messages + the require_messages/optional_object helpers in tools/matrixark_mcp_core_identity.py, which matrixark_mcp_core re-exports), and this schema DESCRIBES that normalizer's accepted input contract. normalize_envelope is the source of truth; this schema must never impose a rule the code does not. The agent-capture path (integrations/agent-hooks/shared/agent_event_schema.json) is a SEPARATE capture format that agent hooks normalize INTO this same envelope; it is not this schema. NOTE (documented code leniencies not fully expressed here): message roles are matched case-insensitively after trimming and non-canonical aliases (see message.role) are normalized to the four canonical roles; ingestion_time_ms is also accepted by the code as a numeric string or float (coerced via int()); scope/metadata accept null (treated as {}); for resource/skill a raw_uri whose value is exactly \"inline-resource\" is NOT treated as a source (text or messages must then be supplied). additionalProperties is true because normalize_envelope copies through passthrough fields; the known ones are documented under properties.",
+  "type": "object",
+  "additionalProperties": true,
+  "properties": {
+    "kind": {
+      "description": "Ingestion kind. Optional in a raw call (the gateway supplies a per-endpoint default_kind), but when present must be one of the enum. Drives the content requirement below.",
+      "type": "string",
+      "enum": ["message", "feedback", "resource", "skill", "business_data"]
+    },
+    "messages": {
+      "description": "Conversation/content turns. Required and non-empty for kind in {message, feedback, business_data}; for {resource, skill} it is one acceptable content source among messages|text|raw_uri.",
+      "type": "array",
+      "items": { "$ref": "#/$defs/message" }
+    },
+    "text": {
+      "description": "Client-facing single-call content for resource/skill ingest (alias: resource_text). Synthesized into a one-item user messages list by resolve_ingest_messages.",
+      "type": "string"
+    },
+    "resource_text": {
+      "description": "Alias of text accepted for resource/skill single-call ingest.",
+      "type": "string"
+    },
+    "raw_uri": {
+      "description": "Local-file path or URI source for resource/skill ingest (passthrough for other kinds). The literal value \"inline-resource\" is a placeholder and is NOT treated as a real source.",
+      "type": "string"
+    },
+    "resource_type": {
+      "description": "Free-form resource classifier (passthrough).",
+      "type": "string"
+    },
+    "scope": {
+      "description": "Access/ownership scope. Optional; null is treated as an empty object. All subfields are optional strings.",
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "properties": {
+        "account_id": { "type": "string" },
+        "tenant_id": { "type": "string" },
+        "team": { "type": "string" },
+        "user_id": { "type": "string" },
+        "session_id": { "type": "string" },
+        "sharing_scope": { "$ref": "#/$defs/sharing_scope" }
+      }
+    },
+    "sharing_scope": {
+      "description": "Sharing visibility. Read from scope.sharing_scope (or top-level); defaults to private_user.",
+      "$ref": "#/$defs/sharing_scope"
+    },
+    "metadata": {
+      "description": "Free-form metadata object. Optional; null is treated as an empty object. May carry ingestion_time_ms and storage_options overrides.",
+      "type": ["object", "null"]
+    },
+    "ingestion_time_ms": {
+      "description": "Ingestion timestamp in epoch milliseconds. Optional; defaults to now. Must be a positive integer (the code also accepts a numeric string/float, coerced via int()).",
+      "type": "integer",
+      "exclusiveMinimum": 0
+    },
+    "expires_at": {
+      "description": "PurchaseMemory per-record TTL (optional). Absolute expiry as unix SECONDS (int/float). Every record produced by this ingestion is stamped ephemeral and stops surfacing from retrieve/get_all once now >= expires_at, is excluded from summaries/rollups, and is lazily purged. Wins over ttl_seconds when both are given. Normalized by apply_memory_envelope_fields into expires_at_ms.",
+      "type": "number"
+    },
+    "ttl_seconds": {
+      "description": "PurchaseMemory relative TTL (optional). expires_at = occurred_at (ingestion_time) + ttl_seconds. Ignored when expires_at is also supplied.",
+      "type": "number"
+    },
+    "retention_cutoff_ts": {
+      "description": "PurchaseMemory scope-level retention cutoff (optional), unix SECONDS. Records in this subject scope whose occurrence time < cutoff are hidden at read-time and reclaimed by the expiry sweep. Persisted as a durable scope marker.",
+      "type": "number"
+    },

@@ -1,0 +1,134 @@
+# Alerts for the customer-facing MatrixArk gateway (`GET /v1/metrics`).
+#
+# Several of these exist because the state they describe is INVISIBLE on latency, error rate and
+# every storage metric -- the deployment answers 200 throughout. Named rather than counted, because
+# a sentence that says "the first two" stops being true the moment somebody inserts a group:
+#
+#   MatrixArkRetrievalNotSemantic, MatrixArkExtractionNotUsingAModel,
+#   MatrixArkSummariesNotUsingAModel
+#       Extraction and embedding both fall back to a local deterministic path when they are
+#       unconfigured or unreachable. That path answers 200 with rule-extracted memories and hash
+#       vectors, so the deployment is indistinguishable from a healthy one until somebody looks at
+#       retrieval quality.
+#
+#   MatrixArkRetrievesAreBeingShed, MatrixArkRetrievesComeBackEmpty
+#       Under load the gateway stops retrieving and answers every retrieve with an empty pack in
+#       ~100 ms. Latency cannot show this: p50 IMPROVES as the packs empty, so the deployment looks
+#       FASTER than one doing the work. The second is the same silence without the backpressure
+#       warning, which does not clear on its own.
+groups:
+  - name: matrixark-gateway-stream
+    rules:
+      - alert: MatrixArkEventStreamBreaking
+        expr: sum(rate(matrixark_gateway_event_stream_ended_total{reason="server_error"}[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The portal's live stream is breaking on the server ({{ $labels.instance }})"
+          description: >-
+            Live streams are ending with reason=server_error. EventSource reconnects on the
+            cadence the stream itself sets, so the client walks straight back into the fault and
+            the portal shows stale state between attempts. Only this reason is alerted on:
+            stream_max_age is the ten-minute rotation and client_gone is a tab closing, so a rule
+            over the total would fire on a healthy deployment. The gateway log carries an incident
+            token for each one.
+
+  - name: matrixark-gateway-retrieval
+    rules:
+      - alert: MatrixArkRetrievesAreBeingShed
+        expr: >-
+          sum(rate(matrixark_gateway_retrieve_outcomes_total{outcome="shed"}[5m]))
+          / clamp_min(sum(rate(matrixark_gateway_retrieve_outcomes_total[5m])), 0.001) > 0.1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Retrieves are being shed, not answered ({{ $labels.instance }})"
+          description: >-
+            Under load this gateway stops retrieving and answers every retrieve with HTTP 200 and
+            an empty pack in about 100 ms, carrying a service_backpressure warning. Latency and
+            error rate cannot show this -- p50 IMPROVES as the packs empty out, so the deployment
+            looks faster than one doing the work. A tenth of retrieves returning nothing is
+            already a product outage. The cooldown lives in gateway state and clears when the
+            load does; a restart clears it too.
+      - alert: MatrixArkRetrievesComeBackEmpty
+        expr: >-
+          sum(rate(matrixark_gateway_retrieve_outcomes_total{outcome="empty"}[15m]))
+          / clamp_min(sum(rate(matrixark_gateway_retrieve_outcomes_total[15m])), 0.001) > 0.25
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A quarter of retrieves return an empty pack with no reason ({{ $labels.instance }})"
+          description: >-
+            These carry no backpressure warning, so they are not shedding: the store is being
+            asked and is answering with nothing. Unlike shedding this does not clear on its own.
+            Check the one-box page (/v1/admin/onebox) for what the store holds and what bounds a
+            retrieve -- an empty pack from a populated store is a known condition on this stack.
+            A low rate is normal: a query genuinely matching nothing lands here too, which is why
+            this is a quarter over half an hour rather than anything tighter.
+
+  - name: matrixark-gateway-config
+    rules:
+      - alert: MatrixArkRetrievalNotSemantic
+        expr: matrixark_gateway_embedding_semantic == 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Retrieval is running on hash vectors ({{ $labels.instance }})"
+          description: >-
+            The embedding provider is deterministic, so every vector is a hash fallback and
+            retrieval is not semantic. Requests still return 200. Fix it on the portal's setup page
+            (/v1/admin/setup) or by setting MATRIXARK_EMBEDDING_PROVIDER and
+            MATRIXARK_EMBEDDING_API_BASE, then set MATRIXARK_REQUIRE_MODEL_EMBEDDINGS=1 so a future
+            encoder outage fails loudly instead of degrading.
+
+      - alert: MatrixArkExtractionNotUsingAModel
+        expr: matrixark_gateway_extraction_model_active == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Ingest is storing rule-extracted memories only ({{ $labels.instance }})"
+          description: >-
+            No extraction model is configured, so ingest stores only what the local rules extract.
+            Intended for a dev deployment; in production it means the memories being written are
+            much thinner than the customer expects.
+
+      - alert: MatrixArkSummariesNotUsingAModel
+        expr: matrixark_gateway_summary_model_active == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Node summaries are being written by rules ({{ $labels.instance }})"
+          description: >-
+            No extraction model is configured, so ingest stores only what the local rules extract.
+            Intended for a dev deployment; in production it means the memories being written are
+            much thinner than the customer expects.
+
+      - alert: MatrixArkGatewayConfigWarnings
+        expr: matrixark_gateway_config_warnings > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} gateway configuration warnings ({{ $labels.instance }})"
+          description: >-
+            The gateway can see problems in its own configuration. The text of each is on
+            /v1/admin/setup and in GET /v1/admin/config.
+
+  - name: matrixark-ingestion
+    rules:
+      - alert: MatrixArkImportFailuresWaiting
+        expr: matrixark_ingestion_documents_retryable > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} imported documents are waiting for a retry ({{ $labels.instance }})"
+          description: >-
+            An import finished with failures worth retrying -- a timeout or an exhausted 5xx, not a
+            rejected request. They stay unimported until somebody opens the portal and presses
