@@ -1,0 +1,675 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+//! What one raft snapshot COSTS at scale, counted inside the primitives that do the work.
+//!
+//! A snapshot here is a STATE IMAGE: the shard's served index plus every slab it references,
+//! materialised as owned bytes. Its size is set by the STORE, not by the request, which makes the
+//! interesting questions about it questions of multiplicity -- how many times is the corpus
+//! walked, how many copies of the shard exist at once, and which of those happen while the raft
+//! cluster write guard is held. That guard is the half of the lock every `propose` needs, so work
+//! under it is not merely slow, it is unavailable.
+//!
+//! COUNTED, never timed. The same test on this box varies about 2.4x in wall time across one day
+//! and the box sits anywhere between load 1 and 30; the quantities below -- walks, copies, reads,
+//! rebuilds -- do not move with load at all. Everything runs at TWO corpus sizes and the RATIO is
+//! asserted with both denominators printed, so a counter that has quietly stopped incrementing
+//! reads as a failure and not as a perfect result.
+//!
+//! The in-order trace of one `maybe_trigger_snapshot` on a 3-node in-process cluster, at the two
+//! sizes `SMALL` and `LARGE` below actually run -- 1,000 and 4,000 records of 128 bytes:
+//!
+//! ```text
+//!                                       1,000        4,000     ratio   per record
+//!   BUILD, holding no cluster guard
+//!     state image builds                    1            1      1.00
+//!     corpus walks for live slab ids        1            1      1.00
+//!     block addresses visited           1,000        4,000      4.00        1.000
+//!     served-index encodes                  1            1      1.00
+//!     index bytes                      48,552      215,013      4.43
+//!     slab directory listings               1            1      1.00
+//!     slab reads                            4            4      1.00
+//!     slab bytes read                 140,000      560,000      4.00          140
+//!     encodes under a shard guard           0            0         -
+//!   INSTALL
+//!     engine rebuilds                       3            3      1.00
+//!     slab writes                          12           12      1.00
+//!     slab bytes re-installed         420,000    1,680,000      4.00          420
+//!     whole-shard image copies              2            2      1.00
+//!     image bytes copied              377,104    1,550,026      4.11
+//!     ... of the above, UNDER THE CLUSTER WRITE GUARD
+//!     engine rebuilds                       0            0         -
+//!     slab bytes re-installed               0            0         -
+//!     image bytes copied                    0            0         -
+//! ```
+//!
+//! The build is one pass: one walk, one encode, one listing, one read per slab, nothing under any
+//! guard. The INSTALL used to be all of it under the guard -- three whole engine rebuilds and
+//! 420,000 / 1,680,000 slab bytes, 100% at both sizes. An engine rebuild is a pure function of the
+//! snapshot, so it is built before the guard is taken; what is left under the guard is the
+//! bookkeeping, and the eligibility check that has to be atomic with it. Which nodes install is
+//! unchanged. One copy of the image was pure waste too -- the snapshot is dropped the moment the
+//! loop ends, so the last install can have the original -- and in a DEPLOYED process, which
+//! installs into exactly one node, that one was the only copy there was.
+
+use super::*;
+use crate::snapshot_probe::{self, SnapshotCounts};
+
+/// Records per corpus. The pair is a 4.00x step, small enough that the whole file runs inside the
+/// ordinary gate on a loaded box and large enough that a per-record identity is worth three
+/// significant figures.
+const SMALL: usize = 1_000;
+const LARGE: usize = 4_000;
+
+/// How many slabs the corpus is spread over.
+///
+/// The slab target is a gibibyte, so a corpus any test can afford to write lands entirely in slab
+/// zero -- and then the live set is `{0}`, the store's set is `{0}`, "one read per slab" is "one
+/// read", and every per-slab multiplicity below is indistinguishable from a per-snapshot one. The
+/// records are rolled onto fresh slabs as they are written so the image genuinely spans several,
+/// and `assert_the_fixture_is_populated` refuses to measure a fixture that collapsed back to one.
+pub(super) const SLABS: usize = 4;
+
+/// A leader with `records` committed and applied, each a 128-byte value under a 12-byte key,
+/// spread over `SLABS` slabs.
+pub(super) fn cluster_with(records: usize) -> RaftCluster {
+    let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);
+    let roll_every = (records / SLABS).max(1);
+    let mut index = 0usize;
+    while index < records {
+        if index > 0 && index % roll_every == 0 {
+            // Target 1 byte: the production target is a gibibyte and is reachable only through a
+            // process-wide env var, which is exactly what `prepare_next_slab_with_target` exists
+            // to avoid mutating. `Some` is required, so a roll that silently did not happen fails
+            // here rather than showing up as a one-slab image three assertions later.
+            assert!(
+                cluster
+                    .node_engine_for_test(1)
+                    .expect("the leader serves an engine")
+                    .block_store()
+                    .prepare_next_slab_with_target(1)
+                    .expect("rolling onto a fresh slab must succeed")
+                    .is_some(),
+                "the slab did not roll at record {index}, so the corpus would land in one slab"
+            );
+        }
+        cluster
+            .propose(Command::StringSet {
+                key: format!("key-{index:08}"),
+                value: vec![b'x'; 128],
+            })
+            .expect("propose must succeed");
+        index += 1;
+    }
+    cluster
+}
+
+/// Make the compaction threshold fire, and stop the catch-up hold from pre-empting it.
+///
+/// Both are deliberate production behaviours that would otherwise make this fixture measure
+/// "nothing happened": the byte threshold is a gibibyte, and the retained-bytes ceiling holds
+/// compaction while a live peer is still behind.
+pub(super) fn force_the_threshold(cluster: &RaftCluster) {
+    let mut inner = cluster.inner.write().expect("raft cluster lock poisoned");
+    inner.config.max_applied_log_bytes = 1;
+    inner.config.max_retained_log_bytes = 0;
+    // And pin the FIXED cadence, which is what every measurement in this file and in
+    // `snapshot_large_store` was taken under: a constant byte threshold, unrelated to the image
+    // the snapshot will read. `snapshot_image_fraction_divisor` raises that threshold in
+    // proportion to the last image, which is exactly the thing those files RECORD as absent --
+    // leaving it at its shipped default would stop the second snapshot in every INCREMENT arm
+    // from firing at all, and a recording of a defect must go on measuring the defect. The
+    // relative cadence is measured in `snapshot_cadence`, against these same arms.
+    inner.config.snapshot_image_fraction_divisor = 0;
+}
+
+/// Everything the snapshot path is about to be measured against, asserted NON-EMPTY.
+///
+/// The most expensive mistake available here is measuring a structure nothing filled: an image
+/// with no slabs walks no slabs, and a cost that never occurred reads exactly like a low one. So
+/// every denominator the rows below divide by is checked here, against the same cluster the
+/// measurement runs on, and printed.
+pub(super) fn assert_the_fixture_is_populated(cluster: &RaftCluster, records: usize) -> Fixture {
+    let snapshot = cluster.create_snapshot().expect("create_snapshot must succeed");
+    let image = snapshot
+        .state_image
+        .as_ref()
+        .expect("the state-image path is the one under test; an entry snapshot measures nothing");
+    let payload = image.payload_bytes();
+    println!("  fixture records        = {records}");
+    println!("  fixture image bytes    = {payload}");
+    println!("  fixture index bytes    = {}", image.index_bytes.len());
+    println!("  fixture image slabs    = {}", image.slabs.len());
+    assert!(
+        image.index_bytes.len() > 1_024,
+        "served index is {} bytes: nothing was indexed, so an index encode measures nothing",
+        image.index_bytes.len()
+    );
+    assert!(
+        image.slabs.len() > 1,
+        "the image carries {} slab(s). With zero, every slab read, copy and re-install below is a \
+         count of zero that would pass any bound put on it; with one, a per-slab cost and a \
+         per-snapshot cost are the same number and neither can be told from the other",
+        image.slabs.len()
+    );
+    let slab_bytes = image
+        .slabs
+        .iter()
+        .map(|slab| slab.bytes.len())
+        .sum::<usize>();
+    assert!(
+        slab_bytes > 0,
+        "the image's slabs are all empty: {} slabs, 0 bytes",
+        image.slabs.len()
+    );
+
+    // The scope of the image is the shard's LIVE slab set intersected with what the store holds.
+    // An EMPTY live set is not an empty image -- it is the fallback that carries the whole store
+    // -- so a fixture whose live set is empty is measuring the other branch entirely.
+    let engine = cluster
+        .node_engine_for_test(1)
+        .expect("the leader serves an engine");
+    let live = engine.live_block_slab_ids(1);
+    println!("  fixture live slab ids  = {live:?}");
+    assert!(
+        live.len() > 1,
+        "the shard's live slab set is {live:?}. Empty means the image took the carry-the-whole-\
+         store fallback and none of the scoping being measured happened; a single id means the \
+         set cannot distinguish a walk of the live set from a walk of the store"
+    );
+
+    // And the node set the install loop walks. One alive node makes "copies per node" and "copies"
+    // the same number and the multiplicity being measured invisible.
+    let alive = cluster
+        .inner
+        .read()
+        .expect("raft cluster lock poisoned")
+        .nodes
+        .values()
+        .filter(|node| node.alive)
+        .count();
+    println!("  fixture alive nodes    = {alive}");
+    assert!(
+        alive > 1,
+        "only {alive} alive node: a per-node cost cannot be distinguished from a per-snapshot one"
+    );
+    Fixture {
+        payload_bytes: payload,
+        slabs: image.slabs.len(),
+        alive_nodes: alive,
+    }
+}
+
+/// The denominators one measurement divides by, read off the fixture it is about to run on.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Fixture {
+    pub(super) payload_bytes: usize,
+    pub(super) slabs: usize,
+    pub(super) alive_nodes: usize,
+}
+
+pub(super) fn print_counts(label: &str, counts: &SnapshotCounts) {
+    println!("  {label}: {counts:?}");
+}
+
+/// The BUILD is one pass over the corpus, and it holds no guard.
+///
+/// What is asserted is the SHAPE at two sizes, not a constant: the walk visits exactly one block
+/// address per record at both sizes (so it is O(corpus) and nothing walks it twice), the store is
+/// listed once and each slab read once however big the corpus is, and no served-index encode
+/// happens while a shard guard is held.
+#[test]
+fn a_snapshot_build_walks_the_corpus_once_and_holds_no_guard() {
+    let mut rows = Vec::new();
+    for records in [SMALL, LARGE] {
+        let cluster = cluster_with(records);
+        println!("=== BUILD records={records} ===");
+        let fixture = assert_the_fixture_is_populated(&cluster, records);
+
+        snapshot_probe::reset();
+        crate::engine::shard_write_guard::reset_index_encode_counts();
+        let snapshot = cluster.create_snapshot().expect("create_snapshot must succeed");
+        let counts = snapshot_probe::counts();
+        let encodes = crate::engine::shard_write_guard::index_encode_counts();
+        print_counts("build", &counts);
+        println!("  encodes: {encodes:?}");
+
+        assert_eq!(
+            counts.image_builds, 1,
+            "one create_snapshot must build exactly one state image"
+        );
+        assert_eq!(
+            counts.live_slab_scans, 1,
+            "one create_snapshot must walk the corpus for live slab ids exactly once"
+        );
+        assert_eq!(
+            counts.live_slab_scan_addresses, records as u64,
+            "the live-slab walk must visit exactly one block address per record: {} for {records} \
+             records",
+            counts.live_slab_scan_addresses
+        );
+        assert_eq!(
+            counts.slab_dir_listings, 1,
+            "the build must list the store's slab directory exactly once"
+        );
+        assert_eq!(
+            counts.slab_reads,
+            snapshot
+                .state_image
+                .as_ref()
+                .expect("state image")
+                .slabs
+                .len() as u64,
+            "the build must read each carried slab exactly once"
+        );
+        assert_eq!(
+            counts.image_clones, 0,
+            "building a snapshot must not copy the image it just built"
+        );
+        assert_eq!(
+            encodes.encodes_total, 1,
+            "the build must encode the served index exactly once"
+        );
+        assert_eq!(
+            encodes.encodes_under_guard, 0,
+            "the served-index encode must not run while a shard-table guard is held"
+        );
+        rows.push((records, fixture, counts));
+    }
+
+    let (small_records, small_fixture, small) = &rows[0];
+    let (large_records, large_fixture, large) = &rows[1];
+    let corpus_ratio = *large_records as f64 / *small_records as f64;
+    println!("=== BUILD ratio, {small_records} -> {large_records} ===");
+    println!("  corpus ratio                 = {corpus_ratio:.3}");
+    println!(
+        "  addresses walked per record  = {:.3} -> {:.3}",
+        small.live_slab_scan_addresses as f64 / *small_records as f64,
+        large.live_slab_scan_addresses as f64 / *large_records as f64
+    );
+    println!(
+        "  slab bytes read ratio        = {:.3}",
+        large.slab_read_bytes as f64 / small.slab_read_bytes.max(1) as f64
+    );
+    println!(
+        "  image bytes ratio            = {:.3}",
+        large_fixture.payload_bytes as f64 / small_fixture.payload_bytes as f64
+    );
+    assert!(
+        small.slab_read_bytes > 0 && large.slab_read_bytes > 0,
+        "slab bytes read is zero at one of the two sizes, so the ratio below is vacuous: \
+         {} and {}",
+        small.slab_read_bytes,
+        large.slab_read_bytes
+    );
+    // The walk is the finding: it is EXACTLY linear in the corpus, with no second pass hiding in
+    // it. Asserted as an identity per record rather than as a bound, because a bound would also
+    // be satisfied by a walk that had stopped happening.
+    assert_eq!(
+        small.live_slab_scan_addresses * (*large_records as u64),
+        large.live_slab_scan_addresses * (*small_records as u64),
+        "the live-slab walk must cost the same per record at both sizes: {} per {small_records} \
+         against {} per {large_records}",
+        small.live_slab_scan_addresses,
+        large.live_slab_scan_addresses
+    );
+    // And the metadata around it does NOT grow with the corpus.
+    assert_eq!(
+        small.slab_dir_listings, large.slab_dir_listings,
+        "the number of slab directory listings must not grow with the corpus"
+    );
+}
+
+/// The INSTALL half, and what it holds the cluster write guard across.
+///
+/// This is the row the whole file exists for. `maybe_trigger_snapshot` is the ROUTINE snapshot --
+/// the periodic compaction tick a deployed node runs, not the rare catch-up send. Each install
+/// rebuilds a whole engine from the image, and it USED to do that inside the cluster write guard:
+/// 3 of 3 rebuilds and 420,000 of 420,000 slab bytes at 1,000 records, 1,680,000 of 1,680,000 at
+/// 4,000 -- 100% of the install work, at both sizes, inside the half of the lock every `propose`
+/// needs.
+///
+/// The rebuild reads nothing but the snapshot, so it is built before the guard is taken. What is
+/// asserted here is the identity in both directions: every rebuild still HAPPENS (a path that
+/// stopped installing would also stop rebuilding under the guard), and none of them happens under
+/// the guard.
+#[test]
+fn a_routine_snapshot_rebuilds_no_engine_under_the_cluster_write_guard() {
+    let mut rows = Vec::new();
+    for records in [SMALL, LARGE] {
+        let cluster = cluster_with(records);
+        println!("=== TRIGGER records={records} ===");
+        let fixture = assert_the_fixture_is_populated(&cluster, records);
+        force_the_threshold(&cluster);
+
+        snapshot_probe::reset();
+        let report = cluster
+            .maybe_trigger_snapshot()
+            .expect("maybe_trigger_snapshot must succeed");
+        let counts = snapshot_probe::counts();
+        println!("  report: {report:?}");
+        print_counts("trigger", &counts);
+
+        // VACUITY FLOOR. Every bound below is on work done under the guard; a trigger that did
+        // not fire does none of it and would satisfy all of them.
+        assert!(
+            report.triggered,
+            "the trigger did not fire ({}), so every count below is zero for the wrong reason",
+            report.reason
+        );
+        assert_eq!(
+            counts.image_builds, 1,
+            "a routine snapshot must build exactly one state image"
+        );
+        assert_eq!(
+            counts.engine_rebuilds, fixture.alive_nodes as u64,
+            "the in-process cluster rebuilds one engine per alive node: {} rebuilds for {} nodes",
+            counts.engine_rebuilds, fixture.alive_nodes
+        );
+        // The per-SLAB multiplicity, which the four-slab fixture is what makes visible: each
+        // install writes every slab in the image again.
+        assert_eq!(
+            counts.slab_installs,
+            counts.engine_rebuilds * fixture.slabs as u64,
+            "each of the {} installs must re-write all {} slabs: {} installs seen",
+            counts.engine_rebuilds,
+            fixture.slabs,
+            counts.slab_installs
+        );
+
+        // THE FINDING. Stated as a pair, because either half alone is satisfiable by a path that
+        // does nothing: the install work still happens in full, and none of it is under the guard.
+        assert_eq!(
+            counts.engine_publishes, fixture.alive_nodes as u64,
+            "every alive node must still be published into: {} publishes for {} nodes",
+            counts.engine_publishes, fixture.alive_nodes
+        );
+        assert!(
+            counts.slab_install_bytes > 0,
+            "vacuity floor: no slab was installed, so the two zeroes below are satisfied by an \
+             install that did not run"
+        );
+        assert_eq!(
+            counts.engine_rebuilds_under_guard, 0,
+            "no engine rebuild on this path may happen under the cluster write guard: {} of {}",
+            counts.engine_rebuilds_under_guard, counts.engine_rebuilds
+        );
+        assert_eq!(
+            counts.slab_install_bytes_under_guard, 0,
+            "no slab a routine snapshot re-installs may be written under the cluster write \
+             guard: {} of {} bytes",
+            counts.slab_install_bytes_under_guard, counts.slab_install_bytes
+        );
+        // A copy of the image is as pure a function of the snapshot as the engine is, so it is
+        // made off the guard for the same reason. With this row the guard-held install work is
+        // zero rather than merely smaller.
+        assert!(
+            counts.image_clone_bytes > 0,
+            "vacuity floor: no image was copied at all, so the zero below audits nothing"
+        );
+        assert_eq!(
+            counts.image_clone_bytes_under_guard, 0,
+            "no copy of the shard image may be made under the cluster write guard: {} of {} bytes",
+            counts.image_clone_bytes_under_guard, counts.image_clone_bytes
+        );
+        rows.push((records, fixture, counts));
+    }
+
+    let (small_records, small_fixture, small) = &rows[0];
+    let (large_records, large_fixture, large) = &rows[1];
+    println!("=== TRIGGER ratio, {small_records} -> {large_records} ===");
+    println!("  corpus ratio            = {:.3}", *large_records as f64 / *small_records as f64);
+    println!(
+        "  image bytes             = {} -> {}",
+        small_fixture.payload_bytes, large_fixture.payload_bytes
+    );
+    println!(
+        "  image copies            = {} -> {}",
+        small.image_clones, large.image_clones
+    );
+    println!(
+        "  image bytes copied      = {} -> {} (ratio {:.3})",
+        small.image_clone_bytes,
+        large.image_clone_bytes,
+        large.image_clone_bytes as f64 / small.image_clone_bytes.max(1) as f64
+    );
+    println!(
+        "  engine rebuilds         = {} -> {}",
+        small.engine_rebuilds, large.engine_rebuilds
+    );
+    println!(
+        "  slab bytes re-installed = {} -> {} (ratio {:.3})",
+        small.slab_install_bytes,
+        large.slab_install_bytes,
+        large.slab_install_bytes as f64 / small.slab_install_bytes.max(1) as f64
+    );
+
+    // The MULTIPLICITY is flat -- it is set by the node count, not by the corpus -- while the
+    // BYTES move with the corpus. Both halves are asserted: a copy count that grew with the
+    // corpus would be a different and worse finding, and a byte total that did not would mean the
+    // counter had stopped.
+    assert_eq!(
+        small.engine_rebuilds, large.engine_rebuilds,
+        "engine rebuilds must be set by the node count, not by the corpus: {} against {}",
+        small.engine_rebuilds, large.engine_rebuilds
+    );
+    assert_eq!(
+        small.image_clones, large.image_clones,
+        "image copies must be set by the node count, not by the corpus: {} against {}",
+        small.image_clones, large.image_clones
+    );
+    assert!(
+        large.slab_install_bytes > small.slab_install_bytes,
+        "slab bytes re-installed under the guard must grow with the corpus: {} against {}",
+        small.slab_install_bytes,
+        large.slab_install_bytes
+    );
+}
+
+/// The one copy that was never needed: the snapshot dies with the loop, so the LAST install can
+/// have the original.
+///
+/// Measured before the move, on a 3-node in-process cluster: 3 copies and 1,142,625 bytes at
+/// 2,000 records, 3 copies and 4,855,779 bytes at 8,000 -- every byte inside the cluster write
+/// guard. After it, 2 copies, and a DEPLOYED process (below) copies nothing at all.
+///
+/// Stated against the install count measured in the same run rather than against a constant, so
+/// it holds at any node count and cannot be satisfied by a fixture that shrank.
+#[test]
+fn the_last_install_takes_the_image_instead_of_copying_it() {
+    let cluster = cluster_with(SMALL);
+    println!("=== LAST INSTALL TAKES ===");
+    let fixture = assert_the_fixture_is_populated(&cluster, SMALL);
+    force_the_threshold(&cluster);
+
+    snapshot_probe::reset();
+    let report = cluster
+        .maybe_trigger_snapshot()
+        .expect("maybe_trigger_snapshot must succeed");
+    let counts = snapshot_probe::counts();
+    println!("  report: {report:?}");
+    print_counts("trigger", &counts);
+    let payload = fixture.payload_bytes;
+    println!("  image bytes: {payload}");
+
+    assert!(report.triggered, "the trigger did not fire: {}", report.reason);
+    assert!(
+        counts.engine_rebuilds >= 2,
+        "{} installs: with fewer than two there is no copy to save and this guard proves nothing",
+        counts.engine_rebuilds
+    );
+    assert_eq!(
+        counts.image_clones,
+        counts.engine_rebuilds - 1,
+        "n installs must cost n-1 copies of the image, not n: {} copies for {} installs",
+        counts.image_clones,
+        counts.engine_rebuilds
+    );
+    assert_eq!(
+        counts.image_clone_bytes_under_guard, 0,
+        "and none of those n-1 copies may be made under the cluster write guard: {} of {} bytes",
+        counts.image_clone_bytes_under_guard, counts.image_clone_bytes
+    );
+    // The direction that matters. This check can only fail one way -- a copy too MANY -- because
+    // a path that lost the image would also copy less; so the image is read back out of every
+    // node that installed it, which is what stops "copied nothing" from passing.
+    let inner = cluster.inner.read().expect("raft cluster lock poisoned");
+    let shard_id = inner.shard_id;
+    let mut served = 0usize;
+    for node in inner.nodes.values() {
+        let Some(installed) = node.installed_snapshot.as_ref() else {
+            continue;
+        };
+        let image = installed
+            .state_image
+            .as_ref()
+            .expect("an installed image snapshot must carry its image");
+        assert_eq!(
+            image.payload_bytes(),
+            payload,
+            "node {} installed a {}-byte image where the built one was {payload} bytes",
+            node.id,
+            image.payload_bytes()
+        );
+        assert_eq!(
+            node.engine
+                .execute(ExecuteRequest {
+                    shard_id,
+                    command: Command::StringGet {
+                        key: "key-00000777".to_string(),
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(vec![b'x'; 128])
+            },
+            "node {} must serve a record from the image it installed",
+            node.id
+        );
+        served += 1;
+    }
+    println!("  nodes serving from their installed image: {served}");
+    assert!(
+        served >= 2,
+        "only {served} node served from an installed image: the read-back above is what stops a \
+         path that dropped the image from satisfying the copy bound"
+    );
+}
+
+/// The DEPLOYED shape: one node, and therefore no copy of the shard at all.
+///
+/// A deployed process owns one node and keeps shadows of its peers, so the install loop reaches
+/// exactly one node. Before the move that single install still took a copy -- the only copy there
+/// was, all of it under the cluster write guard, one whole shard per compaction tick.
+#[test]
+fn a_deployed_node_copies_the_image_not_at_all() {
+    let cluster = cluster_with(SMALL);
+    println!("=== DEPLOYED SHAPE ===");
+    let fixture = assert_the_fixture_is_populated(&cluster, SMALL);
+    // What `RaftProductionRuntime::start` does with `options.local_node_id`.
+    cluster.set_local_node_id(1);
+    force_the_threshold(&cluster);
+
+    snapshot_probe::reset();
+    let report = cluster
+        .maybe_trigger_snapshot()
+        .expect("maybe_trigger_snapshot must succeed");
+    let counts = snapshot_probe::counts();
+    println!("  report: {report:?}");
+    print_counts("trigger", &counts);
+    let payload = fixture.payload_bytes;
+    println!("  image bytes: {payload}");
+
+    assert!(report.triggered, "the trigger did not fire: {}", report.reason);
+    assert_eq!(
+        counts.engine_rebuilds, 1,
+        "a deployed process installs into exactly one node: {} rebuilds",
+        counts.engine_rebuilds
+    );
+    assert_eq!(
+        counts.image_clones, 0,
+        "the single install must TAKE the image: it copied {} bytes of shard under the cluster \
+         write guard",
+        counts.image_clone_bytes
+    );
+    // Vacuity: the install has to have HAPPENED for the zero above to mean anything.
+    assert!(
+        counts.slab_install_bytes > 0,
+        "no slab was installed, so the zero-copy assertion above is satisfied by an install that \
+         did not run"
+    );
+    // And the whole of that one install -- the only one a deployed process performs -- is built
+    // before the cluster write guard is taken.
+    assert_eq!(
+        counts.engine_publishes, 1,
+        "the single install must publish exactly once: {} publishes",
+        counts.engine_publishes
+    );
+    assert_eq!(
+        counts.engine_rebuilds_under_guard, 0,
+        "a deployed node must rebuild no engine under the cluster write guard: {} of {}",
+        counts.engine_rebuilds_under_guard, counts.engine_rebuilds
+    );
+    assert_eq!(
+        counts.slab_install_bytes_under_guard, 0,
+        "a deployed node must write no slab under the cluster write guard: {} of {} bytes",
+        counts.slab_install_bytes_under_guard, counts.slab_install_bytes
+    );
+    let inner = cluster.inner.read().expect("raft cluster lock poisoned");
+    let installed = inner
+        .nodes
+        .get(&1)
+        .expect("node 1")
+        .installed_snapshot
+        .as_ref()
+        .expect("the local node must have installed the snapshot");
+    assert_eq!(
+        installed
+            .state_image
+            .as_ref()
+            .expect("the installed snapshot must carry its image")
+            .payload_bytes(),
+        fixture.payload_bytes,
+        "the moved image must arrive whole"
+    );
+}
+
+/// The transfer-policy entry point must build ONE state image, not two.
+///
+/// It built the image once to decide how to ship it and then threw that one away and built it
+/// again -- two corpus walks, two served-index encodes and two reads of every slab for one send.
+#[test]
+fn the_transfer_policy_entry_point_builds_one_state_image() {
+    let cluster = cluster_with(SMALL);
+    println!("=== TRANSFER POLICY ===");
+    let fixture = assert_the_fixture_is_populated(&cluster, SMALL);
+
+    snapshot_probe::reset();
+    let request = cluster
+        .build_install_snapshot_request_with_policy(3, RaftSnapshotTransferPolicy::default(), None)
+        .expect("building the request must succeed");
+    let counts = snapshot_probe::counts();
+    print_counts("policy", &counts);
+
+    assert_eq!(
+        counts.image_builds, 1,
+        "deciding how to transfer a snapshot and then building it must cost ONE state image"
+    );
+    assert_eq!(
+        counts.live_slab_scans, 1,
+        "one send must walk the corpus for live slab ids once, not once per decision"
+    );
+    assert_eq!(
+        counts.slab_dir_listings, 1,
+        "one send must list the slab directory once"
+    );
+    // The image still ARRIVES: building it once and losing it would satisfy every count above.
+    assert_eq!(
+        request
+            .snapshot
+            .state_image
+            .as_ref()
+            .expect("the request must carry the state image")
+            .payload_bytes(),
+        fixture.payload_bytes,
+        "the single built image must be the one the request carries, whole"
