@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>MatrixArk Access Management Console</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">MatrixArk</p>
+          <h1>Access Management</h1>
+        </div>
+        <div class="toolbar">
+          <a class="button-link" href="./index.html">Operations</a>
+          <a class="button-link" href="./management-portal.html">Management Portal</a>
+          <a class="button-link" href="./matrixark-api-reference.html">API Reference</a>
+          <a class="button-link" href="./agent-context-envelope.html">Agent Envelope</a>
+        </div>
+      </header>
+
+      <section class="summary-grid" aria-label="Access summary">
+        <article><span>Boundary</span><strong>Account</strong><small>billing and governance</small></article>
+        <article><span>Workspace</span><strong>Tenant</strong><small>environment or department</small></article>
+        <article><span>Principal</span><strong>User</strong><small>human, agent, or SSO id</small></article>
+        <article><span>Credential</span><strong>API key</strong><small>scoped, expiring, revocable</small></article>
+      </section>
+
+      <section class="panel access-console-panel">
+        <div class="panel-head">
+          <div>
+            <h2>Apply For API Key</h2>
+            <p>Use this payload with matrixark_admin_create_api_key. The raw key is returned once; inventories are redacted.</p>
+          </div>
+        </div>
+        <div class="access-console-grid">

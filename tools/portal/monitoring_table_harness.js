@@ -57,3 +57,32 @@ function respond(body) {
 const win = {
   document: {
     getElementById: get,
+    querySelector: () => makeEl(),
+    querySelectorAll: () => [],
+    createElement: () => makeEl(),
+    addEventListener() {},
+    body: makeEl("body"),
+    hidden: false
+  },
+  addEventListener() {},
+  location: { origin: "http://localhost", href: "http://localhost", host: "gw.example:8080", reload() {} },
+  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  navigator: {},
+  setTimeout: (fn) => { if (typeof fn === "function") { /* not run: nothing here is time-driven */ } return 0; },
+  setInterval: () => 0,
+  clearInterval() {},
+  Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
+  TextDecoder: function () { this.decode = () => ""; },
+  AbortController: function () { this.abort = () => {}; this.signal = {}; },
+  FileReader: function () {},
+  Blob: function () {},
+  URL: { createObjectURL: () => "", revokeObjectURL() {} },
+  fetch: (url) => {
+    fetched.push(String(url));
+    if (String(url).indexOf("/v1/admin/config") === 0) { return respond(payload); }
+    return respond("{}");
+  },
+  __matrixarkOnFrame() {}
+};
