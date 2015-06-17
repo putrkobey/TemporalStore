@@ -1,0 +1,8 @@
+services:
+  matrixark-mysql-metadata:
+    image: ${MATRIXARK_MYSQL_IMAGE:-mysql:8}
+    container_name: matrixark-mysql-metadata
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MATRIXARK_MYSQL_DATABASE:-matrixark}
+      MYSQL_USER: ${MATRIXARK_MYSQL_USER:-matrixark}
