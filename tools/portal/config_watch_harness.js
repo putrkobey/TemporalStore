@@ -19,3 +19,24 @@ const fs = require("fs");
 const page = fs.readFileSync(process.argv[2], "utf8");
 
 let failures = 0;
+function ok(what, condition, detail) {
+  if (condition) { console.log("ok   " + what); }
+  else { console.log("FAIL " + what + (detail ? "\n     " + detail : "")); failures += 1; }
+}
+
+/* The registration statement as the page ships it, including the `var lastConfigAt` it closes
+   over. Sliced rather than reimplemented: the point is to run what is there. */
+const start = page.indexOf("  var lastConfigAt = null;");
+const end = page.indexOf("});", page.indexOf("(window.__matrixarkFrameQueue", start)) + 3;
+ok("the page registers a config watcher", start !== -1 && end > start);
+if (start === -1) { console.log("FAILED " + failures); process.exit(1); }
+const src = page.slice(start, end);
+
+ok("it registers through the queue, not by calling the register function",
+   src.includes("window.__matrixarkFrameQueue = window.__matrixarkFrameQueue || []"),
+   "this script runs before the nav defines that function; a direct call registers nothing");
+
+function run() {
+  const reloads = [];
+  const hidden = { value: false };
+  const key = { value: "k-test" };
