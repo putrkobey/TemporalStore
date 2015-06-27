@@ -384,3 +384,132 @@ impl BlockStore {
                             .unwrap_or_default();
                         (logical_bytes, live_bytes.min(logical_bytes))
                     }
+                    None => (
+                        slab_total_bytes.get(&stored_slab_id).copied().unwrap_or(bytes),
+                        slab_used_bytes.get(&stored_slab_id).copied().unwrap_or_default(),
+                    ),
+                };
+                let stale_bytes = total_bytes.saturating_sub(used_bytes);
+                let utility_basis_points = if total_bytes == 0 {
+                    0
+                } else {
+                    used_bytes.saturating_mul(10_000) / total_bytes
+                };
+                candidates.push(BlockStoreGcUtilityCandidate {
+                    block_slab_id,
+                    bytes,
+                    total_bytes,
+                    used_bytes,
+                    stale_bytes,
+                    utility_basis_points,
+                    utility_score: block_slab_utility_score(
+                        below_retention_floor,
+                        is_current,
+                        is_live,
+                    ),
+                    created_unix_ms,
+                    updated_unix_ms,
+                    age_ms,
+                });
+            }
+        }
+        candidates.sort_by(|left, right| {
+            // Reclaim the highest-garbage slab first: a lower slab live-fraction
+            // (utility_basis_points) means more garbage, so ascending live-fraction ==
+            // descending garbage ratio. That is the GC victim order, which the previous
+            // key (a categorical utility_score, uniformly 0 for all candidates) never
+            // actually applied.
+            left.utility_basis_points
+                .cmp(&right.utility_basis_points)
+                .then_with(|| left.utility_score.cmp(&right.utility_score))
+                .then_with(|| right.bytes.cmp(&left.bytes))
+                .then_with(|| {
+                    right
+                        .age_ms
+                        .unwrap_or_default()
+                        .cmp(&left.age_ms.unwrap_or_default())
+                })
+                .then_with(|| left.block_slab_id.cmp(&right.block_slab_id))
+        });
+        Ok(candidates)
+    }
+
+    pub(super) fn gc_slabs_before_with_live_refs_mode(
+        &self,
+        retain_from_block_slab_id: u64,
+        live_block_slab_ids: impl IntoIterator<Item = u64>,
+        delayed_destroy: bool,
+    ) -> Result<BlockStoreGcReport, BlockStoreError> {
+        self.gc_slabs_before_with_live_refs_selected(
+            retain_from_block_slab_id,
+            live_block_slab_ids,
+            delayed_destroy,
+            None,
+        )
+    }
+
+    pub(super) fn gc_slabs_before_with_live_refs_selected(
+        &self,
+        retain_from_block_slab_id: u64,
+        live_block_slab_ids: impl IntoIterator<Item = u64>,
+        delayed_destroy: bool,
+        selected_block_slab_ids: Option<BTreeSet<u64>>,
+    ) -> Result<BlockStoreGcReport, BlockStoreError> {
+        let mut inner = self.inner.lock().expect("block store lock poisoned");
+        std::fs::create_dir_all(&inner.root)?;
+        if delayed_destroy {
+            std::fs::create_dir_all(delayed_destroy_dir(&inner.root))?;
+        }
+        let current_block_slab_id = inner.block_slab_id;
+        let live_block_slab_ids = live_block_slab_ids.into_iter().collect::<BTreeSet<_>>();
+        let mut removed = Vec::new();
+        let mut retained = Vec::new();
+        let mut delayed_destroy_ids = Vec::new();
+        let mut retained_live = Vec::new();
+        let mut retained_current = Vec::new();
+        let mut retained_live_bytes = Vec::new();
+        let mut removed_physical_bytes = 0;
+        let mut retained_physical_bytes = 0;
+        let mut delayed_destroy_physical_bytes = 0;
+        let mut retained_live_physical_bytes = 0;
+        let mut retained_current_physical_bytes = 0;
+        let mut retained_live_bytes_physical_bytes = 0;
+        for block_slab_id in slab_ids_at(&inner.root)? {
+            let slab_physical_bytes = slab_path(&inner.root, block_slab_id)
+                .metadata()
+                .map(|metadata| metadata.len())
+                .unwrap_or_default();
+            let below_retention_floor = block_slab_id < retain_from_block_slab_id;
+            let is_current = block_slab_id == current_block_slab_id;
+            let is_live = live_block_slab_ids.contains(&block_slab_id);
+            let is_selected = selected_block_slab_ids
+                .as_ref()
+                .map(|selected| selected.contains(&block_slab_id))
+                .unwrap_or(true);
+            // ASK THE TALLY ONE LAST TIME, IMMEDIATELY BEFORE THE IRREVERSIBLE STEP.
+            //
+            // The header on `live_block_bytes` states the rule this enforces: the tally "only ever
+            // KEEPS a slab; it never grants permission to delete one". Nothing made that true. The
+            // only consumer was the garbage floor in `gc_policy_plan`, and a floor is a THRESHOLD
+            // -- at the shipped 4,000 basis points a slab the tally credits with 200 live bytes out
+            // of 1,000 is 8,000 bp of garbage, clears the floor, and is selected for destruction.
+            // So the tally could keep a slab only once it was more than 60% live, and below that it
+            // was silently overruled in exactly the case it exists to notice.
+            //
+            // The two reclaim entries that take no policy at all -- `gc_slabs_before_with_live_refs`
+            // and its delayed-destroy sibling, which is what the operator reclaim RPC calls -- never
+            // consulted it in any form.
+            //
+            // The constructor doc on `with_slab_garbage_floor` states the invariant from the other
+            // side: a collector candidate is a slab no live page points at, "so its maintained live
+            // bytes are genuinely zero". That was asserted in prose and nowhere in code. It is a
+            // claim about two INDEPENDENT derivations agreeing -- `live_block_slab_ids` is walked
+            // fresh from the index at every call, while the tally is maintained incrementally on the
+            // index's own mutation path and has a drift check of its own -- so the case where they
+            // disagree is real, and the direction that matters is the tally saying live where the
+            // walk said dead.
+            //
+            // `None` (nobody has published) reads as zero and the check is inert, which is the only
+            // reading that is safe: a store with no tally must reclaim exactly as it did before.
+            let tallied_live_bytes = inner
+                .live_block_bytes
