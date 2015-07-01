@@ -15,20 +15,3 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use temporalstore_rust::{Command, ExecuteRequest, TemporalEngine};
-
-const SHARD_ID: u64 = 1;
-
-#[test]
-fn per_write_served_index_cost_report() {
-    let mode = if matches!(
-        std::env::var("MATRIXARK_DELTA_SERVED_INDEX")
-            .unwrap_or_default()
-            .trim()
-            .to_ascii_lowercase()
-            .as_str(),
-        "1" | "true" | "yes" | "on"
-    ) {
-        "DELTA(on)"
-    } else {
-        "BASELINE(off)"
-    };
