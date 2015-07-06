@@ -158,3 +158,163 @@ fn scope_matches_record(record: &Value, query_scope: Option<&Value>) -> bool {
             return false;
         }
     }
+    true
+}
+
+fn record_scope_string(record: &Value, field: &str) -> Option<String> {
+    for source in record_scope_sources(record) {
+        if let Some(value) = scoped_string_value(source, field) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn session_continuity_status(record: &Value, query_scope: Option<&Value>) -> String {
+    if let Some(explicit) = record
+        .get("session_continuity")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+    {
+        return explicit.to_string();
+    }
+    let Some(query) = query_scope else {
+        return "unscoped".to_string();
+    };
+    let Some(query_session) = query
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    else {
+        return "unscoped".to_string();
+    };
+    if record_scope_string(record, "session_id").as_deref() == Some(query_session) {
+        return "same_session".to_string();
+    }
+    if let Some(query_scope_key) = query
+        .get("scope_key")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        if record_scope_string(record, "scope_key").as_deref() == Some(query_scope_key) {
+            return "same_session".to_string();
+        }
+    }
+    let has_sessionish_scope = record_scope_string(record, "scope_key").is_some()
+        || record_scope_string(record, "session_id").is_some();
+    if has_sessionish_scope {
+        "cross_session".to_string()
+    } else {
+        "unscoped".to_string()
+    }
+}
+
+fn continuity_boost(record: &Value, context_class: &str, status: &str) -> f64 {
+    let record_type = record
+        .get("record_type")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match status {
+        "same_session" => match record_type {
+            "context_event" | "context_segment" => 0.16,
+            "context_summary" => 0.12,
+            "context_entity" => 0.10,
+            _ => 0.08,
+        },
+        "cross_session" => {
+            if record_type == "context_entity" || context_class == "resource_fact" {
+                0.11
+            } else if matches!(
+                record_type,
+                "context_event" | "context_segment" | "context_compression_event"
+            ) {
+                0.06
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+fn cross_session_rerank_boost(
+    record: &Value,
+    context_class: &str,
+    status: &str,
+    question_type: &str,
+) -> f64 {
+    if status != "cross_session" {
+        return 0.0;
+    }
+    let record_type = record
+        .get("record_type")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let has_citation = record.get("source_ref").is_some()
+        || record.get("citation").is_some()
+        || record.get("source_chunk_hash").is_some();
+    match record_type {
+        "context_entity" => {
+            if matches!(
+                question_type,
+                "current_state" | "latest" | "multi_hop" | "profile_memory"
+            ) {
+                0.10
+            } else {
+                0.06
+            }
+        }
+        "resource_chunk" if has_citation => 0.04,
+        "context_event" | "context_segment"
+            if matches!(
+                question_type,
+                "multi_hop" | "why_emotion" | "fact" | "evidence"
+            ) =>
+        {
+            0.01
+        }
+        "context_compression_event" => 0.05,
+        "context_summary" => {
+            if question_type == "broad_exploration" {
+                0.05
+            } else {
+                0.02
+            }
+        }
+        _ if matches!(context_class, "resource_fact" | "resource_entity_fact") => {
+            if has_citation {
+                0.06
+            } else {
+                0.04
+            }
+        }
+        _ => 0.0,
+    }
+}
+
+fn type_priority_boost(record: &Value, context_class: &str, question_type: &str) -> f64 {
+    let record_type = record
+        .get("record_type")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    match record_type {
+        "skill_section" => {
+            if matches!(question_type, "procedure" | "evidence") {
+                0.42
+            } else {
+                0.34
+            }
+        }
+        "resource_chunk" => {
+            if matches!(question_type, "evidence" | "fact") {
+                0.20
+            } else {
+                0.12
+            }
+        }
+        "context_entity" => {
+            if matches!(question_type, "current_state" | "latest" | "profile_memory") {
+                0.24
+            } else {
+                0.12
+            }
