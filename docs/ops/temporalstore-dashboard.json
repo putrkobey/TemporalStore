@@ -1,0 +1,129 @@
+{
+  "title": "TemporalStore Production Readiness",
+  "schemaVersion": 39,
+  "version": 3,
+  "panels": [
+    {
+      "title": "Build & Config Readiness (not runtime health)",
+      "type": "stat",
+      "targets": [
+        {
+          "expr": "temporalstore_production_readiness_ready"
+        }
+      ]
+    },
+    {
+      "title": "Readiness Blockers By Area",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "temporalstore_production_readiness_blockers"
+        },
+        {
+          "expr": "temporalstore_production_readiness_service_blockers"
+        }
+      ]
+    },
+    {
+      "title": "Raft Commit Apply And Lease",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "temporalstore_raft_cluster_commit_index"
+        },
+        {
+          "expr": "temporalstore_raft_cluster_has_majority"
+        },
+        {
+          "expr": "temporalstore_raft_node_lag"
+        },
+        {
+          "expr": "temporalstore_raft_node_apply_lag"
+        },
+        {
+          "expr": "temporalstore_raft_leader_lease_valid"
+        }
+      ]
+    },
+    {
+      "title": "Metaserver Scheduler And Topology",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "temporalstore_meta_scheduler_queue_depth"
+        },
+        {
+          "expr": "sum by (result) (temporalstore_meta_scheduler_executions_total)"
+        },
+        {
+          "expr": "temporalstore_meta_topology_version"
+        },
+        {
+          "expr": "temporalstore_meta_inventory"
+        }
+      ]
+    },
+    {
+      "title": "Proxy Route Cache Admission And Quarantine",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "temporalstore_proxy_route_cache_entries"
+        },
+        {
+          "expr": "sum by (kind) (temporalstore_proxy_route_cache_events_total)"
+        },
+        {
+          "expr": "sum by (kind) (temporalstore_proxy_backend_events_total)"
+        },
+        {
+          "expr": "temporalstore_proxy_serving_mode"
+        },
+        {
+          "expr": "temporalstore_proxy_drop_percent"
+        },
+        {
+          "expr": "sum by (rust_family) (temporalstore_proxy_metric_family_parity)"
+        }
+      ]
+    },
+    {
+      "title": "Storage Object Page Slot Lifecycle",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "temporalstore_object_manager_objects"
+        },
+        {
+          "expr": "temporalstore_object_manager_block_refs"
+        },
+        {
+          "expr": "temporalstore_object_manager_dirty_buckets"
+        },
+        {
+          "expr": "temporalstore_storage_bucket_block_refs"
+        },
+        {
+          "expr": "temporalstore_storage_bucket_bytes"
+        },
+        {
+          "expr": "temporalstore_partition_routing_buckets"
+        }
+      ]
+    },
+    {
+      "title": "Page Store And Cache Pressure",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "sum by (kind) (temporalstore_cache_operations_total)"
+        },
+        {
+          "expr": "temporalstore_cache_bytes"
+        },
+        {
+          "expr": "sum by (kind) (temporalstore_block_store_operations_total)"
+        },
+        {
+          "expr": "temporalstore_block_store_slab_bytes"
+        }
