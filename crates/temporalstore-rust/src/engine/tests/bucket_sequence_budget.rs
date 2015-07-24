@@ -391,3 +391,397 @@ fn what_each_of_the_three_sequences_reaches_at_two_corpus_sizes() {
             {
                 let (low, high, nz, total) = spread(rows.iter().map(|row| row.generation));
                 ("dirty_generation", low, high, nz, total)
+            },
+            {
+                let (low, high, nz, total) = spread(rows.iter().map(|row| row.wal_claim));
+                ("first_dirty_wal_sequence", low, high, nz, total)
+            },
+            {
+                let (low, high, nz, total) = spread(rows.iter().map(|row| row.index_log_claim));
+                ("first_dirty_index_log_sequence", low, high, nz, total)
+            },
+        ] {
+            println!(
+                "  {name:<32} non-zero {non_zero:>7} of {total:>7}   range [{low}, {high}]  \
+                 bits needed {}",
+                if high == 0 { 0 } else { 64 - high.leading_zeros() }
+            );
+        }
+
+        dirty_fractions.push((
+            format!("{seeded} records, {range_label}"),
+            dirty as f64 / rows.len() as f64,
+        ));
+    }
+
+    assert_eq!(4, path_lengths.len(), "all four arms must have run");
+    let first_length = path_lengths[0];
+    for length in &path_lengths {
+        assert_eq!(
+            first_length, *length,
+            "the store path length moved between arms ({first_length} then {length}); allocation \
+             bytes move with it at about six bytes a character"
+        );
+    }
+
+    println!("\n=== the dirty fraction, which is what prices hoisting the two transient claims ===");
+    for (label, fraction) in &dirty_fractions {
+        println!("  {label:<52} {:.2}% dirty", 100.0 * fraction);
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// 2. WIDTH AGAINST ALIGNMENT, PER FIELD, WITH THE GROUP EFFECT SPELLED OUT.
+// -------------------------------------------------------------------------------------------
+
+/// The node as declared. The CONTROL: if this is not `size_of::<BucketNode>()` every row below is
+/// describing a structure this engine does not have.
+#[allow(dead_code)]
+struct SeqMirrorLive {
+    routing_bucket: u32,
+    layout: BucketLayoutState,
+    flags: BucketFlags,
+    ttl_ms: BucketTtl,
+    dirty_generation: u64,
+    first_dirty_wal_sequence: u64,
+    first_dirty_index_log_sequence: u64,
+    object_index: ObjectIndex,
+    deleted_object_index: DeletedObjectIndex,
+    block_index: BlockIndexMap,
+    // CARRIED BY EVERY MIRROR, so the DISTANCES stay the prices: a mirror is the live
+    // declaration plus ONE historical difference, and the live node gained this word
+    // when a removal's element name left the page entries.
+    tombstone_elements: crate::engine::state::TombstoneElements,
+}
+
+/// One of the three narrowed to 32 bits.
+#[allow(dead_code)]
+struct SeqMirrorOneNarrowed {
+    routing_bucket: u32,
+    layout: BucketLayoutState,
+    flags: BucketFlags,
+    ttl_ms: BucketTtl,
+    dirty_generation: u64,
+    first_dirty_wal_sequence: u64,
+    first_dirty_index_log_sequence: u32,
+    object_index: ObjectIndex,
+    deleted_object_index: DeletedObjectIndex,
+    block_index: BlockIndexMap,
+    // CARRIED BY EVERY MIRROR, so the DISTANCES stay the prices: a mirror is the live
+    // declaration plus ONE historical difference, and the live node gained this word
+    // when a removal's element name left the page entries.
+    tombstone_elements: crate::engine::state::TombstoneElements,
+}
+
+/// Two of the three narrowed to 32 bits.
+#[allow(dead_code)]
+struct SeqMirrorTwoNarrowed {
+    routing_bucket: u32,
+    layout: BucketLayoutState,
+    flags: BucketFlags,
+    ttl_ms: BucketTtl,
+    dirty_generation: u64,
+    first_dirty_wal_sequence: u32,
+    first_dirty_index_log_sequence: u32,
+    object_index: ObjectIndex,
+    deleted_object_index: DeletedObjectIndex,
+    block_index: BlockIndexMap,
+    // CARRIED BY EVERY MIRROR, so the DISTANCES stay the prices: a mirror is the live
+    // declaration plus ONE historical difference, and the live node gained this word
+    // when a removal's element name left the page entries.
+    tombstone_elements: crate::engine::state::TombstoneElements,
+}
+
+/// All three narrowed to 32 bits.
+#[allow(dead_code)]
+struct SeqMirrorThreeNarrowed {
+    routing_bucket: u32,
+    layout: BucketLayoutState,
+    flags: BucketFlags,
+    ttl_ms: BucketTtl,
+    dirty_generation: u32,
+    first_dirty_wal_sequence: u32,
+    first_dirty_index_log_sequence: u32,
+    object_index: ObjectIndex,
+    deleted_object_index: DeletedObjectIndex,
+    block_index: BlockIndexMap,
+    // CARRIED BY EVERY MIRROR, so the DISTANCES stay the prices: a mirror is the live
+    // declaration plus ONE historical difference, and the live node gained this word
+    // when a removal's element name left the page entries.
+    tombstone_elements: crate::engine::state::TombstoneElements,
+}
+
+/// One of the three gone entirely.
+#[allow(dead_code)]
+struct SeqMirrorOneRemoved {
+    routing_bucket: u32,
+    layout: BucketLayoutState,
+    flags: BucketFlags,
+    ttl_ms: BucketTtl,
+    dirty_generation: u64,
+    first_dirty_wal_sequence: u64,
+    object_index: ObjectIndex,
+    deleted_object_index: DeletedObjectIndex,
+    block_index: BlockIndexMap,
+    // CARRIED BY EVERY MIRROR, so the DISTANCES stay the prices: a mirror is the live
+    // declaration plus ONE historical difference, and the live node gained this word
+    // when a removal's element name left the page entries.
+    tombstone_elements: crate::engine::state::TombstoneElements,
+}
+
+/// Both transient claims gone -- the hoist #1958 priced and declined.
+#[allow(dead_code)]
+struct SeqMirrorTwoRemoved {
+    routing_bucket: u32,
+    layout: BucketLayoutState,
+    flags: BucketFlags,
+    ttl_ms: BucketTtl,
+    dirty_generation: u64,
+    object_index: ObjectIndex,
+    deleted_object_index: DeletedObjectIndex,
+    block_index: BlockIndexMap,
+    // CARRIED BY EVERY MIRROR, so the DISTANCES stay the prices: a mirror is the live
+    // declaration plus ONE historical difference, and the live node gained this word
+    // when a removal's element name left the page entries.
+    tombstone_elements: crate::engine::state::TombstoneElements,
+}
+
+/// WHAT NARROWING OR REMOVING EACH SEQUENCE WOULD MAKE THE NODE -- and the answer is not the one
+/// the shape of the group suggests.
+///
+/// THREE SEQUENCES, NOT FOUR, AND THE TABLE IS RE-DERIVED RATHER THAN SHIFTED.
+/// `last_dump_sequence` left the node: it was read into two reports and nothing else, and the
+/// report takes the figure from the newest dump manifest. That took a whole word out of the
+/// eight-aligned group, so the base is 160 + a six-byte tail = 168 where it was 168 + six = 176,
+/// and the narrowing series loses its last row. The DIFFERENCES are unchanged, because they are
+/// set by the group structure and not by the base -- which is the same reason the base moving to
+/// 184 and then to 176 never moved them either.
+///
+/// The node is 160 bytes of eight-aligned field plus a six-byte tail rounded to eight. A `u64`
+/// narrowed to a `u32` does not vanish: it leaves the eight-aligned group and lands in the tail.
+/// So the arithmetic is `160 - 8n + round_up_8(6 + 4n)` and it steps, it does not slope:
+///
+/// ```text
+///   narrowed   eight-aligned    tail -> rounded    size    vs live
+///     0            160             6 -> 8           168       --
+///     1            152            10 -> 16          168       -0
+///     2            144            14 -> 16          160       -8
+///     3            136            18 -> 24          160       -8
+/// ```
+///
+/// The FIRST narrowing is worth nothing and the third nothing on top of the second. Stating a
+/// per-field saving here would be stating a number that does not exist: the saving belongs to the
+/// GROUP, and only the second crossing moves it.
+///
+/// THE PHASE OF THE STAIRCASE DEPENDS ON THE TAIL, and it has moved twice. At a ten-byte tail the
+/// first narrowing landed on 14, which still rounded to 16, so the first step was worth eight and
+/// the series read 8, 8, 16, 16. At SIX bytes -- the five `bool` are one `BucketFlags` byte -- the
+/// first narrowing lands on 10, which rounds to 16, and the word the group gave up is handed
+/// straight back: 0, 8, 8, 16. Those eight bytes at the head are the same eight the flag pack
+/// collected; two ways to take one rounding, and only one could be paid. With three sequences the
+/// series is that one truncated: 0, 8, 8.
+///
+/// Removing is different from narrowing because the bytes leave the structure instead of moving
+/// to the tail, and the tail does not move at all: one removed is 160, two removed is 152.
+///
+/// THE RECONSTRUCTION IS ASSERTED, not the total. Every row has to satisfy
+/// `eight_aligned + round_up(tail) == size_of`, so a row that happened to land on the right
+/// number for the wrong reason fails.
+#[test]
+fn what_narrowing_or_removing_each_sequence_would_make_the_node() {
+    // --- The control. Nothing below means anything without it. ---
+    assert_eq!(
+        size_of::<BucketNode>(),
+        size_of::<SeqMirrorLive>(),
+        "the mirror of the live declaration is {} bytes against the declaration's {}; the mirrors \
+         have drifted and every price below is fiction",
+        size_of::<SeqMirrorLive>(),
+        size_of::<BucketNode>()
+    );
+
+    let align = align_of::<BucketNode>();
+    assert_eq!(8, align, "BucketNode's alignment moved and the arithmetic below assumes 8");
+
+    // The two groups, taken from the declaration rather than from a literal.
+    //
+    // 152 of eight-aligned field: 160 until the `BlockAddress` inside the inline page entry
+    // merged its slab id and its offset into ONE WORD, which takes a whole word out of the packed
+    // group one level in. 160 was itself 168 until `last_dump_sequence` left the node, which took
+    // a whole word out of the group directly, and 168 was 176 until that same address stopped
+    // storing a `generation` it could derive. Three eight-byte changes, all of them in THIS group
+    // and none of them in the tail.
+    //
+    // AND A SIX-BYTE TAIL, NOT TEN, WHICH MOVED A CONCLUSION RATHER THAN A LITERAL. The five
+    // `bool` became five bits of one `BucketFlags` byte, so the tail is `routing_bucket` (4),
+    // `layout` (1) and the flag byte (1). The rows below are differences computed FROM these two
+    // constants, so they recompute -- but the first row's answer is not the one it used to be:
+    // narrowing ONE sequence used to be worth eight bytes, because the freed `u32` landed in a
+    // ten-byte tail that still rounded to sixteen while the group lost a word. With a six-byte
+    // tail the freed `u32` takes the tail to ten, which rounds to sixteen, and the word the group
+    // gave up is handed straight back. THE EIGHT BYTES ARE THE SAME EIGHT BYTES: packing the
+    // flags and narrowing one sequence were two ways to collect one rounding, and only one of
+    // them could be paid. Removing a word does NOT move the tail, which is why it crosses where a
+    // narrowing does not -- and MERGING two words into one is the same shape of change, which is
+    // why the address merge crosses too and leaves the conclusion above untouched.
+    // 136, not 152: the page entry inside the inline `BlockIndexMap` gave up a sixteen-byte fat
+    // pointer for a one-byte model spelling, and those two words leave the eight-aligned group
+    // exactly as the address merge's one word did.
+    //
+    // AND THEN 80, NOT 136, SINCE THE PAGE INDEX STOPPED HOLDING THAT ENTRY INLINE AT ALL. Same
+    // SHAPE of change as every step before it -- whole words leaving this group, none of them
+    // touching the tail -- taken SEVEN times over in one field, because the arm that held a handle
+    // plus a whole `BlockIndex` now holds a handle and a pointer.
+    //
+    // The rows below are DIFFERENCES from these two constants, so every one of them recomputes and
+    // not one conclusion moves -- which is the point of pricing by difference. The tail is still
+    // six, a narrowing still hands its word straight back, and a removal still crosses.
+    // AND 88, NOT 80, SINCE A REMOVAL'S ELEMENT NAME MOVED ONTO THE NODE. `tombstone_elements` is
+    // one word and it landed in THIS group -- the only byte this structure has ever gained, into
+    // the same group every earlier step came out of, which is why it cost a whole word instead of
+    // disappearing into the tail's rounding.
+    const EIGHT_ALIGNED: usize = 88;
+    const TAIL: usize = 6;
+    let live = size_of::<BucketNode>();
+    assert_eq!(
+        EIGHT_ALIGNED + TAIL.div_ceil(align) * align,
+        live,
+        "the live node must reconstruct from {EIGHT_ALIGNED} B of eight-aligned field and a \
+         {TAIL} B tail, or the model every row below uses is wrong"
+    );
+
+    println!("\n=== narrowing n of the three sequences to 32 bits ===");
+    println!(
+        "  {:<9} {:>14} {:>9} {:>8} {:>6} {:>9}",
+        "narrowed", "eight-aligned", "tail", "rounded", "size", "vs live"
+    );
+    let narrowed_sizes = [
+        size_of::<SeqMirrorLive>(),
+        size_of::<SeqMirrorOneNarrowed>(),
+        size_of::<SeqMirrorTwoNarrowed>(),
+        size_of::<SeqMirrorThreeNarrowed>(),
+    ];
+    for (n, size) in narrowed_sizes.iter().copied().enumerate() {
+        let eight_aligned = EIGHT_ALIGNED - 8 * n;
+        let tail = TAIL + 4 * n;
+        let rounded = tail.div_ceil(align) * align;
+        println!(
+            "  {n:<9} {eight_aligned:>14} {tail:>9} {rounded:>8} {size:>6} {:>+9}",
+            size as i64 - live as i64
+        );
+        assert_eq!(
+            eight_aligned + rounded,
+            size,
+            "narrowing {n} of the three reconstructs to {} B but `size_of` says {size}; the two \
+             groups plus one rounding must account for the width exactly",
+            eight_aligned + rounded
+        );
+    }
+
+    // THE STEP, ASSERTED AS A STEP -- AND ITS PHASE MOVED WHEN THE TAIL DID.
+    //
+    // The staircase is the same shape it always was: every SECOND narrowing collects one
+    // rounding, because a freed `u64` takes a word off the eight-aligned group and puts a `u32`
+    // back into the tail. What changed is where it starts. With a ten-byte tail the first
+    // narrowing landed on 14, which still rounded to 16, so the word was kept and the first step
+    // was worth eight. With a SIX-byte tail -- the five `bool` are one byte now -- the first
+    // narrowing lands on 10, which rounds to 16, and the word the group gave up is handed
+    // straight back.
+    //
+    // So the eight bytes that used to be here are gone, and they are gone because something else
+    // took them: packing the flags and narrowing one sequence were two ways to collect the same
+    // rounding, and only one of them could be paid. With four sequences the series read 0, 8, 8, 16
+    // where it used to read 8, 8, 16, 16; with three it is that series truncated, 0, 8, 8.
+    assert_eq!(
+        0,
+        live - narrowed_sizes[1],
+        "narrowing ONE of the three is worth NOTHING now that the tail is six bytes -- the freed \
+         word goes straight back into the rounding -- but it measured {}",
+        live - narrowed_sizes[1]
+    );
+    assert_eq!(
+        8,
+        live - narrowed_sizes[2],
+        "narrowing a SECOND of the three is priced at eight bytes a bucket; it measured {}",
+        live - narrowed_sizes[2]
+    );
+    assert_eq!(
+        narrowed_sizes[2], narrowed_sizes[3],
+        "narrowing the THIRD is worth nothing on top of the second, but two measured {} and three \
+         measured {}",
+        narrowed_sizes[2], narrowed_sizes[3]
+    );
+
+    // --- Removing, which is a different arithmetic: the bytes leave rather than move. ---
+    let one_removed = size_of::<SeqMirrorOneRemoved>();
+    let two_removed = size_of::<SeqMirrorTwoRemoved>();
+    println!("\n=== removing n of the three outright ===");
+    println!("  0 removed  {live:>4} B");
+    println!("  1 removed  {one_removed:>4} B  {:+}", one_removed as i64 - live as i64);
+    println!("  2 removed  {two_removed:>4} B  {:+}", two_removed as i64 - live as i64);
+    assert_eq!(
+        8,
+        live - one_removed,
+        "removing one sequence is priced at eight bytes a bucket; it measured {}",
+        live - one_removed
+    );
+    assert_eq!(
+        16,
+        live - two_removed,
+        "removing both transient claims is priced at sixteen bytes a bucket -- the figure #1958 \
+         declined on -- and it measured {}",
+        live - two_removed
+    );
+    for (n, size) in [(1usize, one_removed), (2usize, two_removed)] {
+        let eight_aligned = EIGHT_ALIGNED - 8 * n;
+        assert_eq!(
+            eight_aligned + TAIL.div_ceil(align) * align,
+            size,
+            "removing {n} must reconstruct to {} B and `size_of` says {size}",
+            eight_aligned + TAIL.div_ceil(align) * align
+        );
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// 3. ARE THEY DISTINCT? MEASURED OVER A WORKLOAD, NOT READ OFF THE DECLARATION.
+// -------------------------------------------------------------------------------------------
+
+/// THE INDEX-LOG HALF OF A CLAIM CANNOT BE DERIVED FROM THE WAL HALF -- and the measurement that
+/// says so is not the one that looks decisive.
+///
+/// The reason to ask: both halves are stamped by the same command, both only when the field is 0,
+/// both cleared together by a dump. If one were a function of the other, one of the two words
+/// could go, and the width table above says the first word off this group is a real eight bytes a
+/// bucket.
+///
+/// WHAT LOOKS LIKE A FUNCTION. Every bucket that holds BOTH halves holds them exactly one apart,
+/// at both corpus sizes measured here. A reading that stopped there would conclude
+/// `index_log_claim = wal_claim + 1` and take the eight bytes.
+///
+/// WHY IT IS NOT ONE, AND THE NUMBER IS THE REFUTATION. More than half the dirty buckets hold the
+/// WAL half and NO index-log half at all -- 582 of 1,024 at 40,000 records. `append_delta`
+/// returns 0 when it wrote nothing, and 0 is how a bucket says NO CLAIM RECORDED. Deriving the
+/// index-log half would hand every one of those buckets a confident floor it has no grounds for,
+/// and the plan's `wal_claim > 0 && index_log_claim > 0` is there precisely so such a bucket
+/// refuses to name one: an unknown claim blocks the reclaim, and the derived one would release
+/// the log below records the bucket still needs. The missing half is not a value to reconstruct;
+/// it is the absence of a statement.
+///
+/// THE CONTROL ON THE EXPLANATION. If the distance of one were a property of the two CLOCKS, the
+/// two logs would sit one apart at their tails as well. They do not -- their last sequences are
+/// printed beside the claims, and the distance between THOSE is the number that says the one
+/// between the claims is an artifact of when both halves happened to be stamped by the same
+/// write, not a relationship between the sequences.
+///
+/// Reported PER BUCKET and never as a mean.
+#[test]
+#[ignore = "seeds 8,000 then 40,000 records; run by name"]
+fn the_index_log_half_of_a_claim_cannot_be_derived_from_the_wal_half() {
+    let mut wal_only_counts: Vec<(usize, usize, usize)> = Vec::new();
+    let mut path_lengths: Vec<usize> = Vec::new();
+
+    for records in [8_000usize, 40_000usize] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        path_lengths.push(dir.path().as_os_str().len());
+        let engine = seq_engine(dir.path(), "pairs");
+        load_at(&engine, CONFIGURED_END_BUCKET);
