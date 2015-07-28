@@ -94,3 +94,100 @@ thread_local! {
         const { RefCell::new(Vec::new()) };
 }
 
+/// Put aside what this write DID: which object, and where its page now lives.
+///
+/// Staged for the same reason pages are -- the record does not exist yet, so there is nowhere
+/// to put it until the append.
+/// PROOF THAT AN OUTCOME HAS BEEN STAGED FOR THE RECORD.
+///
+/// Private field, so only this module constructs it. A recorded container whose record IS a staged
+/// outcome -- a context node, which is never filed in the bucket index -- requires one of these, so
+/// deleting the staging call stops the install from compiling.
+#[must_use = "a staged outcome whose witness is dropped recorded something nothing will apply"]
+pub(super) struct OutcomeStaged(());
+
+impl OutcomeStaged {
+    /// A STAGED OUTCOME IS A FILED RECORD, so it satisfies a recorded container's witness.
+    ///
+    /// A context node's record IS the staged outcome and nothing else -- it is deliberately never
+    /// filed in the bucket index, because recording it as a `hash` there would have a rebuild add
+    /// an entry the write never made. So this is the one conversion between the two witnesses, and
+    /// it goes one way only: a filed block does NOT imply a staged outcome, because
+    /// `upsert_bucket_index_block_with(.., stage: false)` exists precisely to file without staging.
+    pub(super) fn into_block_filed(self) -> super::storage_bucket_internals::BlockFiled {
+        super::storage_bucket_internals::BlockFiled::from_staged_outcome(self)
+    }
+}
+
+/// [`stage_outcome`], returning the witness.
+pub(super) fn stage_outcome_attested(item: crate::wal::WalOutcomeItem) -> OutcomeStaged {
+    stage_outcome(item);
+    OutcomeStaged(())
+}
+
+pub(super) fn stage_outcome(item: crate::wal::WalOutcomeItem) {
+    crate::alloc_probe::in_class(crate::alloc_probe::AllocClass::StagedOutcome, || {
+        stage_outcome_inner(item)
+    })
+}
+
+/// The staging itself, so the class above covers the opt-out return as well as the push.
+///
+/// This charge sees the outcome BUFFER. Each item's own strings are built by the caller, before it
+/// gets here, and are charged to whatever class that caller is in -- for a page upsert the
+/// bucket-index primitive re-enters this class around the item it builds, so that one path is
+/// whole; a future caller that does not will have its item counted as its own class's cost.
+fn stage_outcome_inner(item: crate::wal::WalOutcomeItem) {
+    // Asked here rather than by each caller. Six of them asked it immediately before calling,
+    // which is six chances to write a seventh that does not -- and the answer belongs with the
+    // table that holds the result, not with the code that produced it.
+    //
+    // The cost of asking late is that a caller now builds the item before learning it is not
+    // wanted. That lands only on the opted-out path: recording results is the default, and the
+    // variable exists to write records an older build can still replay.
+    if !crate::wal::wal_outcome_items_enabled() {
+        return;
+    }
+    OUTCOMES.with(|outcomes| outcomes.borrow_mut().push(item));
+}
+
+/// How many outcomes this write has staged so far, without consuming them.
+pub(super) fn staged_outcome_count() -> usize {
+    OUTCOMES.with(|outcomes| outcomes.borrow().len())
+}
+
+/// Take what this write recorded doing, leaving nothing behind.
+pub(super) fn take_outcomes() -> Vec<crate::wal::WalOutcomeItem> {
+    OUTCOMES.with(|outcomes| std::mem::take(&mut *outcomes.borrow_mut()))
+}
+
+/// Take what this write staged, leaving nothing behind.
+pub(super) fn take_staged() -> Vec<StagedBlock> {
+    STAGED.with(|staged| std::mem::take(&mut *staged.borrow_mut()))
+}
+
+/// (shard, object id) -> the log holding that page, where in it, and the WAL sequence of the
+/// record carrying it.
+///
+/// The log handle is stored per entry rather than once per process: two engines in one process
+/// have separate logs, and a single shared handle would resolve one engine's addresses against
+/// the other's log -- reading the wrong bytes, silently.
+///
+/// The sequence is what lets WAL reclaim coexist with these registrations: a registered page's
+/// only durable copy is its record, so reclaim must never truncate below the lowest registered
+/// sequence (see [`min_registered_sequence`]).
+type Registration = (LocalWriteAheadLogStore, u64, u64);
+
+/// Which page this table is about: the object, and which element of it.
+///
+/// The second term is the whole point of this type existing rather than a bare `u64`. An object id
+/// resolves a RECORD, and one record carries many pages; without the element beside it the last
+/// page of a key to be written owns that key's entry and every earlier one becomes unreachable.
+pub(super) type BlockKey = (u64, Option<std::sync::Arc<str>>);
+
+/// Build a key without owning the component until the map needs it.
+fn block_key(object_id: u64, component: Option<&str>) -> BlockKey {
+    (object_id, component.map(std::sync::Arc::from))
+}
+
+/// The same page identity, folded into ONE `u64`, for the persisted map that survives a reload.

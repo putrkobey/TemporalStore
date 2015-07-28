@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MatrixArk GPT-4o Mini Reader/Judge Benchmarking</title>
+<style>
+body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#172033;background:#fff}
+main{max-width:1120px;margin:0 auto;padding:38px 28px 68px}
+.badge{display:inline-block;background:#eef2ff;color:#3730a3;border-radius:999px;padding:4px 10px;font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:14px}
+h1{font-size:42px;line-height:1.06;margin:0 0 16px}
+pre{white-space:pre-wrap;overflow-x:auto;background:#f6f8fb;border:1px solid #dbe3ef;border-radius:8px;padding:18px;font:14px/1.55 Consolas,"SFMono-Regular",monospace;color:#0f172a}
+</style>
+</head>
+<body><main><span class="badge">Accessible Copy</span><h1>MatrixArk GPT-4o Mini Reader/Judge Benchmarking</h1><pre># MatrixArk GPT-4o Mini Reader/Judge Benchmarking
+
+This doc explains how to use OpenAI API models, especially `gpt-4o-mini`, as
+MatrixArk benchmark reader and judge models for LOCOMO and LongMemEval-style
+runs.
+
+Important: ChatGPT Free/Plus/Pro access is different from OpenAI API access.
+There is no guaranteed free GPT-4 API model for benchmarking. API usage normally
+requires an OpenAI Platform account, API key, and billing/credits.
+
+Official references:
+
+- OpenAI API quickstart: &lt;https://developers.openai.com/api/docs/quickstart&gt;
+- OpenAI API authentication overview: &lt;https://developers.openai.com/api/reference/overview/&gt;
+- GPT-4o mini model page: &lt;https://developers.openai.com/api/docs/models/gpt-4o-mini&gt;
+- OpenAI API pricing: &lt;https://openai.com/api/pricing/&gt;
+
+## Why Use GPT-4o Mini
+
+For MatrixArk vs external-baseline benchmarking, we need to separate:
+
+```text
+retrieval quality  = did TemporalStore find the right context?
+reader quality     = did the model turn that context into the right answer?
+judge quality      = did the evaluator score the answer fairly?
+```
+
+Our deterministic reader is useful for CI and debugging, but it is not
+paper-style benchmark parity. A stronger OpenAI-compatible reader/judge path is
+needed when comparing with systems that use strong LLM readers or judges.
+
+`gpt-4o-mini` is a reasonable benchmark reader/judge option because it is
+OpenAI-compatible, low cost compared with larger models, and strong enough for
+many answer extraction and judge tasks.
+
+## Get An OpenAI API Key
+
