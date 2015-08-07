@@ -1,0 +1,280 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+//! Prometheus metrics rendering for TemporalEngine, split from engine.rs.
+use super::*;
+
+/// TS_METRICS_MAX_BUCKET_SERIES: how many routing buckets may emit per-bucket series on one
+/// shard. `TS_METRICS_MAX_SLOT_SERIES` is the previous spelling and is still read.
+///
+/// A routing bucket is derived per key, so per-bucket metrics scale with record count rather
+/// than with topology. Past this many buckets the per-bucket detail is dropped in favour of the
+/// shard totals, which are emitted unconditionally.
+fn max_bucket_series_per_shard() -> usize {
+    crate::env_flag::env_number_first(
+        &["TS_METRICS_MAX_BUCKET_SERIES", "TS_METRICS_MAX_SLOT_SERIES"],
+        1024,
+    )
+}
+
+impl TemporalEngine {
+    pub fn prometheus_metrics(&self) -> String {
+        let mut out = String::new();
+        out.push_str("# HELP temporalstore_shard_records Number of records by shard and kind.\n");
+        out.push_str("# TYPE temporalstore_shard_records gauge\n");
+        out.push_str("# HELP temporalstore_cache_operations_total Cache operation counters by shard and kind.\n");
+        out.push_str("# TYPE temporalstore_cache_operations_total counter\n");
+        out.push_str("# HELP temporalstore_cache_bytes Cache bytes by shard and tier.\n");
+        out.push_str("# TYPE temporalstore_cache_bytes gauge\n");
+        out.push_str("# HELP temporalstore_block_store_bytes_total Block store byte counters by shard and kind.\n");
+        out.push_str("# TYPE temporalstore_block_store_bytes_total counter\n");
+        out.push_str("# HELP temporalstore_shard_rate_limit_total Commands allowed and refused by a rate limit. Absent for a shard with no limit, which is not the same as a limit that has refused nothing.\n");
+        out.push_str("# TYPE temporalstore_shard_rate_limit_total counter\n");
+        out.push_str("# HELP temporalstore_shard_index_lag_records Records appended to the log that the durable index has not yet accounted for, by shard. High values mean a longer restart and reclaim that cannot advance.\n");
+        out.push_str("# TYPE temporalstore_shard_index_lag_records gauge\n");
+        out.push_str("# HELP temporalstore_shard_expiring_keys Keys holding an expiry deadline that the sweep has not yet removed, by shard. Rising means expiry is falling behind; the sweep's own counts look healthy either way.\n");
+        out.push_str("# TYPE temporalstore_shard_expiring_keys gauge\n");
+        out.push_str(
+            "# HELP temporalstore_wal_records_total Write-ahead log append records by shard.\n",
+        );
+        out.push_str("# TYPE temporalstore_wal_records_total counter\n");
+        out.push_str(
+            "# HELP temporalstore_wal_bytes_total Write-ahead log appended bytes by shard.\n",
+        );
+        out.push_str("# TYPE temporalstore_wal_bytes_total counter\n");
+        out.push_str(
+            "# HELP temporalstore_object_manager_objects Logical hot objects tracked by shard.\n",
+        );
+        out.push_str("# TYPE temporalstore_object_manager_objects gauge\n");
+        out.push_str("# HELP temporalstore_object_manager_block_refs Block-address references tracked by shard.\n");
+        out.push_str("# TYPE temporalstore_object_manager_block_refs gauge\n");
+        out.push_str("# HELP temporalstore_object_manager_dirty_objects Dirty logical objects tracked by shard.\n");
+        out.push_str("# TYPE temporalstore_object_manager_dirty_objects gauge\n");
+        out.push_str("# HELP temporalstore_object_manager_dirty_buckets Dirty routing buckets tracked by shard.\n");
+        out.push_str("# TYPE temporalstore_object_manager_dirty_buckets gauge\n");
+        out.push_str("# HELP temporalstore_storage_bucket_block_refs Live block refs by shard and routing bucket.\n");
+        out.push_str("# TYPE temporalstore_storage_bucket_block_refs gauge\n");
+        out.push_str("# HELP temporalstore_storage_bucket_bytes Live bytes by shard, routing bucket, and kind.\n");
+        out.push_str("# TYPE temporalstore_storage_bucket_bytes gauge\n");
+        out.push_str("# HELP temporalstore_storage_bucket_dirty_objects Dirty objects by shard and routing bucket.\n");
+        out.push_str("# TYPE temporalstore_storage_bucket_dirty_objects gauge\n");
+        out.push_str("# HELP temporalstore_storage_bucket_series_omitted Routing buckets on this shard when per-bucket series were suppressed by TS_METRICS_MAX_BUCKET_SERIES.\n");
+        out.push_str("# TYPE temporalstore_storage_bucket_series_omitted gauge\n");
+        out.push_str("# HELP temporalstore_block_store_operations_total Canonical block-store operation counters by shard.\n");
+        out.push_str("# TYPE temporalstore_block_store_operations_total counter\n");
+        out.push_str("# HELP temporalstore_block_store_slab_bytes Canonical block-store slab bytes by shard and kind.\n");
+        out.push_str("# TYPE temporalstore_block_store_slab_bytes gauge\n");
+        out.push_str("# HELP temporalstore_block_store_slab_count Canonical block-store slab counts by shard and lifecycle state.\n");
+        out.push_str("# TYPE temporalstore_block_store_slab_count gauge\n");
+        out.push_str("# HELP temporalstore_block_store_slab_oldest_unix_ms Oldest block-store slab timestamp by shard and lifecycle scope.\n");
+        out.push_str("# TYPE temporalstore_block_store_slab_oldest_unix_ms gauge\n");
+        out.push_str("# HELP temporalstore_block_store_slab_oldest_age_ms Oldest block-store slab age by shard and lifecycle scope.\n");
+        out.push_str("# TYPE temporalstore_block_store_slab_oldest_age_ms gauge\n");
+        out.push_str(
+            "# HELP temporalstore_partition_routing_buckets Routing buckets owned by shard.\n",
+        );
+        out.push_str("# TYPE temporalstore_partition_routing_buckets gauge\n");
+        out.push_str(
+            "# HELP temporalstore_ingestion_records_total Ingestion record counters by outcome.\n",
+        );
+        out.push_str("# TYPE temporalstore_ingestion_records_total counter\n");
+        out.push_str("# HELP temporalstore_ingestion_kafka_lag Kafka ingestion lag in offsets.\n");
+        out.push_str("# TYPE temporalstore_ingestion_kafka_lag gauge\n");
+        out.push_str("# HELP temporalstore_ingestion_kafka_committed_offset Kafka committed offset by topic and partition.\n");
+        out.push_str("# TYPE temporalstore_ingestion_kafka_committed_offset gauge\n");
+        out.push_str("# HELP temporalstore_ingestion_stream_committed_sequence Streaming ingestion committed sequence by stream.\n");
+        out.push_str("# TYPE temporalstore_ingestion_stream_committed_sequence gauge\n");
+        out.push_str("# HELP temporalstore_ingestion_flink_checkpoint_state Flink checkpoint state as a one-hot gauge.\n");
+        out.push_str("# TYPE temporalstore_ingestion_flink_checkpoint_state gauge\n");
+        // Gathered for every shard before the loop below, which holds a read lock on the shard
+        // table: asking per shard inside it takes a second read on that lock, and a writer
+        // queued between the two deadlocks.
+        let index_lags: std::collections::HashMap<ShardId, u64> =
+            self.shard_index_lags().into_iter().collect();
+        let expiry_backlogs: std::collections::HashMap<ShardId, u64> =
+            self.shard_expiry_backlogs().into_iter().collect();
+        for stats in self.loaded_shard_stats() {
+            push_metric(
+                &mut out,
+                "temporalstore_shard_records",
+                &[
+                    ("shard_id", stats.shard_id.to_string()),
+                    ("kind", "string".into()),
+                ],
+                stats.string_records as u64,
+            );
+            push_metric(
+                &mut out,
+                "temporalstore_shard_records",
+                &[
+                    ("shard_id", stats.shard_id.to_string()),
+                    ("kind", "hash".into()),
+                ],
+                stats.hash_records as u64,
+            );
+            push_metric(
+                &mut out,
+                "temporalstore_shard_records",
+                &[
+                    ("shard_id", stats.shard_id.to_string()),
+                    ("kind", "set".into()),
+                ],
+                stats.set_records as u64,
+            );
+            push_metric(
+                &mut out,
+                "temporalstore_shard_records",
+                &[
+                    ("shard_id", stats.shard_id.to_string()),
+                    ("kind", "feature".into()),
+                ],
+                stats.feature_records as u64,
+            );
+            push_metric(
+                &mut out,
+                "temporalstore_shard_records",
+                &[
+                    ("shard_id", stats.shard_id.to_string()),
+                    ("kind", "sequence".into()),
+                ],
+                stats.sequence_records as u64,
+            );
+            push_metric(
+                &mut out,
+                "temporalstore_shard_records",
+                &[
+                    ("shard_id", stats.shard_id.to_string()),
+                    ("kind", "control_state".into()),
+                ],
+                stats.control_state_records as u64,
+            );
+            // Only for a shard that carries a limit. A shard with none has nothing to count, and
+            // emitting zeros would say "this limit refused nothing" about a shard that has no
+            // limit at all -- which is the one distinction an operator needs from this.
+            if let Some(waiting) = expiry_backlogs.get(&stats.shard_id) {
+                push_metric(
+                    &mut out,
+                    "temporalstore_shard_expiring_keys",
+                    &[("shard_id", stats.shard_id.to_string())],
+                    *waiting,
+                );
+            }
+            if let Some(lag) = index_lags.get(&stats.shard_id) {
+                push_metric(
+                    &mut out,
+                    "temporalstore_shard_index_lag_records",
+                    &[("shard_id", stats.shard_id.to_string())],
+                    *lag,
+                );
+            }
+            if let Some(counters) = self.shard_quota_counters(stats.shard_id) {
+                for (kind, value) in [
+                    ("read_allowed", counters.read_allowed),
+                    ("read_refused", counters.read_refused),
+                    ("write_allowed", counters.write_allowed),
+                    ("write_refused", counters.write_refused),
+                ] {
+                    push_metric(
+                        &mut out,
+                        "temporalstore_shard_rate_limit_total",
+                        &[
+                            ("shard_id", stats.shard_id.to_string()),
+                            ("kind", kind.into()),
+                        ],
+                        value,
+                    );
+                }
+            }
+            for (kind, value) in [
+                ("memory_hits", stats.cache.memory_hits),
+                ("disk_hits", stats.cache.disk_hits),
+                ("misses", stats.cache.misses),
+                ("puts", stats.cache.puts),
+                ("invalidations", stats.cache.invalidations),
+                ("memory_evictions", stats.cache.memory_evictions),
+                ("pmem_hits", stats.cache.pmem_hits),
+                ("pmem_fills", stats.cache.pmem_fills),
+                ("pmem_evictions", stats.cache.pmem_evictions),
+                (
+                    "pmem_admission_accepted",
+                    stats.cache.pmem_admission_accepted,
+                ),
+                (
+                    "pmem_admission_rejected",
+                    stats.cache.pmem_admission_rejected,
+                ),
+                ("pmem_eviction_capacity", stats.cache.pmem_eviction_capacity),
+                (
+                    "pmem_eviction_pinned_skips",
+                    stats.cache.pmem_eviction_pinned_skips,
+                ),
+                (
+                    "memory_admission_accepted",
+                    stats.cache.memory_admission_accepted,
+                ),
+                (
+                    "memory_admission_rejected",
+                    stats.cache.memory_admission_rejected,
+                ),
+                ("memory_fills", stats.cache.memory_fills),
+                ("disk_fills", stats.cache.disk_fills),
+                ("refill_failures", stats.cache.refill_failures),
+                ("eviction_capacity", stats.cache.eviction_capacity),
+                ("eviction_oversize", stats.cache.eviction_oversize),
+                ("eviction_cold", stats.cache.eviction_cold),
+                ("eviction_low_hit", stats.cache.eviction_low_hit),
+                ("eviction_stale", stats.cache.eviction_stale),
+                ("ssd_eviction_cold", stats.cache.ssd_eviction_cold),
+                ("ssd_eviction_low_hit", stats.cache.ssd_eviction_low_hit),
+                ("ssd_eviction_stale", stats.cache.ssd_eviction_stale),
+                ("pinned_entries", stats.cache.pinned_entries),
+                ("pin_operations", stats.cache.pin_operations),
+                ("unpin_operations", stats.cache.unpin_operations),
+                ("eviction_pinned_skips", stats.cache.eviction_pinned_skips),
+                (
+                    "eviction_sampled_groups",
+                    stats.cache.eviction_sampled_groups,
+                ),
+                ("memory_slot_evictions", stats.cache.memory_slot_evictions),
+                ("ssd_slot_evictions", stats.cache.ssd_slot_evictions),
+                ("compressed_puts", stats.cache.compressed_puts),
+                ("compressed_hits", stats.cache.compressed_hits),
+            ] {
+                push_metric(
+                    &mut out,
+                    "temporalstore_cache_operations_total",
+                    &[
+                        ("shard_id", stats.shard_id.to_string()),
+                        ("kind", kind.into()),
+                    ],
+                    value,
+                );
+            }
+            for (tier, value) in [
+                ("memory", stats.cache.memory_bytes),
+                ("pmem", stats.cache.pmem_bytes),
+                ("disk", stats.cache.disk_bytes),
+                ("compression_saved", stats.cache.compression_bytes_saved),
+            ] {
+                push_metric(
+                    &mut out,
+                    "temporalstore_cache_bytes",
+                    &[
+                        ("shard_id", stats.shard_id.to_string()),
+                        ("tier", tier.into()),
+                    ],
+                    value,
+                );
+            }
+            for (kind, value) in [
+                ("writes", stats.block_store_compat.writes),
+                ("reads", stats.block_store_compat.reads),
+                (
+                    "compressed_writes",
+                    stats.block_store_compat.compressed_records_written,
+                ),
+                ("compressed_reads", stats.block_store_compat.compressed_records_read),
+            ] {
+                push_metric(
+                    &mut out,
+                    "temporalstore_block_store_operations_total",
