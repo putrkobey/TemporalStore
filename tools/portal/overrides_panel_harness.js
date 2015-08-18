@@ -1,0 +1,73 @@
+/* Run the key portal's overrides renderer against real payload shapes.
+ *
+ * The page loading without throwing proves nothing about this panel: renderOverrides only runs on
+ * a button press, so a call to a helper that does not exist -- which is exactly the bug this
+ * harness was written after -- loads clean and fails when someone clicks.
+ *
+ * The renderer touches one table body, so it gets a stub that remembers what was written rather
+ * than a full DOM.
+ */
+"use strict";
+const fs = require("fs");
+
+const page = fs.readFileSync(process.argv[2], "utf8");
+const scripts = [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]).join("\n");
+
+function extract(name) {
+  const start = scripts.indexOf("function " + name + "(");
+  if (start < 0) { return null; }
+  let depth = 0;
+  for (let i = scripts.indexOf("{", start); i < scripts.length; i += 1) {
+    if (scripts[i] === "{") { depth += 1; }
+    else if (scripts[i] === "}") {
+      depth -= 1;
+      if (depth === 0) { return scripts.slice(start, i + 1); }
+    }
+  }
+  return null;
+}
+
+const renderSrc = extract("renderOverrides");
+const escapeSrc = extract("escapeHtml");
+if (!renderSrc) { console.log("FAIL renderOverrides is not in the page"); process.exit(1); }
+if (!escapeSrc) { console.log("FAIL escapeHtml is not in the page"); process.exit(1); }
+
+let failures = 0;
+const body = { innerHTML: "", appendChild(node) { this.innerHTML += node.innerHTML; } };
+const table = { querySelector: () => body };
+const doc = { createElement: () => ({ innerHTML: "" }) };
+const factory = new Function(
+  "$", "document",
+  escapeSrc + "\n" + renderSrc + "\n; return renderOverrides;");
+const renderOverrides = factory(() => table, doc);
+
+function run(label, payload, checks) {
+  body.innerHTML = "";
+  try {
+    renderOverrides(payload);
+  } catch (err) {
+    console.log("FAIL " + label + " threw: " + err.message);
+    failures += 1;
+    return;
+  }
+  for (const [what, ok] of checks(body.innerHTML)) {
+    if (ok) { console.log("ok   " + label + " -- " + what); }
+    else {
+      console.log("FAIL " + label + " -- " + what + "\n     got: " + body.innerHTML.slice(0, 200));
+      failures += 1;
+    }
+  }
+}
+
+run("a tenant override", { tenants: [{ tenant: "acme", settings: { top_k_per_layer: 24 } }], users: [] },
+    (html) => [
+      ["names the tenant", html.includes("acme")],
+      ["names the level", html.includes("tenant")],
+      ["shows the setting and value", html.includes("top_k_per_layer=24")],
+    ]);
+
+run("a user override", { tenants: [], users: [{ key: "acme/alice", settings: { recall_reinforcement: false } }] },
+    (html) => [
+      ["names the identity", html.includes("acme/alice")],
+      ["marks it as a user row", html.includes("user")],
+      ["shows the value", html.includes("recall_reinforcement=false")],
