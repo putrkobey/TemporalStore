@@ -785,3 +785,397 @@ fn the_index_log_half_of_a_claim_cannot_be_derived_from_the_wal_half() {
         path_lengths.push(dir.path().as_os_str().len());
         let engine = seq_engine(dir.path(), "pairs");
         load_at(&engine, CONFIGURED_END_BUCKET);
+        let first = seq_keys("first", records / 2);
+        let later = seq_keys("later", records / 2);
+        write_batches(&engine, &first, 118);
+        write_singles(&engine, &first[..16.min(first.len())], 119);
+        one_round_at_the_configured_cap(&engine);
+        write_batches(&engine, &later, 120);
+        let rows = sequences_by_bucket(&engine);
+
+        let both: Vec<(u32, u64, u64)> = rows
+            .iter()
+            .filter(|row| row.wal_claim > 0 && row.index_log_claim > 0)
+            .map(|row| (row.routing_bucket, row.wal_claim, row.index_log_claim))
+            .collect();
+        let wal_only: Vec<u32> = rows
+            .iter()
+            .filter(|row| row.wal_claim > 0 && row.index_log_claim == 0)
+            .map(|row| row.routing_bucket)
+            .collect();
+        let index_log_only = rows
+            .iter()
+            .filter(|row| row.wal_claim == 0 && row.index_log_claim > 0)
+            .count();
+
+        // DENOMINATORS. Both populations have to exist: without buckets holding both there is no
+        // distance to measure, and without buckets holding one there is nothing to refute with.
+        assert!(
+            both.len() >= 64,
+            "only {} buckets of {} hold both halves at {records} records; the distance below \
+             would be measured over nothing",
+            both.len(),
+            rows.len()
+        );
+        assert!(
+            !wal_only.is_empty(),
+            "every bucket at {records} records holds both halves, so this fixture never reaches \
+             the case the refutation rests on"
+        );
+
+        let distances = both
+            .iter()
+            .map(|(_, wal, index_log)| *index_log as i128 - *wal as i128)
+            .collect::<std::collections::BTreeSet<i128>>();
+
+        let wal_tail = engine.wal_store().stats(SEQ_SHARD).last_sequence;
+        let index_log_tail = engine.index_log_store().stats(SEQ_SHARD).last_sequence;
+
+        println!(
+            "\n=== {records} records, 0..1023 ===\n  buckets={} / holding both {} / WAL half \
+             only {} / index-log half only {index_log_only}",
+            rows.len(),
+            both.len(),
+            wal_only.len()
+        );
+        println!(
+            "  distances between the two halves, where both are present: {:?}",
+            distances
+        );
+        println!(
+            "  THE CONTROL: the two logs' own tails are WAL {wal_tail} and index-log \
+             {index_log_tail}, {} apart -- so the distance above is a property of the write that \
+             stamped both, not of the clocks",
+            wal_tail as i128 - index_log_tail as i128
+        );
+
+        // THE HARM, driven rather than argued: the buckets holding only the WAL half are exactly
+        // the ones the plan refuses on, and a derived index-log half would remove that refusal.
+        let plan = engine.storage_wal_reclaim_plan(SEQ_SHARD, Vec::new(), Vec::new());
+        let refused_and_wal_only = wal_only
+            .iter()
+            .filter(|routing_bucket| plan.missing_bucket_generations.contains(routing_bucket))
+            .count();
+        println!(
+            "  the plan refuses on {} buckets; {refused_and_wal_only} of the {} WAL-half-only \
+             buckets are among them",
+            plan.missing_bucket_generations.len(),
+            wal_only.len()
+        );
+
+        wal_only_counts.push((records, wal_only.len(), rows.len()));
+    }
+
+    assert_eq!(2, path_lengths.len(), "both arms must have run");
+    assert_eq!(
+        path_lengths[0], path_lengths[1],
+        "the store path length moved between arms ({} then {})",
+        path_lengths[0], path_lengths[1]
+    );
+
+    println!("\n=== buckets holding the WAL half and no index-log half ===");
+    for (records, wal_only, total) in &wal_only_counts {
+        println!(
+            "  {records:>7} records: {wal_only} of {total} ({:.1}%)",
+            100.0 * *wal_only as f64 / *total as f64
+        );
+    }
+
+    // THE CLAIM. A derivation has to answer for every bucket, and at the larger corpus most of
+    // them have no index-log half to derive.
+    let (big_records, big_wal_only, big_total) = wal_only_counts[1];
+    assert!(
+        big_wal_only * 4 > big_total,
+        "only {big_wal_only} of {big_total} buckets at {big_records} records hold the WAL half \
+         without the index-log half; if that population has become small, the refutation this \
+         module records rests on less than it did and should be re-read"
+    );
+}
+
+/// THE BOUND ON EACH SEQUENCE IS THE STORE'S LIFETIME, NOT THE CORPUS -- which is why a measured
+/// range that fits in 32 bits is not permission to use 32 of them.
+///
+/// Two of the three are positions in a log. Reclaim FREES a log's records; it does not RENUMBER
+/// them, and the sequence a store hands out is monotonic across every reclaim and every restart.
+/// The fourth is a count that a load preserves (`rebuild_bucket_block_ownership` carries it over
+/// deliberately) and that nothing ever resets.
+///
+/// This drives the direction that matters: what a narrowed field would do to the decision. Each
+/// claim is read as a retain FLOOR, and a wrapped claim is not a wrong number, it is a SMALLER
+/// one -- so the floor falls and reclaim frees records the bucket still holds the log for. That
+/// is why this module's answer is "no narrowing", and it is asserted here rather than asserted in
+/// prose: the claim a bucket holds is put one past a `u32` and the plan is shown to keep the
+/// records, where the truncated value would have released them.
+#[test]
+fn the_bound_on_each_sequence_is_the_stores_lifetime_not_the_corpus() {
+    // What a 32-bit claim would do to a claim past its top, spelled as the arithmetic the write
+    // site would perform. `as u32` is the silent form and is what this rejects.
+    const PAST_THIRTY_TWO_BITS: u64 = (u32::MAX as u64) + 4_096;
+    let truncated = PAST_THIRTY_TWO_BITS as u32 as u64;
+    assert!(
+        truncated < PAST_THIRTY_TWO_BITS,
+        "a claim of {PAST_THIRTY_TWO_BITS} narrowed to 32 bits reads back as {truncated}"
+    );
+    assert_eq!(
+        4_095, truncated,
+        "the truncation of {PAST_THIRTY_TWO_BITS} is {truncated}; if this is no longer 4,095 the \
+         arithmetic below describes a different failure"
+    );
+
+    // The floor the reclaim plan computes from a claim: `frontier = min(claim - 1)`, and it then
+    // frees everything at or below the frontier. A truncated claim moves that floor DOWN by
+    // essentially the whole log.
+    let honest_floor = PAST_THIRTY_TWO_BITS.saturating_sub(1);
+    let truncated_floor = truncated.saturating_sub(1);
+    assert!(
+        truncated_floor < honest_floor,
+        "the point of this guard is that truncation LOWERS the floor; it did not"
+    );
+    println!(
+        "\n=== a 32-bit claim on a log past 2^32 ===\n  claim {PAST_THIRTY_TWO_BITS} -> \
+         {truncated}, retain floor {honest_floor} -> {truncated_floor}: {} records that the \
+         bucket still holds the log for become reclaimable",
+        honest_floor - truncated_floor
+    );
+
+    // And the saturating form, which is the only narrowing this codebase would accept, is no
+    // better HERE -- it is wrong in the other direction. A claim saturated to `u32::MAX` names a
+    // write newer than the one the bucket needs, which raises the floor over records it holds.
+    let saturated = u32::MAX as u64;
+    assert!(
+        saturated < PAST_THIRTY_TWO_BITS,
+        "saturation also loses the claim, in the direction that raises the floor: {saturated} \
+         against {PAST_THIRTY_TWO_BITS}"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// 4. EACH SEQUENCE IS READ WHERE THIS MODULE SAYS IT IS. PERTURBED, NOT READ BACK.
+// -------------------------------------------------------------------------------------------
+
+/// Overwrite one bucket's field on a live shard. The shard lock is the engine's own.
+fn perturb(engine: &TemporalEngine, routing_bucket: u32, edit: impl Fn(&mut BucketNode)) {
+    let mut shards = engine.shards.write().expect("engine lock poisoned");
+    let shard = shards.get_mut(&SEQ_SHARD).expect("shard is loaded");
+    let bucket = shard
+        .bucket_index
+        .bucket_map
+        .get_mut(&routing_bucket)
+        .expect("the bucket this test chose is in the map");
+    edit(bucket);
+}
+
+/// THE TWO TRANSIENT CLAIMS ARE LOAD-BEARING: clearing either one alone stops the plan.
+///
+/// The plan requires BOTH halves from a dirty bucket no manifest covers. Clearing one half and
+/// leaving the other is the state a guard reading "is a claim present" cannot tell from whole,
+/// and it is the state this drives -- once for each half, so a reader that stopped consulting
+/// either one turns this red by name.
+///
+/// THE CONTROL IS THE UNPERTURBED PLAN, taken first on the same shard: without it a plan that
+/// refuses for some unrelated reason reads exactly like a plan that refuses because of the edit.
+#[test]
+#[ignore = "seeds 2,000 records; run by name"]
+fn clearing_either_half_of_a_buckets_claim_stops_the_reclaim_plan() {
+    for (label, clear_wal) in [("the WAL half", true), ("the index-log half", false)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = seq_engine(dir.path(), "claimread");
+        load_at(&engine, CONFIGURED_END_BUCKET);
+        write_batches(&engine, &seq_keys("k", 2_000), 118);
+
+        // The bucket this test edits has to be one the plan actually consults: dirty, and with
+        // both halves already stamped.
+        let rows = sequences_by_bucket(&engine);
+        let target = rows
+            .iter()
+            .find(|row| row.dirty && row.wal_claim > 0 && row.index_log_claim > 0)
+            .copied();
+        let target = target.expect(
+            "the fixture produced no dirty bucket holding both halves of a claim, so the branch \
+             this test is named for is never reached",
+        );
+
+        // THE CONTROL.
+        let before = engine.storage_wal_reclaim_plan(SEQ_SHARD, Vec::new(), Vec::new());
+        assert!(
+            !before.missing_bucket_generations.contains(&target.routing_bucket),
+            "bucket {} was already refusing the plan before the edit, so a refusal afterwards \
+             would not be the edit's doing",
+            target.routing_bucket
+        );
+
+        perturb(&engine, target.routing_bucket, |bucket| {
+            if clear_wal {
+                bucket.first_dirty_wal_sequence = 0;
+            } else {
+                bucket.first_dirty_index_log_sequence = 0;
+            }
+        });
+
+        let after = engine.storage_wal_reclaim_plan(SEQ_SHARD, Vec::new(), Vec::new());
+        println!(
+            "\n=== clearing {label} of bucket {} ===\n  missing_bucket_generations {} -> {}, \
+             covered {} -> {}",
+            target.routing_bucket,
+            before.missing_bucket_generations.len(),
+            after.missing_bucket_generations.len(),
+            before.covered_bucket_count,
+            after.covered_bucket_count
+        );
+        assert!(
+            after.missing_bucket_generations.contains(&target.routing_bucket),
+            "clearing {label} of bucket {}'s claim left the plan still covering it, so that half \
+             is not being read where this module says it is read",
+            target.routing_bucket
+        );
+    }
+}
+
+/// `dirty_generation` IS THE EQUALITY THAT LETS A DUMP MANIFEST COVER A BUCKET.
+///
+/// A dump manifest records each bucket's summary, and `bucket_dump_summary_matches_current_generation`
+/// compares `dirty_generation` for EQUALITY against the live one. That match is what puts the
+/// manifest in `retained_manifest_ids` and lets the plan anchor reclaim on it.
+///
+/// Move the live value on every bucket and no manifest matches any of them, so the plan retains
+/// none. Every bucket is moved rather than one, because a manifest is retained if ANY bucket
+/// still matches it -- editing a single bucket is the reduction that lets one right element hide
+/// the rest, and it is exactly what this must not do.
+///
+/// THE CONTROL IS THE SAME PLAN ON THE SAME SHARD BEFORE THE EDIT, asserted to retain a manifest.
+/// Without it, "retains none afterwards" is indistinguishable from a shard that never retained
+/// one.
+///
+/// THE EDIT MOVES THE VALUE FORWARD, which is the direction a real write moves it, and by an
+/// amount no write in the fixture could have produced.
+#[test]
+#[ignore = "seeds 2,000 records and dumps; run by name"]
+fn moving_every_buckets_dirty_generation_stops_the_manifests_covering_them() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = seq_engine(dir.path(), "generation");
+    load_at(&engine, CONFIGURED_END_BUCKET);
+    write_batches(&engine, &seq_keys("k", 2_000), 118);
+    // Dump everything, so every bucket has a manifest recording its generation.
+    engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: SEQ_SHARD,
+        min_undumped_wal_records: 0,
+        min_undumped_wal_bytes: 0,
+        max_dump_buckets_per_round: 0,
+        ..StorageManagerCycleRequest::default()
+    });
+
+    // THE CONTROL.
+    let before = engine.storage_wal_reclaim_plan(SEQ_SHARD, Vec::new(), Vec::new());
+    assert!(
+        !before.retained_manifest_ids.is_empty(),
+        "no manifest was retained before the edit, so there is no coverage for the edit to break"
+    );
+    let rows = sequences_by_bucket(&engine);
+    let carrying = rows.iter().filter(|row| row.generation > 0).count();
+    assert!(
+        carrying > 0,
+        "no bucket carries a generation, so the equality this test drives is never evaluated"
+    );
+
+    // Move EVERY bucket's generation forward, by more than the fixture could have written.
+    const SHIFT: u64 = 1_000_000;
+    let routing_buckets = rows.iter().map(|row| row.routing_bucket).collect::<Vec<_>>();
+    for routing_bucket in routing_buckets {
+        perturb(&engine, routing_bucket, |bucket| {
+            bucket.dirty_generation = bucket.dirty_generation.saturating_add(SHIFT);
+        });
+    }
+
+    let after = engine.storage_wal_reclaim_plan(SEQ_SHARD, Vec::new(), Vec::new());
+    println!(
+        "\n=== every bucket's dirty_generation moved forward by {SHIFT} ===\n  buckets carrying \
+         a generation: {carrying} of {}\n  retained manifests {} -> {}\n  covered {} -> {}",
+        rows.len(),
+        before.retained_manifest_ids.len(),
+        after.retained_manifest_ids.len(),
+        before.covered_bucket_count,
+        after.covered_bucket_count
+    );
+    assert!(
+        after.retained_manifest_ids.is_empty(),
+        "after moving every bucket's dirty_generation the plan still retains {} manifest(s); the \
+         equality `bucket_dump_summary_matches_current_generation` makes on this field is not \
+         reading it",
+        after.retained_manifest_ids.len()
+    );
+}
+
+/// THE DUMPED-LOG WATERMARK COMES FROM THE MANIFEST, AND THERE IS NOWHERE ELSE LEFT FOR IT TO
+/// COME FROM.
+///
+/// WHAT THIS TEST USED TO BE, because the change to it is the finding. The node carried its own
+/// `last_dump_sequence`, written from `manifest.wal_sequence`, and the dump ordering's comment
+/// claimed the sort read it. The sort reads `BucketStorageSummary::last_dump_sequence` -- a
+/// DIFFERENT field with the same name, filled by `merge_last_dump_sequence` from the newest
+/// manifest's INDEX-LOG sequence -- so the node's figure reached no decision at all. This test
+/// pinned that by planting a marker in the node's field and showing the summary did not follow it.
+///
+/// THE MARKER IS GONE BECAUSE THE FIELD IS. There is no per-bucket field to plant in any more:
+/// the node's figure was read into two reports and nothing else, so it was one shard-level
+/// watermark stored once per routing bucket, at eight bytes each. What is pinned instead is the
+/// property that replaced it, in three parts:
+///
+///   * the SUMMARY's figure is the newest manifest's index-log sequence, unchanged;
+///   * the physical index REPORT's per-bucket figure is now that same number, where it used to be
+///     overwritten from the node; and
+///   * a bucket the newest manifest does NOT name reports 0. That is the discriminating part.
+///     Without it "the report shows the manifest's number" is satisfied by a report that shows
+///     that number everywhere, including for buckets no dump has ever covered.
+///
+/// Both manifest sequences are printed, so a run where they coincide is visible rather than
+/// silently making the first assertion undiscriminating.
+#[test]
+#[ignore = "seeds 8,000 records and dumps twice; run by name"]
+fn the_summary_last_dump_sequence_comes_from_the_manifest_not_from_the_node() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = seq_engine(dir.path(), "lastdump");
+    load_at(&engine, CONFIGURED_END_BUCKET);
+    // Two writes with a capped round between them, then a full dump: the state a running shard
+    // reaches, so the manifest the summary reads is one a round actually produced.
+    write_batches(&engine, &seq_keys("first", 4_000), 118);
+    one_round_at_the_configured_cap(&engine);
+    write_batches(&engine, &seq_keys("later", 4_000), 119);
+    engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: SEQ_SHARD,
+        min_undumped_wal_records: 0,
+        min_undumped_wal_bytes: 0,
+        max_dump_buckets_per_round: 0,
+        ..StorageManagerCycleRequest::default()
+    });
+
+    let manifests = engine.list_bucket_dump_manifests(SEQ_SHARD);
+    let manifest = manifests
+        .last()
+        .cloned()
+        .expect("the dump produced no manifest, so there is nothing for the summary to read");
+    assert!(
+        !manifest.bucket_ids.is_empty(),
+        "the manifest names no bucket, so nothing below is exercised"
+    );
+
+    let rows = sequences_by_bucket(&engine);
+    let covered = rows
+        .iter()
+        .find(|row| manifest.bucket_ids.contains(&row.routing_bucket))
+        .copied()
+        .expect("the newest manifest names no bucket that is still in the map");
+
+    let summary_of = |engine: &TemporalEngine, routing_bucket: u32| -> u64 {
+        engine
+            .bucket_storage_summaries(SEQ_SHARD)
+            .into_iter()
+            .find(|summary| summary.routing_bucket == routing_bucket)
+            .map(|summary| summary.last_dump_sequence)
+            .unwrap_or_default()
+    };
+    let reported = |engine: &TemporalEngine, routing_bucket: u32| -> u64 {
+        engine
+            .storage_physical_index_report(SEQ_SHARD)
+            .bucket_nodes
+            .into_iter()
+            .find(|node| node.routing_bucket == routing_bucket)
