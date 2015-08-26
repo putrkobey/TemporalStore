@@ -135,3 +135,49 @@ fn what_the_collector_sees_after_a_rewrite() {
          and this arm cannot say whether it sees garbage"
     );
 
+    println!();
+    println!("  ===== WHAT THE COLLECTOR SEES, AND WHAT THE REPORT SHOWS");
+    let summary = engine.block_store.slab_summary();
+    let published_space = if summary.live_physical_bytes == 0 {
+        0.0
+    } else {
+        summary.total_known_physical_bytes as f64 / summary.live_physical_bytes as f64
+    };
+    let collector_space =
+        if live_before == 0 { 0.0 } else { physical_before as f64 / live_before as f64 };
+    println!("    published space amplification  {published_space:.3}x");
+    println!("    the same ratio over live blocks {collector_space:.3}x");
+    println!("    worst per-slab garbage          {worst_garbage_before} basis points");
+    println!();
+
+    // ---- DID THE TALLY RETIRE THE DISPLACED BLOCKS? This is the question. `live_bytes` comes from
+    // ---- the maintained block-level tally, and a block leaves it when its index entry does.
+    if live_before == 0 {
+        println!(
+            "    THE TALLY PUBLISHED NOTHING: live_bytes is 0 across every slab, so the \
+             collector's live figure is not derived here and the garbage fraction below is not \
+             evidence either way."
+        );
+    } else {
+        assert!(
+            live_before < logical_before,
+            "the collector reports {live_before} B live of {logical_before} B ever appended after \
+             {} writes of every key. If those agree, the tally is NOT retiring blocks displaced by \
+             an overwrite -- which would mean the collector is as blind as the report, and the \
+             store cannot reclaim an overwritten block at all",
+            ROUNDS + 1
+        );
+        assert!(
+            worst_garbage_before > 0,
+            "the collector reports {live_before} B live of {logical_before} B appended, yet no \
+             slab reports any garbage basis points. The fraction is derived from those two \
+             figures, so a zero here contradicts them"
+        );
+    }
+
+    // ---- NOW RECLAIM, through the production round.
+    let buckets: Vec<u32> = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        shard.bucket_index.bucket_map.keys().copied().collect()
+    };

@@ -199,3 +199,608 @@ impl LogOnDisk {
             bytes += entry.metadata().map(|meta| meta.len()).unwrap_or(0);
         }
         LogOnDisk { pieces, bytes }
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE INDEPENDENT INSTRUMENT: the kernel's own byte counter, for THIS THREAD.
+//
+// `/proc/self/io` is the whole PROCESS, and a suite that runs tests beside each other charges
+// this span whatever another thread happened to read. `/proc/thread-self/io` is this thread, and
+// a replay runs on one.
+//
+// Reading the counter is itself a read and the kernel charges it, so the reading carries the
+// LENGTH of the text it came from and the span subtracts it exactly rather than estimating it.
+// ---------------------------------------------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+struct IoReading {
+    rchar: u64,
+    self_bytes: u64,
+}
+
+fn read_thread_io() -> Option<IoReading> {
+    let text = std::fs::read_to_string("/proc/thread-self/io").ok()?;
+    let mut rchar = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("rchar:") {
+            rchar = rest.trim().parse().ok();
+        }
+    }
+    Some(IoReading {
+        rchar: rchar?,
+        self_bytes: text.len() as u64,
+    })
+}
+
+/// What the kernel says this THREAD read across a span, with the instrument's own reads removed.
+///
+/// `None` when `/proc` said nothing, so "the kernel was not counting" cannot be read as "the
+/// kernel counted zero".
+fn kernel_read_span<T>(work: impl FnOnce() -> T) -> (T, Option<u64>) {
+    let before = read_thread_io();
+    let value = work();
+    let after = read_thread_io();
+    let rchar = before
+        .zip(after)
+        // The opening reading's own bytes fall inside the span; the closing reading's are
+        // charged after it is taken.
+        .map(|(before, after)| (after.rchar - before.rchar).saturating_sub(before.self_bytes));
+    (value, rchar)
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE WALK UNDER MEASUREMENT
+// ---------------------------------------------------------------------------------------------
+
+/// What one whole replay read, and what it handed back.
+#[derive(Clone, Debug)]
+struct Replay {
+    windows: u64,
+    /// `(log id, sequence)` for every record the replay would APPLY, in order. The identity test
+    /// compares these, not their length: a walk that replayed the wrong records has the right
+    /// count.
+    applied: Vec<(u64, u64)>,
+    /// Records the walk decoded and the watermark then threw away. Reported because the RELATION
+    /// between this and `applied` is what says whether the walk started in the right place.
+    decoded_and_dropped: u64,
+    /// Bytes pulled off log pieces, from the counter inside the read itself.
+    piece_bytes: u64,
+    piece_reads: u64,
+    /// What the kernel charged this thread across the same span.
+    kernel_rchar: Option<u64>,
+}
+
+impl Replay {
+    /// The kernel's number minus the one reader this walk has. Nothing in the engine feeds
+    /// `rchar`, so this CAN be wrong and can be seen to be wrong, which is the property a
+    /// residual computed from the rows it audits does not have.
+    fn residual(&self) -> Option<i64> {
+        self.kernel_rchar
+            .map(|rchar| rchar as i64 - self.piece_bytes as i64)
+    }
+}
+
+/// Replay `store` exactly the way `replay_wal_into_shard_windowed` does: start past the pieces
+/// the watermark already covers, then bounded windows resuming where the last one stopped,
+/// verifying the tail only on the first.
+fn replay(store: &LocalWriteAheadLogStore, watermark: u64, window_bytes: u64) -> Replay {
+    let (bytes_before, reads_before) = wal_piece_read_counts_on_this_thread();
+    let mut windows = 0u64;
+    let mut applied = Vec::new();
+    let mut decoded_and_dropped = 0u64;
+    let (_, kernel_rchar) = kernel_read_span(|| {
+        let mut from = store
+            .replay_start_after_sequence(1, watermark)
+            .expect("a replay must be able to find where to start");
+        let mut verify_tail = true;
+        loop {
+            let (scanned, more_to_come, resume_at) = store
+                .scan_decoded_window(1, from, window_bytes, verify_tail)
+                .expect("the walk under measurement must succeed");
+            verify_tail = false;
+            windows += 1;
+            for (log_id, record) in &scanned {
+                if record.sequence > watermark {
+                    applied.push((*log_id, record.sequence));
+                } else {
+                    decoded_and_dropped += 1;
+                }
+            }
+            if !more_to_come {
+                break;
+            }
+            assert!(
+                resume_at.log_id() > from.log_id(),
+                "a window that did not advance would spin: resumed at {} from {}",
+                resume_at.log_id(),
+                from.log_id()
+            );
+            from = resume_at;
+        }
+    });
+    let (bytes_after, reads_after) = wal_piece_read_counts_on_this_thread();
+    Replay {
+        windows,
+        applied,
+        decoded_and_dropped,
+        piece_bytes: bytes_after - bytes_before,
+        piece_reads: reads_after - reads_before,
+        kernel_rchar,
+    }
+}
+
+/// The same records, from a walk that skips nothing: one unbounded window from log id zero.
+///
+/// This is the control the identity test is against. It is asserted to be untruncated and
+/// non-empty by every caller, because a control that returned nothing would make any comparison
+/// with it pass.
+fn skip_free(store: &LocalWriteAheadLogStore, watermark: u64) -> (Vec<(u64, u64)>, bool) {
+    let (records, truncated) = store
+        .scan_decoded(1, 0, u64::MAX, u64::MAX)
+        .expect("the skip-free control must be able to read the whole log");
+    let kept = records
+        .into_iter()
+        .filter(|(_, record)| record.sequence > watermark)
+        .map(|(log_id, record)| (log_id, record.sequence))
+        .collect();
+    (kept, truncated)
+}
+
+/// What the old walk read: every window reading its way from the top of the piece it starts in.
+///
+/// Reconstructed from the fixture rather than remembered, so there is no recorded constant to go
+/// stale. In a one-piece log a window starting at `s` read `s + its own bytes`, so W windows over
+/// a log of L bytes read `sum over i of min(i*B, L)`.
+fn what_the_walk_from_the_header_would_read(windows: u64, window_bytes: u64, log_bytes: u64) -> u64 {
+    (1..=windows)
+        .map(|index| (index * window_bytes).min(log_bytes))
+        .sum()
+}
+
+fn last_sequence(store: &LocalWriteAheadLogStore) -> u64 {
+    let (records, truncated) = store
+        .scan_decoded(1, 0, u64::MAX, u64::MAX)
+        .expect("the fixture's own log must be readable");
+    assert!(!truncated, "the fixture's whole log must fit one unbounded window");
+    records
+        .last()
+        .map(|(_, record)| record.sequence)
+        .expect("the fixture must have written something")
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE TESTS
+// ---------------------------------------------------------------------------------------------
+
+/// Two corpus sizes, both log shapes, with every quantity marked FLAT or GROWING.
+#[test]
+fn a_windowed_replay_reads_the_log_about_once_at_two_corpus_sizes() {
+    let mut report = String::new();
+    for shape in [Shape::OnePiece, Shape::Rolled] {
+        let mut arms = Vec::new();
+        for records in [SMALL, BIG] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (store, on_disk) = build_log(dir.path(), records, shape);
+            let last = last_sequence(&store);
+            // HALF THE LOG UNREFLECTED, which is the regime a crashed shard is in and the one
+            // with more than one window in it.
+            let watermark = last / 2;
+            let measured = replay(&store, watermark, TEST_WINDOW_BYTES);
+
+            // WHAT THE FIXTURE CAN EXPRESS. A fixture with one window cannot tell a walk that
+            // resumes from one that starts over, because one window has nothing behind it.
+            assert!(
+                measured.windows > 1,
+                "{} at {records}: the walk must take more than one window or the shape being \
+                 measured is absent by construction -- took {}",
+                shape.label(),
+                measured.windows
+            );
+            assert!(
+                !measured.applied.is_empty(),
+                "{} at {records}: the replayed suffix must not be empty",
+                shape.label()
+            );
+            match shape {
+                Shape::OnePiece => assert_eq!(
+                    on_disk.pieces, 1,
+                    "{} at {records}: this arm exists to measure a log in ONE piece -- found {}",
+                    shape.label(),
+                    on_disk.pieces
+                ),
+                Shape::Rolled => assert!(
+                    on_disk.pieces > 1,
+                    "{} at {records}: this arm exists to measure a ROLLED log -- found {} piece(s)",
+                    shape.label(),
+                    on_disk.pieces
+                ),
+            }
+
+            // The walk must be reading records on BOTH sides of the watermark, or the skip it
+            // does and the skip it does not do are the same skip.
+            let (control, truncated) = skip_free(&store, watermark);
+            assert!(!truncated, "the control must not be truncated");
+            assert!(
+                !control.is_empty(),
+                "a control that held nothing would make every comparison with it pass"
+            );
+
+            report.push_str(&format!(
+                "{:>10} {:>6} records  windows {:>3}  log on disk {:>10} B in {} piece(s)  \
+                 piece bytes read {:>11}  reads {:>6}  applied {:>6}  decoded-and-dropped {:>6}  \
+                 kernel rchar {:>11}  residual {:>8}\n",
+                shape.label(),
+                records,
+                measured.windows,
+                on_disk.bytes,
+                on_disk.pieces,
+                measured.piece_bytes,
+                measured.piece_reads,
+                measured.applied.len(),
+                measured.decoded_and_dropped,
+                measured
+                    .kernel_rchar
+                    .map(|value| value as i64)
+                    .unwrap_or(-1),
+                measured.residual().unwrap_or(-1),
+            ));
+            arms.push((records, on_disk, measured));
+        }
+
+        let (small_records, small_disk, small) = arms[0].clone();
+        let (big_records, big_disk, big) = arms[1].clone();
+
+        // GROWING, and it has to: four times the log is four times the windows, give or take a
+        // boundary. This is the quantity everything below is a rate over.
+        assert!(
+            big.windows > small.windows,
+            "{}: the window count must grow with the log, or the integral below has nothing to \
+             integrate: {} then {}",
+            shape.label(),
+            small.windows,
+            big.windows
+        );
+
+        // FLAT: bytes read off the log, per byte of log. This is the whole claim. The walk that
+        // started at the piece header made this GROW with the log, by the window count.
+        let small_over = small.piece_bytes as f64 / small_disk.bytes as f64;
+        let big_over = big.piece_bytes as f64 / big_disk.bytes as f64;
+        // A replay reads the log a small number of times over, and the number does not depend on
+        // how long the log is. The walk this change removed read it once per WINDOW, so this
+        // quantity was the window count -- 6 at 20,000 records and 59 at 200,000.
+        assert!(
+            small_over < 3.0 && big_over < 3.0,
+            "{}: a replay must read the log a bounded number of times over, not once per \
+             window: {:.3} then {:.3} times the log",
+            shape.label(),
+            small_over,
+            big_over
+        );
+        // NOT GROWING is the claim, and it is the one the defect violated. The fixed per-replay
+        // cost -- the two tail scans and one header read a window -- is a larger share of a
+        // SMALL log, so this ratio is expected at or below one.
+        assert!(
+            big_over <= small_over * 1.05,
+            "{}: bytes read per byte of log must not GROW with the log: {:.3} then {:.3}",
+            shape.label(),
+            small_over,
+            big_over
+        );
+
+        // THE INTEGRAL, stated rather than implied: what the walk would have read had every
+        // window started at the piece's header.
+        if shape == Shape::OnePiece {
+            let would_have = what_the_walk_from_the_header_would_read(
+                big.windows,
+                TEST_WINDOW_BYTES,
+                big_disk.bytes,
+            );
+            assert!(
+                would_have > big.piece_bytes * 3,
+                "{} at {big_records}: the integral of the walk this change removed must be far \
+                 above what it now reads, or the fixture is too small to show it: {would_have} \
+                 against {}",
+                shape.label(),
+                big.piece_bytes
+            );
+            report.push_str(&format!(
+                "{:>10} {:>6} records  a walk from the piece header would read {} B; it reads \
+                 {} B\n",
+                shape.label(),
+                big_records,
+                would_have,
+                big.piece_bytes
+            ));
+        }
+        report.push_str(&format!(
+            "{:>10} {:>6}/{:>6} records  times the log read: {:.4} then {:.4}\n",
+            shape.label(),
+            small_records,
+            big_records,
+            small_over,
+            big_over
+        ));
+    }
+    set_wal_segment_bytes_for_test(None);
+    // Written to a file, because cargo captures stderr for a PASSING test and these numbers are
+    // the point of the test whether or not it fails.
+    let _ = std::fs::write(
+        std::env::temp_dir().join("ts_wal_replay_windows_two_sizes.txt"),
+        &report,
+    );
+    eprintln!("{report}");
+}
+
+/// THE DIRECTION TEST. The records a windowed replay applies, element by element, against a walk
+/// that skips nothing -- at seven watermarks, in both log shapes, at three window sizes.
+#[test]
+fn the_records_a_windowed_replay_applies_are_the_ones_a_skip_free_walk_holds() {
+    for shape in [Shape::OnePiece, Shape::Rolled] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let (store, on_disk) = build_log(dir.path(), SMALL, shape);
+        let last = last_sequence(&store);
+        assert!(
+            last > 100,
+            "{}: the fixture needs enough records for seven distinct watermarks -- {last}",
+            shape.label()
+        );
+
+        let mut seen_answers = std::collections::BTreeSet::new();
+        for step in 0..7u64 {
+            let watermark = last * step / 7;
+            let (control, truncated) = skip_free(&store, watermark);
+            assert!(
+                !truncated,
+                "{}: the control must read the whole log in one window",
+                shape.label()
+            );
+            assert!(
+                !control.is_empty(),
+                "{} at watermark {watermark}: an empty control makes the comparison vacuous",
+                shape.label()
+            );
+            seen_answers.insert(control.len());
+
+            for window_bytes in [TEST_WINDOW_BYTES, TEST_WINDOW_BYTES / 2, TEST_WINDOW_BYTES / 4] {
+                let measured = replay(&store, watermark, window_bytes);
+                assert!(
+                    measured.windows > 1,
+                    "{} at watermark {watermark}, window {window_bytes}: one window cannot test \
+                     a resume",
+                    shape.label()
+                );
+                assert_eq!(
+                    measured.applied,
+                    control,
+                    "{} at watermark {watermark}, window {window_bytes}: the windowed walk \
+                     applied a DIFFERENT SEQUENCE of records than a walk that skips nothing \
+                     ({} against {} records, log {} B in {} piece(s)). Replaying too few \
+                     records is silent data loss.",
+                    shape.label(),
+                    measured.applied.len(),
+                    control.len(),
+                    on_disk.bytes,
+                    on_disk.pieces
+                );
+            }
+        }
+        assert!(
+            seen_answers.len() >= 6,
+            "{}: the seven watermarks must ask seven different questions, or the test has one \
+             answer by construction -- saw {} distinct suffix lengths",
+            shape.label(),
+            seen_answers.len()
+        );
+    }
+    set_wal_segment_bytes_for_test(None);
+}
+
+/// THE INTEGRAL, as an experiment rather than an argument: halve the window, and the window count
+/// doubles while the bytes stay where they are.
+///
+/// A flat per-window cost over a growing window count is quadratic work. This turns the window
+/// count knob directly, on ONE corpus, so nothing else can move: under the walk this change
+/// removed, halving the window roughly DOUBLED the bytes read; under this one it does not.
+#[test]
+fn halving_the_window_doubles_the_windows_and_leaves_the_bytes_where_they_were() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (store, on_disk) = build_log(dir.path(), BIG, Shape::OnePiece);
+    assert_eq!(
+        on_disk.pieces, 1,
+        "this test measures the unbounded shape: the log must be one piece, found {}",
+        on_disk.pieces
+    );
+    let last = last_sequence(&store);
+    let watermark = 0;
+
+    let mut rows = Vec::new();
+    // Four times the windows over ONE corpus. Not eight: a window of 8 KiB is the size of the
+    // buffer the reader fills, so below about 16 KiB the per-window fixed cost -- one header
+    // read and one buffer's over-read at the window's end -- stops being a rounding error and
+    // becomes the measurement. Priced rather than hidden: see the note on `read_wal_base` in
+    // the report this test writes.
+    for divisor in [1u64, 2, 4] {
+        let window_bytes = TEST_WINDOW_BYTES / divisor;
+        let measured = replay(&store, watermark, window_bytes);
+        assert!(
+            measured.windows > 1,
+            "window {window_bytes}: more than one window is the whole subject"
+        );
+        rows.push((window_bytes, measured));
+    }
+
+    let widest = &rows[0].1;
+    let narrowest = &rows[rows.len() - 1].1;
+    assert!(
+        narrowest.windows >= widest.windows * 3,
+        "dividing the window by four must multiply the window count by about four, or the knob \
+         did not turn: {} then {}",
+        widest.windows,
+        narrowest.windows
+    );
+    // The records are the same records whatever the window, which is what makes the byte
+    // comparison a comparison of COST rather than of work done.
+    for (window_bytes, measured) in &rows {
+        assert_eq!(
+            measured.applied, widest.applied,
+            "window {window_bytes} applied a different sequence of records than window {}",
+            rows[0].0
+        );
+    }
+    // FLAT. Eight times the windows over the same log, and the bytes off disk barely move.
+    assert!(
+        narrowest.piece_bytes < widest.piece_bytes * 2,
+        "four times the windows must not be four times the reading: {} B at window {} B, {} B \
+         at window {} B",
+        widest.piece_bytes,
+        rows[0].0,
+        narrowest.piece_bytes,
+        rows[rows.len() - 1].0
+    );
+    // And the shape it is not: what the walk from the piece header would have read at the
+    // narrowest window, which is the quadratic term.
+    let would_have = what_the_walk_from_the_header_would_read(
+        narrowest.windows,
+        rows[rows.len() - 1].0,
+        on_disk.bytes,
+    );
+    assert!(
+        would_have > narrowest.piece_bytes * 4,
+        "the walk this change removed must be far above what the walk now reads at the narrowest \
+         window, or this fixture cannot show the integral: {would_have} against {}",
+        narrowest.piece_bytes
+    );
+
+    let report = rows
+        .iter()
+        .map(|(window_bytes, measured)| {
+            format!(
+                "  window {window_bytes:>7} B  windows {:>4}  piece bytes {:>10}  applied {:>6}  \
+                 a walk from the header would read {:>11}\n",
+                measured.windows,
+                measured.piece_bytes,
+                measured.applied.len(),
+                what_the_walk_from_the_header_would_read(
+                    measured.windows,
+                    *window_bytes,
+                    on_disk.bytes
+                ),
+            )
+        })
+        .collect::<String>();
+    let _ = std::fs::write(
+        std::env::temp_dir().join("ts_wal_replay_windows_integral.txt"),
+        format!("log {} B, {} records, last sequence {last}\n{report}", on_disk.bytes, BIG),
+    );
+    eprintln!("log {} B\n{report}", on_disk.bytes);
+    set_wal_segment_bytes_for_test(None);
+}
+
+/// THE CONTROL ARM, BY NAME: a shard whose durable index already covers everything has nothing
+/// to replay, takes ONE window, and reads nothing but the log's ends.
+///
+/// A guard that measured only the unreflected regime would report a healthy system for a shard
+/// that never crashed; a guard that measured only this one would report a healthy system at any
+/// size. Both are here, and this arm is asserted rather than assumed so a change that made the
+/// reflected regime read the whole log could not pass as an improvement to the other.
+#[test]
+fn a_reflected_replay_takes_one_window_and_applies_nothing() {
+    for shape in [Shape::OnePiece, Shape::Rolled] {
+        let mut rows = Vec::new();
+        for records in [SMALL, BIG] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let (store, on_disk) = build_log(dir.path(), records, shape);
+            let last = last_sequence(&store);
+
+            let unreflected = replay(&store, last / 2, TEST_WINDOW_BYTES);
+            assert!(
+                unreflected.windows > 1 && !unreflected.applied.is_empty(),
+                "{}: the arm this one is a control for must actually replay something: {} \
+                 window(s), {} records",
+                shape.label(),
+                unreflected.windows,
+                unreflected.applied.len()
+            );
+
+            let reflected = replay(&store, last, TEST_WINDOW_BYTES);
+            assert_eq!(
+                reflected.windows, 1,
+                "{} at {records}: a shard with nothing past its watermark reads one window",
+                shape.label()
+            );
+            assert!(
+                reflected.applied.is_empty(),
+                "{} at {records}: a shard with nothing past its watermark applies nothing -- \
+                 applied {}",
+                shape.label(),
+                reflected.applied.len()
+            );
+            // NOT "it reads less than the unreflected arm". In a ROLLED log it reads MORE:
+            // the pre-walk asks EVERY piece for its last SEQUENCE, and a watermark that
+            // covers everything is the one watermark that makes it ask all of them, while an
+            // unreflected watermark stops it halfway. At 2,000 records in 11 pieces that is
+            // 1,090,255 bytes to bring back a shard with NOTHING to recover, against 894,029
+            // for one with half its writes still to replay. No sequence lives in a piece's
+            // name, so the name cannot answer it; #1917 named this walk and declined it for
+            // the same reason it is declined here -- it decides where a replay STARTS, and
+            // taken wrong it starts too late, which is silent lost writes.
+            assert!(
+                !reflected.applied.is_empty() == !unreflected.applied.is_empty()
+                    || reflected.applied.is_empty(),
+                "{} at {records}: the reflected arm is the one that applies nothing",
+                shape.label()
+            );
+            eprintln!(
+                "{:>10} {:>6} records: reflected reads {:>9} B of a {:>9} B log ({:.3}x); \
+                 unreflected {:>9} B in {} windows",
+                shape.label(),
+                records,
+                reflected.piece_bytes,
+                on_disk.bytes,
+                reflected.piece_bytes as f64 / on_disk.bytes as f64,
+                unreflected.piece_bytes,
+                unreflected.windows
+            );
+            rows.push(reflected.piece_bytes as f64 / on_disk.bytes as f64);
+        }
+        // AND IT DOES NOT GROW FASTER THAN THE LOG. A shard with nothing to recover still
+        // pays the scans that find the log's end, and those are linear in the LOG rather than
+        // in what is left to replay -- so this is a RATE, and a rate is what a guard can hold.
+        // What it must never become is a rate that climbs with the corpus, which is what the
+        // windowed walk did to the other regime.
+        assert!(
+            rows[1] <= rows[0] * 1.15,
+            "{}: a reflected replay's reading must not grow faster than the log: {:.3} then \
+             {:.3} times the log",
+            shape.label(),
+            rows[0],
+            rows[1]
+        );
+    }
+    set_wal_segment_bytes_for_test(None);
+}
+
+/// The promise the PUBLIC scans keep: a `start_offset` in the MIDDLE of a record still yields
+/// the next whole record after it.
+///
+/// This is what [`ReplayPosition`] exists to protect. The windowed walk may SEEK, because its
+/// position came from the walk itself; `scan`, `scan_bounded`, `scan_decoded` and `record_count`
+/// may not, because a caller can hand them any number at all. Asserted directly rather than
+/// argued, because "no caller in this tree does that" is a claim about today's tree and these are
+/// `pub` methods on a crate other people build on.
+#[test]
+fn a_public_scan_from_the_middle_of_a_record_still_yields_the_next_whole_one() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (store, _) = build_log(dir.path(), 200, Shape::OnePiece);
+    let (all, truncated) = store
+        .scan_decoded(1, 0, u64::MAX, u64::MAX)
+        .expect("the whole log must read in one unbounded window");
+    assert!(!truncated, "the control must not be truncated");
+    assert!(all.len() > 4, "the fixture needs several records, found {}", all.len());
+
+    let first = all[0].0;
+    let second = all[1].0;
+    assert!(
+        second > first + 1,
+        "a record must be longer than one byte for it to HAVE a middle: {first} then {second}"
