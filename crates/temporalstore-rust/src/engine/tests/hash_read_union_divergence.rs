@@ -83,3 +83,174 @@ fn load_on(engine: &TemporalEngine) {
     });
     assert!(
         response.status.ok,
+        "the fixture could not load shard 1: {:?}",
+        response.status
+    );
+}
+
+fn write(engine: &TemporalEngine, command: Command) {
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command,
+    });
+    assert!(response.status.ok, "the fixture write failed: {response:?}");
+}
+
+/// What the served path answers, as (field, value) pairs sorted so the comparison does not depend
+/// on either source's iteration order. A `HashMap`'s order is randomised per instance, so an
+/// ordered comparison here would be a flake with a plausible-looking message.
+fn served(engine: &TemporalEngine, key: &str) -> Vec<(String, Vec<u8>)> {
+    match engine
+        .execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::HashGetAll {
+                key: key.to_string(),
+            },
+        })
+        .response
+    {
+        CommandResponse::HashEntries { mut entries } => {
+            entries.sort();
+            entries
+        }
+        other => panic!("HashGetAll answered {other:?}"),
+    }
+}
+
+/// The counter, read off the report surface rather than off the static, so these tests exercise
+/// the plumbing a reader would actually use. If the field stops being published the tests stop
+/// compiling.
+fn divergences(engine: &TemporalEngine) -> u64 {
+    engine
+        .hash_read_divergence_report()
+        .index_named_fields_the_container_lacked
+}
+
+fn expected(fields: &[&str]) -> Vec<(String, Vec<u8>)> {
+    let mut out: Vec<(String, Vec<u8>)> = fields
+        .iter()
+        .map(|field| (field.to_string(), format!("value-of-{field}").into_bytes()))
+        .collect();
+    out.sort();
+    out
+}
+
+fn seed(engine: &TemporalEngine, fields: &[&str]) {
+    for field in fields {
+        write(
+            engine,
+            Command::HashSet {
+                key: PLANTED_KEY.to_string(),
+                field: field.to_string(),
+                value: format!("value-of-{field}").into_bytes(),
+            },
+        );
+    }
+}
+
+/// A FIELD THE PAGE INDEX NO LONGER NAMES IS STILL SERVED, AND NOTHING IS COUNTED.
+///
+/// RESTATED DOWN TO ITS ONE REMAINING DIRECTION, AND THE OTHER TWO WERE NOT DROPPED -- THEY ARE
+/// HELD ELSEWHERE. This was `the_hash_read_serves_both_sources_and_counts_what_only_the_index_names`
+/// and it ran three arms over one store: a negative control, a plant that takes a field off the
+/// CONTAINER and leaves it on the index, and a plant in the opposite direction. The first two are
+/// both about a field the INDEX names that the container lacks, and an entry has no field to name.
+/// So the divergence is unreachable BY CONSTRUCTION rather than absent by circumstance: the
+/// control's "the counter did not move" could only ever pass, and the plant's "the counter moved"
+/// could only ever fail -- which is how it failed, at "the divergence counter did not move (0 ->
+/// 0); a counter that is never seen to move is not evidence". Its own in-function comment had
+/// already diagnosed that and held the arm on "the ungated route". The one-entry-a-page flag is
+/// retired, so there is no ungated route left to hold it on.
+///
+/// THOSE TWO ARE HELD, WITH THE REASONS THAT MAKE THEM MEAN SOMETHING, BY
+/// `under_the_gate_a_hash_entry_names_no_field_so_the_divergence_is_unreachable` below: it asserts
+/// the zero TOGETHER WITH a live-entry floor, so the zero cannot be read as an empty store; that
+/// the field taken off the container is GONE from the served answer; and that no field named `""`
+/// is served, which is the phantom the collapse had to fix on the read path. Repeating them here
+/// would be two arms making one structural claim, one of them framed around a retired flag.
+///
+/// WHAT IS LEFT IS THE DIRECTION THAT STILL HAS TWO OUTCOMES, and it matters more now than it did.
+/// With the container the sole source of a hash's field names, an index entry marked deleted must
+/// lose NOTHING -- and this arm marks EVERY live entry of the object deleted, so the index names
+/// nothing live for it at all and the container is answering alone. It is not counted either,
+/// because this direction loses no read and counting it would make the figure unreadable as a risk
+/// number.
+///
+/// THE UNION IS ONE-SIDED NOW, AND THAT IS THE FINDING THIS ARM CARRIES. The module header still
+/// describes `HashGetAll` as serving the union of two sources. Its index half answers from
+/// `shard.hashes` -- it was one of the four consumers that had to move before the element name
+/// could come off the entry -- so the index contributes no NAMES, only the divergence observation
+/// that can no longer observe anything. What protects the single remaining source is
+/// `fold_hash_map_completeness`, which compares the durable map against the pages' own payloads.
+///
+/// rust-internal: drives the engine's own served path and its own report surface
+#[test]
+fn an_index_entry_marked_deleted_loses_no_field_and_is_not_counted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    let fields = ["alpha", "beta", "gamma"];
+    seed(&engine, &fields);
+    assert_eq!(
+        expected(&fields),
+        served(&engine, PLANTED_KEY),
+        "the fixture does not serve its own three fields, so nothing below means anything"
+    );
+
+    // THE DENOMINATOR, BEFORE THE PLANT. A plant that marked nothing would leave the answer
+    // trivially unchanged, and this arm would then be measuring an untouched store.
+    let live_before = live_hash_entries(&engine, PLANTED_KEY);
+    assert_eq!(
+        fields.len(),
+        live_before,
+        "the object holds {live_before} live index entries for {} fields written; every element \
+         gets its own page on the write path, so this arm is not in the state it says",
+        fields.len()
+    );
+
+    // THE PLANT: every live entry of the object marked deleted, so the index names nothing live for
+    // it. The blocks are untouched, so the container's own addresses still resolve.
+    //
+    // IT CANNOT SELECT BY FIELD NAME, AND IT NO LONGER NEEDS TO. It read
+    // `entry.component.as_deref() == Some(INDEX_PLANTED_FIELD)` and then, after the field left the
+    // entry, selected "the object's one live entry" on the belief that one entry a page meant one
+    // entry an OBJECT. It does not: each element is written to its own page, so this object holds
+    // three. Marking all of them is the stronger plant anyway -- it leaves the container answering
+    // with no help from the index at all -- and the count below pins it to exactly the three above
+    // rather than to whatever the walk happened to find.
+    let marked = {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard is loaded");
+        // THE HANDLES FIRST, THEN THE MARK. `BlockIndexMap` has no `values_mut` -- it is an enum
+        // over an inline entry and a sorted vector -- so the matching handles are collected under
+        // the read side of the walk and marked through `get_mut` one at a time.
+        let named = super::BlockObjects::of(&shard.bucket_index);
+        let targets: Vec<(u32, u64)> = shard
+            .bucket_index
+            .bucket_map
+            .iter()
+            .flat_map(|(routing_bucket, bucket)| {
+                bucket
+                    .block_index
+                    .iter()
+                    .filter(|(handle, block)| {
+                        !block.deleted
+                            && block.model_id.as_str() == "hash"
+                            && &**named.at(*routing_bucket, **handle) == PLANTED_KEY
+                    })
+                    .map(|(handle, _)| (*routing_bucket, *handle))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let mut marked = 0usize;
+        for (routing_bucket, handle) in targets {
+            let Some(bucket) = shard.bucket_index.bucket_map.get_mut(&routing_bucket) else {
+                continue;
+            };
+            let Some(block) = bucket.block_index.get_mut(&handle) else {
+                continue;
+            };
+            if !block.deleted {
+                block.deleted = true;
+                marked += 1;
