@@ -76,3 +76,81 @@ resource "aws_route_table" "public" {
   }
 
   tags = {
+    Name = "${var.name_prefix}-public-rt"
+  }
+}
+
+resource "aws_route_table_association" "public" {
+  subnet_id      = aws_subnet.public.id
+  route_table_id = aws_route_table.public.id
+}
+
+resource "aws_security_group" "nodes" {
+  name        = "${var.name_prefix}-nodes"
+  description = "TemporalStore node-to-node and outbound access"
+  vpc_id      = aws_vpc.this.id
+
+  tags = {
+    Name = "${var.name_prefix}-nodes"
+  }
+}
+
+resource "aws_security_group_rule" "nodes_self_all" {
+  type              = "ingress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  security_group_id = aws_security_group.nodes.id
+  self              = true
+  description       = "Allow all TemporalStore intra-cluster traffic"
+}
+
+resource "aws_security_group_rule" "ssh_admin_optional" {
+  count             = var.allowed_admin_cidr == "" ? 0 : 1
+  type              = "ingress"
+  from_port         = 22
+  to_port           = 22
+  protocol          = "tcp"
+  cidr_blocks       = [var.allowed_admin_cidr]
+  security_group_id = aws_security_group.nodes.id
+  description       = "Optional temporary SSH access"
+}
+
+resource "aws_security_group_rule" "monitoring_ui_optional" {
+  count             = var.allowed_monitoring_cidr == "" ? 0 : 1
+  type              = "ingress"
+  from_port         = 8088
+  to_port           = 8088
+  protocol          = "tcp"
+  cidr_blocks       = [var.allowed_monitoring_cidr]
+  security_group_id = aws_security_group.nodes.id
+  description       = "Optional TemporalStore monitoring UI access on metaserver"
+}
+
+resource "aws_security_group_rule" "nodes_egress_all" {
+  type              = "egress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  cidr_blocks       = ["0.0.0.0/0"]
+  ipv6_cidr_blocks  = ["::/0"]
+  security_group_id = aws_security_group.nodes.id
+  description       = "Allow outbound internet access for packages and SSM"
+}
+
+resource "aws_security_group" "efs" {
+  name        = "${var.name_prefix}-efs"
+  description = "TemporalStore EFS mount access"
+  vpc_id      = aws_vpc.this.id
+
+  tags = {
+    Name = "${var.name_prefix}-efs"
+  }
+}
+
+resource "aws_security_group_rule" "efs_from_nodes" {
+  type                     = "ingress"
+  from_port                = 2049
+  to_port                  = 2049
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.nodes.id

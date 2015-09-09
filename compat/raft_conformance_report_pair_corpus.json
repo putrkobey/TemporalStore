@@ -154,3 +154,159 @@
         "append_qps": 1200.0,
         "replication_p50_ms": 4.0,
         "replication_p95_ms": 11.0,
+        "replication_p99_ms": 19.0,
+        "apply_lag_max": 0,
+        "commit_lag_max": 0,
+        "follower_visible_lag_ms": 7,
+        "failover_recovery_ms": 45,
+        "snapshot_install_ms": 33,
+        "quorum_write_failures": 0,
+        "stale_read_count": 0
+      },
+      "behavior_evidence": {
+        "append_replication": {
+          "status": "passed",
+          "leader_append_index": 4096,
+          "replicated_to": [
+            11,
+            12,
+            13
+          ]
+        },
+        "quorum_write": {
+          "status": "passed",
+          "quorum_size": 2,
+          "ack_count": 3
+        },
+        "async_sync_apply": {
+          "status": "passed",
+          "async_applied_index": 4096,
+          "sync_applied_index": 4096
+        },
+        "follower_visibility": {
+          "status": "passed",
+          "visible_on_followers": [
+            12,
+            13
+          ],
+          "max_visibility_lag": 0
+        },
+        "leader_failover": {
+          "status": "passed",
+          "old_leader_id": 12,
+          "new_leader_id": 11
+        },
+        "replica_add_remove": {
+          "status": "passed",
+          "added": [
+            14
+          ],
+          "removed": [
+            12
+          ]
+        },
+        "learner_promotion": {
+          "status": "passed",
+          "learner_id": 14,
+          "promoted_to_voter": true
+        },
+        "snapshot_install": {
+          "status": "passed",
+          "snapshot_index": 3072,
+          "installed_on": [
+            12,
+            13
+          ]
+        },
+        "apply_lag_recovery": {
+          "status": "passed",
+          "max_lag_before": 128,
+          "max_lag_after": 0
+        },
+        "read_after_write_under_leader_change": {
+          "status": "passed",
+          "write_index": 4096,
+          "read_index_after_failover": 4096
+        }
+      }
+    },
+    "membership_events": [
+      {
+        "event": "add_voter",
+        "raft_group_id": "data:slot-0001",
+        "term": 7,
+        "membership_config": {
+          "voters": [
+            11,
+            12,
+            13
+          ],
+          "learners": []
+        }
+      }
+    ],
+    "leader_election_events": [
+      {
+        "event": "leader_elected",
+        "raft_group_id": "meta:default",
+        "leader_id": 1,
+        "term": 4,
+        "commit_index": 128,
+        "applied_index": 128
+      }
+    ],
+    "replication_metrics": {
+      "commit_index": 4096,
+      "applied_index": 4096,
+      "max_apply_lag": 0,
+      "stale_read_count": 0
+    },
+    "failover_metrics": {
+      "raft_failover_event": {
+        "status": "passed",
+        "old_leader_id": 10,
+        "new_leader_id": 11,
+        "term": 7
+      },
+      "failover_recovery_ms": 45
+    },
+    "snapshot_restore_metrics": {
+      "snapshot_index": 3072,
+      "snapshot_restore_ms": 33,
+      "checksum_match": true
+    },
+    "readiness": {
+      "status": "ready",
+      "topology_ready": true,
+      "metaserver_ready": true,
+      "data_node_ready": true
+    },
+    "parity_status": {
+      "feature_correct": true,
+      "performance_candidate": true,
+      "production_performance_parity": false
+    },
+    "test_matrix": {
+      "three_node_metaserver_raft": {
+        "status": "passed"
+      },
+      "three_node_data_node_raft": {
+        "status": "passed"
+      },
+      "combined_metaserver_data_node_raft": {
+        "status": "passed"
+      },
+      "leader_kill_restart": {
+        "status": "passed"
+      },
+      "follower_kill_restart": {
+        "status": "passed"
+      },
+      "add_replica": {
+        "status": "passed"
+      },
+      "remove_replica": {
+        "status": "passed"
+      },
+      "learner_catch_up": {
+        "status": "passed"
