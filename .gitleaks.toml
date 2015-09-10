@@ -1,0 +1,9 @@
+# gitleaks configuration for TemporalStore.
+# Default rule set plus a narrowly-scoped allowlist for verified non-secrets:
+#   - unit-test fixtures (fake api-key / hash strings inside test files)
+#   - local "onebox" test-deployment config tokens (not production)
+#   - public AWS resource identifiers in dated benchmark docs (EC2 instance IDs
+#     i-..., EBS volume IDs vol-...) which are public identifiers, not secrets
+# No production credentials are allowlisted. A full-history scan reports no leaks
+# with this config. The Governance workflow pins gitleaks to the version this
+# schema targets (see GITLEAKS_VERSION in .github/workflows/governance.yml).
