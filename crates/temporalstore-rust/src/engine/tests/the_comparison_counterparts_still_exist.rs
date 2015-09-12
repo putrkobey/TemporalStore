@@ -41,3 +41,91 @@
 //!     `compaction_watermark` a **position**, so a count *within* a retained window needs runs
 //!     tagged by position, which this store does not keep.
 //!   * `skipped_disabled_chunk_endpoints` — `enabled` comes from a **per-cycle parameter** the
+//!     caller passes, so there is no persistent per-shard setting to count.
+//!   * `reclaim_budget_limited_node_count` — `budget_exhausted` is a **transient round outcome**
+//!     nothing retains, so reporting it from the status would mean inventing retained state for it.
+//!
+//! The last two are *not reportable from the status*, which is different from missing: their right
+//! home is the cycle report path, where the outcome lives.
+//!
+//! All three of their names appear in that surface only as string keys in a flat `fields` map, so
+//! none of their definitions could be read either — which is its own useful fact: **a name in a
+//! metric dictionary is not a schema field**, and 14 of the names here are that.
+//!
+//! rust-internal: reads this crate's own source, no product behaviour
+
+/// (what it answers, our file, our field or pair, a note on the pairing)
+const COUNTERPARTS: &[(&str, &str, &str, &str)] = &[
+    (
+        "records eligible for compaction before a budget cut in",
+        "engine/engine_reports.rs",
+        "removable_records_before_budget",
+        "the eligible count, which is what a compactable count is before the round is bounded",
+    ),
+    (
+        "records a compaction round actually removed",
+        "engine/engine_reports.rs",
+        "records_removed",
+        "on the index-log GC report: the log is where a change record lives here",
+    ),
+    (
+        "records a transaction-log compaction removed",
+        "data_node.rs",
+        "index_log_records_removed",
+        "the same quantity reported on the GC response rather than the stage report",
+    ),
+    (
+        "tombstones a compaction could drop",
+        "engine/engine_reports.rs",
+        "delete_marked_object_ids_before",
+        "delete-marked ids are this tree's tombstones; `_after` beside it gives the dropped count",
+    ),
+    (
+        "tombstones a compaction did drop",
+        "engine/engine_reports.rs",
+        "delete_marked_object_ids_after",
+        "the second half of that pair -- before minus after is the drop",
+    ),
+    (
+        "the best candidate's recoverable bytes",
+        "control.rs",
+        "best_compaction_candidate_bytes",
+        "the first candidate a ratio-ordered pipeline would take is the best one",
+    ),
+    (
+        "the best candidate's discard ratio",
+        "control.rs",
+        "best_compaction_candidate_ratio_ppm",
+        "recoverable over the slab's live-plus-pending bytes, which is what a min-ratio gate reads",
+    ),
+    (
+        "ranges on the candidate slabs",
+        "control.rs",
+        "compaction_candidate_range_count",
+        "the count beside the bytes: across how many holes the recovery is spread",
+    ),
+    (
+        "candidate slabs emitted by a reclaim pass",
+        "control.rs",
+        "compaction_candidate_slabs",
+        "how many slabs a pass would offer, which is what an emitted-candidate count is",
+    ),
+    (
+        "whether the round was cut short by its budget",
+        "engine/engine_reports.rs",
+        "budget_exhausted",
+        "paired with blocks_left_by_budget and bytes_left_by_budget on the compaction report",
+    ),
+    (
+        "blocks and bytes a budget left behind",
+        "engine/engine_reports.rs",
+        "blocks_left_by_budget",
+        "the skipped-by-budget quantity, named for what was left rather than what was skipped",
+    ),
+];
+
+/// Named, and deliberately not mapped.
+const UNRESOLVED: &[(&str, &str)] = &[
+    (
+        "skipped_disabled_chunk_endpoints",
+        "a count of participants with reclaim disabled. `StorageIndexGcReport::enabled` is assigned \
