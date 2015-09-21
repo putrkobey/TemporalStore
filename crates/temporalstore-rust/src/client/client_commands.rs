@@ -127,3 +127,132 @@ pub(super) fn command_key(command: &Command) -> Option<&str> {
         | Command::ContextQuerySummaries { .. }
         | Command::ContextQuerySummaryVectors { .. }
         | Command::ContextWriteCompressionEvent { .. }
+        | Command::ContextQueryCompressionEvents { .. }
+        | Command::ContextCompressEvents { .. }
+        | Command::ContextResourceBlobBegin { .. }
+        | Command::ContextResourceBlobAppend { .. }
+        | Command::ContextResourceBlobCommit { .. }
+        | Command::ContextResourceBlobPut { .. }
+        | Command::ContextResourceBlobFetch { .. }
+        | Command::ContextResourceBlobSweep { .. }
+        | Command::ContextQueryNodeContext { .. } => None,
+    }
+}
+
+pub(crate) fn command_routing_key(command: &Command) -> Option<String> {
+    command_key(command)
+        .map(str::to_string)
+        .or_else(|| context_command_key(command))
+}
+
+pub(super) fn context_command_key(command: &Command) -> Option<String> {
+    match command {
+        Command::ContextUpsertNode { tenant_hash, node } => {
+            Some(context_node_key(*tenant_hash, node.node_hash))
+        }
+        Command::ContextGetNode {
+            tenant_hash,
+            node_hash,
+        } => Some(context_node_key(*tenant_hash, *node_hash)),
+        Command::ContextGetNodes {
+            tenant_hash,
+            node_hashes,
+        } => node_hashes
+            .first()
+            .map(|node_hash| context_node_key(*tenant_hash, *node_hash)),
+        Command::ContextQuerySummaryVectors {
+            tenant_hash,
+            node_hashes,
+            level,
+            ..
+        } => node_hashes
+            .first()
+            .map(|node_hash| context_summary_key(*tenant_hash, *node_hash, *level)),
+        Command::ContextWriteEvent {
+            tenant_hash,
+            node_hash,
+            ..
+        }
+        | Command::ContextWriteExtractedEvent {
+            tenant_hash,
+            node_hash,
+            ..
+        }
+        | Command::ContextQueryEvents {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_event_key(*tenant_hash, *node_hash)),
+        Command::ContextWriteIndexRef {
+            tenant_hash,
+            index_name,
+            index_value_hash,
+            scope_hash,
+            ..
+        }
+        | Command::ContextQueryIndex {
+            tenant_hash,
+            index_name,
+            index_value_hash,
+            scope_hash,
+            ..
+        } => Some(context_index_key(
+            *tenant_hash,
+            index_name,
+            *index_value_hash,
+            *scope_hash,
+        )),
+        Command::ContextQueryIndexIntersection {
+            tenant_hash,
+            predicates,
+            ..
+        } => predicates.first().map(|predicate| {
+            context_index_key(
+                *tenant_hash,
+                &predicate.index_name,
+                predicate.index_value_hash,
+                predicate.scope_hash,
+            )
+        }),
+        Command::ContextWritePackAudit { tenant_hash, audit } => {
+            Some(context_audit_key(*tenant_hash, audit.session_hash))
+        }
+        Command::ContextQueryPackAudit {
+            tenant_hash,
+            session_hash,
+            ..
+        } => Some(context_audit_key(*tenant_hash, *session_hash)),
+        Command::ContextMarkSummaryDirty {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_dirty_key(*tenant_hash, *node_hash)),
+        Command::ContextQuerySummaryDirty {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_dirty_key(*tenant_hash, *node_hash)),
+        Command::ContextMarkEmbeddingDirty {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_embedding_dirty_key(*tenant_hash, *node_hash)),
+        Command::ContextQueryEmbeddingDirty {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_embedding_dirty_key(*tenant_hash, *node_hash)),
+        Command::ContextUpsertEntity {
+            tenant_hash,
+            entity,
+        } => Some(context_entity_key(
+            *tenant_hash,
+            entity.node_hash,
+            entity.entity_hash,
+        )),
+        Command::ContextGetEntity {
+            tenant_hash,
+            node_hash,
+            entity_hash,
+        } => Some(context_entity_key(*tenant_hash, *node_hash, *entity_hash)),
+        Command::ContextQueryEntities {

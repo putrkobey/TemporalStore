@@ -41,25 +41,3 @@ const win = {
   Number, JSON, String, Math, Date, TextDecoder: function () {}, AbortController: function () {},
   fetch: () => Promise.reject(new Error("no network in this harness"))
 };
-win.window = win;
-
-const run = new Function("window", "document", "setTimeout", "sessionStorage", "fetch",
-                         "AbortController", "TextDecoder", source);
-run(win, win.document, win.setTimeout, win.sessionStorage, win.fetch,
-    win.AbortController, win.TextDecoder);
-
-if (typeof win.__matrixarkLiveFrame !== "function") {
-  throw new Error("the strip did not expose __matrixarkLiveFrame");
-}
-
-function snapshot() {
-  return {
-    stripHidden: els.liveStrip.hidden,
-    enc: els.liveEnc.hidden ? null : els.liveEnc.innerHTML,
-    encClass: els.liveEnc.className,
-    imp: els.liveImp.hidden ? null : els.liveImp.innerHTML,
-    impClass: els.liveImp.className,
-    req: els.liveReq.hidden ? null : els.liveReq.innerHTML,
-    reqClass: els.liveReq.className,
-    warn: els.liveWarn.hidden ? null : els.liveWarn.innerHTML,
-    dot: els.liveDot.className
