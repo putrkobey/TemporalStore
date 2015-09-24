@@ -25,30 +25,3 @@
           <p class="lead">
             The exporter converts service `/vars` endpoints into Prometheus text format with
             source labels for metaserver and data-node attribution.
-          </p>
-        </div>
-        <a class="button primary" href="../temporalstore-vars.prom">Open raw metrics</a>
-      </section>
-
-      <section class="split wide-left">
-        <article class="panel">
-          <div class="panel-head">
-            <div>
-              <p class="eyebrow">Live Samples</p>
-              <h2>Scrape status</h2>
-            </div>
-            <button class="button" type="button" data-refresh-prom>Refresh</button>
-          </div>
-          <div class="prom-grid" data-prom-grid></div>
-        </article>
-        <article class="panel">
-          <p class="eyebrow">Usage</p>
-          <h2>Pull from Prometheus</h2>
-          <pre class="code-block">curl http://35.92.109.186:8088/temporalstore-vars.prom</pre>
-          <p class="muted">
-            Current live targets are TemporalStore metaserver, data01, and data02. MatrixDB and
-            MatrixKV should be added with the same source-label pattern when their exporters are enabled.
-          </p>
-        </article>
-      </section>
-
