@@ -26,17 +26,3 @@ function ok(what, condition, detail) {
   else { console.log("FAIL " + what + (detail ? "\n     " + detail : "")); failures += 1; }
 }
 
-const base = { target: "embedding", ok: true, latency_ms: 12, url: "http://127.0.0.1:8400/v1" };
-
-const agreed = probeHtml(Object.assign({}, base, {
-  response: { model: "all-MiniLM-L6-v2", dimensions: 384,
-              requested_model: "all-MiniLM-L6-v2", model_matches_request: true },
-}));
-ok("a model that matches reads as ok", />ok</.test(agreed), agreed);
-ok("and is not styled as a problem", !/class="probe bad"/.test(agreed), agreed);
-
-const differs = probeHtml(Object.assign({}, base, {
-  response: { model: "all-MiniLM-L6-v2", dimensions: 384,
-              requested_model: "text-embedding-3-small", model_matches_request: false },
-}));
-ok("a different model is not reported as ok", !/>ok</.test(differs), differs);
