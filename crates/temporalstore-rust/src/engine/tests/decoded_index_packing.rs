@@ -215,3 +215,111 @@ fn a_decode_puts_back_exactly_the_series_that_were_encoded() {
             shard.control_state(), decoded.control_state(),
             "{label}: the control-state series must come back entry for entry"
         );
+        assert_eq!(
+            shard.expires_at_ms(), decoded.expires_at_ms(),
+            "{label}: the expiry map must come back entry for entry"
+        );
+        assert_eq!(
+            shard.sets, decoded.sets,
+            "{label}: the set members must come back entry for entry"
+        );
+        assert_eq!(
+            shard.zsets, decoded.zsets,
+            "{label}: the zset members must come back entry for entry"
+        );
+        // THE STORED BYTES DO NOT MOVE, as bytes rather than as a sentence. A repack changes
+        // which node an entry sits in; an encode walks the entries in key order, which is the
+        // same order either way. Re-encoding what came back must reproduce the input exactly --
+        // that is what says this carries no index-format stamp.
+        // THE STORED BYTES DO NOT MOVE -- proven on ONE state, which is the only way it can be
+        // proven here.
+        //
+        // The obvious test, "re-encode what came back and compare against the input", cannot
+        // decide this: an index's `strings` map is a `HashMap`, which serializes in TABLE order,
+        // and two `HashMap`s carrying identical entries iterate differently because each instance
+        // seeds its own hasher. Two decodes of the SAME bytes therefore re-encode to two different
+        // byte strings of the same length, before any change of ours. (Measured: 184,645 bytes
+        // either way, first differing at byte 83, inside `strings`, which this pass does not
+        // touch.) An assertion against the input bytes would have failed on a property of the
+        // encoder and been read as this change moving the stored form.
+        //
+        // So the subject is a SINGLE state, encoded before and after the repack. Its `HashMap`
+        // tables are untouched -- the repack reaches values through `values_mut` and never
+        // reinserts a key -- so table order is held fixed and the only thing that could differ is
+        // what the repack does. It does nothing: a `BTreeMap` serializes in KEY order, and the
+        // repack changes which node an entry sits in, never which key it is under.
+        if label == "container" {
+            let mut subject = crate::engine::decode_index_bytes_inner(&bytes)
+                .expect("the container index decodes without the repack");
+            let before = crate::engine::encode_index_bytes(&subject);
+            crate::engine::state::repack_decoded_btrees(&mut subject);
+            let after = crate::engine::encode_index_bytes(&subject);
+            assert_eq!(
+                before, after,
+                "{label}: repacking one state changed the bytes it encodes to, so the stored form \
+                 moved and this needs an index-format stamp"
+            );
+            // And again, to say the pass is idempotent: a second decode of a repacked store, or a
+            // repack reached twice down two paths, must not keep changing the answer.
+            crate::engine::state::repack_decoded_btrees(&mut subject);
+            assert_eq!(
+                before,
+                crate::engine::encode_index_bytes(&subject),
+                "{label}: repacking twice is not the same as repacking once"
+            );
+        }
+        // And the ORDER, not only the contents: a repack that sorted differently would still
+        // compare equal as a map while handing every range read a different answer.
+        let encoded_order: Vec<u64> = shard
+            .features()
+            .get("f0")
+            .expect("the first series is seeded")
+            // `points()` rather than a key view: the trait has none, and the ORDER this test
+            // asserts is exactly what `points()` promises, so it is the correct method here and
+            // not merely the available one.
+            .points()
+            .map(|(at, _)| at)
+            .collect();
+        let decoded_order: Vec<u64> = decoded
+            .features()
+            .get("f0")
+            .expect("the first series decodes")
+            .points()
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            encoded_order, decoded_order,
+            "{label}: the series must iterate in the same order it was written in"
+        );
+    }
+}
+
+// =================================================================================================
+// FOOTPRINT: what the tree shape costs, against the same entries packed in one go.
+// =================================================================================================
+
+/// What a decoded series costs against the same entries packed in one go, at three sizes.
+///
+/// Three sizes rather than one, because a single reading cannot tell a per-entry cost from a
+/// fixed one -- and the whole claim here is that the cost is per entry.
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "seeds three corpora under the counting allocator; run by name"]
+fn what_a_decoded_series_costs_against_one_packed_in_one_go() {
+    let mut rows: Vec<(usize, f64, f64, f64)> = Vec::new();
+    for series_points in [250usize, 1_000, 4_000] {
+        let (container, _plain, seeded_points, seeded_list) = encoded_index(400, 4, series_points);
+        assert_eq!(
+            4 * series_points,
+            seeded_points,
+            "denominator: every seeded point must be in the map before it is encoded"
+        );
+        assert_eq!(64, seeded_list, "denominator: the list entries are seeded");
+
+        let decoded =
+            crate::engine::decode_index_bytes(&container).expect("the container index decodes");
+        let decoded_points: usize = decoded.features().values().map(|s| s.len()).sum();
+        assert_eq!(
+            seeded_points, decoded_points,
+            "denominator: the decode must put every point back, or the ratio below divides by the \
+             wrong number"
