@@ -890,3 +890,449 @@ fn a_handle_for_the_component_costs_a_table_entry_per_block() {
         );
         assert!(
             cost.chunk_bytes >= cost.request_bytes,
+            "{label}: chunk column below request column"
+        );
+        assert!(cost.blocks > 0, "{label}: no pages measured");
+    }
+
+    // --- BOTH POPULATIONS MUST BE REACHED, or the verdict is decided by the fixture. ---
+    let schema: Vec<&(String, TableCost, BlocksPerObject)> = rows
+        .iter()
+        .filter(|(label, _, _)| label.starts_with("containers of 100"))
+        .collect();
+    let content: Vec<&(String, TableCost, BlocksPerObject)> = rows
+        .iter()
+        .filter(|(label, _, _)| label.starts_with("one container of 2000"))
+        .collect();
+    assert_eq!(2, schema.len(), "the repeated-schema arm runs at both ranges");
+    assert_eq!(2, content.len(), "the unique-name arm runs at both ranges");
+
+    // --- THE SCHEMA POPULATION: names repeat, so the table is small and the handle PAYS. ---
+    for (label, cost, _) in &schema {
+        assert!(
+            cost.entries_per_block() < 0.5,
+            "{label}: {} distinct components over {} pages. This arm exists to hold a REPEATED \
+             schema -- the same hundred field names across forty objects -- so distinct names are \
+             supposed to be far fewer than pages",
+            cost.entries,
+            cost.blocks
+        );
+        assert!(
+            cost.resident_per_block() < SAVED,
+            "{label}: the table holds {:.2} B a page against {SAVED} B saved, so a handle is \
+             supposed to PAY where the names repeat",
+            cost.resident_per_block()
+        );
+    }
+
+    // --- THE CONTENT-DERIVED POPULATION: one name per page, and the handle LOSES. ---
+    for (label, cost, _) in &content {
+        assert!(
+            cost.entries_per_block() > 0.9,
+            "{label}: {} distinct components over {} pages. This arm exists to hold names that do \
+             NOT repeat -- one container whose two thousand members are all distinct -- so the \
+             table is supposed to hold about one entry per page",
+            cost.entries,
+            cost.blocks
+        );
+        assert!(
+            cost.resident_per_block() > SAVED,
+            "{label}: the table holds {:.2} B a page against {SAVED} B saved, so a handle is \
+             supposed to LOSE where every name is distinct",
+            cost.resident_per_block()
+        );
+    }
+
+    println!(
+        "\n  VERDICT, BY POPULATION. Where a component name is a repeated SCHEMA name the table \n\
+           holds {:.2} B a page and a handle nets {:+.2}. Where it is CONTENT-DERIVED -- a zset \n\
+           member, a timestamped entry -- it holds {:.2} B a page and a handle nets {:+.2}. A \n\
+           single blended figure would hide that, and the second population is the one a \n\
+           container store is mostly made of.",
+        schema[0].1.resident_per_block(),
+        SAVED - schema[0].1.resident_per_block(),
+        content[0].1.resident_per_block(),
+        SAVED - content[0].1.resident_per_block(),
+    );
+}
+
+/// THE COMPONENT NAME IS HEX TEXT FOR NUMBERS, AND HALF OF IT CARRIES NOTHING.
+///
+/// A separate and larger term than the pointer, measured separately because it is a separate
+/// change: it needs no table, no ordinal and no map. `{biased:016x}` is sixteen characters for
+/// eight bytes and `hex::encode(member)` is exactly twice its input, so a zset member of twenty
+/// bytes becomes a fifty-six character name where twenty-eight bytes would do.
+///
+/// COUNTED OVER A REAL STORE and classified by a predicate that a hash FIELD fails -- a field is
+/// the caller's own text and is not an encoding of anything, which is what stops this reporting a
+/// saving on names that have none.
+#[test]
+#[ignore = "seeds two stores; run by name"]
+fn the_component_name_is_hex_text_for_numbers_and_that_half_is_measured() {
+    let mut rows: Vec<(String, BlocksPerObject)> = Vec::new();
+    let mut path_lengths: Vec<usize> = Vec::new();
+    for (range_label, end) in [
+        ("whole keyspace", WHOLE_KEYSPACE_END),
+        ("operator 1023", OPERATOR_END),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        path_lengths.push(dir.path().as_os_str().len());
+        let engine = probe_engine(dir.path());
+        load_shard_over(&engine, end);
+        // Sets and zsets produce hex component names; hash fields are the caller's own short
+        // text. Both, so the classifier is exercised in both directions in the same store and a
+        // predicate that matched everything would fail below.
+        seed_wide_members(&engine, 4, 100);
+        let measured = blocks_per_object(&engine);
+        measured.report(&format!("hex component census, {range_label}"));
+        rows.push((range_label.to_string(), measured));
+    }
+    for length in &path_lengths {
+        assert_eq!(path_lengths[0], *length, "the store path length moved between arms");
+    }
+
+    for (label, measured) in &rows {
+        assert!(
+            measured.component_name_bytes > 0,
+            "{label}: no component text at all, so the ratio below is free"
+        );
+        // BOTH directions of the predicate must be reached, or it is not discriminating.
+        assert!(
+            measured.hex_components > 0,
+            "{label}: the predicate classified NO component as a hex spelling, and this fixture \
+             seeds zsets and lists which produce them"
+        );
+        assert!(
+            measured.hex_component_name_bytes < measured.component_name_bytes,
+            "{label}: the predicate classified EVERY component byte as hex, and this fixture also \
+             seeds hash fields, which are the caller's own text. A predicate that matches \
+             everything is not measuring anything"
+        );
+        let hex_share =
+            measured.hex_component_name_bytes as f64 / measured.component_name_bytes as f64;
+        println!(
+            "  {label}: {:.1}% of component text is a hex spelling of numbers; storing those as \
+             bytes would halve {} B to {} B",
+            100.0 * hex_share,
+            measured.hex_component_name_bytes,
+            measured.hex_component_name_bytes / 2
+        );
+    }
+}
+
+// =================================================================================================
+// LAYOUT. What each name's handle does to the entry, and to the component level around it.
+// =================================================================================================
+
+// `mod ordinal_layout` AND `an_ordinal_does_not_cost_the_component_list_its_tag` WERE HERE.
+//
+// They measured whether replacing `ComponentBlocks`'s component NAME with a two-byte ordinal would
+// cost `ComponentList` the tag that rode the name's niche. Mirror types with `NonZeroU16`,
+// `NonZeroU32` and a plain-integer control priced the three candidates, and the answer was that an
+// ordinal makes the level smaller rather than larger.
+//
+// THE NARROWING THEY WERE CLEARING THE WAY FOR IS SUPERSEDED, AND BY A STRONGER RESULT. The field
+// is not two bytes now, it is zero: `ComponentBlocks` and `ComponentList` are deleted and an
+// object's refs hang directly off the object. Deleting the name beats narrowing it, so there is no
+// decision left for this measurement to inform.
+//
+// AND A MECHANICAL REWRITE WOULD HAVE BEEN WORSE THAN A DELETION. Two of its arms -- wrapper width
+// equals entry width, and the sentinel control equals the `NonZero` one -- still COMPILE after the
+// deletion, because both of their operands are mirror types declared in this file. They would have
+// become assertions about rustc's layout rules over types this crate does not ship: green forever,
+// measuring nothing. The two arms that lose an operand would have been repaired by substituting
+// the pinned literal 40, which makes both sides constants fixed by declarations in this same file.
+// The comment that stood at the pins said they were "pinned so a change to `BlockRefs` cannot make
+// this test vacuous" -- a guard that protects nothing once the left-hand side is local too.
+
+/// THE ENTRY IS 72 BYTES AND ITS RECONSTRUCTION IS ASSERTED, NOT ITS TOTAL.
+///
+/// A literal 72 goes stale silently the next time a field moves. What is asserted here is that the
+/// fields ACCOUNT for the number: the eight-aligned group plus one rounding of the tail.
+///
+/// AND WHAT EACH OF THE THREE NAMES WOULD BE WORTH, measured on mirrors rather than projected, so
+/// the remaining two verdicts are stated against the same arithmetic as the one that shipped.
+#[test]
+fn every_byte_of_the_entry_is_accounted_for_by_the_fields_it_holds() {
+    use std::mem::{align_of, offset_of, size_of};
+
+    let address = size_of::<crate::block_store::ElementEntry>();
+    let model = size_of::<StoredModelKind>();
+    // THE WIDTH THE KEY USED TO COST, kept as a counterfactual beside `component`'s for the
+    // same reason: the verdicts below are stated against what each of the three names WOULD be
+    // worth, and that arithmetic needs the term even though no field carries it.
+    let object_key_when_it_was_a_field = size_of::<Arc<str>>();
+    // `component` IS NO LONGER A FIELD OF THE ENTRY. The local is kept as the WIDTH THE NAME USED
+    // TO COST, because the verdicts below are stated against that arithmetic -- what each of the
+    // three names would be worth -- and it is now a counterfactual rather than a measurement.
+    let component_when_it_was_a_field = size_of::<Option<Arc<str>>>();
+    // TWO FLAG BYTES, NOT THREE, AND THE ROUNDING HID THE THIRD.
+    //
+    // This read `3usize`. The entry holds `dirty` and `deleted` and nothing else -- `log_backed`
+    // is an accessor over the address, not a field -- so the tail is two bytes. The
+    // reconstruction below went on passing anyway: a tail of three and a tail of four both round
+    // to one word, so the sum reached the same width either way. That is the same word-granularity
+    // blindness `entry_width_at_each_step` documents for its own mirror and
+    // `an_assigned_durable_id_defeats_ground_one_only` carried in four of them.
+    //
+    // SPELLED AS THE TYPES, so a flag that stops being a `bool` fails here instead of leaving a
+    // literal right by luck.
+    let flags = size_of::<bool>() + size_of::<bool>();
+
+    println!("\n=== BlockIndex, field by field ===");
+    println!("  offsets: address@{} model_id@{} dirty@{} deleted@{}",
+        offset_of!(BlockIndex, address),
+        offset_of!(BlockIndex, model_id),
+        offset_of!(BlockIndex, dirty),
+        offset_of!(BlockIndex, deleted),
+    );
+    println!(
+        "  address {address} + model_id {model} + flags {flags} = {} bytes of field in {} B \
+         (the key would have added {object_key_when_it_was_a_field} more and a name \
+          {component_when_it_was_a_field} on top of that)",
+        address + model + flags,
+        size_of::<BlockIndex>()
+    );
+
+    assert_eq!(1, model, "the model spelling is supposed to be one byte");
+    assert_eq!(8, align_of::<BlockIndex>());
+
+    // THE RECONSTRUCTION. The 8-aligned fields form the group; the model byte and the three
+    // flag bytes are the tail, and the tail is rounded once to the alignment.
+    //
+    // ONE 8-ALIGNED FIELD NOW. `component` was one of three and went at 56 -> 40; `object_key`
+    // was the second and goes at 40 -> 24; the address is what is left. The reconstruction is what
+    // proves the arithmetic rather than the comment -- if the field set and this sum part, it
+    // fails here.
+    let eight_aligned = address;
+    let tail = model + flags;
+    let round_up = |value: usize, to: usize| (value + to - 1) / to * to;
+    assert_eq!(
+        eight_aligned + round_up(tail, align_of::<BlockIndex>()),
+        size_of::<BlockIndex>(),
+        "the fields do not account for the structure: group {eight_aligned} + tail {tail} rounded \
+         to {} is not {}",
+        align_of::<BlockIndex>(),
+        size_of::<BlockIndex>()
+    );
+    // 56 AND NOT 64: the address inside the entry shed its object id, a whole eight-byte field in
+    // the eight-aligned group. The accounting above is a RECONSTRUCTION and needed no change for it
+    // -- which is the point of reconstructing rather than totalling -- but this literal did, and
+    // NOTHING BUT RUNNING IT COULD HAVE SAID SO. That sentence was already here for the 72 -> 64
+    // step and it earned itself again: a scan for `const _: () = assert!(size_of...)` does not see
+    // an `assert_eq!` in a test body, so this pin compiled clean and failed at run time.
+    // TWENTY-FOUR NOW, AND THE SENTENCE ABOVE EARNED ITSELF A FOURTH TIME. It was written for
+    // the 72 -> 64 step, repeated for 64 -> 56, again for 56 -> 40, and this is 40 -> 24: the
+    // RECONSTRUCTION above needed no change, which is the point of reconstructing rather than
+    // totalling, and this literal did. `cargo check` cannot see an `assert_eq!` in a test body,
+    // so the pin compiled clean and only running it said so.
+    assert_eq!(24, size_of::<BlockIndex>());
+    // THE `!= 39` AND `!= 41` PARTNERS THAT STOOD HERE ARE GONE. They could distinguish no
+    // case. The `assert_eq!` above panics first, so on the only change that could ever have
+    // fired them they were never reached -- and an assertion that never ran reads exactly like
+    // one that passed. The claim they reached for, that 40 is a value and not a bound, is
+    // carried by `align_of::<BlockIndex>() == 8` earlier in this function, which a width pin
+    // does NOT entail: `== 40` is equally true at align 1, 2, 4 and 8.
+
+    // The slack, which is why every step here is sixteen bytes and not twelve.
+    let slack = size_of::<BlockIndex>() - (eight_aligned + tail);
+    println!(
+        "  slack {slack} B -- the three flag bytes and the model byte share the rounding, which is \
+         why swapping a 16-byte pointer for a small field takes the STRUCTURE down a whole \
+         eight-byte step and then some"
+    );
+    assert!(slack < 8, "a slack of {slack} means a whole word is unaccounted for");
+
+    // AND THE MAP ARM, WHICH NO LONGER CARRIES THE ENTRY INLINE.
+    //
+    // This used to assert `BlockIndexMap == 8 + size_of::<BlockIndex>()` -- a handle plus an inline
+    // entry -- and that was the relation that made narrowing the entry worth a word off every
+    // `BucketNode` in the `BucketMap`. The single-page arm now holds a POINTER, so the page index is
+    // a bare container header and its width is INDEPENDENT of the entry's.
+    //
+    // WHICH MEANS THE NARROWING MEASURED ABOVE IS STILL WORTH SOMETHING, BUT SOMEWHERE ELSE: on the
+    // HEAP rather than in the node. Every boxed single-page arm and every element of every page list
+    // is sixteen bytes smaller for it. The node banked its share once, and once only, whichever of
+    // the two changes landed second.
+    //
+    // The relation is asserted in the NEGATIVE so this cannot silently become true again: an entry
+    // back inside the page index would put the width of the whole structure back on every bucket.
+    let arm = size_of::<crate::engine::state::BlockIndexMap>();
+    assert_ne!(
+        8 + size_of::<BlockIndex>(),
+        arm,
+        "the page index is {arm} B, which is a handle plus a whole entry again -- the inline arm has \
+         come back and every bucket in the map is paying the entry's width whether it holds one page \
+         or fifty"
+    );
+    assert_eq!(
+        size_of::<Vec<(u64, BlockIndex)>>(),
+        arm,
+        "the page index is {arm} B against its own page list's {} B; it is supposed to be exactly \
+         that header, with both other arms riding pointer niches",
+        size_of::<Vec<(u64, BlockIndex)>>()
+    );
+    // THE COMPARISON HAD TO MOVE OFF THE ENTRY'S WIDTH, because the entry is now exactly as wide
+    // as the arm and `arm < size_of::<BlockIndex>()` is false of two equal numbers.
+    //
+    // IT WAS NEVER THE RIGHT COMPARISON ANYWAY, which the println below already said: the arm is a
+    // bare page-list header and its width is INDEPENDENT of the entry's. What "too narrow to hold
+    // one inline" means is that it cannot hold a HANDLE AND AN ENTRY, which is what an inline
+    // single-page arm would have to carry -- so that is what is asserted. At 24 against 32 it
+    // holds, and it would hold at any entry width, which is the point: this is a claim about the
+    // representation and not an accident of two numbers meeting.
+    assert!(
+        arm < size_of::<u64>() + size_of::<BlockIndex>(),
+        "the page index is {arm} B and a handle plus one entry is {} B; the index must be too \
+         narrow to hold one inline, or the entry is back in the node",
+        size_of::<u64>() + size_of::<BlockIndex>()
+    );
+    println!(
+        "  BlockIndexMap {arm} B (a bare page-list header -- INDEPENDENT of the entry's width now), \
+         BucketNode {} B. The sixteen bytes measured above are banked on the HEAP: in every boxed \
+         arm and every list element, not in the node.",
+        size_of::<crate::engine::state::BucketNode>()
+    );
+}
+
+// =================================================================================================
+// THE READ PATH, COUNTED. A handle adds a table lookup; a one-byte discriminant does not.
+// =================================================================================================
+
+/// READING A PAGE'S MODEL SPELLING EXAMINES NO MORE ENTRIES THAN IT DID.
+///
+/// A handle into a table adds a dependent load to every resolution of a name, and no footprint
+/// measurement can see it. The spelling that SHIPPED here is not that shape: it is a discriminant
+/// in the entry and the name is a `&'static str` off the registry, so resolving it is a match on
+/// one byte and touches nothing outside the entry that was already loaded.
+///
+/// COUNTED, not timed -- a timing-ratio instrument in this tree once read 485x idle against 11x
+/// busy off identical code. `BLOCK_LOOKUP_ENTRIES_EXAMINED` is the existing counter inside
+/// `find_block`, and the claim is that reading every page's spelling adds NOTHING to it.
+#[test]
+fn resolving_a_model_spelling_examines_no_block_index_entries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine(dir.path());
+    load_shard_over(&engine, OPERATOR_END);
+    seed_container_keys(&engine, 8, 100);
+    seed_routed_keys(&engine, 200);
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+
+    crate::engine::state::reset_block_lookup_entries_examined();
+    let before = crate::engine::state::block_lookup_entries_examined();
+    let mut resolved = 0usize;
+    let mut folded = 0u64;
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for (_, block) in bucket.block_index.iter() {
+            // The resolution under test, folded so it cannot be optimised away.
+            let spelling = block.model_id.as_str();
+            folded = folded
+                .wrapping_mul(31)
+                .wrapping_add(spelling.len() as u64)
+                .wrapping_add(spelling.as_bytes()[0] as u64);
+            resolved += 1;
+        }
+    }
+    let after = crate::engine::state::block_lookup_entries_examined();
+
+    println!(
+        "\n=== resolving a model spelling ===\n  {resolved} spellings resolved, \
+         BLOCK_LOOKUP_ENTRIES_EXAMINED {before} -> {after}, checksum {folded}"
+    );
+    assert!(resolved > 0, "no spelling was resolved, so the count below is free");
+    assert_ne!(0, folded, "the fold read nothing, so the loads may have been dropped");
+    assert_eq!(
+        before, after,
+        "resolving {resolved} model spellings moved the page-lookup counter from {before} to \
+         {after}. A spelling is supposed to be a match on one byte already inside the entry; a \
+         move here means it is going through an index"
+    );
+}
+
+// =================================================================================================
+// THE LIFETIME HAZARD. Release empties a bucket's page list; reload re-derives it.
+// =================================================================================================
+
+/// A RELEASED BUCKET RELOADS EVERY PAGE'S NAMES, ELEMENT BY ELEMENT.
+///
+/// `release_bucket_blocks` empties a bucket's page list and `reload_released_bucket` re-derives it
+/// from the model maps. Anything the entry holds has to survive that or be re-derived IDENTICALLY,
+/// and a count of pages cannot show it: a reload that produced the right NUMBER of pages with one
+/// spelling wrong would pass a count and mis-attribute a page.
+///
+/// So the comparison is element by element, over the sorted triples, and the fixture is asserted
+/// to have actually released something before the comparison is made.
+#[test]
+fn a_released_bucket_reloads_every_name_element_by_element() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine(dir.path());
+    load_shard_over(&engine, OPERATOR_END);
+    // `released_model_kind_is_addressable` admits `string` and `context_node` only, so a release
+    // is only reversible for those -- which is what this fixture seeds.
+    seed_routed_keys(&engine, 400);
+
+    // A RELEASE REFUSES A DIRTY BUCKET, and a freshly written one is dirty -- releasing it while
+    // `eviction_dump_before_evict` is false would strand undumped writes with nothing to rebuild
+    // them from. So the fixture dumps through the production lifecycle, which is what clears the
+    // flag (`clear_dumped_bucket_dirty_state`).
+    let candidates: Vec<u32> = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        shard.bucket_index.bucket_map.keys().copied().collect()
+    };
+    assert!(!candidates.is_empty(), "the fixture produced no bucket to release");
+    let lifecycle = engine.apply_storage_lifecycle(crate::engine::reports::StorageLifecycleRequest {
+        shard_id: 1,
+        selected_dump_buckets: candidates.clone(),
+        max_dump_buckets_per_round: candidates.len(),
+        ..Default::default()
+    });
+    println!("\n=== release/reload ===");
+    println!("  fixture: {} candidate buckets, lifecycle ran", candidates.len());
+    std::hint::black_box(&lifecycle);
+
+    let before = block_triples(&engine);
+    assert!(!before.is_empty(), "the fixture produced no pages to release");
+
+    // DRIVEN ON THE FUNCTION ITSELF. `refused_buckets` is one number for eleven different answers,
+    // so a fixture that fails a precondition has to say WHICH one -- otherwise it reads as a
+    // release that simply had nothing to do, which is the shape that makes the comparison below
+    // pass over an empty set.
+    let outcome = {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard is loaded");
+        crate::engine::storage_bucket_internals::release_bucket_blocks(shard, &candidates)
+    };
+    println!(
+        "  released {} buckets holding {} pages, refused {}",
+        outcome.released_buckets.len(),
+        outcome.released_blocks,
+        outcome.refused_buckets
+    );
+    println!("  refusals by term: {:?}", outcome.refusals);
+    assert!(
+        outcome.released_blocks > 0,
+        "the release emptied no page list, so the reload below re-derives nothing and every \
+         assertion after it is free. {} candidates were offered; the terms they failed on are \
+         {:?}",
+        candidates.len(),
+        outcome.refusals
+    );
+    let released = outcome.released_buckets.clone();
+
+    // The released buckets really did lose their pages.
+    let during = block_triples(&engine);
+    assert!(
+        during.len() < before.len(),
+        "the release left {} pages of {} resident, so it did not empty a page list",
+        during.len(),
+        before.len()
+    );
+
+    for routing_bucket in &released {
+        let reloaded = {
+            let mut shards = engine.shards.write().expect("engine lock poisoned");
+            let shard = shards.get_mut(&1).expect("shard is loaded");
+            crate::engine::storage_bucket_internals::reload_released_bucket(
