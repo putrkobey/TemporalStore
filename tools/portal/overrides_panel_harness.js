@@ -46,28 +46,3 @@ function run(label, payload, checks) {
   try {
     renderOverrides(payload);
   } catch (err) {
-    console.log("FAIL " + label + " threw: " + err.message);
-    failures += 1;
-    return;
-  }
-  for (const [what, ok] of checks(body.innerHTML)) {
-    if (ok) { console.log("ok   " + label + " -- " + what); }
-    else {
-      console.log("FAIL " + label + " -- " + what + "\n     got: " + body.innerHTML.slice(0, 200));
-      failures += 1;
-    }
-  }
-}
-
-run("a tenant override", { tenants: [{ tenant: "acme", settings: { top_k_per_layer: 24 } }], users: [] },
-    (html) => [
-      ["names the tenant", html.includes("acme")],
-      ["names the level", html.includes("tenant")],
-      ["shows the setting and value", html.includes("top_k_per_layer=24")],
-    ]);
-
-run("a user override", { tenants: [], users: [{ key: "acme/alice", settings: { recall_reinforcement: false } }] },
-    (html) => [
-      ["names the identity", html.includes("acme/alice")],
-      ["marks it as a user row", html.includes("user")],
-      ["shows the value", html.includes("recall_reinforcement=false")],
