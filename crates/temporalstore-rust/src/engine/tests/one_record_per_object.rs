@@ -424,3 +424,856 @@ fn converting_one_objects_rows_into_the_record_and_back_loses_nothing() {
     // included too, because the layout arm must hold everything the inline arm holds as well --
     // an arm that only works for the cases the other one refuses cannot serve a mixed object.
     let layout_cases: [(&str, ElementEntry, u8, Option<u64>, bool); 4] = [
+        ("ordinal 1, no deadline", ElementEntry::from_parts(5, 64, 128, Some(1), Some(1)), 1, None, true),
+        ("ordinal 3, deadline", ElementEntry::from_parts(7, 4_096, 832, Some(3), Some(3)), 4, Some(42), false),
+        ("ordinal at the stored ceiling", ElementEntry::from_parts(2, 128, 64, Some(u64::from(u16::MAX)), Some(u64::from(u16::MAX))), 1, None, false),
+        ("ordinal zero, in the layout arm too", ElementEntry::from_parts(1, 0, 16, Some(0), Some(0)), 1, None, false),
+    ];
+    for (what, address, model_id, deadline, dirty) in layout_cases {
+        let handle = BlockLayoutHandle::from_stored(77);
+        let (record, layout) =
+            ObjectRecord::from_object_rows_with_layout(&address, model_id, deadline, dirty, handle)
+                .unwrap_or_else(|error| panic!("{what}: the layout arm refused: {error}"));
+        assert!(
+            matches!(record.page_address(), BlockAddress::Many(_)),
+            "{what}: an identified page should take the layout arm"
+        );
+        assert_eq!(1, layout.len(), "{what}: one page should produce a one-page layout");
+        let (back_address, back_model) = record
+            .into_object_rows(Some(&layout))
+            .unwrap_or_else(|error| panic!("{what}: unfolding refused: {error}"));
+        assert_eq!(address, back_address, "{what}: the address row changed");
+        assert_eq!(model_id, back_model, "{what}: the model id changed");
+        assert_eq!(address.block_id(), back_address.block_id(), "{what}: page identity");
+        assert_eq!(address.generation(), back_address.generation(), "{what}: generation presence");
+        checked += 1;
+    }
+    assert_eq!(11, checked, "the conversion matrix did not run");
+}
+
+/// THE INLINE ARM'S ONE LIMIT, REFUSED BY NAME RATHER THAN DROPPED -- AND ITS EXACT BOUNDARY.
+///
+/// Twenty-three of the record's twenty-four bytes are spoken for, so the sixteen-bit page ordinal
+/// an [`ElementEntry`] carries has no inline home as a VALUE. Its PRESENCE does, as `BLOCK_IN_LOG`.
+/// So the boundary is at zero: ordinal absent and ordinal zero are both inline, and a nonzero
+/// ordinal -- which is a page of a multi-page object -- is refused by name and routed to the
+/// layout arm. Dropping it instead would resolve a key to a different page of the same object and
+/// read the wrong bytes with no error anywhere.
+///
+/// BOTH SIDES OF THE BOUNDARY ARE ASSERTED. A test that only checked the refusal would pass if the
+/// inline arm refused everything, which is the state this function was in before a store
+/// measurement showed it would send 400 of 400 real objects down the side-allocating arm.
+#[test]
+fn the_inline_arm_takes_ordinal_zero_and_refuses_a_nonzero_one_by_name() {
+    // THE ACCEPTING SIDE, which is the one a real store exercises.
+    for ordinal in [None, Some(0u64)] {
+        let entry = ElementEntry::from_parts(5, 64, 128, ordinal, ordinal);
+        let record = ObjectRecord::from_object_rows(&entry, 1, None, false).unwrap_or_else(|error| {
+            panic!("the inline arm refused ordinal {ordinal:?}, which it must hold: {error}")
+        });
+        assert!(
+            matches!(record.page_address(), BlockAddress::One(_)),
+            "ordinal {ordinal:?} did not take the inline arm"
+        );
+        let (back, ..) = record.into_object_rows(None).expect("unfold");
+        assert_eq!(entry, back, "ordinal {ordinal:?} did not survive the inline arm");
+    }
+
+    // THE REFUSING SIDE.
+    let identified = ElementEntry::from_parts(5, 64, 128, Some(7), Some(7));
+    let refusal = ObjectRecord::from_object_rows(&identified, 1, None, false)
+        .expect_err("the inline arm accepted a nonzero page ordinal it has no room for");
+    assert_eq!(
+        ObjectRecordRefusal::NonZeroBlockOrdinalDoesNotFitInline { block_id: 7 },
+        refusal,
+        "the refusal is not the named one"
+    );
+    assert!(
+        refusal.to_string().contains("NonZeroBlockOrdinalDoesNotFitInline"),
+        "the refusal does not name itself: {refusal}"
+    );
+
+    // AND THE LAYOUT ARM TAKES IT. A refusal with no route through is a dead end, not a design.
+    let (_record, layout) = ObjectRecord::from_object_rows_with_layout(
+        &identified,
+        1,
+        None,
+        false,
+        BlockLayoutHandle::from_stored(1),
+    )
+    .expect("the layout arm must hold what the inline arm refuses");
+    assert!(!layout.is_empty(), "the layout arm produced nothing");
+}
+
+/// A HANDLE WITH NO LAYOUT IS REFUSED, not defaulted to a zero address.
+#[test]
+fn a_layout_handle_with_no_layout_is_refused_by_name() {
+    let mut record = ObjectRecord::default();
+    record.set_block_address(BlockAddress::Many(BlockLayoutHandle::from_stored(5)));
+    let refusal = record
+        .into_object_rows(None)
+        .expect_err("unfolding a handle with no layout returned an address anyway");
+    assert!(
+        matches!(refusal, ObjectRecordRefusal::LayoutHandleWithNoLayout { .. }),
+        "the refusal is not the named one: {refusal}"
+    );
+
+    let empty = BlockLayout::default();
+    let refusal = record
+        .into_object_rows(Some(&empty))
+        .expect_err("unfolding against an EMPTY layout returned an address anyway");
+    assert!(
+        matches!(refusal, ObjectRecordRefusal::LayoutHandleWithNoLayout { .. }),
+        "an empty layout was not refused: {refusal}"
+    );
+}
+
+/// WHAT THE RECORD COSTS INSIDE THE MAP THAT WOULD HOLD IT -- MEASURED, NOT MULTIPLIED BY HAND.
+///
+/// The record is 24 bytes where the address it replaces is 16, so the obvious statement is "eight
+/// bytes an object". THAT STATEMENT IS WRONG, and wrong in the direction that flatters the design.
+/// A hash table allocates SLOTS, not entries: the eight bytes are paid on every slot the table
+/// holds, including the empty ones, so the real figure is eight times the table's slot occupancy.
+/// This codebase has already priced that multiplier once -- the `Box<str>` key change is recorded
+/// as 13.1 B/key saved at 1.434 slots a key, not 8.
+///
+/// So rather than guess the occupancy, this weighs both maps at the same population: the one the
+/// shard holds today and the one it would hold with the record in it. The difference IS the cost,
+/// with the slack included, and it is reported per object so it can be set against the per-object
+/// savings below it.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn what_the_record_costs_inside_the_map_that_holds_it() {
+    use std::collections::HashMap;
+
+    const KEYS: usize = 8_000;
+    let keys: Vec<Box<str>> =
+        (0..KEYS).map(|i| format!("s{i}").into_boxed_str()).collect();
+    let address = ElementEntry::from_parts(3, 4_096, 128, Some(0), Some(0));
+    let record = ObjectRecord::from_object_rows(&address, 1, Some(1_700_000_000_000), true)
+        .expect("the inline arm must hold an ordinary live address");
+
+    let mut today: HashMap<Box<str>, ElementEntry> = HashMap::new();
+    for key in &keys {
+        today.insert(key.clone(), address.clone());
+    }
+    let mut with_record: HashMap<Box<str>, ObjectRecord> = HashMap::new();
+    for key in &keys {
+        with_record.insert(key.clone(), record);
+    }
+    assert_eq!(KEYS, today.len(), "denominator: the present-day map did not take every key");
+    assert_eq!(KEYS, with_record.len(), "denominator: the record map did not take every key");
+
+    let today_bytes = deep_heap_bytes(&today);
+    let record_bytes = deep_heap_bytes(&with_record);
+    let added = record_bytes as i64 - today_bytes as i64;
+
+    println!(
+        "the map holding one row per object, at {KEYS} objects (keys are the same in both, so the \
+         difference is the VALUE width and the slack it multiplies by):"
+    );
+    println!(
+        "  value = ElementEntry ({} B)   {today_bytes:>9} B   {:>6.1} B/object",
+        std::mem::size_of::<ElementEntry>(),
+        today_bytes as f64 / KEYS as f64
+    );
+    println!(
+        "  value = ObjectRecord ({} B)   {record_bytes:>9} B   {:>6.1} B/object",
+        std::mem::size_of::<ObjectRecord>(),
+        record_bytes as f64 / KEYS as f64
+    );
+    println!(
+        "  ADDED BY THE RECORD           {added:>9} B   {:>6.1} B/object   (the naive figure is \
+         {} B/object, so the slot occupancy multiplies it by {:.2}x)",
+        added as f64 / KEYS as f64,
+        std::mem::size_of::<ObjectRecord>() - std::mem::size_of::<ElementEntry>(),
+        (added as f64 / KEYS as f64)
+            / (std::mem::size_of::<ObjectRecord>() - std::mem::size_of::<ElementEntry>()) as f64
+    );
+
+    assert!(today_bytes > 0, "non-vacuity: the present-day map weighed nothing");
+    assert!(
+        added > 0,
+        "a 24-byte value in place of a 16-byte one cannot cost nothing; the probe charged {added}"
+    );
+    // THE DIRECTION OF THE ERROR THIS TEST EXISTS TO CATCH. If the measured cost came out at or
+    // below the naive per-entry figure, the slack would not be being counted and every saving
+    // quoted against it would be overstated.
+    let naive = (std::mem::size_of::<ObjectRecord>() - std::mem::size_of::<ElementEntry>()) as f64;
+    assert!(
+        added as f64 / KEYS as f64 >= naive,
+        "the measured cost {:.1} B/object is BELOW the naive {naive:.0} B/object, so the table's \
+         empty slots are not being charged and this figure cannot be set against a saving",
+        added as f64 / KEYS as f64
+    );
+}
+
+/// WHAT MOVING `strings` ONTO THE RECORD WOULD COST, at several deadline fractions.
+///
+/// The move is de-risked everywhere except its price. The inline arm takes 400 of 400 real string
+/// addresses, the key-ordered expiry walk has no production caller, the compaction write-back is
+/// guarded, and `control_state_blocks` has already made the same move. What is open is whether it
+/// pays: the record is measured at +16.4 B/object over a bare address and that is charged on EVERY
+/// string key, while the savings -- deleting the per-key expiry table and the by-key half of the
+/// dirty index -- land only on the keys that actually carry a deadline or are dirty.
+///
+/// That asymmetry is exactly the shape that made a union merge cost 144 B/key elsewhere in this
+/// campaign, so it is priced rather than assumed.
+///
+/// WHAT IS HELD CONSTANT: the keys. Every arm shares one set of `Arc<str>` allocations, so the
+/// figures are the ROWS and not the characters -- the same discipline the consolidation probes use.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_moving_the_string_map_onto_the_record_would_cost -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "builds several map shapes at 20,000 keys; run by name"]
+fn what_moving_the_string_map_onto_the_record_would_cost() {
+    use crate::engine::object_record::ObjectRecord;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+    const KEYS: usize = 20_000;
+
+    let shared: Vec<Arc<str>> = (0..KEYS)
+        .map(|i| Arc::from(format!("s{i:08}").as_str()))
+        .collect();
+    let address =
+        |i: usize| ElementEntry::from_parts(1, i as u64 * 64, 64, Some(0), Some(i as u64));
+
+    // One arm pair per deadline fraction. `dirty` tracks the deadline here deliberately: a key
+    // written with a TTL is the key that was just written, so it is the dirty one too. Separating
+    // them would price a population this store does not produce.
+    println!();
+    println!("  {KEYS} keys, key allocations SHARED in every arm, so the figures are the ROWS");
+    println!(
+        "    ElementEntry {} B, ObjectRecord {} B (inline arm, no owned array)",
+        std::mem::size_of::<ElementEntry>(),
+        std::mem::size_of::<ObjectRecord>()
+    );
+    println!();
+    println!("  fraction    TODAY (addresses + expiry)        PROPOSED (records)        delta");
+
+    let mut crossover: Option<f64> = None;
+    let mut previous: Option<(f64, f64)> = None;
+    for percent in [0usize, 10, 25, 50, 75, 100] {
+        let with_deadline = KEYS * percent / 100;
+
+        // ---- TODAY: a bare-address map, plus a per-key expiry table for the TTL'd subset.
+        let mut addresses: HashMap<Arc<str>, ElementEntry> = HashMap::new();
+        let mut expiry: BTreeMap<Arc<str>, u64> = BTreeMap::new();
+        for (i, key) in shared.iter().enumerate() {
+            addresses.insert(Arc::clone(key), address(i));
+            if i < with_deadline {
+                expiry.insert(Arc::clone(key), 1_700_000_000_000 + i as u64);
+            }
+        }
+        let today = deep_heap_bytes(&addresses) + deep_heap_bytes(&expiry);
+
+        // ---- PROPOSED: one slot map, the deadline and the dirty bit inside the record, and NO
+        // separate expiry table. The deadline-ordered mirror is not modelled on either side: it
+        // survives the move unchanged, so it cancels.
+        // THE INLINE ARM, NOT THE SERIES PATH. A string holds ONE address, not a series, and
+        // `every_way_of_building_a_single_address_record_lands_in_the_inline_arm` is the arm that
+        // says so. Building these through `ObjectSlot::from(BTreeMap)` allocates a one-element
+        // owned array per key -- which is what a SERIES needs and a single address does not -- and
+        // priced the proposal at a flat 128.3 B/key, 2.4x the bare map, independent of the
+        // deadline fraction. That flatness was the tell: a cost that does not move with the thing
+        // being varied is not measuring it.
+        let mut records: HashMap<Arc<str>, ObjectRecord> = HashMap::new();
+        for (i, key) in shared.iter().enumerate() {
+            let deadline = (i < with_deadline).then_some(1_700_000_000_000 + i as u64);
+            let record = ObjectRecord::from_object_rows(&address(i), 1, deadline, i < with_deadline)
+                .expect("a single string address lands in the inline arm");
+            records.insert(Arc::clone(key), record);
+        }
+        let proposed = deep_heap_bytes(&records);
+
+        let today_per = today as f64 / KEYS as f64;
+        let proposed_per = proposed as f64 / KEYS as f64;
+        let delta = today_per - proposed_per;
+        println!(
+            "  {percent:>4}%      {today:>10} B  {today_per:>7.1} B/key     {proposed:>10} B  {proposed_per:>7.1} B/key   {delta:>+7.1}"
+        );
+
+        if let Some((previous_percent, previous_delta)) = previous {
+            if previous_delta < 0.0 && delta >= 0.0 {
+                crossover = Some(
+                    previous_percent
+                        + (percent as f64 - previous_percent) * (-previous_delta)
+                            / (delta - previous_delta),
+                );
+            }
+        }
+        previous = Some((percent as f64, delta));
+    }
+
+    println!();
+    match crossover {
+        Some(at) => {
+            println!("  CROSSOVER: the move starts paying at about {at:.0}% of string keys");
+            println!("  carrying a deadline, bracketed by the two measured points around it.");
+        }
+        None => println!("  NO CROSSOVER in the measured range: the sign does not change."),
+    }
+    println!();
+    println!("  It also deletes a TABLE -- the per-key expiry map -- taking the places a key can");
+    println!("  live from 13 to 12, which no per-key figure here captures.");
+
+    // THE CLAIM: the trade is asymmetric and the sign depends on the deadline fraction, which is
+    // what makes this a decision rather than a free move. If the sign stops changing, one side
+    // dominates and the move can be taken or refused without knowing the workload.
+    let _ = crossover;
+}
+
+/// WHICH HALF OF THE DIRTY INDEX A FLAG BIT ON THE RECORD WOULD ACTUALLY REMOVE.
+///
+/// The dirty index is two trees -- one keyed by object key answering "is this object dirty", one
+/// keyed by routing bucket answering "which objects in this bucket are dirty". A flag bit on a
+/// per-object record answers the first question and cannot answer the second without visiting
+/// every object, so at most the FIRST tree can go. How much that is worth is the number the whole
+/// saving turns on, and the census probe can only weigh the index WHOLE: the two fields are
+/// private to a module another lane is mid-flight in, and adding an accessor there to measure
+/// something is not a trade worth making.
+///
+/// SO THIS WEIGHS THE SHAPES SEPARATELY AND CHECKS THE SUM. Each half is rebuilt here as a
+/// standalone map of exactly the type the index declares, at the same population, and weighed on
+/// its own. That is a MODEL, so it is validated rather than trusted: the two parts are summed and
+/// compared against a real `DirtyObjectIndex` filled with the same keys and buckets. A model that
+/// does not reproduce the measured whole is reported as not reproducing it.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn which_half_of_the_dirty_index_a_record_flag_would_remove() {
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::sync::Arc;
+
+    const KEYS: usize = 4_000;
+    /// The shipped routing range's bucket count, so the per-bucket half amortises as it does in
+    /// production rather than as it does on the legacy whole-word range.
+    const BUCKETS: u32 = 1_024;
+
+    let keys: Vec<Arc<str>> =
+        (0..KEYS).map(|i| Arc::from(format!("one-record-dirty-{i}").as_str())).collect();
+    let bucket_of = |i: usize| (i as u32) % BUCKETS;
+
+    // --- The real thing, weighed whole. ---
+    let mut whole = crate::engine::state::DirtyObjectIndex::default();
+    for (i, key) in keys.iter().enumerate() {
+        whole.insert(key, bucket_of(i));
+    }
+    assert_eq!(KEYS, whole.len(), "denominator: the index did not take every key");
+    let whole_bytes = deep_heap_bytes(&whole);
+
+    // --- Half one: the by-key tree, as its own declared type. ---
+    let mut by_key: BTreeMap<Arc<str>, u32> = BTreeMap::new();
+    for (i, key) in keys.iter().enumerate() {
+        by_key.insert(Arc::clone(key), bucket_of(i));
+    }
+    let by_key_bytes =
+        deep_heap_bytes(&by_key);
+
+    // --- Half two: the by-bucket tree, as its own declared type. ---
+    let mut by_bucket: BTreeMap<u32, BTreeSet<Arc<str>>> = BTreeMap::new();
+    for (i, key) in keys.iter().enumerate() {
+        by_bucket.entry(bucket_of(i)).or_default().insert(Arc::clone(key));
+    }
+    let by_bucket_bytes =
+        deep_heap_bytes(&by_bucket);
+
+    let modelled = by_key_bytes + by_bucket_bytes;
+    println!(
+        "dirty index over {KEYS} keys across {BUCKETS} buckets (Arc payloads NOT counted -- they \
+         are shared by both halves and survive either one):"
+    );
+    println!(
+        "  measured WHOLE                 {whole_bytes:>10} B   {:>7.1} B/dirty object",
+        whole_bytes as f64 / KEYS as f64
+    );
+    println!(
+        "  modelled by_key half           {by_key_bytes:>10} B   {:>7.1} B/dirty object  <- what a \
+         record flag bit could remove",
+        by_key_bytes as f64 / KEYS as f64
+    );
+    println!(
+        "  modelled by_bucket half        {by_bucket_bytes:>10} B   {:>7.1} B/dirty object  <- \
+         survives: it answers an iteration question",
+        by_bucket_bytes as f64 / KEYS as f64
+    );
+    println!(
+        "  modelled sum                   {modelled:>10} B   ({:.3}x the measured whole)",
+        modelled as f64 / whole_bytes as f64
+    );
+
+    // NON-VACUITY FIRST: a zero in either half would make this read as "one half is free".
+    assert!(by_key_bytes > 0, "the by-key model weighed nothing");
+    assert!(by_bucket_bytes > 0, "the by-bucket model weighed nothing");
+    assert!(whole_bytes > 0, "the real index weighed nothing");
+
+    // THE MODEL IS CHECKED, NOT TRUSTED. The declared inner set is an inline-arm enum rather than
+    // a bare `BTreeSet`, so the model is expected to be CLOSE and not exact; a loose bound that
+    // still refuses a model off by a factor is what is wanted here.
+    let ratio = modelled as f64 / whole_bytes as f64;
+    assert!(
+        (0.75..=1.25).contains(&ratio),
+        "the two-half model sums to {modelled} B against a measured {whole_bytes} B ({ratio:.3}x) \
+         -- it does not reproduce the whole, so neither half's share may be quoted from it"
+    );
+}
+
+/// HOW OFTEN A REAL STORE WOULD NEED THE LAYOUT ARM, measured through the ordinary write path.
+///
+/// The inline arm holds a page with no identity; the layout arm holds one with an identity, at the
+/// cost of a side allocation. Which of those is the COMMON case decides whether this record saves
+/// memory or spends it, and that is not something to reason about from the type -- it is a count
+/// over what a store actually files.
+///
+/// NON-VACUITY: the population is asserted non-empty before the split is reported, because "0 of 0
+/// need the layout arm" reads exactly like "the inline arm serves everything".
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+fn how_often_a_real_store_needs_the_layout_arm() {
+    const KEYS: usize = 400;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for i in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("one-record-{i}"),
+                value: vec![b'v'; 32],
+            },
+        });
+        assert!(response.status.ok, "the fixture could not write: {:?}", response.status);
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    assert_eq!(KEYS, shard.strings().len(), "denominator: the fixture did not seed what it reports");
+
+    // CLASSIFIED BY WHAT THE INLINE ARM ACTUALLY ACCEPTS, which is "ordinal absent OR ordinal
+    // zero" -- not by "ordinal absent", which is what an earlier draft of this counter asked and
+    // which reported 400 of 400 needing the layout arm while the converter was happily taking
+    // them inline. A census whose buckets disagree with the code it is costing is worse than no
+    // census, because it reads like a result.
+    let mut inline_ordinal_absent = 0usize;
+    let mut inline_ordinal_zero = 0usize;
+    let mut needs_layout = 0usize;
+    let mut with_generation = 0usize;
+    let mut largest_ordinal = 0u64;
+    for slot in shard.strings().values() {
+        let address = &slot.address();
+        match address.block_id() {
+            None => inline_ordinal_absent += 1,
+            Some(0) => inline_ordinal_zero += 1,
+            Some(id) => {
+                needs_layout += 1;
+                largest_ordinal = largest_ordinal.max(id);
+            }
+        }
+        if address.generation().is_some() {
+            with_generation += 1;
+        }
+    }
+    let inline = inline_ordinal_absent + inline_ordinal_zero;
+    let total = inline + needs_layout;
+    assert_eq!(KEYS, total, "every address must land in exactly one arm");
+    assert!(total > 0, "non-vacuity: no addresses were examined");
+    println!(
+        "of {total} live string addresses written through the ordinary path: {inline} take the \
+         INLINE arm ({:.1}%) -- {inline_ordinal_absent} with no page ordinal and \
+         {inline_ordinal_zero} at ordinal zero -- and {needs_layout} need the LAYOUT arm ({:.1}%)",
+        100.0 * inline as f64 / total as f64,
+        100.0 * needs_layout as f64 / total as f64
+    );
+    println!(
+        "  {with_generation} carry a generation; the largest page ordinal seen is {largest_ordinal}"
+    );
+
+    // THE CLASSIFICATION IS CHECKED AGAINST THE CONVERTER, not trusted. Every address goes through
+    // the arm the count above put it in, and the arm it lands in is asserted -- so a counter that
+    // drifts from the converter again fails here rather than printing a wrong percentage.
+    let mut converted_inline = 0usize;
+    let mut converted_layout = 0usize;
+    for slot in shard.strings().values() {
+        let address = &slot.address();
+        match address.block_id() {
+            None | Some(0) => {
+                let record = ObjectRecord::from_object_rows(address, 1, None, true)
+                    .unwrap_or_else(|error| {
+                        panic!("the census put this address inline and the converter refused: {error}")
+                    });
+                assert!(
+                    matches!(record.page_address(), BlockAddress::One(_)),
+                    "an address counted as inline did not take the inline arm"
+                );
+                let (back, ..) = record.into_object_rows(None).unwrap_or_else(|error| {
+                    panic!("a live address converted inline and would not come back: {error}")
+                });
+                assert_eq!(*address, back, "a live address did not survive the inline arm");
+                converted_inline += 1;
+            }
+            Some(_) => {
+                let (record, layout) = ObjectRecord::from_object_rows_with_layout(
+                    address,
+                    1,
+                    None,
+                    true,
+                    BlockLayoutHandle::from_stored(converted_layout as u64),
+                )
+                .unwrap_or_else(|error| panic!("the layout arm refused a live address: {error}"));
+                let (back, ..) = record.into_object_rows(Some(&layout)).unwrap_or_else(|error| {
+                    panic!("a live address converted into a layout and would not come back: {error}")
+                });
+                assert_eq!(*address, back, "a live address did not survive the layout arm");
+                converted_layout += 1;
+            }
+        }
+    }
+    assert_eq!(inline, converted_inline, "the inline count and the inline conversions disagree");
+    assert_eq!(needs_layout, converted_layout, "the layout count and the layout conversions disagree");
+    assert_eq!(total, converted_inline + converted_layout, "not every live address converted");
+}
+
+/// A probe engine on an EXPLICIT routing range.
+///
+/// Spelled here rather than reused from the census probe for the reason the local heap helper is:
+/// that module's loader is private to it. The range matters -- on the legacy whole-word default
+/// every key gets a bucket of its own, so a per-round bucket cap would bind against a bucket count
+/// equal to the key count and the cadence below would read as a different regime.
+#[cfg(feature = "alloc-probe")]
+fn probe_engine_on_for_record(
+    dir: &std::path::Path,
+    end_routing_bucket: u32,
+) -> std::sync::Arc<TemporalEngine> {
+    let engine = std::sync::Arc::new(TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.join("cache"),
+        dir.join("blocks"),
+        dir.join("indexes"),
+    ));
+    let response = engine.load_shard_with(crate::control::LoadShardRequest {
+        shard_id: 1,
+        table_name: "one-record-cadence".to_string(),
+        shard_uri: "local://one-record-cadence/1".to_string(),
+        start_routing_bucket: 0,
+        end_routing_bucket,
+        readonly: false,
+        load_version: 1,
+        local_node_id: Some(1),
+    });
+    assert!(
+        response.status.ok,
+        "the fixture could not load shard 1 on 0..{end_routing_bucket}: {:?}",
+        response.status
+    );
+    engine
+}
+
+/// WHETHER THE TRIGGER THAT WOULD MAKE A DIRTY BIT REDUNDANT IS ACTUALLY PULLED.
+///
+/// The costing for this record argued that its dirty-bit half duplicates a lever that already
+/// exists: a dump hands back the whole dirty cost, so a trigger is cheaper than a type change.
+/// THAT ARGUMENT HAS A PRECONDITION NOBODY HAD CHECKED -- that dumps run in the deployment -- and
+/// the figure behind it was taken on the WRONG PATH.
+///
+/// The 151.9 B/object the census reported recovered came from `apply_storage_eviction(.., dump =
+/// true, ..)`. `StorageManagerOptions::enable_evict` now ships TRUE, but that is not the path a
+/// shipped round takes: the same default pairs the flag with a 64 MiB `index_resident_limit_bytes`,
+/// which is the higher bar, so the periodic loop calls `apply_index_resident_bound` and a shard
+/// under the bound declines with `"index_resident_below_bound"`. So the number is still measured on
+/// a path a deployment does not take -- the deployment has to be holding roughly 1.7 M keys in one
+/// shard before it does.
+///
+/// The path a deployment DOES take is `apply_storage_lifecycle`, which is ungated -- only
+/// `dry_run` skips it (`storage_manager_cycle.rs:546`) -- and whose dump is released by
+/// `min_undumped_wal_records` or `min_undumped_wal_bytes`, whichever is crossed first.
+///
+/// # TWO ARMS, BECAUSE THE GATE COUNTS SOMETHING DIFFERENT FROM WHAT THE COST COUNTS
+///
+/// The gate counts undumped WAL RECORDS. The dirty index costs per OBJECT. **A batch append is
+/// ONE record however many objects it carries**, so those two quantities diverge by the batch
+/// size, and which side of the threshold a store sits on depends on how it writes rather than on
+/// how much it has written. So:
+///
+///   * BATCHED writes an object count far above the threshold in a record count far below it.
+///   * SINGLE writes crosses the record threshold at the object count that equals it.
+///
+/// Both arms print the plan's OWN decision -- `dump_delayed`, the record count, the object count,
+/// the buckets selected -- before any round runs. A round that hands back zero has two opposite
+/// explanations, the cadence declining and the cap binding, and a probe that cannot separate them
+/// would publish the wrong headline. An earlier revision of this test did exactly that: it saw
+/// zero drained across 24 rounds and concluded the saving was collected at a bounded rate, when
+/// what had actually happened was that 4,000 objects arrived as FOUR WAL records and the cadence
+/// correctly declined.
+///
+/// THE DEFAULTS ARE READ FROM THE OPTIONS STRUCT, NOT COPIED AS LITERALS, so a probe cannot keep
+/// passing against a cadence that has since moved.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn what_the_default_dump_cadence_actually_drains() {
+    const SHIPPED_END: u32 = 1023;
+    const MAX_ROUNDS: usize = 20;
+
+    let shipped = crate::data_node::StorageManagerOptions::default();
+    println!(
+        "shipped dump cadence: min_undumped_wal_records={}, min_undumped_wal_bytes={}, \
+         max_dump_buckets_per_round={}, enable_evict={}, eviction_dump_before_evict={}",
+        shipped.min_undumped_wal_records,
+        shipped.min_undumped_wal_bytes,
+        shipped.max_dump_buckets_per_round,
+        shipped.enable_evict,
+        shipped.eviction_dump_before_evict,
+    );
+    // THE TWO FACTS THE WHOLE READING RESTS ON, asserted so this fails loudly if either moves
+    // rather than silently costing the wrong lever.
+    // RESTATED. This asserted `!shipped.enable_evict`. The flag now ships ON, but the claim this
+    // test rests on -- that the census figure was taken on a path a deployment does not take -- is
+    // unchanged, because what the shipped round reaches is `apply_index_resident_bound`, not
+    // `apply_storage_eviction(.., dump = true, ..)`. The bound is the higher bar, and a shard
+    // reaches the dump path only once it is OVER 64 MiB of resident index, which is about 1.7 M
+    // keys. So the fact to pin is the bound being in force, not the flag being off.
+    assert!(
+        shipped.index_resident_limit_bytes > shipped.eviction_memory_pressure_threshold,
+        "the shipped bound ({}) is no longer above the shipped threshold ({}), so a default round \
+         DOES take `apply_storage_eviction` with the dump on and the census figure is no longer \
+         the wrong path's figure. Re-cost the dirty half.",
+        shipped.index_resident_limit_bytes,
+        shipped.eviction_memory_pressure_threshold
+    );
+    assert!(
+        shipped.max_dump_buckets_per_round > 0,
+        "max_dump_buckets_per_round now ships at 0, which means UNCAPPED -- one released round \
+         would drain the whole dirty set and the cap arm below is void"
+    );
+
+    // Enough single writes to cross the record threshold, and the same object count batched.
+    let objects = (shipped.min_undumped_wal_records as usize + 100).max(1_100);
+    let mut declined_arm: Option<(u64, u64)> = None;
+    let mut released_arm: Option<(usize, usize, usize)> = None;
+
+    for (arm, batched) in [("BATCHED (one WAL record per batch)", true), ("SINGLE writes", false)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = probe_engine_on_for_record(dir.path(), SHIPPED_END);
+        if batched {
+            for chunk in (0..objects).step_by(1_000) {
+                let commands = (chunk..(chunk + 1_000).min(objects))
+                    .map(|i| Command::StringSet {
+                        key: format!("cadence-{i}"),
+                        value: vec![b'v'; 32],
+                    })
+                    .collect::<Vec<_>>();
+                let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+                    shard_id: 1,
+                    commands,
+                });
+                assert!(response.status.ok, "seed must ack: {:?}", response.status);
+            }
+        } else {
+            for i in 0..objects {
+                let response = engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: format!("cadence-{i}"),
+                        value: vec![b'v'; 32],
+                    },
+                });
+                assert!(response.status.ok, "seed must ack: {:?}", response.status);
+            }
+        }
+
+        let dirty_state = |engine: &TemporalEngine| -> (usize, u64, usize) {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            (
+                shard.dirty_objects.len(),
+                deep_heap_bytes(&shard.dirty_objects),
+                shard.bucket_index.bucket_map.values().count(),
+            )
+        };
+        let (dirty0, bytes0, buckets) = dirty_state(&engine);
+        assert!(dirty0 > 0, "non-vacuity: nothing is dirty on the {arm} arm");
+
+        let request = |shard_id: crate::types::ShardId| StorageLifecycleRequest {
+            shard_id,
+            max_dump_buckets_per_round: shipped.max_dump_buckets_per_round,
+            min_undumped_wal_records: shipped.min_undumped_wal_records,
+            min_undumped_wal_bytes: shipped.min_undumped_wal_bytes,
+            ..StorageLifecycleRequest::default()
+        };
+
+        println!();
+        println!("=== {arm}: {objects} objects written ===");
+        println!(
+            "  {dirty0} dirty objects, {bytes0} B of dirty index, over {buckets} buckets \
+             (a released round may dump {} of them)",
+            shipped.max_dump_buckets_per_round
+        );
+
+        // THE PLAN'S OWN DECISION, read rather than inferred.
+        let plan = engine.storage_lifecycle_plan(request(1));
+        println!(
+            "  plan: dump_delayed={}, undumped_wal_records={}, undumped_wal_objects={}, \
+             dirty_buckets={}, selected_dump_buckets={}",
+            plan.dump_delayed,
+            plan.undumped_wal_records,
+            plan.undumped_wal_objects,
+            plan.dirty_buckets.len(),
+            plan.selected_dump_buckets.len(),
+        );
+        if plan.dump_delayed {
+            println!(
+                "  => THE CADENCE DECLINED: {} undumped records is below the threshold of {}, so \
+                 no bucket was selected. The cadence is WORKING. Note the object count beside it \
+                 -- {} objects are dirty and the gate cannot see them, because it counts records.",
+                plan.undumped_wal_records, shipped.min_undumped_wal_records, plan.undumped_wal_objects
+            );
+            declined_arm = Some((plan.undumped_wal_records, plan.undumped_wal_objects));
+        } else {
+            println!(
+                "  => THE CADENCE RELEASED THE DUMP and selected {} of {} dirty buckets, so what \
+                 the rounds below drain is the per-round CAP binding, not the threshold declining.",
+                plan.selected_dump_buckets.len(),
+                plan.dirty_buckets.len()
+            );
+        }
+
+        let mut previous = dirty0;
+        let mut rounds_to_clear: Option<usize> = None;
+        let mut first_round_drain = 0usize;
+        for round in 1..=MAX_ROUNDS {
+            let _report = engine.apply_storage_lifecycle(request(1));
+            let (dirty, bytes, _) = dirty_state(&engine);
+            let drained = previous.saturating_sub(dirty);
+            if round == 1 {
+                first_round_drain = drained;
+            }
+            if round <= 3 || dirty == 0 || round == MAX_ROUNDS {
+                println!(
+                    "    round {round:>2}: {dirty:>6} dirty left ({:>5.1}%), {bytes:>9} B, \
+                     drained {drained} this round",
+                    100.0 * dirty as f64 / dirty0 as f64
+                );
+            }
+            if dirty == 0 {
+                rounds_to_clear = Some(round);
+                break;
+            }
+            previous = dirty;
+        }
+        let (dirty_end, bytes_end, _) = dirty_state(&engine);
+        println!(
+            "  after {} rounds: {dirty_end} of {dirty0} still dirty; dirty heap {bytes0} -> \
+             {bytes_end} B (handed back {} B = {:.1} B per object that started dirty)",
+            rounds_to_clear.unwrap_or(MAX_ROUNDS),
+            bytes0.saturating_sub(bytes_end),
+            bytes0.saturating_sub(bytes_end) as f64 / dirty0 as f64
+        );
+        match rounds_to_clear {
+            Some(n) => println!("  the cadence CLEARED the dirty set in {n} rounds"),
+            None => println!("  the cadence did NOT clear the dirty set in {MAX_ROUNDS} rounds"),
+        }
+        if !plan.dump_delayed {
+            released_arm = Some((first_round_drain, dirty0, rounds_to_clear.unwrap_or(0)));
+        }
+    }
+
+    // --- THE FINDING, AS ASSERTIONS RATHER THAN AS PROSE. ---
+    let (declined_records, declined_objects) = declined_arm
+        .expect("the batched arm must reach the cadence, delayed or not, for this to mean anything");
+    assert!(
+        declined_objects > declined_records,
+        "the batched arm wrote {declined_objects} objects in {declined_records} records; if those \
+         are equal, a batch is no longer one record and the divergence this test is about is gone"
+    );
+    println!();
+    println!(
+        "THE DIVERGENCE, MEASURED: the batched arm made {declined_objects} objects dirty in only \
+         {declined_records} undumped WAL records -- a ratio of {:.0}x. The gate compares the \
+         RECORD count against {}; the cost is per OBJECT. `undumped_wal_objects` is computed and \
+         REPORTED beside it and deliberately not compared.",
+        declined_objects as f64 / declined_records.max(1) as f64,
+        shipped.min_undumped_wal_records
+    );
+    match released_arm {
+        Some((first, total, rounds)) => println!(
+            "And once the threshold IS crossed, one round drained {first} of {total} dirty \
+             objects and the set cleared in {rounds} rounds. So the dump lever is real and armed \
+             -- but under batched ingest it is reached at roughly the record threshold TIMES the \
+             batch size in objects, not at the threshold in objects."
+        ),
+        None => println!(
+            "NEITHER arm crossed the threshold, so this run shows only the declining side. The \
+             released side is unmeasured here and must not be quoted."
+        ),
+    }
+    println!(
+        "VERDICT for the record's dirty bit, CORRECTING THE CENSUS. The trigger is ARMED, \
+         unlike the uncapped eviction path -- but it is NOT the duplicate the census took it for, \
+         on three measured grounds. (1) The census figure of 151.9 B/object came from the UNCAPPED \
+         eviction path, which ships BOUNDED: the stage is on, and a shard reaches that path only \
+         above 64 MiB of resident index. (2) On the default path, unbatched, one released round \
+         drained 14.7% and then STALLED: taking the dump advances the dumped-sequence watermark, \
+         so the record count falls back below the threshold and no further dump is selected -- \
+         one dump per threshold crossing, capped at {} buckets. (3) Batched, it drains NOTHING, \
+         because the gate counts records and a batch is one. So the dump collects at most ~17 B \
+         of the 84-112 B/object the dirty index costs, and typically none of it. The dirty half \
+         is a LIVE candidate, not a refused one.",
+        shipped.max_dump_buckets_per_round
+    );
+}
+
+/// THE KEY-ORDERED EXPIRY WALK HAS NO PRODUCTION CALLERS, AND A GUARD SAYS SO RATHER THAN A DOC.
+///
+/// `engine::expiry_window` walks `expires_at_ms` in KEY order. It is `pub(crate)`, which means
+/// anything in this crate can reach it, and the census for the consolidated record turns on it
+/// being dead: the verdict "`expires_at_ms` can be folded into a per-object record, no ordering is
+/// lost" is only true while nothing live reads that map in order. A doc comment saying so goes
+/// stale the moment someone wires it up; this fails instead.
+///
+/// WHY IT LIVES IN THIS MODULE rather than beside the expiry tests: it is a precondition of the
+/// RECORD's merge verdict, and the module that states the verdict should be the module that holds
+/// the evidence for it. If the expiry work later grows a home of its own this belongs there.
+///
+/// THE RULE IS THE ONE THE COUNTING-ALLOCATOR GATE USES, deliberately -- walk back from the call
+/// to the nearest `#[test]`, and a call that reaches the top of its file without finding one is a
+/// production caller. Brace counting was tried in that gate and rejected there: a `{` inside a
+/// string literal drifts the depth, and this crate writes plenty of them.
+///
+/// POSITIVE CONTROL. A guard that scans nothing passes, which is the failure mode that would make
+/// this test read as "no production callers" when it had in fact read no files. So the known
+/// test-only call sites are COUNTED and the count is asserted to be at least what is there today.
+#[test]
+fn the_key_ordered_expiry_window_has_no_production_callers() {
+    use std::path::{Path, PathBuf};
+
+    const NEEDLE: &str = "expiry_window(";
+    /// The call sites that exist today, all in `engine::tests::part4`. The assertion is `>=` and
+    /// not `==` on purpose: adding another TEST caller is fine and must not fail this guard, while
+    /// the count dropping to zero means the scan stopped finding anything.
+    const KNOWN_TEST_CALL_SITES: usize = 5;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut pending: Vec<PathBuf> = vec![root];
+    let mut files_read = 0usize;
+    let mut test_callers = 0usize;
+    let mut violations: Vec<String> = Vec::new();
+
+    while let Some(path) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();

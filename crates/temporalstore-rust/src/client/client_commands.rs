@@ -256,3 +256,132 @@ pub(super) fn context_command_key(command: &Command) -> Option<String> {
             entity_hash,
         } => Some(context_entity_key(*tenant_hash, *node_hash, *entity_hash)),
         Command::ContextQueryEntities {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_entity_collection_key(*tenant_hash, *node_hash)),
+        Command::ContextUpsertChildRef {
+            tenant_hash,
+            child_ref,
+        } => Some(context_child_key(*tenant_hash, child_ref.parent_hash)),
+        Command::ContextQueryChildren {
+            tenant_hash,
+            parent_hash,
+            ..
+        } => Some(context_child_key(*tenant_hash, *parent_hash)),
+        // Keyed by the NODE: the vector lives on the node record.
+        Command::ContextSetNodeEmbedding {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_node_key(*tenant_hash, *node_hash)),
+        Command::ContextTraverseTree {
+            tenant_hash,
+            start_node_hash,
+            ..
+        } => Some(context_child_key(*tenant_hash, *start_node_hash)),
+        Command::ContextUpsertSummary {
+            tenant_hash,
+            summary,
+        } => Some(context_summary_key(
+            *tenant_hash,
+            summary.node_hash,
+            summary.level,
+        )),
+        Command::ContextQuerySummaries {
+            tenant_hash,
+            node_hash,
+            level,
+            ..
+        } => Some(context_summary_key(*tenant_hash, *node_hash, *level)),
+        Command::ContextWriteCompressionEvent { tenant_hash, event } => {
+            Some(context_compression_key(*tenant_hash, event.node_hash))
+        }
+        Command::ContextQueryCompressionEvents {
+            tenant_hash,
+            node_hashes,
+            ..
+        } => node_hashes
+            .first()
+            .map(|node_hash| context_compression_key(*tenant_hash, *node_hash)),
+        Command::ContextCompressEvents {
+            tenant_hash,
+            node_hash,
+            ..
+        }
+        | Command::ContextQueryNodeContext {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_compression_key(*tenant_hash, *node_hash)),
+        _ => None,
+    }
+}
+
+pub(super) fn context_node_key(tenant_hash: u64, node_hash: u64) -> String {
+    format!("ctx:node:{tenant_hash}:{node_hash}")
+}
+
+pub(super) fn context_event_key(tenant_hash: u64, node_hash: u64) -> String {
+    format!("ctx:event:{tenant_hash}:{node_hash}")
+}
+
+pub(super) fn context_index_key(
+    tenant_hash: u64,
+    index_name: &str,
+    index_value_hash: u64,
+    scope_hash: u64,
+) -> String {
+    format!("ctxidx:{tenant_hash}:{index_name}:{index_value_hash}:{scope_hash}")
+}
+
+pub(super) fn context_audit_key(tenant_hash: u64, session_hash: u64) -> String {
+    format!("ctx:audit:{tenant_hash}:{session_hash}")
+}
+
+pub(super) fn context_dirty_key(tenant_hash: u64, node_hash: u64) -> String {
+    format!("ctx:dirty:{tenant_hash}:{node_hash}")
+}
+
+pub(super) fn context_embedding_dirty_key(tenant_hash: u64, node_hash: u64) -> String {
+    format!("ctx:embdirty:{tenant_hash}:{node_hash}")
+}
+
+pub(super) fn context_entity_key(tenant_hash: u64, node_hash: u64, entity_hash: u64) -> String {
+    format!("ctx:entity:{tenant_hash}:{node_hash}:{entity_hash}")
+}
+
+pub(super) fn context_entity_collection_key(tenant_hash: u64, node_hash: u64) -> String {
+    format!("ctx:entity:{tenant_hash}:{node_hash}")
+}
+
+pub(super) fn context_child_key(tenant_hash: u64, parent_hash: u64) -> String {
+    format!("ctx:child:{tenant_hash}:{parent_hash}")
+}
+
+pub(super) fn context_embedding_key(tenant_hash: u64, ref_hash: u64) -> String {
+    format!("ctx:embedding:{tenant_hash}:{ref_hash}")
+}
+
+pub(super) fn context_summary_key(tenant_hash: u64, node_hash: u64, level: u32) -> String {
+    format!("ctx:summary:{tenant_hash}:{node_hash}:{level}")
+}
+
+pub(super) fn context_compression_key(tenant_hash: u64, node_hash: u64) -> String {
+    format!("ctx:compress:{tenant_hash}:{node_hash}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_drain_drops_commands_that_carry_no_routing_key() {
+        // The drop decision hashes a routing key and answered "not dropped" for every command
+        // that has none -- the resource-blob upload path, sequence batch queries,
+        // node-embedding reads. A table an operator had drained to 100 went on sending them.
+        let keyless = Command::ContextResourceBlobPut {
+            tenant_hash: 7,
+            payload_base64: String::new(),
+        };
+        assert_eq!(
