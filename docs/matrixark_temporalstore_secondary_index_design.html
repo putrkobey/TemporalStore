@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MatrixArk Secondary Index Design</title>
+  <style>
+    :root { color-scheme: light dark; --fg:#182026; --muted:#5d6b76; --line:#d8dee4; --code:#f4f6f8; --accent:#175ddc; }
+    @media (prefers-color-scheme: dark) { :root { --fg:#e6edf3; --muted:#9aa7b2; --line:#30363d; --code:#161b22; --accent:#79c0ff; } }
+    body { margin:0; font:16px/1.55 system-ui, -apple-system, Segoe UI, sans-serif; color:var(--fg); background:Canvas; }
+    main { max-width:980px; margin:0 auto; padding:32px 22px 64px; }
+    h1 { font-size:2rem; line-height:1.15; margin:0 0 20px; }
+    h2 { margin-top:34px; padding-top:14px; border-top:1px solid var(--line); }
+    p, li { max-width:82ch; }
+    code { background:var(--code); padding:0.1rem 0.28rem; border-radius:4px; }
+    pre { background:var(--code); border:1px solid var(--line); border-radius:8px; padding:14px; overflow:auto; }
+    pre code { background:transparent; padding:0; }
+    .note { border-left:4px solid var(--accent); padding:10px 14px; background:color-mix(in srgb, var(--accent) 8%, transparent); }
+  </style>
+</head>
+<body>
+<main>
+<h1>MatrixArk Secondary Index Design</h1>
+<h2>Short Answer</h2>
+<p>TemporalStore already had a primary timestamp-keyed feature model before MatrixArk context management was introduced. That older model stores data under one time-ordered key and applies compact field filters during query.</p>
+<p>MatrixArk's current <code>ContextIndexRef</code> layer is closer to a native posting list:</p>
+<pre><code>ctxidx:{tenant_hash}:{index_name}:{index_value_hash}:{scope_hash}
+  timestamp_key -&gt; {primary_node_hash, primary_event_time_ms, event_id_hash}</code></pre>
+<p>That is better than duplicating full events, but it can still fan out heavily when every event, resource chunk, PDF keyword, heading, status, and source emits separate index refs.</p>
+<div class="note"><strong>Decision:</strong> the production serving path should use timestamped context series plus declared compact filter fields, not unbounded product-visible ContextIndex rows for every term.</div>
+<h2>How TemporalStore Worked Before Context Management</h2>
+<pre><code>struct TemporalFeaturePoint {
+    uint64_t timestamp;
+    std::string value;
+};
+
+struct TemporalFeatureFilter {
+    std::string field;
+    TemporalFeatureFilterOp op;
+    uint64_t value;
+};
+
+struct TemporalFeatureQuery {
+    uint64_t start_ts;
+    uint64_t end_ts;
+    uint64_t count;
+    std::vector&lt;TemporalFeatureFilter&gt; filters;
+};</code></pre>
+<p>The primary access pattern is:</p>
+<pre><code>key + timestamp range + count + optional filters -&gt; matching rows</code></pre>
+<p>For sequence feature rows, the payload has a fixed compact schema, such as <code>timestamp</code>, <code>gid</code>, <code>action_type</code>, <code>duration</code>, and <code>author_id</code>. Query filters can apply to compact fields. Timestamp remains the primary timeline key.</p>
+<h2>How Current MatrixArk Context Indexing Works</h2>
+<pre><code>ctx:event:{tenant_hash}:{node_hash}
+ctx:entity:{tenant_hash}:{node_hash}:{entity_hash}
+ctx:summary:{tenant_hash}:{node_hash}:{level}
+ctx:embedding:{tenant_hash}:{ref_hash}
+ctxidx:{tenant_hash}:{index_name}:{index_value_hash}:{scope_hash}</code></pre>
+<p>For <code>ContextEvent</code>, ingestion time is the primary timeline:</p>
+<pre><code>ctx:event:{tenant_hash}:{node_hash}
+  context_timeline_key(ingestion_time_ms, event_id_hash) -&gt; compact ContextEvent</code></pre>
+<p>For secondary lookup, the current native context path writes small refs:</p>
+<pre><code>ctxidx:{tenant_hash}:event_kind:{event_kind_hash}:{scope_hash}
+ctxidx:{tenant_hash}:status:{status_hash}:{scope_hash}
+ctxidx:{tenant_hash}:source:{source_hash}:{scope_hash}
+ctxidx:{tenant_hash}:entity:{entity_hash}:{scope_hash}
+ctxidx:{tenant_hash}:event_time_bucket:{bucket_ms}:{scope_hash}</code></pre>
+<p>Each ref points back to the primary event row:</p>
+<pre><code>{primary_node_hash, primary_event_time_ms, event_id_hash}</code></pre>
+<h2>Why Too Many Indexes Hurt</h2>
+<ul>
+  <li>More writes per event or resource chunk.</li>
