@@ -100,37 +100,3 @@ impl ObjectStore for AwsCliObjectStore {
         } else {
             format!("{}/", self.prefix)
         };
-        Ok(keys
-            .into_iter()
-            .filter_map(|key| key.strip_prefix(&strip).map(str::to_string))
-            .collect())
-    }
-
-    async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
-        self.run_aws(&["s3", "rm", &self.s3_uri(key)])?;
-        Ok(())
-    }
-
-    fn uri(&self, key: &str) -> String {
-        self.s3_uri(key)
-    }
-}
-
-async fn sample_snapshot(root: &Path) -> LocalSnapshot {
-    let shard_root = root.join("shard-101");
-    tokio::fs::create_dir_all(shard_root.join("page_segments"))
-        .await
-        .unwrap();
-    let index_path = shard_root.join("index.bin");
-    let checksums_path = shard_root.join("checksums.json");
-    let slab_path = shard_root.join("block_segments/0001.seg");
-    tokio::fs::write(&index_path, b"aws-index").await.unwrap();
-    tokio::fs::write(&checksums_path, b"[]").await.unwrap();
-    tokio::fs::write(&slab_path, b"aws-page-segment")
-        .await
-        .unwrap();
-
-    let file_store = Arc::new(FileObjectStore::new(root.join("bootstrap-objects")));
-    let snapshot_store = S3SnapshotStore::new("aws-smoke-cluster", "test", root, file_store);
-    snapshot_store
-        .create_local_snapshot(101, "term:3:index:44".to_string())
