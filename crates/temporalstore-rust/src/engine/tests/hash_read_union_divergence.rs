@@ -254,3 +254,88 @@ fn an_index_entry_marked_deleted_loses_no_field_and_is_not_counted() {
             if !block.deleted {
                 block.deleted = true;
                 marked += 1;
+            }
+        }
+        marked
+    };
+    assert_eq!(
+        live_before, marked,
+        "the plant marked {marked} of {live_before} live entries; a partial plant leaves the index \
+         naming some of the object and this arm would not be about the container answering alone"
+    );
+    assert_eq!(
+        0,
+        live_hash_entries(&engine, PLANTED_KEY),
+        "the object still holds live index entries after the plant"
+    );
+
+    let before = divergences(&engine);
+    let served_after = served(&engine, PLANTED_KEY);
+    let after = divergences(&engine);
+
+    // THE CONTAINER ANSWERS ALONE, AND IT ANSWERS IN FULL.
+    assert_eq!(
+        expected(&fields),
+        served_after,
+        "with no live index entry for the object the read served {served_after:?}. The container \
+         holds all three fields and their addresses, so it must answer all three -- a short answer \
+         here means the read still depends on the index naming something"
+    );
+
+    // AND NOTHING WAS COUNTED, because the container-side direction loses no read.
+    assert_eq!(
+        before, after,
+        "the container-only direction counted {} divergences; the counter is for a field the INDEX \
+         names that the container lacks, and mixing the two makes it unreadable as a risk figure",
+        after - before
+    );
+
+    // THE DENOMINATOR IS PUBLISHED AND NON-ZERO, because a count without one is unreadable.
+    let report = engine.hash_read_divergence_report();
+    assert!(
+        report.reads_served >= 2,
+        "the report says {} reads were served over {} divergences; a zero or missing denominator \
+         makes the count say nothing either way",
+        report.reads_served,
+        report.index_named_fields_the_container_lacked
+    );
+}
+
+/// The live hash page entries this object holds.
+fn live_hash_entries(engine: &TemporalEngine, key: &str) -> usize {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    let named = super::BlockObjects::of(&shard.bucket_index);
+    let mut live = 0usize;
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for (handle, block) in &bucket.block_index {
+            if !block.deleted
+                && block.model_id.as_str() == "hash"
+                && &**named.at(bucket.routing_bucket, *handle) == key
+            {
+                live += 1;
+            }
+        }
+    }
+    live
+}
+
+/// Holds the one-entry-a-page gate OFF and puts back whatever was there -- on a normal drop AND
+/// while unwinding, so a failing arm cannot leak it into every later test in the process.
+///
+/// `remove_var` IS THE CORRECT RESTORE when the variable was absent: the gate reads through
+/// `env_flag_default_on`, so UNSET MEANS ON and removing it restores the shipped default rather
+/// than turning the gate off for the rest of the binary.
+
+
+
+/// UNDER THE GATE THERE IS NOTHING FOR THIS COUNTER TO COUNT, AND THAT IS ASSERTED.
+///
+/// The arm above holds the gate OFF because that is the only route on which a hash page entry still
+/// names a field. This states the other half: with the gate at its shipped default every hash entry
+/// is page-named, so the same plant -- a field taken off the container and left on the index --
+/// produces NO named-only field, the read serves the container's remaining fields and nothing else,
+/// and the counter cannot move.
+///
+/// WRITTEN AS A TRIPWIRE RATHER THAN A ZERO. A counter that does not move is also what a broken
+/// instrument looks like, so this does not merely assert zero: it asserts that the index names no
