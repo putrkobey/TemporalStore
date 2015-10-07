@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>TemporalStore Monitoring</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">TemporalStore</p>
+          <h1>Operations Console</h1>
+        </div>
+        <div class="toolbar">
+          <span id="cluster-status" class="status-pill">
+            <span class="dot"></span>
+            loading
+          </span>
+          <a class="button-link" href="./management-portal.html">Management Portal</a>
+          <a class="button-link" href="./access-management.html">Access Management</a>
+          <a class="button-link" href="./ingestion-dashboard.html">Ingestion Dashboard</a>
+          <a class="button-link" href="./matrixark-api-reference.html">API Reference</a>
+          <a class="button-link" href="./agent-context-envelope.html">Agent Envelope</a>
+          <button id="refresh" type="button" aria-label="Refresh dashboard">Refresh</button>
+        </div>
+      </header>
+
+      <div id="health-source-banner" class="health-source-banner" role="status" aria-live="polite"></div>
+
+      <section class="summary-grid" aria-label="Cluster summary">
+        <article>
+          <span>Topology</span>
+          <strong id="summary-topology">-</strong>
+          <small id="summary-topology-note">metaserver / data nodes</small>
+        </article>
+        <article>
+          <span>Primary Write QPS</span>
+          <strong id="summary-write-qps">-</strong>
+          <small id="summary-write-note">latest scale run</small>
+        </article>
+        <article>
+          <span>Secondary Lag</span>
+          <strong id="summary-lag">-</strong>
+          <small id="summary-lag-note">replay visibility</small>
+        </article>
+        <article>
+          <span>Blockcache</span>
+          <strong id="summary-cache">-</strong>
+          <small id="summary-cache-note">DRAM / SSD</small>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>One Cluster Products</h2>
+            <p>TemporalStore, MatrixKV, and MatrixDB running on the same AWS test cluster.</p>
+          </div>
+        </div>
+        <div id="products-grid" class="product-grid"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>LLM Context Operations</h2>
+            <p>End-to-end extraction, ingestion, retrieval, feedback, replay, and resource recall for MatrixArk context testing.</p>
+          </div>
+          <span id="context-runtime-status" class="status-pill">
+            <span class="dot"></span>
+            pending
+          </span>
+        </div>
+        <div id="context-kpis" class="context-kpis"></div>
+        <div id="context-flow" class="flow-grid"></div>
+      </section>
+
+      <section class="panel ops-workspace-panel">
+        <div class="panel-head">
+          <div>
+            <h2>Operations Workspace</h2>
+            <p>Runtime operations, configuration, testing, and evidence grouped for production review.</p>
+          </div>
+        </div>
+        <div id="context-ops-workspace" class="ops-workspace-grid"></div>
+      </section>
+
+      <section class="panel data-plane-panel">
+        <div class="panel-head">
+          <div>
+            <h2>Context Data Plane</h2>
+            <p>Context nodes, events, extractions, ingestions, resources, feedback, summaries, and context packs.</p>
+          </div>
+        </div>
+        <div id="context-data-plane" class="data-plane-grid"></div>
+      </section>
+
+      <section id="testing" class="layout context-layout">
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <div>
+              <h2>Pipeline Test Console</h2>
+              <p>Layered context flow with TemporalStore as the serving store.</p>
+            </div>
+          </div>
+          <div id="context-tests" class="test-grid context-tests"></div>
+          <div class="table-wrap section-gap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Step</th>
+                  <th>Input</th>
+                  <th>TemporalStore Writes</th>
+                  <th>Serving Query</th>
+                  <th>Expected Output</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody id="context-pipeline-body"></tbody>
