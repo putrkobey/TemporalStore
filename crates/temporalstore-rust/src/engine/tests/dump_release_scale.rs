@@ -893,3 +893,451 @@ fn what_a_dump_costs_and_releases_at_two_corpus_sizes() {
     );
 }
 
+/// THE WRITE-AHEAD LOG HALF OF THE SAME DUMP RELEASES NOTHING, AND SAYS IT THE SAME WAY AS A
+/// SWEEP THAT HAD NOTHING TO SAY.
+///
+/// Three arms, because the claim needs all three:
+///
+/// * SUBJECT -- the batch-written store the corpus sizes above are built from. Its WAL release is
+///   zero against a log that demonstrably holds records.
+/// * CONTROL -- the same call against a log written one command at a time, which releases plenty.
+///   Without it the subject's zero could be a reclaim that never works, or an empty log.
+/// * EMPTY -- a loaded shard nobody wrote to, where there is genuinely nothing to free.
+///
+/// The assertion that matters is the last comparison: SUBJECT and EMPTY report the IDENTICAL
+/// triple. `dump_and_reclaim_index_logs_with_min_reclaimable` takes the sweep's `Result` with
+/// `.ok()` and then reads every field through `.unwrap_or_default()`, so a sweep that returned an
+/// error and a sweep that had nothing to do are the same `CatalogDumpReclaimReport` to the byte.
+/// That much does not depend on knowing WHY the subject arm's sweep fails -- it is an error
+/// rendering as success, and no operator and no test can tell the two apart.
+///
+/// rust-internal: prices the engine's own reclaim reporting, no product behaviour
+#[test]
+fn a_dump_reports_the_same_write_ahead_log_release_whether_or_not_one_happened() {
+    const CONTROL_RECORDS: usize = 1_200;
+    let _rolling = roll_at(ROLL_BYTES);
+
+    let batched_dir = tempfile::tempdir().expect("tempdir");
+    let batched = measure_dump(batched_dir.path(), SMALL, FIXED_SUFFIX);
+    assert_fixture_can_express_it(&batched);
+
+    // EMPTY ARM: a shard that is loaded and never written. The dump completes (it has an index to
+    // serialize, even an empty one) and the sweep finds no log at all, which is the one case where
+    // zero is the honest answer.
+    let empty_dir = tempfile::tempdir().expect("tempdir");
+    let empty = release_engine(empty_dir.path());
+    let empty_wal_records = empty
+        .write_ahead_log_store()
+        .info(SHARD)
+        .map(|info| info.records)
+        .unwrap_or(0);
+    let empty_report = empty
+        .dump_and_reclaim_index_logs_with_min_reclaimable(SHARD, 0)
+        .expect("APPARATUS: the empty-shard dump did not complete");
+
+    let control_dir = tempfile::tempdir().expect("tempdir");
+    let control = release_engine(control_dir.path());
+    seed_one_at_a_time(&control, 0, CONTROL_RECORDS);
+    let control_wal = control.write_ahead_log_store();
+    let control_records_before = control_wal.info(SHARD).map(|info| info.records).unwrap_or(0);
+    let control_report = control
+        .dump_and_reclaim_index_logs_with_min_reclaimable(SHARD, 0)
+        .expect("APPARATUS: the control dump did not complete");
+    let control_released = control_report
+        .wal_bytes_before
+        .saturating_sub(control_report.wal_bytes_after);
+
+    eprintln!(
+        "\nDUMP WAL batched corpus={} log held {} records in {} B, dump released {} B in {} records",
+        batched.corpus,
+        batched.wal_records_before,
+        batched.wal_bytes_on_disk_before,
+        batched.wal_released,
+        batched.wal_records_removed,
+    );
+    eprintln!(
+        "DUMP WAL control one-command-at-a-time records={CONTROL_RECORDS} log held {control_records_before} records, dump released {control_released} B in {} records",
+        control_report.wal_records_removed,
+    );
+    eprintln!(
+        "DUMP WAL empty shard: log held {empty_wal_records} records, dump released {} B in {} records (before={} after={})",
+        empty_report
+            .wal_bytes_before
+            .saturating_sub(empty_report.wal_bytes_after),
+        empty_report.wal_records_removed,
+        empty_report.wal_bytes_before,
+        empty_report.wal_bytes_after,
+    );
+
+    // CONTROL FIRST, so a zero on the subject arm cannot be the reclaim never working at all.
+    assert!(
+        control_records_before > 0,
+        "CONTROL: the control log held no records, so its release proves nothing"
+    );
+    assert!(
+        control_released > 0 && control_report.wal_records_removed > 0,
+        "CONTROL: a dump against a log written one command at a time released {control_released} B \
+         in {} records -- this arm exists to prove a non-zero WAL release is expressible here, and \
+         without it the subject arm's zero says nothing",
+        control_report.wal_records_removed
+    );
+    // SUBJECT. This arm reported 0 B in 0 records when it was written, and the assertion here
+    // said so. The cause was found -- the reclaim walk stripped a trailing delimiter off a
+    // binary frame, which declares its own length, so a payload ending in `0x0A` read one byte
+    // short and the whole sweep was refused as a torn frame. See `wal_reclaim_frame_boundary`.
+    // Inverted rather than loosened, per the note this assertion used to carry: the arm still
+    // has to say something, and what it says now is that the batch path releases.
+    assert!(
+        batched.wal_released > 0 && batched.wal_records_removed > 0,
+        "SUBJECT: the dump released {} B in {} records from a log holding {} records in {} bytes. \
+         A batch-written log reclaims now; a zero here is that defect returning, not a log with \
+         nothing to give -- the fixture assertions above have already shown it holds records",
+        batched.wal_released,
+        batched.wal_records_removed,
+        batched.wal_records_before,
+        batched.wal_bytes_on_disk_before
+    );
+
+    // THE ONE THAT DOES NOT DEPEND ON KNOWING WHY, now the other way round. A store holding a
+    // log and a store holding none used to hand back the same three numbers. They must not.
+    assert_eq!(
+        empty_wal_records, 0,
+        "APPARATUS: the empty arm's log held {empty_wal_records} records, so it is not the \
+         nothing-to-do case this comparison needs"
+    );
+    let empty_released = empty_report
+        .wal_bytes_before
+        .saturating_sub(empty_report.wal_bytes_after);
+    assert_ne!(
+        (batched.wal_released, batched.wal_records_removed),
+        (empty_released, empty_report.wal_records_removed),
+        "a store holding {} records in {} bytes and a store holding no log at all report the same \
+         release again",
+        batched.wal_records_before,
+        batched.wal_bytes_on_disk_before
+    );
+
+    // And the term that says WHICH of the two a zero is, for the cases where a zero is still the
+    // answer. The sweep's `Result` is still dropped with `.ok()` -- a failed sweep must not fail
+    // a dump that has already completed -- so without this an error is three zeros again.
+    assert!(
+        !batched.wal_sweep_failed,
+        "SUBJECT: the sweep reported a failure, so its three zeros would be a refusal rendered as \
+         success were the term not there to say so"
+    );
+    assert!(
+        !empty_report.wal_sweep_failed,
+        "EMPTY: an empty shard's sweep reports a failure, so the term is reading something other \
+         than the sweep's own outcome"
+    );
+}
+
+/// WHAT A CALLER CAN TELL ABOUT A DUMP THAT DID NOT HAPPEN.
+///
+/// `maybe_dump_and_reclaim_index_logs` is what the embedded proxy polls on a timer, and it is the
+/// only thing keeping that store's logs bounded. It answers `None` for a shard below the
+/// threshold and `None` for a shard this engine does not serve at all, so a loop that reads it
+/// cannot separate "nothing needed doing" from "this never ran".
+///
+/// rust-internal: reads the engine's own maintenance entry point, no product behaviour
+#[test]
+fn a_dump_that_was_not_needed_and_one_that_could_not_run_are_the_same_answer() {
+    const UNSERVED_SHARD: ShardId = 99;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = release_engine(dir.path());
+    seed_range(&engine, 0, 500);
+
+    let below_threshold = engine.maybe_dump_and_reclaim_with_gap_for_test(SHARD, u64::MAX, 0, 0);
+    let unserved = engine.maybe_dump_and_reclaim_with_gap_for_test(UNSERVED_SHARD, 1, 0, 0);
+    let fired = engine.maybe_dump_and_reclaim_with_gap_for_test(SHARD, 1, 0, 0);
+
+    // DENOMINATOR. Without an arm that fires, three `None`s would be a dump that never works.
+    assert!(
+        fired.is_some(),
+        "APPARATUS: no arm of this fixture produced a dump, so two `None`s below say nothing"
+    );
+    assert!(
+        below_threshold.is_none(),
+        "a shard below the gap should not dump"
+    );
+    assert!(
+        unserved.is_none(),
+        "a shard this engine does not serve should not dump"
+    );
+    assert_eq!(
+        below_threshold, unserved,
+        "the one call the embedded reclaim loop makes answers identically for a shard that needed \
+         no dump and a shard it cannot dump at all -- if these ever differ, the loop has gained a \
+         way to know it is not running"
+    );
+}
+
+/// DIRECTION: THE SAME RECORDS IN THE SAME ORDER, NOT THE SAME NUMBER OF THEM.
+///
+/// Releasing too little is slow and releasing too much is silent loss, so a count is the wrong
+/// assertion: a reclaim that dropped one record and kept an extra would pass it. This compares
+/// the served sequence element by element against a store that never dumped.
+///
+/// rust-internal: exercises the engine's dump/reclaim/reload cycle, no product behaviour
+#[test]
+fn a_dump_and_reclaim_leaves_the_same_records_in_the_same_order_as_a_store_that_never_dumped() {
+    const CORPUS: usize = 5_000;
+    let _rolling = roll_at(ROLL_BYTES);
+
+    fn served_sequence(engine: &TemporalEngine, count: usize) -> Vec<Option<usize>> {
+        (0..count)
+            .map(|index| {
+                let response = engine.execute(ExecuteRequest {
+                    shard_id: SHARD,
+                    command: Command::StringGet {
+                        key: format!("k-{index:08}"),
+                    },
+                });
+                match response.response {
+                    CommandResponse::Bytes { value } => value.map(|bytes| bytes.len()),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    let control_dir = tempfile::tempdir().expect("tempdir");
+    let control = release_engine(control_dir.path());
+    seed_range(&control, 0, CORPUS);
+    let control_sequence = served_sequence(&control, CORPUS);
+
+    let dumped_dir = tempfile::tempdir().expect("tempdir");
+    let dumped = release_engine(dumped_dir.path());
+    seed_range(&dumped, 0, CORPUS);
+    let report = dumped
+        .dump_and_reclaim_index_logs_with_min_reclaimable(SHARD, 0)
+        .expect("APPARATUS: the dump did not complete");
+    drop(dumped);
+    let reloaded = release_engine(dumped_dir.path());
+    let reloaded_sequence = served_sequence(&reloaded, CORPUS);
+
+    // DENOMINATORS. Two empty stores match element for element.
+    let live = control_sequence.iter().filter(|slot| slot.is_some()).count();
+    assert_eq!(
+        live, CORPUS,
+        "APPARATUS: the control served {live} of {CORPUS} records before any dump, so a match \
+         below would be two stores agreeing about nothing"
+    );
+    assert!(
+        report.index_log_records_removed > 0,
+        "APPARATUS: the dump removed no index-log records, so the reload below did not have to \
+         survive a reclaim"
+    );
+
+    let first_difference = control_sequence
+        .iter()
+        .zip(reloaded_sequence.iter())
+        .position(|(control_slot, reloaded_slot)| control_slot != reloaded_slot);
+    assert_eq!(
+        first_difference, None,
+        "the store that dumped, reclaimed and reloaded first differs from the one that never \
+         dumped at record {first_difference:?}: control {:?} against reloaded {:?}",
+        first_difference.and_then(|at| control_sequence.get(at)),
+        first_difference.and_then(|at| reloaded_sequence.get(at)),
+    );
+    assert_eq!(
+        control_sequence, reloaded_sequence,
+        "the two stores serve different sequences"
+    );
+}
+
+/// CAN THE DUMP KEEP UP WITH A STORE THAT KEEPS BEING WRITTEN.
+///
+/// Five rounds of "write 4,000 records, then dump". The log has to come back to its floor every
+/// round for the bound to be reachable at all, and it does. What moves is the price: each round
+/// releases the same bytes and writes more of them.
+///
+/// rust-internal: prices repeated engine dumps in bytes, no product behaviour
+#[test]
+fn a_store_written_between_dumps_returns_to_its_floor_and_pays_the_whole_store() {
+    const PER_ROUND: usize = 4_000;
+    const ROUNDS: usize = 5;
+    let _rolling = roll_at(ROLL_BYTES);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = release_engine(dir.path());
+    seed_range(&engine, 0, SMALL);
+    engine
+        .dump_and_reclaim_index_logs_with_min_reclaimable(SHARD, 0)
+        .expect("APPARATUS: the priming dump did not complete");
+
+    let store = engine.index_log_store();
+    let mut written = SMALL;
+    let mut costs = Vec::new();
+    let mut releases = Vec::new();
+    let mut floors = Vec::new();
+    for _ in 0..ROUNDS {
+        seed_range(&engine, written, written + PER_ROUND);
+        written += PER_ROUND;
+        let before = bytes_written_now().expect("APPARATUS: /proc/thread-self/io carries no wchar line");
+        let report = engine
+            .dump_and_reclaim_index_logs_with_min_reclaimable(SHARD, 0)
+            .expect("APPARATUS: a round's dump did not complete");
+        let after = bytes_written_now().expect("APPARATUS: /proc/thread-self/io carries no wchar line");
+        costs.push(after.saturating_sub(before));
+        releases.push(
+            report
+                .index_log_bytes_before
+                .saturating_sub(report.index_log_bytes_after),
+        );
+        floors.push((store.log_len_bytes(SHARD), store.piece_count(SHARD)));
+    }
+    eprintln!("\nDUMP ROUNDS costs={costs:?}");
+    eprintln!("DUMP ROUNDS releases={releases:?}");
+    eprintln!("DUMP ROUNDS floors={floors:?}");
+
+    // THE BOUND IS REACHED, EVERY ROUND.
+    for (round, (bytes, pieces)) in floors.iter().enumerate() {
+        assert_eq!(
+            *pieces, 1,
+            "round {round} left the log in {pieces} pieces holding {bytes} B -- the bound the \
+             store rests on is one piece, and a round that does not reach it is a round the store \
+             does not recover from"
+        );
+    }
+    let first_release = releases[0];
+    for (round, released) in releases.iter().enumerate() {
+        assert_eq!(
+            *released, first_release,
+            "round {round} released {released} B against round 0's {first_release} B -- every \
+             round wrote the same {PER_ROUND} records, so every round should free the same bytes"
+        );
+    }
+
+    // AND COSTS MORE EVERY TIME.
+    for round in 1..ROUNDS {
+        assert!(
+            costs[round] > costs[round - 1],
+            "round {round} cost {} B against round {}'s {} B -- the store grew by {PER_ROUND} \
+             records between them and the dump writes the whole store, so this is the quantity \
+             that is supposed to climb",
+            costs[round],
+            round - 1,
+            costs[round - 1]
+        );
+    }
+    let first_ratio = costs[0] as f64 / releases[0] as f64;
+    let last_ratio = costs[ROUNDS - 1] as f64 / releases[ROUNDS - 1] as f64;
+    eprintln!(
+        "DUMP ROUNDS written per byte released: {first_ratio:.2} -> {last_ratio:.2} over {ROUNDS} rounds"
+    );
+    assert!(
+        last_ratio > first_ratio * 1.5,
+        "over {ROUNDS} rounds on a store that grew from {SMALL} to {written} records, the price of \
+         a dump went {first_ratio:.2} -> {last_ratio:.2} bytes written per byte released; under \
+         1.5x and the cost would not be tracking the store"
+    );
+}
+
+/// CONTROL FOR THE BYTE INSTRUMENT.
+///
+/// The residual in the measurement above is 0 at every size, and a 0 from a blind instrument
+/// looks exactly like a 0 from an exact one. This plants a known write where the attribution walk
+/// cannot see it and requires the residual to recover it to the byte.
+///
+/// rust-internal: proves this module's own measuring apparatus, no product behaviour
+#[test]
+fn the_byte_instrument_reports_a_planted_write() {
+    const PLANTED: usize = 4_096;
+    let walked = tempfile::tempdir().expect("tempdir");
+    let outside = tempfile::tempdir().expect("tempdir");
+
+    let tree_before = tree_snapshot(walked.path());
+    let before = bytes_written_now().expect("APPARATUS: /proc/thread-self/io carries no wchar line");
+    std::fs::write(outside.path().join("planted"), vec![b'x'; PLANTED]).expect("plant the write");
+    let after = bytes_written_now().expect("APPARATUS: /proc/thread-self/io carries no wchar line");
+    let tree_after = tree_snapshot(walked.path());
+
+    let attributed: u64 = changed_files(&tree_before, &tree_after)
+        .iter()
+        .map(|(_, len)| *len)
+        .sum();
+    let residual = after.saturating_sub(before) as i64 - attributed as i64;
+    eprintln!(
+        "\nDUMP INSTRUMENT planted={PLANTED} kernel={} attributed={attributed} residual={residual}",
+        after - before
+    );
+    assert_eq!(
+        attributed, 0,
+        "APPARATUS: the walk attributed {attributed} B inside a root nothing was written to"
+    );
+    assert_eq!(
+        residual, PLANTED as i64,
+        "the instrument recovered {residual} of {PLANTED} planted bytes; a residual that cannot \
+         see a byte written outside its attribution reports 0 for every dump whatever a dump does"
+    );
+}
+
+// =============================================================================================
+// MAKING THE COST TRACK THE RELEASE
+// =============================================================================================
+//
+// Everything above prices a dump against a CONSTANT accrual threshold and finds bytes written per
+// byte released linear in the store. Two things have to be separated to act on that.
+//
+// THE WHOLE-INDEX WRITE IS IRREDUCIBLE, and `what_a_dump_writes_is_the_base_index` below counts
+// it. The base index is not a second copy of something incremental that could be written instead:
+// the incremental form already exists and is the index log, `load_index_inner` already loads base
+// + folded deltas, and the base index IS the compaction of that log. A dump that wrote only a
+// delta would have compacted nothing, so it would release nothing, and #1920 established that
+// nothing bounds the retained log except a completed dump. Writing less per dump is not available.
+//
+// THE RATIO IS NOT IRREDUCIBLE. It is cost over release, and while the cost is the store, the
+// release is whatever the cadence held out for -- a constant number of bytes that has nothing to
+// do with the base index a dump must write to free them.
+// `effective_index_dump_threshold_bytes` makes the configured value a FLOOR and adds a relative
+// term: a threshold dump waits until the accrual reaches
+// `base_index / INDEX_DUMP_BASE_FRACTION_DIVISOR`. The ratio is then the divisor, at every size.
+
+/// The accrual floor the cadence arms configure. Small enough that the relative term binds at both
+/// corpus sizes, large enough that the FIXED control still fires within a few batches.
+const CADENCE_FLOOR_BYTES: u64 = 16 * 1024;
+/// Corpus sizes for the cadence arms, exactly 10x apart.
+///
+/// Smaller than the 20,000 and 200,000 this module's first test uses, and deliberately. The figure
+/// the cadence bounds is bytes written per byte RELEASED -- dimensionless -- so what showing it
+/// needs is a tenfold RANGE, not a large absolute size, and the absolute cost of a dump at 20,000
+/// and 200,000 records is already measured and asserted above. A 200,000-record arm here would add
+/// minutes to every run of the suite forever to restate a ratio this pair states.
+const CADENCE_SMALL: usize = 5_000;
+const CADENCE_LARGE: usize = 50_000;
+/// Records written between two cadence checks. Small against the smallest threshold any arm holds
+/// out for, so a round overshoots by at most one batch and the released figure is the threshold
+/// rather than the batch.
+const CADENCE_BATCH: usize = 100;
+/// A round that has not fired after this many batches is an apparatus failure, not a zero.
+const CADENCE_MAX_BATCHES: usize = 1_000;
+/// The FIXED cadence, spelled as the divisor that disables the relative term. An arm that is not
+/// exercising the relative term says so by passing this.
+const FIXED_CADENCE: u64 = 0;
+
+/// One round of a cadence: the records written until the gate fired, and what the dump it fired
+/// cost and released.
+#[derive(Debug, Clone)]
+struct CadenceRound {
+    policy: &'static str,
+    corpus_before: usize,
+    records_written: usize,
+    /// What the production threshold function asked for, given the base index below.
+    threshold_bytes: u64,
+    /// The base index on disk when the round started -- the relative term's only input.
+    base_index_before: u64,
+    /// COST, from the kernel, for the dump alone.
+    kernel_bytes_written: u64,
+    attributed_bytes: u64,
+    residual_bytes: i64,
+    /// The length the ACTIVE index-log piece ended at -- the folded catalog anchor the dump
+    /// appended, as the post-dump sweep left it. The only value the residual is allowed to take
+    /// besides zero, and it is read off the tree rather than chosen. See
+    /// `assert_round_can_express_it`.
+    active_piece_bytes: u64,
+    /// RELEASE.
+    index_log_released: u64,
+    index_log_records_removed: usize,
+    /// The index log's high-water mark this round. What the relative term buys is paid here.
+    undumped_at_dump: u64,
