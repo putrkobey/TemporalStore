@@ -1,0 +1,113 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+//! WHAT ONE APPEND COSTS WHEN IT TRAVELS WITH OTHERS, per entry.
+//!
+//! # THE QUESTION
+//!
+//! One append of one entry costs a fixed envelope over the user's bytes, and at a small value that
+//! envelope IS the amplification: an eight-byte value carries it whole. `publish_wal_entries_batch`
+//! makes `N` entries share exactly TWO object-store appends instead of `2N`, so the obvious hope is
+//! that it divides the envelope by `N`.
+//!
+//! IT DOES NOT, and this program is how that is established rather than argued. The envelope is
+//! charged PER FRAME, and batching changes how many appends carry the frames, not how many frames
+//! there are. Each entry still gets its own log frame and its own sidecar frame, so the per-entry
+//! byte cost of a batch of two hundred and fifty-six is the per-entry byte cost of a batch of one.
+//!
+//! Measured, at an 8-byte value: 64.0 B per entry at `N = 1` and 70.0 B at `N = 256`. Flat, and
+//! what movement there is goes the WRONG WAY -- see below.
+//!
+//! # IT IS NOT QUITE IDENTICAL EITHER, AND THE DIFFERENCE HAS NO STABLE SIGN
+//!
+//! The two paths write slightly different bytes for the same entries, because they fill the
+//! sidecar's offset-shaped fields with different NUMBERS: a batch records the object length after
+//! the whole batch where separate appends record it as it stood at their own append, and several
+//! of those fields are varints whose width follows the value.
+//!
+//! The difference is a fraction of a percent and its SIGN IS NOT A PROPERTY OF BATCHING. Measured
+//! at a 256-entry batch of 8-byte values it was +0.40% when the log frame carried a 32-byte digest
+//! and -0.70% once that digest became a CRC32C. An earlier version of this program asserted the
+//! sign from a single measurement and named the object-length field as the cause; narrowing the
+//! frame flipped it. Several fields move together and this program does not separate them, so the
+//! cause is NOT established here and the assertion is on magnitude rather than direction.
+//!
+//! That is the honest shape of the trade: batching buys appends and barriers, costs or saves a
+//! handful of bytes per entry depending on the frame size, and does nothing whatsoever to the
+//! envelope. It is still worth doing. It is just not an answer to the envelope.
+//!
+//! # WHAT BATCHING DOES AMORTISE, AND WHY THIS DENOMINATOR CANNOT SEE IT
+//!
+//! Two appends instead of `2N` is a real and large saving in the things an append costs besides
+//! bytes: round trips, durability barriers, and one EXTENT per append in each object's metadata.
+//! The published denominator sums `extent.length()` -- the DATA each extent holds -- so a hundred
+//! extents holding a hundred bytes and one extent holding a hundred bytes are the same number.
+//! That is not a flaw to be corrected by folding extent metadata into the ratio; it is a different
+//! term. So the extent COUNT is reported beside the byte figure as its own column, and the
+//! unbatched control is run at every point to show the counts actually diverge.
+//!
+//! # TWO SWEEPS, BECAUSE THERE ARE TWO VARIABLES
+//!
+//! `N` is swept at a fixed payload to test whether the per-entry cost depends on batch size, and
+//! the payload is swept at a fixed `N` to fit `per_entry = rate * payload + envelope`. Quoting a
+//! single ratio would hide whichever of the two was moving.
+//!
+//! The fitted line is `1.0010 * payload + 63.7` with a worst residual of 4.8 B, which puts the
+//! per-entry ratio at 1.10x around a 637-byte value and 1.01x around a 7,100-byte one. Those
+//! crossings are properties of the ENVELOPE, so they do not move with `N` either -- and they move
+//! whenever the envelope does, which is why the program prints them rather than this comment
+//! being the place they are quoted from.
+//!
+//! rust-internal: measures the shared store's own layout, no product behaviour
+
+use std::sync::Arc;
+
+use matrixobjectstore_rs::StoreOptions;
+use temporalstore_rust::shared_store::{
+    SharedStoreReplicator, SharedStoreWalAppendMode, SharedStoreWalEntry,
+};
+use temporalstore_rust::{Command, MatrixObjectObjectStore};
+use temporalstore_snapshot::object_store::ObjectStore;
+
+const BUCKET: &str = "temporalstore-shared";
+const SHARD: u64 = 1;
+const KEY: &str = "amp-key";
+const CLUSTER: &str = "cluster-batched-append";
+
+/// What one run of `count` entries left in the shared WAL prefix.
+struct Measured {
+    /// key + value, summed over every entry the run published.
+    user_bytes: u64,
+    /// Sum of every extent's LENGTH over every object under the shared WAL prefix. The same
+    /// numerator `one_append_amplification_report` uses, so the two are comparable.
+    blob_bytes: u64,
+    /// How many objects the prefix holds. Asserted, never assumed.
+    objects: usize,
+    /// How many extents those objects hold between them -- one per append that reached the store.
+    /// This is what batching moves and what the byte figure cannot see.
+    extents: usize,
+}
+
+/// Publish `count` entries of `payload` bytes each into a store of its own.
+///
+/// `batched` picks the path under test: one `publish_wal_entries_batch` call, or `count` separate
+/// `publish_wal_entry` calls. Everything else is held identical so the difference between the two
+/// is the path and nothing else.
+async fn run(count: usize, payload: usize, batched: bool, options: &StoreOptions) -> Measured {
+    let store =
+        Arc::new(MatrixObjectObjectStore::new(BUCKET, options.clone()).expect("a store of its own"));
+    let replicator = SharedStoreReplicator::new(CLUSTER, store.clone())
+        .with_wal_append_mode(SharedStoreWalAppendMode::ProtobufAppendBlob);
+
+    let entries: Vec<SharedStoreWalEntry> = (0..count)
+        .map(|at| SharedStoreWalEntry {
+            shard_id: SHARD,
+            wal_index: at as u64 + 1,
+            command: Some(Command::StringSet {
+                key: KEY.to_string(),
+                value: vec![b'v'; payload],
+            }),
+            staged_blocks: Vec::new(),
+            outcomes: Vec::new(),
+        })
+        .collect();
