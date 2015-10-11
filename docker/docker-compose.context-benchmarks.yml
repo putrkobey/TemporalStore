@@ -1,0 +1,12 @@
+services:
+  open-reader:
+    image: "${TEMPORALSTORE_READER_IMAGE:-ollama/ollama:0.3.14}"
+    ports:
+      - "${TEMPORALSTORE_READER_PORT:-11434}:11434"
+    volumes:
+      - temporalstore-ollama:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
