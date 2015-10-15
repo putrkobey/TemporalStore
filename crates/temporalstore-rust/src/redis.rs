@@ -539,3 +539,545 @@ mod tests {
                 RespValue::Bulk(Some(b"d".to_vec())),
             ]),
             "negative indices count from the tail"
+        );
+        assert_eq!(
+            run(&mut state, vec!["LRANGE", "l", "5", "9"]),
+            RespValue::Array(Vec::new()),
+            "an out-of-window range answers empty, never an error"
+        );
+
+        assert_eq!(run(&mut state, vec!["LPOP", "l"]), RespValue::Bulk(Some(b"a".to_vec())));
+        assert_eq!(run(&mut state, vec!["RPOP", "l"]), RespValue::Bulk(Some(b"d".to_vec())));
+        assert_eq!(
+            run(&mut state, vec!["LPOP", "l", "5"]),
+            RespValue::Array(vec![
+                RespValue::Bulk(Some(b"b".to_vec())),
+                RespValue::Bulk(Some(b"c".to_vec())),
+            ]),
+            "a COUNT larger than the list drains it and answers what there was"
+        );
+        assert_eq!(run(&mut state, vec!["LPOP", "l"]), RespValue::Bulk(None));
+        assert_eq!(run(&mut state, vec!["LLEN", "l"]), RespValue::Integer(0));
+        assert_eq!(run(&mut state, vec!["LLEN", "missing"]), RespValue::Integer(0));
+
+        // Interleaved pushes after a drain keep working -- the sequence space is not consumed.
+        assert_eq!(run(&mut state, vec!["LPUSH", "l", "z"]), RespValue::Integer(1));
+        assert_eq!(run(&mut state, vec!["LPOP", "l"]), RespValue::Bulk(Some(b"z".to_vec())));
+    }
+
+    /// Sorted sets behave like the native ones: ZADD answers only NEW members, a re-score
+    /// moves ordering without growing the set, ranges walk (score, member) order with
+    /// negative indices and WITHSCORES, score windows honor -inf/+inf and the exclusive
+    /// paren, and TYPE says zset.
+    #[test]
+    fn sorted_set_commands_match_native() {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let mut state = RedisCommandState::default();
+        let mut run = |state: &mut RedisCommandState, args: Vec<&str>| {
+            execute_redis_command_with_state(
+                args.into_iter().map(|arg| arg.as_bytes().to_vec()).collect(),
+                1,
+                state,
+                &mut |command| {
+                    let response = engine.execute(crate::ExecuteRequest {
+                        shard_id: 1,
+                        command,
+                    });
+                    if response.status.ok {
+                        Ok(response.response)
+                    } else {
+                        Err(response.status.message)
+                    }
+                },
+            )
+        };
+        let bulk = |text: &str| RespValue::Bulk(Some(text.as_bytes().to_vec()));
+
+        assert_eq!(run(&mut state, vec!["ZADD", "z", "2", "b", "1", "a"]), RespValue::Integer(2));
+        assert_eq!(run(&mut state, vec!["ZADD", "z", "3", "c", "5", "a"]), RespValue::Integer(1),
+            "re-scoring a is not an add");
+        assert_eq!(run(&mut state, vec!["ZCARD", "z"]), RespValue::Integer(3));
+        assert_eq!(run(&mut state, vec!["ZSCORE", "z", "a"]), bulk("5"));
+        assert_eq!(run(&mut state, vec!["ZSCORE", "z", "missing"]), RespValue::Bulk(None));
+        assert_eq!(run(&mut state, vec!["TYPE", "z"]), RespValue::SimpleString("zset".to_string()));
+
+        assert_eq!(
+            run(&mut state, vec!["ZRANGE", "z", "0", "-1"]),
+            RespValue::Array(vec![bulk("b"), bulk("c"), bulk("a")]),
+            "order follows the moved score"
+        );
+        assert_eq!(
+            run(&mut state, vec!["ZRANGE", "z", "0", "1", "WITHSCORES"]),
+            RespValue::Array(vec![bulk("b"), bulk("2"), bulk("c"), bulk("3")]),
+        );
+        assert_eq!(
+            run(&mut state, vec!["ZREVRANGE", "z", "0", "0"]),
+            RespValue::Array(vec![bulk("a")]),
+        );
+        assert_eq!(
+            run(&mut state, vec!["ZRANGEBYSCORE", "z", "-inf", "+inf"]),
+            RespValue::Array(vec![bulk("b"), bulk("c"), bulk("a")]),
+        );
+        assert_eq!(
+            run(&mut state, vec!["ZRANGEBYSCORE", "z", "(2", "5"]),
+            RespValue::Array(vec![bulk("c"), bulk("a")]),
+            "the paren excludes the bound"
+        );
+        assert_eq!(
+            run(&mut state, vec!["ZREVRANGEBYSCORE", "z", "+inf", "3", "WITHSCORES"]),
+            RespValue::Array(vec![bulk("a"), bulk("5"), bulk("c"), bulk("3")]),
+            "rev-by-score takes (max, min) and answers descending"
+        );
+
+        assert_eq!(run(&mut state, vec!["ZREM", "z", "b", "missing"]), RespValue::Integer(1));
+        assert_eq!(run(&mut state, vec!["ZCARD", "z"]), RespValue::Integer(2));
+
+        // Negative scores order below positives (the sign-flip bias at work).
+        assert_eq!(run(&mut state, vec!["ZADD", "z", "-1.5", "n"]), RespValue::Integer(1));
+        assert_eq!(
+            run(&mut state, vec!["ZRANGE", "z", "0", "0", "WITHSCORES"]),
+            RespValue::Array(vec![bulk("n"), bulk("-1.5")]),
+        );
+    }
+
+    /// The rest of the sorted-set surface: ZINCRBY creates-then-moves atomically, ZCOUNT
+    /// honors the window syntax, ZPOPMIN/ZPOPMAX drain in order with scores attached, and
+    /// ZRANK/ZREVRANK answer positions or nil.
+    #[test]
+    fn sorted_set_completion_commands_match_native() {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let mut state = RedisCommandState::default();
+        let mut run = |state: &mut RedisCommandState, args: Vec<&str>| {
+            execute_redis_command_with_state(
+                args.into_iter().map(|arg| arg.as_bytes().to_vec()).collect(),
+                1,
+                state,
+                &mut |command| {
+                    let response = engine.execute(crate::ExecuteRequest {
+                        shard_id: 1,
+                        command,
+                    });
+                    if response.status.ok {
+                        Ok(response.response)
+                    } else {
+                        Err(response.status.message)
+                    }
+                },
+            )
+        };
+        let bulk = |text: &str| RespValue::Bulk(Some(text.as_bytes().to_vec()));
+
+        // ZINCRBY on a missing member starts from 0; on a present one it moves the score.
+        assert_eq!(run(&mut state, vec!["ZINCRBY", "z", "3", "a"]), bulk("3"));
+        assert_eq!(run(&mut state, vec!["ZINCRBY", "z", "-1.5", "a"]), bulk("1.5"));
+        assert_eq!(run(&mut state, vec!["ZCARD", "z"]), RespValue::Integer(1));
+
+        assert_eq!(run(&mut state, vec!["ZADD", "z", "5", "b", "7", "c"]), RespValue::Integer(2));
+        assert_eq!(run(&mut state, vec!["ZCOUNT", "z", "-inf", "+inf"]), RespValue::Integer(3));
+        assert_eq!(run(&mut state, vec!["ZCOUNT", "z", "(1.5", "5"]), RespValue::Integer(1),
+            "the paren excludes a's exact score");
+
+        assert_eq!(run(&mut state, vec!["ZRANK", "z", "a"]), RespValue::Integer(0));
+        assert_eq!(run(&mut state, vec!["ZREVRANK", "z", "a"]), RespValue::Integer(2));
+        assert_eq!(run(&mut state, vec!["ZRANK", "z", "missing"]), RespValue::Bulk(None));
+
+        assert_eq!(
+            run(&mut state, vec!["ZPOPMIN", "z"]),
+            RespValue::Array(vec![bulk("a"), bulk("1.5")]),
+        );
+        assert_eq!(
+            run(&mut state, vec!["ZPOPMAX", "z", "5"]),
+            RespValue::Array(vec![bulk("c"), bulk("7"), bulk("b"), bulk("5")]),
+            "a COUNT larger than the set drains it high-to-low"
+        );
+        assert_eq!(run(&mut state, vec!["ZCARD", "z"]), RespValue::Integer(0));
+        assert_eq!(run(&mut state, vec!["ZPOPMIN", "z"]), RespValue::Array(Vec::new()));
+    }
+
+    /// The token-bucket verbs over RESP: TAKE admits until the bucket runs dry and then
+    /// answers denied with a retry-after, PEEK answers the same shape without consuming.
+    #[test]
+    fn bucket_verbs_admit_then_deny_with_retry_after() {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let mut state = RedisCommandState::default();
+        let mut run = |state: &mut RedisCommandState, args: Vec<&str>| {
+            execute_redis_command_with_state(
+                args.into_iter().map(|arg| arg.as_bytes().to_vec()).collect(),
+                1,
+                state,
+                &mut |command| {
+                    let response = engine.execute(crate::ExecuteRequest {
+                        shard_id: 1,
+                        command,
+                    });
+                    if response.status.ok {
+                        Ok(response.response)
+                    } else {
+                        Err(response.status.message)
+                    }
+                },
+            )
+        };
+        let fields = |value: RespValue| -> Vec<String> {
+            match value {
+                RespValue::Array(items) => items
+                    .into_iter()
+                    .map(|item| match item {
+                        RespValue::Bulk(Some(bytes)) => String::from_utf8(bytes).expect("utf8"),
+                        other => panic!("unexpected item: {other:?}"),
+                    })
+                    .collect(),
+                other => panic!("unexpected response: {other:?}"),
+            }
+        };
+
+        // Capacity 2, no refill within the test: two takes admit, the third denies.
+        let first = fields(run(&mut state, vec!["BUCKETTAKE", "q", "1", "2", "0.001"]));
+        assert_eq!("1", first[0]);
+        let second = fields(run(&mut state, vec!["BUCKETTAKE", "q", "1", "2", "0.001"]));
+        assert_eq!("1", second[0]);
+        let third = fields(run(&mut state, vec!["BUCKETTAKE", "q", "1", "2", "0.001"]));
+        assert_eq!("0", third[0], "the drained bucket must deny");
+        assert!(third[2].parse::<u64>().expect("retry ms") > 0, "denied answers a retry-after");
+
+        // PEEK reports without consuming. The retry-after may drift by the milliseconds the
+        // wall clock moved between calls, so equality holds for the outcome and the level,
+        // and the retry-after only within a tolerance.
+        let peek_one = fields(run(&mut state, vec!["BUCKETPEEK", "q", "1", "2", "0.001"]));
+        let peek_two = fields(run(&mut state, vec!["BUCKETPEEK", "q", "1", "2", "0.001"]));
+        assert_eq!(peek_one[0], peek_two[0], "peek must not change the outcome");
+        assert_eq!(peek_one[1], peek_two[1], "peek must not consume");
+        let retry_one = peek_one[2].parse::<i64>().expect("retry ms");
+        let retry_two = peek_two[2].parse::<i64>().expect("retry ms");
+        assert!((retry_one - retry_two).abs() <= 50, "retry-after moved {retry_one} -> {retry_two}");
+    }
+
+    /// The windowed seen-set: first sight answers 0 and marks, a repeat inside the window
+    /// answers 1 without re-marking, the window expires entries, SEENCARD counts, and DEL
+    /// clears the whole set.
+    #[test]
+    fn seen_set_marks_dedupes_expires_and_clears() {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let mut state = RedisCommandState::default();
+        let mut run = |state: &mut RedisCommandState, args: Vec<&str>| {
+            execute_redis_command_with_state(
+                args.into_iter().map(|arg| arg.as_bytes().to_vec()).collect(),
+                1,
+                state,
+                &mut |command| {
+                    let response = engine.execute(crate::ExecuteRequest {
+                        shard_id: 1,
+                        command,
+                    });
+                    if response.status.ok {
+                        Ok(response.response)
+                    } else {
+                        Err(response.status.message)
+                    }
+                },
+            )
+        };
+
+        assert_eq!(run(&mut state, vec!["SEENCHECK", "idem", "a", "60000"]), RespValue::Integer(0),
+            "first sight is not a duplicate");
+        assert_eq!(run(&mut state, vec!["SEENCHECK", "idem", "a", "60000"]), RespValue::Integer(1),
+            "a repeat inside the window is");
+        assert_eq!(run(&mut state, vec!["SEENCHECK", "idem", "b", "60000"]), RespValue::Integer(0));
+        assert_eq!(run(&mut state, vec!["SEENCARD", "idem"]), RespValue::Integer(2));
+
+        // A 1ms window expires across a 25ms sleep: the member reads as new again, and the
+        // bounded front-sweep has removed the stale entries from the count.
+        assert_eq!(run(&mut state, vec!["SEENCHECK", "gone", "x", "1"]), RespValue::Integer(0));
+        std::thread::sleep(std::time::Duration::from_millis(25));
+        assert_eq!(run(&mut state, vec!["SEENCHECK", "gone", "x", "1"]), RespValue::Integer(0),
+            "an expired member is new again");
+        assert_eq!(run(&mut state, vec!["SEENCARD", "gone"]), RespValue::Integer(1),
+            "the sweep dropped the expired entry, keeping only the fresh mark");
+
+        assert_eq!(run(&mut state, vec!["DEL", "idem"]), RespValue::Integer(1));
+        assert_eq!(run(&mut state, vec!["SEENCARD", "idem"]), RespValue::Integer(0));
+        assert_eq!(run(&mut state, vec!["SEENCHECK", "idem", "a", "60000"]), RespValue::Integer(0),
+            "a cleared set forgets");
+    }
+
+    #[test]
+    fn set_zero_expiry_match_native() {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let mut state = RedisCommandState::default();
+        let run = |state: &mut RedisCommandState, args: Vec<&str>| {
+            execute_redis_command_with_state(
+                args.into_iter().map(|arg| arg.as_bytes().to_vec()).collect(),
+                1,
+                state,
+                |command| {
+                    let response = engine.execute(ExecuteRequest {
+                        shard_id: 1,
+                        command,
+                    });
+                    if response.status.ok {
+                        Ok(response.response)
+                    } else {
+                        Err(response.status.message)
+                    }
+                },
+            )
+        };
+
+        // Non-positive expiry is rejected on SETEX / PSETEX / SET EX (would otherwise write
+        // an already-expired key). Matches real Redis.
+        assert!(matches!(
+            run(&mut state, vec!["SETEX", "a", "0", "v"]),
+            RespValue::Error(_)
+        ));
+        assert!(matches!(
+            run(&mut state, vec!["PSETEX", "b", "0", "v"]),
+            RespValue::Error(_)
+        ));
+        assert!(matches!(
+            run(&mut state, vec!["SET", "c", "v", "EX", "0"]),
+            RespValue::Error(_)
+        ));
+        assert_eq!(run(&mut state, vec!["GET", "a"]), RespValue::Bulk(None));
+        // A positive expiry still works.
+        assert_eq!(
+            run(&mut state, vec!["SETEX", "d", "100", "v"]),
+            RespValue::SimpleString("OK".to_string())
+        );
+    }
+
+    /// `GETEX key PERSIST` must make the key permanent.
+    ///
+    /// NON-VACUITY. Every half is asserted SEPARATELY, and each half states its denominator
+    /// first: the deadline was really set (PTTL is a positive number, not -1 and not -2), the
+    /// key really exists at the moment PERSIST is asked for, and only then is the removal of
+    /// the deadline claimed. A single combined assertion would pass with the key already gone.
+    ///
+    /// WHY IT MATTERS. `PERSIST` is the caller saying "keep this forever". A spelling that
+    /// accepts the request and leaves the deadline armed loses the value later, silently, with
+    /// no error anywhere -- the worst shape a storage defect can take.
+    #[test]
+    fn getex_persist_makes_the_key_permanent() {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let mut state = RedisCommandState::default();
+        let run = |state: &mut RedisCommandState, args: Vec<&str>| {
+            execute_redis_command_with_state(
+                args.into_iter().map(|arg| arg.as_bytes().to_vec()).collect(),
+                1,
+                state,
+                |command| {
+                    let response = engine.execute(ExecuteRequest {
+                        shard_id: 1,
+                        command,
+                    });
+                    if response.status.ok {
+                        Ok(response.response)
+                    } else {
+                        Err(response.status.message)
+                    }
+                },
+            )
+        };
+        let pttl = |state: &mut RedisCommandState, key: &str| match run(state, vec!["PTTL", key]) {
+            RespValue::Integer(value) => value,
+            other => panic!("PTTL {key} answered {other:?}"),
+        };
+
+        // DENOMINATOR 1: the key exists and carries a real deadline. Both halves separately.
+        assert_eq!(
+            run(&mut state, vec!["SETEX", "persist:key", "600", "v"]),
+            RespValue::SimpleString("OK".to_string()),
+        );
+        assert_eq!(
+            run(&mut state, vec!["GET", "persist:key"]),
+            RespValue::Bulk(Some(b"v".to_vec())),
+            "the key must exist before PERSIST is asked for anything",
+        );
+        let armed = pttl(&mut state, "persist:key");
+        assert!(
+            armed > 0,
+            "the deadline must be ARMED before this test can say anything about removing it, \
+             PTTL read {armed} (-1 is no deadline, -2 is no key)",
+        );
+
+        // THE CLAIM: GETEX ... PERSIST returns the value AND disarms the deadline.
+        assert_eq!(
+            run(&mut state, vec!["GETEX", "persist:key", "PERSIST"]),
+            RespValue::Bulk(Some(b"v".to_vec())),
+            "GETEX still answers with the value",
+        );
+        assert_eq!(
+            pttl(&mut state, "persist:key"),
+            -1,
+            "after PERSIST the key must exist with NO deadline (-1), not still be counting down",
+        );
+
+        // POSITIVE CONTROL: the same spelling with a duration still ARMS a deadline, so the
+        // assertion above cannot be passing because GETEX stopped doing anything at all.
+        assert_eq!(
+            run(&mut state, vec!["GETEX", "persist:key", "EX", "600"]),
+            RespValue::Bulk(Some(b"v".to_vec())),
+        );
+        let rearmed = pttl(&mut state, "persist:key");
+        assert!(
+            rearmed > 0,
+            "GETEX EX must still arm a deadline, PTTL read {rearmed}",
+        );
+
+        // And PERSIST on a key that has no deadline is a no-op, not an error or a deletion.
+        assert_eq!(
+            run(&mut state, vec!["SET", "persist:plain", "v"]),
+            RespValue::SimpleString("OK".to_string()),
+        );
+        assert_eq!(pttl(&mut state, "persist:plain"), -1);
+        assert_eq!(
+            run(&mut state, vec!["GETEX", "persist:plain", "PERSIST"]),
+            RespValue::Bulk(Some(b"v".to_vec())),
+        );
+        assert_eq!(pttl(&mut state, "persist:plain"), -1);
+        assert_eq!(
+            run(&mut state, vec!["GET", "persist:plain"]),
+            RespValue::Bulk(Some(b"v".to_vec())),
+            "a no-op PERSIST must not remove the key",
+        );
+    }
+
+    #[test]
+    fn resp_parser_reads_array_command() {
+        let mut input = BufReader::new(&b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\nv\r\n"[..]);
+        assert_eq!(
+            read_command(&mut input).unwrap(),
+            Some(vec![b"SET".to_vec(), b"k".to_vec(), b"v".to_vec()])
+        );
+    }
+
+    #[test]
+    // shared-corpus: redis_engine_product_command_flow;
+    fn redis_core_api_extensions_use_engine_and_state() {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let mut state = RedisCommandState::default();
+        let run = |state: &mut RedisCommandState, args: Vec<&str>| {
+            execute_redis_command_with_state(
+                args.into_iter()
+                    .map(|arg| arg.as_bytes().to_vec())
+                    .collect(),
+                1,
+                state,
+                |command| {
+                    let response = engine.execute(ExecuteRequest {
+                        shard_id: 1,
+                        command,
+                    });
+                    if response.status.ok {
+                        Ok(response.response)
+                    } else {
+                        Err(response.status.message)
+                    }
+                },
+            )
+        };
+
+        assert_eq!(run(&mut state, vec!["DBSIZE"]), RespValue::Integer(0));
+        assert_eq!(
+            run(&mut state, vec!["SET", "redis:core:string", "value"]),
+            RespValue::SimpleString("OK".to_string())
+        );
+        assert_eq!(
+            run(&mut state, vec!["GETRANGE", "redis:core:string", "0", "4"]),
+            RespValue::Bulk(Some(b"value".to_vec()))
+        );
+        assert_eq!(
+            run(
+                &mut state,
+                vec!["SETRANGE", "redis:core:string", "5", "-tail"]
+            ),
+            RespValue::Integer(10)
+        );
+        assert_eq!(
+            run(&mut state, vec!["GETRANGE", "redis:core:string", "0", "-1"]),
+            RespValue::Bulk(Some(b"value-tail".to_vec()))
+        );
+        assert_eq!(
+            run(
+                &mut state,
+                vec!["GETEX", "redis:core:string", "PX", "60000"]
+            ),
+            RespValue::Bulk(Some(b"value-tail".to_vec()))
+        );
+        assert_eq!(
+            run(&mut state, vec!["INCRBYFLOAT", "redis:core:float", "1.5"]),
+            RespValue::Bulk(Some(b"1.5".to_vec()))
+        );
+        assert_eq!(
+            run(&mut state, vec!["TYPE", "redis:core:string"]),
+            RespValue::SimpleString("string".to_string())
+        );
+        assert_eq!(
+            run(&mut state, vec!["HSETNX", "redis:core:hash", "field", "v1"]),
+            RespValue::Integer(1)
+        );
+        assert_eq!(
+            run(&mut state, vec!["HSETNX", "redis:core:hash", "field", "v2"]),
+            RespValue::Integer(0)
+        );
+        assert_eq!(
+            run(&mut state, vec!["HEXISTS", "redis:core:hash", "field"]),
+            RespValue::Integer(1)
+        );
+        assert_eq!(
+            run(&mut state, vec!["HEXISTS", "redis:core:hash", "missing"]),
+            RespValue::Integer(0)
+        );
+        assert_eq!(
+            run(&mut state, vec!["HKEYS", "redis:core:hash"]),
+            RespValue::Array(vec![RespValue::Bulk(Some(b"field".to_vec()))])
+        );
+        assert_eq!(
+            run(&mut state, vec!["HVALS", "redis:core:hash"]),
+            RespValue::Array(vec![RespValue::Bulk(Some(b"v1".to_vec()))])
+        );
+        assert_eq!(
+            run(&mut state, vec!["HSTRLEN", "redis:core:hash", "field"]),
+            RespValue::Integer(2)
+        );
+        assert_eq!(
+            run(
+                &mut state,
+                vec!["HINCRBYFLOAT", "redis:core:hash", "float", "1.5"]
+            ),
+            RespValue::Bulk(Some(b"1.5".to_vec()))
+        );
+        assert_eq!(
+            run(&mut state, vec!["HSCAN", "redis:core:hash", "0"]),
+            RespValue::Array(vec![
+                RespValue::Bulk(Some(b"0".to_vec())),
+                RespValue::Array(vec![
+                    RespValue::Bulk(Some(b"field".to_vec())),
+                    RespValue::Bulk(Some(b"v1".to_vec())),
+                    RespValue::Bulk(Some(b"float".to_vec())),
+                    RespValue::Bulk(Some(b"1.5".to_vec())),
+                ]),
+            ])
+        );
+        assert_eq!(
+            run(&mut state, vec!["TYPE", "redis:core:hash"]),
+            RespValue::SimpleString("hash".to_string())
+        );
+        assert_eq!(
+            run(&mut state, vec!["SADD", "redis:core:set", "a", "b"]),
+            RespValue::Integer(2)
+        );
+        assert_eq!(
+            run(&mut state, vec!["SADD", "redis:core:other-set", "b", "c"]),
+            RespValue::Integer(2)
+        );
+        assert_eq!(
+            run(
+                &mut state,
+                vec!["SDIFF", "redis:core:set", "redis:core:other-set"]
