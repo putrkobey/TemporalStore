@@ -43,25 +43,3 @@ fn manifest_install_materializes_index_under_bulk_mode() {
         &index_dir,
     );
     engine.load_shard(SHARD_ID);
-    for key in ["alpha", "bravo", "charlie"] {
-        let response = engine.execute(ExecuteRequest {
-            shard_id: SHARD_ID,
-            command: Command::StringSet {
-                key: key.to_string(),
-                value: b"v".to_vec(),
-            },
-        });
-        assert!(response.status.ok, "{response:?}");
-    }
-
-    let manifest = engine
-        .create_bucket_dump_manifest(SHARD_ID, Vec::new())
-        .expect("dump manifest should persist");
-
-    // Remove the on-disk served index so ONLY the install can re-materialize it. This
-    // isolates the durable write from the per-record writes that ran while bulk mode was
-    // off, making the assertion below fail iff install honored the (buggy) bulk gate.
-    let index_path = index_dir.join(format!("shard-{SHARD_ID}.index.json"));
-    let _ = std::fs::remove_file(&index_path);
-    assert!(
-        !index_path.exists(),

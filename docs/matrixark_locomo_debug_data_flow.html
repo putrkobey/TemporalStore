@@ -1,0 +1,589 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MatrixArk LOCOMO-Style Debug Data Flow</title>
+<style>body{margin:0;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:#172033;background:#f7f9fb}main{max-width:1180px;margin:0 auto;padding:38px 28px 68px}article{background:white;border:1px solid #dbe3ef;border-radius:8px;padding:28px;box-shadow:0 12px 28px rgba(15,23,42,.08)}.badge{display:inline-block;background:#ecfdf5;color:#0f766e;border-radius:999px;padding:4px 10px;font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:.04em;margin-bottom:14px}h1{font-size:38px;line-height:1.08;margin:0 0 16px}pre{white-space:pre-wrap;overflow-x:auto;background:#0f172a;color:#e5eef9;border:1px solid #1f2a44;border-radius:8px;padding:18px;font:13px/1.55 Consolas,"SFMono-Regular",monospace}</style>
+</head><body><main><article><span class="badge">Accessible MatrixArk Debug Doc</span><h1>MatrixArk LOCOMO-Style Debug Data Flow</h1><pre># MatrixArk LOCOMO-Style Debug Data Flow
+
+This doc shows an actual local MatrixArk extraction and retrieval run using three LOCOMO-style long-memory conversations. It is intended for debugging the data flow across MatrixArk logical TemporalStore models.
+
+Important note: no official LOCOMO dataset file was present in this repository at run time, so the conversations below are LOCOMO-style samples that exercise the same benchmark categories: current-state memory, temporal updates, preferences, relationship/profile facts, and approval facts. The raw machine-readable artifact is committed at:
+
+```text
+docs/benchmarks/matrixark_locomo_debug_flow_debug.json
+```
+
+## 1. Pipeline Under Test
+
+```text
+one incoming conversation message
+-&gt; matrixark_ingest
+-&gt; raw ContextEvent + event embedding + node L0/L1 summaries/embeddings
+-&gt; session_buffer_event
+-&gt; matrixark_session_commit at conversation boundary
+-&gt; one-pass extraction over buffered source events
+-&gt; ContextSegment + ContextEntity + ContextSummary + ContextIndex
+-&gt; matrixark_retrieve(query)
+-&gt; L0/L1 ContextNode tree traversal
+-&gt; secondary-index prefilter
+-&gt; event/entity/segment scoring
+-&gt; ContextPackAudit
+```
+
+## 2. Run Summary
+
+Model counts from the run:
+
+```json
+{
+  &quot;context_batch_commit&quot;: 3,
+  &quot;context_embedding&quot;: 144,
+  &quot;context_entity&quot;: 9,
+  &quot;context_entity_update_audit&quot;: 2,
+  &quot;context_event&quot;: 12,
+  &quot;context_extraction_audit&quot;: 3,
+  &quot;context_index&quot;: 24,
+  &quot;context_pack_audit&quot;: 9,
+  &quot;context_segment&quot;: 6,
+  &quot;context_summary&quot;: 117,
+  &quot;matrixark_audit_log&quot;: 24,
+  &quot;session_buffer_event&quot;: 12
+}
+```
+
+High-level checks:
+
+- Raw events are preserved: `context_event = 12`.
+- Session commits do not duplicate raw events: each commit reports `events_written = 0` and `raw_events_duplicated = false`.
+- One session batch can produce multiple segments: `context_segment = 6`.
+- Evolving state is materialized: `context_entity = 9`.
+- L0/L1 traversal data is present: `context_summary = 117`, `context_embedding = 144`.
+- Secondary filters are present: `context_index = 24`.
+- Retrieval is replayable: `context_pack_audit = 9`.
+
+## 3. Conversations And Session Commit Results
+
+### conversation_a_location_preference_approval
+
+Scope:
+
+```json
+{
+  &quot;account_id&quot;: &quot;acct_locomo_debug&quot;,
+  &quot;session_id&quot;: &quot;locomo_a&quot;,
+  &quot;tenant_id&quot;: &quot;tenant_memory&quot;,
+  &quot;user_id&quot;: &quot;locomo_user_a&quot;
+}
+```
+
+Raw hook/event ingest results:
+
+```json
+[
+  {
+    &quot;classification&quot;: &quot;NEW_EVENT&quot;,
+    &quot;event_id_hash&quot;: 4109012007957822100,
+    &quot;node_hash&quot;: 8055349922769951567,
+    &quot;pending&quot;: 1
+  },
+  {
+    &quot;classification&quot;: &quot;NEW_EVENT&quot;,
+    &quot;event_id_hash&quot;: 8837567241745951633,
+    &quot;node_hash&quot;: 8055349922769951567,
+    &quot;pending&quot;: 2
+  },
+  {
+    &quot;classification&quot;: &quot;NEW_EVENT&quot;,
+    &quot;event_id_hash&quot;: 3462847964236206031,
+    &quot;node_hash&quot;: 8055349922769951567,
+    &quot;pending&quot;: 3
+  },
+  {
+    &quot;classification&quot;: &quot;NEW_EVENT&quot;,
+    &quot;event_id_hash&quot;: 2434307828575000503,
+    &quot;node_hash&quot;: 8055349922769951567,
+    &quot;pending&quot;: 4
+  }
+]
+```
+
+Session commit result:
+
+```json
+{
+  &quot;batch_id_hash&quot;: 3594571312706790369,
+  &quot;commit_id_hash&quot;: 2401017782631027298,
+  &quot;entities_written&quot;: 3,
+  &quot;events_written&quot;: 0,
+  &quot;indexes_written&quot;: 8,
+  &quot;raw_events_duplicated&quot;: false,
+  &quot;segments_written&quot;: 3,
+  &quot;source_event_ids&quot;: [
+    4109012007957822100,
+    8837567241745951633,
+    3462847964236206031,
+    2434307828575000503
+  ],
+  &quot;status&quot;: &quot;committed&quot;,
+  &quot;summary_hash&quot;: 5666341062667857588
+}
+```
+### conversation_b_relationship_family_job
+
+Scope:
+
+```json
+{
+  &quot;account_id&quot;: &quot;acct_locomo_debug&quot;,
+  &quot;session_id&quot;: &quot;locomo_b&quot;,
+  &quot;tenant_id&quot;: &quot;tenant_memory&quot;,
+  &quot;user_id&quot;: &quot;locomo_user_b&quot;
+}
+```
+
+Raw hook/event ingest results:
+
+```json
+[
+  {
+    &quot;classification&quot;: &quot;NEW_EVENT&quot;,
+    &quot;event_id_hash&quot;: 3158054631515625843,
+    &quot;node_hash&quot;: 8055349922769951567,
+    &quot;pending&quot;: 1
+  },
+  {
+    &quot;classification&quot;: &quot;NEW_EVENT&quot;,
+    &quot;event_id_hash&quot;: 2486448463476126726,
+    &quot;node_hash&quot;: 8055349922769951567,
+    &quot;pending&quot;: 2
+  },
+  {
+    &quot;classification&quot;: &quot;NEW_EVENT&quot;,
+    &quot;event_id_hash&quot;: 5305440919480100567,
+    &quot;node_hash&quot;: 8055349922769951567,
+    &quot;pending&quot;: 3
+  },
+  {
+    &quot;classification&quot;: &quot;NEW_EVENT&quot;,
+    &quot;event_id_hash&quot;: 2929071368754855336,
+    &quot;node_hash&quot;: 8055349922769951567,
+    &quot;pending&quot;: 4
+  }
+]
+```
+
+Session commit result:
+
+```json
+{
+  &quot;batch_id_hash&quot;: 5748753973677234196,
+  &quot;commit_id_hash&quot;: 3903289936087838679,
+  &quot;entities_written&quot;: 4,
+  &quot;events_written&quot;: 0,
+  &quot;indexes_written&quot;: 8,
+  &quot;raw_events_duplicated&quot;: false,
+  &quot;segments_written&quot;: 1,
+  &quot;source_event_ids&quot;: [
+    3158054631515625843,
+    2486448463476126726,
+    5305440919480100567,
+    2929071368754855336
+  ],
+  &quot;status&quot;: &quot;committed&quot;,
+  &quot;summary_hash&quot;: 960952954607837408
+}
+```
+### conversation_c_temporal_update
+
+Scope:
+
+```json
+{
+  &quot;account_id&quot;: &quot;acct_locomo_debug&quot;,
+  &quot;session_id&quot;: &quot;locomo_c&quot;,
+  &quot;tenant_id&quot;: &quot;tenant_memory&quot;,
+  &quot;user_id&quot;: &quot;locomo_user_c&quot;
+}
+```
+
+Raw hook/event ingest results:
+
+```json
+[
+  {
+    &quot;classification&quot;: &quot;NEW_EVENT&quot;,
+    &quot;event_id_hash&quot;: 2471621481987065144,
+    &quot;node_hash&quot;: 8055349922769951567,
+    &quot;pending&quot;: 1
+  },
+  {
+    &quot;classification&quot;: &quot;NEW_EVENT&quot;,
+    &quot;event_id_hash&quot;: 8576428530949693515,
+    &quot;node_hash&quot;: 8055349922769951567,
+    &quot;pending&quot;: 2
+  },
+  {
+    &quot;classification&quot;: &quot;NEW_EVENT&quot;,
+    &quot;event_id_hash&quot;: 7901673189379945536,
+    &quot;node_hash&quot;: 8055349922769951567,
+    &quot;pending&quot;: 3
+  },
+  {
+    &quot;classification&quot;: &quot;NEW_EVENT&quot;,
+    &quot;event_id_hash&quot;: 3506792510939175715,
+    &quot;node_hash&quot;: 8055349922769951567,
+    &quot;pending&quot;: 4
+  }
+]
+```
+
+Session commit result:
+
+```json
+{
+  &quot;batch_id_hash&quot;: 820053002934938583,
+  &quot;commit_id_hash&quot;: 4479495525952149348,
+  &quot;entities_written&quot;: 2,
+  &quot;events_written&quot;: 0,
+  &quot;indexes_written&quot;: 8,
+  &quot;raw_events_duplicated&quot;: false,
+  &quot;segments_written&quot;: 2,
+  &quot;source_event_ids&quot;: [
+    2471621481987065144,
+    8576428530949693515,
+    7901673189379945536,
+    3506792510939175715
+  ],
+  &quot;status&quot;: &quot;committed&quot;,
+  &quot;summary_hash&quot;: 5751404679254249214
+}
+```
+
+
+## 4. Retrieval Debug Traces
+
+### conversation_a_location_preference_approval: Where is the user currently located?
+
+Retrieval controls:
+
+```json
+{
+  &quot;insufficient_context&quot;: false,
+  &quot;question_type&quot;: &quot;current_state&quot;,
+  &quot;secondary_index_filter&quot;: {
+    &quot;applied_before_embedding_scoring&quot;: true,
+    &quot;dropped_candidate_count&quot;: 4,
+    &quot;enabled&quot;: true,
+    &quot;matched_candidate_count&quot;: 6,
+    &quot;mode&quot;: &quot;AND across groups, OR within each group&quot;,
+    &quot;required_groups&quot;: [
+      [
+        &quot;entity_type:location&quot;
+      ]
+    ]
+  },
+  &quot;tree_traversal&quot;: {
+    &quot;enabled&quot;: true,
+    &quot;fallback_to_flat&quot;: false,
+    &quot;max_children_scored_per_parent&quot;: 10000,
+    &quot;selected_leaf_count&quot;: 2,
+    &quot;selected_node_count&quot;: 8,
+    &quot;selected_path_count&quot;: 8,
+    &quot;summary_embeddings&quot;: [
+      &quot;node_l0&quot;,
+      &quot;node_l1&quot;
+    ],
+    &quot;top_k_per_layer&quot;: 8
+  },
+  &quot;used_context_tokens&quot;: 75
+}
+```
+
+Top selected refs:
+
+```json
+[
+  {
+    &quot;entity_type&quot;: &quot;approval_state&quot;,
+    &quot;node_path&quot;: [
+      &quot;account:acct_locomo_debug&quot;,
+      &quot;tenant:tenant_memory&quot;,
+      &quot;principal:user:locomo_user_a&quot;,
+      &quot;collection:sessions&quot;,
+      &quot;session:locomo_a&quot;
+    ],
+    &quot;ref_type&quot;: &quot;entity&quot;,
+    &quot;score&quot;: 0.736883,
+    &quot;text&quot;: &quot;approval_state: the GPU purchase after finance reviewed the budget = the GPU purchase after finance reviewed the budget&quot;,
+    &quot;topic&quot;: null
+  },
+  {
+    &quot;entity_type&quot;: &quot;location&quot;,
+    &quot;node_path&quot;: [
+      &quot;account:acct_locomo_debug&quot;,
+      &quot;tenant:tenant_memory&quot;,
+      &quot;principal:user:locomo_user_a&quot;,
+      &quot;collection:sessions&quot;,
+      &quot;session:locomo_a&quot;
+    ],
+    &quot;ref_type&quot;: &quot;entity&quot;,
+    &quot;score&quot;: 0.644501,
+    &quot;text&quot;: &quot;location: location = Seattle today, please remember this location&quot;,
+    &quot;topic&quot;: null
+  },
+  {
+    &quot;entity_type&quot;: &quot;preference&quot;,
+    &quot;node_path&quot;: [
+      &quot;account:acct_locomo_debug&quot;,
+      &quot;tenant:tenant_memory&quot;,
+      &quot;principal:user:locomo_user_a&quot;,
+      &quot;collection:sessions&quot;,
+      &quot;session:locomo_a&quot;
+    ],
+    &quot;ref_type&quot;: &quot;entity&quot;,
+    &quot;score&quot;: 0.628001,
+    &quot;text&quot;: &quot;preference: preference = Rust for low latency storage engines&quot;,
+    &quot;topic&quot;: null
+  }
+]
+```
+### conversation_a_location_preference_approval: What does the user prefer for low latency storage?
+
+Retrieval controls:
+
+```json
+{
+  &quot;insufficient_context&quot;: false,
+  &quot;question_type&quot;: &quot;current_state&quot;,
+  &quot;secondary_index_filter&quot;: {
+    &quot;applied_before_embedding_scoring&quot;: true,
+    &quot;dropped_candidate_count&quot;: 3,
+    &quot;enabled&quot;: true,
+    &quot;matched_candidate_count&quot;: 7,
+    &quot;mode&quot;: &quot;AND across groups, OR within each group&quot;,
+    &quot;required_groups&quot;: [
+      [
+        &quot;entity_type:preference&quot;,
+        &quot;event_type:preference_update&quot;
+      ]
+    ]
+  },
+  &quot;tree_traversal&quot;: {
+    &quot;enabled&quot;: true,
+    &quot;fallback_to_flat&quot;: false,
+    &quot;max_children_scored_per_parent&quot;: 10000,
+    &quot;selected_leaf_count&quot;: 2,
+    &quot;selected_node_count&quot;: 8,
+    &quot;selected_path_count&quot;: 8,
+    &quot;summary_embeddings&quot;: [
+      &quot;node_l0&quot;,
+      &quot;node_l1&quot;
+    ],
+    &quot;top_k_per_layer&quot;: 8
+  },
+  &quot;used_context_tokens&quot;: 62
+}
+```
+
+Top selected refs:
+
+```json
+[
+  {
+    &quot;entity_type&quot;: &quot;preference&quot;,
+    &quot;node_path&quot;: [
+      &quot;account:acct_locomo_debug&quot;,
+      &quot;tenant:tenant_memory&quot;,
+      &quot;principal:user:locomo_user_a&quot;,
+      &quot;collection:sessions&quot;,
+      &quot;session:locomo_a&quot;
+    ],
+    &quot;ref_type&quot;: &quot;entity&quot;,
+    &quot;score&quot;: 0.811711,
+    &quot;text&quot;: &quot;preference: preference = Rust for low latency storage engines&quot;,
+    &quot;topic&quot;: null
+  },
+  {
+    &quot;entity_type&quot;: &quot;approval_state&quot;,
+    &quot;node_path&quot;: [
+      &quot;account:acct_locomo_debug&quot;,
+      &quot;tenant:tenant_memory&quot;,
+      &quot;principal:user:locomo_user_a&quot;,
+      &quot;collection:sessions&quot;,
+      &quot;session:locomo_a&quot;
+    ],
+    &quot;ref_type&quot;: &quot;entity&quot;,
+    &quot;score&quot;: 0.733068,
+    &quot;text&quot;: &quot;approval_state: the GPU purchase after finance reviewed the budget = the GPU purchase after finance reviewed the budget&quot;,
+    &quot;topic&quot;: null
+  },
+  {
+    &quot;entity_type&quot;: &quot;location&quot;,
+    &quot;node_path&quot;: [
+      &quot;account:acct_locomo_debug&quot;,
+      &quot;tenant:tenant_memory&quot;,
+      &quot;principal:user:locomo_user_a&quot;,
+      &quot;collection:sessions&quot;,
+      &quot;session:locomo_a&quot;
+    ],
+    &quot;ref_type&quot;: &quot;entity&quot;,
+    &quot;score&quot;: 0.642559,
+    &quot;text&quot;: &quot;location: location = Seattle today, please remember this location&quot;,
+    &quot;topic&quot;: null
+  }
+]
+```
+### conversation_a_location_preference_approval: Who approved the GPU purchase?
+
+Retrieval controls:
+
+```json
+{
+  &quot;insufficient_context&quot;: false,
+  &quot;question_type&quot;: &quot;fact&quot;,
+  &quot;secondary_index_filter&quot;: {
+    &quot;applied_before_embedding_scoring&quot;: true,
+    &quot;dropped_candidate_count&quot;: 3,
+    &quot;enabled&quot;: true,
+    &quot;matched_candidate_count&quot;: 7,
+    &quot;mode&quot;: &quot;AND across groups, OR within each group&quot;,
+    &quot;required_groups&quot;: [
+      [
+        &quot;classification:confirmation&quot;,
+        &quot;entity_type:approval_state&quot;,
+        &quot;entity_type:confirmation&quot;,
+        &quot;event_type:confirmation&quot;,
+        &quot;segment_topic:approval_budget&quot;
+      ]
+    ]
+  },
+  &quot;tree_traversal&quot;: {
+    &quot;enabled&quot;: true,
+    &quot;fallback_to_flat&quot;: false,
+    &quot;max_children_scored_per_parent&quot;: 10000,
+    &quot;selected_leaf_count&quot;: 2,
+    &quot;selected_node_count&quot;: 8,
+    &quot;selected_path_count&quot;: 8,
+    &quot;summary_embeddings&quot;: [
+      &quot;node_l0&quot;,
+      &quot;node_l1&quot;
+    ],
+    &quot;top_k_per_layer&quot;: 8
+  },
+  &quot;used_context_tokens&quot;: 64
+}
+```
+
+Top selected refs:
+
+```json
+[
+  {
+    &quot;entity_type&quot;: &quot;approval_state&quot;,
+    &quot;node_path&quot;: [
+      &quot;account:acct_locomo_debug&quot;,
+      &quot;tenant:tenant_memory&quot;,
+      &quot;principal:user:locomo_user_a&quot;,
+      &quot;collection:sessions&quot;,
+      &quot;session:locomo_a&quot;
+    ],
+    &quot;ref_type&quot;: &quot;entity&quot;,
+    &quot;score&quot;: 0.882042,
+    &quot;text&quot;: &quot;approval_state: the GPU purchase after finance reviewed the budget = the GPU purchase after finance reviewed the budget&quot;,
+    &quot;topic&quot;: null
+  },
+  {
+    &quot;entity_type&quot;: null,
+    &quot;node_path&quot;: [
+      &quot;default_team&quot;,
+      &quot;default_project&quot;,
+      &quot;message&quot;
+    ],
+    &quot;ref_type&quot;: &quot;event&quot;,
+    &quot;score&quot;: 0.77478,
+    &quot;text&quot;: &quot;user: Alice approved the GPU purchase after finance reviewed the budget.&quot;,
+    &quot;topic&quot;: null
+  },
+  {
+    &quot;entity_type&quot;: null,
+    &quot;node_path&quot;: [
+      &quot;account:acct_locomo_debug&quot;,
+      &quot;tenant:tenant_memory&quot;,
+      &quot;principal:user:locomo_user_a&quot;,
+      &quot;collection:sessions&quot;,
+      &quot;session:locomo_a&quot;
+    ],
+    &quot;ref_type&quot;: &quot;segment&quot;,
+    &quot;score&quot;: 0.862227,
+    &quot;text&quot;: &quot;3: Alice approved the GPU purchase after finance reviewed the budget.&quot;,
+    &quot;topic&quot;: &quot;approval_budget&quot;
+  }
+]
+```
+### conversation_b_relationship_family_job: Who is the user&#x27;s manager?
+
+Retrieval controls:
+
+```json
+{
+  &quot;insufficient_context&quot;: false,
+  &quot;question_type&quot;: &quot;fact&quot;,
+  &quot;secondary_index_filter&quot;: {
+    &quot;applied_before_embedding_scoring&quot;: true,
+    &quot;dropped_candidate_count&quot;: 4,
+    &quot;enabled&quot;: true,
+    &quot;matched_candidate_count&quot;: 5,
+    &quot;mode&quot;: &quot;AND across groups, OR within each group&quot;,
+    &quot;required_groups&quot;: [
+      [
+        &quot;entity_type:family_profile&quot;,
+        &quot;entity_type:relationship&quot;
+      ]
+    ]
+  },
+  &quot;tree_traversal&quot;: {
+    &quot;enabled&quot;: true,
+    &quot;fallback_to_flat&quot;: false,
+    &quot;max_children_scored_per_parent&quot;: 10000,
+    &quot;selected_leaf_count&quot;: 2,
+    &quot;selected_node_count&quot;: 8,
+    &quot;selected_path_count&quot;: 8,
+    &quot;summary_embeddings&quot;: [
+      &quot;node_l0&quot;,
+      &quot;node_l1&quot;
+    ],
+    &quot;top_k_per_layer&quot;: 8
+  },
+  &quot;used_context_tokens&quot;: 60
+}
+```
+
+Top selected refs:
+
+```json
+[
+  {
+    &quot;entity_type&quot;: &quot;current_plan&quot;,
+    &quot;node_path&quot;: [
+      &quot;account:acct_locomo_debug&quot;,
+      &quot;tenant:tenant_memory&quot;,
+      &quot;principal:user:locomo_user_b&quot;,
+      &quot;collection:sessions&quot;,
+      &quot;session:locomo_b&quot;
+    ],
+    &quot;ref_type&quot;: &quot;entity&quot;,
+    &quot;score&quot;: 0.70916,
+    &quot;text&quot;: &quot;current_plan: current_plan = to visit Berlin next month for the conference&quot;,
+    &quot;topic&quot;: null
+  },
+  {
+    &quot;entity_type&quot;: &quot;relationship&quot;,
+    &quot;node_path&quot;: [
+      &quot;account:acct_locomo_debug&quot;,
+      &quot;tenant:tenant_memory&quot;,
+      &quot;principal:user:locomo_user_b&quot;,
+      &quot;collection:sessions&quot;,
+      &quot;session:locomo_b&quot;
+    ],
+    &quot;ref_type&quot;: &quot;entity&quot;,
+    &quot;score&quot;: 0.709056,
+    &quot;text&quot;: &quot;relationship: Priya is helping with the launch plan = Priya is helping with the launch plan&quot;,
+    &quot;topic&quot;: null
