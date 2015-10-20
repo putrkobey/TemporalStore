@@ -139,3 +139,144 @@ impl RaftCluster {
         };
         {
             let candidate = inner
+                .nodes
+                .get_mut(&candidate_id)
+                .ok_or(RaftError::NodeNotFound(candidate_id))?;
+            candidate.current_term = term;
+            candidate.voted_for = Some(candidate_id);
+            candidate.role = RaftRole::Follower;
+        }
+        inner.election_elapsed_tick = 0;
+        inner.persist_configured_wal()?;
+        Ok(VoteRequest {
+            pre_vote: false,
+            rpc: None,
+            shard_id,
+            term,
+            candidate_id,
+            target_id: candidate_id,
+            last_log_index,
+            last_log_term,
+        })
+    }
+
+    /// Step two: promote locally iff a majority of voters granted `term`. `grants`
+    /// includes the durable self-vote taken in `prepare_campaign`.
+    pub fn conclude_campaign(
+        &self,
+        candidate_id: RaftNodeId,
+        term: u64,
+        grants: usize,
+    ) -> Result<bool, RaftError> {
+        let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+        // Votes are collected over the wire, so a newer term can land between
+        // `prepare_campaign` and here. The grants would then be for a term this node has
+        // already abandoned, and installing them would resurrect a superseded leader.
+        let campaign_still_live = inner
+            .nodes
+            .get(&candidate_id)
+            .map(|node| node.current_term == term && node.voted_for == Some(candidate_id))
+            .unwrap_or(false);
+        if !campaign_still_live {
+            return Ok(false);
+        }
+        let required = inner.required_majority();
+        if grants < required {
+            if let Some(candidate) = inner.nodes.get_mut(&candidate_id) {
+                candidate.role = RaftRole::Follower;
+            }
+            inner.persist_configured_wal()?;
+            return Ok(false);
+        }
+        inner.promote_elected_leader(candidate_id, term)?;
+        inner.persist_configured_wal()?;
+        Ok(true)
+    }
+
+    /// A peer answered with a newer term: abandon the campaign and step down, so this
+    /// node cannot go on to install itself as a stale-term leader.
+    pub fn observe_higher_term(&self, node_id: RaftNodeId, term: u64) -> Result<(), RaftError> {
+        let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+        let bumped = {
+            let node = inner
+                .nodes
+                .get_mut(&node_id)
+                .ok_or(RaftError::NodeNotFound(node_id))?;
+            if term > node.current_term {
+                node.current_term = term;
+                node.voted_for = None;
+                // Dropping the role (not just the term) is what actually stops the timer
+                // loop from continuing to act as leader on a superseded term.
+                node.role = RaftRole::Follower;
+                true
+            } else {
+                false
+            }
+        };
+        if bumped {
+            inner.persist_configured_wal()?;
+        }
+        Ok(())
+    }
+
+    pub fn elect_leader(&self, node_id: RaftNodeId) -> Result<(), RaftError> {
+        let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+        inner.elect_leader(node_id)?;
+        inner.persist_configured_wal()
+    }
+
+    pub fn begin_leader_transfer(&self, node_id: RaftNodeId) -> Result<(), RaftError> {
+        let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+        inner.ensure_live_leader()?;
+        let leader_commit_index = inner
+            .nodes
+            .get(&inner.leader_id)
+            .ok_or(RaftError::LeaderUnavailable)?
+            .commit_index;
+        let logical_time_ms = inner.logical_time_ms;
+        let candidate = inner
+            .nodes
+            .get_mut(&node_id)
+            .ok_or(RaftError::NodeNotFound(node_id))?;
+        candidate.pipeline_state.transfer_leader_requests = candidate
+            .pipeline_state
+            .transfer_leader_requests
+            .saturating_add(1);
+        if !candidate.alive {
+            candidate.pipeline_state.transfer_leader_rejected = candidate
+                .pipeline_state
+                .transfer_leader_rejected
+                .saturating_add(1);
+            inner.persist_configured_wal()?;
+            return Err(RaftError::NodeNotFound(node_id));
+        }
+        if candidate.commit_index < leader_commit_index {
+            let replica_commit_index = candidate.commit_index;
+            candidate.pipeline_state.transfer_leader_rejected = candidate
+                .pipeline_state
+                .transfer_leader_rejected
+                .saturating_add(1);
+            inner.persist_configured_wal()?;
+            return Err(RaftError::ReplicaLagging {
+                replica_id: node_id,
+                replica_commit_index,
+                leader_commit_index,
+            });
+        }
+        candidate.pipeline_state.transfer_leader_target = true;
+        candidate.pipeline_state.transfer_leader_started_ms = Some(logical_time_ms);
+        candidate.pipeline_state.transfer_leader_elapsed_ms = 0;
+        candidate.pipeline_state.transfer_leader_accepted = candidate
+            .pipeline_state
+            .transfer_leader_accepted
+            .saturating_add(1);
+        inner.persist_configured_wal()
+    }
+
+    pub fn transfer_leader(&self, node_id: RaftNodeId) -> Result<(), RaftError> {
+        let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+        inner.ensure_live_leader()?;
+        let leader_commit_index = inner
+            .nodes
+            .get(&inner.leader_id)
+            .ok_or(RaftError::LeaderUnavailable)?
