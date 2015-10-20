@@ -30,3 +30,19 @@ impl Client {
                 ttl_seconds,
                 precision as i32,
                 uuid.as_ptr(),
+                occur_time_seconds,
+                &mut error,
+            )
+        };
+        check(code, error)
+    }
+
+    pub fn control_state_count(
+        &self,
+        key: &str,
+        precision: ControlStatePrecision,
+        window: ControlStateWindow,
+    ) -> Result<i64> {
+        let key = cstring(key)?;
+        let mut count = 0_i64;
+        let mut error: *mut c_char = ptr::null_mut();
