@@ -1,0 +1,3534 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+//! Part 2 of engine tests, split from engine/engine_regression_tests.rs.
+#![allow(clippy::all)]
+use super::*;
+
+#[test]
+fn memory_miss_reads_local_block_file_using_index_address() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    let cache = engine.cache();
+    let block_store = engine.block_store();
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        },
+    });
+    assert_eq!(block_store.stats().writes, 1);
+
+    let first = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        first.response,
+        CommandResponse::Bytes {
+            value: Some(b"v".to_vec())
+        }
+    );
+    assert_eq!(block_store.stats().reads, 1);
+
+    let second = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        second.response,
+        CommandResponse::Bytes {
+            value: Some(b"v".to_vec())
+        }
+    );
+    assert_eq!(block_store.stats().reads, 1);
+    assert_eq!(cache.stats().memory_hits, 1);
+
+    cache.clear_memory_for_test();
+    let third = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        third.response,
+        CommandResponse::Bytes {
+            value: Some(b"v".to_vec())
+        }
+    );
+    assert_eq!(block_store.stats().reads, 1);
+    assert_eq!(cache.stats().disk_hits, 1);
+}
+
+#[test]
+fn three_layer_cache_reads_memory_then_block_cache_then_local_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    let cache = engine.cache();
+    let block_store = engine.block_store();
+    engine.load_shard(1);
+
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        },
+    });
+
+    let first = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        first.response,
+        CommandResponse::Bytes {
+            value: Some(b"v".to_vec())
+        }
+    );
+    assert_eq!(block_store.stats().reads, 1);
+    // ONE PUT PER POINT READ, where this was two. A string get used to cache the payload twice --
+    // the command response under `CacheKey::string` and the block frame under
+    // `CacheKey::page_with_slot` -- and the response copy was memory-only with a single reader,
+    // while the frame is the tiered, persistent copy this very test goes on to exercise. The
+    // response copy is no longer written.
+    //
+    // KEPT EXACT RATHER THAN WIDENED TO A RANGE. The count is the subject here, and a `>=` would
+    // stop noticing either a layer returning or one going away.
+    assert_eq!(cache.stats().puts, 1);
+    assert!(cache.stats().memory_bytes > 0);
+    assert!(cache.stats().disk_bytes > 0);
+
+    let memory = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        memory.response,
+        CommandResponse::Bytes {
+            value: Some(b"v".to_vec())
+        }
+    );
+    assert!(cache.stats().memory_hits >= 1);
+    assert_eq!(block_store.stats().reads, 1);
+
+    cache.clear_memory_for_test();
+    let block_cache = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        block_cache.response,
+        CommandResponse::Bytes {
+            value: Some(b"v".to_vec())
+        }
+    );
+    assert_eq!(cache.stats().disk_hits, 1);
+    assert_eq!(block_store.stats().reads, 1);
+
+    cache.invalidate_shard(1).unwrap();
+    let local_file = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        local_file.response,
+        CommandResponse::Bytes {
+            value: Some(b"v".to_vec())
+        }
+    );
+    assert_eq!(block_store.stats().reads, 2);
+    // EXACTLY TWO PUTS ACROSS THE THREE TIERS, where this asserted `>= 4`. The payload is cached
+    // once per fill now, not twice, and the four reads above account for both puts: the cold read
+    // fills the frame, the second read is a memory hit, the read after `clear_memory_for_test` is a
+    // disk hit that does NOT promote, and the read after `invalidate_shard` fills it again from the
+    // local file.
+    //
+    // PINNED EXACTLY RATHER THAN LOWERED. Measured at 2 on three consecutive runs. A threshold
+    // walked down every time the number moves stops being a guard; an exact count with its
+    // derivation written out fails in both directions.
+    assert_eq!(cache.stats().puts, 2);
+    assert!(cache.stats().memory_bytes > 0);
+    assert!(cache.stats().disk_bytes > 0);
+
+    let observation = engine.rust_storage_observation(1).unwrap();
+    assert!(observation.observed_memory_hit);
+    assert!(observation.observed_block_cache_hit);
+    assert!(observation.observed_local_file_read);
+    assert!(observation.observed_cache_invalidation);
+    assert!(observation.cache_memory_bytes > 0);
+    assert!(observation.cache_disk_bytes > 0);
+    assert!(observation.local_block_bytes_written > 0);
+    assert!(observation.local_block_bytes_read > 0);
+}
+
+#[test]
+fn tiny_memory_cache_eviction_refills_from_persistence_then_block_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        32,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    let cache = engine.cache();
+    let block_store = engine.block_store();
+    engine.load_shard(1);
+
+    let target_value = b"target-value-0123456789".to_vec();
+    for (key, value) in [
+        ("target", target_value.clone()),
+        ("evict-a", b"eviction-value-a-0123456789".to_vec()),
+        ("evict-b", b"eviction-value-b-0123456789".to_vec()),
+    ] {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: key.to_string(),
+                value,
+            },
+        });
+        assert!(response.status.ok, "{response:?}");
+    }
+    let first_read = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "target".to_string(),
+        },
+    });
+    assert_eq!(
+        first_read.response,
+        CommandResponse::Bytes {
+            value: Some(target_value.clone())
+        }
+    );
+    assert_eq!(block_store.stats().reads, 1);
+
+    for key in ["evict-a", "evict-b"] {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: key.to_string(),
+            },
+        });
+        assert!(
+            response.status.ok,
+            "eviction pressure read should pass: {response:?}"
+        );
+    }
+    assert!(
+        cache.stats().memory_evictions > 0,
+        "reading multiple persisted blocks through a tiny memory cache should evict older blocks"
+    );
+    assert!(
+        cache.stats().disk_bytes > 0,
+        "persistent page read should populate block-cache files"
+    );
+
+    let target_block_key = {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard should exist");
+        let address = shard.string_address("target").expect("target address should exist");
+        let (start, end) = shard.routing_range();
+        CacheKey::page_with_slot(
+            1,
+            address.block_slab_id(),
+            address.offset(),
+            address.length(),
+            Some(crate::engine::hashing::block_routing_bucket("target", start, end)),
+        )
+    };
+    assert_eq!(
+        cache.get_memory(&target_block_key),
+        None,
+        "target page block should have been evicted from memory"
+    );
+
+    let disk_hits_before = cache.stats().disk_hits;
+    let file_reads_before_block_hit = block_store.stats().reads;
+    let second_read = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "target".to_string(),
+        },
+    });
+    assert_eq!(
+        second_read.response,
+        CommandResponse::Bytes {
+            value: Some(target_value.clone())
+        }
+    );
+    assert_eq!(
+        block_store.stats().reads,
+        file_reads_before_block_hit,
+        "memory miss should hit disk block cache instead of rereading block store"
+    );
+    assert!(
+        cache.stats().disk_hits > disk_hits_before,
+        "block cache should serve the read and promote it to memory"
+    );
+    assert_eq!(
+        cache.get_memory(&target_block_key),
+        Some(target_value),
+        "disk block hit should promote the page block into memory"
+    );
+}
+
+#[test]
+// shared-corpus: storage_cache_replacement_policy_soak;
+fn cache_replacement_policy_soak() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        32,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    let target_value = b"target-value-0123456789".to_vec();
+    for round in 0..4 {
+        for item in 0..8 {
+            let key = format!("soak-{round}-{item}");
+            let value = format!("soak-value-{round}-{item}").into_bytes();
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet { key, value },
+            });
+            assert!(response.status.ok, "{response:?}");
+        }
+    }
+    let target_write = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "soak-target".to_string(),
+            value: target_value.clone(),
+        },
+    });
+    assert!(target_write.status.ok, "{target_write:?}");
+
+    for round in 0..4 {
+        for item in 0..8 {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: format!("soak-{round}-{item}"),
+                },
+            });
+            assert!(response.status.ok, "{response:?}");
+        }
+    }
+    let warm_target = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "soak-target".to_string(),
+        },
+    });
+    assert_eq!(
+        warm_target.response,
+        CommandResponse::Bytes {
+            value: Some(target_value.clone())
+        }
+    );
+
+    assert!(
+        engine.cache().stats().memory_evictions > 0,
+        "tiny memory cache should perform replacement during the pressure pass"
+    );
+    assert!(
+        engine.cache().stats().disk_bytes > 0,
+        "pressure pass should leave a disk-cache tier for cold read refill"
+    );
+
+    let target_block_key = {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("loaded shard");
+        let address = shard
+            .strings()
+            .get("soak-target")
+            .expect("target page address")
+            .clone();
+        let (start, end) = shard.routing_range();
+        CacheKey::page_with_slot(
+            1,
+            address.block_slab_id(),
+            address.offset(),
+            address.length(),
+            Some(crate::engine::hashing::block_routing_bucket("soak-target", start, end)),
+        )
+    };
+
+    let evict_report = engine.apply_storage_eviction(1, 1, 4, true, false);
+    assert_eq!(evict_report.mode, "evict_cache");
+    assert!(evict_report.pressure_gate_open, "{evict_report:?}");
+    assert!(evict_report.pressure_before > 0, "{evict_report:?}");
+    assert!(
+        !evict_report.selected_victims.is_empty(),
+        "{evict_report:?}"
+    );
+    assert!(
+        !evict_report.dump_manifest_ids.is_empty(),
+        "dump-before-evict should durably dump dirty victim slots: {evict_report:?}"
+    );
+    assert!(
+        evict_report.cache_entries_removed > 0 || evict_report.cache_disk_bytes_removed > 0,
+        "eviction should remove at least one cache entry or disk-cache block: {evict_report:?}"
+    );
+
+    let _ = engine.cache().invalidate(&target_block_key);
+    engine.cache().clear_memory_for_test();
+    assert_eq!(engine.cache().get_memory(&target_block_key), None);
+    let block_reads_before = engine.block_store().stats().reads;
+    let disk_hits_before = engine.cache().stats().disk_hits;
+    let cold_target = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "soak-target".to_string(),
+        },
+    });
+    assert_eq!(
+        cold_target.response,
+        CommandResponse::Bytes {
+            value: Some(target_value.clone())
+        }
+    );
+    assert_eq!(
+        engine.cache().get_memory(&target_block_key),
+        Some(target_value.clone()),
+        "cold read should refill memory from disk cache or page store"
+    );
+    assert!(
+        engine.cache().stats().disk_hits > disk_hits_before
+            || engine.block_store().stats().reads > block_reads_before,
+        "cold read should be backed by disk cache or persistent page store"
+    );
+    engine.cache().clear_memory_for_test();
+    assert_eq!(engine.cache().get_memory(&target_block_key), None);
+    let refill_samples_before = engine.cache().stats().refill_latency_samples;
+    let disk_refill_target = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "soak-target".to_string(),
+        },
+    });
+    assert_eq!(
+        disk_refill_target.response,
+        CommandResponse::Bytes {
+            value: Some(target_value.clone())
+        }
+    );
+    assert!(
+        engine.cache().stats().refill_latency_samples > refill_samples_before,
+        "second cold read should hit disk cache and record refill latency"
+    );
+    engine.cache().set_async_writeback_queue_limit_for_test(1);
+    engine
+        .cache()
+        .enqueue_async_writeback(
+            CacheKey::page_with_slot(1, 50_000, 0, 8, Some(99)),
+            b"writeback".to_vec(),
+        )
+        .unwrap();
+    assert!(engine
+        .cache()
+        .enqueue_async_writeback(
+            CacheKey::page_with_slot(1, 50_001, 0, 8, Some(99)),
+            b"overflow".to_vec(),
+        )
+        .is_err());
+    let drained = engine.cache().drain_async_writeback(8).unwrap();
+    assert_eq!(drained.drained, 1);
+    engine.cache().record_compaction_latency_micros(750);
+    let stats = engine.cache().stats();
+    assert!(stats.async_writeback_backpressure_rejections > 0);
+    assert!(stats.async_writeback_max_queue_depth > 0);
+    assert!(stats.async_writeback_max_queue_bytes > 0);
+    assert_cache_latency_histograms_observed(stats);
+
+    let drop_dir = tempfile::tempdir().unwrap();
+    let drop_engine = TemporalEngine::with_local_dirs(
+        64,
+        drop_dir.path().join("cache"),
+        drop_dir.path().join("blocks"),
+        drop_dir.path().join("indexes"),
+    );
+    drop_engine.load_shard(7);
+    for item in 0..6 {
+        let key = format!("drop-{item}");
+        let response = drop_engine.execute(ExecuteRequest {
+            shard_id: 7,
+            command: Command::StringSet {
+                key: key.clone(),
+                value: format!("drop-value-{item}").repeat(10).into_bytes(),
+            },
+        });
+        assert!(response.status.ok, "{response:?}");
+        assert!(
+            drop_engine
+                .execute(ExecuteRequest {
+                    shard_id: 7,
+                    command: Command::StringGet { key },
+                })
+                .status
+                .ok
+        );
+    }
+    let drop_report = drop_engine.apply_storage_eviction(7, 1, 2, true, true);
+    assert_eq!(drop_report.mode, "delete_drop");
+    assert!(drop_report.pressure_gate_open, "{drop_report:?}");
+    assert!(!drop_report.selected_victims.is_empty(), "{drop_report:?}");
+    assert!(
+        drop_report.dropped_object_count > 0,
+        "delete/drop eviction mode should drop selected cold objects: {drop_report:?}"
+    );
+}
+
+#[test]
+// shared-corpus: storage_cache_replacement_policy_soak;
+fn cache_dram_pmem_ssd_tiers_admit_refill_and_evict() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = matrixcache::MultiLayerCache::with_tiering_policy(
+        dir.path(),
+        matrixcache::CacheTieringPolicy {
+            memory_capacity_bytes: 16,
+            pmem_capacity_bytes: 24,
+            ssd_capacity_bytes: 4096,
+            data_placement: matrixcache::CacheDataPlacement::Tiered,
+            data_placement_threshold_bytes: 0,
+            memory_hotness_threshold: 10,
+            pmem_admit_hotness_threshold: 5,
+            ssd_admit_hotness_threshold: 2,
+            max_memory_block_bytes: 32,
+            max_pmem_block_bytes: 32,
+            max_ssd_block_bytes: 128,
+            ssd_write_through: true,
+        },
+        matrixcache::CacheBlockOptions::default(),
+    );
+    let key = CacheKey::page_with_slot(9, 1, 0, 16, Some(11));
+    let request = matrixcache::CacheAdmissionRequest {
+        block_kind: matrixcache::CacheBlockKind::Page,
+        shard_id: 9,
+        routing_slot: Some(11),
+        block_bytes: 16,
+        hotness: 6,
+        pinned: false,
+    };
+
+    cache
+        .put_with_admission(key.clone(), b"pmem-tier-value!".to_vec(), request)
+        .unwrap();
+    let stats = cache.stats();
+    assert_eq!(stats.memory_bytes, 0, "PMEM admission should not warm DRAM");
+    assert!(
+        stats.pmem_bytes > 0,
+        "PMEM tier should hold the admitted block"
+    );
+    assert!(
+        stats.disk_bytes > 0,
+        "SSD write-through should persist the block"
+    );
+    assert_eq!(stats.pmem_admission_accepted, 1);
+    assert_eq!(stats.ssd_admission_accepted, 1);
+
+    assert_eq!(
+        cache.get(&key).unwrap(),
+        Some(b"pmem-tier-value!".to_vec()),
+        "PMEM hit should serve before SSD and promote to DRAM"
+    );
+    let stats = cache.stats();
+    assert!(stats.pmem_hits > 0);
+    assert!(stats.memory_bytes > 0);
+    assert!(stats.refill_latency_samples > 0);
+
+    for idx in 0..4 {
+        let cold_key = CacheKey::page_with_slot(9, 2 + idx, 0, 16, Some(11));
+        cache
+            .put_with_admission(
+                cold_key,
+                vec![b'a' + idx as u8; 16],
+                matrixcache::CacheAdmissionRequest {
+                    block_kind: matrixcache::CacheBlockKind::Page,
+                    shard_id: 9,
+                    routing_slot: Some(11),
+                    block_bytes: 16,
+                    hotness: 6,
+                    pinned: false,
+                },
+            )
+            .unwrap();
+    }
+    let eviction = cache.eviction_report();
+    assert!(
+        eviction.pmem_evictions > 0,
+        "PMEM capacity pressure should evict through the middle tier: {eviction:?}"
+    );
+    assert!(
+        cache.stats().disk_bytes > 0,
+        "SSD tier should retain refill copies after PMEM eviction"
+    );
+}
+
+#[test]
+fn restarted_engine_refills_tiny_memory_cache_from_persistent_block_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let original =
+        TemporalEngine::with_local_dirs(32, dir.path().join("cache-a"), &block_dir, &index_dir);
+    original.load_shard(1);
+    let target_value = b"restart-target-value-0123456789".to_vec();
+    let write = original.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "target".to_string(),
+            value: target_value.clone(),
+        },
+    });
+    assert!(write.status.ok, "{write:?}");
+    assert_eq!(original.block_store().stats().writes, 1);
+
+    let restarted =
+        TemporalEngine::with_local_dirs(32, dir.path().join("cache-b"), &block_dir, &index_dir);
+    restarted.load_shard(1);
+    let restarted_cache = restarted.cache();
+    let restarted_block_store = restarted.block_store();
+    let target_block_key = {
+        let shards = restarted.shards.read().expect("shards lock poisoned");
+        let shard = shards
+            .get(&1)
+            .expect("shard should exist after index replay");
+        let address = shard
+            .strings()
+            .get("target")
+            .expect("target address should be restored from index")
+            .clone();
+        let (start, end) = shard.routing_range();
+        CacheKey::page_with_slot(
+            1,
+            address.block_slab_id(),
+            address.offset(),
+            address.length(),
+            Some(crate::engine::hashing::block_routing_bucket("target", start, end)),
+        )
+    };
+
+    let first_read = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "target".to_string(),
+        },
+    });
+    assert_eq!(
+        first_read.response,
+        CommandResponse::Bytes {
+            value: Some(target_value.clone())
+        }
+    );
+    assert_eq!(
+        restarted_block_store.stats().reads,
+        1,
+        "restart should miss memory and load the persisted page once"
+    );
+    assert_eq!(
+        restarted_cache.get_memory(&target_block_key),
+        Some(target_value.clone()),
+        "persistent page read should refill the memory cache"
+    );
+    assert!(
+        restarted_cache.stats().disk_bytes > 0,
+        "persistent page read should also write the disk block cache"
+    );
+
+    restarted_cache.clear_memory_for_test();
+    assert_eq!(restarted_cache.get_memory(&target_block_key), None);
+    let disk_hits_before = restarted_cache.stats().disk_hits;
+    let block_reads_before = restarted_block_store.stats().reads;
+    let second_read = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "target".to_string(),
+        },
+    });
+    assert_eq!(
+        second_read.response,
+        CommandResponse::Bytes {
+            value: Some(target_value.clone())
+        }
+    );
+    assert_eq!(
+        restarted_block_store.stats().reads,
+        block_reads_before,
+        "memory miss after restart should use the disk block cache"
+    );
+    assert!(
+        restarted_cache.stats().disk_hits > disk_hits_before,
+        "disk block cache should serve the second read"
+    );
+    assert_eq!(
+        restarted_cache.get_memory(&target_block_key),
+        Some(target_value),
+        "disk block hit should promote the page block back into memory"
+    );
+}
+
+#[test]
+fn block_reads_fill_compressed_block_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::with_block_options(
+        1024 * 1024,
+        dir.path().join("cache"),
+        matrixcache::CacheBlockOptions {
+            compression: matrixcache::CacheCompression::Zstd { level: 1 },
+            min_compress_bytes: 16,
+        },
+    );
+    let engine = TemporalEngine::with_cache_block_store_and_index_dir(
+        cache.clone(),
+        BlockStore::new(dir.path().join("blocks")),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let value = vec![b'x'; 4096];
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "large".to_string(),
+            value: value.clone(),
+        },
+    });
+
+    let first = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "large".to_string(),
+        },
+    });
+    assert_eq!(
+        first.response,
+        CommandResponse::Bytes { value: Some(value) }
+    );
+    assert!(cache.stats().compressed_puts >= 1);
+    assert!(cache.stats().compression_bytes_saved > 0);
+
+    cache.clear_memory_for_test();
+    let _ = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "large".to_string(),
+        },
+    });
+    assert!(cache.stats().compressed_hits >= 1);
+}
+
+#[test]
+fn local_dirs_constructor_applies_block_store_compression_options() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs_and_block_store_options(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+        BlockStoreOptions {
+            compression_enabled: false,
+            ..BlockStoreOptions::default()
+        },
+    );
+    engine.load_shard(1);
+    let value = b"engine-page-policy-".repeat(80);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "large-policy".to_string(),
+            value: value.clone(),
+        },
+    });
+
+    let block_store = engine.block_store();
+    let stats = block_store.stats();
+    assert_eq!(stats.writes, 1);
+    assert_eq!(stats.compressed_records_written, 0);
+    assert_eq!(stats.compression_bytes_saved, 0);
+
+    let read = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "large-policy".to_string(),
+        },
+    });
+    assert_eq!(read.response, CommandResponse::Bytes { value: Some(value) });
+}
+
+#[test]
+fn write_invalidates_cached_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = MultiLayerCache::new(1024, dir.path());
+    let engine = TemporalEngine::new(cache.clone());
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"old".to_vec(),
+        },
+    });
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"new".to_vec(),
+        },
+    });
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        response.response,
+        CommandResponse::Bytes {
+            value: Some(b"new".to_vec())
+        }
+    );
+    assert!(cache.stats().invalidations >= 2);
+}
+
+#[test]
+fn async_storage_string_write_stays_on_hot_memory_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+
+    let write = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "hot".to_string(),
+            value: b"value".to_vec(),
+        },
+    });
+    assert!(write.status.ok);
+    // The write records
+    // a WAL entry even in async mode; async only means the commit does not
+    // block (no fsync -> syncs == 0), and page/index materialization is deferred.
+    assert_eq!(engine.block_store().stats().writes, 0);
+    assert_eq!(engine.write_ahead_log_store().stats(1).writes, 1);
+    assert_eq!(engine.write_ahead_log_store().stats(1).syncs, 0);
+    assert_eq!(engine.index_log_store().stats(1).writes, 0);
+
+    let read = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "hot".to_string(),
+        },
+    });
+    assert_eq!(
+        read.response,
+        CommandResponse::Bytes {
+            value: Some(b"value".to_vec())
+        }
+    );
+    assert_eq!(engine.block_store().stats().reads, 0);
+    assert!(engine.cache().stats().memory_hits >= 1);
+}
+
+#[test]
+fn async_hot_block_survives_memory_eviction_via_spill() {
+    // Regression for the log-backed hot-page read-as-missing bug (gap P1): under async_storage a
+    // write lives ONLY in the memory tier at a synthetic hot-page address. If the memory-only
+    // entry is evicted before the next dump, a read used to miss the cache, hit a non-existent
+    // slab file, and return value:None for an ACKED write. The eviction handler now spills the
+    // evicted hot page to a real slab and a hot-address cache miss resolves the redirect, so the
+    // value survives eviction on the live path (no reload needed).
+    let dir = tempfile::tempdir().unwrap();
+    // Deliberately tiny memory tier so the flood below forces capacity eviction of the target.
+    let engine = TemporalEngine::with_local_dirs(
+        2048,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+
+    // Async write -> memory-only hot page, nothing in the block store yet.
+    let target_value = b"durable-async-value-that-must-survive-eviction".to_vec();
+    assert!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "target".to_string(),
+                    value: target_value.clone(),
+                },
+            })
+            .status
+            .ok
+    );
+    assert_eq!(engine.block_store().stats().writes, 0);
+
+    // Flood the memory tier with far more async hot pages than it can hold, forcing the target's
+    // page to be evicted (and spilled to a real slab by the eviction handler).
+    for i in 0..400 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("filler-{i}"),
+                value: vec![b'x'; 96],
+            },
+        });
+    }
+
+    // At least one hot page must have spilled to a durable slab (proves the handler fired).
+    assert!(
+        engine.block_store().stats().writes > 0,
+        "evicted hot pages must spill to a durable slab"
+    );
+
+    // Drop EVERY cache tier for the shard so the only surviving copy of the target is the durable
+    // spilled slab (plus the WAL). This defeats the cache's own cross-tier retention and forces
+    // the read to resolve through the hot-page spill redirect -- the path this fix adds.
+    let _ = engine.cache().invalidate_shard(1);
+
+    let reads_before = engine.block_store().stats().reads;
+    // The acked write must still read back as its value -- resolved via the spill redirect + a
+    // durable slab read, NOT as value:None.
+    let read = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "target".to_string(),
+        },
+    });
+    assert_eq!(
+        read.response,
+        CommandResponse::Bytes {
+            value: Some(target_value)
+        },
+        "an acked async write must not read as missing after its hot page is evicted"
+    );
+    // The value came from the durable spilled slab, confirming the redirect fallback was used.
+    assert!(
+        engine.block_store().stats().reads > reads_before,
+        "the evicted target must be served from the durable spilled slab"
+    );
+}
+
+fn set_async_config(engine: &TemporalEngine, shard_id: ShardId) {
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+}
+
+#[test]
+fn atomic_batch_survives_restart_when_complete() {
+    // Positive control for gap E3: a fully-persisted atomic batch replays in full on restart.
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine =
+        TemporalEngine::with_local_dirs(1024 * 1024, dir.path().join("cache-a"), &block_dir, &index_dir);
+    engine.load_shard(1);
+    set_async_config(&engine, 1);
+    let batch = engine.batch_execute(BatchExecuteRequest {
+        shard_id: 1,
+        commands: vec![
+            Command::StringSet { key: "b0".to_string(), value: b"v0".to_vec() },
+            Command::StringSet { key: "b1".to_string(), value: b"v1".to_vec() },
+            Command::StringSet { key: "b2".to_string(), value: b"v2".to_vec() },
+        ],
+    });
+    assert!(batch.status.ok);
+    drop(engine);
+
+    let restarted =
+        TemporalEngine::with_local_dirs(1024 * 1024, dir.path().join("cache-b"), &block_dir, &index_dir);
+    restarted.load_shard(1);
+    for (key, value) in [("b0", "v0"), ("b1", "v1"), ("b2", "v2")] {
+        let read = restarted.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet { key: key.to_string() },
+        });
+        assert_eq!(
+            read.response,
+            CommandResponse::Bytes { value: Some(value.as_bytes().to_vec()) },
+            "complete batch key {key} must survive restart"
+        );
+    }
+}
+
+#[test]
+fn atomic_batch_is_all_or_nothing_when_commit_marker_lost() {
+    // Gap E3: a crash between the batch's buffered appends and its single durability barrier can
+    // leave a partial suffix on disk. Simulate that by dropping the batch's final (commit-marker)
+    // WAL line; on restart the WHOLE batch must be discarded -- never a partially-applied prefix
+    // that a retry would double-apply.
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine =
+        TemporalEngine::with_local_dirs(1024 * 1024, dir.path().join("cache-a"), &block_dir, &index_dir);
+    engine.load_shard(1);
+    set_async_config(&engine, 1);
+    // A standalone durable write before the batch, to prove only the batch is dropped.
+    assert!(engine
+        .execute_durable(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet { key: "keep".to_string(), value: b"kept".to_vec() },
+        })
+        .status
+        .ok);
+    let batch = engine.batch_execute(BatchExecuteRequest {
+        shard_id: 1,
+        commands: vec![
+            Command::StringSet { key: "b0".to_string(), value: b"v0".to_vec() },
+            Command::StringSet { key: "b1".to_string(), value: b"v1".to_vec() },
+            Command::StringSet { key: "b2".to_string(), value: b"v2".to_vec() },
+        ],
+    });
+    assert!(batch.status.ok);
+    drop(engine);
+
+    // Simulate the lost commit marker: drop the last WAL line (batch_index == batch_size).
+    let wal_path = index_dir.join("wals").join("shard-1.wal.bin");
+    // Read as BYTES and walk the records by their FRAMES, not by newlines. A record is only a
+    // "line" while the frame ends with one; once it declares its own length the payload carries
+    // 0x0A freely, and splitting on that byte cuts records in half -- which makes this test
+    // build a log no writer would ever produce and then assert on how recovery handles it.
+    // Asking the frame where each record ends works whichever frame wrote it.
+    let contents = std::fs::read(&wal_path).expect("wal file should exist");
+    let mut spans: Vec<(usize, usize)> = Vec::new();
+    let mut at = 0usize;
+    while at < contents.len() {
+        // The preallocated zeros reservation trails the records and is not one of them.
+        if contents[at] == 0 {
+            break;
+        }
+        match crate::log_framing::next_frame(&contents[at..]) {
+            Ok(Some((consumed, _))) if consumed > 0 => {
+                spans.push((at, at + consumed));
+                at += consumed;
+            }
+            _ => break,
+        }
+    }
+    // however many records the batch became. Written as N records sharing a batch id the last
+    // one is the commit marker and dropping it strands the rest; written as ONE record carrying
+    // every item, dropping it removes the batch outright. Both are the same test -- cut the tail
+    // and require that nothing of the batch survives -- and neither depends on the count, so this
+    // asserts the shape it needs rather than the shape one format happens to produce.
+    assert!(
+        spans.len() >= 2,
+        "expected the standalone write plus at least one batch record, got {}",
+        spans.len()
+    );
+    spans.pop(); // the commit marker, or the whole batch when it is one record
+    let mut truncated = Vec::new();
+    for (start, end) in spans {
+        truncated.extend_from_slice(&contents[start..end]);
+    }
+    std::fs::write(&wal_path, truncated).expect("rewrite wal");
+
+    let restarted =
+        TemporalEngine::with_local_dirs(1024 * 1024, dir.path().join("cache-b"), &block_dir, &index_dir);
+    restarted.load_shard(1);
+
+    // The pre-batch durable write survives.
+    assert_eq!(
+        restarted
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet { key: "keep".to_string() },
+            })
+            .response,
+        CommandResponse::Bytes { value: Some(b"kept".to_vec()) }
+    );
+    // No member of the incomplete batch is applied -- not even the durable prefix (b0, b1).
+    for key in ["b0", "b1", "b2"] {
+        assert_eq!(
+            restarted
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet { key: key.to_string() },
+                })
+                .response,
+            CommandResponse::Bytes { value: None },
+            "incomplete-batch key {key} must NOT be applied"
+        );
+    }
+}
+
+#[test]
+fn durable_execute_overrides_async_storage_for_raft_local_file_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+
+    let write = engine.execute_durable(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "raft".to_string(),
+            value: b"value".to_vec(),
+        },
+    });
+    assert!(write.status.ok);
+    assert_eq!(engine.block_store().stats().writes, 1);
+    assert_eq!(engine.write_ahead_log_store().stats(1).writes, 1);
+    assert_eq!(engine.index_log_store().stats(1).writes, 1);
+
+    let read = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "raft".to_string(),
+        },
+    });
+    assert_eq!(
+        read.response,
+        CommandResponse::Bytes {
+            value: Some(b"value".to_vec())
+        }
+    );
+}
+
+#[test]
+fn durable_index_survives_restart_and_points_to_block_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache-a");
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(1024, &cache_dir, &block_dir, &index_dir);
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"persisted".to_vec(),
+        },
+    });
+
+    let restarted =
+        TemporalEngine::with_local_dirs(1024, dir.path().join("cache-b"), &block_dir, &index_dir);
+    restarted.load_shard(1);
+    let response = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        response.response,
+        CommandResponse::Bytes {
+            value: Some(b"persisted".to_vec())
+        }
+    );
+    assert_eq!(restarted.block_store().stats().reads, 1);
+}
+
+#[test]
+fn async_write_survives_restart_via_wal_replay_like_native() {
+    // conformance: an async_storage write records a WAL entry but defers page/
+    // index materialization to the background dump. If the crash beats the dump,
+    // Startup load replays the wal and recovers the write. Rust must replay
+    // its WAL on shard load the same way, or the async write is silently lost.
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"async-durable".to_vec(),
+        },
+    });
+    assert_eq!(engine.block_store().stats().writes, 0);
+    assert_eq!(engine.write_ahead_log_store().stats(1).writes, 1);
+    drop(engine);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+    let response = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        response.response,
+        CommandResponse::Bytes {
+            value: Some(b"async-durable".to_vec())
+        },
+        "async write must be recovered by replaying the WAL on shard load"
+    );
+}
+
+// Readiness race regression: after a restart with WAL entries not yet reflected in the served
+// index, the shard is published but NOT serving until `replay_wal_into_shard` completes
+// (ShardInfo.recovering gates it). A read that arrives inside that window must NOT observe a
+// false null from the half-reconstructed state -- it must be rejected with a retryable
+// `shard_not_loaded`. Once replay completes the same read must return the recovered value.
+// (The fix commit gated this deliberately without a deterministic test; this pins it.)
+#[test]
+fn read_during_wal_replay_recovery_returns_retryable_not_false_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    // async_storage: the write lands in the WAL but page/index materialization is deferred, so
+    // it is absent from the served index until the WAL is replayed on the next load.
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"recovered-value".to_vec(),
+        },
+    });
+    assert_eq!(engine.block_store().stats().writes, 0);
+    assert_eq!(engine.write_ahead_log_store().stats(1).writes, 1);
+    drop(engine);
+
+    // Restart, and park the shard in the recovery window: base index loaded (the async write is
+    // NOT in it yet), recovering=true, WAL not yet replayed.
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    let watermark = restarted.test_publish_recovering_shard(1);
+
+    // A read inside the recovery window must be rejected retryably, NOT return a false null.
+    let during = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert!(
+        !during.status.ok,
+        "read during WAL-replay recovery must be rejected, not served from half-built state"
+    );
+    assert_eq!(during.status.code, "shard_not_loaded");
+    assert_eq!(
+        during.response,
+        CommandResponse::Empty,
+        "recovering read must return a retryable error, never a false null (Bytes {{ None }})"
+    );
+
+    // After replay completes and the gate clears, the same read returns the recovered value.
+    restarted.test_finish_recovery(1, watermark);
+    let after = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert!(after.status.ok, "shard must serve once recovery completes");
+    assert_eq!(
+        after.response,
+        CommandResponse::Bytes {
+            value: Some(b"recovered-value".to_vec())
+        },
+        "the WAL-recovered value must be served after recovery completes"
+    );
+}
+
+// Coalesced control-state persistence skips the per-write whole-series page rewrite
+// (write-amplification) and relies on the index snapshot + WAL replay for durability, the
+// same model control_state_changes/fol already use. This MUST stay crash-safe: increments
+// recorded only in the WAL (no page materialization, no flush) must be recovered on reload.
+#[test]
+fn control_state_coalesced_write_survives_restart_via_wal_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    let mut config = Config {
+        version: 2,
+        async_storage: true,
+        ..Config::default()
+    };
+    config
+        .extend_config
+        .insert("control_coalesce_persist".to_string(), "on".to_string());
+    assert!(engine.set_config(SetConfigRequest { shard_id: 1, config }).ok);
+
+    for (timestamp_ms, amount) in [(10u64, 1i64), (20, 2), (30, 4), (40, 8)] {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ControlStateIncrement {
+                key: "cap".to_string(),
+                timestamp_ms,
+                amount,
+            },
+        });
+    }
+    // Coalesced: the per-write control_state page rewrite is skipped; the WAL carries durability.
+    assert_eq!(
+        engine.block_store().stats().writes,
+        0,
+        "coalesced control-state writes must not materialize a per-write page"
+    );
+    assert!(
+        engine.write_ahead_log_store().stats(1).writes >= 4,
+        "each coalesced increment must still be recorded in the WAL"
+    );
+    drop(engine);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+    let response = restarted
+        .execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ControlStateCount {
+                key: "cap".to_string(),
+                start_ms: 0,
+                end_ms: 100,
+            },
+        })
+        .response;
+    assert_eq!(
+        response,
+        CommandResponse::Integer { value: 15 },
+        "coalesced control-state counter must be recovered by WAL replay on reload"
+    );
+}
+
+#[test]
+fn async_storage_batch_write_records_wal_without_sync_or_index() {
+    // Batch analog of the single-command async conformance: the batch path (used by
+    // ingestion) must also record a WAL entry per async write, unfsynced, with page/
+    // index materialization deferred.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    let batch = engine.batch_execute(BatchExecuteRequest {
+        shard_id: 1,
+        commands: vec![
+            Command::StringSet {
+                key: "a".to_string(),
+                value: b"a".to_vec(),
+            },
+            Command::StringSet {
+                key: "b".to_string(),
+                value: b"b".to_vec(),
+            },
+        ],
+    });
+    assert!(batch.status.ok);
+    assert_eq!(engine.block_store().stats().writes, 0);
+    // logged at all, not logged once per command. Whether a batch of two becomes two records
+    // sharing a batch id or one record carrying both items is a property of the log format, and
+    // this test is about what an ASYNCHRONOUS batch does and does not touch: the log yes, the
+    // barrier no, the block store no, the index no. Pinning the count made it a test of the
+    // format instead, which is how it came to fail on a change that took nothing away from it.
+    assert!(
+        engine.write_ahead_log_store().stats(1).writes >= 1,
+        "the batch must reach the log"
+    );
+    assert_eq!(engine.write_ahead_log_store().stats(1).syncs, 0);
+    assert_eq!(engine.index_log_store().stats(1).writes, 0);
+}
+
+#[test]
+fn eviction_ranks_victims_least_recently_used_first_like_native() {
+    // Eviction victims are ordered least-recently-used first, so a
+    // repeatedly-read hot bucket is evicted last. Rust stamps per-bucket recency on
+    // every read/write and sorts victims oldest-first.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for key in ["cold-a", "cold-b", "cold-c", "cold-d", "hot"] {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: key.to_string(),
+                value: b"value".to_vec(),
+            },
+        });
+    }
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    for _ in 0..3 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: "hot".to_string(),
+            },
+        });
+    }
+    let report = engine.apply_storage_eviction(1, 0, 0, false, false);
+    assert!(
+        report.selected_victims.len() >= 2,
+        "expected multiple victim buckets: {report:?}"
+    );
+    let recencies: Vec<u64> = report
+        .selected_victims
+        .iter()
+        .map(|victim| victim.last_touched_ms)
+        .collect();
+    assert!(
+        recencies.windows(2).all(|pair| pair[0] <= pair[1]),
+        "victims must be ordered least-recently-used first: {report:?}"
+    );
+    assert!(
+        recencies.last() > recencies.first(),
+        "the hot bucket must have the newest recency and sort last: {report:?}"
+    );
+}
+
+#[test]
+fn wal_replay_gap_refuses_load_like_dataloss() {
+    // WAL replay returns DataLoss and aborts load on a hole in the
+    // retained wal. Rust must likewise refuse the load (not-loaded) rather than
+    // silently serve a truncated prefix.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    // Seed the WAL with a sequence hole {1,2,4} (missing 3) before loading the shard;
+    // there is no served index, so recovery replays from watermark 0.
+    let wal = engine.write_ahead_log_store();
+    for seq in [1u64, 2, 4] {
+        wal.append_replayed_record(WriteAheadLogRecord {
+            shard_id: 1,
+            sequence: seq,
+            command: Some(Command::StringSet {
+                key: format!("k{seq}"),
+                value: b"v".to_vec(),
+            }),
+            metadata: None,
+            staged_blocks: Vec::new(),
+            outcomes: Vec::new(),
+        })
+        .unwrap();
+    }
+    let response = engine.load_shard_with(LoadShardRequest {
+        shard_id: 1,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 0,
+        end_routing_bucket: u32::MAX,
+        readonly: false,
+        table_name: String::new(),
+    });
+    assert!(
+        !response.status.ok,
+        "load must refuse on a WAL sequence gap: {response:?}"
+    );
+    assert_eq!(response.status.code, "wal_replay_sequence_gap");
+    // The shard must be left NOT loaded (unwound).
+    let get = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k1".to_string(),
+        },
+    });
+    assert!(
+        !get.status.ok,
+        "a refused load must leave the shard not-loaded: {get:?}"
+    );
+}
+
+#[test]
+fn expiry_sweep_emits_wal_delete_marker_like_native() {
+    // Active expiry is a logged, replicated delete. Rust's sweep must append a
+    // WAL tombstone per expired key so followers / WAL replay observe the deletion,
+    // instead of removing only in-memory + index.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        },
+    });
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::CommonExpire {
+            key: "k".to_string(),
+            ttl_ms: 1,
+        },
+    });
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let wal_before_sweep = engine.write_ahead_log_store().stats(1).writes;
+    let report = engine.sweep_expired_records(1).unwrap();
+    assert_eq!(report.expired_records_removed, 1);
+    let wal_after_sweep = engine.write_ahead_log_store().stats(1).writes;
+    assert_eq!(
+        wal_after_sweep - wal_before_sweep,
+        1,
+        "the expiry sweep must append one WAL delete (tombstone) per expired key"
+    );
+}
+
+
+/// Pins the two clocks these recovery tests depend on: the timestamp stamped onto each WAL
+/// record (which replay reads back as the leader clock) and the clock the engine computes
+/// deadlines with. Both are restored on drop, including on panic, so a pinned clock can
+/// never leak into another test on this thread.
+static PINNED_LEADER_CLOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct PinnedLeaderClock(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl PinnedLeaderClock {
+    fn at(leader_now_ms: u64) -> Self {
+        // The record clock is process-wide, so two tests pinning it at once would stamp each
+        // other's records. Held for the few writes that need it, released on drop.
+        let guard = PINNED_LEADER_CLOCK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::wal::set_test_record_clock_ms(Some(leader_now_ms));
+        crate::engine::set_replay_clock_ms(Some(leader_now_ms));
+        PinnedLeaderClock(guard)
+    }
+
+    fn real_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_millis() as u64
+    }
+}
+
+impl Drop for PinnedLeaderClock {
+    fn drop(&mut self) {
+        crate::wal::set_test_record_clock_ms(None);
+        crate::engine::set_replay_clock_ms(None);
+    }
+}
+
+#[test]
+fn wal_replay_uses_leader_timestamp_for_ttl_deadline_like_native() {
+    // resolves a TTL to an ABSOLUTE deadline on the leader before logging it
+    // (deadline = request.ttl_ms + current time at log time); replay uses that
+    // value. Rust must resolve replayed TTLs against the leader's logged timestamp, not
+    // the (later) restart clock -- otherwise crash recovery resurrects a key past its
+    // deadline with a fresh restart-time+ttl lifetime.
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    // async so the SETEX lives only in the WAL, forcing a replay on reload.
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSetEx {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+            ttl_ms: 40,
+        },
+    });
+    // Sleep well past the 40ms TTL so the leader deadline is in the past at reload.
+    std::thread::sleep(std::time::Duration::from_millis(160));
+    drop(engine);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+    let get = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        get.response,
+        CommandResponse::Bytes { value: None },
+        "a key past its leader TTL deadline must not be resurrected with a replay-time deadline"
+    );
+}
+
+/// A WAL record carrying NO leader timestamp must replay against the LIVE clock.
+///
+/// The rule is already written down for the raft-apply path, on `execute_raft_apply_at`: "`None`
+/// (or a zero stamp, from an entry written before the log carried one) keeps the live clock".
+/// `ReplayClockGuard::enter` enforces it with `.filter(|stamp| *stamp > 0)`. The WAL replay loop
+/// sets the same thread-local, but set it straight from `metadata.timestamp_ms` -- so an
+/// unstamped record pinned the replay clock to 0 and every relative deadline resolved during it
+/// landed in 1970. A durably acknowledged write then comes back from recovery already expired,
+/// which is the quietest way a store can lose one.
+///
+/// The zero is reachable rather than hypothetical: protobuf is the only WAL encoder, and its
+/// decoder copies this field verbatim, so an absent `timestamp_ms` decodes as 0 -- while the
+/// field immediately beside it, `version`, IS normalized for precisely this case.
+///
+/// BOTH HALVES ARE ASSERTED SEPARATELY, and they fail the same way for opposite reasons: a
+/// stamped record must still resolve against its stamp (the behaviour this must not break), and
+/// an unstamped one must not resolve against a zero. Asserting only one of them would pass on a
+/// replay that got the other exactly backwards.
+#[test]
+fn wal_replay_reads_an_unstamped_record_against_the_live_clock() {
+    use crate::wal::{WriteAheadLogRecord, WriteAheadLogRecordMetadata};
+
+    const ONE_MINUTE_MS: u64 = 60 * 1000;
+
+    // Records built by hand and written straight into the log, because the stamp is the whole
+    // subject: no writer API will produce a zero on request (`set_test_record_clock_ms` reads
+    // its own zero as "not pinned"), so the only way to state one is to write the record.
+    fn record_at(sequence: u64, key: &str, stamp_ms: u64) -> WriteAheadLogRecord {
+        WriteAheadLogRecord {
+            shard_id: 1,
+            sequence,
+            command: Some(Command::StringSetEx {
+                key: key.to_string(),
+                value: b"v".to_vec(),
+                ttl_ms: ONE_MINUTE_MS,
+            }),
+            metadata: Some(WriteAheadLogRecordMetadata {
+                version: crate::wal::WRITE_AHEAD_LOG_FORMAT_VERSION,
+                timestamp_ms: stamp_ms,
+                items: Vec::new(),
+                batch_id: None,
+                batch_size: None,
+                batch_index: None,
+            }),
+            staged_blocks: Vec::new(),
+            outcomes: Vec::new(),
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let live_now_ms = PinnedLeaderClock::real_now_ms();
+
+    {
+        let writer = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            dir.path().join("cache-a"),
+            &block_dir,
+            &index_dir,
+        );
+        let log = writer.write_ahead_log_store();
+        // Sequence 1: STAMPED an hour ago, one-minute TTL. Its deadline is long past.
+        log.append_replayed_record(record_at(1, "stamped", live_now_ms - 60 * ONE_MINUTE_MS))
+            .unwrap();
+        // Sequence 2: UNSTAMPED, same one-minute TTL. Nothing in the record says when the
+        // leader took it, so the only honest reading of its deadline is "a minute from now".
+        log.append_replayed_record(record_at(2, "unstamped", 0))
+            .unwrap();
+    }
+
+    // No index file was ever written, so the replay watermark is 0 and both records replay.
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+
+    let ttl_of = |key: &str| {
+        match restarted
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::CommonTtl {
+                    key: key.to_string(),
+                },
+            })
+            .response
+        {
+            CommandResponse::Integer { value } => value,
+            other => panic!("TTL for {key} answered {other:?}"),
+        }
+    };
+
+    // HALF A, the control. The stamped record still resolves against its own stamp, so its
+    // deadline sits 59 minutes in the past and the key is gone. -2 is "no such key". This half
+    // passes before the fix as well as after; it is here so a change that repaired half B by
+    // ignoring every stamp could not pass.
+    assert_eq!(
+        ttl_of("stamped"),
+        -2,
+        "a record carrying a real leader stamp must resolve its deadline against that stamp, \
+         not against the restart clock"
+    );
+
+    // HALF B, the finding. Read against a zero clock the unstamped record's deadline is 60000 --
+    // an absolute instant in 1970 -- so it replays already-expired and answers -2, the same
+    // number as half A for the opposite reason.
+    let remaining = ttl_of("unstamped");
+    assert!(
+        remaining > 0 && remaining <= ONE_MINUTE_MS as i64,
+        "an unstamped record must resolve its one-minute TTL against the live clock, leaving \
+         at most {ONE_MINUTE_MS}ms and more than 0; got {remaining} (-2 means the replay clock \
+         was pinned to 1970 and a durable write came back from recovery already expired)"
+    );
+}
+
+#[test]
+fn wal_replay_conditional_write_uses_leader_clock_for_lazy_expiry_like_native() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    // async so both records live only in the WAL, forcing a replay on reload.
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+
+    // An hour of downtime, STATED rather than slept for. Sleeping for it was the defect in
+    // this test: the two writes below have to land while k is still live, so a real deadline
+    // made that a race against whatever else the machine was doing, and any stall longer than
+    // the TTL failed the test on a property it is not about.
+    let leader_now_ms = PinnedLeaderClock::real_now_ms() - 60 * 60 * 1000;
+    {
+        let _clock = PinnedLeaderClock::at(leader_now_ms);
+        // Record 1: create k with a one-minute deadline, an hour before restart.
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSetEx {
+                key: "k".to_string(),
+                value: b"v1".to_vec(),
+                ttl_ms: 60 * 1000,
+            },
+        });
+        // Record 2: a SET XX refreshing k=v2 with a deadline that OUTLASTS the downtime. On
+        // the leader this fires because k is live at leader time, and it now fires
+        // unconditionally, because the deadline and the check read the same pinned clock.
+        let cond = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSetConditional {
+                key: "k".to_string(),
+                value: b"v2".to_vec(),
+                ttl_ms: Some(2 * 60 * 60 * 1000),
+                condition: StringSetCondition::IfExists,
+                return_old: false,
+                keep_ttl: false,
+            },
+        });
+        assert_eq!(
+            cond.response,
+            CommandResponse::Integer { value: 1 },
+            "SET XX must fire on the leader while k is live"
+        );
+    }
+    // These writes are asynchronous: the commit does not block, so a returned write does not
+    // mean the record has reached the file. The engine has no Drop that flushes, so dropping
+    // it is not a barrier either -- the successor below can open the log before the last
+    // record lands in it, and a replay test whose log is missing its last record fails
+    // looking exactly like a recovery defect. Flush, then check there is something to replay.
+    let flushed = engine
+        .write_ahead_log_store()
+        .flush(1)
+        .expect("flush the log before the engine goes away");
+    let _ = flushed;
+    assert!(
+        engine.write_ahead_log_store().stats(1).writes >= 2,
+        "premise: the log must hold the writes this test is about to replay, got {}",
+        engine.write_ahead_log_store().stats(1).writes
+    );
+    drop(engine);
+
+    // Restart on the REAL clock. Record 1's deadline lapsed 59 minutes ago; the deadline the
+    // SET XX installed is still an hour out. Replay installs record 1's outcome (an absolute
+    // leader-time deadline) and re-executes record 2, whose lazy-expiry check picks the
+    // branch: against the leader clock k is live and the write survives; against the restart
+    // clock k reads expired and a durably-committed write is silently lost.
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    // Assert the LOAD, not just what is readable after it. `load_shard` throws its response
+    // away, so a shard that refused to recover looks identical to one that recovered empty --
+    // every assertion below then reports a missing value and blames replay for dropping it,
+    // which is the wrong end of the failure and is exactly how this was read for several
+    // rounds.
+    let loaded = restarted.load_shard_with(LoadShardRequest {
+        shard_id: 1,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 0,
+        end_routing_bucket: u32::MAX,
+        readonly: false,
+        table_name: String::new(),
+    });
+    assert!(
+        loaded.status.ok,
+        "the shard refused the load: {:?}",
+        loaded.status
+    );
+
+    let get = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        get.response,
+        CommandResponse::Bytes {
+            value: Some(b"v2".to_vec())
+        },
+        "replay must reproduce the leader's SET XX branch (k live at leader time), not drop \
+         the committed write because the original deadline lapsed during downtime"
+    );
+}
+
+#[test]
+fn wal_replay_rearmed_expire_does_not_abort_recovery_like_native() {
+    // A committed EXPIRE that re-arms a key's TTL must replay cleanly even if the key's
+    // ORIGINAL (pre-re-arm) deadline has lapsed by restart time. Command preconditions are
+    // a LEADER-time gate; re-running them during replay against the restart clock made a
+    // replayed EXPIRE fail "not_found" and abort the WHOLE shard load (data unavailability
+    // for every key on the shard). ReplayWal re-applies logged effects without
+    // re-checking preconditions. The canary below proves the shard actually recovered.
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    // async so every record lives only in the WAL, forcing a full replay on reload.
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+
+    // An hour of downtime, stated rather than slept for, as in the sibling test. What this
+    // test needs is that k's deadline has LAPSED by restart -- a premise that now holds by
+    // construction. It previously held only if the sleep outlasted the TTL, and widening the
+    // TTL to steady the race quietly inverted it: 250ms of downtime against a 1500ms
+    // deadline left the key live at restart, so the test passed without ever building the
+    // situation it exists to check.
+    let leader_now_ms = PinnedLeaderClock::real_now_ms() - 60 * 60 * 1000;
+    {
+        let _clock = PinnedLeaderClock::at(leader_now_ms);
+        // Durable canary that survives iff replay runs to completion (not aborted mid-way).
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "canary".to_string(),
+                value: b"present".to_vec(),
+            },
+        });
+        // Create k with a one-minute deadline, then re-arm it via EXPIRE. Both logged, both
+        // an hour before restart, so both deadlines are in the past by the time replay runs.
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSetEx {
+                key: "k".to_string(),
+                value: b"v".to_vec(),
+                ttl_ms: 60 * 1000,
+            },
+        });
+        let rearmed = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::CommonExpire {
+                key: "k".to_string(),
+                ttl_ms: 60 * 1000,
+            },
+        });
+        assert!(
+            rearmed.status.ok,
+            "EXPIRE on a live key should succeed on the leader"
+        );
+    }
+    // These writes are asynchronous: the commit does not block, so a returned write does not
+    // mean the record has reached the file. The engine has no Drop that flushes, so dropping
+    // it is not a barrier either -- the successor below can open the log before the last
+    // record lands in it, and a replay test whose log is missing its last record fails
+    // looking exactly like a recovery defect. Flush, then check there is something to replay.
+    let flushed = engine
+        .write_ahead_log_store()
+        .flush(1)
+        .expect("flush the log before the engine goes away");
+    let _ = flushed;
+    assert!(
+        engine.write_ahead_log_store().stats(1).writes >= 3,
+        "premise: the log must hold the writes this test is about to replay, got {}",
+        engine.write_ahead_log_store().stats(1).writes
+    );
+    drop(engine);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    // Assert the LOAD, not just what is readable after it. `load_shard` throws its response
+    // away, so a shard that refused to recover looks identical to one that recovered empty --
+    // every assertion below then reports a missing value and blames replay for dropping it,
+    // which is the wrong end of the failure and is exactly how this was read for several
+    // rounds.
+    let loaded = restarted.load_shard_with(LoadShardRequest {
+        shard_id: 1,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 0,
+        end_routing_bucket: u32::MAX,
+        readonly: false,
+        table_name: String::new(),
+    });
+    assert!(
+        loaded.status.ok,
+        "the shard refused the load: {:?}",
+        loaded.status
+    );
+
+    // THE PREMISE, ASSERTED. This test is only meaningful if k's deadline actually lapsed
+    // while the engine was down; if it did not, the situation it exists to check was never
+    // built and the canary below passes for free. That is not hypothetical -- widening this
+    // test's TTL to steady a race once left 250ms of downtime against a 1500ms deadline, and
+    // it kept passing while checking nothing. So: k must be GONE at restart.
+    let lapsed = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        lapsed.response,
+        CommandResponse::Bytes { value: None },
+        "premise: k's re-armed deadline must have lapsed during the downtime, or this test \
+         is not exercising a replayed EXPIRE whose deadline is in the past"
+    );
+    let canary = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "canary".to_string(),
+        },
+    });
+    assert_eq!(
+        canary.response,
+        CommandResponse::Bytes {
+            value: Some(b"present".to_vec())
+        },
+        "shard must recover: a replayed re-arming EXPIRE whose original deadline lapsed must \
+         not abort the whole WAL replay"
+    );
+}
+
+#[test]
+fn hdel_last_field_removes_key_like_native() {
+    // hash2::Del removes the whole object once the last field is deleted; Rust left an
+    // empty field map behind, so the key still reported as existing (EXISTS=1, TYPE=hash).
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::HashSet {
+            key: "h".to_string(),
+            field: "f".to_string(),
+            value: b"v".to_vec(),
+        },
+    });
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::HashDelete {
+            key: "h".to_string(),
+            field: "f".to_string(),
+        },
+    });
+    let exists = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::CommonExists {
+            key: "h".to_string(),
+        },
+    });
+    assert_eq!(
+        exists.response,
+        CommandResponse::Integer { value: 0 },
+        "an emptied hash must not leave a phantom key (deletes the object on last HDEL)"
+    );
+}
+
+#[test]
+fn timestamped_models_survive_unload_reload_round_trip() {
+    // Regression net for the membership-authoritative reconcile + serde round-trip: write a
+    // string plus the reconcile page-reading timestamped kinds (feature + sequence), then
+    // unload + reload and assert every value comes back intact (no loss, no resurrection).
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "s".to_string(),
+            value: b"string-value".to_vec(),
+        },
+    });
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::FeatureAppend {
+            key: "f".to_string(),
+            points: vec![
+                FeaturePoint {
+                    timestamp_ms: 10,
+                    value: b"a".to_vec(),
+                },
+                FeaturePoint {
+                    timestamp_ms: 20,
+                    value: b"b".to_vec(),
+                },
+            ],
+        },
+    });
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::SequenceAdd {
+            key: "seq".to_string(),
+            rows: vec![SequenceFeatureRow {
+                timestamp_ms: 5,
+                gid: 1,
+                action_type: 2,
+                duration: 3,
+                author_id: 4,
+            }],
+        },
+    });
+
+    let feature_timestamps = |engine: &TemporalEngine| -> Vec<u64> {
+        match engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureQuery {
+                    key: "f".to_string(),
+                    start_ms: 0,
+                    end_ms: u64::MAX,
+                    count: Some(100),
+                },
+            })
+            .response
+        {
+            CommandResponse::FeaturePoints { points } => {
+                points.iter().map(|p| p.timestamp_ms).collect()
+            }
+            other => panic!("expected FeaturePoints, got {other:?}"),
+        }
+    };
+    let sequence_len = |engine: &TemporalEngine| -> usize {
+        match engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::SequenceQuery {
+                    key: "seq".to_string(),
+                    start_ms: 0,
+                    end_ms: u64::MAX,
+                    count: 100,
+                    filters: Vec::new(),
+                },
+            })
+            .response
+        {
+            CommandResponse::SequenceRows { rows } => rows.len(),
+            other => panic!("expected SequenceRows, got {other:?}"),
+        }
+    };
+    let features_before = feature_timestamps(&engine);
+    assert_eq!(features_before, vec![10, 20]);
+    assert_eq!(sequence_len(&engine), 1);
+
+    engine.unload_shard(1);
+    engine.load_shard(1);
+
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: "s".to_string(),
+                },
+            })
+            .response,
+        CommandResponse::Bytes {
+            value: Some(b"string-value".to_vec()),
+        },
+        "string must survive reload"
+    );
+    assert_eq!(
+        feature_timestamps(&engine),
+        features_before,
+        "feature series must survive reload unchanged"
+    );
+    assert_eq!(
+        sequence_len(&engine),
+        1,
+        "sequence row must survive reload"
+    );
+}
+
+#[test]
+fn reconcile_does_not_resurrect_evicted_feature_points_on_reload() {
+    // A single FeatureAppend packs all timestamps into one page; the feature_max_size trim
+    // drops the oldest from the in-memory series, but the page still physically holds them.
+    // reconcile-from-pages must keep the persisted (trimmed) membership -- the evicted points
+    // must NOT resurrect on reload (writes per-timestamp deleted tombstones for this).
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    feature_max_size: 3,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    // One append of 5 points; the max_size=3 trim keeps the newest 3 in the series.
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::FeatureAppend {
+            key: "f".to_string(),
+            points: (1..=5)
+                .map(|i| FeaturePoint {
+                    timestamp_ms: i * 10,
+                    value: vec![i as u8],
+                })
+                .collect(),
+        },
+    });
+    let live_timestamps = |engine: &TemporalEngine| -> Vec<u64> {
+        match engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureQuery {
+                    key: "f".to_string(),
+                    start_ms: 0,
+                    end_ms: u64::MAX,
+                    count: Some(100),
+                },
+            })
+            .response
+        {
+            CommandResponse::FeaturePoints { points } => {
+                points.iter().map(|point| point.timestamp_ms).collect()
+            }
+            other => panic!("expected FeaturePoints, got {other:?}"),
+        }
+    };
+    let before = live_timestamps(&engine);
+    assert!(
+        before.contains(&50) && !before.contains(&10),
+        "trim should keep the newest points and drop the oldest: {before:?}"
+    );
+    drop(engine);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+    assert_eq!(
+        live_timestamps(&restarted),
+        before,
+        "reload must not resurrect the evicted feature points that still physically live in the page"
+    );
+}
+
+/// The object-lifecycle snapshot answers exactly what the recovery report answers.
+///
+/// The maintenance round used to obtain this field by building a whole recovery report, which
+/// reads every live page off the block store to count the readable ones and then discards all
+/// of that. The snapshot computes the same field from the shard's maps and the slab reports.
+/// "Same" has to be checked rather than argued: this drives a workload that moves each of its
+/// parts -- writes, overwrites, deletes, a maintenance cycle, a rolled slab -- and compares the
+/// whole struct after every stage.
+#[test]
+fn object_lifecycle_snapshot_matches_the_recovery_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    let mut stages = 0usize;
+    let mut check = |engine: &TemporalEngine, what: &str| {
+        let from_report = engine.storage_recovery_report(1).object_lifecycle;
+        let snapshot = engine.storage_object_lifecycle_snapshot_for_test(1);
+        assert_eq!(
+            snapshot, from_report,
+            "after {what}: the snapshot and the recovery report disagree"
+        );
+        stages += 1;
+    };
+
+    check(&engine, "an empty shard");
+
+    for index in 0..120 {
+        write_string(&engine, &format!("life-{index:04}"), b"value");
+    }
+    check(&engine, "120 writes");
+
+    for index in 0..60 {
+        write_string(&engine, &format!("life-{index:04}"), b"a longer replacement value");
+    }
+    check(&engine, "60 overwrites leaving stale pages");
+
+    for index in 0..30 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::CommonDelete {
+                key: format!("life-{index:04}"),
+            },
+        });
+    }
+    check(&engine, "30 deletes");
+
+    engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        min_undumped_wal_records: 0,
+        min_undumped_wal_bytes: 0,
+        ..StorageManagerCycleRequest::default()
+    });
+    check(&engine, "a maintenance cycle");
+
+    // A rolled slab separates the slab reports from the live refs, which is what
+    // stale_object_ids measures.
+    engine.block_store().roll_slab().unwrap();
+    for index in 120..160 {
+        write_string(&engine, &format!("life-{index:04}"), b"value");
+    }
+    check(&engine, "a rolled slab and 40 more writes");
+
+    assert_eq!(stages, 6, "every stage must have been compared");
+}
+
+/// Planning and applying a maintenance round reads no pages at all.
+///
+/// Both phases used to build a whole `StorageRecoveryReport`, which reads EVERY live page off
+/// the block store so it can count the readable ones -- and then kept one field: the planner
+/// kept a per-slab byte tally, the apply kept `object_lifecycle`. Neither field needs a page.
+///
+/// This is the property that regresses silently: a caller reaching for the recovery report
+/// again still passes `object_lifecycle_snapshot_matches_the_recovery_report`, because the
+/// answer would be right -- it would just cost a full-store read on a loop that runs every
+/// thirty seconds. Counting the reads is the only thing that shows it.
+#[test]
+fn planning_a_maintenance_round_reads_no_blocks() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..400 {
+        write_string(&engine, &format!("round-{index:04}"), b"value");
+    }
+    let lifecycle = StorageLifecycleRequest {
+        shard_id: 1,
+        selected_dump_buckets: Vec::new(),
+        max_dump_buckets_per_round: 64,
+        min_undumped_wal_records: 0,
+        min_undumped_wal_bytes: 0,
+        purge_delayed_destroy: false,
+        purge_delayed_destroy_slab_ids: None,
+        prune_bucket_dump_manifests: false,
+        roll_forward_bucket_dump_installs: false,
+        follower_replay_cursors: Vec::new(),
+        block_gc_shared_store_cursors: Vec::new(),
+        block_gc_raft_snapshot_refs: Vec::new(),
+        block_gc_checkpoint_floor_slab_id: None,
+        block_gc_raft_install_floor_slab_id: None,
+        block_gc_delayed_destroy_grace_ms: 0,
+        invalidate_cache: false,
+        warm_cache: false,
+    };
+    // Settle first: the fixture's own dump is not what this measures.
+    engine.apply_storage_lifecycle(lifecycle.clone());
+
+    let live_blocks = engine.live_block_count_for_test(1);
+    assert!(
+        live_blocks >= 300,
+        "the fixture must hold pages worth reading: {live_blocks}"
+    );
+
+    let before = engine.block_store().stats().reads;
+    crate::engine::reset_live_block_scan_entries();
+    let plan = engine.storage_lifecycle_plan(lifecycle.clone());
+    let planned = engine.block_store().stats().reads.saturating_sub(before);
+    let surveyed = crate::engine::live_block_scan_entries();
+    assert_eq!(
+        planned, 0,
+        "planning read {planned} pages with {live_blocks} live -- it is scanning the store"
+    );
+    // NON-VACUITY: the plan must have inspected the shard, or "it read 0 pages" is the report of
+    // a call that did nothing.
+    //
+    // This used to ask `!plan.bucket_summaries.is_empty()`. That anchor no longer holds here, and
+    // the reason is the thing under test one line up: the fixture SETTLES first, a settled shard
+    // has no dirty bucket, and the plan now skips the whole-shard walk that fills
+    // `bucket_summaries` in exactly that case. `None` there means "did not look" -- so keeping
+    // the old assertion would have failed, and weakening it to `is_none()` would have removed the
+    // non-vacuity guard altogether and left `planned == 0` proving nothing.
+    //
+    // Count the live-page entries the plan materialised instead. The plan still surveys the live
+    // set for its reclaim and slab stages, so this is the same claim -- the plan inspects the
+    // shard without reading the block store -- anchored to a source the conditional does not
+    // remove.
+    assert!(
+        surveyed > 0,
+        "the plan materialised no live-page entries at all with {live_blocks} live pages, so the \
+zero-read count above proves nothing"
+    );
+    // DELIBERATELY NOT ASSERTED EITHER WAY: whether this plan skipped the summary walk.
+    //
+    // One `apply_storage_lifecycle` is not enough to settle a shard. A round with no dirty slot
+    // can still select a dump, because `dump_refreshes_a_vacated_slab` asks for one while the
+    // newest manifest still names a slab compaction has emptied -- and that branch takes the walk
+    // itself. Measured: on this fixture the plan DOES walk, so `bucket_summaries` is `Some(..)`
+    // here even though no slot is dirty.
+    //
+    // That is the conditional working, not failing, and it is why the idle measurement in
+    // `an_idle_round_does_not_walk_the_live_blocks_to_populate_a_report` settles in a bounded LOOP
+    // rather than a single round. Pinning a value here would pin the vacated-slab refresh instead
+    // of the thing this test measures.
+
+    let before = engine.block_store().stats().reads;
+    engine.apply_storage_lifecycle(lifecycle);
+    let applied = engine.block_store().stats().reads.saturating_sub(before);
+    assert_eq!(
+        applied, 0,
+        "applying read {applied} pages with {live_blocks} live -- it is scanning the store"
+    );
+}
+
+/// What one plan phase costs, at several store sizes. Prints; run it with --ignored.
+///
+///   cargo test --release -p temporalstore-rust --lib what_the_plan_phase_costs -- --ignored --nocapture
+///
+/// This is the measurement the narrow reclaim view was made for. Before it, the plan built a
+/// whole StorageRecoveryReport -- 50.04 / 219.92 / 978.02 ms at 2k / 8k / 32k live pages, and
+/// one read of every live page. After: 2.31 / 17.40 / 82.84 ms, and no reads at all.
+#[test]
+#[ignore]
+fn what_the_plan_phase_costs() {
+    for records in [2_000usize, 8_000, 32_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            8 << 20,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for index in 0..records {
+            write_string(&engine, &format!("survey-{index:06}"), b"0123456789abcdef");
+        }
+        let started = std::time::Instant::now();
+        let rounds = 5;
+        for _ in 0..rounds {
+            let _ = engine.storage_lifecycle_plan(StorageLifecycleRequest {
+                shard_id: 1,
+                selected_dump_buckets: Vec::new(),
+                max_dump_buckets_per_round: 64,
+                min_undumped_wal_records: 1_000,
+                min_undumped_wal_bytes: 96 * 1024 * 1024,
+                purge_delayed_destroy: false,
+                purge_delayed_destroy_slab_ids: None,
+                prune_bucket_dump_manifests: false,
+                roll_forward_bucket_dump_installs: false,
+                follower_replay_cursors: Vec::new(),
+                block_gc_shared_store_cursors: Vec::new(),
+                block_gc_raft_snapshot_refs: Vec::new(),
+                block_gc_checkpoint_floor_slab_id: None,
+                block_gc_raft_install_floor_slab_id: None,
+                block_gc_delayed_destroy_grace_ms: 0,
+                invalidate_cache: false,
+                warm_cache: false,
+            });
+        }
+        let each = started.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+        eprintln!(
+            "  {records:>6} records: {each:>8.2} ms per plan phase ({:.3}% of a 30 s round)",
+            each / 30_000.0 * 100.0
+        );
+    }
+}
+
+/// The reclaim planner picks the same slabs from the narrow view as from the full report.
+///
+/// This is the other half of the change that removed the whole-store scan from the plan phase.
+/// `storage_reclaim_slab_reports` leaves the three read-dependent fields at zero, so if the
+/// selection had ever consulted one of them the two lists would separate here -- which is
+/// exactly the claim being made, and not one to take on inspection.
+///
+/// The fixture rolls slabs so the stale/live split is real: a slab whose pages have all been
+/// overwritten is the case the planner exists to find.
+#[test]
+fn the_reclaim_planner_sees_the_same_candidates() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    let mut stages = 0usize;
+    let mut check = |engine: &TemporalEngine, what: &str| {
+        let (narrow, full) = engine.reclaim_candidates_two_ways_for_test(1);
+        assert_eq!(
+            narrow, full,
+            "after {what}: the planner's view and the report disagree on what to reclaim"
+        );
+        stages += 1;
+    };
+
+    check(&engine, "an empty shard");
+
+    for index in 0..200 {
+        write_string(&engine, &format!("reclaim-{index:04}"), b"first value");
+    }
+    check(&engine, "200 writes");
+
+    // Roll, then overwrite every key: slab 0 is now entirely stale, which is the candidate the
+    // planner must find and score.
+    engine.block_store().roll_slab().unwrap();
+    for index in 0..200 {
+        write_string(&engine, &format!("reclaim-{index:04}"), b"second value, longer");
+    }
+    check(&engine, "a rolled slab and 200 overwrites");
+    let (narrow, _) = engine.reclaim_candidates_two_ways_for_test(1);
+    assert!(
+        !narrow.is_empty(),
+        "the fixture must produce a candidate, or the comparisons prove nothing"
+    );
+
+    // Partially stale: roll again, overwrite half.
+    engine.block_store().roll_slab().unwrap();
+    for index in 0..100 {
+        write_string(&engine, &format!("reclaim-{index:04}"), b"third value");
+    }
+    check(&engine, "a partially stale slab");
+
+    for index in 0..50 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::CommonDelete {
+                key: format!("reclaim-{index:04}"),
+            },
+        });
+    }
+    check(&engine, "50 deletes");
+
+    engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        min_undumped_wal_records: 0,
+        min_undumped_wal_bytes: 0,
+        ..StorageManagerCycleRequest::default()
+    });
+    check(&engine, "a maintenance cycle");
+
+    assert_eq!(stages, 6, "every stage must have been compared");
+}
+
+/// The write-ahead log's byte threshold measures what is UNDUMPED, not the whole file.
+///
+/// The threshold exists to let a shard that is writing hard dump before its record count says
+/// so. Measuring it against the log's total size on disk breaks that in both directions: a log
+/// that is large but fully dumped clears the threshold on every round, so a shard that has
+/// written one record since its last dump dumps again -- and a whole-index serialize per round
+/// is the cost this cadence exists to avoid.
+///
+/// The index log already draws the distinction, in `undumped_len_since_dump`: current length
+/// minus the length at the last dump. This holds the write-ahead log to the same meaning.
+#[test]
+fn the_wal_byte_threshold_measures_undumped_bytes_not_the_whole_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    let lifecycle = |min_records: u64, min_bytes: u64| StorageLifecycleRequest {
+        shard_id: 1,
+        selected_dump_buckets: Vec::new(),
+        max_dump_buckets_per_round: 0,
+        min_undumped_wal_records: min_records,
+        min_undumped_wal_bytes: min_bytes,
+        purge_delayed_destroy: false,
+        purge_delayed_destroy_slab_ids: None,
+        prune_bucket_dump_manifests: false,
+        roll_forward_bucket_dump_installs: false,
+        follower_replay_cursors: Vec::new(),
+        block_gc_shared_store_cursors: Vec::new(),
+        block_gc_raft_snapshot_refs: Vec::new(),
+        block_gc_checkpoint_floor_slab_id: None,
+        block_gc_raft_install_floor_slab_id: None,
+        block_gc_delayed_destroy_grace_ms: 0,
+        invalidate_cache: false,
+        warm_cache: false,
+    };
+
+    // Enough writes that the log is comfortably past any threshold this test uses.
+    for index in 0..400 {
+        write_string(&engine, &format!("wal-{index:04}"), &[b'v'; 256]);
+    }
+    // Dump everything, so nothing after this point is undumped except what we write next.
+    engine.apply_storage_lifecycle(lifecycle(0, 0));
+
+    let log_bytes = engine.write_ahead_log_store().stats(1).persistent_bytes;
+    assert!(
+        log_bytes > 4_096,
+        "the fixture needs a log bigger than the threshold below: {log_bytes}"
+    );
+
+    // One small write. Against the UNDUMPED bytes that is far under 4 KiB, so with a record
+    // threshold that also says wait, the round must delay the dump.
+    write_string(&engine, "wal-after-the-dump", b"one small record");
+    let plan = engine.storage_lifecycle_plan(lifecycle(1_000, 4_096));
+    assert!(
+        plan.dump_delayed,
+        "one record and a few bytes after a dump must not earn another dump; \
+         the threshold is reading the whole {log_bytes}-byte log instead of what is undumped"
+    );
+
+    // And the threshold must still RELEASE a dump once real work has piled up: write past it.
+    for index in 0..400 {
+        write_string(&engine, &format!("wal-more-{index:04}"), &[b'v'; 256]);
+    }
+    let plan = engine.storage_lifecycle_plan(lifecycle(1_000, 4_096));
+    assert!(
+        !plan.dump_delayed,
+        "past the byte threshold the dump must fire even though the record count says wait"
+    );
+}
+
+/// What does `slab_reports()` cost, and how much does it read? Prints; run with --ignored.
+///
+///   sync; echo 3 > /proc/sys/vm/drop_caches
+///   cargo test --release -p temporalstore-rust --lib what_the_slab_survey_costs -- --ignored --nocapture
+///
+/// It is on the plan path of every maintenance round (the reclaim slab view, the recovery report
+/// and the boundary report all call it), and it `fs::read`s every slab file in full. The figure
+/// that matters is the COLD one: a warm run measures the page cache, not the work.
+#[test]
+#[ignore]
+fn what_the_slab_survey_costs() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        8 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let records = 32_000usize;
+    for index in 0..records {
+        write_string(&engine, &format!("slab-{index:06}"), &[b'v'; 512]);
+    }
+
+    let store = engine.block_store();
+    let slabs = store.slab_ids().unwrap_or_default();
+    let on_disk: u64 = store
+        .slab_reports()
+        .unwrap_or_default()
+        .iter()
+        .map(|report| report.physical_bytes)
+        .sum();
+
+    // First call after the writes: whatever the page cache happens to hold.
+    let started = std::time::Instant::now();
+    let first = store.slab_reports().unwrap_or_default().len();
+    let first_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+    // Five more, fully warm.
+    let started = std::time::Instant::now();
+    let rounds = 5;
+    for _ in 0..rounds {
+        std::hint::black_box(store.slab_reports().unwrap_or_default().len());
+    }
+    let warm_ms = started.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+
+    eprintln!(
+        "  {records} records, {} slabs, {on_disk} bytes on disk ({:.1} MiB)",
+        slabs.len(),
+        on_disk as f64 / (1024.0 * 1024.0)
+    );
+    eprintln!("    slab_reports() first={first_ms:.2} ms  warm={warm_ms:.2} ms  (reports={first})");
+    // And the same two fields, by header walk, decoding nothing.
+    let started = std::time::Instant::now();
+    let mut counts = Vec::new();
+    for _ in 0..rounds {
+        counts = store.slab_block_counts().unwrap_or_default();
+    }
+    let walk_ms = started.elapsed().as_secs_f64() * 1000.0 / rounds as f64;
+    eprintln!("    header walk   warm={walk_ms:.2} ms  (slabs={})", counts.len());
+    eprintln!("    => slab_reports is {:.1}x the header walk", warm_ms / walk_ms.max(0.0001));
+    let survey_blocks: u64 = store
+        .slab_reports()
+        .unwrap_or_default()
+        .iter()
+        .map(|report| report.block_count)
+        .sum();
+    let walk_blocks: u64 = counts.iter().map(|entry| entry.2).sum();
+    eprintln!("    block_count: slab_reports={survey_blocks} header_walk={walk_blocks} {}",
+        if survey_blocks == walk_blocks { "AGREE" } else { "DISAGREE" });
+}
+
+/// What does the boundary report cost, and how many pages does a whole round read? Prints.
+///
+///   cargo test --release -p temporalstore-rust --lib what_a_round_still_reads -- --ignored --nocapture
+#[test]
+#[ignore]
+fn what_a_round_still_reads() {
+    for records in [2_000usize, 8_000, 32_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            8 << 20,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for index in 0..records {
+            write_string(&engine, &format!("round-{index:06}"), &[b'v'; 256]);
+        }
+        let cycle = |engine: &TemporalEngine| {
+            engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+                shard_id: 1,
+                min_undumped_wal_records: 0,
+                min_undumped_wal_bytes: 0,
+                ..StorageManagerCycleRequest::default()
+            });
+        };
+        cycle(&engine);
+
+        let live = engine.live_block_count_for_test(1) as u64;
+
+        let before = engine.block_store().stats().reads;
+        let started = std::time::Instant::now();
+        let _ = engine.storage_recovery_boundary_report(1);
+        let boundary_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let boundary_reads = engine.block_store().stats().reads.saturating_sub(before);
+
+        let before = engine.block_store().stats().reads;
+        let started = std::time::Instant::now();
+        cycle(&engine);
+        let round_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let round_reads = engine.block_store().stats().reads.saturating_sub(before);
+
+        eprintln!(
+            "  {records:>6} records ({live} live pages):  boundary={boundary_ms:>8.2} ms \
+             / {boundary_reads} reads   whole round={round_ms:>8.2} ms / {round_reads} reads \
+             ({:.1}x the live pages)",
+            round_reads as f64 / live.max(1) as f64
+        );
+
+        // Which stage is it? The cycle reports a duration per stage.
+        let report = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+            shard_id: 1,
+            min_undumped_wal_records: 0,
+            min_undumped_wal_bytes: 0,
+            ..StorageManagerCycleRequest::default()
+        });
+        let mut stages = report
+            .stages
+            .iter()
+            .map(|stage| (stage.duration_ms, stage.stage.clone()))
+            .collect::<Vec<_>>();
+        stages.sort_by(|left, right| right.0.cmp(&left.0));
+        for (duration_ms, stage) in stages.iter().take(5) {
+            eprintln!("        {stage:<18} {duration_ms:>8} ms");
+        }
+    }
+}
+
+/// The dump cap a server ships with still lets the log be reclaimed.
+///
+/// Reclaim frees the log below a floor, and that floor is the oldest sequence any bucket still
+/// needs. A bucket that is dirty and has no durable dump manifest is captured nowhere, so it
+/// holds the floor at 0 -- and a round that dumps at most `max_dump_buckets_per_round` buckets
+/// leaves every other dirty bucket in exactly that state.
+///
+/// So a shard that dirties more buckets per round than the cap allows never advances the floor at
+/// all -- not slowly, at all -- and the log grows for ever while every round reports success.
+/// Measured, 500 dirty buckets per round over 12 rounds and 6,000 writes:
+///
+/// | cap | floor after 12 rounds | log |
+/// |---|---|---|
+/// | 0 (no cap) | reaches the head | one segment |
+/// | 64 | **0, every round** | rolled a second segment |
+/// | 128, 256 | **0, every round** | rolled a second segment |
+/// | 512 (above the dirty count) | reaches the head | one segment |
+///
+/// At the default routing range every key gets its own bucket, so "more than the cap in a round"
+/// is every real workload. This is the other half of the symptom
+/// `the_data_node_server_never_runs_a_maintenance_cycle` named: the cycle runs now, and still
+/// could not reclaim.
+///
+/// A capped dump only becomes safe once a bucket records the log sequence at which it FIRST went
+/// dirty -- then an undumped bucket holds the floor at its own oldest write rather than at 0,
+/// and the floor advances as far as the dumped buckets allow. Until that exists the cap has to
+/// be off, which is what this pins.
+#[test]
+fn the_shipped_dump_cap_still_lets_the_log_be_reclaimed() {
+    let shipped_cap = crate::data_node::StorageManagerOptions::default().max_dump_buckets_per_round;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        8 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    // Many more dirty buckets in one round than a small cap would cover.
+    for index in 0..500 {
+        write_string(&engine, &format!("floor-{index:04}"), &[b'v'; 256]);
+    }
+    let report = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        min_undumped_wal_records: 0,
+        min_undumped_wal_bytes: 0,
+        max_dump_buckets_per_round: shipped_cap,
+        ..StorageManagerCycleRequest::default()
+    });
+    let last_sequence = engine.write_ahead_log_store().stats(1).last_sequence;
+    let wal = report
+        .wal_reclaim_report
+        .as_ref()
+        .expect("the round must run WAL reclaim");
+    assert!(
+        wal.plan.retain_from_wal_sequence > 0,
+        "the shipped dump cap ({shipped_cap}) left the reclaim floor at 0 with {last_sequence} \
+         records written, so this log can never be reclaimed: blockers={:?}",
+        wal.plan.blocker_reasons,
+    );
+}
+
+/// The write-ahead log stays bounded under continuous writing, round after round.
+///
+/// This is the production symptom the maintenance work started from: a data node whose logs grew
+/// until the disk did. Making the cycle run was the fix; this is the guard that it KEEPS working.
+///
+/// Reclaim can only free the log below its floor, and the floor is held by the oldest bucket that
+/// has not been dumped. The dump selects buckets ordered by `first_dirty_wal_sequence` -- the
+/// bucket's own oldest undumped write, which is the thing holding the log -- with the summary's
+/// `last_dump_sequence`, "is the newest dump manifest covering this bucket", as the tiebreaker
+/// behind it. If that ordering ever starves a bucket, the floor stops advancing and the log grows
+/// for ever while every round still reports success. Nothing else here would notice: the cycle
+/// completes, the stages report applied, and only the disk fills.
+///
+/// So this writes the same working set every round and requires the floor to reach the head each
+/// time. Twelve rounds and 6,000 writes: every round removes exactly what that round wrote, the
+/// floor advances to `last_sequence + 1`, and the log's on-disk size never moves off the
+/// preallocated segment.
+#[test]
+fn the_log_stays_bounded_under_continuous_writing() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        8 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    let mut bytes_seen: Vec<u64> = Vec::new();
+    for round in 1..=12u64 {
+        // The same 500 keys every round, so everything written is superseded and the whole log
+        // below the floor is reclaimable. A shard that cannot free THIS cannot free anything.
+        for index in 0..500 {
+            write_string(&engine, &format!("bound-{index:04}"), &[b'v'; 256]);
+        }
+        let report = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+            shard_id: 1,
+            min_undumped_wal_records: 0,
+            min_undumped_wal_bytes: 0,
+            ..StorageManagerCycleRequest::default()
+        });
+        let stats = engine.write_ahead_log_store().stats(1);
+        let wal = report
+            .wal_reclaim_report
+            .as_ref()
+            .expect("the round must run WAL reclaim");
+        assert_eq!(
+            wal.plan.retain_from_wal_sequence,
+            stats.last_sequence.saturating_add(1),
+            "round {round}: the reclaim floor did not reach the head, so a bucket is starving \
+             the log: last_sequence={} retain_from={}",
+            stats.last_sequence,
+            wal.plan.retain_from_wal_sequence,
+        );
+        assert!(
+            wal.wal_records_removed > 0,
+            "round {round}: nothing was reclaimed, though 500 records were written into it"
+        );
+        bytes_seen.push(stats.persistent_bytes);
+    }
+
+    // The log warms up over the first rounds and then stops moving: measured
+    // [39898, 40602, 41602, 41605, 41605, ...], flat from round four to round twelve.
+    //
+    // This used to assert all twelve rounds were IDENTICAL, and they were -- at 262,144 every
+    // round, which is neither the log's size nor a quantity that could respond to anything.
+    // Under preallocation `persistent_bytes` reported the file's RESERVATION, a 256 KiB chunk
+    // boundary, so the bound this test exists to prove was being satisfied by a constant. A
+    // guard that holds a number which cannot move is not guarding.
+    //
+    // So the first assertion now is that the figure DOES move, which is what tells a live
+    // measurement from a constant, and only then that it settles and stays settled.
+    let first = bytes_seen[0];
+    let plateau = bytes_seen[bytes_seen.len() - 1];
+    assert_ne!(
+        first, plateau,
+        "the durable byte figure was the same in round 1 and round {} ({first}). That is what a \
+         reservation looks like -- a number fixed by the preallocation chunk rather than by the \
+         log -- and this test cannot bound a log through one: {bytes_seen:?}",
+        bytes_seen.len()
+    );
+    assert!(
+        bytes_seen.windows(2).all(|pair| pair[1] >= pair[0]),
+        "the log did not settle monotonically, so neither the warm-up nor the plateau below \
+         describes it: {bytes_seen:?}"
+    );
+    let tail = &bytes_seen[4..];
+    assert!(
+        tail.iter().all(|bytes| *bytes == plateau),
+        "the log was still growing after four rounds of rewriting the same 500 keys: \
+         {bytes_seen:?}"
+    );
+    assert!(
+        plateau < first.saturating_mul(2),
+        "the settled log ({plateau} bytes) is more than twice its first round ({first}), so the \
+         rewrites are accumulating rather than superseding: {bytes_seen:?}"
+    );
+}
+
+/// A bucket remembers the log sequence of its OLDEST undumped write.
+///
+/// That is the floor the bucket holds over the write-ahead log. Reclaim frees the log below the
+/// oldest sequence any bucket still needs, and a dirty bucket with no durable dump manifest is
+/// captured nowhere -- so without this the only safe answer for it is 0, and one such bucket pins
+/// the entire log for ever. That is what made a capped dump stop reclaim completely
+/// (`the_shipped_dump_cap_still_lets_the_log_be_reclaimed`).
+///
+/// Three properties, and the middle one is the one that is easy to get wrong:
+///
+///  * a write to a clean bucket records THIS write's sequence;
+///  * a second write to an already-dirty bucket does NOT move it forward -- it is the oldest
+///    undumped write, not the newest;
+///  * a dump clears it, because the dump captured everything the bucket held.
+#[test]
+fn a_bucket_remembers_its_oldest_undumped_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    write_string(&engine, "first", b"one");
+    let after_first = engine.first_dirty_sequences_for_test(1);
+    let claimed = after_first
+        .iter()
+        .filter(|(_, sequence)| *sequence > 0)
+        .count();
+    assert!(
+        claimed > 0,
+        "a write left no bucket holding a claim over the log: {after_first:?}"
+    );
+    let first_claim = after_first
+        .iter()
+        .map(|(_, sequence)| *sequence)
+        .filter(|sequence| *sequence > 0)
+        .min()
+        .expect("a claim");
+
+    // More writes to OTHER keys, then the same key again. The first key's bucket must still
+    // point at its original write, not at the later one.
+    for index in 0..20 {
+        write_string(&engine, &format!("other-{index:02}"), b"value");
+    }
+    write_string(&engine, "first", b"two");
+    let after_more = engine.first_dirty_sequences_for_test(1);
+    let still = after_more
+        .iter()
+        .map(|(_, sequence)| *sequence)
+        .filter(|sequence| *sequence > 0)
+        .min()
+        .expect("a claim");
+    assert_eq!(
+        still, first_claim,
+        "the oldest claim moved forward when a dirty bucket was written again; it must stay at \
+         the OLDEST undumped write, or reclaim would free records still needed"
+    );
+
+    // A dump captures everything, so nothing holds a claim afterwards.
+    engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        min_undumped_wal_records: 0,
+        min_undumped_wal_bytes: 0,
+        ..StorageManagerCycleRequest::default()
+    });
+    let after_dump = engine.first_dirty_sequences_for_test(1);
+    assert!(
+        after_dump.iter().all(|(_, sequence)| *sequence == 0),
+        "a dump captured every bucket, so none may still hold a claim: {after_dump:?}"
+    );
+}
+
+/// A capped dump takes the bucket that has held the log longest first.
+///
+/// What pins the log's reclaim floor is a bucket's OLDEST UNDUMPED WRITE. When a round can only
+/// dump some of the dirty buckets, dumping them in that order is what stops one bucket being
+/// starved for ever while newer ones are re-dirtied and dumped ahead of it -- the ordering the
+/// bucket node's `first_dirty_wal_sequence` exists to make possible.
+///
+/// The fixture writes three keys in a known order, dirtying three buckets at three known
+/// sequences, then asks for a plan that may dump only one. It must pick the oldest.
+#[test]
+fn a_capped_dump_takes_the_oldest_undumped_bucket_first() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // Three buckets, dirtied oldest-first.
+    write_string(&engine, "aaa-oldest", b"one");
+    write_string(&engine, "bbb-middle", b"two");
+    write_string(&engine, "ccc-newest", b"three");
+
+    let claims = engine.first_dirty_sequences_for_test(1);
+    let oldest = claims
+        .iter()
+        .filter(|(_, sequence)| *sequence > 0)
+        .min_by_key(|(_, sequence)| *sequence)
+        .map(|(routing_bucket, _)| *routing_bucket)
+        .expect("a bucket must hold a claim after three writes");
+
+    let plan = engine.storage_lifecycle_plan(StorageLifecycleRequest {
+        shard_id: 1,
+        selected_dump_buckets: Vec::new(),
+        max_dump_buckets_per_round: 1,
+        min_undumped_wal_records: 0,
+        min_undumped_wal_bytes: 0,
+        purge_delayed_destroy: false,
+        purge_delayed_destroy_slab_ids: None,
+        prune_bucket_dump_manifests: false,
+        roll_forward_bucket_dump_installs: false,
+        follower_replay_cursors: Vec::new(),
+        block_gc_shared_store_cursors: Vec::new(),
+        block_gc_raft_snapshot_refs: Vec::new(),
+        block_gc_checkpoint_floor_slab_id: None,
+        block_gc_raft_install_floor_slab_id: None,
+        block_gc_delayed_destroy_grace_ms: 0,
+        invalidate_cache: false,
+        warm_cache: false,
+    });
+    assert_eq!(
+        plan.selected_dump_buckets.len(),
+        1,
+        "the cap of one must select exactly one bucket: {:?}",
+        plan.selected_dump_buckets
+    );
+    assert_eq!(
+        plan.selected_dump_buckets[0], oldest,
+        "a round that can dump one bucket must dump the one holding the log's floor; claims were \
+         {claims:?}"
+    );
+}
+
+/// A capped dump still reclaims, because an undumped bucket holds the logs only from its own
+/// oldest write.
+///
+/// A bucket that is dirty and has no durable dump manifest is captured nowhere. The plan used to
+/// have no choice but to retain everything for it -- floor 0 -- so a round that dumped only some
+/// of the dirty buckets reclaimed NOTHING, for ever
+/// (`the_shipped_dump_cap_still_lets_the_log_be_reclaimed` is why the cap had to be turned off).
+///
+/// With `first_dirty_wal_sequence` and `first_dirty_index_log_sequence` such a bucket can say
+/// where its oldest undumped write sits in each log, and hold them only from there. Measured over
+/// 12 rounds of 500 dirty buckets:
+///
+/// | cap | records behind the head, before | after |
+/// |---|---|---|
+/// | 64 | 6001 (nothing reclaimed) | 436 |
+/// | 128 | 6001 | 372 |
+/// | 256 | 6001 | 244 |
+///
+/// Both claims are required and a zero in either still blocks: they count in different sequences,
+/// and a bucket that can place itself in one log but not the other has said nothing about the
+/// second. That is the assertion that matters here -- not the exact distance behind the head,
+/// which depends on the cap.
+#[test]
+fn a_capped_dump_still_reclaims() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        8 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // Far more dirty buckets per round than the cap can cover, for several rounds.
+    let mut last_retain = 0u64;
+    for _round in 1..=4u64 {
+        for index in 0..200 {
+            write_string(&engine, &format!("capped-{index:04}"), &[b'v'; 128]);
+        }
+        let report = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+            shard_id: 1,
+            min_undumped_wal_records: 0,
+            min_undumped_wal_bytes: 0,
+            max_dump_buckets_per_round: 16,
+            ..StorageManagerCycleRequest::default()
+        });
+        let wal = report
+            .wal_reclaim_report
+            .as_ref()
+            .expect("the round must run WAL reclaim");
+        last_retain = wal.plan.retain_from_wal_sequence;
+    }
+
+    let stats = engine.write_ahead_log_store().stats(1);
+    assert!(
+        last_retain > 0,
+        "a capped round reclaimed nothing: the floor is still pinned at 0 with {} records \
+         written, which is the state a dump cap used to force",
+        stats.last_sequence,
+    );
+    // And it must be a real floor, not a token one: most of the log should be behind it.
+    assert!(
+        last_retain * 2 > stats.last_sequence,
+        "the floor advanced to {last_retain} of {}, which is too little to call reclaimable",
+        stats.last_sequence,
+    );
+}
+
+fn write_string(engine: &TemporalEngine, key: &str, value: &[u8]) {
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: key.to_string(),
+            value: value.to_vec(),
+        },
+    });
+}
+
+fn read_string(engine: &TemporalEngine, key: &str) -> Option<Vec<u8>> {
+    match engine
+        .execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: key.to_string(),
+            },
+        })
+        .response
+    {
+        CommandResponse::Bytes { value } => value,
+        other => panic!("expected Bytes, got {other:?}"),
+    }
+}
+
+#[test]
+fn manifest_fold_threshold_dump_fires_only_past_the_gap_and_folds_the_catalog() {
+    // MANIFEST-CONFORMANCE FOLD cadence: with a tiny WAL gap, a threshold dump fires once the
+    // undumped index-log has grown past it, folding the slab catalog into an index-log
+    // MetaItem anchor; below the gap nothing is dumped. Matches
+    // index-meta dump background cadence -- never a per-write dump.
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine =
+        TemporalEngine::with_local_dirs(1 << 20, dir.path().join("cache"), &block_dir, &index_dir);
+    engine.load_shard(1);
+    write_string(&engine, "k0", b"v0");
+    // A gap far larger than the current index-log must NOT dump.
+    assert!(
+        !engine.maybe_dump_index_catalog_with_gap_for_test(1, u64::MAX, 0),
+        "no dump below the threshold"
+    );
+    assert!(
+        engine.index_log_store().latest_slab_catalog(1).unwrap().is_none(),
+        "no folded catalog before any dump"
+    );
+    // A gap of 1 byte crosses immediately: exactly one dump fires and folds the catalog.
+    for i in 0..8 {
+        write_string(&engine, &format!("k{i}"), b"value");
+    }
+    assert!(
+        engine.maybe_dump_index_catalog_with_gap_for_test(1, 1, 0),
+        "dump fires once the undumped gap crosses the threshold"
+    );
+    let catalog = engine.index_log_store().latest_slab_catalog(1).unwrap();
+    let catalog = catalog.expect("a folded slab catalog must be durable after the dump");
+    assert!(
+        !catalog.slabs.is_empty(),
+        "the dump must fold at least the active slab into the anchor"
+    );
+    // The watermark advanced: the undumped gap reset, so an immediate re-check does not re-dump.
+    assert!(
+        !engine.maybe_dump_index_catalog_with_gap_for_test(1, u64::MAX, 0),
+        "the dumped watermark advanced; no immediate re-dump"
+    );
+}
+
+/// A dump that just happened holds the next one off; one that never happened holds nothing.
+///
+/// The unit test pins the rule. This pins the WIRING: that the engine reads how long ago this
+/// shard dumped, that a completed dump is what sets it, and that a shard which has not dumped
+/// reports no time at all rather than zero. A rule can be right while nothing consults it.
+///
+/// The gap stays at 1 byte throughout, so the byte half of the decision is satisfied at every
+/// step and only the interval can change the answer. Without that, a "no dump" could just as
+/// well be the gap having reset -- which is exactly what the second assertion would otherwise
+/// be observing.
+#[test]
+fn a_catalog_dump_waits_out_the_interval_before_the_next_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine =
+        TemporalEngine::with_local_dirs(1 << 20, dir.path().join("cache"), &block_dir, &index_dir);
+    engine.load_shard(1);
+    for i in 0..8 {
+        write_string(&engine, &format!("k{i}"), b"value");
+    }
+    assert_eq!(
+        engine.index_log_store().ms_since_catalog_dump(1),
+        None,
+        "a shard that has not dumped has no elapsed time, not an elapsed time of zero"
+    );
+    // Never dumped, so a minute-long floor holds nothing off.
+    assert!(
+        engine.maybe_dump_index_catalog_with_gap_for_test(1, 1, 60_000),
+        "the first dump is never delayed"
+    );
+    assert!(
+        engine.index_log_store().ms_since_catalog_dump(1).is_some(),
+        "a completed dump records when it happened"
+    );
+
+    // Enough new deltas to cross a 1-byte gap again -- the byte half says yes.
+    for i in 8..16 {
+        write_string(&engine, &format!("k{i}"), b"value");
+    }
+    assert!(
+        engine.index_log_store().undumped_len_since_dump(1) >= 1,
+        "the second dump must be refused by the CLOCK, not by an empty gap"
+    );
+    assert!(
+        !engine.maybe_dump_index_catalog_with_gap_for_test(1, 1, 60_000),
+        "a dump moments after the last one waits for the interval"
+    );
+    // Same state, no floor: it fires. So what held it back was the interval and nothing else.
+    assert!(
+        engine.maybe_dump_index_catalog_with_gap_for_test(1, 1, 0),
+        "with no floor the same gap dumps immediately"
+    );
+}
+
+/// Counting a log's records agrees with scanning it, exactly, on both logs.
+///
+/// The recovery report used to learn these two numbers by scanning each log in full and taking
+/// the length of the result -- reading every record of both logs into memory, on the plan path
+/// of every maintenance round. The counts now walk without collecting.
+///
+/// The property that matters is not "the count is plausible", it is "the count is what the scan
+/// would have said". So this asserts them equal on a log with real content, rather than pinning
+/// a number that would drift with anything that changes how much a write logs.
+#[test]
+fn counting_a_logs_records_agrees_with_scanning_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine =
+        TemporalEngine::with_local_dirs(1 << 20, dir.path().join("cache"), &block_dir, &index_dir);
+    engine.load_shard(1);
+
+    // Empty first: a log with no file at all must count zero rather than fail.
+    assert_eq!(engine.write_ahead_log_store().record_count(1).unwrap(), 0);
+    assert_eq!(engine.index_log_store().record_count(1).unwrap(), 0);
+
+    for index in 0..64 {
+        write_string(&engine, &format!("counted-{index:03}"), b"value");
+    }
+    engine.flush_shard_index(1);
+
+    let wal_scanned = engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .unwrap()
+        .len();
+    let wal_counted = engine.write_ahead_log_store().record_count(1).unwrap();
+    assert_eq!(
+        wal_counted, wal_scanned,
+        "the write-ahead log counted {wal_counted} records where a scan found {wal_scanned}"
+    );
+    assert!(wal_scanned > 0, "the log must have records for this to prove anything");
+
+    let index_scanned = engine
+        .index_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .unwrap()
+        .len();
+    let index_counted = engine.index_log_store().record_count(1).unwrap();
+    assert_eq!(
+        index_counted, index_scanned,
+        "the index log counted {index_counted} records where a scan found {index_scanned}"
+    );
+    assert!(index_scanned > 0, "the index log must have records too");
+
+    // And the report that drove this reads the same numbers.
+    let report = engine.storage_recovery_report(1);
+    assert_eq!(report.wal_records, wal_scanned);
+    assert_eq!(report.index_log_records, index_scanned);
+}
+
+#[test]
+fn catalog_dump_reclaim_shrinks_both_logs_and_reload_stays_exact() {
+    // Embedded-path log reclaim: once a threshold dump durably captures the shard, the
+    // index-log records the base reflects and the WAL prefix below the anchor are redundant --
+    // reclaiming them must SHRINK both files on disk, keep the cadence alive (watermark
+    // measured from the post-reclaim length), and leave a reload byte-exact.
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine =
+        TemporalEngine::with_local_dirs(1 << 20, dir.path().join("cache-a"), &block_dir, &index_dir);
+    engine.load_shard(1);
+    for i in 0..60 {
+        write_string(&engine, &format!("key-{i}"), format!("val-{i}").as_bytes());
+    }
+    let report = engine
+        .maybe_dump_and_reclaim_with_gap_for_test(1, 1, 0, 0)
+        .expect("past the gap, the dump + reclaim must fire");
+    assert!(
+        report.index_log_bytes_after < report.index_log_bytes_before,
+        "the index log must shrink on disk after the dump ({} -> {})",
+        report.index_log_bytes_before,
+        report.index_log_bytes_after
+    );
+    assert!(
+        report.wal_bytes_after < report.wal_bytes_before,
+        "the WAL must shrink on disk after the dump ({} -> {})",
+        report.wal_bytes_before,
+        report.wal_bytes_after
+    );
+    assert!(report.index_log_records_removed > 0);
+    assert!(report.wal_records_removed > 0);
+    // The folded catalog anchor survives its own sweep -- it is the load-time catalog seed.
+    assert!(
+        engine
+            .index_log_store()
+            .latest_slab_catalog(1)
+            .unwrap()
+            .is_some(),
+        "the folded catalog anchor must survive the index-log sweep"
+    );
+    // The watermark was re-marked at the post-reclaim length: no immediate re-dump, and the
+    // cadence fires again once new writes regrow the gap (it must not wait for the file to
+    // regrow past its PRE-reclaim size).
+    assert!(engine.maybe_dump_and_reclaim_with_gap_for_test(1, u64::MAX, 0, 0).is_none());
+    for i in 60..70 {
+        write_string(&engine, &format!("key-{i}"), format!("val-{i}").as_bytes());
+    }
+    assert!(
+        engine.maybe_dump_and_reclaim_with_gap_for_test(1, 1, 0, 0).is_some(),
+        "the cadence must keep firing after a reclaim shrank the log"
+    );
+    drop(engine);
+    let restarted = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+    for i in 0..70 {
+        assert_eq!(
+            read_string(&restarted, &format!("key-{i}")),
+            Some(format!("val-{i}").into_bytes()),
+            "every acked key must survive reload after the logs were reclaimed"
+        );
+    }
+}
+
+#[test]
+fn catalog_dump_reclaim_pins_wal_records_holding_block_in_wal_blocks() {
+    // An async write's page can live ONLY in its WAL record (served back through the
+    // block-in-WAL registration). A post-dump WAL sweep must pin its floor at the lowest
+    // registered sequence so that record survives, even when the dump anchor is far above it.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    // One async write first: its WAL record carries its staged page.
+    engine.set_config(SetConfigRequest {
+        shard_id: 1,
+        config: Config {
+            version: 2,
+            async_storage: true,
+            ..Config::default()
+        },
+    });
+    write_string(&engine, "async-key", b"async-value");
+    // Then a run of synchronous writes, which advance the dump anchor past the async record.
+    engine.set_config(SetConfigRequest {
+        shard_id: 1,
+        config: Config {
+            version: 3,
+            async_storage: false,
+            ..Config::default()
+        },
+    });
+    for i in 0..40 {
+        write_string(&engine, &format!("sync-{i}"), format!("val-{i}").as_bytes());
+    }
+    let report = engine
+        .maybe_dump_and_reclaim_with_gap_for_test(1, 1, 0, 0)
+        .expect("dump + reclaim must fire");
+    let floor = report
+        .wal_retention_floor
