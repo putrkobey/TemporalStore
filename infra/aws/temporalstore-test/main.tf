@@ -154,3 +154,81 @@ resource "aws_security_group_rule" "efs_from_nodes" {
   to_port                  = 2049
   protocol                 = "tcp"
   source_security_group_id = aws_security_group.nodes.id
+  security_group_id        = aws_security_group.efs.id
+  description              = "Allow NFS from TemporalStore nodes"
+}
+
+resource "aws_security_group_rule" "efs_egress_all" {
+  type              = "egress"
+  from_port         = 0
+  to_port           = 0
+  protocol          = "-1"
+  cidr_blocks       = ["0.0.0.0/0"]
+  security_group_id = aws_security_group.efs.id
+}
+
+resource "aws_iam_role" "ec2" {
+  name = "${var.name_prefix}-ec2-role"
+
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = {
+        Service = "ec2.amazonaws.com"
+      }
+    }]
+  })
+}
+
+resource "aws_iam_role_policy_attachment" "ssm" {
+  role       = aws_iam_role.ec2.name
+  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy" "artifact_read" {
+  name = "${var.name_prefix}-artifact-read"
+  role = aws_iam_role.ec2.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect = "Allow"
+      Action = [
+        "s3:GetObject"
+      ]
+      Resource = "arn:aws:s3:::temporalstore-test-artifacts-${data.aws_caller_identity.current.account_id}-${var.aws_region}/temporalstore-runtime-release-matrixcache-ssd.tar.gz"
+    }]
+  })
+}
+
+resource "aws_iam_instance_profile" "ec2" {
+  name = "${var.name_prefix}-ec2-profile"
+  role = aws_iam_role.ec2.name
+}
+
+resource "aws_efs_file_system" "shared" {
+  creation_token   = "${var.name_prefix}-shared"
+  performance_mode = "generalPurpose"
+  throughput_mode  = "elastic"
+  encrypted        = true
+
+  lifecycle_policy {
+    transition_to_ia = "AFTER_30_DAYS"
+  }
+
+  tags = {
+    Name = "${var.name_prefix}-shared"
+  }
+}
+
+resource "aws_efs_mount_target" "shared" {
+  file_system_id  = aws_efs_file_system.shared.id
+  subnet_id       = aws_subnet.public.id
+  security_groups = [aws_security_group.efs.id]
+}
+
+resource "aws_instance" "data" {
+  for_each = local.data_nodes
+
