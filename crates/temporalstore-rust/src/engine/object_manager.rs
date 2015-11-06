@@ -1,0 +1,217 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+use serde::{Deserialize, Serialize};
+
+use super::state::ShardState;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ObjectRuntimeState {
+    pub object_id: u64,
+    #[serde(rename = "routing_slot")]
+    pub routing_bucket: u32,
+    pub object_keys: Vec<String>,
+    pub model_ids: Vec<String>,
+    pub block_ref_count: usize,
+    pub hot_block_ref_count: usize,
+    pub cold_block_ref_count: usize,
+    pub deleted_block_ref_count: usize,
+    pub residency: String,
+    pub dirty: bool,
+    pub deleted: bool,
+    pub loading: bool,
+    pub in_memory: bool,
+    pub ttl_ms: Option<u64>,
+}
+
+/// `Default` is the "no shard, nothing to say" report: every count zero and no objects. It is
+/// not a valid description of a populated shard and is never returned for one -- see
+/// `runtime_report`, which returns it only when the state carries no shard id to derive with.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(super) struct ObjectManagerRuntimeReport {
+    pub object_manager_runtime_module: bool,
+    pub bucket_index_authority: bool,
+    pub live_object_count: usize,
+    pub live_block_ref_count: usize,
+    pub reused_object_ids: usize,
+    pub dirty_object_count: usize,
+    pub deleted_object_count: usize,
+    pub hot_object_count: usize,
+    pub cold_object_count: usize,
+    pub mixed_residency_object_count: usize,
+    pub object_block_transition_count: usize,
+    pub loading_object_count: usize,
+    pub in_memory_object_count: usize,
+    pub ttl_object_count: usize,
+    pub objects: Vec<ObjectRuntimeState>,
+}
+
+#[allow(dead_code)]
+pub(super) fn runtime_report(shard: &ShardState) -> ObjectManagerRuntimeReport {
+    // NO SHARD, NO REPORT. Every object id below is derived from (shard, kind, key), and a state
+    // that never entered the engine has no shard to derive with. An empty report says "nothing to
+    // say"; a report built on a guessed zero would name objects belonging to a different shard and
+    // nothing downstream could tell the difference.
+    let Some(shard_id) = shard.shard_id() else {
+        return ObjectManagerRuntimeReport::default();
+    };
+    let mut object_ids = std::collections::BTreeSet::new();
+    let mut object_ref_counts = std::collections::BTreeMap::<u64, usize>::new();
+    let mut objects = std::collections::BTreeMap::<u64, ObjectRuntimeState>::new();
+    let mut live_block_ref_count = 0usize;
+
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for object_id in &bucket.object_index {
+            object_ids.insert(*object_id);
+            let object_deleted = bucket.deleted() || bucket.deleted_object_index.contains(object_id);
+            let object = objects
+                .entry(*object_id)
+                .or_insert_with(|| ObjectRuntimeState {
+                    object_id: *object_id,
+                    routing_bucket: bucket.routing_bucket,
+                    object_keys: Vec::new(),
+                    model_ids: Vec::new(),
+                    block_ref_count: 0,
+                    hot_block_ref_count: 0,
+                    cold_block_ref_count: 0,
+                    deleted_block_ref_count: 0,
+                    residency: "cold".to_string(),
+                    dirty: bucket.dirty(),
+                    deleted: object_deleted,
+                    loading: bucket.loading(),
+                    in_memory: bucket.in_memory(),
+                    ttl_ms: bucket.ttl_ms.ms(),
+                });
+            object.dirty |= bucket.dirty();
+            object.deleted |= object_deleted;
+            object.loading |= bucket.loading();
+            object.in_memory |= bucket.in_memory();
+            object.ttl_ms = match (object.ttl_ms, bucket.ttl_ms.ms()) {
+                (Some(existing), Some(next)) => Some(existing.min(next)),
+                (None, Some(next)) => Some(next),
+                (existing, None) => existing,
+            };
+        }
+        let identities = shard.bucket_index.block_identities();
+        for (handle, block) in bucket.block_index.iter() {
+            // THE OBJECT COMES FROM BESIDE THE PAGE, AND A LIVE PAGE NOTHING BESIDE IT NAMES IS
+            // NO LONGER SKIPPED.
+            //
+            // # THE SKIP WAS SILENTLY UNDERCOUNTING THIS REPORT
+            //
+            // This read `page.object_key` before the identity was hoisted off the entry. Hoisted,
+            // it became `identity_of` with a `continue` on `None` -- and `None` covers TWO states,
+            // only one of which is the tombstone the old comment named. The other is a bucket whose
+            // pages are not in the object lookup at all, and for such a bucket EVERY live page was
+            // skipped, so `live_block_ref_count` and every `block_ref_count` came back zero while
+            // the object rows themselves were still built from `object_index`. A report saying
+            // "one object, zero block refs" for an object with two pages is not a smaller answer,
+            // it is a wrong one.
+            //
+            // MEASURED BY `two_buckets_holding_one_object_id_are_reported_as_one_object`, which
+            // asserts two refs and read zero. Attributed to the hoist and not to anything after
+            // it: that test, this walk and the fixture are byte-identical to the commit the hoist
+            // landed on, and the fixture cannot file a lookup entry -- `BlockIndexMap::insert`
+            // cannot reach a `CoreIndex`.
+            //
+            // # SO THE TWO STATES ARE SEPARATED
+            //
+            // A DELETED page nothing names is still skipped, for the reason the old comment gave:
+            // it is the one tombstone whose removal named no element, and a report keyed by object
+            // id has no row to put it in. A LIVE page falls back to the entry's own copy, which is
+            // the source this walk used before the hoist and is still there.
+            //
+            // AND THE FALLBACK IS REFUSED OUTSIDE THE ONE WINDOW THAT EXPLAINS IT, which is what
+            // stops it quietly becoming the normal path again: a live page has nothing beside it
+            // only while the lookup names no position at all. The check beside the page index
+            // carries the same rule, for the same reason.
+            //
+            // THE FALLBACK IS GONE, AND THE ANSWER IS THE ONE ITS OWN NOTE GAVE: the lookup
+            // must be established before this report walks, not a second source kept for good.
+            //
+            // SO A LIVE PAGE NOTHING NAMES IS SKIPPED AND REFUSED, NOT GUESSED AT. A report is not
+            // the durability path -- a row it cannot key is a row it omits, where the ENCODER in
+            // the same state refuses outright -- and the `debug_assert!` keeps the skip inside the
+            // one window that explains it: the lookup names no position at all.
+            let object_key = match identities.identity_of(bucket, *handle, block) {
+                Some(beside) => beside.object_key,
+                None if block.deleted => continue,
+                None => {
+                    debug_assert!(
+                        identities.names_no_position(),
+                        "bucket {} holds a live page the object lookup does not name while the \
+                         lookup DOES name positions, so this report is dropping a row outside the \
+                         one window that explains it",
+                        bucket.routing_bucket
+                    );
+                    continue;
+                }
+            };
+            // A TOMBSTONE ENTRY IS NOT A LIVE BLOCK REF. It is counted below as a DELETED one, which
+            // is what it is, and the field this line fills is named `live`. The distinction did not
+            // exist before a container removal started leaving an entry behind: `deleted: true` was
+            // constructed in exactly one place, on a whole-object path where every entry carried it,
+            // so counting all entries and counting the live ones were the same number.
+            if !block.deleted {
+                live_block_ref_count = live_block_ref_count.saturating_add(1);
+            }
+            let block_object_id = block.object_id(shard_id, object_key);
+            object_ids.insert(block_object_id);
+            *object_ref_counts.entry(block_object_id).or_default() += 1;
+            // `missing_object_owner_refs` STOOD HERE AND HAS BEEN RETIRED, not zeroed. It counted
+            // blocks whose address named an object other than the entry's -- a real comparison of
+            // two stored copies while there were two. There is one source now, so the test could
+            // only compare a value with itself, and a counter that is structurally zero reports
+            // "no problems" indistinguishably from a counter that works.
+            let object = objects
+                .entry(block_object_id)
+                .or_insert_with(|| ObjectRuntimeState {
+                    object_id: block_object_id,
+                    routing_bucket: bucket.routing_bucket,
+                    object_keys: Vec::new(),
+                    model_ids: Vec::new(),
+                    block_ref_count: 0,
+                    hot_block_ref_count: 0,
+                    cold_block_ref_count: 0,
+                    deleted_block_ref_count: 0,
+                    residency: "cold".to_string(),
+                    dirty: false,
+                    deleted: false,
+                    loading: false,
+                    in_memory: false,
+                    ttl_ms: None,
+                });
+            object.block_ref_count = object.block_ref_count.saturating_add(1);
+            object.dirty |= block.dirty || bucket.dirty();
+            // ONE PAGE'S DELETION IS NOT THE OBJECT'S, and separating the two is the whole of this
+            // change here. `page.deleted` still makes this a deleted BLOCK REF -- it is one -- but it
+            // no longer makes the OBJECT deleted, because a container removal now leaves a tombstone
+            // entry and one removed member out of twelve would otherwise report the whole set as a
+            // deleted object through the public runtime report.
+            //
+            // `residency` never went wrong: it already required `deleted_block_ref_count >=
+            // block_ref_count`, so eleven live refs beside one deleted one never read as "deleted".
+            // The FIELD did, and it is reported beside the residency that contradicts it.
+            // `a_removed_member_does_not_make_its_object_deleted` drives both.
+            let object_deleted =
+                bucket.deleted() || bucket.deleted_object_index.contains(&block_object_id);
+            object.deleted |= object_deleted;
+            if block.deleted || object_deleted {
+                object.deleted_block_ref_count = object.deleted_block_ref_count.saturating_add(1);
+            } else if bucket.in_memory() && !block.log_backed() {
+                object.hot_block_ref_count = object.hot_block_ref_count.saturating_add(1);
+            } else {
+                object.cold_block_ref_count = object.cold_block_ref_count.saturating_add(1);
+            }
+            object.loading |= bucket.loading();
+            object.in_memory |= bucket.in_memory();
+            object.ttl_ms = match (object.ttl_ms, bucket.ttl_ms.ms()) {
+                (Some(existing), Some(next)) => Some(existing.min(next)),
+                (None, Some(next)) => Some(next),
+                (existing, None) => existing,
+            };
+            if !object.object_keys.contains(&object_key.to_string()) {
+                object.object_keys.push(object_key.to_string());
+            }
+            if !object.model_ids.contains(&block.model_id.to_string()) {
+                object.model_ids.push(block.model_id.clone().to_string());
