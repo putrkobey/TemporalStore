@@ -19,25 +19,3 @@ const source = page.slice(scriptStart, scriptEnd);
 
 function makeEl(id) {
   return { id, hidden: true, innerHTML: "", className: "", _listeners: {},
-           addEventListener() {} };
-}
-const els = {};
-["liveStrip", "liveEnc", "liveImp", "liveReq", "liveWarn", "liveDot"].forEach((id) => {
-  els[id] = makeEl(id);
-});
-
-const win = {
-  document: {
-    getElementById: (id) => els[id] || null,
-    addEventListener() {},
-    hidden: false
-  },
-  addEventListener() {},
-  setTimeout: () => 0,
-  sessionStorage: { getItem: () => "" },
-  /* Claimed, so the script wires its hooks and then stands down instead of trying to connect.
-     Exactly the path a page with its own stream takes. */
-  __matrixarkLive: "page",
-  Number, JSON, String, Math, Date, TextDecoder: function () {}, AbortController: function () {},
-  fetch: () => Promise.reject(new Error("no network in this harness"))
-};
