@@ -2180,3 +2180,4369 @@ fn an_integer_addressed_lookup_serves_another_objects_refs() {
 
     // --- 2. WHAT A COLLISION SERVES. ---
     //
+    // The search runs at a TRUNCATED address width so that it terminates in milliseconds inside
+    // the ordinary suite. The truncation is the only thing scaled: the derivation, the key
+    // spelling and the container are the ones an integer-addressed lookup would use. At 24 bits
+    // the first collision arrives inside twenty thousand keys; at 64 it is the same construction at
+    // a scale no test can run, which is why the bound above is stated rather than searched for.
+    const ADDRESS_BITS: u32 = 24;
+    const MASK: u64 = (1u64 << ADDRESS_BITS) - 1;
+    const SEARCH_CEILING: usize = 40_000;
+    let mut by_address: BTreeMap<u64, String> = BTreeMap::new();
+    let mut collision: Option<(String, String, u64)> = None;
+    let mut scanned = 0usize;
+    for i in 0..SEARCH_CEILING {
+        let key = format!("tenant/1/object/{i:08}");
+        scanned += 1;
+        let address = stable_object_hash(&key) & MASK;
+        if let Some(first) = by_address.get(&address) {
+            collision = Some((first.clone(), key, address));
+            break;
+        }
+        by_address.insert(address, key);
+    }
+    let (first_key, second_key, address) = collision.expect(
+        "no two of the keys scanned shared a truncated address, so this test asserted nothing \
+         about what a derived address can serve",
+    );
+    println!(
+        "a {ADDRESS_BITS}-bit derived address collides after {scanned} keys of \
+         {SEARCH_CEILING}: {first_key:?} and {second_key:?} both address {address:#x}"
+    );
+    assert_ne!(
+        first_key, second_key,
+        "the search returned one key twice, which is a bug in the search and not a collision"
+    );
+    // AND THE INSTRUMENT CAN REFUSE. At FULL width these two keys do NOT collide, so the pair is
+    // an artefact of the truncation and not of the two keys being equal in some other way.
+    assert_ne!(
+        stable_object_hash(&first_key),
+        stable_object_hash(&second_key),
+        "the two keys collide at full width too, so the truncation is not what produced this \
+         collision and the scaling argument does not hold"
+    );
+
+    // The lookup, addressed the way an integer-addressed one would be, holding ONE object's refs.
+    let mut id_addressed: BTreeMap<u64, BlockRefs> = BTreeMap::new();
+    let filed = BlockRefs::One(BlockLookupRef {
+        routing_bucket: 7,
+        block_ref_key: 99,
+    });
+    id_addressed.insert(stable_object_hash(&first_key) & MASK, filed.clone());
+
+    // AND THE SECOND OBJECT, WHICH HAS FILED NOTHING, IS SERVED THE FIRST ONE'S REFS.
+    let served = id_addressed.get(&(stable_object_hash(&second_key) & MASK));
+    assert_eq!(
+        Some(&filed),
+        served,
+        "an index addressed by a derived id answered nothing for a key colliding with a filed one, \
+         so the hazard this test exists to name is not reachable through it"
+    );
+
+    // --- 3. WHAT CATCHES IT, AND WHAT THAT COSTS. ---
+    //
+    // The only check that tells the two apart is a comparison against the object key the entry was
+    // filed under -- so the entry has to HOLD that key, which is the allocation the route removes.
+    let mut verified: BTreeMap<u64, (Arc<str>, BlockRefs)> = BTreeMap::new();
+    verified.insert(
+        stable_object_hash(&first_key) & MASK,
+        (Arc::from(first_key.as_str()), filed.clone()),
+    );
+    let hit = verified.get(&(stable_object_hash(&second_key) & MASK));
+    let resolved = match hit {
+        Some((stored, refs)) if &**stored == second_key.as_str() => Some(refs),
+        _ => None,
+    };
+    assert!(
+        resolved.is_none(),
+        "verify-on-hit did not reject a colliding key, so the only check available does not work \
+         either"
+    );
+    assert!(
+        hit.is_some(),
+        "the verified map did not even see the colliding address, so the rejection above was \
+         satisfied by a miss rather than by the verification"
+    );
+    // AND THE WIDTH THAT MAKES VERIFICATION A REGRESSION RATHER THAN A TRADE.
+    assert!(
+        std::mem::size_of::<(u64, (Arc<str>, BlockRefs))>()
+            > std::mem::size_of::<(Arc<str>, BlockRefs)>(),
+        "the verified id-addressed entry is no wider than the key-addressed entry it would \
+         replace, so ground 1 of the refusal beside ObjectBlockLookup has to be restated"
+    );
+}
+
+// =================================================================================================
+// HOW MANY STRUCTURES HOLD AN ENTRY FOR ONE OBJECT, AND WHAT EACH OF THEM COSTS
+// =================================================================================================
+//
+// THE QUESTION THE SIBLING PROBES DO NOT ANSWER. Every probe above divides a structure's heap by
+// the shard's live-key count, which prices the index as a whole. It cannot say how many SEPARATE
+// structures hold a row for one object, and that count -- not the width of any one row -- is what
+// multiplies. A census by division also hides the kinds that are absent from a fixture: a map that
+// holds nothing for a `string` reads as a small per-key number rather than as a zero.
+//
+// SO THIS MEASURES A MARGINAL COHORT. A population is seeded, every structure is weighed, a cohort
+// of ONE KIND is added, and every structure is weighed again. A structure whose heap does not move
+// holds no entry for that kind; one whose heap moves holds an entry costing the delta over the
+// cohort. That is the count the census needs, and it is read off the allocator rather than off the
+// type declarations.
+//
+// TWO FIGURES, BECAUSE A `HashMap` DELTA IS NOT A PER-ENTRY COST. A hash table clones to its bucket
+// COUNT, which steps at a power of two: a cohort that straddles a rehash is charged the whole new
+// table and the next cohort is charged nothing. So every structure is reported twice --
+//
+//   * MARGINAL, the cohort delta over the cohort size, which answers "does this structure hold an
+//     entry for this kind at all" exactly, and answers "what does the entry cost" only on average
+//     across a rehash;
+//   * STEADY-STATE, the structure's whole heap over ITS OWN denominator -- `strings` over the
+//     string count, `bucket_map` over the PAGE count, `bucket_recency` over the BUCKET count --
+//     which is the resident figure including table slack, and is the one to quote.
+//
+// Mixing those two denominators is the error this campaign has already paid for once, so each row
+// prints the denominator it used. A per-page or per-bucket row is meaningless without the bucket
+// count, which is printed in the arm header and asserted to be a 0..1023 population.
+#[cfg(feature = "alloc-probe")]
+fn census_bytes(shard: &crate::engine::state::ShardState) -> Vec<(&'static str, u64)> {
+    let bucket_map = deep_heap_bytes(&shard.bucket_index.bucket_map);
+    let lookup = deep_heap_bytes(&shard.bucket_index.object_block_lookup);
+    let core_rest = deep_heap_bytes(&shard.bucket_index)
+        .saturating_sub(bucket_map)
+        .saturating_sub(lookup);
+    let (arc_bytes, _) = arc_payload_bytes(&shard.bucket_index);
+    let (dirty_arc_bytes, _, _) = dirty_arc_payload_bytes(shard);
+    vec![
+        ("strings", deep_heap_bytes(shard.strings())),
+        ("features", deep_heap_bytes(shard.features())),
+        ("hashes", deep_heap_bytes(&shard.hashes)),
+        ("bucket_index.bucket_map", bucket_map),
+        ("bucket_index.object_block_lookup", lookup),
+        ("bucket_index, the rest of CoreIndex", core_rest),
+        ("dirty_objects", deep_heap_bytes(&shard.dirty_objects)),
+        ("bucket_recency", deep_heap_bytes(&shard.bucket_recency)),
+        ("expires_at_ms", deep_heap_bytes(shard.expires_at_ms())),
+        ("expiry_by_deadline", deep_heap_bytes(&shard.expiry_by_deadline)),
+        ("wal_resident_blocks", deep_heap_bytes(&shard.wal_resident_blocks)),
+        ("bucket-index Arc<str> payloads", arc_bytes),
+        ("dirty-index Arc<str> payloads", dirty_arc_bytes),
+        ("WHOLE ShardState clone", deep_heap_bytes(shard)),
+    ]
+}
+
+/// The census rows, weighed through the shard lock and handed back as owned numbers.
+#[cfg(feature = "alloc-probe")]
+fn snapshot_census(engine: &TemporalEngine) -> Vec<(&'static str, u64)> {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    census_bytes(shard)
+}
+
+/// Per-structure delta over a cohort of one kind, and the COUNT of structures that moved.
+///
+/// The count is the deliverable. `WHOLE ShardState clone` is a superset of every row above it and
+/// is excluded from the count on purpose -- including it would report one structure too many for
+/// every kind.
+#[cfg(feature = "alloc-probe")]
+fn report_cohort(
+    case: &str,
+    cohort: usize,
+    before: &[(&'static str, u64)],
+    after: &[(&'static str, u64)],
+) -> usize {
+    assert_eq!(before.len(), after.len(), "census rows must line up to be differenced");
+    assert!(cohort > 0, "denominator: a cohort of zero divides into anything");
+    println!("  --- {case}: cohort of {cohort} ---");
+    let mut holders = 0usize;
+    for (i, (name, b)) in before.iter().enumerate() {
+        let (name_after, a) = after[i];
+        assert_eq!(*name, name_after, "census rows drifted between the two snapshots");
+        let delta = a as i64 - *b as i64;
+        let whole = *name == "WHOLE ShardState clone";
+        let note = if whole {
+            "superset of the rows above, not counted"
+        } else if delta == 0 {
+            "HOLDS NO ENTRY for this kind"
+        } else {
+            ""
+        };
+        if delta != 0 && !whole {
+            holders += 1;
+        }
+        println!(
+            "      {name:<38} {delta:>12} B  {:>9.1} B/object  {note}",
+            delta as f64 / cohort as f64
+        );
+    }
+    println!("      => STRUCTURES HOLDING AN ENTRY for one {case}: {holders}");
+    holders
+}
+
+#[cfg(feature = "alloc-probe")]
+fn seed_strings_from(
+    engine: &TemporalEngine,
+    prefix: &str,
+    start: usize,
+    count: usize,
+    ttl_ms: Option<u64>,
+) {
+    let end = start + count;
+    for chunk_start in (start..end).step_by(1_000) {
+        let commands = (chunk_start..(chunk_start + 1_000).min(end))
+            .map(|i| match ttl_ms {
+                None => Command::StringSet {
+                    key: format!("{prefix}{i}"),
+                    value: vec![b'v'; 32],
+                },
+                Some(ttl) => Command::StringSetEx {
+                    key: format!("{prefix}{i}"),
+                    value: vec![b'v'; 32],
+                    ttl_ms: ttl,
+                },
+            })
+            .collect::<Vec<_>>();
+        if commands.is_empty() {
+            continue;
+        }
+        let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+            shard_id: 1,
+            commands,
+        });
+        assert!(response.status.ok, "string seed must ack: {:?}", response.status);
+    }
+}
+
+#[cfg(feature = "alloc-probe")]
+fn seed_hashes_from(engine: &TemporalEngine, prefix: &str, count: usize, fields: usize) {
+    for i in 0..count {
+        let commands = (0..fields)
+            .map(|f| Command::HashSet {
+                key: format!("{prefix}{i}"),
+                field: format!("f{f}"),
+                value: vec![b'h'; 32],
+            })
+            .collect::<Vec<_>>();
+        let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+            shard_id: 1,
+            commands,
+        });
+        assert!(response.status.ok, "hash seed must ack: {:?}", response.status);
+    }
+}
+
+#[cfg(feature = "alloc-probe")]
+fn seed_features_from(engine: &TemporalEngine, prefix: &str, keys: usize, points: usize) {
+    for k in 0..keys {
+        for chunk_start in (0..points).step_by(500) {
+            let batch = (chunk_start..(chunk_start + 500).min(points))
+                .map(|t| crate::types::FeaturePoint {
+                    timestamp_ms: 1_700_000_000_000 + t as u64,
+                    value: vec![b'f'; 32],
+                })
+                .collect::<Vec<_>>();
+            if batch.is_empty() {
+                continue;
+            }
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureAppend {
+                    key: format!("{prefix}{k}"),
+                    points: batch,
+                },
+            });
+            assert!(response.status.ok, "feature seed must ack: {:?}", response.status);
+        }
+    }
+}
+
+/// HOW MANY STRUCTURES HOLD AN ENTRY FOR ONE OBJECT, PER KIND, ON THE SHIPPED ROUTING RANGE.
+///
+/// Five cases, each measured as a marginal cohort against the same base population: a plain string
+/// with no deadline, a string with one, a container, a timestamped series, and -- for the clean
+/// case -- the same population after the production dump-and-release sequence, where a NEGATIVE
+/// delta is memory the dump handed back.
+///
+/// WHY THE CLEAN CASE IS A DUMP RATHER THAN A SIXTH COHORT. Nothing writes a clean object: an
+/// object is clean because a dump has been taken since it was written. So "clean" is not a kind to
+/// seed, it is a state to reach, and the honest measurement of what being dirty costs is what a
+/// dump gives back.
+///
+/// THE ARMS ARE 4x APART AT THE DENOMINATOR THEY ARE QUOTED AT, AND BOTH COMPLETE. The sibling
+/// probes seed 8,000 then 80,000 records, and the 80,000 arm has never finished on this box -- it
+/// was stopped mid-seed at thirteen minutes of CPU. A figure from an arm that does not complete is
+/// not a figure.
+///
+/// AND 4x IN THE SEED IS NOT 4x IN THE TABLE. An earlier spelling scaled the base string count 4x
+/// and left the container, series and cohort populations fixed; the live-key counts the
+/// steady-state table divides by then came out 2.33x apart, and `hashes` fell from 48.9 to 20.9
+/// B/key purely because the mix had changed underneath it. Every population here scales by ONE
+/// factor, so the mix is identical between the arms and the ratio is 4.0 at the denominator the
+/// figures are actually quoted against.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "seeds two corpora under the counting allocator and weighs every structure; run by name"]
+fn how_many_structures_hold_an_entry_for_one_object() {
+    /// The shipped default since #1973, and the range `docs/runtime_tuning.md` tells an operator to
+    /// set. On the LEGACY whole-u32 range every key gets a bucket of its own, so every per-bucket
+    /// cost divides by one key and `bucket_recency` reads as a per-key structure. It is not one.
+    const SHIPPED_END: u32 = 1023;
+
+    // ONE SCALE FACTOR PER ARM, and EVERY population below derives from it, so the two arms
+    // hold the same MIX and differ only in size. The previous spelling scaled the base strings 4x
+    // and left the container and series populations fixed, which made the live-key ratio 2.33x at
+    // the steady-state table rather than 4x -- and moved `hashes` from 48.9 to 20.9 B/key by
+    // dilution alone. A ratio taken across two mixes is not a scaling result.
+    for (arm, scale) in [("1x", 1usize), ("4x", 4usize)] {
+        let base_strings = 2_000 * scale;
+        let base_series = 2 * scale;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = probe_engine_on(dir.path(), SHIPPED_END);
+        probe_seed(&engine, base_strings, base_series, 1_000, 0);
+
+        // --- DENOMINATORS FIRST, ASSERTED, because every figure below divides by one. ---
+        let (base_keys, buckets, blocks) = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            let keys = shard.strings().len() + shard.features().len();
+            let buckets = shard.bucket_index.bucket_map.values().count();
+            let blocks: usize =
+                shard.bucket_index.bucket_map.values().map(|b| b.block_index.len()).sum();
+            assert_eq!(
+                base_strings,
+                shard.strings().len(),
+                "denominator: the string map does not hold the base population"
+            );
+            assert_eq!(
+                base_series,
+                shard.features().len(),
+                "denominator: the feature map does not hold the base population"
+            );
+            assert!(blocks > 0, "denominator: the bucket index must hold pages");
+            assert!(
+                buckets > 0 && buckets <= (SHIPPED_END as usize + 1),
+                "denominator: {buckets} buckets is not a 0..{SHIPPED_END} population -- the fixture \
+                 did not load on the shipped range and every per-bucket row below is the other \
+                 regime's"
+            );
+            assert!(
+                buckets < keys,
+                "denominator: {buckets} buckets for {keys} keys is one bucket per key, which is the \
+                 LEGACY range -- a per-bucket structure would read as a per-key one"
+            );
+            (keys, buckets, blocks)
+        };
+        println!(
+            "=== {arm}-record base on 0..{SHIPPED_END}: {base_keys} live keys, {buckets} BUCKETS, \
+             {blocks} pages (scale {scale}x; every population scales together so the two arms hold \
+             the same mix) ==="
+        );
+
+        // --- CASE 1: a plain string object, no deadline, dirty because nothing has dumped yet. ---
+        let string_cohort: usize = 500 * scale;
+        let before = snapshot_census(&engine);
+        seed_strings_from(&engine, "p", base_strings + 1_000_000, string_cohort, None);
+        let after = snapshot_census(&engine);
+        report_cohort("plain string, NO deadline, DIRTY", string_cohort, &before, &after);
+
+        // --- CASE 2: the same object WITH a deadline. ---
+        let ttl_cohort: usize = 500 * scale;
+        let ttl_before = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            shards.get(&1).expect("shard").expires_at_ms().len()
+        };
+        let before = snapshot_census(&engine);
+        seed_strings_from(&engine, "t", base_strings + 2_000_000, ttl_cohort, Some(86_400_000));
+        let after = snapshot_census(&engine);
+        let ttl_after = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            shards.get(&1).expect("shard").expires_at_ms().len()
+        };
+        // NON-VACUITY: a deadline cohort that files no deadline would make the two expiry rows read
+        // as free, which is the whole question this case exists to answer.
+        assert_eq!(
+            ttl_before + ttl_cohort,
+            ttl_after,
+            "the deadline cohort filed {} deadlines, not {ttl_cohort} -- the expiry rows below are \
+             measuring nothing",
+            ttl_after - ttl_before
+        );
+        report_cohort("string WITH a deadline, DIRTY", ttl_cohort, &before, &after);
+
+        // --- CASE 3: a container object. N IS STATED: eight elements each. ---
+        let hash_cohort: usize = 250 * scale;
+        const HASH_FIELDS: usize = 8;
+        let before = snapshot_census(&engine);
+        seed_hashes_from(&engine, "h", hash_cohort, HASH_FIELDS);
+        let after = snapshot_census(&engine);
+        report_cohort("container object, 8 elements each, DIRTY", hash_cohort, &before, &after);
+
+        // --- CASE 4: a timestamped object. N IS STATED: one thousand points each. ---
+        let series_cohort: usize = 2 * scale;
+        const SERIES_POINTS: usize = 1_000;
+        let before = snapshot_census(&engine);
+        seed_features_from(&engine, "g", series_cohort, SERIES_POINTS);
+        let after = snapshot_census(&engine);
+        report_cohort(
+            "timestamped object, 1,000 points each, DIRTY",
+            series_cohort,
+            &before,
+            &after,
+        );
+
+        // --- THE STEADY-STATE TABLE: every structure over ITS OWN denominator. ---
+        {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            let rows = census_bytes(shard);
+            let strings_n = shard.strings().len();
+            let features_n = shard.features().len();
+            let hashes_n = shard.hashes.len();
+            let lookup_n = shard.bucket_index.object_block_lookup.len();
+            let dirty_n = shard.dirty_objects.len();
+            let recency_n = shard.bucket_recency.len();
+            let expiry_n = shard.expires_at_ms().len();
+            let deadline_n = shard.expiry_by_deadline.len();
+            let wal_n = shard.wal_resident_blocks.len();
+            let buckets_now = shard.bucket_index.bucket_map.values().count();
+            let blocks_now: usize =
+                shard.bucket_index.bucket_map.values().map(|b| b.block_index.len()).sum();
+            let live_keys = strings_n + features_n + hashes_n;
+            println!(
+                "  --- STEADY STATE, each structure over ITS OWN denominator ({buckets_now} \
+                 buckets, {blocks_now} pages, {strings_n} strings, {features_n} series, {hashes_n} \
+                 containers, {dirty_n} dirty) ---"
+            );
+            for (name, bytes) in &rows {
+                let (denom, denom_name): (usize, &str) = match *name {
+                    "strings" => (strings_n, "string object"),
+                    "features" => (features_n, "series object"),
+                    "hashes" => (hashes_n, "container object"),
+                    "bucket_index.bucket_map" => (blocks_now, "PAGE"),
+                    "bucket_index.object_block_lookup" => (lookup_n, "lookup row"),
+                    "bucket_index, the rest of CoreIndex" => (buckets_now, "BUCKET"),
+                    "dirty_objects" => (dirty_n, "dirty object"),
+                    "bucket_recency" => (recency_n, "BUCKET"),
+                    "expires_at_ms" => (expiry_n, "deadline"),
+                    "expiry_by_deadline" => (deadline_n, "deadline"),
+                    "wal_resident_blocks" => (wal_n, "log-resident block"),
+                    _ => (live_keys, "live key"),
+                };
+                println!(
+                    "      {name:<38} {bytes:>12} B  {:>9.1} B per {denom_name:<18} (n = {denom})",
+                    if denom == 0 { 0.0 } else { *bytes as f64 / denom as f64 }
+                );
+            }
+        }
+
+        // --- CASE 5: CLEAN. The production dump-and-release sequence; negative is handed back. ---
+        let probe_keys: Vec<String> = (0..16).map(|i| format!("s{i}")).collect();
+        let readable = |engine: &TemporalEngine| {
+            probe_keys
+                .iter()
+                .filter(|key| {
+                    matches!(
+                        engine
+                            .execute(ExecuteRequest {
+                                shard_id: 1,
+                                command: Command::StringGet { key: (*key).clone() },
+                            })
+                            .response,
+                        crate::types::CommandResponse::Bytes { value: Some(_) }
+                    )
+                })
+                .count()
+        };
+        let read_before = readable(&engine);
+        assert_eq!(
+            probe_keys.len(),
+            read_before,
+            "the fixture cannot read its own keys BEFORE the dump, so a read afterwards proves nothing"
+        );
+        let dirty_count = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            shards.get(&1).expect("shard").dirty_objects.len()
+        };
+        assert!(
+            dirty_count > 0,
+            "non-vacuity: nothing is dirty before the dump, so the clean case would recover nothing \
+             and read as a structure that costs nothing"
+        );
+        let before = snapshot_census(&engine);
+        let _report = engine.apply_storage_eviction(1, 0, 0, true, false);
+        let after = snapshot_census(&engine);
+        println!(
+            "  --- CLEAN: dump+release over {dirty_count} dirty objects (negative = handed back) ---"
+        );
+        report_cohort("object made CLEAN by a dump", dirty_count, &before, &after);
+        let read_after = readable(&engine);
+        assert_eq!(
+            probe_keys.len(),
+            read_after,
+            "the dump made keys unreadable -- a recovery figure taken beside broken reads is not a \
+             saving"
+        );
+    }
+}
+
+// =================================================================================================
+// THE FOOTPRINT BRACKET
+// =================================================================================================
+
+/// THE RATCHET: WHAT THE SHARD INDEX IS ALLOWED TO COST, BRACKETED ABOVE AND BELOW.
+///
+/// # WHY A BRACKET AND NOT A CEILING
+///
+/// A ceiling alone rots in one direction. It catches a regression and says nothing when the figure
+/// IMPROVES, so a win goes unrecorded and the ceiling keeps quoting a cost nobody pays any more --
+/// and the next reader takes the stale ceiling for the current footprint. The floor is what makes
+/// this a ratchet rather than a cap: cross it and the test FAILS, demanding both bounds be moved
+/// down and the new figure published. An improvement that does not tighten this test is an
+/// improvement nobody can cite.
+///
+/// The floor earns its keep a second way. Every term here is measured by CLONING the structure and
+/// counting what the clone allocates, so a structure that becomes empty, or a field that stops
+/// being reached, measures as CHEAP rather than as broken. A figure that falls through the floor is
+/// as likely to be a measurement that stopped measuring as a genuine saving, and the two are
+/// indistinguishable from the number alone. The floor forces that question to be asked out loud.
+///
+/// # THE DENOMINATORS, AND WHY BOTH RATIOS ARE PUBLISHED
+///
+/// The same heap divides two ways and the two are NOT interchangeable:
+///
+///   * **per live key** -- one object, one index record. This is the denominator for anything
+///     charged once per object, a per-record width above all.
+///   * **per live address** -- one stored page. This is the denominator for anything charged once
+///     per page.
+///
+/// On this fixture they differ by exactly 2x, because half the addresses are series points hanging
+/// off forty keys. Quoting a per-record cost against the per-address figure halves it, and that is
+/// a mistake this lane has already made and published. So both are asserted, each against its own
+/// named denominator, and neither is derived from the other.
+///
+/// # WHAT IS PINNED, AND WHY EVERY ONE OF THEM HAS TO BE
+///
+/// A footprint figure is meaningless without the population it was taken over, so the fixture is
+/// pinned and ASSERTED, not merely passed:
+///
+///   * **the routing range** -- 0..1023, the shipped default since #1973. On the legacy whole-u32
+///     range every key gets a bucket of its own, every per-bucket cost divides by one key, and the
+///     same measurement reads 48% higher. That is not a different fixture, it is a different
+///     REGIME, and a bracket taken on one says nothing about the other.
+///   * **the bucket count** -- 1,024, asserted exactly. It is the denominator of every per-bucket
+///     term and it is what separates the two regimes.
+///   * **the corpus** -- 40,000 single-page objects and 40 series of 1,000 points. Asserted at both
+///     ends, because the per-key figure FALLS as the corpus grows (0.798x across a 10x corpus, so
+///     per-bucket costs amortise), which makes the corpus size part of the number itself.
+///
+/// # WHAT THIS FIXTURE IS NOT
+///
+/// Its mix is CONSTRUCTED. Forty of 40,040 keys carry a series because this test passes forty, and
+/// that quotient is this test's own arguments read back, not an observed property of any corpus.
+/// Nothing here may be quoted as a population. The bracket is a regression gate on a fixed fixture
+/// and is honest only as that.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "seeds 80,000 records under the counting allocator; run by name"]
+fn the_index_footprint_stays_inside_its_measured_bracket() {
+    /// The shipped routing default since #1973, and what an operator is told to set.
+    const SHIPPED_END: u32 = 1023;
+    /// Every bucket in 0..=1023 is occupied at this corpus size, and that is asserted rather than
+    /// assumed: it is the denominator of every per-bucket term below.
+    const PINNED_BUCKETS: usize = 1024;
+    /// The corpus the bracket was taken over. Changing any of these four changes the number.
+    const PINNED_STRINGS: usize = 40_000;
+    const PINNED_SERIES: usize = 40;
+    const PINNED_POINTS: usize = 1_000;
+    /// HOW MANY STRINGS CARRY A DEADLINE, and the reason this corpus has any at all.
+    ///
+    /// WHAT THE FIXTURE COULD NOT SEE BEFORE. The seed issued `StringSet` and `FeatureAppend`
+    /// only, and `StringSet` carries no TTL -- so `expires_at_ms` and `expiry_by_deadline` were
+    /// EMPTY here. That matters because the consolidation's trade is exactly those two maps: a
+    /// slot is sixteen bytes wider than the bare address it replaces, and those bytes are the
+    /// deadline, flags and model id that a later change fills so a key's deadline entry can stop
+    /// existing. On a corpus with no deadlines the COST of that widening was fully visible and the
+    /// OFFSETTING WIN was structurally unmeasurable -- a bound that can see one half of a trade
+    /// reports a regression for a change that is net neutral or better.
+    ///
+    /// That is the same vacuity as a duplication figure measured on an empty map, arriving from
+    /// the other side. `strings` being seeded is what made its cost real; `expires_at_ms` being
+    /// empty is what hid the win against it.
+    ///
+    /// HALF, NOT ALL. Both populations stay present, so a change that helps only the
+    /// deadline-carrying keys shows a partial win rather than all-or-nothing -- which is more
+    /// informative and does not imply every stored object has a TTL.
+    const PINNED_DEADLINES: usize = PINNED_STRINGS / 2;
+
+    // THE BRACKET, measured on 0..1023 at this corpus: 16,141,700 B over 40,040 live keys and
+    // 80,000 live addresses, which is 403.1 B/key and 201.8 B/address.
+    //
+    // THESE ARE NOT COMPARABLE TO THE FIGURES THAT STOOD HERE BEFORE. The previous bracket read
+    // 14,253,412 B -> 356.0 B/key and 178.2 B/address, and it was taken on a corpus with NO
+    // DEADLINES. The corpus changed, so the measurement changed; the old pair and this pair are
+    // measurements of different things and neither is a drift from the other.
+    //
+    // WHAT THE DELTA IS, STATED NO MORE STRONGLY THAN IT CAN BE. It is the delta OF THE CORPUS
+    // CHANGE -- 1,888,288 B for 20,000 deadlines -- of which the two deadline maps' node space is
+    // 1,883,344 B measured separately: 45.2 B per deadline in `expires_at_ms` and 48.9 B per
+    // deadline in the ordered `expiry_by_deadline`. It is NOT "the cost of a deadline"; an earlier
+    // version of this comment said that and it does not follow.
+    //
+    // AN OPEN QUESTION, LEFT OPEN HERE RATHER THAN LEFT OUT. Those two figures cannot BOTH be the
+    // cost of the deadlines. A deadline's key characters live in one `Arc<str>` shared by both maps
+    // (`set_expiry`: "ONE ALLOCATION OF THE CHARACTERS, HELD BY BOTH MAPS"), so ~480,000 B of
+    // character buffers for 20,000 keys must appear in a WHOLE-SHARD delta -- and they appear in
+    // neither node figure, which leaves the two within 0.26% of each other. So something in this
+    // corpus change went DOWN by roughly the size of the characters, and it is not yet identified.
+    // An unexplained term that size is exactly what makes a confident attribution unsafe, which is
+    // why the sentence above claims only the corpus change.
+    //
+    // WHY THE NODE FIGURES EXCLUDE THE CHARACTERS, BY TWO ROUTES. The first reasons about what the
+    // code does: `deep_heap_bytes` is `value.clone()` under the counting allocator, and
+    // `Arc::clone` is a refcount bump rather than an allocation, so cloning either map allocates
+    // node space and no characters. The second shows the alternative CANNOT BE TRUE, and is the
+    // stronger of the two: std's `BTreeMap` holds at most 11 entries per node, and an
+    // `Arc<str>`(16 B) key with a `u64`(8 B) value gives a 264 B full-node payload against this
+    // crate's measured 280-byte root node -- so 45.2 B/entry implies about 56% node occupancy,
+    // which is plausible, while 45.2 minus 24 B of characters would leave 21.2 B/entry and imply
+    // 120% occupancy, which is impossible. One route argues from semantics; the other rules the
+    // alternative out.
+    //
+    // THE MARGINS ARE CARRIED ACROSS UNCHANGED, which is what makes this a fixture change and not
+    // a bound relaxation. Each bound keeps the exact distance it had from the figure it bracketed:
+    //
+    //     key     ceiling  +4.0   ->  403.1 + 4.0  = 407.1      (was 356.0 + 4.0  = 360.0)
+    //     key     floor   -18.0   ->  403.1 - 18.0 = 385.1      (was 356.0 - 18.0 = 338.0)
+    //     address ceiling  +1.8   ->  201.8 + 1.8  = 203.6      (was 178.2 + 1.8  = 180.0)
+    //     address floor    -9.2   ->  201.8 - 9.2  = 192.6      (was 178.2 - 9.2  = 169.0)
+    //
+    // So the gate is exactly as tight as it was: it still refuses a change that moves the figure
+    // by more than the same number of bytes it refused before. Headroom is deliberately thin --
+    // the point is to catch a change that moves the figure, not to leave room for one, and a bound
+    // nothing can breach gates nothing.
+    //
+    // THE WORKED EXAMPLE BELOW WAS MEASURED ON THE PRE-DEADLINE CORPUS, which is not the corpus
+    // this file now seeds. Its figures -- 14,253,412 B, 382.2 B/key, and a breach of 22.2 B/key
+    // against a 360.0 ceiling -- are measurements of the OLD fixture against the OLD bound, kept
+    // because the rule they demonstrate does not depend on which corpus produced it. Read them as
+    // the example's own numbers and not as this file's baseline: the baseline is the pair at the
+    // top of this block. The same statement applies here as to the bounds themselves -- the two
+    // corpora measure different things and neither is a drift from the other.
+    //
+    // AND THE CONVERSION'S COST IS NOT RE-DERIVED HERE. 26.2 B/key is what widening `strings` cost
+    // on the old corpus; what it costs on this one is a measurement the conversion's own change
+    // has to make. Asserting a new figure for it here would be the mirror of the error this block
+    // exists to warn about.
+    // ============================================================================================
+    // BEFORE YOU ESTIMATE A VALUE-TYPE CHANGE AGAINST THIS BOUND: MULTIPLY BY THE TABLE'S
+    // CAPACITY, NOT BY ITS LENGTH.
+    // ============================================================================================
+    //
+    // A `HashMap` whose VALUE type grows by n bytes does not cost `len * n`. It costs
+    // `capacity * n`, because hashbrown allocates one slot per capacity unit whether or not a key
+    // occupies it. Capacity is a power of two at or above `len / 0.875`, so the multiplier between
+    // the two estimates is 1.0 just after a doubling and approaches 2.0 just before the next one.
+    // The SAME change therefore costs nearly twice as much in one store as in another with nothing
+    // in the code differing.
+    //
+    // MEASURED HERE, on this fixture, by converting `strings` from a 16-byte `ElementEntry` value
+    // to a 32-byte `ObjectSlot`:
+    //
+    //     predicted with len:       40,000 x 16 B  =   640,000 B  =  16.0 B/key
+    //     measured:              15,301,988 B - 14,253,412 B
+    //                                           = 1,048,576 B  =  26.2 B/key   (382.2 B/key)
+    //     explained by capacity:   40,040 / 0.875 = 45,760 -> 65,536 slots
+    //                              65,536 x 16 B  = 1,048,576 B   -- the measured delta, to the byte
+    //
+    // So the length-based estimate was low by 1.64x and the change breached this ceiling by 22.2
+    // B/key when it was predicted to fit. The identity above is a very strong EXPLANATION of the
+    // measured delta and is not a second independent measurement of it.
+    //
+    // AND IT CUTS BOTH WAYS, WHICH IS THE PART AN ESTIMATE USUALLY MISSES. Removing a whole map
+    // recovers `capacity * entry_size`, also at capacity scale -- so a consolidation that widens a
+    // value and deletes a table is paying and recovering at the SAME multiplier. Only the key
+    // copies it saves scale with occupancy. That is why widening a value in place is a regression
+    // while widening it as part of a merge need not be, and a net prediction that mixes the two
+    // scales is wrong in a direction that flatters the change.
+    const CEILING_B_PER_KEY: f64 = 407.1;
+    const FLOOR_B_PER_KEY: f64 = 385.1;
+    const CEILING_B_PER_ADDRESS: f64 = 203.6;
+    const FLOOR_B_PER_ADDRESS: f64 = 192.6;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine_on(dir.path(), SHIPPED_END);
+    probe_seed(
+        &engine,
+        PINNED_STRINGS,
+        PINNED_SERIES,
+        PINNED_POINTS,
+        PINNED_DEADLINES,
+    );
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    // NON-VACUITY: the corpus really carries the deadlines it was asked for. Without this, a seed
+    // that silently stopped setting them would quietly restore the old one-sided fixture and every
+    // bound below would be re-derived on a corpus nobody checked.
+    assert_eq!(
+        PINNED_DEADLINES,
+        shard.expires_at_ms().len(),
+        "the fixture seeded {PINNED_DEADLINES} deadlines and the shard holds {}; the bracket's          whole reason for carrying them is that this map is not empty",
+        shard.expires_at_ms().len()
+    );
+
+    // --- THE POPULATION, PINNED. Each of these is a denominator or a regime control, and every
+    // --- one of them is asserted before a single ratio is written.
+    let string_keys = shard.strings().len();
+    let series_map_keys = shard.features().len();
+    let feature_points: usize = shard.features().values().map(|s| s.len()).sum();
+    let bucket_count = shard.bucket_index.bucket_map.values().count();
+    let bucket_blocks: usize = shard
+        .bucket_index
+        .bucket_map
+        .values()
+        .map(|b| b.block_index.len())
+        .sum();
+
+    assert_eq!(
+        PINNED_STRINGS, string_keys,
+        "the fixture seeded {PINNED_STRINGS} single-page objects and the string map holds \
+         {string_keys} -- the corpus is part of the bracket, so a figure taken over a different \
+         one is not comparable to it"
+    );
+    assert_eq!(
+        PINNED_SERIES, series_map_keys,
+        "the fixture seeded {PINNED_SERIES} series and the feature map holds {series_map_keys}"
+    );
+    assert_eq!(
+        PINNED_SERIES * PINNED_POINTS,
+        feature_points,
+        "the fixture seeded {} series points and the feature maps hold {feature_points}",
+        PINNED_SERIES * PINNED_POINTS
+    );
+    assert_eq!(
+        PINNED_BUCKETS, bucket_count,
+        "the bracket was taken over {PINNED_BUCKETS} buckets and this fixture produced \
+         {bucket_count} -- every per-bucket term divides by this, so the bracket does not apply"
+    );
+    // THE REGIME CONTROL. On the legacy range buckets and keys are the same number and the whole
+    // figure reads 48% higher. A fixture that drifted onto that range would sail past the ceiling
+    // for a reason that has nothing to do with any structure's cost.
+    assert!(
+        bucket_count < string_keys + series_map_keys,
+        "{bucket_count} buckets for {} keys is one bucket per key, which is the LEGACY range -- \
+         this bracket is only valid on the shipped 0..{SHIPPED_END}",
+        string_keys + series_map_keys
+    );
+    assert!(bucket_blocks > 0, "denominator: the bucket index holds no pages");
+
+    // --- THE NUMERATOR: the whole live heap the shard index holds. The clone counts shared
+    // --- payloads ONCE, so the two `Arc` terms are added back explicitly rather than being
+    // --- double-counted or dropped.
+    let whole_bytes = deep_heap_bytes(shard);
+    let (arc_bytes, _arc_count) = arc_payload_bytes(&shard.bucket_index);
+    let (dirty_arc_bytes, _dirty_arc_count, _shared) = dirty_arc_payload_bytes(shard);
+    let total_index_heap_bytes = whole_bytes + arc_bytes + dirty_arc_bytes;
+    assert!(
+        total_index_heap_bytes > 0,
+        "numerator: the index measured as costing nothing, which is a broken measurement and not a \
+         free index"
+    );
+
+    // --- THE TWO RATIOS. Numerator and denominator are named ON THE LINE that divides them,
+    // --- because every wrong figure this campaign has published was a denominator question.
+    //
+    // numerator: total live index heap, bytes. denominator: LIVE KEYS -- one per object, which is
+    // 40,000 single-page objects plus 40 series maps. This is the denominator for a per-record cost.
+    let live_keys = string_keys + series_map_keys;
+    let bytes_per_live_key = total_index_heap_bytes as f64 / live_keys as f64;
+    //
+    // numerator: the SAME total live index heap, bytes. denominator: LIVE ADDRESSES -- one per
+    // stored page, which is 40,000 object pages plus 40,000 series points. This is the denominator
+    // for a per-page cost, and it is 2x the key count on this fixture, so the two ratios are not
+    // interchangeable and neither is derived from the other.
+    let live_addresses = string_keys + feature_points;
+    let bytes_per_live_address = total_index_heap_bytes as f64 / live_addresses as f64;
+
+    println!(
+        "=== footprint bracket on 0..{SHIPPED_END}: {total_index_heap_bytes} B over {live_keys} \
+         live keys and {live_addresses} live addresses, {bucket_count} buckets, {bucket_blocks} \
+         pages ==="
+    );
+    println!("  {bytes_per_live_key:.1} B/key   (bracket {FLOOR_B_PER_KEY}..={CEILING_B_PER_KEY})");
+    println!(
+        "  {bytes_per_live_address:.1} B/address   (bracket {FLOOR_B_PER_ADDRESS}..=\
+         {CEILING_B_PER_ADDRESS})"
+    );
+
+    // --- THE CEILING: a regression. Named with the denominator, so the figure in the message can
+    // --- be compared to the right thing.
+    assert!(
+        bytes_per_live_key <= CEILING_B_PER_KEY,
+        "the shard index now costs {bytes_per_live_key:.1} B per live key \
+         ({total_index_heap_bytes} B over {live_keys} keys), above the {CEILING_B_PER_KEY} B/key \
+         ceiling. Either the change pays for itself somewhere this does not measure -- say where \
+         -- or the footprint regressed"
+    );
+    assert!(
+        bytes_per_live_address <= CEILING_B_PER_ADDRESS,
+        "the shard index now costs {bytes_per_live_address:.1} B per live address \
+         ({total_index_heap_bytes} B over {live_addresses} addresses), above the \
+         {CEILING_B_PER_ADDRESS} B/address ceiling"
+    );
+
+    // --- THE FLOOR: either a win that has to be recorded, or a measurement that stopped
+    // --- measuring. The message has to say both, because the number cannot tell them apart.
+    assert!(
+        bytes_per_live_key >= FLOOR_B_PER_KEY,
+        "the shard index now costs {bytes_per_live_key:.1} B per live key \
+         ({total_index_heap_bytes} B over {live_keys} keys), BELOW the {FLOOR_B_PER_KEY} B/key \
+         floor. Two things look like this and they are not the same: a real saving, which should \
+         move both bounds down and publish the new figure; or a structure that went empty or \
+         stopped being reached, which measures as cheap because this counts what a CLONE \
+         allocates. Establish which before lowering anything"
+    );
+    assert!(
+        bytes_per_live_address >= FLOOR_B_PER_ADDRESS,
+        "the shard index now costs {bytes_per_live_address:.1} B per live address \
+         ({total_index_heap_bytes} B over {live_addresses} addresses), BELOW the \
+         {FLOOR_B_PER_ADDRESS} B/address floor -- a saving to be recorded, or a term that stopped \
+         being measured"
+    );
+}
+
+// =================================================================================================
+// WHAT THE DEADLINE MERGE WOULD TRADE, PRICED BEFORE IT IS BUILT
+// =================================================================================================
+
+/// THE TWO HALVES OF A DEADLINE, WEIGHED SEPARATELY, BECAUSE ONLY ONE OF THEM CAN BE RECLAIMED.
+///
+/// # THE QUESTION THIS ANSWERS
+///
+/// An `ObjectSlot` is sixteen bytes wider than the bare `ElementEntry` it replaces, and those bytes
+/// are a `deadline`, `flags` and a `model_id` that no production path reads yet. The case for
+/// paying them is that a later change puts a key's deadline IN the slot, so the key's entry in the
+/// deadline maps can stop existing.
+///
+/// A deadline is held in TWO maps, not one:
+///
+///   * `expires_at_ms: BTreeMap<Arc<str>, u64>` -- key to deadline. This is the half a slot can
+///     absorb: one value per key is exactly the shape the record carries.
+///   * `expiry_by_deadline: BTreeMap<(u64, Arc<str>), ()>` -- the DEADLINE-ORDERED index. This half
+///     a slot cannot absorb, and the reason is control flow rather than width: the expiry round
+///     walks it in order and BREAKS as soon as it passes `now`, so it visits only the due keys. A
+///     `HashMap` of slots has no order, so the same question becomes a scan of every live key per
+///     round. `expiry_scale` already holds a guard for why a bounded round-robin cursor should not
+///     replace an ordered index here, so this is a settled question being priced, not reopened.
+///
+/// BOTH OF THESE ARE `BTreeMap`s, so NEITHER takes the capacity multiplier that governs the paid
+/// side. There is no power-of-two slot array and no load factor on the recovered side: it is
+/// node-allocated, and this crate has measured separately that a `BTreeMap` holding one element
+/// allocates a 280-byte root node. The recovered side is therefore ONE cost model, not two.
+///
+/// So the merge pays the slot's width on EVERY key and recovers only `expires_at_ms`, and only on
+/// keys that actually carry a deadline. That asymmetry is the whole trade, and it has a break-even
+/// deadline share rather than a yes or no answer.
+///
+/// # WHAT `deep_heap_bytes` COUNTS HERE, AND WHY IT IS THE RECOVERABLE TERM
+///
+/// That helper is `let copy = value.clone()` under the counting allocator, so it reports what
+/// CLONING allocates. `Arc::clone` is a refcount bump and not an allocation, so cloning either of
+/// these maps allocates B-tree node space and NOTHING for the key characters. The figures below
+/// are node space only.
+///
+/// THAT IS EXACTLY THE RECOVERABLE TERM, AND IT IS A PROPERTY OF THIS DATA RATHER THAN LUCK. The
+/// characters are allocated ONCE and held by BOTH maps: `set_expiry` does a single
+/// `Arc::from(key)` and clones the handle into each -- its own comment reads "ONE ALLOCATION OF THE
+/// CHARACTERS, HELD BY BOTH MAPS". So deleting `expires_at_ms` leaves the characters alive under
+/// the ordered map's refcount, and a figure that excluded them is the figure this trade needs.
+///
+/// DO NOT REUSE THE HELPER THIS WAY ON A MAP WITH OWNED KEYS. A `BTreeMap<String, _>` or a
+/// `HashMap<Box<str>, _>` allocates its key buffers on clone, and there the same call reports the
+/// characters too. Reused on a map with SHARED keys without knowing that, it silently omits the
+/// largest term and nothing warns you.
+///
+/// AND THESE FIGURES ARE NOT COMPARABLE TO A WHOLE-SHARD DELTA. The bracket's 94.4 B per deadline
+/// is a difference of total shard heap -- characters plus both maps' nodes. The numbers here are
+/// node space for one map. Printing the two beside each other would read as a comparison because
+/// it would be formatted as one, so this prints neither a total nor the bracket figure.
+///
+/// # WHY THE COST TERM IS A CAPACITY IDENTITY AND NOT A SECOND MEASUREMENT
+///
+/// The widening costs `capacity * 16 B`, not `len * 16 B`: hashbrown allocates a slot per capacity
+/// unit whether a key occupies it or not. At 40,000 string keys the table holds 65,536 slots, so
+/// the cost is 65,536 x 16 = 1,048,576 B. That figure is quoted here as the identity it is; the
+/// footprint bracket is what measures it, and the two agree to the byte.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "seeds the bracket corpus under the counting allocator; run by name"]
+fn what_the_deadline_merge_would_trade() {
+    const STRINGS: usize = 40_000;
+    const SERIES: usize = 40;
+    const POINTS: usize = 1_000;
+    const DEADLINES: usize = STRINGS / 2;
+    /// The string table's capacity at this key count: the next power of two at or above
+    /// `40_000 / 0.875`. The widening is charged here and not at the key count.
+    const STRING_TABLE_CAPACITY: usize = 65_536;
+    /// An `ObjectSlot` over the `ElementEntry` it replaces.
+    const SLOT_WIDENING_B: usize = 16;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine_on(dir.path(), 1023);
+    probe_seed(&engine, STRINGS, SERIES, POINTS, DEADLINES);
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+
+    // NON-VACUITY, BOTH WAYS. A corpus with no deadlines prices the recoverable half at zero and
+    // reads as "the merge recovers nothing"; a corpus where every key has one prices it at its
+    // maximum and reads as "the merge always wins". Neither is this fixture, and the assertions say
+    // which it is before any figure is taken.
+    assert_eq!(
+        DEADLINES,
+        shard.expires_at_ms().len(),
+        "the fixture seeded {DEADLINES} deadlines and the keyed map holds {}",
+        shard.expires_at_ms().len()
+    );
+    assert_eq!(
+        DEADLINES,
+        shard.expiry_by_deadline.len(),
+        "the two deadline maps disagree on their length, so one of them is not being maintained \
+         and neither figure below is about the state this prices"
+    );
+    assert!(
+        shard.strings().len() > DEADLINES,
+        "every key carries a deadline in this fixture, so the asymmetry this measures -- paying on \
+         all keys, recovering on some -- is not present and the break-even below is meaningless"
+    );
+
+    let keyed_b = deep_heap_bytes(shard.expires_at_ms());
+    let ordered_b = deep_heap_bytes(&shard.expiry_by_deadline);
+    let keys = shard.strings().len();
+
+    let recoverable_per_deadline = keyed_b as f64 / DEADLINES as f64;
+    let cost_b = (STRING_TABLE_CAPACITY * SLOT_WIDENING_B) as f64;
+    let recovered_b = keyed_b as f64;
+    let net_b = recovered_b - cost_b;
+    let break_even_deadlines = cost_b / recoverable_per_deadline;
+
+    println!("\n=== what a deadline costs, and which half a slot can take ===");
+    println!("  corpus: {keys} string keys, {DEADLINES} of them with a deadline");
+    println!(
+        "  expires_at_ms      (RECOVERABLE) {keyed_b:>10} B   {:>7.1} B per deadline",
+        recoverable_per_deadline
+    );
+    println!(
+        "  expiry_by_deadline (MUST STAY)   {ordered_b:>10} B   {:>7.1} B per deadline",
+        ordered_b as f64 / DEADLINES as f64
+    );
+    println!("\n=== the trade, at this deadline share ===");
+    println!(
+        "  paid:      {cost_b:>10.0} B   = {STRING_TABLE_CAPACITY} slots x {SLOT_WIDENING_B} B, on EVERY key"
+    );
+    println!("  recovered: {recovered_b:>10.0} B   = the keyed half, on {DEADLINES} keys");
+    println!(
+        "  net:       {net_b:>+10.0} B   ({:+.1} B/key over {keys} keys)",
+        net_b / keys as f64
+    );
+    println!(
+        "\n  break-even: {break_even_deadlines:.0} deadlines, which is {:.1}% of {keys} keys",
+        100.0 * break_even_deadlines / keys as f64
+    );
+    println!(
+        "  so the merge pays for itself only where more than {:.1}% of objects carry a deadline.",
+        100.0 * break_even_deadlines / keys as f64
+    );
+
+    // THE ONE SHAPE CLAIM: the ordered half is not a rounding error. If it ever became negligible
+    // the trade would be worth revisiting, because then the unrecoverable term would not matter.
+    assert!(
+        ordered_b * 3 > keyed_b,
+        "the ordered index is {ordered_b} B against the recoverable {keyed_b} B -- under a third of \
+         it. The term this measurement treats as UNRECOVERABLE has stopped being material next to \
+         the one it blocks, so the merge's arithmetic should be re-derived rather than read off \
+         this probe"
+    );
+}
+
+/// Does any OTHER resident map hold its own copy of the key characters?
+///
+/// The dirty index stopped holding one (#2183) and the probe above reports its payload row at zero.
+/// But that probe walks the BUCKET INDEX's allocations and the dirty index's, and nothing else --
+/// so a third holder would be invisible to it, and its bytes would be missing from the total rather
+/// than merely unattributed. `strings` and `context_nodes` are both keyed by `ModelKey`, which is
+/// `Arc<str>`, so they are the obvious candidates.
+///
+/// THIS IS A COUNT, NOT A READING. It compares ALLOCATION IDENTITY -- the pointer -- against the
+/// set the bucket index holds, because the characters are equal either way and equality cannot
+/// witness sharing.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib which_resident_maps_hold_their_own_key_characters -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore = "seeds a corpus under the counting allocator; run by name"]
+#[cfg(feature = "alloc-probe")]
+fn which_resident_maps_hold_their_own_key_characters() {
+    const RECORDS: usize = 8_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = probe_engine_on(dir.path(), crate::DEFAULT_END_ROUTING_BUCKET);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("own-{index:08}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("loaded shard");
+
+    // Every allocation the bucket index holds, by pointer.
+    let mut bucket: HashSet<usize> = HashSet::new();
+    walk_bucket_index_strings(&shard.bucket_index, &mut bucket);
+
+    // `strings` is keyed by ModelKey = Arc<str>. Are those the same allocations?
+    let mut strings_total = 0usize;
+    let mut strings_shared = 0usize;
+    let mut seen: HashSet<usize> = HashSet::new();
+    for key in shard.strings().keys() {
+        let ptr = key.as_ptr() as usize;
+        if !seen.insert(ptr) {
+            continue;
+        }
+        strings_total += 1;
+        if bucket.contains(&ptr) {
+            strings_shared += 1;
+        }
+    }
+
+    let dirty_shared = {
+        let mut shared = 0usize;
+        let mut seen: HashSet<usize> = HashSet::new();
+        for key in shard.dirty_objects.iter() {
+            let ptr = key.as_ptr() as usize;
+            if seen.insert(ptr) && bucket.contains(&ptr) {
+                shared += 1;
+            }
+        }
+        shared
+    };
+
+    println!();
+    println!("  {RECORDS} string writes on the shipped routing range");
+    println!("  bucket index holds            {} distinct key allocations", bucket.len());
+    println!("  strings                       {strings_total} distinct, {strings_shared} shared with the bucket index");
+    println!("  dirty index                   {dirty_shared} shared with the bucket index");
+    println!();
+    if strings_shared == strings_total && strings_total > 0 {
+        println!("  -> `strings` shares every key: there is ONE copy and the probe's total is right.");
+    } else {
+        let own = strings_total - strings_shared;
+        println!("  -> `strings` holds {own} allocations of its OWN, so the characters exist");
+        println!("     {} times and the per-key total above is MISSING those bytes.",
+                 1 + usize::from(own > 0));
+    }
+
+    // The dirty index's sharing is already guarded elsewhere; assert it here too so this test
+    // fails loudly if the adoption regresses, rather than quietly reporting a different subject.
+    assert!(dirty_shared > 0, "the dirty index shares nothing -- the key adoption has regressed");
+    assert_eq!(RECORDS, strings_total, "strings should hold one key per record");
+    assert_eq!(
+        strings_total, strings_shared,
+        "{strings_shared} of `strings`' {strings_total} key allocations are the same allocation          the bucket index holds, and EVERY ONE SHOULD BE. Five of its six insert sites used to          spell `key.as_str().into()`, allocating a second copy of characters the page index          already held; `ShardState::adopt_strings_key`, called once the page IS filed, closes          that. A shortfall here means the adoption stopped running and the duplicate is back --          and it will NOT show up in the per-key total, because a clone-based probe cannot see an          `Arc` payload."
+    );
+}
+
+/// How many times a CONTEXT key's characters exist, across the maps a context write touches.
+///
+/// The one-copy work so far has been about the maps keyed by `ModelKey`/`Arc<str>`, which CAN
+/// share an allocation. The rest are keyed by `String`, which always owns its characters --
+/// so a key landing in several of them has one copy per map, by construction, and no amount of
+/// adoption can fix that without changing the key type.
+///
+/// This counts the copies rather than assuming them. For a string workload only one of those maps
+/// is populated, which is why the per-key figures elsewhere do not show this at all.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib how_many_times_a_context_keys_characters_exist -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore = "seeds context events; run by name"]
+#[cfg(feature = "alloc-probe")]
+fn how_many_times_a_context_keys_characters_exist() {
+    const EVENTS: u64 = 400;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = probe_engine_on(dir.path(), crate::DEFAULT_END_ROUTING_BUCKET);
+    for index in 0..EVENTS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextWriteEvent {
+                tenant_hash: 7,
+                node_hash: 1_000 + index,
+                event: Box::new(crate::types::ContextEvent {
+                    event_id_hash: 0xDEAD_0000_0000_0000 | index,
+                    event_time_ms: 1_787_270_070_000 + index,
+                    ingestion_time_ms: 1_787_270_070_000 + index,
+                    kind: 9,
+                    event_type: 2,
+                    actor_hash: 0,
+                    status: 0,
+                    valid_until_ms: 0,
+                    confidence: 0.9,
+                    importance: 0.7,
+                    text: format!("event payload {index}"),
+                    source_ref: String::new(),
+                    related_node_hashes: Vec::new(),
+                    compact_attrs: Vec::new(),
+                    vector: Vec::new(),
+                }),
+                first_write_only: false,
+                cold_storage: false,
+            },
+        });
+        assert!(response.status.ok, "event {index}: {:?}", response.status);
+
+        // AND MARK BOTH FLAVOURS OF DIRTY, so `context_dirty_index` is populated rather than
+        // empty. Without this the probe reported it at 0 keys and said nothing about whether its
+        // keys can be shared -- which is the question, since it is one of the last two maps on
+        // this shard still keyed by `String`.
+        for command in [
+            Command::ContextMarkSummaryDirty {
+                tenant_hash: 7,
+                node_hash: 1_000 + index,
+                event_time_ms: 1_787_270_070_000 + index,
+                reason: 1,
+                propagate_depth: 0,
+            },
+            Command::ContextMarkEmbeddingDirty {
+                tenant_hash: 7,
+                node_hash: 1_000 + index,
+                event_time_ms: 1_787_270_070_000 + index,
+                reason: 1,
+                propagate_depth: 0,
+                clear: false,
+            },
+        ] {
+            let marked = engine.execute(ExecuteRequest { shard_id: 1, command });
+            assert!(marked.status.ok, "mark {index}: {:?}", marked.status);
+        }
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("loaded shard");
+
+    // Every String-keyed map a context write can touch, by name, with the key TEXTS it holds.
+    let holders: Vec<(&str, Vec<&str>)> = vec![
+        ("context_events (Arc-keyed)", shard.context_events().keys().map(|k| &**k).collect()),
+        ("context_event_timeline (Arc-keyed)", shard.context_event_timeline.keys().map(|k| &**k).collect()),
+        ("context_indexes", shard.context_indexes().keys().map(|k| &**k).collect()),
+        ("context_audits", shard.context_audits().keys().map(|k| &**k).collect()),
+        // NO KEY CHARACTERS AT ALL NOW, which is the point of this row rather than a gap in
+        // it. This map was the family's largest character holder -- 800 keys and 14,000
+        // characters at 400 events, 52% of every key character counted here -- and the one
+        // String-keyed map among them, so it could never share an allocation with anything.
+        // Its key is `DirtyMark` now: the tenant, the node and a flavour, 24 bytes inline and
+        // nothing on the heap. An empty text list is therefore the correct report, and the
+        // assertion below pins it so a reversion shows up as characters reappearing.
+        ("context_dirty_index (no key characters)", Vec::new()),
+        ("context_entities", shard.context_entities().keys().map(|k| &**k).collect()),
+        ("context_children", shard.context_children().keys().map(|k| &**k).collect()),
+        ("context_summaries", shard.context_summaries().keys().map(|k| &**k).collect()),
+        ("context_compressions", shard.context_compressions().keys().map(|k| &**k).collect()),
+        ("context_compression_watermark (Arc-keyed)", shard.context_compression_watermark().keys().map(|k| &**k).collect()),
+        ("context_nodes (Arc-keyed)", shard.context_nodes().keys().map(|k| &**k).collect()),
+    ];
+
+    let mut copies: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut holders_of: std::collections::HashMap<&str, Vec<&str>> =
+        std::collections::HashMap::new();
+    let mut characters = 0usize;
+    println!();
+    println!("  {EVENTS} context events written");
+    println!("  map                                keys   chars held");
+    for (name, keys) in &holders {
+        let chars: usize = keys.iter().map(|k| k.len()).sum();
+        if !keys.is_empty() {
+            characters += chars;
+        }
+        println!("  {name:34} {:>5}   {chars:>9}", keys.len());
+        for k in keys {
+            *copies.entry(k).or_insert(0) += 1;
+            holders_of.entry(k).or_insert_with(Vec::new).push(*name);
+        }
+    }
+    let distinct = copies.len();
+    // KEYS THAT EXIST IN EXACTLY ONE MAP CANNOT BE SHARED WITH ANYTHING, and that is the end of
+    // the one-copy road rather than a gap in it. A key is shareable only if some OTHER structure
+    // holds the same characters; the dirty keys carry their own prefixes (`ctx:dirty:`,
+    // `ctx:embdirty:`), no other map is keyed by them, and they are never written to the block
+    // store so the page index does not hold them either. One holder, one allocation, nothing to
+    // adopt.
+    let single_holder = copies.values().filter(|n| **n == 1).count();
+    let total_entries: usize = holders.iter().map(|(_, k)| k.len()).sum();
+    let mut by_count: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+    for n in copies.values() {
+        *by_count.entry(*n).or_insert(0) += 1;
+    }
+    println!();
+    println!("  distinct key texts: {distinct}; total map entries: {total_entries}");
+    println!("  key texts held by exactly ONE map: {single_holder} -- nothing to share with");
+    for (n, how_many) in &by_count {
+        println!("    {how_many} key texts exist in {n} map(s)");
+    }
+    println!("  characters held across all of them: {characters} B");
+    if distinct > 0 {
+        println!(
+            "  so {:.2} copies per distinct key, {:.1} B/key of characters",
+            total_entries as f64 / distinct as f64,
+            characters as f64 / distinct as f64
+        );
+    }
+    println!();
+    println!("  The rows marked Arc-keyed CAN hold one allocation between them, which is what");
+    println!("  the count below measures. A String-keyed row cannot: each of its entries owns");
+    println!("  its own characters no matter what any other map holds.");
+
+    // AND NOW BY ALLOCATION, WHICH IS A DIFFERENT QUESTION. The count above is a count of map
+    // ENTRIES per distinct key TEXT, so it cannot tell two maps holding ONE allocation from two
+    // maps holding two equal copies -- and that difference is the entire point of keying these two
+    // by `ModelKey`. Contents cannot tell them apart; pointers can.
+    let mut bucket: HashSet<usize> = HashSet::new();
+    walk_bucket_index_strings(&shard.bucket_index, &mut bucket);
+    let event_series_allocations: HashSet<usize> = shard
+        .context_events()
+        .keys()
+        .map(|k| k.as_ptr() as usize)
+        .collect();
+    let mut timeline_total = 0usize;
+    let mut shared_with_series = 0usize;
+    let mut shared_with_bucket = 0usize;
+    for key in shard.context_event_timeline.keys() {
+        let ptr = key.as_ptr() as usize;
+        timeline_total += 1;
+        if event_series_allocations.contains(&ptr) {
+            shared_with_series += 1;
+        }
+        if bucket.contains(&ptr) {
+            shared_with_bucket += 1;
+        }
+    }
+    println!();
+    println!("  BY ALLOCATION, not by text:");
+    println!("    time index keys                   {timeline_total:>5}");
+    println!("    same allocation as the series map {shared_with_series:>5}");
+    println!("    same allocation as bucket index   {shared_with_bucket:>5}");
+
+    // IS THERE A THIRD COPY AT ALL? A zero on the line above is AMBIGUOUS, and the two readings
+    // need different work: the page index might hold an equal-but-distinct copy of this key, or it
+    // might not hold the key yet at all. An adoption route exists only in the first case. Asking
+    // the lookup directly is the only way to tell, so ask it.
+    let mut lookup_holds = 0usize;
+    let mut lookup_distinct = 0usize;
+    for key in shard.context_event_timeline.keys() {
+        if let Some(canonical) = shard
+            .bucket_index
+            .object_block_lookup
+            .any_shared_object_key(&**key)
+        {
+            lookup_holds += 1;
+            if canonical.as_ptr() as usize != key.as_ptr() as usize {
+                lookup_distinct += 1;
+            }
+        }
+    }
+    println!("    page index holds the key          {lookup_holds:>5}");
+    println!("    ... as a DISTINCT allocation      {lookup_distinct:>5}");
+    println!(
+        "    adoption: {} calls, {} found no handle, {} moved",
+        crate::engine::state::CONTEXT_EVENT_ADOPT_CALLS.load(std::sync::atomic::Ordering::Relaxed),
+        crate::engine::state::CONTEXT_EVENT_ADOPT_NO_HANDLE
+            .load(std::sync::atomic::Ordering::Relaxed),
+        crate::engine::state::CONTEXT_EVENT_ADOPT_MOVED.load(std::sync::atomic::Ordering::Relaxed),
+    );
+
+    // ASSERTED IN BOTH DIRECTIONS, because one direction alone is not informative. "The pair
+    // shares one allocation" was ALREADY true while a second, equal allocation sat in the page
+    // index -- so it passing says nothing about the page index. The second assertion is the one
+    // that catches a leftover copy: no key the lookup holds may be a DISTINCT allocation.
+    //
+    // The adoption counters are printed and deliberately NOT asserted: they are process-global,
+    // so another test running in the same binary can move them, and a count that another test can
+    // change cannot carry a verdict about this one.
+    assert_eq!(
+        timeline_total, shared_with_bucket,
+        "{shared_with_bucket} of the time index's {timeline_total} key allocations are the same          allocation the PAGE INDEX holds, and every one should be. The pair files its maps during          execution, when the lookup does not yet hold the key, so the adoption after the bucket          index is filed is what closes it. A shortfall means that adoption stopped running or          moved to a point before the handle exists -- which is how it failed the first time, on          400 of 400 writes."
+    );
+    assert_eq!(
+        0, lookup_distinct,
+        "{lookup_distinct} of the keys the page index holds are a DISTINCT allocation from the          one the event maps hold, and none should be. This is the assertion that a passing          pair-sharing check cannot make: the pair shared one allocation while a second equal copy          sat in the lookup, and only comparing against the lookup finds it."
+    );
+    assert_eq!(
+        timeline_total, shared_with_series,
+        "{shared_with_series} of the time index's {timeline_total} key allocations are the same \
+         allocation the event series map holds, and EVERY ONE SHOULD BE: both maps are filed at one \
+         site from one handle. A shortfall means some caller went back to minting its own key, which \
+         puts a second copy of every event key's characters back -- and it will NOT show up in the \
+         per-key total, because a clone-based probe cannot see an `Arc` payload."
+    );
+
+    // THE GUARD THAT KEEPS ONE-COPY TRUE AS MAPS ARE ADDED.
+    //
+    // A key is shareable only when some OTHER structure holds the same characters, so the rule is
+    // NOT "every map should be `Arc`-keyed". The 800 dirty keys above live in exactly one map and
+    // have nothing to share with, which is why `context_dirty_index` keeping its `String` key
+    // costs nothing at all. The rule is: if a key text is held by MORE THAN ONE map, every holder
+    // must be able to share, or those characters exist twice -- and no clone-based byte probe will
+    // say so, because cloning an `Arc` is a refcount bump.
+    //
+    // So this fails when a `String`-keyed map starts holding a key another map already holds,
+    // which is exactly how a duplicate gets reintroduced after the adoption work.
+    let mut unshareable_duplicates: Vec<(&str, Vec<&str>)> = holders_of
+        .iter()
+        .filter(|(_, holders)| holders.len() > 1)
+        .filter(|(_, holders)| holders.iter().any(|name| !name.contains("Arc-keyed")))
+        .map(|(key, holders)| (*key, holders.clone()))
+        .collect();
+    unshareable_duplicates.sort();
+    assert!(
+        unshareable_duplicates.is_empty(),
+        "{} key texts are held by several maps where at least one CANNOT share, so those          characters exist more than once: {:?}. Either the new holder takes a `ModelKey` and joins          `adopt_object_key_allocations`, or it should not be keyed by the object key at all.",
+        unshareable_duplicates.len(),
+        &unshareable_duplicates[..unshareable_duplicates.len().min(4)]
+    );
+
+    assert!(
+        distinct > 0,
+        "no context keys landed -- the write path did not populate these maps"
+    );
+}
+
+/// WHAT A PER-SHARD RESIDENT BOUND RECOVERS, AND THAT ITS SIGNAL IS THIS SHARD'S OWN BYTES.
+///
+/// `what_a_dump_then_release_recovers_on_the_shipped_routing_range` proves a dump-then-release
+/// recovers the bulk of the derived index. It drives that sequence by hand, with
+/// `memory_pressure_threshold = 0`, which is not a trigger an operator can deploy.
+///
+/// WHEN THIS WAS WRITTEN the gate it passes through summed four NODE-WIDE cache terms with one
+/// per-shard index term, so a constant threshold fired on an idle shard whenever a busy one shared
+/// the process -- measured in `the_evict_gates_cache_terms_are_process_wide_not_per_shard`, which
+/// is still the standing measurement of the cache aggregate being node-wide. The gate itself has
+/// since been narrowed to `bucket_index_resident_bytes` alone
+/// (`the_evict_gate_reads_only_this_shards_own_bytes`), so both gates now read this shard's own
+/// bytes.
+///
+/// `apply_index_resident_bound` is the narrow bound. This measures what it recovers AND pins that
+/// it read the narrow signal -- `pressure_before` must equal this shard's own index bytes.
+///
+/// THE GUARD IS BIDIRECTIONAL, because "it fired" alone is satisfied by a gate that always fires:
+/// a bound of 0 must report disabled, a bound ABOVE this shard's bytes must refuse, and only a
+/// bound BELOW them may release anything.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_a_per_shard_resident_bound_recovers -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "seeds 40,000 records then dumps and releases under the counting allocator; run by name"]
+fn what_a_per_shard_resident_bound_recovers() {
+    const SHIPPED_END: u32 = 1023;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine_on(dir.path(), SHIPPED_END);
+    probe_seed(&engine, 40_000, 40, 1_000, 0);
+
+    let probe_keys: Vec<String> = (0..16).map(|i| format!("s{i}")).collect();
+    let readable = |engine: &TemporalEngine| -> usize {
+        probe_keys
+            .iter()
+            .filter(|key| {
+                matches!(
+                    engine
+                        .execute(ExecuteRequest {
+                            shard_id: 1,
+                            command: Command::StringGet { key: (*key).clone() },
+                        })
+                        .response,
+                    crate::types::CommandResponse::Bytes { value: Some(_) }
+                )
+            })
+            .count()
+    };
+    let snapshot = |engine: &TemporalEngine| -> (u64, u64, u64, u64, usize, usize, usize, usize) {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        (
+            deep_heap_bytes(&shard.bucket_index.bucket_map),
+            deep_heap_bytes(&shard.bucket_index.object_block_lookup),
+            deep_heap_bytes(&shard.dirty_objects),
+            deep_heap_bytes(shard),
+            shard.strings().len() + shard.features().len(),
+            shard.bucket_index.bucket_map.values().count(),
+            shard
+                .bucket_index
+                .bucket_map
+                .values()
+                .map(|b| b.block_index.len())
+                .sum(),
+            shard.bucket_index.released_buckets.len(),
+        )
+    };
+
+    // THE WHOLE-INDEX TOTAL, COMPUTED THE WAY THE COMPOSITION PROBE COMPUTES IT, so the figure
+    // after the bound is a MEASUREMENT of the same quantity rather than a subtraction of line
+    // items from a number taken in another run. Same three terms, same helpers: the whole
+    // `ShardState` plus each side's `Arc<str>` payloads counted once each.
+    let index_total = |engine: &TemporalEngine| -> (u64, u64, u64, u64) {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let whole = deep_heap_bytes(shard);
+        let (arc, _n) = arc_payload_bytes(&shard.bucket_index);
+        let (dirty_arc, _m, _s) = dirty_arc_payload_bytes(shard);
+        (whole + arc + dirty_arc, whole, arc, dirty_arc)
+    };
+    // Strings hold one address each and each series holds its points. The model maps keep every
+    // address across a release, so this denominator does not move with the bound.
+    const LIVE_ADDRESSES: u64 = 40_000 + 40 * 1_000;
+
+    // THE INDEX AT THE SAME SCOPE THE COMPARISON FIGURE USES, which is the only way the two
+    // numbers mean anything beside each other. That figure is an INDEX NODE per key -- a tree node
+    // wrapping a slot struct, reported by the allocator -- and it does NOT include the data the
+    // records hold. Our `TOTAL live heap` row DOES: `strings` and `features` are the model maps,
+    // the records themselves, and on this fixture they are most of it. Putting a data-inclusive
+    // total beside a node-only figure is the scope error that gets caught every time it is made.
+    //
+    // So this sums only the per-key INDEX structures: the whole bucket index measured in one call
+    // (its map, its object lookup and the rest of `CoreIndex`), the dirty index, the recency row,
+    // and the key payloads each side holds once.
+    let index_only = |engine: &TemporalEngine| -> (u64, u64, u64, u64, u64) {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let bucket_index = deep_heap_bytes(&shard.bucket_index);
+        let dirty = deep_heap_bytes(&shard.dirty_objects);
+        let recency = deep_heap_bytes(&shard.bucket_recency);
+        let (arc, _n) = arc_payload_bytes(&shard.bucket_index);
+        let (dirty_arc, _m, _s) = dirty_arc_payload_bytes(shard);
+        (
+            bucket_index + dirty + recency + arc + dirty_arc,
+            bucket_index,
+            dirty,
+            recency,
+            arc + dirty_arc,
+        )
+    };
+
+    let (bm0, lk0, dr0, whole0, keys, buckets0, pages0, released0) = snapshot(&engine);
+    let resident0 = engine.bucket_index_resident_bytes(1);
+    let read0 = readable(&engine);
+    let (total0, w0, a0, d0) = index_total(&engine);
+    let (idx0, bi0, di0, rc0, ap0) = index_only(&engine);
+
+    assert_eq!(40_040, keys, "denominator: the fixture did not seed the corpus it reports");
+    assert!(buckets0 < keys, "denominator: one bucket per key means this is the LEGACY range");
+    assert_eq!(0, released0, "denominator: the fixture starts with nothing released");
+    assert_eq!(probe_keys.len(), read0, "the fixture cannot read its own keys BEFORE the sequence");
+    assert!(resident0 > 0, "denominator: a zero resident figure cannot be bounded");
+
+    println!("=== before: {keys} keys, {buckets0} buckets, {pages0} pages ===");
+    println!("  this shard's own index resident bytes: {resident0}");
+
+    // --- CONTROL 1: a bound of zero is disabled and walks nothing. ---
+    let disabled = engine.apply_index_resident_bound(1, 0, 0);
+    assert_eq!(
+        "index_resident_bound_disabled", disabled.skipped_reason,
+        "a bound of 0 must mean disabled, so this is free to call on a deployment that set none"
+    );
+    assert_eq!(0, disabled.bucket_index_buckets_released, "a disabled bound released something");
+
+    // --- CONTROL 2: a bound ABOVE this shard's own bytes must refuse. ---
+    //
+    // This is the assertion that separates a narrow gate from the wide one. The wide gate handed
+    // this same number would OPEN, because its pressure is dominated by cache terms a release
+    // cannot reduce; the narrow gate sees only the index and declines.
+    let above = resident0.saturating_mul(2);
+    let refused = engine.apply_index_resident_bound(1, above, 0);
+    assert_eq!(
+        "index_resident_below_bound", refused.skipped_reason,
+        "a bound of {above} B is above this shard's {resident0} B of index and must refuse"
+    );
+    assert_eq!(0, refused.bucket_index_buckets_released, "a refused bound released something");
+    assert_eq!(
+        resident0, refused.pressure_before,
+        "the gate reported {} B of pressure where this shard's index is {resident0} B -- it read a \
+         signal wider than the shard, which is the contamination this entry point exists to avoid",
+        refused.pressure_before
+    );
+
+    // --- AND THE BOUND THAT FIRES: below this shard's own bytes. ---
+    let bound = resident0 / 2;
+    let report = engine.apply_index_resident_bound(1, bound, 0);
+    assert!(
+        report.skipped_reason.is_empty(),
+        "a bound of {bound} B under {resident0} B of index should have opened, not skipped on {:?}",
+        report.skipped_reason
+    );
+    assert_eq!(
+        resident0, report.pressure_before,
+        "the firing gate read {} B where this shard's index is {resident0} B",
+        report.pressure_before
+    );
+
+    let (bm1, lk1, dr1, whole1, keys1, buckets1, pages1, released1) = snapshot(&engine);
+    let resident1 = engine.bucket_index_resident_bytes(1);
+    let read1 = readable(&engine);
+
+    println!("=== after the bound fired: {buckets1} buckets, {pages1} pages, {released1} released ===");
+    let row = |name: &str, before: u64, after: u64| {
+        println!(
+            "  {name:<28} {before:>10} -> {after:>10} B   recovered {:>10} B  {:>8.1} B/key  {:>6.1}%",
+            before.saturating_sub(after),
+            before.saturating_sub(after) as f64 / keys as f64,
+            if before == 0 { 0.0 } else { 100.0 * before.saturating_sub(after) as f64 / before as f64 }
+        );
+    };
+    row("bucket_map", bm0, bm1);
+    row("object_block_lookup", lk0, lk1);
+    row("dirty_objects", dr0, dr1);
+    row("whole ShardState", whole0, whole1);
+    println!("  modelled resident {resident0} -> {resident1} B, bound was {bound} B");
+    println!("  pages {pages0} -> {pages1}, buckets {buckets0} -> {buckets1}, keys {keys} -> {keys1}");
+    println!("  reads: {read0} of {} before, {read1} after", probe_keys.len());
+
+    // --- THE RE-MEASURED WHOLE-INDEX TOTAL, which is the figure that answers "how big is the
+    // index now" rather than "how much did these three rows give back". ---
+    let (total1, w1, a1v, d1) = index_total(&engine);
+    println!();
+    println!("  WHOLE-INDEX TOTAL, re-measured rather than derived:");
+    println!(
+        "    before    {total0:>10} B   {:>8.1} B/key   {:>8.1} B/address   (whole {w0}, arc {a0}, dirty-arc {d0})",
+        total0 as f64 / keys as f64,
+        total0 as f64 / LIVE_ADDRESSES as f64
+    );
+    println!(
+        "    after     {total1:>10} B   {:>8.1} B/key   {:>8.1} B/address   (whole {w1}, arc {a1v}, dirty-arc {d1})",
+        total1 as f64 / keys as f64,
+        total1 as f64 / LIVE_ADDRESSES as f64
+    );
+    println!(
+        "    recovered {:>10} B   {:>8.1} B/key   {:>6.1}% of the whole index",
+        total0.saturating_sub(total1),
+        total0.saturating_sub(total1) as f64 / keys as f64,
+        100.0 * total0.saturating_sub(total1) as f64 / total0 as f64
+    );
+    // --- AND THE INDEX AT THE COMPARISON'S OWN SCOPE: no model data. ---
+    let (idx1, bi1, di1, rc1, ap1) = index_only(&engine);
+    println!();
+    println!("  INDEX ONLY -- per-key index structures, excluding the model data maps:");
+    println!(
+        "    before    {idx0:>10} B   {:>8.1} B/key   (bucket index {bi0}, dirty {di0}, recency {rc0}, key payloads {ap0})",
+        idx0 as f64 / keys as f64
+    );
+    println!(
+        "    after     {idx1:>10} B   {:>8.1} B/key   (bucket index {bi1}, dirty {di1}, recency {rc1}, key payloads {ap1})",
+        idx1 as f64 / keys as f64
+    );
+    println!(
+        "    the model data this EXCLUDES, for scope: strings + features = {} B ({:.1} B/key)",
+        total1.saturating_sub(idx1).saturating_sub(0),
+        total1.saturating_sub(idx1) as f64 / keys as f64
+    );
+    assert!(
+        idx1 < idx0,
+        "the index-only subtotal did not fall ({idx0} -> {idx1})"
+    );
+
+    assert!(
+        total1 < total0,
+        "the whole-index total did not fall ({total0} -> {total1}), so the per-term recoveries          above did not add up to anything at the index level"
+    );
+
+    // --- CORRECTNESS, NOT NEGOTIABLE. ---
+    assert_eq!(
+        probe_keys.len(),
+        read1,
+        "the bound made {} of {} keys unreadable, which makes every figure above worthless",
+        probe_keys.len() - read1,
+        probe_keys.len()
+    );
+    assert_eq!(keys, keys1, "the key count moved, which is data loss rather than reclaim");
+
+    // --- NON-VACUITY: every assertion above is satisfied by a bound that recovered nothing. ---
+    assert!(
+        released1 > 0,
+        "the bound opened and released nothing, so this measured the bare-release case"
+    );
+    assert!(
+        resident1 < resident0,
+        "the bound opened, released {released1} buckets, and this shard's own resident figure did \
+         not fall ({resident0} -> {resident1}) -- so the quantity the bound is written against is \
+         not the quantity the release reduces, which would make the bound unable to ever satisfy \
+         itself"
+    );
+}
+
+/// WHAT THE FEATURE SERIES WOULD COST AS AN OWNED ARRAY INSTEAD OF A B-TREE.
+///
+/// `features` is the largest single row left in the index after the resident bound fires -- 49.1
+/// B/key at a 40,040-key corpus -- and it holds 40 series of 1,000 addresses each. The row is
+/// CONTAINER, not payload: a point is `(u64, ElementEntry)` and `ElementEntry` is 16 bytes, so the
+/// payload is 24 bytes a point and the B-tree charges about twice that.
+///
+/// This prices the swap before anyone pays for it. The conversion is not a type swap --
+/// `OwnedTimestampedSeries` deliberately has no serde impl, so an adopting map needs a
+/// compatibility field and a decode fold -- so the saving has to be worth that before the slice is
+/// worth writing. Measured here rather than computed from `size_of`, because the allocator's
+/// rounding and the B-tree's fill are exactly what a `size_of` account gets wrong.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn what_the_feature_series_would_cost_as_an_owned_array() {
+    const POINTS: u64 = 1_000;
+    const SERIES: usize = 40;
+    const LIVE_KEYS: f64 = 40_040.0;
+
+    let point = |i: u64| -> (u64, ElementEntry) {
+        (i, ElementEntry::from_parts(1, i * 64, 64, Some(i & u64::from(u16::MAX)), Some(i)))
+    };
+
+    let mut trees: Vec<BTreeMap<u64, ElementEntry>> = Vec::with_capacity(SERIES);
+    for _ in 0..SERIES {
+        let mut tree = BTreeMap::new();
+        for i in 0..POINTS {
+            let (at, address) = point(i);
+            tree.insert(at, address);
+        }
+        trees.push(tree);
+    }
+    let mut arrays: Vec<crate::engine::timestamped_series::OwnedTimestampedSeries> =
+        Vec::with_capacity(SERIES);
+    for _ in 0..SERIES {
+        let mut array = crate::engine::timestamped_series::OwnedTimestampedSeries::default();
+        for i in 0..POINTS {
+            let (at, address) = point(i);
+            array.insert(at, address);
+        }
+        arrays.push(array);
+    }
+
+    let tree_bytes = deep_heap_bytes(&trees);
+    let array_bytes = deep_heap_bytes(&arrays);
+    let points = SERIES as f64 * POINTS as f64;
+    println!();
+    println!("  {SERIES} series x {POINTS} points, payload is 24 B a point:");
+    println!(
+        "    BTreeMap      {tree_bytes:>10} B   {:>6.1} B/point   {:>6.1} B/key at 40,040 keys",
+        tree_bytes as f64 / points,
+        tree_bytes as f64 / LIVE_KEYS
+    );
+    println!(
+        "    owned array   {array_bytes:>10} B   {:>6.1} B/point   {:>6.1} B/key at 40,040 keys",
+        array_bytes as f64 / points,
+        array_bytes as f64 / LIVE_KEYS
+    );
+    println!(
+        "    the swap is worth {:>6.1} B/key, taking the measured features row from 49.1 to {:.1}",
+        (tree_bytes.saturating_sub(array_bytes)) as f64 / LIVE_KEYS,
+        array_bytes as f64 / LIVE_KEYS
+    );
+
+    assert_eq!(16, std::mem::size_of::<ElementEntry>(), "the address width moved");
+    assert!(
+        array_bytes < tree_bytes,
+        "the owned array ({array_bytes} B) is not smaller than the B-tree ({tree_bytes} B), so the \
+         conversion would be churn -- and the compatibility field and decode fold it needs are not \
+         free"
+    );
+}
+
+/// WHAT THE `strings` MAP COSTS, AND WHERE ITS 54.0 B/KEY ACTUALLY GOES.
+///
+/// After the resident bound fires, `strings` is the largest row left in the index -- 54.0 B/key at
+/// a 40,040-key corpus -- and the entry it holds is 32 bytes: a 16-byte `Arc<str>` fat pointer and
+/// a 16-byte `ElementEntry`. So the row is 1.69x its own payload, and the question this answers is
+/// whether that is distributed slack a different container would avoid, or something intrinsic.
+///
+/// THE ANSWER IS CAPACITY ROUNDING, and it is worth pricing rather than guessing at: a hash table
+/// rounds to a power of two, so 40,000 entries live in 65,536 slots at a 61% load and the unused
+/// 39% is paid in full. A B-tree has no power-of-two step; it pays node headers instead. Which
+/// wins is an empirical question about THESE widths, and a previous swap of this kind measured a
+/// 1.93x REGRESSION, so the measurement comes before the change.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn where_the_string_maps_bytes_go_and_whether_a_btree_would_be_smaller() {
+    const KEYS: usize = 40_000;
+    const LIVE_KEYS: f64 = 40_040.0;
+
+    let entry = |i: usize| -> (std::sync::Arc<str>, ElementEntry) {
+        (
+            std::sync::Arc::from(format!("own-{i:08}").as_str()),
+            ElementEntry::from_parts(1, i as u64 * 64, 64, Some(0), Some(i as u64)),
+        )
+    };
+
+    let mut hash: HashMap<std::sync::Arc<str>, ElementEntry> = HashMap::new();
+    for i in 0..KEYS {
+        let (key, address) = entry(i);
+        hash.insert(key, address);
+    }
+    let mut presized: HashMap<std::sync::Arc<str>, ElementEntry> = HashMap::with_capacity(KEYS);
+    for i in 0..KEYS {
+        let (key, address) = entry(i);
+        presized.insert(key, address);
+    }
+    let mut tree: BTreeMap<std::sync::Arc<str>, ElementEntry> = BTreeMap::new();
+    for i in 0..KEYS {
+        let (key, address) = entry(i);
+        tree.insert(key, address);
+    }
+
+    // Measured WITHOUT the key payloads, which every candidate holds identically: a clone-based
+    // probe cannot see an `Arc` payload anyway, so what comes back is the table or the nodes.
+    let hash_bytes = deep_heap_bytes(&hash);
+    let presized_bytes = deep_heap_bytes(&presized);
+    let tree_bytes = deep_heap_bytes(&tree);
+    let payload = (KEYS * (std::mem::size_of::<std::sync::Arc<str>>()
+        + std::mem::size_of::<ElementEntry>())) as f64;
+
+    println!();
+    println!("  {KEYS} entries, payload is {} B each ({payload:.0} B total):",
+        std::mem::size_of::<std::sync::Arc<str>>() + std::mem::size_of::<ElementEntry>());
+    for (name, bytes, capacity) in [
+        ("HashMap, grown", hash_bytes, Some(hash.capacity())),
+        ("HashMap, pre-sized", presized_bytes, Some(presized.capacity())),
+        ("BTreeMap", tree_bytes, None),
+    ] {
+        println!(
+            "    {name:<20} {bytes:>10} B   {:>6.1} B/key at 40,040   {:>5.2}x payload{}",
+            bytes as f64 / LIVE_KEYS,
+            bytes as f64 / payload,
+            match capacity {
+                Some(c) => format!("   capacity {c}, load {:.0}%", 100.0 * KEYS as f64 / c as f64),
+                None => String::new(),
+            }
+        );
+    }
+    let best = tree_bytes.min(presized_bytes);
+    println!(
+        "    the best alternative is worth {:>5.1} B/key against the grown table",
+        (hash_bytes.saturating_sub(best)) as f64 / LIVE_KEYS
+    );
+
+    assert_eq!(16, std::mem::size_of::<ElementEntry>(), "the address width moved");
+    assert!(hash_bytes > 0 && tree_bytes > 0, "a zero figure cannot be compared");
+}
+
+/// WHAT ONE KEY WITH ONE PAGE COSTS, which is the denominator a per-key index figure uses.
+///
+/// Every figure in this file so far is taken on a fixture that seeds 40,000 strings AND 40 series
+/// of 1,000 points -- about TWO stored addresses per live key. A per-key index cost measured there
+/// is not comparable to one measured on a corpus of single-page objects, because half the addresses
+/// belong to forty keys. The honest matched measurement is one address per key, and this is it.
+///
+/// No feature series at all, so every live key owns exactly one page: `live_keys == pages`, which
+/// is asserted rather than assumed because the whole figure divides by it.
+///
+/// # WHICH SURFACE, AND WHAT THE FIGURE HAS DONE
+///
+/// RESIDENT bytes, over live keys, after the bound has fired. Not the stored index: that is
+/// `what_the_slot_index_floor_is`, on the `TSIDX` container, and 29.42 B/object there is not
+/// comparable to anything here.
+///
+/// This test reported 76.8 B/key when it was written and now reports 90.0 -- 17% worse, across a
+/// run of changes each meant to shrink this index. It drifted silently because nothing here
+/// asserted a level: "the total fell", "the keys survived" and "the reads answer" are all true at
+/// any level. The per-structure census and the two bounds at the end of this function are what
+/// close that, and the census says where the figure lives: about three quarters of it is the
+/// `strings` map, whose entry is a `ModelKey` plus an `ObjectSlot`.
+///
+/// # THE WHOLE OF THE 13.2 B/KEY IS ONE MAP, MEASURED AT BOTH ENDS
+///
+/// Run with this census at the commit that recorded 76.8 and at the commit that records 90.0, the
+/// two tables differ in ONE row to two decimal places:
+///
+/// ```text
+///                                           76.8 era    90.0 era     delta
+///   strings                                    54.07       67.17    +13.10
+///   bucket_index.bucket_map                    20.70       20.70     +0.00
+///   bucket_recency                              0.87        0.87     +0.00
+///   bucket_index, the rest of CoreIndex         0.31        0.32     +0.01
+///   the rest of ShardState, unnamed above       0.87        0.88     +0.01
+///   WHOLE ShardState clone                     76.81       89.95    +13.14
+/// ```
+///
+/// AND THE ROW IS ARITHMETIC, not a mystery. The string map's value went from a bare
+/// `ElementEntry` to an `ObjectSlot` -- 16 bytes to 24 -- so the entry went 32 to 40, and the
+/// table charges one control byte per slot on top. At 40,000 keys the table holds 65,536 slots in
+/// both eras, and `65_536 * 33 / 40_000` is 54.07 while `65_536 * 41 / 40_000` is 67.17. Both
+/// measured figures fall out of the entry width and the load factor exactly, which is also the
+/// statement of where a saving here would have to come from: the entry, or the slack.
+///
+/// WHAT THE EIGHT BYTES BUY is the owned-element array that lets one map hold the kinds that have
+/// several elements per object. An object with exactly one element carries the pointer and leaves
+/// it `None`, so on a corpus of single-page objects -- this one -- the eight bytes are paid and
+/// nothing hangs off them, and the table's own slack turns the eight into thirteen.
+///
+/// IT IS STILL RUN BY NOTHING. This test is `#[ignore]`d and behind `alloc-probe`, so the bounds
+/// below bite only when someone runs the command in this doc comment. That is the shape of every
+/// measurement in this file and it is why the figures in them rot; a bound that is not run is a
+/// record of what was true, not a gate.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_one_key_with_one_block_costs -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "seeds 40,000 single-page records then bounds the index; run by name"]
+fn what_one_key_with_one_block_costs() {
+    const SHIPPED_END: u32 = 1023;
+    const KEYS: usize = 40_000;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine_on(dir.path(), SHIPPED_END);
+    probe_seed(&engine, KEYS, 0, 0, 0);
+
+    let probe_keys: Vec<String> = (0..16).map(|i| format!("s{i}")).collect();
+    let readable = |engine: &TemporalEngine| -> usize {
+        probe_keys
+            .iter()
+            .filter(|key| {
+                matches!(
+                    engine
+                        .execute(ExecuteRequest {
+                            shard_id: 1,
+                            command: Command::StringGet { key: (*key).clone() },
+                        })
+                        .response,
+                    crate::types::CommandResponse::Bytes { value: Some(_) }
+                )
+            })
+            .count()
+    };
+    let total = |engine: &TemporalEngine| -> (u64, usize, usize) {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let whole = deep_heap_bytes(shard);
+        let (arc, _n) = arc_payload_bytes(&shard.bucket_index);
+        let (dirty_arc, _m, _s) = dirty_arc_payload_bytes(shard);
+        let blocks: usize = shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .map(|b| b.block_index.len())
+            .sum();
+        (whole + arc + dirty_arc, shard.strings().len(), blocks)
+    };
+
+    let (before, keys0, pages0) = total(&engine);
+    let census_before = snapshot_census(&engine);
+    let read0 = readable(&engine);
+    assert_eq!(KEYS, keys0, "denominator: the fixture did not seed the corpus it reports");
+    assert_eq!(
+        keys0, pages0,
+        "denominator: {pages0} pages over {keys0} keys is not one page per key, so this is not the \
+         single-page regime it claims to measure"
+    );
+    assert_eq!(probe_keys.len(), read0, "the fixture cannot read its own keys before the bound");
+    assert_eq!(
+        0,
+        engine
+            .shards
+            .read()
+            .expect("engine lock poisoned")
+            .get(&1)
+            .expect("shard")
+            .features()
+            .len(),
+        "denominator: a feature series would put a second address on some key"
+    );
+
+    let resident = engine.bucket_index_resident_bytes(1);
+    let report = engine.apply_index_resident_bound(1, resident / 2, 0);
+    assert!(report.skipped_reason.is_empty(), "the bound did not open: {:?}", report.skipped_reason);
+
+    let (after, keys1, pages1) = total(&engine);
+    let census_after = snapshot_census(&engine);
+    let read1 = readable(&engine);
+
+    println!();
+    println!("  ONE KEY, ONE PAGE -- {keys0} keys, {pages0} pages before, {pages1} after");
+    println!(
+        "    before   {before:>10} B   {:>6.1} B/key   (= B/page, one page a key)",
+        before as f64 / keys0 as f64
+    );
+    println!(
+        "    after    {after:>10} B   {:>6.1} B/key   recovered {:>6.1} B/key, {:>5.1}%",
+        after as f64 / keys0 as f64,
+        before.saturating_sub(after) as f64 / keys0 as f64,
+        100.0 * before.saturating_sub(after) as f64 / before as f64
+    );
+    println!("    reads {read0} of {} before, {read1} after", probe_keys.len());
+
+    // WHERE THE PER-KEY FIGURE LIVES, STRUCTURE BY STRUCTURE.
+    //
+    // A single per-key number can only be compared against another single per-key number, which
+    // says that something moved and never what. These rows say which structure it was.
+    //
+    // THE ROWS THAT ARE NOT PARTS OF THE WHOLE ARE SEPARATED, because they are added to it rather
+    // than contained in it: a clone probe cannot see an `Arc` payload, so the two `Arc<str>` rows
+    // are weighed on their own and the total is `whole + payloads`. Whatever the named structures
+    // do not cover inside the whole is printed as its own row rather than left implicit -- an
+    // unnamed remainder takes up precisely what the named terms miss, which is how a
+    // decomposition comes to be wrong in a term and still add up.
+    let outside = ["bucket-index Arc<str> payloads", "dirty-index Arc<str> payloads"];
+    let whole_row = "WHOLE ShardState clone";
+    println!();
+    println!("    PER STRUCTURE, over {keys0} keys           before      after      delta  (B/key)");
+    let per_key = |bytes: u64| bytes as f64 / keys0 as f64;
+    let mut structures_before = 0u64;
+    let mut structures_after = 0u64;
+    let mut payloads_before = 0u64;
+    let mut payloads_after = 0u64;
+    let mut whole_before = 0u64;
+    let mut whole_after = 0u64;
+    for ((name, was), (also, now)) in census_before.iter().zip(census_after.iter()) {
+        assert_eq!(name, also, "the two censuses are not in the same order");
+        if *name == whole_row {
+            whole_before = *was;
+            whole_after = *now;
+        } else if outside.contains(name) {
+            payloads_before += was;
+            payloads_after += now;
+        } else {
+            structures_before += was;
+            structures_after += now;
+        }
+        println!(
+            "      {name:<38} {:>8.2}   {:>8.2}   {:>+8.2}",
+            per_key(*was),
+            per_key(*now),
+            per_key(*now) - per_key(*was)
+        );
+    }
+    println!(
+        "      {:<38} {:>8.2}   {:>8.2}   {:>+8.2}",
+        "the rest of ShardState, unnamed above",
+        per_key(whole_before.saturating_sub(structures_before)),
+        per_key(whole_after.saturating_sub(structures_after)),
+        per_key(whole_after.saturating_sub(structures_after))
+            - per_key(whole_before.saturating_sub(structures_before))
+    );
+
+    // THE ACCOUNTING IDENTITY, so the rows above are this figure and not another one.
+    assert_eq!(
+        before,
+        whole_before + payloads_before,
+        "the before total is {before} B but the census says {} + {payloads_before}",
+        whole_before
+    );
+    assert_eq!(
+        after,
+        whole_after + payloads_after,
+        "the after total is {after} B but the census says {} + {payloads_after}",
+        whole_after
+    );
+    assert!(
+        structures_before <= whole_before,
+        "the named structures weigh {structures_before} B inside a {whole_before} B clone, so a \
+         row above is being counted twice and every share is wrong"
+    );
+    // AND THE ROWS THIS FIXTURE MUST POPULATE, each asserted non-zero: a decomposition whose
+    // terms are all zero still sums to the whole.
+    for owed in ["strings", "bucket_index.bucket_map", "bucket-index Arc<str> payloads"] {
+        let bytes = census_before
+            .iter()
+            .find(|(name, _)| *name == owed)
+            .map(|(_, bytes)| *bytes)
+            .unwrap_or_else(|| panic!("the census has no {owed} row"));
+        assert!(
+            bytes > 0,
+            "the {owed} row is 0 B on a 40,000-key single-page shard, so this census is weighing \
+             something other than the index this test reports"
+        );
+    }
+
+    assert_eq!(probe_keys.len(), read1, "the bound made keys unreadable");
+    assert_eq!(keys0, keys1, "the key count moved, which is data loss rather than reclaim");
+    assert!(after < before, "the total did not fall ({before} -> {after})");
+
+    // THE LEVEL, BOUNDED. This test printed 76.8 B/key when it was written and asserted NOTHING
+    // about that number: the only assertions were that the total fell, that the keys survived and
+    // that the reads still answered. All three hold at any level, so the figure drifted to 90.0
+    // across a run of changes each intended to shrink this index, and every one of them was green.
+    // A measurement with no bound on its level is a printout.
+    //
+    // THE SURFACE, so this bound cannot be read against a figure from a different one. These are
+    // RESIDENT bytes -- a clone-probe walk of `ShardState` plus the `Arc<str>` payloads a clone
+    // cannot see -- over the LIVE KEY count, after the resident bound has fired. It is not the
+    // stored index. `what_the_slot_index_floor_is` measures that, on the `TSIDX` container, and
+    // reports 29.42 B/object at 8,000 padded keys; the container is a zstd frame and its figure
+    // cannot name a field. Neither number bounds the other in either direction.
+    let after_per_key = after as f64 / keys0 as f64;
+    assert!(
+        after_per_key < 95.0,
+        "one key with one page costs {after_per_key:.1} B of RESIDENT index after the bound \
+         fires, over the 95 B bound. The per-structure table printed above says which structure \
+         moved -- take the bound down with it rather than up to meet it"
+    );
+    // AND THE TERM THAT DOMINATES IT IS BOUNDED BY NAME, so the next drift lands on a structure
+    // instead of on a total. Three quarters of the figure is one map.
+    let strings_after = census_after
+        .iter()
+        .find(|(name, _)| *name == "strings")
+        .map(|(_, bytes)| *bytes)
+        .expect("the census has no strings row");
+    let strings_per_key = strings_after as f64 / keys0 as f64;
+    assert!(
+        strings_per_key < 72.0,
+        "the string map weighs {strings_per_key:.1} B/key resident, over the 72 B bound, and it \
+         is about three quarters of the whole per-key figure. Its entry is a `ModelKey` and an \
+         `ObjectSlot` -- 16 B and 24 B -- and a hash table carrying 40 B of entry at its own load \
+         factor charges about 67. That is where a per-key saving on this corpus has to come from"
+    );
+}
+
+/// WHAT THE DEFAULT CONFIGURATION ACTUALLY DOES TO A 40,000-KEY SHARD, which is not the same
+/// question as what the bound delivers when it fires.
+///
+/// `what_one_key_with_one_block_costs` fires the bound DIRECTLY, at half the shard's own resident
+/// index, and measures 90.0 B/key afterwards (76.8 when that figure was first written; its own doc
+/// comment carries the per-structure comparison that says which map moved). That is what the
+/// mechanism is worth. It is NOT what
+/// a deployment running defaults sees, and conflating the two would be the more flattering of the
+/// two readings -- so this runs the default cycle, untouched, and records the verdict.
+///
+/// THE DEFAULT IS A CAP, NOT A SCHEDULE. It bounds the resident index at 64 MiB a shard. A
+/// 40,000-key single-page shard holds about 1.4 MB of it, so the default DECLINES here, and that
+/// is correct: a cap that fired at 2% of its limit would be a thrash, not a bound. The figure a
+/// deployment at this size sees is therefore the unbounded one, and an operator wanting the
+/// bounded figure sets the limit below that shard's own resident index.
+///
+/// Written down as a test rather than a comment because the alternative is a claim in a commit
+/// message that nothing checks.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "seeds 40,000 single-page records and runs the default cycle; run by name"]
+fn what_the_default_configuration_does_to_a_forty_thousand_key_shard() {
+    const SHIPPED_END: u32 = 1023;
+    const KEYS: usize = 40_000;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine_on(dir.path(), SHIPPED_END);
+    probe_seed(&engine, KEYS, 0, 0, 0);
+
+    let total = |engine: &TemporalEngine| -> u64 {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let (arc, _n) = arc_payload_bytes(&shard.bucket_index);
+        let (dirty_arc, _m, _s) = dirty_arc_payload_bytes(shard);
+        deep_heap_bytes(shard) + arc + dirty_arc
+    };
+
+    let defaults = crate::engine::reports::StorageManagerCycleRequest::default();
+    let limit = defaults.index_resident_limit_bytes;
+    let resident = engine.bucket_index_resident_bytes(1);
+    let before = total(&engine);
+
+    println!();
+    println!("  DEFAULT CONFIGURATION on a {KEYS}-key single-page shard:");
+    println!("    default index_resident_limit_bytes : {limit} B ({} MiB)", limit / (1024 * 1024));
+    println!("    this shard's own resident index    : {resident} B");
+    println!(
+        "    so the default {} here",
+        if resident >= limit { "FIRES" } else { "DECLINES" }
+    );
+
+    let report = engine.apply_index_resident_bound(1, limit, defaults.eviction_batch_limit);
+    let after = total(&engine);
+    println!("    verdict                            : {:?}", report.skipped_reason);
+    println!(
+        "    index total                        : {before} -> {after} B   ({:.1} -> {:.1} B/key)",
+        before as f64 / KEYS as f64,
+        after as f64 / KEYS as f64
+    );
+    println!(
+        "    the shard would have to hold about {:.0}x this many keys for the default to fire",
+        limit as f64 / resident as f64
+    );
+
+    // THE HONEST PAIR, asserted so neither half can be quoted without the other.
+    assert!(limit > 0, "the default bound is disabled, so nothing bounds a growing index");
+    assert!(
+        resident < limit,
+        "this corpus is at or above the default bound, so the default DOES fire here and the \
+         prose above is wrong"
+    );
+    assert_eq!(
+        "index_resident_below_bound", report.skipped_reason,
+        "the default declined for a reason other than being below the bound"
+    );
+    assert_eq!(before, after, "the default declined and yet the index moved");
+}
+
+/// WHY THERE ARE TWENTY-SIX PER-KEY MAPS AND NOT ONE, measured on one key written four ways.
+///
+/// The consolidation question is not "could these maps be merged" but "would merging them save
+/// anything", and that turns entirely on whether one KEY TEXT is held by several of them. A record
+/// folded into the consolidated map pays `ObjectSlot` at 32 bytes where a bare address map pays
+/// `ElementEntry` at 16 -- so consolidating a key that lives in exactly ONE map makes it BIGGER by
+/// 16 bytes, and only a key living in several maps gets smaller by losing the other entries.
+///
+/// So this writes the SAME raw key through four families and counts the holders of every key text
+/// the shard ends up with. The answer is a property of how the keys are DERIVED, not of the
+/// containers: each family prefixes the raw key with its own name, so the texts are disjoint.
+///
+/// A MAP SHOWING ZERO KEYS HERE IS NOT A MAP WITH NO WRITER, and reading it that way was an error
+/// made against this very output. `control_state_uuid`, `control_state_rollups` and
+/// `feature_rollups` report zero on this fixture and ALL THREE have production writers: the first
+/// through a multi-line chain (`shard` / `.control_state_uuid` / `.insert(..)`) that a single-line
+/// grep cannot match, the other two through `windowed_sum_series(&mut shard.., ..)`, which inserts
+/// into whatever map it is handed. `control_state_uuid` is also `#[serde(default)]`, so a stored
+/// image fills it with no code path involved at all.
+///
+/// So this probe answers "is this key duplicated", never "is this map dead". The second question
+/// needs the three checks a grep misses: multi-line chains, `&mut` escapes into helpers, and
+/// deserialization.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib why_there_are_many_per_key_maps -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "writes one key through four families; run by name"]
+fn why_there_are_many_per_key_maps_and_not_one() {
+    const KEYS: usize = 64;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = probe_engine_on(dir.path(), crate::DEFAULT_END_ROUTING_BUCKET);
+
+    for index in 0..KEYS {
+        let raw = format!("k{index:04}");
+        let commands = vec![
+            Command::StringSet { key: raw.clone(), value: vec![b'v'; 32] },
+            Command::FeatureAppend {
+                key: raw.clone(),
+                points: vec![crate::types::FeaturePoint {
+                    timestamp_ms: 1_787_270_070_000 + index as u64,
+                    value: vec![b'f'; 8],
+                }],
+            },
+            Command::ControlStateSetAndGet {
+                family: crate::types::ControlStateFamily::Counter,
+                key: raw.clone(),
+                timestamp_ms: 1_787_270_070_000 + index as u64,
+                amount: 1,
+                start_ms: 0,
+                end_ms: u64::MAX,
+                aggregator: "sum".to_string(),
+            },
+            Command::ControlStateSelectionSet {
+                key: raw.clone(),
+                value: vec![b's'; 8],
+                occur_time_ms: 1_787_270_070_000 + index as u64,
+                ttl_ms: 0,
+                selection_type: crate::types::ControlStateSelectionType::Last,
+            },
+            // THE REMAINING MAPS WITH WRITERS, so this covers every per-key map a non-context
+            // write can reach rather than the four the first version happened to drive. The last
+            // one is a QUERY on purpose: `FeatureAggQuery` caches its decoded answer in
+            // `feature_values` under the same key `features` is keyed by, so a read is what puts
+            // a second holder on the key.
+            Command::SeenCheck {
+                key: raw.clone(),
+                member: vec![b'm'; 8],
+                window_ms: 60_000,
+            },
+            Command::BucketTake {
+                key: raw.clone(),
+                tokens: 1.0,
+                capacity: 10.0,
+                refill_per_sec: 1.0,
+            },
+            Command::FeatureAggQuery {
+                key: raw.clone(),
+                start_ms: 0,
+                end_ms: u64::MAX,
+                aggregator: "sum".to_string(),
+                count: None,
+            },
+        ];
+        for command in commands {
+            let response = engine.execute(ExecuteRequest { shard_id: 1, command });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("loaded shard");
+
+    // Every per-key map a non-context write can land in, with the key TEXTS it holds.
+    // EACH KEY CARRIES ITS DATA POINTER, which is what makes this check representation-agnostic.
+    // A `String` key and an `Arc<str>` key both expose the address of their characters, so "do
+    // these two maps hold ONE allocation or two equal ones" is answerable without knowing, or
+    // maintaining a list of, which maps are keyed by what. An allowlist of map names goes stale
+    // the moment a map is converted; a pointer does not.
+    let holders: Vec<(&str, Vec<(&str, usize)>)> = vec![
+        ("strings", shard.strings().keys().map(|k| (&**k, k.as_ptr() as usize)).collect()),
+        ("features", shard.features().keys().map(|k| (&**k, k.as_ptr() as usize)).collect()),
+        (
+            "control_state",
+            shard.control_state().keys().map(|k| (&**k, k.as_ptr() as usize)).collect(),
+        ),
+        (
+            "control_state_selection",
+            shard
+                .control_state_selection
+                .keys()
+                .map(|k| (&**k, k.as_ptr() as usize))
+                .collect(),
+        ),
+        (
+            "control_state_uuid",
+            shard.control_state_uuid().keys().map(|k| (&**k, k.as_ptr() as usize)).collect(),
+        ),
+        (
+            "control_state_rollups",
+            shard.control_state_rollups().keys().map(|k| (&**k, k.as_ptr() as usize)).collect(),
+        ),
+        (
+            "feature_values",
+            shard.feature_values().keys().map(|k| (&**k, k.as_ptr() as usize)).collect(),
+        ),
+        (
+            "feature_rollups",
+            shard.feature_rollups().keys().map(|k| (&**k, k.as_ptr() as usize)).collect(),
+        ),
+        ("seen", shard.seen.keys().map(|k| (&**k, k.as_ptr() as usize)).collect()),
+        ("buckets", shard.buckets.keys().map(|k| (&**k, k.as_ptr() as usize)).collect()),
+        (
+            "expires_at_ms",
+            shard.expires_at_ms().keys().map(|k| (&**k, k.as_ptr() as usize)).collect(),
+        ),
+    ];
+
+    let mut holders_of: std::collections::BTreeMap<&str, Vec<(&str, usize)>> =
+        std::collections::BTreeMap::new();
+    println!();
+    println!("  {KEYS} raw keys, each written through seven commands across every writable per-key map");
+    println!("  map                            keys");
+    for (name, keys) in &holders {
+        println!("  {name:30} {:>5}", keys.len());
+        for (text, ptr) in keys {
+            holders_of.entry(text).or_default().push((*name, *ptr));
+        }
+    }
+
+    let mut by_holders: std::collections::BTreeMap<usize, usize> =
+        std::collections::BTreeMap::new();
+    for maps in holders_of.values() {
+        *by_holders.entry(maps.len()).or_insert(0) += 1;
+    }
+    println!();
+    println!("  distinct key texts: {}", holders_of.len());
+    for (n, how_many) in &by_holders {
+        println!("    {how_many} texts are held by {n} map(s)");
+    }
+    let shareable: usize = holders_of.values().filter(|m| m.len() > 1).count();
+    println!("  texts held by MORE THAN ONE map -- the only consolidation candidates: {shareable}");
+    println!();
+    println!("  a sample of the texts one raw key turns into:");
+    for (text, maps) in holders_of.iter().filter(|(t, _)| t.contains("k0000")) {
+        println!("    {text:38} <- {maps:?}");
+    }
+    println!();
+    println!(
+        "  widths: ElementEntry {} B, ObjectRecord {} B, ObjectSlot {} B -- so folding a key that",
+        std::mem::size_of::<ElementEntry>(),
+        std::mem::size_of::<crate::engine::object_record::ObjectRecord>(),
+        std::mem::size_of::<crate::engine::object_record::ObjectSlot>()
+    );
+    println!("  lives in ONE map into the consolidated map makes it larger, not smaller.");
+
+    // THE GUARD: one key text, one allocation, whatever holds it.
+    //
+    // Measured by POINTER, so it cannot be satisfied by two maps holding equal copies. Any text
+    // whose holders report more than one distinct address has its characters stored once per
+    // address, and a clone-based byte probe will never say so, because cloning an `Arc` is a
+    // refcount bump.
+    let mut duplicated: Vec<(&str, Vec<(&str, usize)>)> = holders_of
+        .iter()
+        .filter(|(_, held)| {
+            held.iter().map(|(_, ptr)| *ptr).collect::<std::collections::HashSet<_>>().len() > 1
+        })
+        .map(|(text, held)| (*text, held.clone()))
+        .collect();
+    duplicated.sort();
+    println!();
+    println!(
+        "  by ALLOCATION: {} of {} texts are stored more than once",
+        duplicated.len(),
+        holders_of.len()
+    );
+    assert!(
+        duplicated.is_empty(),
+        "{} key texts are stored more than once -- the holders report different addresses for the          same characters: {:?}. A map holding a key another map already holds must take a          `ModelKey` and join `adopt_object_key_allocations`.",
+        duplicated.len(),
+        &duplicated[..duplicated.len().min(3)]
+    );
+
+    assert!(!holders_of.is_empty(), "no keys landed -- the write path populated nothing");
+    assert!(
+        std::mem::size_of::<crate::engine::object_record::ObjectSlot>()
+            > std::mem::size_of::<ElementEntry>(),
+        "the consolidated slot is no longer wider than a bare address, so the arithmetic above \
+         changed and the conclusion has to be re-derived"
+    );
+}
+
+/// WHAT CONSOLIDATING THE THREE HOLDERS OF A RAW KEY WOULD COST, AND AT WHAT OVERLAP IT PAYS.
+///
+/// `why_there_are_many_per_key_maps_and_not_one` shows a raw key landing in `strings`, `features`
+/// and `control_state_selection`. The obvious next move is one entry per key instead of three, and
+/// the obvious place is the consolidated map -- except that `ObjectRecord` is 24 bytes carrying a
+/// deadline word and a page-address word, and nothing else. It cannot hold an 8-byte series or a
+/// 40-byte selection value: those maps are DOMAIN-valued, not address-valued, so they cannot fold
+/// into `ObjectSlot` without widening it.
+///
+/// So the question is what a PURPOSE-BUILT consolidated entry would cost, and the answer has two
+/// arms rather than one number:
+///
+///   * a key held by all three maps pays one key field instead of three, and one table instead of
+///     three -- the win;
+///   * a key held by ONE map pays the slots of the two values it does not have -- the loss.
+///
+/// Which dominates is a property of the WORKLOAD, not of the design, so this measures both arms and
+/// prints the overlap fraction where they cross. A design chosen without that fraction is chosen on
+/// the arm whoever argued for it happened to measure.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_consolidating_three_holders_would_cost -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "builds four map shapes at 20,000 keys; run by name"]
+fn what_consolidating_three_holders_would_cost() {
+    use crate::engine::timestamped_series::OwnedTimestampedSeries;
+    const KEYS: usize = 20_000;
+
+    // The union a consolidated entry would have to hold: every value, each optional, because a key
+    // present in one map has nothing for the other two.
+    // `Clone` because `deep_heap_bytes` measures by cloning -- the probe cannot weigh a shape
+    // it cannot copy.
+    #[allow(dead_code)]
+    #[derive(Clone)]
+    struct Consolidated {
+        address: Option<ElementEntry>,
+        series: Option<OwnedTimestampedSeries>,
+        selection: Option<(u64, Vec<u8>, u8)>,
+    }
+
+    let key = |i: usize| -> std::sync::Arc<str> { std::sync::Arc::from(format!("k{i:08}").as_str()) };
+    let address = |i: usize| ElementEntry::from_parts(1, i as u64 * 64, 64, Some(0), Some(i as u64));
+    let series = |i: usize| {
+        let mut s = OwnedTimestampedSeries::default();
+        s.insert(i as u64, address(i));
+        s
+    };
+    let selection = || (7u64, vec![b's'; 8], 1u8);
+
+    // ARM A: three maps, one entry each, every key in all three. Keys SHARED, because that is the
+    // state on this branch -- the adoption puts all three holders on one allocation, so the only
+    // thing three maps still cost over one is the key FIELD and the table, not the characters.
+    let shared: Vec<std::sync::Arc<str>> = (0..KEYS).map(key).collect();
+    let mut m_strings: HashMap<std::sync::Arc<str>, ElementEntry> = HashMap::new();
+    let mut m_series: HashMap<std::sync::Arc<str>, OwnedTimestampedSeries> = HashMap::new();
+    let mut m_selection: HashMap<std::sync::Arc<str>, (u64, Vec<u8>, u8)> = HashMap::new();
+    for (i, k) in shared.iter().enumerate() {
+        m_strings.insert(std::sync::Arc::clone(k), address(i));
+        m_series.insert(std::sync::Arc::clone(k), series(i));
+        m_selection.insert(std::sync::Arc::clone(k), selection());
+    }
+    let three_maps =
+        deep_heap_bytes(&m_strings) + deep_heap_bytes(&m_series) + deep_heap_bytes(&m_selection);
+
+    // ARM B: one map, one entry per key, all three values present.
+    let mut m_one: HashMap<std::sync::Arc<str>, Consolidated> = HashMap::new();
+    for (i, k) in shared.iter().enumerate() {
+        m_one.insert(
+            std::sync::Arc::clone(k),
+            Consolidated {
+                address: Some(address(i)),
+                series: Some(series(i)),
+                selection: Some(selection()),
+            },
+        );
+    }
+    let one_map_full = deep_heap_bytes(&m_one);
+
+    // ARM C: the LOSING arm -- every key in one map only, three maps.
+    let mut c_strings: HashMap<std::sync::Arc<str>, ElementEntry> = HashMap::new();
+    for (i, k) in shared.iter().enumerate() {
+        c_strings.insert(std::sync::Arc::clone(k), address(i));
+    }
+    let three_maps_no_overlap = deep_heap_bytes(&c_strings);
+
+    // ARM D: the same keys in the consolidated shape, two slots empty.
+    let mut d_one: HashMap<std::sync::Arc<str>, Consolidated> = HashMap::new();
+    for (i, k) in shared.iter().enumerate() {
+        d_one.insert(
+            std::sync::Arc::clone(k),
+            Consolidated { address: Some(address(i)), series: None, selection: None },
+        );
+    }
+    let one_map_sparse = deep_heap_bytes(&d_one);
+
+    println!();
+    println!("  {KEYS} keys, key allocations SHARED in every arm (so this prices fields and tables)");
+    println!(
+        "    widths: ElementEntry {} B, OwnedTimestampedSeries {} B, selection {} B, Consolidated {} B",
+        std::mem::size_of::<ElementEntry>(),
+        std::mem::size_of::<OwnedTimestampedSeries>(),
+        std::mem::size_of::<(u64, Vec<u8>, u8)>(),
+        std::mem::size_of::<Consolidated>()
+    );
+    println!();
+    println!("  FULL OVERLAP -- every key in all three:");
+    println!("    three maps      {three_maps:>10} B   {:>7.1} B/key", three_maps as f64 / KEYS as f64);
+    println!("    one map         {one_map_full:>10} B   {:>7.1} B/key", one_map_full as f64 / KEYS as f64);
+    let win = three_maps as f64 - one_map_full as f64;
+    println!("    consolidation {:>+12.1} B   {:>+7.1} B/key", win, win / KEYS as f64);
+    println!();
+    println!("  NO OVERLAP -- every key in one map only:");
+    println!(
+        "    one bare map    {three_maps_no_overlap:>10} B   {:>7.1} B/key",
+        three_maps_no_overlap as f64 / KEYS as f64
+    );
+    println!(
+        "    one map, sparse {one_map_sparse:>10} B   {:>7.1} B/key",
+        one_map_sparse as f64 / KEYS as f64
+    );
+    let loss = three_maps_no_overlap as f64 - one_map_sparse as f64;
+    println!("    consolidation {:>+12.1} B   {:>+7.1} B/key", loss, loss / KEYS as f64);
+    println!();
+    let per_key_win = win / KEYS as f64;
+    let per_key_loss = -loss / KEYS as f64;
+    if per_key_win > 0.0 && per_key_loss > 0.0 {
+        let breakeven = per_key_loss / (per_key_win + per_key_loss);
+        println!(
+            "  BREAK-EVEN: consolidation pays once more than {:.1}% of keys are held by all three.",
+            100.0 * breakeven
+        );
+        println!("  Below that fraction it costs more than the three maps it replaces.");
+    } else {
+        println!("  One arm does not trade -- read the two figures above rather than a fraction.");
+    }
+
+    assert!(three_maps > 0 && one_map_full > 0, "a zero figure cannot be compared");
+}
+
+/// WHAT MAKING `control_state`s KEY A SHARED HANDLE COSTS AND SAVES, BOTH HALVES SEPARATELY.
+///
+/// `which_string_keyed_holders_duplicate_a_key_another_map_holds` shows the raw-keyed half of
+/// `control_state` owning a second copy of characters three other maps already agreed on, 8 of 8
+/// keys. Converting the key to `ModelKey` lets that half share. But one map cannot have two key
+/// types, so the DECORATED half -- `control_state:<family>:<key>`, which no other map holds --
+/// is converted too, and for that half sharing is impossible. It can only cost.
+///
+/// So the change has two arms, and a single average would hide one of them:
+///
+///   * raw half: the inline key field goes 24 -> 16 bytes AND the characters stop being a second
+///     allocation, because the handle is the one the page index already owns;
+///   * decorated half: the inline field still goes 24 -> 16, but the characters are STILL one
+///     allocation, now with two counter words ahead of them.
+///
+/// # THE DECORATED HALF WAS PREDICTED TO COST AND IT DOES NOT
+///
+/// This test was written expecting the decorated half to be a LOSS -- the two counter words an
+/// `Arc<str>` puts ahead of the bytes looked like they would cross an allocator rounding step
+/// that the `String` did not. Measured at 20,000 keys, that is wrong: the decorated half improves
+/// by a flat **10.2 B/key** at every key length tried, because the 8 bytes the inline field gives
+/// up (24 -> 16, a fat pointer rather than ptr/len/capacity) shrinks the table as well, and at
+/// these lengths `len + 16` lands in the same bin as `len` did.
+///
+/// So there is no overlap fraction to satisfy: the conversion pays on BOTH kinds of key, and the
+/// `println!` below reports that rather than a break-even. The assert at the end pins the only
+/// thing that must still hold -- that the raw-half saving GROWS with key length, because that is
+/// the signature of a character allocation that stopped happening rather than of an inline field
+/// that merely got smaller.
+///
+/// Measured, `chunk_bytes`, 20,000 keys:
+///
+///   key length    raw half            decorated half
+///   8             401.0 -> 342.4      400.6 -> 390.4
+///   24            400.6 -> 342.4      416.6 -> 406.4
+///   48            432.6 -> 342.4      448.6 -> 438.4
+///
+/// Two things to read carefully there. The raw-half saving is a STEP, not a slope: 58.6 at length
+/// 8 and 58.2 at 24 are the same figure, and it jumps to 90.2 at 48 -- so quoting one number as
+/// "the saving" is quoting one cell. And the ~400 B/key absolute is almost all the one-point
+/// `BTreeMap` value, not the key; only the differences between arms are about the key.
+///
+/// # WHY THIS MEASURES BY BUILDING AND NOT BY `deep_heap_bytes`
+///
+/// `deep_heap_bytes` measures by CLONING, and cloning an `Arc` is a refcount bump -- so it cannot
+/// see an `Arc` payload at all. For the shared arm that happens to be right, because those
+/// characters genuinely belong to the page index rather than to this map. For the DECORATED arm it
+/// is wrong in the direction that flatters the change: that map owns its `Arc` outright, and a
+/// clone probe would report its characters as free. So every arm here is built under the counting
+/// allocator instead, with the key texts materialised OUTSIDE the probe, so each arm is charged
+/// for exactly one key allocation of its own kind and nothing else.
+///
+/// The figure is `chunk_bytes`, what the allocator actually set aside, NOT the `alloc_bytes` that
+/// `deep_heap_bytes` and therefore most published figures in this file report. That is deliberate
+/// here -- an `Arc<str>` adds two counter words to the request, which is exactly the kind of thing
+/// that crosses a rounding step and would be invisible in the requested figure -- but it means a
+/// number from this test is NOT directly comparable with a B/key figure from the others.
+///
+/// rust-internal: measures this crates own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_a_shared_control_state_key_costs -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "builds four map shapes at three key lengths; run by name, and ALONE -- the \n           allocation counters are process-global, so a test running beside this one is \n           counted into its arms"]
+fn what_a_shared_control_state_key_costs_on_each_half() {
+    const KEYS: usize = 20_000;
+
+    println!();
+    println!("  {KEYS} keys per arm, built under the counting allocator (not cloned)");
+
+    let mut rows: Vec<(usize, f64, f64)> = Vec::new();
+
+    // Key lengths that matter: the allocator rounds, so a figure at one length is one point on a
+    // step function. 8 is short; 24 and 48 carry Arc<str>s two-refcount header into further bins,
+    // and 48 is a realistic object key.
+    for key_len in [8usize, 24, 48] {
+        let pad = |mut s: String| {
+            while s.len() < key_len {
+                s.push('x');
+            }
+            s
+        };
+        // Materialised OUTSIDE every probe: these stand for text the caller already has.
+        let raw_texts: Vec<String> = (0..KEYS).map(|i| pad(format!("k{i:07}"))).collect();
+        let dec_texts: Vec<String> =
+            raw_texts.iter().map(|k| format!("control_state:h:{k}")).collect();
+        // The handles the page index owns. The shared arm borrows from here, which is what
+        // adoption does -- so these characters are not charged to the map under test, exactly as
+        // they are not charged in the engine.
+        let handles: Vec<std::sync::Arc<str>> =
+            raw_texts.iter().map(|k| std::sync::Arc::from(&k[..])).collect();
+
+        let series = |i: usize| {
+            let mut m = std::collections::BTreeMap::new();
+            m.insert(i as u64, i as i64);
+            m
+        };
+
+        // Every arm allocates the same table and the same series, so the difference between two
+        // arms is the key and only the key.
+        let owned_keys = |texts: &Vec<String>| -> u64 {
+            let probe = Probe::start();
+            let mut map: HashMap<String, std::collections::BTreeMap<u64, i64>> = HashMap::new();
+            for (i, text) in texts.iter().enumerate() {
+                map.insert(text.clone(), series(i));
+            }
+            std::hint::black_box(&map);
+            probe.stop().chunk_bytes
+        };
+        let minted_arc_keys = |texts: &Vec<String>| -> u64 {
+            let probe = Probe::start();
+            let mut map: HashMap<std::sync::Arc<str>, std::collections::BTreeMap<u64, i64>> =
+                HashMap::new();
+            for (i, text) in texts.iter().enumerate() {
+                map.insert(std::sync::Arc::from(&text[..]), series(i));
+            }
+            std::hint::black_box(&map);
+            probe.stop().chunk_bytes
+        };
+
+        let raw_owned = owned_keys(&raw_texts);
+        let raw_shared = {
+            let probe = Probe::start();
+            let mut map: HashMap<std::sync::Arc<str>, std::collections::BTreeMap<u64, i64>> =
+                HashMap::new();
+            for (i, handle) in handles.iter().enumerate() {
+                map.insert(std::sync::Arc::clone(handle), series(i));
+            }
+            std::hint::black_box(&map);
+            probe.stop().chunk_bytes
+        };
+        let dec_owned = owned_keys(&dec_texts);
+        let dec_minted = minted_arc_keys(&dec_texts);
+
+        let per = |bytes: u64| bytes as f64 / KEYS as f64;
+        let raw_win = per(raw_owned) - per(raw_shared);
+        let dec_cost = per(dec_minted) - per(dec_owned);
+        rows.push((key_len, raw_win, dec_cost));
+
+        println!();
+        println!("  key length {key_len}");
+        println!(
+            "    raw half        String {:>7.1}  ->  shared {:>7.1} B/key   {:+7.1}",
+            per(raw_owned),
+            per(raw_shared),
+            -raw_win
+        );
+        println!(
+            "    decorated half  String {:>7.1}  ->  minted {:>7.1} B/key   {:+7.1}",
+            per(dec_owned),
+            per(dec_minted),
+            dec_cost
+        );
+        if raw_win > 0.0 && dec_cost > 0.0 {
+            // net = f * raw_win - (1 - f) * dec_cost = 0
+            println!(
+                "    pays once more than {:.1}% of keys arrive through the counter commands",
+                100.0 * dec_cost / (raw_win + dec_cost)
+            );
+        } else if dec_cost <= 0.0 {
+            println!("    both halves improve at this length -- there is no ratio to satisfy");
+        } else {
+            println!("    the raw half does not improve here; read the two rows, not a ratio");
+        }
+
+        assert!(
+            raw_owned > 0 && raw_shared > 0 && dec_owned > 0 && dec_minted > 0,
+            "a zero figure cannot be compared at key length {key_len}"
+        );
+        // If the shared arm is not smaller, the handles were copied rather than borrowed and
+        // every figure above is measuring something else.
+        assert!(
+            raw_shared < raw_owned,
+            "the shared arm is not smaller at key length {key_len} ({raw_shared} vs {raw_owned}), \
+             so the handle was not actually borrowed"
+        );
+    }
+
+    // The saving must GROW with key length -- it is one character allocation that stops
+    // happening. Flat would mean the figure is the inline field only and the sharing is not
+    // working.
+    assert!(
+        rows[2].1 > rows[0].1,
+        "the raw-half saving did not grow from key length {} to {} ({:.1} vs {:.1} B/key), so it \
+         is not the characters that stopped being allocated",
+        rows[0].0,
+        rows[2].0,
+        rows[0].1,
+        rows[2].1
+    );
+}
+
+/// WHAT THE FOUR COLLECTION MAPS SHARING ONE KEY IS WORTH, MEASURED AND NOT MULTIPLIED.
+///
+/// `which_string_keyed_holders_duplicate_a_key_another_map_holds` measured a raw key held by eight
+/// holders at FIVE allocations: four adopted maps agreeing on one, and `hashes`, `sets`, `zsets`
+/// and `lists` each owning a copy. All four share the handle now.
+///
+/// The arithmetic temptation is to take the one-map figure from
+/// `what_a_shared_control_state_key_costs_on_each_half` and multiply it by four. That would be
+/// wrong twice over: the four value types differ (`HashFieldMap`, two `BTreeMap<Vec<u8>, _>`
+/// shapes and a `BTreeMap<i64, _>`), so the entry widths and therefore the table growth differ
+/// per map; and the saving is a STEP in key length, so four steps need not land on the same one.
+/// A footprint total is re-measured, never derived.
+///
+/// So this builds all four maps, with their real value types, in both key shapes.
+///
+/// rust-internal: measures this crates own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_four_collection_maps_sharing -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "builds eight map shapes at three key lengths; run by name, and ALONE -- the allocation \
+            counters are process-global"]
+fn what_four_collection_maps_sharing_one_key_costs() {
+    use std::collections::BTreeMap;
+    const KEYS: usize = 20_000;
+
+    println!();
+    println!("  {KEYS} keys in EACH of four maps, built under the counting allocator");
+    println!("  (chunk_bytes, so not comparable with the alloc_bytes figures elsewhere here)");
+
+    let mut rows: Vec<(usize, f64)> = Vec::new();
+
+    for key_len in [8usize, 24, 48] {
+        let pad = |mut s: String| {
+            while s.len() < key_len {
+                s.push('x');
+            }
+            s
+        };
+        let texts: Vec<String> = (0..KEYS).map(|i| pad(format!("k{i:07}"))).collect();
+        let handles: Vec<std::sync::Arc<str>> =
+            texts.iter().map(|k| std::sync::Arc::from(&k[..])).collect();
+
+        // The four real value shapes, one element each -- the element count is held equal across
+        // both arms so the difference is the key.
+        let set_v = |i: usize| {
+            let mut m: BTreeMap<Vec<u8>, ElementEntry> = BTreeMap::new();
+            m.insert(vec![b'm'; 8], ElementEntry::from_parts(1, i as u64, 8, None, None));
+            m
+        };
+        let list_v = |i: usize| {
+            let mut m: BTreeMap<i64, ElementEntry> = BTreeMap::new();
+            m.insert(i as i64, ElementEntry::from_parts(1, i as u64, 8, None, None));
+            m
+        };
+        let zset_v = |i: usize| {
+            let mut m: BTreeMap<Vec<u8>, (u64, ElementEntry)> = BTreeMap::new();
+            m.insert(
+                vec![b'z'; 8],
+                (1u64, ElementEntry::from_parts(1, i as u64, 8, None, None)),
+            );
+            m
+        };
+
+        let owned = {
+            let probe = Probe::start();
+            let mut sets: HashMap<String, BTreeMap<Vec<u8>, ElementEntry>> = HashMap::new();
+            let mut lists: HashMap<String, BTreeMap<i64, ElementEntry>> = HashMap::new();
+            let mut zsets: HashMap<String, BTreeMap<Vec<u8>, (u64, ElementEntry)>> = HashMap::new();
+            let mut hashes: HashMap<String, BTreeMap<Vec<u8>, ElementEntry>> = HashMap::new();
+            for (i, text) in texts.iter().enumerate() {
+                sets.insert(text.clone(), set_v(i));
+                lists.insert(text.clone(), list_v(i));
+                zsets.insert(text.clone(), zset_v(i));
+                hashes.insert(text.clone(), set_v(i));
+            }
+            std::hint::black_box((&sets, &lists, &zsets, &hashes));
+            probe.stop().chunk_bytes
+        };
+
+        let shared = {
+            let probe = Probe::start();
+            let mut sets: HashMap<std::sync::Arc<str>, BTreeMap<Vec<u8>, ElementEntry>> =
+                HashMap::new();
+            let mut lists: HashMap<std::sync::Arc<str>, BTreeMap<i64, ElementEntry>> =
+                HashMap::new();
+            let mut zsets: HashMap<std::sync::Arc<str>, BTreeMap<Vec<u8>, (u64, ElementEntry)>> =
+                HashMap::new();
+            let mut hashes: HashMap<std::sync::Arc<str>, BTreeMap<Vec<u8>, ElementEntry>> =
+                HashMap::new();
+            for (i, handle) in handles.iter().enumerate() {
+                sets.insert(std::sync::Arc::clone(handle), set_v(i));
+                lists.insert(std::sync::Arc::clone(handle), list_v(i));
+                zsets.insert(std::sync::Arc::clone(handle), zset_v(i));
+                hashes.insert(std::sync::Arc::clone(handle), set_v(i));
+            }
+            std::hint::black_box((&sets, &lists, &zsets, &hashes));
+            probe.stop().chunk_bytes
+        };
+
+        let per = |b: u64| b as f64 / KEYS as f64;
+        let saving = per(owned) - per(shared);
+        rows.push((key_len, saving));
+        println!();
+        println!("  key length {key_len}");
+        println!("    four maps, own copies   {:>8.1} B/key", per(owned));
+        println!("    four maps, one handle   {:>8.1} B/key", per(shared));
+        println!("    saving                  {:>8.1} B/key", saving);
+
+        assert!(
+            shared < owned,
+            "the shared arm is not smaller at key length {key_len} ({shared} vs {owned}), so the \
+             handles were copied rather than borrowed"
+        );
+    }
+
+    println!();
+    println!("  The saving is a STEP in key length, not a slope -- read the row, not an average:");
+    for (len, saving) in &rows {
+        println!("    key length {len:>3}  ->  {saving:>7.1} B/key");
+    }
+    assert!(
+        rows[2].1 > rows[0].1,
+        "the saving did not grow with key length ({:.1} at {} vs {:.1} at {}), so it is not four \
+         character allocations that stopped happening",
+        rows[0].1,
+        rows[0].0,
+        rows[2].1,
+        rows[2].0
+    );
+}
+
+/// WHAT A WHOLE-SHARD LIVE-BLOCK WALK ALLOCATES PER ENTRY, AND WHAT THE KEY COSTS OF THAT.
+///
+/// `collect_model_live_block_entries` walks every live block on the shard and builds a
+/// `LiveBlockEntry` for each. The key reaches it as a `&str`, because `visit_model_live_blocks`
+/// hands its `emit` closure `(ModelKind, &str, Option<&str>, &ElementEntry)` -- so the handle the
+/// model map holds is gone by the time the entry is built, and the entry is built with
+///
+///     live_block_entry(object_key.to_string(), ..)        // one allocation
+///     -> LiveBlockEntry { object_key: Arc::from(object_key.into()), .. }   // and another
+///
+/// TWO allocations of the same characters per entry, where cloning the map's own handle would be
+/// none. Same shape as the tombstone row -- a `&str` discarding a handle the caller already held
+/// -- but at a CLOSURE boundary shared by fifteen arms, so the fix is wider than a signature.
+///
+/// Which is why this measures first. The walk is `WholeShardEntries`, so the cost is per live
+/// block on the shard, and whether that is worth a fifteen-arm change is a number rather than an
+/// opinion.
+///
+/// # MEASURED: TWO OF THE THREE ALLOCATIONS PER ENTRY ARE THE KEY
+///
+///     6000 live block entries from 2000 keys across three kinds
+///     18,014 allocations = 3.00 per entry, 322.1 bytes per entry
+///     the key's two allocations: at most 58.0 bytes per entry
+///
+/// So **67% of the allocation COUNT and 18% of the bytes**. That makes it a throughput finding for
+/// the dump and rebuild paths that run this walk, more than a footprint one -- worth saying both
+/// ways round, because a campaign measuring resident bytes would have called 18% marginal and
+/// stopped.
+///
+/// # AND WHY THE FIX IS NOT JUST A SIGNATURE
+///
+/// Fourteen of the arms iterate a `ModelKey`-keyed map and could pass the handle they already
+/// hold. One cannot: the `context_entities` arm COMPOSES its key from the collection key and the
+/// entity hash and emits `composed.as_str()`, so there is no handle in existence to pass. A
+/// uniform `&ModelKey` parameter is therefore impossible, and the shape that works is a small
+///
+///     enum KeyRef<'a> { Shared(&'a ModelKey), Borrowed(&'a str) }
+///
+/// with `live_block_entry` cloning the handle where there is one and minting where there is not.
+/// That is a fifteen-arm change on the walk that feeds dumps and rebuilds, so it is left as a
+/// separate reviewed change rather than folded in behind this measurement -- the number is here so
+/// the decision can be made on it.
+///
+/// rust-internal: measures this crates own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_a_whole_shard_live_block_walk -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "seeds a shard and walks every live block; run by name, and ALONE -- the allocation \
+            counters are process-global"]
+fn what_a_whole_shard_live_block_walk_allocates_per_entry() {
+    const KEYS: usize = 2_000;
+    const T0: u64 = 1_787_270_070_000;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = std::sync::Arc::new(crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    ));
+    engine.load_shard(1);
+
+    // A spread of kinds, so the walk crosses several arms rather than one.
+    for index in 0..KEYS {
+        let raw = format!("walked-{index:06}");
+        for command in [
+            crate::types::Command::StringSet { key: raw.clone(), value: vec![b'v'; 16] },
+            crate::types::Command::FeatureAppend {
+                key: raw.clone(),
+                points: vec![crate::types::FeaturePoint {
+                    timestamp_ms: T0 + index as u64,
+                    value: vec![b'f'; 8],
+                }],
+            },
+            crate::types::Command::HashSet {
+                key: raw.clone(),
+                field: "f".to_string(),
+                value: vec![b'h'; 8],
+            },
+        ] {
+            let response = engine
+                .execute(crate::types::ExecuteRequest { shard_id: 1, command });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+
+    let probe = Probe::start();
+    let entries = crate::engine::storage_bucket_internals::collect_model_live_block_entries(shard);
+    let counts = probe.stop();
+    let walked = entries.len();
+    std::hint::black_box(&entries);
+
+    println!();
+    println!("  {KEYS} keys written across three kinds");
+    println!("  live block entries the walk produced: {walked}");
+    println!("  allocations: {}", counts.allocs);
+    println!("  bytes (chunk): {}", counts.chunk_bytes);
+    if walked > 0 {
+        println!("    per entry: {:.2} allocations", counts.allocs as f64 / walked as f64);
+        println!(
+            "    per entry: {:.1} bytes",
+            counts.chunk_bytes as f64 / walked as f64
+        );
+        // What the key alone would stop costing: the String and the Arc built from it. The figure
+        // to compare a fifteen-arm change against.
+        println!(
+            "    of which the key's two allocations are at most {:.1} bytes per entry",
+            (2 * (16 + "walked-000000".len())) as f64
+        );
+    }
+
+    assert!(
+        walked > 0,
+        "the walk produced no entries, so this measures nothing about a whole-shard walk"
+    );
+    assert!(
+        counts.allocs > 0,
+        "the walk allocated nothing, which cannot be right for {walked} entries"
+    );
+}
+
+/// WHAT THE COMPOSED ENTITY KEY COSTS THE WALK, AND WHETHER A HANDLE IS THE ONLY WAY TO FIX IT.
+///
+/// `what_a_whole_shard_live_block_walk_allocates_per_entry` reached 1.00 allocations per entry, and
+/// the one arm left out of that is `context_entities`. It cannot lend a handle for a reason no
+/// signature reaches: it COMPOSES its key inside the inner loop --
+///
+///     let composed = format!("{collection_key}:{entity_hash}");
+///
+/// -- so the key it emits exists nowhere to be borrowed. That was recorded as a floor.
+///
+/// IT IS NOT THE WHOLE FLOOR. A composed key costs TWO allocations per entry: the `format!` that
+/// builds it, and the `Arc` the consumer mints from it because there is no handle. Interning the
+/// composed key would remove the second and is a design question with its own footprint cost. The
+/// FIRST is a reused buffer -- no design change, no interning, no new resident bytes.
+///
+/// So this measures the arm on its own, before any of that, so the two halves can be told apart.
+/// The fixture writes `context_entities` directly rather than through a command, because the walk
+/// takes a `&ShardState` and the question is about the walk.
+///
+/// rust-internal: measures this crates own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_the_composed_entity_key_costs -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "builds a shard of entity series and walks it; run by name, and ALONE -- the allocation \
+            counters are process-global"]
+fn what_the_composed_entity_key_costs_the_walk() {
+    use std::collections::BTreeMap;
+    const COLLECTIONS: usize = 200;
+    const PER_COLLECTION: usize = 10;
+
+    let mut shard = crate::engine::state::ShardState::default();
+    for collection in 0..COLLECTIONS {
+        let collection_key: std::sync::Arc<str> =
+            std::sync::Arc::from(format!("ctx:entity:tenant-a:node-{collection:05}").as_str());
+        let mut series: BTreeMap<u64, ElementEntry> = BTreeMap::new();
+        for entity in 0..PER_COLLECTION {
+            series.insert(
+                entity as u64,
+                ElementEntry::from_parts(1, (collection * 64 + entity) as u64, 48, None, None),
+            );
+        }
+        // The map holds slots; the B-tree the loop above built converts.
+        shard.context_entities_mut().insert(collection_key, series.into());
+    }
+
+    let probe = Probe::start();
+    let entries = crate::engine::storage_bucket_internals::collect_model_live_block_entries(&shard);
+    let counts = probe.stop();
+    let walked = entries.len();
+    std::hint::black_box(&entries);
+
+    println!();
+    println!("  {COLLECTIONS} collections x {PER_COLLECTION} entities");
+    println!("  entries the walk produced: {walked}");
+    println!("  allocations: {}", counts.allocs);
+    println!("  bytes (chunk): {}", counts.chunk_bytes);
+    if walked > 0 {
+        println!("    per entry: {:.2} allocations", counts.allocs as f64 / walked as f64);
+        println!(
+            "    per entry: {:.1} bytes",
+            counts.chunk_bytes as f64 / walked as f64
+        );
+    }
+    println!();
+    println!("  For comparison, the arms that lend a handle reach 1.00 allocations per entry.");
+    println!("  Two per entry here would be the `format!` plus the `Arc` minted from it: the");
+    println!("  first is a reused buffer, the second needs the composed key to be interned.");
+
+    assert_eq!(
+        COLLECTIONS * PER_COLLECTION,
+        walked,
+        "the walk produced {walked} entries, not {}, so the entity arm is not the thing being \
+         measured",
+        COLLECTIONS * PER_COLLECTION
+    );
+    assert!(counts.allocs > 0, "the walk allocated nothing, which cannot be right");
+}
+
+/// WHICH ARM THE LAST ALLOCATION PER ENTRY BELONGS TO, MEASURED PER ARM INSTEAD OF GUESSED.
+///
+/// The whole-shard walk sits at 1.00 allocations per entry and I have now been wrong TWICE about
+/// what that one is. I said it was the component's intermediate `String` -- it is not, because
+/// every container kind converges on the page and no live arm emits a component at all. I ruled out
+/// the `ElementEntry` clone by reading, which is right as far as it goes: that type is all inline
+/// fields.
+///
+/// Two wrong decompositions is enough to stop deriving one. This walks ONE kind at a time, so the
+/// per-entry figure is attributable by construction rather than by arithmetic over a mixed total:
+/// a shard holding only strings, then only features, then only hashes.
+///
+/// What the arms do differently, and therefore what the comparison can separate:
+///
+///   strings    one entry per object, key lent, no component, no inner collection
+///   features   goes through `visit_timestamped_series`, which builds a collection of unique
+///              addresses per series before emitting
+///   hashes     goes through `emit_one_entry_a_block`, which builds a `BTreeSet` of pages per key
+///              to dedup them
+///
+/// So if the residual is per-SERIES rather than per-entry, the arms with an inner collection will
+/// show it and the strings arm will not.
+///
+/// rust-internal: measures this crates own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib which_arm_the_last_allocation -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "walks three single-kind shards; run by name, and ALONE -- the allocation counters are \
+            process-global"]
+fn which_arm_the_last_allocation_per_entry_belongs_to() {
+    use std::collections::BTreeMap;
+    const KEYS: usize = 1_000;
+    const T0: u64 = 1_787_270_070_000;
+
+    let address = |i: usize| ElementEntry::from_parts(1, i as u64 * 64, 48, None, None);
+
+    // ---- strings: one entry per object, nothing nested -------------------------------
+    let strings_only = {
+        let mut shard = crate::engine::state::ShardState::default();
+        for i in 0..KEYS {
+            shard
+                .set_string_address(std::sync::Arc::from(format!("s-{i:06}").as_str()), &address(i));
+        }
+        let probe = Probe::start();
+        let entries =
+            crate::engine::storage_bucket_internals::collect_model_live_block_entries(&shard);
+        let counts = probe.stop();
+        let n = entries.len();
+        std::hint::black_box(&entries);
+        (n, counts.allocs, counts.chunk_bytes)
+    };
+
+    // ---- features: through `visit_timestamped_series`, one address each ---------------
+    let features_only = {
+        let mut shard = crate::engine::state::ShardState::default();
+        for i in 0..KEYS {
+            let mut series = crate::engine::timestamped_series::OwnedTimestampedSeries::default();
+            series.insert(T0 + i as u64, address(i));
+            shard
+                .features_mut()
+                // The map holds slots; `From<OwnedTimestampedSeries>` is the same
+                // conversion the migrated context kinds' fixtures use.
+                .insert(
+                    std::sync::Arc::from(format!("f-{i:06}").as_str()),
+                    // `ObjectSlot` converts from the B-TREE shape, not from the owned
+                    // array -- `to_btree()` is the bridge the slot already provides, and
+                    // it is what the context fixtures convert from too.
+                    series.to_btree().into(),
+                );
+        }
+        let probe = Probe::start();
+        let entries =
+            crate::engine::storage_bucket_internals::collect_model_live_block_entries(&shard);
+        let counts = probe.stop();
+        let n = entries.len();
+        std::hint::black_box(&entries);
+        (n, counts.allocs, counts.chunk_bytes)
+    };
+
+    // ---- hashes: through `emit_one_entry_a_block`, one field each ----------------------
+    let hashes_only = {
+        let mut shard = crate::engine::state::ShardState::default();
+        for i in 0..KEYS {
+            shard.hashes.insert_element_for_test(
+                &format!("h-{i:06}"),
+                std::sync::Arc::from("field"),
+                address(i),
+            );
+        }
+        let probe = Probe::start();
+        let entries =
+            crate::engine::storage_bucket_internals::collect_model_live_block_entries(&shard);
+        let counts = probe.stop();
+        let n = entries.len();
+        std::hint::black_box(&entries);
+        (n, counts.allocs, counts.chunk_bytes)
+    };
+
+    println!();
+    println!("  {KEYS} keys per arm, one entry each, walked on a single-kind shard");
+    println!();
+    println!("    arm        entries   allocations   per entry   bytes/entry");
+    for (name, (n, allocs, bytes)) in [
+        ("strings", strings_only),
+        ("features", features_only),
+        ("hashes", hashes_only),
+    ] {
+        println!(
+            "    {name:<10} {n:>7}   {allocs:>11}   {:>9.2}   {:>11.1}",
+            allocs as f64 / n.max(1) as f64,
+            bytes as f64 / n.max(1) as f64
+        );
+    }
+    println!();
+    println!("  An arm at ~0 per entry has nothing left to charge. An arm at ~1 is paying for");
+    println!("  something once per entry, and the shapes above say what is available to pay for:");
+    println!("  an inner collection per series, or the entry itself.");
+    println!();
+    println!("  MEASURED: strings 0.01, hashes 1.01, features 2.01. The mixed walk's 1.00 is the");
+    println!("  average of those three and nothing else -- (0.01 + 2.01 + 1.01) / 3 = 1.01.");
+    println!("  strings pays NOTHING: its key is lent, it has no component and nothing nested.");
+    println!("  hashes pays once, for `emit_one_entry_a_block`'s dedup set per key.");
+    println!("  features pays TWICE, and `unique_timestamped_kv_block_addresses` is why:");
+    println!("      .collect::<HashSet<_>>().into_iter().collect::<Vec<_>>()");
+    println!("  a hash set to dedup, then a vector to sort.");
+    println!();
+    println!("  COLLAPSING THOSE TWO IS A DESIGN DECISION, NOT A REFACTOR. Sort-then-dedup needs a");
+    println!("  TOTAL ORDER over every identity field of `ElementEntry`, which derives PartialEq,");
+    println!("  Eq and Hash but deliberately NOT Ord. Sorting by the three documented keys leaves");
+    println!("  entries differing in `block_id` comparing Equal, so a stable sort can interleave");
+    println!("  them as A, B, A and `dedup()` -- which removes only CONSECUTIVE duplicates --");
+    println!("  keeps the second A. A hand-written comparator that misses a field is worse still:");
+    println!("  two distinct entries compare Equal and dedup drops one, which is data loss on a");
+    println!("  walk that feeds rebuilds. The current shape is correct BY CONSTRUCTION because it");
+    println!("  dedups on the derived Eq/Hash. Giving the wire type an Ord is the decision.");
+
+    for (name, (n, _, _)) in [
+        ("strings", strings_only),
+        ("features", features_only),
+        ("hashes", hashes_only),
+    ] {
+        assert_eq!(
+            KEYS, n,
+            "the {name} arm produced {n} entries, not {KEYS} -- that arm is not being measured"
+        );
+    }
+}
+
+/// THE SERIES DEDUP KEEPS ONE OF EACH DISTINCT ENTRY, INCLUDING THE CASE A NAIVE `dedup()` BREAKS.
+///
+/// `unique_timestamped_kv_block_addresses` used to dedup through a `HashSet` and then sort in a
+/// `Vec` -- two allocations per series, and the whole of the features arm's walk cost. It now
+/// collects once, sorts by (slab, offset, length), and dedups by the DERIVED `PartialEq` within
+/// each run of equal sort keys.
+///
+/// That is safe for a reason worth pinning rather than asserting: two FULLY equal entries agree on
+/// the three sort keys, so they land in the same contiguous group, and a group scan with the
+/// derived comparison cannot miss a field. What is NOT safe, and what this test exists to catch,
+/// is the obvious shortcut -- `sort_by(three keys)` then `dedup()`. `dedup()` removes only
+/// CONSECUTIVE duplicates, and entries differing in `block_id` compare Equal under that sort, so a
+/// stable sort can order them `A, B, A` and the second `A` survives.
+///
+/// So the fixture below is exactly that arrangement: two entries naming one page and differing in
+/// their block id, with a repeat of the first. A correct dedup returns TWO entries; a `dedup()`
+/// after that sort returns three.
+///
+/// rust-internal: measures this crates own resident structures, no product behaviour
+///
+///   cargo test -p temporalstore-rust --lib the_series_dedup_keeps_one_of_each -- --nocapture
+#[test]
+fn the_series_dedup_keeps_one_of_each_distinct_entry() {
+    use crate::engine::storage_reporting::unique_timestamped_kv_block_addresses;
+    use crate::engine::timestamped_series::OwnedTimestampedSeries;
+
+    // One page -- same slab, offset and length -- carrying two different block ids, and the first
+    // id seen again at a later timestamp. Under the sort these three compare Equal to each other,
+    // which is the whole point.
+    let block_a_id5 = ElementEntry::from_parts(7, 4_096, 64, Some(5), None);
+    let block_a_id9 = ElementEntry::from_parts(7, 4_096, 64, Some(9), None);
+    assert_ne!(
+        block_a_id5, block_a_id9,
+        "the fixture needs two DISTINCT entries on one page, or it tests nothing"
+    );
+
+    let mut series = OwnedTimestampedSeries::default();
+    series.insert(1_787_270_070_001, block_a_id5.clone());
+    series.insert(1_787_270_070_002, block_a_id9.clone());
+    series.insert(1_787_270_070_003, block_a_id5.clone());
+
+    let unique = unique_timestamped_kv_block_addresses(&series);
+
+    println!();
+    println!("  three addresses in, {} out", unique.len());
+    for entry in &unique {
+        println!(
+            "    slab {} offset {} length {} block_id {:?}",
+            entry.block_slab_id(),
+            entry.offset(),
+            entry.length(),
+            entry.block_id()
+        );
+    }
+
+    assert_eq!(
+        2,
+        unique.len(),
+        "the dedup returned {} entries for two distinct addresses. Three means the repeat of the \
+         first survived -- which is what `sort_by(three keys)` followed by `dedup()` does, because \
+         the two block ids compare Equal under that sort and leave A, B, A with no consecutive \
+         pair. One means two distinct entries were merged, which is data loss.",
+        unique.len()
+    );
+    assert!(
+        unique.iter().any(|entry| *entry == block_a_id5),
+        "the entry with block id 5 is missing: {unique:?}"
+    );
+    assert!(
+        unique.iter().any(|entry| *entry == block_a_id9),
+        "the entry with block id 9 is missing: {unique:?}"
+    );
+
+    // AND THE ORDER THE CALLERS READ IS UNCHANGED: sorted by slab, then offset, then length.
+    for pair in unique.windows(2) {
+        let (left, right) = (&pair[0], &pair[1]);
+        let ordered = (
+            left.block_slab_id(),
+            left.offset(),
+            left.length(),
+        ) <= (
+            right.block_slab_id(),
+            right.offset(),
+            right.length(),
+        );
+        assert!(ordered, "the result is not sorted by (slab, offset, length): {unique:?}");
+    }
+}
+
+/// WHAT INTERNING THE COMPOSED ENTITY KEY WOULD TRADE, PRICED ON BOTH SIDES.
+///
+/// The entity arm is the only one whose key cannot be lent: it COMPOSES the key from the collection
+/// key and the entity hash, so the key it emits exists nowhere to be borrowed. Its last allocation
+/// per entry is the `Arc` the consumer mints from those characters, and the standing suggestion for
+/// removing it is to intern the composed key in a pool.
+///
+/// I recorded that as a decision "with a measurable cost on both sides" and then left it open.
+/// This closes it, because the two sides are not symmetric and the asymmetry is the whole answer:
+///
+///   the SAVING is per walk        -- one allocation per entity entry, each time the walk runs,
+///                                    and the minted `Arc` is dropped as soon as the entry is
+///                                    consumed, so nothing accumulates today
+///   the COST is permanent         -- one pooled `Arc<str>` per DISTINCT composed key, resident
+///                                    for the life of the shard whether a walk ever runs again
+///
+/// So interning converts a transient, repeatable cost into a standing one. This prices the standing
+/// side, which is the half that cannot be undone by running the walk less often.
+///
+/// rust-internal: measures this crates own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_interning_the_composed_entity_key -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "builds an intern pool of composed keys; run by name, and ALONE -- the allocation \
+            counters are process-global"]
+fn what_interning_the_composed_entity_key_would_trade() {
+    const COLLECTIONS: usize = 200;
+    const PER_COLLECTION: usize = 10;
+    let entities = COLLECTIONS * PER_COLLECTION;
+
+    // The composed key as the arm builds it: `{collection_key}:{entity_hash}`.
+    let composed: Vec<String> = (0..COLLECTIONS)
+        .flat_map(|collection| {
+            (0..PER_COLLECTION).map(move |entity| {
+                format!("ctx:entity:tenant-a:node-{collection:05}:{entity}")
+            })
+        })
+        .collect();
+    let width = composed.first().map(|key| key.len()).unwrap_or(0);
+
+    // THE STANDING COST: a pool holding one handle per distinct composed key, which is what
+    // interning means. Measured as it is built, so the figure is the pool and not the fixture.
+    let probe = Probe::start();
+    let mut pool: std::collections::HashSet<std::sync::Arc<str>> =
+        std::collections::HashSet::new();
+    for key in &composed {
+        if !pool.contains(&key[..]) {
+            pool.insert(std::sync::Arc::from(&key[..]));
+        }
+    }
+    let counts = probe.stop();
+    std::hint::black_box(&pool);
+
+    println!();
+    println!("  {entities} distinct composed keys, {width} characters each");
+    println!();
+    println!("  THE STANDING COST of interning them:");
+    println!("    allocations: {}", counts.allocs);
+    println!("    bytes (chunk): {}", counts.chunk_bytes);
+    println!(
+        "    per entity: {:.1} bytes, resident for the life of the shard",
+        counts.chunk_bytes as f64 / entities as f64
+    );
+    println!();
+    println!("  THE SAVING, for comparison: 1 allocation per entity entry PER WALK, and the");
+    println!("  entity arm measures 1.01 allocations per entry today");
+    println!("  (`what_the_composed_entity_key_costs_the_walk`). The minted `Arc` is dropped as");
+    println!("  soon as the entry is consumed, so today's cost accumulates nothing.");
+    println!();
+    println!("  SO THE TRADE IS: pay {:.1} resident bytes per entity, forever, to stop",
+        counts.chunk_bytes as f64 / entities as f64);
+    println!("  allocating one Arc per entity on each walk. That pays only if the walk runs often");
+    println!("  enough to outweigh bytes that are never reclaimed -- and the walk is a dump,");
+    println!("  rebuild and reporting path, not a serving one.");
+
+    assert_eq!(
+        entities,
+        pool.len(),
+        "the pool holds {} keys for {entities} distinct composed keys, so this is not pricing one \
+         handle per key",
+        pool.len()
+    );
+    assert!(
+        counts.chunk_bytes > 0,
+        "the pool allocated nothing, which cannot be right for {entities} keys"
+    );
+}
+
+/// WHAT REPEATED FIELD NAMES COST THE MODEL MAPS, ON AN AXIS THIS CAMPAIGN NEVER MEASURED.
+///
+/// Every figure in this campaign has been about the object KEY. A hash object's FIELD names are a
+/// second axis of the same invariant, and they are not shared at all: `HashFieldMap` holds
+/// `Vec<(String, ElementEntry)>`, so each object owns a `String` per field. A `status` field across
+/// ten thousand objects is ten thousand copies of one short name.
+///
+/// The index side already shares them. `intern_shared` draws component names from `kind_pool`, and
+/// its own doc explains why the pool is CAPPED at 64: "a component name is not [bounded] -- it
+/// comes from the caller -- and the cap is what makes sharing it safe anyway: past the cap a name
+/// still works, it just allocates as it did before." So the mechanism and the safety argument both
+/// exist; only the model side does not use them.
+///
+/// This prices the duplication before anything proposes removing it, on the shape that makes it
+/// worst: many objects drawing field names from a small set, which is what a schema looks like.
+///
+/// rust-internal: measures this crates own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_repeated_field_names_cost -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "builds two field-map shapes at 4,000 objects; run by name, and ALONE -- the allocation \
+            counters are process-global"]
+fn what_repeated_field_names_cost_the_model_maps() {
+    const OBJECTS: usize = 4_000;
+    // A schema's worth of names, drawn from a small set -- which is the point.
+    const NAMES: &[&str] = &[
+        "status",
+        "updated_at",
+        "owner",
+        "retention_class",
+        "last_seen_region",
+    ];
+
+    let address = |i: usize| ElementEntry::from_parts(1, i as u64 * 64, 48, None, None);
+
+    // AS IT IS: one owned `String` per field per object.
+    let owned = {
+        let probe = Probe::start();
+        let mut maps: Vec<Vec<(String, ElementEntry)>> = Vec::with_capacity(OBJECTS);
+        for object in 0..OBJECTS {
+            let mut fields: Vec<(String, ElementEntry)> = Vec::with_capacity(NAMES.len());
+            for (slot, name) in NAMES.iter().enumerate() {
+                fields.push((name.to_string(), address(object * NAMES.len() + slot)));
+            }
+            maps.push(fields);
+        }
+        std::hint::black_box(&maps);
+        probe.stop()
+    };
+
+    // SHARED, the way the index already shares a component: one handle per distinct name, taken
+    // from a pool, and every object holding a clone of it.
+    let shared = {
+        let probe = Probe::start();
+        let mut pool: std::collections::HashSet<std::sync::Arc<str>> =
+            std::collections::HashSet::new();
+        for name in NAMES {
+            pool.insert(std::sync::Arc::from(*name));
+        }
+        let handles: Vec<std::sync::Arc<str>> = NAMES
+            .iter()
+            .map(|name| pool.get(&name[..]).expect("just inserted").clone())
+            .collect();
+        let mut maps: Vec<Vec<(std::sync::Arc<str>, ElementEntry)>> = Vec::with_capacity(OBJECTS);
+        for object in 0..OBJECTS {
+            let mut fields: Vec<(std::sync::Arc<str>, ElementEntry)> =
+                Vec::with_capacity(NAMES.len());
+            for (slot, handle) in handles.iter().enumerate() {
+                fields.push((
+                    std::sync::Arc::clone(handle),
+                    address(object * NAMES.len() + slot),
+                ));
+            }
+            maps.push(fields);
+        }
+        std::hint::black_box((&maps, &pool));
+        probe.stop()
+    };
+
+    let fields = OBJECTS * NAMES.len();
+    let per = |bytes: u64| bytes as f64 / fields as f64;
+
+    println!();
+    println!(
+        "  {OBJECTS} objects x {} field names = {fields} fields, {} distinct names",
+        NAMES.len(),
+        NAMES.len()
+    );
+    println!();
+    println!("    shape      allocations        bytes   per field");
+    println!(
+        "    owned      {:>11}   {:>10}   {:>9.1}",
+        owned.allocs,
+        owned.chunk_bytes,
+        per(owned.chunk_bytes)
+    );
+    println!(
+        "    shared     {:>11}   {:>10}   {:>9.1}",
+        shared.allocs,
+        shared.chunk_bytes,
+        per(shared.chunk_bytes)
+    );
+    println!(
+        "    saving     {:>11}   {:>10}   {:>9.1}",
+        owned.allocs as i64 - shared.allocs as i64,
+        owned.chunk_bytes as i64 - shared.chunk_bytes as i64,
+        per(owned.chunk_bytes) - per(shared.chunk_bytes)
+    );
+    println!();
+    println!("  A `String` field is 24 bytes of inline struct plus its characters; a shared handle");
+    println!("  is 16 inline and no characters at all beyond the one pooled copy. Unlike interning");
+    println!("  the composed entity key, THIS pool is bounded by the schema rather than by the");
+    println!("  corpus -- which is the same argument `kind_pool`'s cap already makes.");
+    println!();
+    println!("  AND THE CONVERSION IS ARCHITECTURAL, NOT A SIGNATURE CHANGE -- checked, because");
+    println!("  twice today I called something blocked and was wrong. `ElementMap::Element` is");
+    println!("  `String` for `HashFieldMap`, and the three `insert_element` sites sit inside");
+    println!("  `RecordedMap`'s generic operations, which hold `&mut` the map and NO access to the");
+    println!("  shard's `kind_pool`. That pool is deliberately \"owned by the index rather than a");
+    println!("  global, so the write path interns through the `&mut` it already holds and no lock");
+    println!("  appears on it\". So every route is a decision:");
+    println!();
+    println!("    thread the pool into RecordedMap's ops   changes the declared operation set,");
+    println!("                                             which is that module's stated invariant");
+    println!("    intern before the proof is built         changes ElementMap::Element to Arc<str>");
+    println!("                                             and the recorded-proof types with it");
+    println!("    a static pool                            adds the lock the codebase rejected");
+    println!();
+    println!("  A per-map pool is the option that LOOKS cheap and defeats the purpose: the saving");
+    println!("  above is cross-object sharing, and a pool per object shares nothing.");
+
+    assert!(
+        shared.chunk_bytes < owned.chunk_bytes,
+        "the shared shape is not smaller ({} vs {}), so the comparison is measuring something \
+         other than the field name",
+        shared.chunk_bytes,
+        owned.chunk_bytes
+    );
+    assert!(
+        owned.allocs > 0 && shared.allocs > 0,
+        "an arm allocated nothing, which cannot be right for {fields} fields"
+    );
+}
+
+/// WHAT THE ONE CONSTANT FIELD NAME COSTS AT THE SHAPE THE PRODUCT ACTUALLY WRITES.
+///
+/// # WHY THIS IS NOT THE FIGURE ALREADY RECORDED
+///
+/// `what_repeated_field_names_cost_the_model_maps` priced field-name sharing on a SCHEMA: five
+/// distinct names of ten to sixteen characters, 38.4 bytes saved per field. That is the right
+/// shape for the Redis-compatible surface and the wrong one for the dominant arm, and
+/// `hash_field_map`'s own module doc says why: `write_context_node` is the one producer of a
+/// context-node page and it files that page under the single constant `CONTEXT_NODE_FIELD`
+/// (`"meta"`), so the fields-per-hash histogram was p50 = p90 = p99 = MAX = 1 at both 4,000 and
+/// 40,000 nodes, with a single distinct occupancy at 100% of keys.
+///
+/// So the dominant arm is not "a few short names repeated". It is ONE name, four characters long,
+/// copied once per object in the store. That is a different measurement, and the answer could have
+/// gone either way: four characters is small enough that the characters are not the cost, and what
+/// is left is the 24-byte `String` struct against a 16-byte handle plus one allocation per entry
+/// against one for the whole shard.
+///
+/// # AND THE VERDICT IS REQUIRED TO HOLD AT BOTH ARMS
+///
+/// A real store uses both surfaces, and the module doc records the trap: a mixed corpus measured a
+/// mean of 1.98 fields per hash over a population containing no hash holding two. So this measures
+/// the narrow arm AND the wide one, and reports both rather than averaging them.
+///
+/// # WHAT READING THE WRITE SITES ADDED TO THE FIGURE
+///
+/// The four sites that install a hash element were read rather than assumed, and the wide arm is
+/// worse than this probe's own `owned` column says. All three Redis-surface sites pass
+/// `Some(field.clone())` as the bucket-index COMPONENT and `field.clone()` again as the map's
+/// element -- the same characters allocated twice per write, one of which this probe does not
+/// even count. The context-node site borrows the constant for the component and allocates it
+/// once for the element. A single interned handle serves both positions at every site.
+///
+/// rust-internal: measures this crates own resident structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_the_one_constant_field_name -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "builds four field-map shapes at 4,000 hashes; run by name, and ALONE -- the allocation \
+            counters are process-global"]
+fn what_the_one_constant_field_name_costs_at_the_shape_the_product_writes() {
+    const HASHES: usize = 4_000;
+    // The constant the write path spells, read from the crate rather than written out here, so a
+    // change to it cannot leave this probe pricing a name nothing files.
+    let narrow: &[&str] = &[crate::engine::constants::CONTEXT_NODE_FIELD];
+    // The wide arm, which only the Redis-compatible surface produces. Sixty-four is the occupancy
+    // the container comparison in `model_map_container_cost` reports its second figure at.
+    let wide_names: Vec<String> = (0..64).map(|index| format!("field-{index:04}")).collect();
+    let wide: Vec<&str> = wide_names.iter().map(|name| &name[..]).collect();
+
+    let address = |i: usize| ElementEntry::from_parts(1, i as u64 * 64, 48, None, None);
+
+    // AS IT IS: `Vec<(String, ElementEntry)>`, one owned name per field per hash.
+    let owned = |names: &[&str]| {
+        let probe = Probe::start();
+        let mut maps: Vec<Vec<(String, ElementEntry)>> = Vec::with_capacity(HASHES);
+        for object in 0..HASHES {
+            let mut fields: Vec<(String, ElementEntry)> = Vec::with_capacity(names.len());
+            for (slot, name) in names.iter().enumerate() {
+                fields.push((name.to_string(), address(object * names.len() + slot)));
+            }
+            maps.push(fields);
+        }
+        std::hint::black_box(&maps);
+        probe.stop()
+    };
+
+    // POOLED, the way `bucket_index.kind_pool` already shares a component name: one handle per
+    // distinct name for the whole shard, every entry holding a clone of it. The pool itself is
+    // measured INSIDE the probe, so its cost is charged here and not hidden.
+    let pooled = |names: &[&str]| {
+        let probe = Probe::start();
+        let mut pool: std::collections::HashSet<std::sync::Arc<str>> =
+            std::collections::HashSet::new();
+        for name in names {
+            pool.insert(std::sync::Arc::from(*name));
+        }
+        let handles: Vec<std::sync::Arc<str>> = names
+            .iter()
+            .map(|name| pool.get(&name[..]).expect("just inserted").clone())
+            .collect();
+        let mut maps: Vec<Vec<(std::sync::Arc<str>, ElementEntry)>> = Vec::with_capacity(HASHES);
+        for object in 0..HASHES {
+            let mut fields: Vec<(std::sync::Arc<str>, ElementEntry)> =
+                Vec::with_capacity(names.len());
+            for (slot, handle) in handles.iter().enumerate() {
+                fields.push((
+                    std::sync::Arc::clone(handle),
+                    address(object * names.len() + slot),
+                ));
+            }
+            maps.push(fields);
+        }
+        std::hint::black_box((&maps, &pool));
+        probe.stop()
+    };
+
+    let arms = [
+        ("narrow (1 constant field)", narrow.to_vec(), narrow.len()),
+        ("wide (64 distinct fields)", wide.clone(), wide.len()),
+    ];
+
+    println!();
+    println!("  {HASHES} hashes per arm, field name taken from the crate constant where it is one");
+    for (label, names, width) in arms {
+        let fields = HASHES * width;
+        let a = owned(&names);
+        let b = pooled(&names);
+        let per = |bytes: u64| bytes as f64 / fields as f64;
+        println!();
+        println!("  {label} -- {fields} fields");
+        println!("    shape      allocations        bytes   per field   allocs per field");
+        println!(
+            "    owned      {:>11}   {:>10}   {:>9.1}   {:>16.2}",
+            a.allocs,
+            a.chunk_bytes,
+            per(a.chunk_bytes),
+            a.allocs as f64 / fields as f64
+        );
+        println!(
+            "    pooled     {:>11}   {:>10}   {:>9.1}   {:>16.2}",
+            b.allocs,
+            b.chunk_bytes,
+            per(b.chunk_bytes),
+            b.allocs as f64 / fields as f64
+        );
+        println!(
+            "    saving     {:>11}   {:>10}   {:>9.1}   {:>16.2}",
+            a.allocs as i64 - b.allocs as i64,
+            a.chunk_bytes as i64 - b.chunk_bytes as i64,
+            per(a.chunk_bytes) - per(b.chunk_bytes),
+            (a.allocs as f64 - b.allocs as f64) / fields as f64
+        );
+        assert!(
+            a.allocs > 0 && b.allocs > 0,
+            "an arm of {label} allocated nothing, which cannot be right for {fields} fields"
+        );
+    }
+
+    println!();
+    println!("  THE MECHANISM IS ALREADY IN THE CRATE, which is what makes this a conversion");
+    println!("  rather than a design: `bucket_index.kind_pool` interns COMPONENT names through");
+    println!("  `intern_shared`, and `install_element` takes `&mut ShardState`, so the pool is");
+    println!("  reachable from the write site without a new lock, a static, or a pool per");
+    println!("  object -- which were the three routes a per-map pool was refused for.");
+    println!();
+    println!("  AND THE FIELD NAME IS THE COMPONENT, READ AT ALL FOUR WRITE SITES RATHER THAN");
+    println!("  ASSUMED. The three Redis-surface sites in `execute_on_shard` pass");
+    println!("  `Some(field.clone())` as the component AND `field.clone()` as the element: the");
+    println!("  same characters, allocated TWICE per write. The context-node site passes");
+    println!("  `CONTEXT_NODE_FIELD` borrowed for the component and its `.to_string()` for the");
+    println!("  element -- one allocation per write of a four-byte constant. So the narrow arm");
+    println!("  pays once per object and the wide arm twice per field, and one interned handle");
+    println!("  serves both positions at every site.");
+}
+
+/// WHAT ONE HASH FIELD WRITE ALLOCATES, END TO END.
+///
+/// # WHY A WHOLE-PATH FIGURE AND NOT A SYNTHETIC ONE
+///
+/// The per-structure probes in this file build a container and measure it. That answers what a
+/// shape costs; it cannot answer whether a saving reaches a caller. A field name is now a shared
+/// handle, the element position takes it from `kind_pool`, and the bucket index's COMPONENT
+/// position was being cloned from an owned parameter that nothing read afterwards -- three changes
+/// whose combined effect on a real write is not the sum of three synthetic probes.
+///
+/// So this drives `HashSet` through the engine and counts. One number, on the path a caller uses.
+///
+/// # WHAT IT IS NOT
+///
+/// It is not an A/B. A single binary cannot run the write path twice with different code in it, so
+/// this records the figure and the breakdown that explains it; the before-and-after lives in the
+/// change's own measurement, taken by running this probe on each side.
+///
+/// rust-internal: measures this crates own write path, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_one_hash_field_write_allocates -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "drives 2,000 hash field writes under the counting allocator; run by name, and ALONE -- \
+            the allocation counters are process-global"]
+fn what_one_hash_field_write_allocates() {
+    use crate::types::{Command, ExecuteRequest};
+
+    const OBJECTS: usize = 500;
+    const FIELDS: usize = 4;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = std::sync::Arc::new(crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    ));
+    engine.load_shard(1);
+
+    // WARM FIRST, so the figure is a steady-state write rather than the first write's one-off
+    // structure building. A probe that counts the first write of a fresh shard measures the shard's
+    // construction and calls it a write.
+    for field in 0..FIELDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::HashSet {
+                key: "warm-up".to_string(),
+                field: format!("f{field}"),
+                value: vec![b'v'; 32],
+            },
+        });
+        assert!(response.status.ok, "warm-up: {:?}", response.status);
+    }
+
+    let probe = Probe::start();
+    for object in 0..OBJECTS {
+        for field in 0..FIELDS {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("hashwrite-{object:06}"),
+                    field: format!("f{field}"),
+                    value: vec![b'v'; 32],
+                },
+            });
+            assert!(response.status.ok, "write {object}/{field}: {:?}", response.status);
+        }
+    }
+    let counts = probe.stop();
+
+    // AND A SECOND ARM, ON THE PATH THAT ACTUALLY ROUTES THROUGH `stage_component_outcome`.
+    //
+    // The hash write does not: `install_element` moves its owned component into the bucket-index
+    // filing and `install_element_staged_only` stages through `stage_outcome_attested`. The four
+    // callers of `stage_component_outcome` are `ControlStateIncrement`, `ControlStateChangeAdd`,
+    // `ControlStateSelectionSet` and `ContextUpsertEntity`. That is worth measuring separately,
+    // because a figure taken on the wrong path reads as a refutation of a change that is simply
+    // somewhere else -- which is exactly what the first run of this probe did.
+    for index in 0..FIELDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ControlStateIncrement {
+                key: "counter-warm".to_string(),
+                timestamp_ms: 1_787_270_070_000 + index as u64,
+                amount: 1,
+            },
+        });
+        assert!(response.status.ok, "counter warm-up: {:?}", response.status);
+    }
+    let counter_probe = Probe::start();
+    for object in 0..OBJECTS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ControlStateIncrement {
+                key: format!("counter-{object:06}"),
+                timestamp_ms: 1_787_270_070_000 + object as u64,
+                amount: 1,
+            },
+        });
+        assert!(response.status.ok, "counter {object}: {:?}", response.status);
+    }
+    let counter_counts = counter_probe.stop();
+    println!();
+    println!("  {OBJECTS} control-state increments (through stage_component_outcome), warmed first");
+    println!("    allocations      : {}", counter_counts.allocs);
+    println!(
+        "    allocations/write: {:.2}",
+        counter_counts.allocs as f64 / OBJECTS as f64
+    );
+    println!("    chunk bytes      : {}", counter_counts.chunk_bytes);
+    println!(
+        "    bytes/write      : {:.1}",
+        counter_counts.chunk_bytes as f64 / OBJECTS as f64
+    );
+    assert!(
+        counter_counts.allocs > 0,
+        "the counter path allocated nothing for {OBJECTS} increments"
+    );
+
+    let writes = OBJECTS * FIELDS;
+    println!();
+    println!("  {writes} hash field writes ({OBJECTS} objects x {FIELDS} fields), warmed first");
+    println!("    allocations      : {}", counts.allocs);
+    println!("    allocations/write: {:.2}", counts.allocs as f64 / writes as f64);
+    println!("    chunk bytes      : {}", counts.chunk_bytes);
+    println!("    bytes/write      : {:.1}", counts.chunk_bytes as f64 / writes as f64);
+
+    // DENOMINATOR, asserted: the writes have to have landed, or the figure is of nothing.
+    let (objects_held, fields_held) = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        (
+            shard.hashes.len(),
+            shard.hashes.iter().map(|(_, f)| f.len()).sum::<usize>(),
+        )
+    };
+    println!("    objects held     : {objects_held}");
+    println!("    fields held      : {fields_held}");
+    assert_eq!(
+        OBJECTS + 1,
+        objects_held,
+        "the shard holds {objects_held} hash objects for {OBJECTS} written plus one warm-up, so \
+         the fixture did not write what it claims and the per-write figure divides by the wrong \
+         number"
+    );
+    assert_eq!(
+        writes + FIELDS,
+        fields_held,
+        "the shard holds {fields_held} fields for {} written, so fields were overwritten or lost",
+        writes + FIELDS
+    );
+    assert!(
+        counts.allocs > 0,
+        "the write path allocated nothing for {writes} writes, which cannot be right -- the probe \
+         is not seeing the allocator"
+    );
+
+    // AND THE FIELD NAME IS STILL ONE ALLOCATION PER DISTINCT NAME, not one per write. This is the
+    // invariant the shared handle bought, restated here because a per-write figure that quietly
+    // included a name allocation per write would look like a regression in this probe and read as
+    // noise.
+    let distinct_name_allocations = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let mut addresses = std::collections::HashSet::new();
+        for (_, fields) in shard.hashes.iter() {
+            for name in fields.keys() {
+                addresses.insert(name.as_ptr() as usize);
+            }
+        }
+        addresses.len()
+    };
+    println!("    distinct field-name allocations: {distinct_name_allocations} for {FIELDS} names");
+    assert_eq!(
+        FIELDS, distinct_name_allocations,
+        "{distinct_name_allocations} allocations hold {FIELDS} distinct field names across \
+         {objects_held} objects. One per name is what the pooled handle bought; one per object is \
+         what it replaced"
+    );
+}
+
+/// WHAT ONE APPEND COSTS, AND WHETHER IT TRACKS THE SERIES IT APPENDS TO.
+///
+/// # WHY THE SHAPE MATTERS MORE THAN THE NUMBER
+///
+/// A per-append figure on its own is not actionable: it could be a constant, or it could be the
+/// series' length in disguise. So this takes the figure at TWO series lengths and prints the ratio
+/// beside the length ratio. A cost that is FLAT across an 8x series is a constant per append; one
+/// that rises with the series means every append pays for the points already there, which is the
+/// difference between a store that ingests a long series cheaply and one that does not.
+///
+/// # WHAT IS AND IS NOT IN THE FIGURE
+///
+/// This drives `FeatureAppend` through the engine, so the number is the whole write path -- the
+/// block append, the index, the staged outcome, the page filing -- and not one container's growth.
+/// It is NOT an A/B against anything: it is the current cost, recorded so a later change has a
+/// before.
+///
+/// THE SERIES IS WARMED TO LENGTH FIRST, outside the probe window, so the measurement is of an
+/// append to an EXISTING series rather than of the first write that builds the structures around
+/// it.
+///
+/// rust-internal: measures this crates own write path, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_one_append_costs -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "warms two series to 400 and 3,200 points and appends under the counting allocator; run \
+            by name, and ALONE -- the allocation counters are process-global"]
+fn what_one_append_costs_at_two_series_lengths() {
+    use crate::types::{Command, ExecuteRequest, FeaturePoint};
+
+    const T0: u64 = 1_787_270_070_000;
+    const APPENDS: usize = 50;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = std::sync::Arc::new(crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    ));
+    engine.load_shard(1);
+
+    let append = |key: &str, at: u64| {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::FeatureAppend {
+                key: key.to_string(),
+                points: vec![FeaturePoint {
+                    timestamp_ms: at,
+                    value: vec![b'v'; 8],
+                }],
+            },
+        });
+        assert!(response.status.ok, "append to {key} at {at}: {:?}", response.status);
+    };
+
+    // One arm per series length. Each series is warmed to length OUTSIDE the probe, then measured
+    // over `APPENDS` further appends.
+    let mut rows: Vec<(usize, u64, u64, usize)> = Vec::new();
+    for warm_to in [400usize, 3_200usize] {
+        let key = format!("series-{warm_to}");
+        for index in 0..warm_to {
+            append(&key, T0 + index as u64);
+        }
+        let probe = Probe::start();
+        for index in 0..APPENDS {
+            append(&key, T0 + (warm_to + index) as u64);
+        }
+        let counts = probe.stop();
+        let points = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            shard.features().get(&key[..]).map(|s| s.len()).unwrap_or(0)
+        };
+        rows.push((warm_to, counts.allocs, counts.chunk_bytes, points));
+    }
+
+    println!();
+    println!("  {APPENDS} appends measured per arm, series warmed to length first");
+    println!("    series length   allocs/append   bytes/append   points held");
+    for (warm_to, allocs, bytes, points) in &rows {
+        println!(
+            "    {warm_to:>13}   {:>13.1}   {:>12.1}   {points:>11}",
+            *allocs as f64 / APPENDS as f64,
+            *bytes as f64 / APPENDS as f64
+        );
+    }
+
+    // --- DENOMINATORS, asserted before any ratio is read off them. ---
+    let (small_len, small_allocs, small_bytes, small_points) = rows[0];
+    let (big_len, big_allocs, big_bytes, big_points) = rows[1];
+    assert_eq!(
+        small_len + APPENDS,
+        small_points,
+        "the short series holds {small_points} points for {} appended, so the fixture did not build \
+         the series it measures",
+        small_len + APPENDS
+    );
+    assert_eq!(
+        big_len + APPENDS,
+        big_points,
+        "the long series holds {big_points} points for {} appended",
+        big_len + APPENDS
+    );
+    assert!(
+        small_allocs > 0 && big_allocs > 0,
+        "an arm allocated nothing across {APPENDS} appends, so the probe is not seeing the allocator"
+    );
+
+    // --- AND THE SHAPE, which is what this probe exists to say. ---
+    let length_ratio = big_len as f64 / small_len as f64;
+    let alloc_ratio = big_allocs as f64 / small_allocs as f64;
+    let byte_ratio = big_bytes as f64 / small_bytes as f64;
+    println!();
+    println!("    series length ratio : {length_ratio:.2}x");
+    println!("    allocations ratio   : {alloc_ratio:.2}x");
+    println!("    bytes ratio         : {byte_ratio:.2}x");
+    println!();
+    if byte_ratio > length_ratio * 0.5 {
+        println!("    THE BYTES TRACK THE SERIES: an append pays for the points already there.");
+    } else if byte_ratio < 1.5 {
+        println!("    THE BYTES ARE FLAT: an append costs a constant, whatever the series holds.");
+    } else {
+        println!("    THE BYTES RISE SUBLINEARLY: between a constant and the series length.");
+    }
+
+    // Recorded rather than asserted as a bound, because this probe's job is to establish the
+    // figure. What IS asserted is that both arms produced one -- a silent zero here would read as
+    // a flat cost and be the most flattering possible misreading.
+    assert!(
+        small_bytes > 0 && big_bytes > 0,
+        "an arm reported zero bytes per append, which would read as a flat cost and is instead a \
+         broken measurement"
+    );
+}
+
+/// WHAT ONE CONTEXT-EVENT APPEND COSTS, AT TWO NODE SERIES LENGTHS.
+///
+/// # WHY THIS IS ASKED SEPARATELY FROM THE FEATURE APPEND
+///
+/// `what_one_append_costs_at_two_series_lengths` found a feature append restating the whole series
+/// per append, because `command_upsert_components` answered `None` for features and the caller
+/// then wrote a whole-object snapshot record. `ContextWriteEvent` sits in that same `None` bucket,
+/// and a context node's event series is the structure most likely to be LONG in use -- a node
+/// accumulates events for as long as it is alive.
+///
+/// But it is NOT the same arm and must not be assumed to behave the same way. A context event
+/// writes TWO resident structures per append (the event series keyed by event id, and
+/// `context_event_timeline` keyed by timeline key), it can fire auto compression, and its index
+/// entry is keyed by the event id while its page is keyed by the timeline key -- which is why
+/// `timestamped_component` takes an identity at all. So this measures the arm rather than
+/// inferring it from the feature result.
+///
+/// # THE ARMS
+///
+/// One node, warmed to `length` events outside the probe window, then `MEASURED` further appends
+/// inside it. Two lengths an octave apart, so the ratio says whether the cost tracks the series.
+///
+/// # WHAT IT FOUND, WHICH REFUTED THE PREDICTION IT WAS WRITTEN TO CONFIRM
+///
+///     series length   allocs/append   bytes/append   events held
+///               400           122.2        23258.9           450
+///              3200           122.4        61780.2          3250
+///     allocations ratio : 1.00x over an 8x series -- FLAT
+///     bytes ratio       : 2.66x
+///
+/// The allocation count does not move. So `ContextWriteEvent` is NOT carrying the defect the
+/// feature append had, even though it sits in the same `None` bucket of
+/// `command_upsert_components` and `command_object_keys` does name its key, which is what sends
+/// it down the whole-object-record path. Whatever that record costs here, it is not one
+/// allocation per event already held: at 3,200 events the feature append was spending 9,830
+/// allocations and 3.27 MB per append, and this spends 122 and 62 KB.
+///
+/// GOING AHEAD AND DECLARING ITS COMPONENTS WOULD HAVE BEEN A CHANGE WITH NO MEASURED PAYOFF,
+/// and it is not a safe one. The arm normalises the event before writing:
+/// `normalize_context_event_storage_keys` fills `event_time_ms` from `resolve_now_ms()` and
+/// `event_id_hash` from a hash of the text when either arrives as 0. The component for a context
+/// event is `timestamped_component(timeline_key, Some(event_id_hash))`, and the timeline key is
+/// derived from the time -- so for any caller that omits either field, a component derived from
+/// the command names an entry that does not exist, while the entry that does exist goes unnamed.
+/// That is a correctness hazard, not a slow path, and it was worth finding before the change
+/// rather than after.
+///
+/// WHERE THE BYTES COME FROM IS STILL OPEN, AND ONE ANSWER HAS BEEN RULED OUT BY MEASUREMENT.
+///
+/// Flat allocations with climbing bytes is the SHARD-side signature, not the series one: the
+/// cross in `is_the_appends_cost_the_series_or_the_shard` measured a 50-point series in a big
+/// shard at 985,144 B per append in almost no extra allocations. This arm calls the same
+/// `next_block_index_for_object`, which rebuilt a shard-wide map to choose one integer, so the
+/// obvious reading was that both appends were left paying one term.
+///
+/// THEY WERE NOT. Making that function ask the object instead of the shard took the FEATURE
+/// append from 1,084,817 to 134,017 bytes at 3,200 points, and moved this one from 61,780.2 to
+/// 61,492.2 -- half a percent, which is nothing. So whatever sizes a context-event append's
+/// buffers, it is not the ordinal allocator, and the shared-term reading this paragraph used to
+/// assert was wrong. Recorded rather than deleted, because the shape it was reasoning from is
+/// sound and it is the second time on this path that a signature matched a cause that turned out
+/// not to be the one: the attribution has to come from moving the suspect and re-measuring, not
+/// from recognising the curve.
+///
+/// rust-internal: measures this crates own write path, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_one_context_event_append_costs -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "seeds two shards to 400 and 3,200 events on ONE node; run by name, and ALONE -- the \
+            allocation counters are process-global"]
+fn what_one_context_event_append_costs_at_two_series_lengths() {
+    use crate::types::{Command, ExecuteRequest};
+
+    const T0: u64 = 1_787_270_070_000;
+    const MEASURED: usize = 50;
+
+    let event = |index: u64| crate::types::ContextEvent {
+        event_id_hash: 0xDEAD_0000_0000_0000 | index,
+        event_time_ms: T0 + index,
+        ingestion_time_ms: T0 + index,
+        kind: 9,
+        event_type: 2,
+        actor_hash: 0,
+        status: 0,
+        valid_until_ms: 0,
+        confidence: 0.9,
+        importance: 0.7,
+        text: "an event payload".to_string(),
+        source_ref: String::new(),
+        related_node_hashes: Vec::new(),
+        compact_attrs: Vec::new(),
+        vector: Vec::new(),
+    };
+
+    let mut rows: Vec<(usize, u64, u64, usize)> = Vec::new();
+    for length in [400usize, 3_200usize] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = probe_engine_on(dir.path(), crate::DEFAULT_END_ROUTING_BUCKET);
+        let write = |index: u64| {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ContextWriteEvent {
+                    tenant_hash: 7,
+                    node_hash: 11,
+                    event: Box::new(event(index)),
+                    first_write_only: false,
+                    cold_storage: false,
+                },
+            });
+            assert!(response.status.ok, "event {index}: {:?}", response.status);
+        };
+        for index in 0..length {
+            write(index as u64);
+        }
+        let probe = Probe::start();
+        for index in 0..MEASURED {
+            write((length + index) as u64);
+        }
+        let counts = probe.stop();
+
+        // The series length the appends actually saw, READ BACK rather than assumed: auto
+        // compression can fold a window, and a fold would make `length` a fiction.
+        let held = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            let object_key = crate::engine::context::context_event_key(7, 11);
+            shard
+                .context_events()
+                .get(&*object_key)
+                .map_or(0, |series| series.len())
+        };
+        rows.push((length, counts.allocs, counts.chunk_bytes, held));
+    }
+
+    println!();
+    println!("  {MEASURED} context-event appends measured per arm, node warmed to length first");
+    println!("    series length   allocs/append   bytes/append   events held");
+    for (length, allocs, bytes, held) in &rows {
+        println!(
+            "    {length:>13}   {:>13.1}   {:>12.1}   {held:>11}",
+            *allocs as f64 / MEASURED as f64,
+            *bytes as f64 / MEASURED as f64
+        );
+    }
+
+    let (small, small_allocs, small_bytes, small_held) = rows[0];
+    let (big, big_allocs, big_bytes, big_held) = rows[1];
+    let series_ratio = big as f64 / small as f64;
+    let alloc_ratio = big_allocs as f64 / small_allocs.max(1) as f64;
+    let byte_ratio = big_bytes as f64 / small_bytes.max(1) as f64;
+    println!();
+    println!("    series length ratio : {series_ratio:.2}x");
+    println!("    allocations ratio   : {alloc_ratio:.2}x");
+    println!("    bytes ratio         : {byte_ratio:.2}x");
+    println!();
+    // THREE VERDICTS, NOT TWO, because the two columns mean different things and an "or" over
+    // them would report the wrong cause. The whole-object-record defect the feature append had
+    // shows up in ALLOCATIONS -- one `IndexItem` per entry already held, so both columns climb
+    // together. A cost that climbs in BYTES while the allocation count stays flat is the opposite
+    // shape: a few large buffers sized by something other than the entry count. Collapsing those
+    // into one message is how a measurement gets read as confirming whichever cause was expected.
+    if alloc_ratio > 2.0 {
+        println!("    THE APPEND TRACKS THE SERIES: writing one event to a node costs the entries");
+        println!("    already on it, one allocation at a time, so a long-lived node gets steadily");
+        println!("    more expensive to append to -- the shape the feature append had before it");
+        println!("    declared its upsert components.");
+    } else if byte_ratio > 2.0 {
+        println!("    NOT THE SERIES TERM. The allocation count is FLAT in the node's length, so");
+        println!("    this arm is not restating one entry per event held. The bytes still climb,");
+        println!("    in a near-constant number of allocations -- a few large buffers sized by");
+        println!("    something other than the entry count.");
+        println!("    AND NOT THE ORDINAL ALLOCATOR EITHER: making that ask the object instead of");
+        println!("    the shard took a FEATURE append from 1,084,817 to 134,017 bytes and left");
+        println!("    this one at 61,492 from 61,780. The cause of these bytes is still open.");
+    } else {
+        println!("    THE APPEND IS FLAT in both columns: the cost does not track the events held,");
+        println!("    so this arm carries neither the whole-object-record defect nor a buffer");
+        println!("    sized by the shard.");
+    }
+
+    // --- DENOMINATORS, so a ratio is never taken over a fixture that did not build. ---
+    assert!(
+        small_allocs > 0 && big_allocs > 0,
+        "an arm allocated nothing across {MEASURED} appends: {small_allocs} and {big_allocs}"
+    );
+    assert!(
+        small_held >= small && big_held >= big,
+        "the node does not hold the events this probe warmed it with ({small_held} of {small}, \
+         {big_held} of {big}), so the arms are not the lengths they are labelled and the ratio \
+         above is of something else -- auto compression is the likely cause"
+    );
+}
+
+/// WHAT CHOOSING THE NEXT BLOCK ORDINAL COSTS, AT TWO SHARD SIZES.
+///
+/// # WHY THIS IS MEASURED AT THE FUNCTION AND NOT ONLY AT THE APPEND
+///
+/// `next_block_index_for_object` answers one question -- the lowest block ordinal this object may
+/// safely use next -- and it is called on every write that adds a page. An append probe can only
+/// say that the append got cheaper; it cannot say this is why. Calling the function directly, at
+/// two shard sizes an octave apart, says whether its cost is sized by the SHARD (which has
+/// nothing to do with the question) or by the OBJECT (which is the question).
+///
+/// # WHAT IT USED TO COST
+///
+/// It built `BlockKeysByPosition::from_lookup` over the ENTIRE object lookup -- two `HashMap`s,
+/// one insert per block ref of every object in the shard -- and then walked the bucket's whole
+/// page index asking `identity_of` for each page, to choose one integer. Both terms sized by the
+/// shard, neither by the object. Measured by this arm on the parent commit, after the bucket bug
+/// below was fixed:
+///
+///     blocks in shard   allocs/call   bytes/call   ordinal answered
+///                 400          16.0      59648.0                400
+///                3200          22.0     475584.0               3200
+///
+/// and on this commit, 0.0 and 0.0 at both sizes, with the same two answers. The end-to-end
+/// effect is in `what_one_append_costs_at_two_series_lengths`: 1,084,817 -> 134,017 bytes per
+/// append on a 3,200-point series.
+///
+/// THE COST BOUND BELOW FAILS ON THE PARENT COMMIT, which is the only evidence that it is a guard
+/// and not a comment: it reports the 475,584 and names what would have had to come back.
+///
+/// # THE ANSWER IS ASSERTED BEFORE THE COST, AND THAT IS NOT CEREMONY
+///
+/// This probe's first version derived the routing bucket as `block_routing_bucket(&key, 0,
+/// DEFAULT_END_ROUTING_BUCKET)`, which is not the range the shard files under. So it asked about a
+/// bucket holding none of the object's pages: the call answered ordinal 0 for a 400-block object
+/// and allocated nothing, and the arm printed 0.0 bytes per call both BEFORE and AFTER the change
+/// it exists to measure. A cost probe aimed at the wrong question reports the cheapest possible
+/// answer, which reads exactly like a win. The bucket now comes out of the object's own filing,
+/// the ref list is asserted non-empty, and the ordinal is asserted to be the block count.
+///
+/// # WHAT IT COSTS NOW
+///
+/// Nothing. The live half reads the object's own ref list and takes a max; the deleted half is a
+/// walk, but a CONDITIONAL one, skipped entirely unless the bucket holds a tombstone row at all.
+/// Neither path allocates, so the assertion below is on a byte count near zero rather than on a
+/// ratio -- a ratio between two small numbers says much less than the numbers do.
+///
+/// rust-internal: measures this crates own index structures, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_choosing_the_next_block_ordinal_costs -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "seeds two shards to 400 and 3,200 blocks; run by name, and ALONE -- the allocation \
+            counters are process-global"]
+fn what_choosing_the_next_block_ordinal_costs() {
+    use crate::types::{Command, ExecuteRequest, FeaturePoint};
+
+    const T0: u64 = 1_787_270_070_000;
+    const CALLS: usize = 20;
+
+    let mut rows: Vec<(usize, u64, u64, u32)> = Vec::new();
+    for blocks in [400usize, 3_200usize] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = std::sync::Arc::new(crate::TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        ));
+        engine.load_shard(1);
+        let key = format!("ordinal-{blocks}");
+        for index in 0..blocks {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureAppend {
+                    key: key.clone(),
+                    points: vec![FeaturePoint {
+                        timestamp_ms: T0 + index as u64,
+                        value: vec![b'v'; 8],
+                    }],
+                },
+            });
+            assert!(response.status.ok, "seed {index}: {:?}", response.status);
+        }
+
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        // THE BUCKET IS READ OUT OF THE OBJECT'S OWN FILING, NOT RECOMPUTED.
+        //
+        // This first spelled it `block_routing_bucket(&key, 0, DEFAULT_END_ROUTING_BUCKET)`, and
+        // the shard does not use that range -- so the call was asked about a bucket the object is
+        // not in, answered ordinal 0 for a 400-block object, and allocated nothing doing it. A
+        // cost probe that asks the wrong question measures the cheapest possible answer and reads
+        // as a win: the arm reported 0.0 bytes per call BEFORE and AFTER the change it was written
+        // to measure, which the answer assertion below is what caught.
+        let refs = shard
+            .bucket_index
+            .object_block_refs("feature", &key)
+            .map(|refs| refs.as_slice().to_vec())
+            .unwrap_or_default();
+        assert!(
+            !refs.is_empty(),
+            "the lookup holds no block ref for the {blocks}-block object this arm seeded, so there              is nothing for the ordinal allocator to find and any cost it reports is the cost of              answering about an object that is not there"
+        );
+        let routing_bucket = refs[0].routing_bucket;
+        // Warmed once outside the window, so what is measured is the steady-state answer and not
+        // a first-touch of anything the call reaches.
+        let warm = crate::engine::state::next_block_index_for_object(
+            &shard.bucket_index,
+            routing_bucket,
+            "feature",
+            &key,
+        );
+        let probe = Probe::start();
+        let mut last = 0;
+        for _ in 0..CALLS {
+            last = crate::engine::state::next_block_index_for_object(
+                &shard.bucket_index,
+                routing_bucket,
+                "feature",
+                &key,
+            );
+        }
+        let counts = probe.stop();
+        assert_eq!(
+            warm, last,
+            "the call is not deterministic across {CALLS} invocations on an unchanging shard"
+        );
+        rows.push((blocks, counts.allocs, counts.chunk_bytes, last));
+    }
+
+    println!();
+    println!("  {CALLS} calls per arm, on an unchanging shard");
+    println!("    blocks in shard   allocs/call   bytes/call   ordinal answered");
+    for (blocks, allocs, bytes, answer) in &rows {
+        println!(
+            "    {blocks:>15}   {:>11.1}   {:>10.1}   {answer:>16}",
+            *allocs as f64 / CALLS as f64,
+            *bytes as f64 / CALLS as f64
+        );
+    }
+
+    let (small, _small_allocs, small_bytes, small_answer) = rows[0];
+    let (big, _big_allocs, big_bytes, big_answer) = rows[1];
+    let per = |v: u64| v as f64 / CALLS as f64;
+    println!();
+    println!("    shard ratio : {:.2}x", big as f64 / small as f64);
+    println!("    bytes/call  : {:.1} -> {:.1}", per(small_bytes), per(big_bytes));
+    println!();
+    println!("    BEFORE, measured by this same arm on the parent commit: 16.0 allocs and");
+    println!("    59,648 B/call at 400 blocks, 22.0 and 475,584 B/call at 3,200 -- a shard-wide");
+    println!("    position map plus a walk of the bucket's whole page index, to choose one");
+    println!("    integer. Both commits answer 400 and 3,200, so the answer did not move.");
+
+    // --- THE ANSWER FIRST. A cheap call that answers wrongly is worse than an expensive one. ---
+    assert_eq!(
+        small_answer,
+        u32::try_from(small).expect("the arm's block count fits a u32"),
+        "a {small}-block object's next ordinal should be {small}"
+    );
+    assert_eq!(
+        big_answer,
+        u32::try_from(big).expect("the arm's block count fits a u32"),
+        "a {big}-block object's next ordinal should be {big}"
+    );
+    // --- AND THEN THE COST, stated as a bound rather than a ratio: both arms are meant to be
+    // --- at or near zero, and a ratio between two near-zero numbers carries no information.
+    assert!(
+        per(big_bytes) < 1_024.0,
+        "choosing one ordinal on a {big}-block shard moved {:.1} bytes per call. The shard-wide \
+         term this function used to carry is back, or a new one arrived: it reads the object's own \
+         ref list and takes a max, which allocates nothing.",
+        per(big_bytes)
+    );
+}
+
+/// IS WHAT IS LEFT OF AN APPEND THE SERIES OR THE SHARD? The other probes conflate them.
+///
+/// # WHY THE EXISTING FIXTURE CANNOT ANSWER THIS
+///
+/// `what_one_append_costs_at_two_series_lengths` grows ONE series to 3,200 points, and each point
+/// gets its own block -- the ordinal allocator answers 3,200 after 3,200 appends. So that fixture
+/// grows the series and the shard together, and "the cost tracks the series" and "the cost tracks
+/// the shard" are the same curve in it. It measures the number correctly and cannot attribute it.
+///
+/// THEY ARE DIFFERENT PROBLEMS WITH DIFFERENT FIXES. A cost that tracks the SERIES means an append
+/// re-reads or restates the points it joins, and keeping series short would contain it. A cost
+/// that tracks the SHARD means an append pays for objects it has nothing to do with, which does
+/// not go away by keeping series short and is the worse of the two.
+///
+/// # THE CROSS
+///
+/// Three arms, so the two axes come apart:
+///
+///   A  short series,  small shard   -- the baseline
+///   B  LONG  series,  big shard     -- what the existing probe measures
+///   C  short series,  BIG shard     -- a short series in a shard holding B's worth of blocks,
+///                                      under OTHER objects
+///
+/// If C costs about what B costs, the price is the SHARD's size and the series is innocent. If C
+/// costs about what A costs, the price really is the series the append joins.
+///
+/// # WHAT IT FOUND
+///
+/// Run after #2232 (the append stopped snapshotting its series), #2234 (the ordinal allocator
+/// stopped asking the whole shard) and #2238 (its declared component actually builds an item).
+/// The figures the run prints are the attribution of the ~134 KB those three left behind; read
+/// them rather than this sentence, because the point of the arm is that the split is measured.
+///
+/// rust-internal: measures this crates own write path, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib is_the_appends_cost_the_series_or_the_shard -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "seeds three shards, one to 3,200 blocks; run by name, and ALONE -- the allocation \
+            counters are process-global"]
+fn is_the_appends_cost_the_series_or_the_shard() {
+    use crate::types::{Command, ExecuteRequest, FeaturePoint};
+
+    const T0: u64 = 1_787_270_070_000;
+    const BIG: usize = 3_200;
+    const SMALL: usize = 50;
+    const MEASURED: usize = 20;
+
+    // Seed a shard with `spread_over` filler objects of `points_each` points, then warm
+    // `measure_key` to `measure_points` and measure `MEASURED` further appends to it.
+    let run = |spread_over: usize, points_each: usize, measure_points: usize| -> (u64, u64, usize) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = std::sync::Arc::new(crate::TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
