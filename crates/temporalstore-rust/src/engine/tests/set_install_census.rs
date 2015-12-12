@@ -102,3 +102,56 @@ fn every_command_that_installs_a_set_member_reports_a_touched_element() {
         .collect();
     println!("[set-census] of those, handled by an arm in execute_on_shard: {handled:?}");
     assert_eq!(
+        declared, handled,
+        "a Set-family command is declared with no arm to handle it, or the arm spells its name \
+         differently. Either way the class below is not bounded: declared {declared:?}, handled \
+         {handled:?}"
+    );
+
+    // ---- WHICH OF THOSE ARMS INSTALLS, read from the arm bodies. ------------------------------
+    //
+    // An install is an arm that puts an element INTO `shard.sets`. The two spellings that do that
+    // are an `entry(..)` chain and a direct `insert`, and both are looked for inside the arm's own
+    // text rather than anywhere in the file.
+    let mut installs: Vec<String> = Vec::new();
+    for name in &declared {
+        let marker = format!("Command::{name} {{");
+        let Some(at) = execute.find(&marker) else {
+            continue;
+        };
+        // The arm runs to the next `        Command::` at the match's own indentation.
+        let rest = &execute[at + marker.len()..];
+        let body = match rest.find("\n        Command::") {
+            Some(end) => &rest[..end],
+            None => rest,
+        };
+        // AN INSTALL IS A CALL TO THE RECORDED OPERATION, and that is now the ONLY spelling.
+        //
+        // This matcher has been blinded once already and the blinding was by the change that made
+        // the statement stronger. It used to look for `.sets` plus an `.entry(` or `.insert(`,
+        // which is what an arm spelled when it reached the model map directly. Since
+        // `RecordedSetContainer` took the map, the inner field is private and an arm CANNOT reach
+        // it -- so the only way to install is `install_set_member`, and looking for the old shape
+        // reported zero installs on a tree where the install was right there.
+        //
+        // The stronger statement is why the restatement is not a relaxation: before, an arm could
+        // install by any spelling that reached a `HashMap`, and this matcher had to guess them all.
+        // Now there is exactly one, enforced by privacy, and the matcher names it.
+        // RESTATED AGAIN, by the collapse of the two containers into one generic map. This asked
+        // for `recorded_set_container::install_set_member(`, which was itself a restatement of an
+        // earlier `.sets` plus `entry`/`insert`. The operation is now written ONCE for every kind
+        // and named with the kind it is for, so what identifies a set install is the turbofish.
+        //
+        // Each restatement has been STRONGER than the one before, which is why none of them is a
+        // relaxation: first any spelling that reached a `HashMap`, then one named per-kind function,
+        // and now one generic function whose kind parameter the compiler checks.
+        if body.contains("install_element::<super::recorded_map::SetKind>(") {
+            installs.push(name.clone());
+        }
+    }
+    installs.sort();
+    println!("[set-census] arms that install a set member: {installs:?}");
+    // VACUITY: the operation must be findable by name, so a rename cannot make `installs` empty
+    // and have someone "fix" this test by expecting nothing.
+    assert!(
+        execute.contains("install_element::<super::recorded_map::SetKind>("),
