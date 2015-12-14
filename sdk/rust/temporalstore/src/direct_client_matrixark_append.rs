@@ -55,31 +55,3 @@ impl Client {
             _ => None,
         };
         let count_value_c = count_value.map(cstring).transpose()?;
-        let append_options_c = cstring(append_options_json)?;
-        let mut error: *mut c_char = ptr::null_mut();
-        let entries_ptr = if c_entries.is_empty() {
-            ptr::null()
-        } else {
-            c_entries.as_ptr()
-        };
-        let code = unsafe {
-            temporalstore_matrixark_batch_append_records_v2(
-                self.raw,
-                entries_ptr,
-                c_entries.len(),
-                count_key_c
-                    .as_ref()
-                    .map_or(ptr::null(), |value| value.as_ptr()),
-                count_value_c
-                    .as_ref()
-                    .map_or(ptr::null(), |value| value.as_ptr()),
-                append_options_c.as_ptr(),
-                &mut error,
-            )
-        };
-        check(code, error)
-    }
-
-    // Same call as `matrixark_batch_append_records_with_options`, except each entry carries its
-    // own `route_json` instead of all of them sharing `{}`.
-    pub fn matrixark_batch_append_records_with_routes_and_options(
