@@ -43,3 +43,49 @@ const ROUNDS: usize = 4;
 /// would make this measure deduplication instead of rewrite.
 fn noisy_value(index: usize, round: usize, len: usize) -> Vec<u8> {
     let mut state = (index as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add((round as u64).wrapping_mul(0x1234_5678_9ABC_DEF0))
+        | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "writes 2,000 keys five times over and runs a reclaim cycle; run by name"]
+fn what_the_collector_sees_after_a_rewrite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    for round in 0..=ROUNDS {
+        for index in 0..KEYS {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("gc-{index:06}"),
+                    value: noisy_value(index, round, VALUE),
+                },
+            });
+            assert!(response.status.ok, "round {round} write {index}: {:?}", response.status);
+        }
+    }
+
+    let report_fractions = |label: &str| -> (u64, u64, u64, u64) {
+        let fractions = engine
+            .block_store
+            .slab_live_fractions()
+            .expect("the slab live fractions read");
+        let logical: u64 = fractions.iter().map(|f| f.logical_bytes).sum();
+        let live: u64 = fractions.iter().map(|f| f.live_bytes).sum();
+        let physical: u64 = fractions.iter().map(|f| f.physical_bytes).sum();
