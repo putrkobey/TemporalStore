@@ -1,0 +1,1127 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+//! Redis command dispatcher (execute_redis_command_with_state), extracted from redis.rs.
+
+use super::*;
+use crate::types::{Command, CommandResponse, ControlStateFamily, StringSetCondition};
+
+pub fn execute_redis_command_with_state(
+    args: Vec<Vec<u8>>,
+    shard_id: ShardId,
+    state: &mut RedisCommandState,
+    mut execute: impl FnMut(Command) -> Result<CommandResponse, String>,
+) -> RespValue {
+    if args.is_empty() {
+        return RespValue::Error("ERR empty command".to_string());
+    }
+    let command = upper(&args[0]);
+    match command.as_str() {
+        "AUTH" if args.len() == 2 => {
+            let configured = state
+                .config
+                .get("requirepass")
+                .map(String::as_str)
+                .unwrap_or_default();
+            if configured.is_empty() || configured.as_bytes() == args[1].as_slice() {
+                state.authenticated = true;
+                RespValue::SimpleString("OK".to_string())
+            } else {
+                RespValue::Error("ERR invalid password".to_string())
+            }
+        }
+        "PING" => RespValue::SimpleString(
+            args.get(1)
+                .map(|value| String::from_utf8_lossy(value).to_string())
+                .unwrap_or_else(|| "PONG".to_string()),
+        ),
+        "ECHO" if args.len() == 2 => RespValue::Bulk(Some(args[1].clone())),
+        "SELECT" if args.len() == 2 => match parse_u64(&args[1], "db") {
+            Ok(0) => RespValue::SimpleString("OK".to_string()),
+            Ok(_) => RespValue::Error("ERR DB index is out of range".to_string()),
+            Err(err) => RespValue::Error(err),
+        },
+        "BGSAVE" if args.len() == 1 || args.len() == 2 => {
+            RespValue::SimpleString("Background saving started".to_string())
+        }
+        "COMMAND" => redis_command_response(&args),
+        "CONFIG" if args.len() >= 2 => redis_config_response(&args, state),
+        "SLAVEOF" if args.len() == 3 => {
+            let host = string_arg(&args[1]);
+            let port = string_arg(&args[2]);
+            if host.eq_ignore_ascii_case("no") && port.eq_ignore_ascii_case("one") {
+                state.master = None;
+            } else {
+                state.master = Some((host, port));
+            }
+            RespValue::SimpleString("OK".to_string())
+        }
+        "INFO" if args.len() == 1 || args.len() == 2 => {
+            let section = args
+                .get(1)
+                .map(|value| string_arg(value))
+                .unwrap_or_else(|| "default".to_string());
+            RespValue::Bulk(Some(
+                redis_info(section.as_str(), shard_id, state).into_bytes(),
+            ))
+        }
+        "PARTITION" if args.len() >= 2 => redis_partition_response(&args, shard_id, state),
+        "PSLOTHASHKEY" if args.len() == 2 => {
+            RespValue::Integer(bucket_id_for_key(String::from_utf8_lossy(&args[1]).as_ref()) as i64)
+        }
+        "PCLUSTERKEYSLOT" if args.len() == 2 => {
+            RespValue::Integer(bucket_id_for_key(String::from_utf8_lossy(&args[1]).as_ref()) as i64)
+        }
+        "PCLUSTERHASH" if args.len() == 2 => {
+            RespValue::Integer(stable_key_hash(String::from_utf8_lossy(&args[1]).as_ref()) as i64)
+        }
+        // Not `state.keyspace.len()`: the mirror holds names, and a name whose deadline has
+        // passed is not a key. See `live_matching_keys`.
+        "DBSIZE" if args.len() == 1 => {
+            RespValue::Integer(live_matching_keys("*", state, &mut execute).len() as i64)
+        }
+        "TYPE" if args.len() == 2 => redis_type_response(&args[1], &mut execute),
+        "GET" if args.len() == 2 => bytes_response(execute(Command::StringGet {
+            key: string_arg(&args[1]),
+        })),
+        "MGET" if args.len() >= 2 => {
+            let mut values = Vec::new();
+            for key in args.iter().skip(1) {
+                match execute(Command::StringGet {
+                    key: string_arg(key),
+                }) {
+                    Ok(CommandResponse::Bytes { value }) => values.push(RespValue::Bulk(value)),
+                    Ok(_) => return RespValue::Error("ERR invalid mget response".to_string()),
+                    Err(err) => return RespValue::Error(format!("ERR {err}")),
+                }
+            }
+            RespValue::Array(values)
+        }
+        "GETDEL" if args.len() == 2 => {
+            let key = string_arg(&args[1]);
+            match execute(Command::StringGet { key: key.clone() }) {
+                Ok(CommandResponse::Bytes { value }) => {
+                    if value.is_some() {
+                        if let Err(err) = execute(Command::CommonDelete { key }) {
+                            return RespValue::Error(format!("ERR {err}"));
+                        }
+                        state.keyspace.remove(&string_arg(&args[1]));
+                    }
+                    RespValue::Bulk(value)
+                }
+                Ok(_) => RespValue::Error("ERR invalid getdel response".to_string()),
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            }
+        }
+        // GETSET IS `SET key value GET`, AND CARRIES SET SEMANTICS WITH IT. The caller hands
+        // over the whole new value, so the deadline that belonged to the value being replaced
+        // goes with it. `StringSet` never touches the expiry index -- it drops an already-
+        // lapsed record and then writes the page -- so it left the OLD countdown running under
+        // the NEW value, and the key vanished at a time the caller had overwritten away. The
+        // conditional write is the one that clears the deadline, and it carries the old value
+        // back in the same command, so the separate `StringGet` that used to read it (and
+        // could observe a different record than the one being replaced) is gone too.
+        "GETSET" if args.len() == 3 => {
+            let key = string_arg(&args[1]);
+            match execute(Command::StringSetConditional {
+                key: key.clone(),
+                value: args[2].clone(),
+                ttl_ms: None,
+                condition: StringSetCondition::Always,
+                return_old: true,
+                keep_ttl: false,
+            }) {
+                Ok(CommandResponse::Bytes { value }) => {
+                    state.keyspace.insert(key);
+                    RespValue::Bulk(value)
+                }
+                Ok(_) => RespValue::Error("ERR invalid getset response".to_string()),
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            }
+        }
+        "SET" if args.len() >= 3 => {
+            let key = string_arg(&args[1]);
+            let value = args[2].clone();
+            let options = match parse_set_options(&args[3..]) {
+                Ok(options) => options,
+                Err(err) => return RespValue::Error(err),
+            };
+            // NOTE: the redis bridge rejects TTL+NX/XX ("not supported ... yet"), but that
+            // is a stopgap limitation, not a semantic -- real Redis supports SET k v NX EX 10
+            // and Rust deliberately does too (see the redis_string_hash_set_and_feature test).
+            // We keep the more-capable Rust behavior rather than match a shim's TODO.
+            match execute(Command::StringSetConditional {
+                key: key.clone(),
+                value,
+                ttl_ms: options.ttl_ms,
+                condition: options.condition,
+                return_old: options.return_old,
+                keep_ttl: options.keep_ttl,
+            }) {
+                Ok(CommandResponse::Bytes { value }) => {
+                    if options.condition == StringSetCondition::Always || value.is_some() {
+                        state.keyspace.insert(key);
+                    }
+                    RespValue::Bulk(value)
+                }
+                Ok(CommandResponse::Integer { value: 1 }) => {
+                    state.keyspace.insert(key);
+                    RespValue::SimpleString("OK".to_string())
+                }
+                Ok(CommandResponse::Integer { value: 0 }) => RespValue::Bulk(None),
+                Ok(_) => RespValue::Error("ERR invalid set response".to_string()),
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            }
+        }
+        "SETNX" if args.len() == 3 => match execute(Command::StringSetConditional {
+            key: string_arg(&args[1]),
+            value: args[2].clone(),
+            ttl_ms: None,
+            condition: StringSetCondition::IfNotExists,
+            return_old: false,
+            keep_ttl: false,
+        }) {
+            Ok(CommandResponse::Integer { value }) => {
+                if value > 0 {
+                    state.keyspace.insert(string_arg(&args[1]));
+                }
+                RespValue::Integer(value)
+            }
+            Ok(CommandResponse::Bytes { value: None }) => RespValue::Integer(0),
+            Ok(_) => RespValue::Error("ERR invalid setnx response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        // MSET IS A BATCH OF SET, SO EACH PAIR CLEARS ITS OWN DEADLINE. Same rule, same
+        // reason as GETSET above: the caller supplies the whole value for each key.
+        "MSET" if args.len() >= 3 && args.len() % 2 == 1 => {
+            for pair in args[1..].chunks(2) {
+                if let Err(err) = execute(Command::StringSetConditional {
+                    key: string_arg(&pair[0]),
+                    value: pair[1].clone(),
+                    ttl_ms: None,
+                    condition: StringSetCondition::Always,
+                    return_old: false,
+                    keep_ttl: false,
+                }) {
+                    return RespValue::Error(format!("ERR {err}"));
+                }
+                state.keyspace.insert(string_arg(&pair[0]));
+            }
+            RespValue::SimpleString("OK".to_string())
+        }
+        "MSETNX" if args.len() >= 3 && args.len() % 2 == 1 => {
+            for pair in args[1..].chunks(2) {
+                match execute(Command::CommonExists {
+                    key: string_arg(&pair[0]),
+                }) {
+                    Ok(CommandResponse::Integer { value }) if value > 0 => {
+                        return RespValue::Integer(0);
+                    }
+                    Ok(CommandResponse::Integer { .. }) => {}
+                    Ok(_) => return RespValue::Error("ERR invalid exists response".to_string()),
+                    Err(err) => return RespValue::Error(format!("ERR {err}")),
+                }
+            }
+            // The same write as MSET, though MSETNX can never observe the difference: it
+            // only reaches here when NONE of its keys exist, and a key that does not exist
+            // has no deadline to discard. It is spelled the same so a reader does not have
+            // to re-derive that, and so the rule has one spelling rather than two.
+            for pair in args[1..].chunks(2) {
+                if let Err(err) = execute(Command::StringSetConditional {
+                    key: string_arg(&pair[0]),
+                    value: pair[1].clone(),
+                    ttl_ms: None,
+                    condition: StringSetCondition::Always,
+                    return_old: false,
+                    keep_ttl: false,
+                }) {
+                    return RespValue::Error(format!("ERR {err}"));
+                }
+                state.keyspace.insert(string_arg(&pair[0]));
+            }
+            RespValue::Integer(1)
+        }
+        "GETEX" if args.len() >= 2 => {
+            let key = string_arg(&args[1]);
+            match execute(Command::StringGet { key: key.clone() }) {
+                Ok(CommandResponse::Bytes { value }) => {
+                    if value.is_some() {
+                        let deadline = match parse_getex_ttl_ms(&args[2..]) {
+                            Ok(value) => value,
+                            Err(err) => return RespValue::Error(err),
+                        };
+                        // PERSIST is its own outcome, and it is the one this used to lose:
+                        // it shared a `None` with "no option words" and so cleared nothing.
+                        match deadline {
+                            GetExDeadline::Unchanged => {}
+                            GetExDeadline::Persist => {
+                                if let Err(err) = execute(Command::CommonPersist { key }) {
+                                    return RespValue::Error(format!("ERR {err}"));
+                                }
+                            }
+                            GetExDeadline::Arm(ttl_ms) => {
+                                if let Err(err) = execute(Command::CommonExpire { key, ttl_ms }) {
+                                    return RespValue::Error(format!("ERR {err}"));
+                                }
+                            }
+                            // The value was already read above and is still returned; what
+                            // the caller asked for is a key that is gone by the time they
+                            // get it, so it goes now rather than in a millisecond.
+                            GetExDeadline::Discard => {
+                                if let Err(err) = execute(Command::CommonDelete { key: key.clone() })
+                                {
+                                    return RespValue::Error(format!("ERR {err}"));
+                                }
+                                state.keyspace.remove(&key);
+                            }
+                        }
+                    }
+                    RespValue::Bulk(value)
+                }
+                Ok(_) => RespValue::Error("ERR invalid getex response".to_string()),
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            }
+        }
+        "SETEX" if args.len() == 4 => match parse_u64(&args[2], "seconds") {
+            // rejects a non-positive expiry ("invalid expire time"); Rust otherwise
+            // stored a key with deadline now+0 that vanishes on the next access.
+            Ok(0) => RespValue::Error("ERR invalid expire time in setex".to_string()),
+            Ok(seconds) => match execute(Command::StringSetEx {
+                key: string_arg(&args[1]),
+                value: args[3].clone(),
+                ttl_ms: seconds.saturating_mul(1000),
+            }) {
+                Ok(_) => {
+                    state.keyspace.insert(string_arg(&args[1]));
+                    RespValue::SimpleString("OK".to_string())
+                }
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            },
+            Err(err) => RespValue::Error(err),
+        },
+        "PSETEX" if args.len() == 4 => match parse_u64(&args[2], "milliseconds") {
+            Ok(0) => RespValue::Error("ERR invalid expire time in psetex".to_string()),
+            Ok(ttl_ms) => match execute(Command::StringSetEx {
+                key: string_arg(&args[1]),
+                value: args[3].clone(),
+                ttl_ms,
+            }) {
+                Ok(_) => {
+                    state.keyspace.insert(string_arg(&args[1]));
+                    RespValue::SimpleString("OK".to_string())
+                }
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            },
+            Err(err) => RespValue::Error(err),
+        },
+        "EXISTS" if args.len() >= 2 => {
+            let mut count = 0;
+            for key in args.iter().skip(1) {
+                match execute(Command::CommonExists {
+                    key: string_arg(key),
+                }) {
+                    Ok(CommandResponse::Integer { value }) => count += value,
+                    Ok(_) => return RespValue::Error("ERR invalid exists response".to_string()),
+                    Err(err) => return RespValue::Error(format!("ERR {err}")),
+                }
+            }
+            RespValue::Integer(count)
+        }
+        "DEL" if args.len() >= 2 => {
+            let mut removed = 0;
+            for key_arg in args.iter().skip(1) {
+                let key = string_arg(key_arg);
+                match execute(Command::CommonExists { key: key.clone() }) {
+                    Ok(CommandResponse::Integer { value }) => {
+                        if value > 0 {
+                            if let Err(err) = execute(Command::CommonDelete { key: key.clone() }) {
+                                return RespValue::Error(format!("ERR {err}"));
+                            }
+                            state.keyspace.remove(&key);
+                            removed += 1;
+                        }
+                    }
+                    Ok(_) => return RespValue::Error("ERR invalid exists response".to_string()),
+                    Err(err) => return RespValue::Error(format!("ERR {err}")),
+                }
+            }
+            RespValue::Integer(removed)
+        }
+        "UNLINK" if args.len() >= 2 => {
+            let mut removed = 0;
+            for key_arg in args.iter().skip(1) {
+                let key = string_arg(key_arg);
+                match execute(Command::CommonExists { key: key.clone() }) {
+                    Ok(CommandResponse::Integer { value }) if value > 0 => {
+                        if let Err(err) = execute(Command::CommonDelete { key: key.clone() }) {
+                            return RespValue::Error(format!("ERR {err}"));
+                        }
+                        state.keyspace.remove(&key);
+                        removed += 1;
+                    }
+                    Ok(CommandResponse::Integer { .. }) => {}
+                    Ok(_) => return RespValue::Error("ERR invalid exists response".to_string()),
+                    Err(err) => return RespValue::Error(format!("ERR {err}")),
+                }
+            }
+            RespValue::Integer(removed)
+        }
+        "TOUCH" if args.len() >= 2 => {
+            let mut touched = 0;
+            for key in args.iter().skip(1) {
+                match execute(Command::CommonExists {
+                    key: string_arg(key),
+                }) {
+                    Ok(CommandResponse::Integer { value }) => touched += value,
+                    Ok(_) => return RespValue::Error("ERR invalid exists response".to_string()),
+                    Err(err) => return RespValue::Error(format!("ERR {err}")),
+                }
+            }
+            RespValue::Integer(touched)
+        }
+        "RANDOMKEY" if args.len() == 1 => live_matching_keys("*", state, &mut execute)
+            .into_iter()
+            .next()
+            .map(|key| RespValue::Bulk(Some(key.into_bytes())))
+            .unwrap_or(RespValue::Bulk(None)),
+        "FLUSHDB" | "FLUSHALL" if args.len() == 1 || args.len() == 2 => {
+            for key in state.keyspace.iter().cloned().collect::<Vec<_>>() {
+                if let Err(err) = execute(Command::CommonDelete { key }) {
+                    return RespValue::Error(format!("ERR {err}"));
+                }
+            }
+            state.keyspace.clear();
+            RespValue::SimpleString("OK".to_string())
+        }
+        "COPY" if args.len() == 3 || args.len() == 4 => {
+            let replace = args
+                .get(3)
+                .is_some_and(|option| upper(option).as_str() == "REPLACE");
+            copy_or_rename_key_response(&args[1], &args[2], false, replace, state, &mut execute)
+        }
+        "RENAME" if args.len() == 3 => {
+            copy_or_rename_key_response(&args[1], &args[2], true, true, state, &mut execute)
+        }
+        "RENAMENX" if args.len() == 3 => {
+            copy_or_rename_key_response(&args[1], &args[2], true, false, state, &mut execute)
+        }
+        "EXPIRE" if args.len() == 3 => expire_response(&args, 1000, state, &mut execute),
+        "PEXPIRE" if args.len() == 3 => expire_response(&args, 1, state, &mut execute),
+        "EXPIREAT" if args.len() == 3 => expire_at_response(&args, 1000, state, &mut execute),
+        "PEXPIREAT" if args.len() == 3 => expire_at_response(&args, 1, state, &mut execute),
+        "PERSIST" if args.len() == 2 => match execute(Command::CommonPersist {
+            key: string_arg(&args[1]),
+        }) {
+            Ok(CommandResponse::Integer { value }) => RespValue::Integer(value),
+            Ok(_) => RespValue::Error("ERR invalid persist response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "EXPIRETIME" if args.len() == 2 => expire_time_response(&args[1], 1000, &mut execute),
+        "PEXPIRETIME" if args.len() == 2 => expire_time_response(&args[1], 1, &mut execute),
+        "TTL" if args.len() == 2 => match execute(Command::CommonTtl {
+            key: string_arg(&args[1]),
+        }) {
+            // TTL: the negative sentinels (-2 missing, -1 no-expiry) pass through
+            // unchanged; a positive remaining-ms value rounds UP to seconds ((ms+999)/1000).
+            // The old `value / 1000` turned -1/-2 into 0 and floored sub-second remainders.
+            Ok(CommandResponse::Integer { value }) => {
+                if value < 0 {
+                    RespValue::Integer(value)
+                } else {
+                    RespValue::Integer((value + 999) / 1000)
+                }
+            }
+            Ok(_) => RespValue::Error("ERR invalid ttl response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "PTTL" if args.len() == 2 => integer_response(execute(Command::CommonTtl {
+            key: string_arg(&args[1]),
+        })),
+        "STRLEN" if args.len() == 2 => match execute(Command::StringGet {
+            key: string_arg(&args[1]),
+        }) {
+            Ok(CommandResponse::Bytes { value }) => {
+                RespValue::Integer(value.map(|value| value.len() as i64).unwrap_or_default())
+            }
+            Ok(_) => RespValue::Error("ERR invalid strlen response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "GETRANGE" if args.len() == 4 => string_getrange_response(&args, &mut execute),
+        "SETRANGE" if args.len() == 4 => {
+            let response = string_setrange_response(&args, &mut execute);
+            if matches!(response, RespValue::Integer(_)) {
+                state.keyspace.insert(string_arg(&args[1]));
+            }
+            response
+        }
+        "APPEND" if args.len() == 3 => {
+            let key = string_arg(&args[1]);
+            match execute(Command::StringGet { key: key.clone() }) {
+                Ok(CommandResponse::Bytes { value }) => {
+                    let mut new_value = value.unwrap_or_default();
+                    new_value.extend_from_slice(&args[2]);
+                    let new_len = new_value.len() as i64;
+                    if let Err(err) = execute(Command::StringSet {
+                        key: key.clone(),
+                        value: new_value,
+                    }) {
+                        return RespValue::Error(format!("ERR {err}"));
+                    }
+                    state.keyspace.insert(key);
+                    RespValue::Integer(new_len)
+                }
+                Ok(_) => RespValue::Error("ERR invalid append response".to_string()),
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            }
+        }
+        "INCR" if args.len() == 2 => {
+            let response = string_increment_response(&args[1], 1, &mut execute);
+            if matches!(response, RespValue::Integer(_)) {
+                state.keyspace.insert(string_arg(&args[1]));
+            }
+            response
+        }
+        "DECR" if args.len() == 2 => {
+            let response = string_increment_response(&args[1], -1, &mut execute);
+            if matches!(response, RespValue::Integer(_)) {
+                state.keyspace.insert(string_arg(&args[1]));
+            }
+            response
+        }
+        "INCRBY" if args.len() == 3 => match parse_i64_arg(&args[2], "increment") {
+            Ok(increment) => {
+                let response = string_increment_response(&args[1], increment, &mut execute);
+                if matches!(response, RespValue::Integer(_)) {
+                    state.keyspace.insert(string_arg(&args[1]));
+                }
+                response
+            }
+            Err(err) => RespValue::Error(err),
+        },
+        "INCRBYFLOAT" if args.len() == 3 => {
+            let response = string_increment_float_response(&args[1], &args[2], &mut execute);
+            if matches!(response, RespValue::Bulk(Some(_))) {
+                state.keyspace.insert(string_arg(&args[1]));
+            }
+            response
+        }
+        "DECRBY" if args.len() == 3 => match parse_i64_arg(&args[2], "decrement") {
+            // rejects DECRBY i64::MIN ("decrement would overflow"): negating it
+            // overflows i64. Plain `-decrement` panics in debug and wraps to i64::MIN in
+            // release (then silently stores a wrong value). Guard with checked_neg.
+            Ok(decrement) => match decrement.checked_neg() {
+                Some(neg) => {
+                    let response = string_increment_response(&args[1], neg, &mut execute);
+                    if matches!(response, RespValue::Integer(_)) {
+                        state.keyspace.insert(string_arg(&args[1]));
+                    }
+                    response
+                }
+                None => RespValue::Error("ERR decrement would overflow".to_string()),
+            },
+            Err(err) => RespValue::Error(err),
+        },
+        "HINCRBYFLOAT" if args.len() == 4 => {
+            let response =
+                hash_increment_float_response(&args[1], &args[2], &args[3], &mut execute);
+            if matches!(response, RespValue::Bulk(Some(_))) {
+                state.keyspace.insert(string_arg(&args[1]));
+            }
+            response
+        }
+        "HSET" if args.len() >= 4 && args.len() % 2 == 0 => {
+            let key = string_arg(&args[1]);
+            let mut added = 0;
+            for pair in args[2..].chunks(2) {
+                let field = string_arg(&pair[0]);
+                match execute(Command::HashGet {
+                    key: key.clone(),
+                    field,
+                }) {
+                    Ok(CommandResponse::Bytes { value: None }) => added += 1,
+                    Ok(CommandResponse::Bytes { value: Some(_) }) => {}
+                    Ok(_) => return RespValue::Error("ERR invalid hget response".to_string()),
+                    Err(err) => return RespValue::Error(format!("ERR {err}")),
+                }
+            }
+            let entries = args[2..]
+                .chunks(2)
+                .map(|pair| (string_arg(&pair[0]), pair[1].clone()))
+                .collect();
+            match execute(Command::HashMultiSet {
+                key: key.clone(),
+                entries,
+            }) {
+                Ok(_) => {
+                    state.keyspace.insert(key);
+                    RespValue::Integer(added)
+                }
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            }
+        }
+        "HSETNX" if args.len() == 4 => match execute(Command::HashGet {
+            key: string_arg(&args[1]),
+            field: string_arg(&args[2]),
+        }) {
+            Ok(CommandResponse::Bytes { value: Some(_) }) => RespValue::Integer(0),
+            Ok(CommandResponse::Bytes { value: None }) => match execute(Command::HashSet {
+                key: string_arg(&args[1]),
+                field: string_arg(&args[2]),
+                value: args[3].clone(),
+            }) {
+                Ok(_) => {
+                    state.keyspace.insert(string_arg(&args[1]));
+                    RespValue::Integer(1)
+                }
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            },
+            Ok(_) => RespValue::Error("ERR invalid hget response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "HMSET" if args.len() >= 4 && args.len() % 2 == 0 => {
+            let entries = args[2..]
+                .chunks(2)
+                .map(|pair| (string_arg(&pair[0]), pair[1].clone()))
+                .collect();
+            match execute(Command::HashMultiSet {
+                key: string_arg(&args[1]),
+                entries,
+            }) {
+                Ok(_) => {
+                    state.keyspace.insert(string_arg(&args[1]));
+                    RespValue::SimpleString("OK".to_string())
+                }
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            }
+        }
+        "HGET" if args.len() == 3 => bytes_response(execute(Command::HashGet {
+            key: string_arg(&args[1]),
+            field: string_arg(&args[2]),
+        })),
+        "HSTRLEN" if args.len() == 3 => match execute(Command::HashGet {
+            key: string_arg(&args[1]),
+            field: string_arg(&args[2]),
+        }) {
+            Ok(CommandResponse::Bytes { value }) => {
+                RespValue::Integer(value.map(|value| value.len() as i64).unwrap_or_default())
+            }
+            Ok(_) => RespValue::Error("ERR invalid hstrlen response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "HEXISTS" if args.len() == 3 => match execute(Command::HashGet {
+            key: string_arg(&args[1]),
+            field: string_arg(&args[2]),
+        }) {
+            Ok(CommandResponse::Bytes { value }) => RespValue::Integer(i64::from(value.is_some())),
+            Ok(_) => RespValue::Error("ERR invalid hget response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "HMGET" if args.len() >= 3 => {
+            match execute(Command::HashMultiGet {
+                key: string_arg(&args[1]),
+                fields: args.iter().skip(2).map(|field| string_arg(field)).collect(),
+            }) {
+                Ok(CommandResponse::Values { values }) => {
+                    RespValue::Array(values.into_iter().map(RespValue::Bulk).collect())
+                }
+                Ok(_) => RespValue::Error("ERR invalid hmget response".to_string()),
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            }
+        }
+        "HINCRBY" if args.len() == 4 => match parse_i64_arg(&args[3], "increment") {
+            Ok(increment) => integer_response(execute(Command::HashIncrBy {
+                key: string_arg(&args[1]),
+                field: string_arg(&args[2]),
+                increment,
+            })),
+            Err(err) => RespValue::Error(err),
+        },
+        "HGETALL" if args.len() == 2 => match execute(Command::HashGetAll {
+            key: string_arg(&args[1]),
+        }) {
+            Ok(CommandResponse::HashEntries { entries }) => RespValue::Array(
+                entries
+                    .into_iter()
+                    .flat_map(|(field, value)| {
+                        vec![
+                            RespValue::Bulk(Some(field.into_bytes())),
+                            RespValue::Bulk(Some(value)),
+                        ]
+                    })
+                    .collect(),
+            ),
+            Ok(_) => RespValue::Error("ERR invalid hgetall response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "HKEYS" if args.len() == 2 => match execute(Command::HashGetAll {
+            key: string_arg(&args[1]),
+        }) {
+            Ok(CommandResponse::HashEntries { entries }) => RespValue::Array(
+                entries
+                    .into_iter()
+                    .map(|(field, _)| RespValue::Bulk(Some(field.into_bytes())))
+                    .collect(),
+            ),
+            Ok(_) => RespValue::Error("ERR invalid hkeys response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "HVALS" if args.len() == 2 => match execute(Command::HashGetAll {
+            key: string_arg(&args[1]),
+        }) {
+            Ok(CommandResponse::HashEntries { entries }) => RespValue::Array(
+                entries
+                    .into_iter()
+                    .map(|(_, value)| RespValue::Bulk(Some(value)))
+                    .collect(),
+            ),
+            Ok(_) => RespValue::Error("ERR invalid hvals response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "HSCAN" if args.len() >= 3 => {
+            let cursor = match parse_usize(&args[2], "cursor") {
+                Ok(value) => value,
+                Err(err) => return RespValue::Error(err),
+            };
+            let (pattern, count) = match parse_scan_tail_options(&args[3..]) {
+                Ok(value) => value,
+                Err(err) => return RespValue::Error(err),
+            };
+            match execute(Command::HashGetAll {
+                key: string_arg(&args[1]),
+            }) {
+                Ok(CommandResponse::HashEntries { mut entries }) => {
+                    entries.sort_by(|left, right| left.0.cmp(&right.0));
+                    let values = entries
+                        .into_iter()
+                        .filter(|(field, _)| redis_pattern_matches(&pattern, field))
+                        .flat_map(|(field, value)| {
+                            [
+                                RespValue::Bulk(Some(field.into_bytes())),
+                                RespValue::Bulk(Some(value)),
+                            ]
+                        })
+                        .collect();
+                    redis_cursor_block_response(cursor, count, values)
+                }
+                Ok(_) => RespValue::Error("ERR invalid hscan response".to_string()),
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            }
+        }
+        "HLEN" if args.len() == 2 => integer_response(execute(Command::HashLen {
+            key: string_arg(&args[1]),
+        })),
+        "HDEL" if args.len() >= 3 => {
+            let key = string_arg(&args[1]);
+            let mut removed = 0;
+            for field in args.iter().skip(2) {
+                let field = string_arg(field);
+                match execute(Command::HashGet {
+                    key: key.clone(),
+                    field: field.clone(),
+                }) {
+                    Ok(CommandResponse::Bytes { value: Some(_) }) => {
+                        if let Err(err) = execute(Command::HashDelete {
+                            key: key.clone(),
+                            field,
+                        }) {
+                            return RespValue::Error(format!("ERR {err}"));
+                        }
+                        removed += 1;
+                    }
+                    Ok(CommandResponse::Bytes { value: None }) => {}
+                    Ok(_) => return RespValue::Error("ERR invalid hget response".to_string()),
+                    Err(err) => return RespValue::Error(format!("ERR {err}")),
+                }
+            }
+            RespValue::Integer(removed)
+        }
+        "ZADD" if args.len() >= 4 && args.len() % 2 == 0 => {
+            let key = string_arg(&args[1]);
+            let mut pairs = Vec::new();
+            for chunk in args[2..].chunks(2) {
+                match parse_score_arg(&chunk[0]) {
+                    Ok((score, false, false)) => pairs.push((score, chunk[1].clone())),
+                    Ok(_) => {
+                        return RespValue::Error(
+                            "ERR min and max cannot be exclusive here".to_string(),
+                        )
+                    }
+                    Err(err) => return RespValue::Error(err),
+                }
+            }
+            let mut added = 0;
+            for (score, member) in pairs {
+                match execute(Command::ZSetAdd {
+                    key: key.clone(),
+                    member,
+                    score,
+                }) {
+                    Ok(CommandResponse::Integer { value }) => added += value,
+                    Ok(_) => return RespValue::Error("ERR invalid zadd response".to_string()),
+                    Err(err) => return RespValue::Error(format!("ERR {err}")),
+                }
+            }
+            state.keyspace.insert(key);
+            RespValue::Integer(added)
+        }
+        "ZSCORE" if args.len() == 3 => match execute(Command::ZSetScore {
+            key: string_arg(&args[1]),
+            member: args[2].clone(),
+        }) {
+            Ok(CommandResponse::Bytes { value }) => RespValue::Bulk(value),
+            Ok(_) => RespValue::Error("ERR invalid zscore response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "ZREM" if args.len() >= 3 => {
+            let key = string_arg(&args[1]);
+            let mut removed = 0;
+            for member in args.iter().skip(2) {
+                match execute(Command::ZSetRemove {
+                    key: key.clone(),
+                    member: member.clone(),
+                }) {
+                    Ok(CommandResponse::Integer { value }) => removed += value,
+                    Ok(_) => return RespValue::Error("ERR invalid zrem response".to_string()),
+                    Err(err) => return RespValue::Error(format!("ERR {err}")),
+                }
+            }
+            RespValue::Integer(removed)
+        }
+        "ZCARD" if args.len() == 2 => match execute(Command::ZSetCard {
+            key: string_arg(&args[1]),
+        }) {
+            Ok(CommandResponse::Integer { value }) => RespValue::Integer(value),
+            Ok(_) => RespValue::Error("ERR invalid zcard response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "ZRANGE" | "ZREVRANGE" if args.len() == 4 || args.len() == 5 || args.len() == 6 => {
+            let mut rev = command == "ZREVRANGE";
+            let mut withscores = false;
+            for flag in args.iter().skip(4) {
+                match string_arg(flag).to_ascii_uppercase().as_str() {
+                    "WITHSCORES" => withscores = true,
+                    "REV" if command == "ZRANGE" => rev = true,
+                    other => {
+                        return RespValue::Error(format!("ERR syntax error near {other}"))
+                    }
+                }
+            }
+            match (
+                parse_i64_arg(&args[2], "start"),
+                parse_i64_arg(&args[3], "stop"),
+            ) {
+                (Ok(start), Ok(stop)) => match execute(Command::ZSetRange {
+                    key: string_arg(&args[1]),
+                    start,
+                    stop,
+                    rev,
+                }) {
+                    Ok(CommandResponse::Members { members }) => {
+                        interleaved_members_response(members, withscores)
+                    }
+                    Ok(_) => RespValue::Error("ERR invalid zrange response".to_string()),
+                    Err(err) => RespValue::Error(format!("ERR {err}")),
+                },
+                (Err(err), _) | (_, Err(err)) => RespValue::Error(err),
+            }
+        }
+        "ZRANGEBYSCORE" | "ZREVRANGEBYSCORE" if args.len() == 4 || args.len() == 5 => {
+            let rev = command == "ZREVRANGEBYSCORE";
+            let withscores = match args.get(4) {
+                None => false,
+                Some(flag) if string_arg(flag).eq_ignore_ascii_case("WITHSCORES") => true,
+                Some(other) => {
+                    return RespValue::Error(format!(
+                        "ERR syntax error near {}",
+                        string_arg(other)
+                    ))
+                }
+            };
+            // ZREVRANGEBYSCORE takes (max, min); the engine always takes (min, max).
+            let (low_raw, high_raw) = if rev {
+                (&args[3], &args[2])
+            } else {
+                (&args[2], &args[3])
+            };
+            match (parse_score_arg(low_raw), parse_score_arg(high_raw)) {
+                (Ok((min, min_exclusive, _)), Ok((max, max_exclusive, _))) => {
+                    match execute(Command::ZSetRangeByScore {
+                        key: string_arg(&args[1]),
+                        min,
+                        max,
+                        min_exclusive,
+                        max_exclusive,
+                        rev,
+                    }) {
+                        Ok(CommandResponse::Members { members }) => {
+                            interleaved_members_response(members, withscores)
+                        }
+                        Ok(_) => {
+                            RespValue::Error("ERR invalid zrangebyscore response".to_string())
+                        }
+                        Err(err) => RespValue::Error(format!("ERR {err}")),
+                    }
+                }
+                (Err(err), _) | (_, Err(err)) => RespValue::Error(err),
+            }
+        }
+        "ZINCRBY" if args.len() == 4 => match parse_score_arg(&args[2]) {
+            Ok((increment, false, _)) => match execute(Command::ZSetIncrBy {
+                key: string_arg(&args[1]),
+                member: args[3].clone(),
+                increment,
+            }) {
+                Ok(CommandResponse::Bytes { value }) => RespValue::Bulk(value),
+                Ok(_) => RespValue::Error("ERR invalid zincrby response".to_string()),
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            },
+            Ok(_) => RespValue::Error("ERR increment cannot be exclusive".to_string()),
+            Err(err) => RespValue::Error(err),
+        },
+        "ZCOUNT" if args.len() == 4 => {
+            match (parse_score_arg(&args[2]), parse_score_arg(&args[3])) {
+                (Ok((min, min_exclusive, _)), Ok((max, max_exclusive, _))) => {
+                    match execute(Command::ZSetRangeByScore {
+                        key: string_arg(&args[1]),
+                        min,
+                        max,
+                        min_exclusive,
+                        max_exclusive,
+                        rev: false,
+                    }) {
+                        Ok(CommandResponse::Members { members }) => {
+                            RespValue::Integer((members.len() / 2) as i64)
+                        }
+                        Ok(_) => RespValue::Error("ERR invalid zcount response".to_string()),
+                        Err(err) => RespValue::Error(format!("ERR {err}")),
+                    }
+                }
+                (Err(err), _) | (_, Err(err)) => RespValue::Error(err),
+            }
+        }
+        "ZPOPMIN" | "ZPOPMAX" if args.len() == 2 || args.len() == 3 => {
+            let count = match args.get(2) {
+                None => 1,
+                Some(raw) => match parse_i64_arg(raw, "count") {
+                    Ok(count) if count >= 0 => count as u64,
+                    Ok(_) => {
+                        return RespValue::Error(
+                            "ERR value is out of range, must be positive".to_string(),
+                        )
+                    }
+                    Err(err) => return RespValue::Error(err),
+                },
+            };
+            match execute(Command::ZSetPop {
+                key: string_arg(&args[1]),
+                min: command == "ZPOPMIN",
+                count,
+            }) {
+                Ok(CommandResponse::Members { members }) => RespValue::Array(
+                    members
+                        .into_iter()
+                        .map(|value| RespValue::Bulk(Some(value)))
+                        .collect(),
+                ),
+                Ok(_) => RespValue::Error("ERR invalid zpop response".to_string()),
+                Err(err) => RespValue::Error(format!("ERR {err}")),
+            }
+        }
+        "ZRANK" | "ZREVRANK" if args.len() == 3 => match execute(Command::ZSetRank {
+            key: string_arg(&args[1]),
+            member: args[2].clone(),
+            rev: command == "ZREVRANK",
+        }) {
+            Ok(CommandResponse::Bytes { value: Some(rank) }) => {
+                match String::from_utf8_lossy(&rank).parse::<i64>() {
+                    Ok(rank) => RespValue::Integer(rank),
+                    Err(_) => RespValue::Error("ERR invalid zrank response".to_string()),
+                }
+            }
+            Ok(CommandResponse::Bytes { value: None }) => RespValue::Bulk(None),
+            Ok(_) => RespValue::Error("ERR invalid zrank response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "LPUSH" | "RPUSH" if args.len() >= 3 => {
+            let key = string_arg(&args[1]);
+            let left = command == "LPUSH";
+            let mut length = 0;
+            for member in args.iter().skip(2) {
+                match execute(Command::ListPush {
+                    key: key.clone(),
+                    member: member.clone(),
+                    left,
+                }) {
+                    Ok(CommandResponse::Integer { value }) => length = value,
+                    Ok(_) => return RespValue::Error("ERR invalid lpush response".to_string()),
+                    Err(err) => return RespValue::Error(format!("ERR {err}")),
+                }
+            }
+            state.keyspace.insert(key);
+            RespValue::Integer(length)
+        }
+        "LPOP" | "RPOP" if args.len() == 2 || args.len() == 3 => {
+            let key = string_arg(&args[1]);
+            let left = command == "LPOP";
+            // Optional COUNT arg: answers an array (possibly empty) instead of a bulk/nil.
+            let count = if args.len() == 3 {
+                match parse_i64_arg(&args[2], "count") {
+                    Ok(count) if count >= 0 => Some(count),
+                    Ok(_) => return RespValue::Error("ERR value is out of range, must be positive".to_string()),
+                    Err(err) => return RespValue::Error(err),
+                }
+            } else {
+                None
+            };
+            let mut popped = Vec::new();
+            let want = count.unwrap_or(1);
+            for _ in 0..want {
+                match execute(Command::ListPop {
+                    key: key.clone(),
+                    left,
+                }) {
+                    Ok(CommandResponse::Bytes { value: Some(value) }) => popped.push(value),
+                    Ok(CommandResponse::Bytes { value: None }) => break,
+                    Ok(_) => return RespValue::Error("ERR invalid lpop response".to_string()),
+                    Err(err) => return RespValue::Error(format!("ERR {err}")),
+                }
+            }
+            match count {
+                None => match popped.pop() {
+                    Some(value) => RespValue::Bulk(Some(value)),
+                    None => RespValue::Bulk(None),
+                },
+                Some(_) if popped.is_empty() => RespValue::Bulk(None),
+                Some(_) => RespValue::Array(
+                    popped
+                        .into_iter()
+                        .map(|value| RespValue::Bulk(Some(value)))
+                        .collect(),
+                ),
+            }
+        }
+        "LRANGE" if args.len() == 4 => {
+            match (
+                parse_i64_arg(&args[2], "start"),
+                parse_i64_arg(&args[3], "stop"),
+            ) {
+                (Ok(start), Ok(stop)) => match execute(Command::ListRange {
+                    key: string_arg(&args[1]),
+                    start,
+                    stop,
+                }) {
+                    Ok(CommandResponse::Members { members }) => RespValue::Array(
+                        members
+                            .into_iter()
+                            .map(|member| RespValue::Bulk(Some(member)))
+                            .collect(),
+                    ),
+                    Ok(_) => return RespValue::Error("ERR invalid lrange response".to_string()),
+                    Err(err) => return RespValue::Error(format!("ERR {err}")),
+                },
+                (Err(err), _) | (_, Err(err)) => RespValue::Error(err),
+            }
+        }
+        "LLEN" if args.len() == 2 => match execute(Command::ListLen {
+            key: string_arg(&args[1]),
+        }) {
+            Ok(CommandResponse::Integer { value }) => RespValue::Integer(value),
+            Ok(_) => RespValue::Error("ERR invalid llen response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "SADD" if args.len() >= 3 => {
+            let key = string_arg(&args[1]);
+            let mut existing = match execute(Command::SetMembers { key: key.clone() }) {
+                Ok(CommandResponse::Members { members }) => {
+                    members.into_iter().collect::<HashSet<_>>()
+                }
+                Ok(_) => return RespValue::Error("ERR invalid smembers response".to_string()),
+                Err(err) => return RespValue::Error(format!("ERR {err}")),
+            };
+            let mut added = 0;
+            for member in args.iter().skip(2) {
+                if existing.insert(member.clone()) {
+                    if let Err(err) = execute(Command::SetAdd {
+                        key: key.clone(),
+                        member: member.clone(),
+                    }) {
+                        return RespValue::Error(format!("ERR {err}"));
+                    }
+                    state.keyspace.insert(key.clone());
+                    added += 1;
+                }
+            }
+            RespValue::Integer(added)
+        }
+        "SMEMBERS" if args.len() == 2 => match execute(Command::SetMembers {
+            key: string_arg(&args[1]),
+        }) {
+            Ok(CommandResponse::Members { members }) => RespValue::Array(
+                members
+                    .into_iter()
+                    .map(|member| RespValue::Bulk(Some(member)))
+                    .collect(),
+            ),
+            Ok(_) => RespValue::Error("ERR invalid smembers response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "SCARD" if args.len() == 2 => match execute(Command::SetMembers {
+            key: string_arg(&args[1]),
+        }) {
+            Ok(CommandResponse::Members { members }) => RespValue::Integer(members.len() as i64),
+            Ok(_) => RespValue::Error("ERR invalid smembers response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "SISMEMBER" if args.len() == 3 => match execute(Command::SetMembers {
+            key: string_arg(&args[1]),
+        }) {
+            Ok(CommandResponse::Members { members }) => {
+                RespValue::Integer(i64::from(members.iter().any(|member| member == &args[2])))
+            }
+            Ok(_) => RespValue::Error("ERR invalid smembers response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "SMISMEMBER" if args.len() >= 3 => match execute(Command::SetMembers {
+            key: string_arg(&args[1]),
+        }) {
+            Ok(CommandResponse::Members { members }) => {
+                let existing = members.into_iter().collect::<HashSet<_>>();
+                RespValue::Array(
+                    args.iter()
+                        .skip(2)
+                        .map(|member| RespValue::Integer(i64::from(existing.contains(member))))
+                        .collect(),
+                )
+            }
+            Ok(_) => RespValue::Error("ERR invalid smembers response".to_string()),
+            Err(err) => RespValue::Error(format!("ERR {err}")),
+        },
+        "SREM" if args.len() >= 3 => {
+            let key = string_arg(&args[1]);
+            let mut existing = match execute(Command::SetMembers { key: key.clone() }) {
+                Ok(CommandResponse::Members { members }) => {
+                    members.into_iter().collect::<HashSet<_>>()
+                }
+                Ok(_) => return RespValue::Error("ERR invalid smembers response".to_string()),
+                Err(err) => return RespValue::Error(format!("ERR {err}")),
+            };
+            let mut removed = 0;
+            for member in args.iter().skip(2) {
+                if existing.remove(member) {
+                    if let Err(err) = execute(Command::SetRemove {
+                        key: key.clone(),
+                        member: member.clone(),
+                    }) {
+                        return RespValue::Error(format!("ERR {err}"));
+                    }
+                    removed += 1;
+                }
+            }
+            RespValue::Integer(removed)
+        }
+        "SPOP" if args.len() == 2 || args.len() == 3 => {
+            let key = string_arg(&args[1]);
+            let count = match args.get(2) {
+                Some(value) => match parse_usize(value, "count") {
+                    Ok(value) => Some(value),
+                    Err(err) => return RespValue::Error(err),
