@@ -1,0 +1,15 @@
+<!doctype html><meta charset='utf-8'><title>MatrixArk ContextNode Materialization</title><style>body{font-family:Inter,Segoe UI,Arial,sans-serif;max-width:1040px;margin:32px auto;padding:0 24px;color:#172033;line-height:1.45}pre{background:#f6f8fb;border:1px solid #dde5f0;padding:14px;overflow:auto;border-radius:8px}code{background:#edf2f7;padding:2px 4px;border-radius:4px}</style><pre># MatrixArk ContextNode Materialization
+
+Date: 2026-06-23
+
+## Decision
+
+MatrixArk callers do not manually create `ContextNode` objects in v1. They send messages, resources, feedback, and optional hints such as `metadata.node_path`.
+
+MatrixArk now materializes the tree internally:
+
+```text
+incoming message or batch
+-&gt; normalize or infer node_path
+-&gt; ensure every prefix exists as context_node
+-&gt; ensure every parent/child edge exists as context_child_ref
