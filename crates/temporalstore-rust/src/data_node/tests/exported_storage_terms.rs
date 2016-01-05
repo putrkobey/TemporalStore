@@ -86,3 +86,91 @@ fn exported(shards: &[crate::meta::ServerShardServingState]) -> BTreeMap<String,
     metrics
 }
 
+#[test]
+fn the_storage_terms_are_exported_and_sum_across_shards() {
+    // TWO SHARDS WITH DIFFERENT VALUES. At n=1, "summed" and "last one wins" agree.
+    let both = exported(&[shard_with(1, 1), shard_with(2, 3)]);
+
+    for (key, per_unit) in [
+        ("storage_live_block_bytes", 100u64),
+        ("storage_non_purged_physical_bytes", 500),
+        ("storage_logical_bytes_written", 700),
+        ("storage_stale_bytes_recorded", 400),
+        ("storage_stale_bytes_discarded", 150),
+        ("storage_pending_discard_bytes", 250),
+        ("storage_pending_discard_block_refs", 7),
+        ("storage_stale_bytes_by_overwrite", 300),
+        ("storage_stale_bytes_by_removal", 70),
+        ("storage_stale_bytes_by_sweep", 30),
+        ("storage_discard_candidate_bytes", 90),
+        ("storage_discard_candidate_zones", 2),
+        ("storage_compaction_candidate_bytes", 60),
+        ("storage_compaction_candidate_zones", 3),
+        ("storage_compaction_candidate_range_count", 11),
+        ("storage_merged_discard_range_count", 13),
+        ("storage_fragmented_range_count", 5),
+        ("storage_dropped_discard_range_count", 1),
+        ("storage_stale_zones_tracked", 4),
+        ("storage_stale_zones_pruned", 1),
+    ] {
+        // scale 1 + scale 3 = four units of each figure
+        let want = per_unit * 4;
+        assert_eq!(
+            both.get(key).copied(),
+            Some(want),
+            "{key} exported {:?} where two shards at 1x and 3x should sum to {want}. These are \
+             byte and count terms, so the exporter's cross-shard add is the right aggregation -- a \
+             value equal to one shard's share means it is being overwritten rather than summed",
+            both.get(key)
+        );
+    }
+
+    // ---- AND THE PLACEMENT CAVEAT IS REACHABLE, which is the one key a dashboard built on the
+    // ---- candidate counts needs in order to know whether they are counts or lower bounds.
+    assert!(
+        both.contains_key("storage_dropped_discard_range_count"),
+        "the placement caveat is not exported, so a scrape cannot tell whether the candidate \
+         figures beside it are exact"
+    );
+
+    // ---- THE NODE-LEVEL COUNTS COUNT SHARDS, and the fixture is built so exactly one of the two
+    // ---- qualifies on each condition. A count equal to 2 would mean every shard is being counted
+    // ---- rather than the qualifying ones, which a fixture where both qualified could not detect.
+    for (key, expected) in [
+        ("storage_shards_recommending_compaction", 1u64),
+        ("storage_shards_offering_a_compaction_candidate", 2),
+        ("storage_shards_with_truncated_placement", 1),
+    ] {
+        let got = both.get(key).copied().unwrap_or_default();
+        assert_eq!(
+            got, expected,
+            "{key} is {got}, expected {expected} over two shards. These count PARTICIPANTS -- a \
+             shard is this store's reclaim participant, where the surface being followed counts \
+             chunk servers -- so a value above the shard count means the condition is being counted \
+             per slab or per candidate instead, and the figure no longer means what its name says"
+        );
+        assert!(
+            got <= 2,
+            "{key} is {got} over 2 shards. A count of shards cannot exceed the number of shards"
+        );
+    }
+
+    // ---- AND NO IDENTITY IS EXPORTED. `best_reclaim_candidate_endpoint` names WHICH participant
+    // ---- holds the best candidate. A shard id has no sum, and neither does a cross-shard maximum,
+    // ---- so neither belongs in a dictionary aggregated with `saturating_add`.
+    let identities: Vec<&String> = both
+        .keys()
+        .filter(|key| {
+            key.contains("endpoint")
+                || key.contains("_id")
+                || key.ends_with("_shard")
+                || key.contains("best_candidate_shard")
+        })
+        .collect();
+    assert!(
+        identities.is_empty(),
+        "these exported metrics look like identities rather than quantities: {identities:?}. A \
+         shard id or an endpoint name has no meaningful sum across shards, which is what this \
+         exporter does to every value -- the same category error as exporting a ratio through it"
+    );
+}
