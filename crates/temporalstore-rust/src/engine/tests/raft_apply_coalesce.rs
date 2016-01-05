@@ -22,27 +22,3 @@ use super::*;
 // property of an engine now, and each of these builds its own.
 
 const BATCH: usize = 64;
-
-fn new_engine(dir: &std::path::Path) -> TemporalEngine {
-    let engine = TemporalEngine::with_local_dirs(
-        16 * 1024,
-        dir.join("cache"),
-        dir.join("blocks"),
-        dir.join("indexes"),
-    );
-    engine.load_shard(1);
-    engine
-}
-
-fn batch_requests() -> Vec<ExecuteRequest> {
-    (0..BATCH)
-        .map(|i| ExecuteRequest {
-            shard_id: 1,
-            command: Command::StringSet {
-                key: format!("k{i}"),
-                value: format!("v{i}").into_bytes(),
-            },
-        })
-        .collect()
-}
-
