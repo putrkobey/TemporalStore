@@ -1,0 +1,36 @@
+# Build outputs
+build/
+build-*/
+build-ubuntu22/
+output/
+output-*/
+cmake-build-*/
+target/
+target-rust-bench/
+benchmark_reports/
+
+# Compiled artifacts
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.exe
+*.lib
+*.pdb
+*.jar
+*.class
+
+# Logs and local reports
+crash.log
+*.log
+*.err.log
+*.out.log
+last-*.txt
+ssm-*.json
+terraform-output*.json
+
+# Local dependency drops and vendored/private dependency sandboxes
+dependencies/
+thirdparty/
+local_build/

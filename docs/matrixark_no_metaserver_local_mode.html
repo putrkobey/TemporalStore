@@ -15,20 +15,3 @@
     table { border-collapse: collapse; width: 100%; background: #fff; }
     th, td { border: 1px solid #dce3ee; padding: 10px 12px; text-align: left; font-size: 14px; }
     th { background: #edf2f7; }
-    .panel { background: #fff; border: 1px solid #dde3ef; border-radius: 8px; padding: 22px; box-shadow: 0 10px 30px rgba(20,33,61,.06); }
-  </style>
-</head>
-<body><main>
-<h1>MatrixArk No-Metaserver Local Mode</h1>
-<section class="panel"><p>MatrixArk now supports an explicit local mode that does not start or require a metaserver. Set <code>MATRIXARK_LOCAL_MODE=no-metaserver</code> and the conformance MCP wrappers use the <code>temporalstore-local</code> backend.</p></section>
-<h2>Why</h2>
-<p>Distributed TemporalStore still uses metaserver for table discovery, placement, partition ownership, multi-node operation, and Raft. Local MatrixArk development should not need that full cluster, so no-metaserver mode persists the same MatrixArk context records into a local record log.</p>
-<h2>Run It</h2>
-<pre>cd <repo>
-
-MATRIXARK_LOCAL_MODE=no-metaserver \
-MATRIXARK_TEMPORALSTORE_LOCAL_STORE=/tmp/matrixark-local-native.jsonl \
-bash tools/matrixark_mcp_server.sh --line-json</pre>
-<pre>python3 tools/matrixark_mcp_server.py \
-  --backend temporalstore-local \
-  --local-store /tmp/matrixark-local.jsonl \

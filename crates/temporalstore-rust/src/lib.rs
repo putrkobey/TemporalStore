@@ -181,3 +181,94 @@ pub use engine::reports::{
 };
 pub use engine::TemporalEngine;
 
+/// THE FIRST ROUTING BUCKET A SHARD OWNS BY DEFAULT.
+pub const DEFAULT_START_ROUTING_BUCKET: u32 = 0;
+
+/// THE LAST ROUTING BUCKET A SHARD OWNS BY DEFAULT -- 1,024 buckets, CHOSEN BY MEASUREMENT.
+///
+/// A page's routing bucket is `start + FNV-1a-64(object_key) % (end - start + 1)`, so this value
+/// sets the MODULUS. The previous default was `u32::MAX`: 4.29 billion buckets among a few thousand
+/// keys, where every key lands alone in its own bucket by construction. That was never a
+/// configuration anyone ran -- `docs/runtime_tuning.md` told an operator to set 1,024 buckets before
+/// the first ingest -- so the shipped default disagreed with the shipped documentation.
+///
+/// SWEPT, NOT COPIED FROM THE DOCUMENT'S EXAMPLE. 255 / 1,023 / 4,095 / 65,535 at 4,000 and 40,000
+/// routed records, every distribution as a histogram with percentiles and a MAX and every byte
+/// figure in BOTH allocator columns, in `engine/tests/routing_range_default.rs`. What the sweep
+/// says, on the CHUNK column that charges `malloc_usable_size`:
+///
+/// ```text
+///   end      40,000 records          4,000 records        dump/release unit   read path
+///   255      114.1 B/rec  -59.2%     132.6 B/rec -52.8%   168 pages           6.42 entries
+///   1023     120.2 B/rec  -57.0%     191.9 B/rec -31.6%    50 pages           4.54 entries
+///   4095     144.1 B/rec  -48.4%     256.2 B/rec  -8.7%    21 pages           2.91 entries
+///   65535    252.7 B/rec   -9.5%     257.9 B/rec  -8.1%     6 pages           0.83 entries
+///   u32::MAX 279.3 B/rec    ---      280.7 B/rec   ---      1 page            0.00 entries
+/// ```
+///
+/// The byte saving SATURATES -- 1,023 is within 5% of the floor 255 reaches -- while the dump and
+/// release unit grows LINEARLY in the corpus without bound, because the fill is
+/// `records / bucket-count`. So the right choice is the WIDEST range that still reaches the
+/// amortisation floor, which is this one, and not the narrowest range the byte column prefers.
+///
+/// ONLY NEW STORES GET IT. See `engine/routing_range_stamp.rs`: a store records the range it was
+/// built under, an existing store is honoured on THAT range, and a store whose stamp disagrees with
+/// the configured range is REFUSED rather than loaded with every page filed out of range.
+///
+/// A STORE CARRYING NO STAMP AT ALL IS ALSO REFUSED, with `routing_range_unstamped`. It used to be
+/// adopted onto the whole keyspace on the reasoning that this was the only range it could have been
+/// built on -- true of the default, false of the configuration, since this setting is exactly what
+/// an operator was told to change before the first ingest. So it is refused rather than guessed at.
+///
+/// REFUSED IS NOT THE SAME AS UNRECOVERABLE, and this paragraph used to say the range "is not
+/// recorded anywhere". It was: a pre-stamp address carried the bucket it was filed under, so the
+/// width can be SOLVED from such a store and then checked against every address in it. See
+/// `engine/routing_range_stamp.rs` for the arithmetic, and for why the engine still does not do it.
+pub const DEFAULT_END_ROUTING_BUCKET: u32 = 1023;
+
+/// THE NAMES THE FIRST ROUTING BUCKET IS SET BY, CURRENT SPELLING FIRST.
+///
+/// Beside the default it falls back to, and shared by every reader, because the setting has two
+/// spellings and a reader that retypes them can carry one and not the other. The `_SLOT` name is
+/// the previous one and is still read, for the reason `bin/server/raft_route.rs` gives: "a shard
+/// whose range silently widened back to the whole keyspace looks healthy and serves the wrong
+/// keys". Two readers existed and only one of them read the environment at all, which is what
+/// made a store built on another range unopenable through the proxy.
+pub const START_ROUTING_BUCKET_ENV_NAMES: &[&str] =
+    &["TS_SHARD_START_ROUTING_BUCKET", "TS_SHARD_START_ROUTING_SLOT"];
+
+/// THE NAMES THE LAST ROUTING BUCKET IS SET BY, CURRENT SPELLING FIRST.
+///
+/// See [`START_ROUTING_BUCKET_ENV_NAMES`]. This is the one that sets the MODULUS, so a reader
+/// that misses it does not narrow the range a little -- it files every later write in buckets the
+/// existing blocks are not in.
+pub const END_ROUTING_BUCKET_ENV_NAMES: &[&str] =
+    &["TS_SHARD_END_ROUTING_BUCKET", "TS_SHARD_END_ROUTING_SLOT"];
+
+pub use index_log::{IndexLogRecord, IndexLogStats, LocalIndexLogStore};
+pub use ingestion::{
+    dead_letter_export_report, flink_production_checkpoint_handshake_report,
+    ingestion_readiness_report, kafka_consumer_group_runtime_report,
+    raft_failover_idempotence_report, FlinkCheckpointAction, FlinkCheckpointState,
+    FlinkCheckpointStatus, FlinkCheckpointUpdate, FlinkProductionCheckpointHandshakeReport,
+    IngestionBatchReport, IngestionBatchRequest, IngestionDeadLetter,
+    IngestionDeadLetterExportReport, IngestionRaftFailoverIdempotenceReport,
+    IngestionReadinessReport, IngestionRecord, IngestionRecordResult, IngestionSource,
+    IngestionStateReport, IngestionStats, KafkaConsumerGroupMember,
+    KafkaConsumerGroupRuntimeReport, KafkaHighWatermark, KafkaOffsetLedgerEntry,
+};
+pub use meta::{
+    AckResponse, AddNamespaceRequest, AddTableRequest, FreezeStaleServersRequest, GetShardResponse,
+    GetTableTopologyRequest, ListNamespacesResponse, ListProxiesResponse, ListServersResponse,
+    ListTablesResponse, LoadFinishRequest, LocalMetaMutationLog, MetaEntityState, MetaInfo,
+    MetaMutation, MetaPreflightReport, MetaStats, NamespaceMetaInfo, ShardStatLoad,
+    ProxyHeartbeatRequest, ProxyHeartbeatResponse, ProxyMetaInfo, RegisterProxyRequest,
+    RegisterServerRequest, RegisterShardRequest, RegisterShardResponse, ServerEndpoint,
+    ServerHeartbeatRequest, ServerHeartbeatResponse, ServerMetaInfo, ServerRuntimeLoad,
+    ServerShardServingState, ShardLoad, ShardLocation, SingleNodeMeta, StaleResourceReport,
+    StaleServerReport, StateChangeRequest, TableMetaInfo, TableShard, TableTopologyResponse,
+};
+pub use partition_id::{
+    validate_partition_count_per_set, validate_partition_set_count, PartitionId, PartitionIdError,
+    MAX_PARTITION_SET_INDEX, MAX_TABLE_ID, MIN_BUCKETS_PER_PARTITION, PARTITION_INDEX_MASK,
+    PARTITION_VERSION_MASK, BUCKET_COUNT, BUCKET_MASK,

@@ -43,3 +43,93 @@ function points(n) {
 const SERIES = mode === "absent" ? undefined : {
   interval_s: 15,
   points: mode === "short" ? points(1) : points(8),
+  covers_s: mode === "short" ? 0 : 105,
+  worker_scoped: true,
+};
+
+const OVERVIEW = {
+  status: "ok",
+  footprint: { worker: { resident_bytes: 1048576, peak_bytes: 1048576,
+                         source: "/proc/self/status", workers: 1 },
+               engine: { available: false } },
+  latency: { available: true, deadline_ms: 0, deadline_is_cooperative: true,
+             transport_request_timeout_ms: 60000, transport_io_timeout_ms: 60000,
+             bounds_a_slow_call: "transport_request_timeout_ms",
+             worst_case_single_call_ms: 60000, deadline_can_be_overrun_by_ms: 0 },
+  metrics_series: SERIES,
+  config: { skills: { budgets: { available: false } } },
+};
+
+const els = new Map();
+function makeEl(id) {
+  return {
+    id: id || "", hidden: false, textContent: "",
+    value: id === "key" ? "k-admin" : "", checked: true, className: "",
+    style: {}, dataset: {}, files: [], options: [], children: [], _html: "",
+    get innerHTML() { return this._html; },
+    set innerHTML(v) { this._html = String(v); },
+    addEventListener() {}, removeEventListener() {}, appendChild() {}, removeChild() {},
+    setAttribute() {}, getAttribute() { return null; }, closest() { return null; },
+    querySelector() { return null; }, querySelectorAll() { return []; },
+    scrollIntoView() {}, focus() {}, click() {},
+    classList: { add() {}, remove() {}, toggle() {} }
+  };
+}
+function el(id) {
+  if (!els.has(id)) { els.set(id, makeEl(id)); }
+  return els.get(id);
+}
+
+const win = {
+  document: {
+    getElementById: (id) => el(id),
+    querySelector: () => makeEl(), querySelectorAll: () => [],
+    createElement: () => makeEl(), addEventListener() {}, body: makeEl(), hidden: false
+  },
+  addEventListener() {},
+  location: { origin: "http://localhost", href: "http://localhost", reload() {} },
+  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  navigator: {},
+  setTimeout: () => 0, setInterval: () => 0, clearInterval() {},
+  Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
+  TextDecoder: function () { this.decode = (v) => Buffer.from(v || []).toString("utf8"); },
+  AbortController: function () { this.abort = () => {}; this.signal = {}; },
+  FileReader: function () {}, Blob: function () {},
+  URL: { createObjectURL: () => "", revokeObjectURL() {} },
+  fetch: (url) => {
+    const u = String(url);
+    if (u.indexOf("/v1/admin/overview") >= 0) {
+      return Promise.resolve({ ok: true, status: 200,
+                               json: () => Promise.resolve(OVERVIEW),
+                               text: () => Promise.resolve(JSON.stringify(OVERVIEW)) });
+    }
+    if (u.indexOf("/v1/admin/events") >= 0) {
+      return Promise.resolve({ ok: true, status: 200,
+                               body: { getReader: () => ({ read: () => new Promise(() => {}) }) },
+                               json: () => Promise.resolve({}), text: () => Promise.resolve("") });
+    }
+    return Promise.resolve({ ok: true, status: 200,
+                             json: () => Promise.resolve({ settings: {} }),
+                             text: () => Promise.resolve("") });
+  }
+};
+win.window = win;
+
+const names = Object.keys(win);
+const values = names.map((k) => win[k]);
+scripts.forEach((body, index) => {
+  try { new Function(...names, body)(...values); }
+  catch (e) { console.log("FAIL script " + index + " threw: " + e.message); failures += 1; }
+});
+
+setTimeout(function () {
+  const html = el("trend").innerHTML;
+  ok("the panel was drawn at all", !/Loading/.test(html), html.slice(0, 160));
+
+  if (mode === "absent") {
+    /* An older worker that does not publish a series must not render an empty chart, which would
+       read as a deployment serving nothing. */
+    ok("a missing series says so rather than drawing zero",
+       /Not available/.test(html) && !/<svg/.test(html), html.slice(0, 300));
