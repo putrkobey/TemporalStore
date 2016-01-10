@@ -1,0 +1,71 @@
+/* Run the Setup page's byteHint against real settings shapes and report what it produced.
+ *
+ * Grepping the built page proves the function is present, not that it fires: a hint appended to a
+ * variable nothing renders, or a pattern that never matches the variable names actually shipped,
+ * both leave the same source text in the file. byteHint is pure, so it is extracted and called --
+ * the thing under test is what it returns for a given field.
+ *
+ * Cases are the settings the portal really offers, including the two quota knobs that predate the
+ * engine group, so a pattern matching only TS_* would be caught here.
+ */
+"use strict";
+const fs = require("fs");
+
+const page = fs.readFileSync(process.argv[2], "utf8");
+const scripts = [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]).join("\n");
+
+const start = scripts.indexOf("function byteHint(");
+if (start < 0) {
+  console.log("FAIL byteHint is not in the built page");
+  process.exit(1);
+}
+let depth = 0;
+let end = -1;
+for (let i = scripts.indexOf("{", start); i < scripts.length; i += 1) {
+  if (scripts[i] === "{") {
+    depth += 1;
+  } else if (scripts[i] === "}") {
+    depth -= 1;
+    if (depth === 0) { end = i + 1; break; }
+  }
+}
+if (end < 0) {
+  console.log("FAIL could not brace-match byteHint");
+  process.exit(1);
+}
+const byteHint = new Function(scripts.slice(start, end) + "; return byteHint;")();
+
+let failures = 0;
+
+const cases = [
+  { env: "TS_BLOCK_SEGMENT_TARGET_BYTES", value: "1073741824", expect: "1 GiB" },
+  { env: "TS_COMPACTION_WATERMARK_BYTES", value: "268435456", expect: "256 MiB" },
+  { env: "TS_CONTEXT_PAGE_TARGET_BYTES", value: "65536", expect: "64 KiB" },
+  { env: "TS_INDEX_DUMP_WAL_GAP_BYTES", value: "1048576", expect: "1 MiB" },
+  { env: "MATRIXARK_QUOTA_MAX_BLOB_BYTES", value: "5368709120", expect: "5 GiB" },
+  { env: "MATRIXARK_QUOTA_MAX_BODY_BYTES", value: "16777216", expect: "16 MiB" },
+  /* The only case exercising the DEFAULT path. It named TS_PAGE_INDEX_CACHE_BYTES until that
+     variable was retired, which would have left it testing the rule against a name that
+     exists nowhere -- the same mistake the note below records. TS_CACHE_MEMORY_BYTES is the
+     cache budget the engine actually enforces, and its default is 16 MiB. */
+  { env: "TS_CACHE_MEMORY_BYTES", value: "", default: "16777216", expect: "16 MiB" },
+  /* Both are byte counts whose names do NOT end in _BYTES. The case here used to read
+     TS_STREAM_MAX_BLOB_SIZE_BYTES, a variable that exists nowhere -- so it exercised the suffix
+     rule against a name invented to satisfy it, and said nothing about the setting it was for. */
+  { env: "TS_STREAM_MAX_BLOB_SIZE", value: "10485760", expect: "10 MiB" }
+];
+
+for (const c of cases) {
+  const out = byteHint({ env: c.env, value: c.value, default: c.default });
+  if (!out.includes(c.expect)) {
+    console.log("FAIL " + c.env + ": expected " + c.expect + ", got " + JSON.stringify(out));
+    failures += 1;
+  } else {
+    console.log("ok   " + c.env + " -> " + c.expect);
+  }
+}
+
+/* `MATRIXARK_SUMMARY_REFRESH_LIMIT` is the interesting one: an int setting whose name ends in a
+   size-ish word but which counts summaries, not bytes. It belongs here rather than above, where
+   an `expect: ""` would have asserted nothing -- `"anything".includes("")` is true. */
+for (const env of ["TS_VECTOR_SCALED", "TS_MAX_RETAINED_FINISHED_JOBS", "MATRIXARK_HTTP_PORT",
