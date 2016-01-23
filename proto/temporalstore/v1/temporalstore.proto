@@ -1,0 +1,136 @@
+syntax = "proto3";
+
+package temporalstore.v1;
+
+// TemporalStoreService is the Rust-native production SDK contract. Existing
+// HTTP/JSON client and proxy routes must continue to expose the same logical
+// request and response fields until generated tonic/prost bindings are wired.
+service TemporalStoreService {
+  rpc Execute(ExecuteRequest) returns (ExecuteResponse);
+  rpc BatchExecute(BatchExecuteRequest) returns (BatchExecuteResponse);
+  rpc OpenTable(OpenTableRequest) returns (OpenTableResponse);
+  rpc SyncTopology(SyncTopologyRequest) returns (SyncTopologyResponse);
+  rpc GetClientPreflight(ClientPreflightRequest) returns (ClientPreflightResponse);
+}
+
+// ProxyService is the Rust-native proxy RPC contract. It intentionally does
+// not claim legacy wire compatibility; existing legacy callers must migrate
+// through the Rust-native HTTP/RESP/tonic surfaces.
+service ProxyService {
+  rpc ProxyExecuteStream(stream ProxyStreamRequest) returns (stream ProxyStreamEvent);
+  rpc RouteCallbacks(stream ProxyRouteCallback) returns (stream ProxyRouteAck);
+  rpc WatchProxyPreflight(ProxyPreflightWatchRequest) returns (stream ProxyPreflightEvent);
+}
+
+// DataNodeService is the Rust-native data-node RPC contract. HTTP routes keep
+// serving local tests, while production adapters use this streaming shape for
+// shard-affine execution, async lifecycle callbacks, and job status updates.
+service DataNodeService {
+  rpc ExecuteStream(stream DataNodeStreamRequest) returns (stream DataNodeStreamEvent);
+  rpc LifecycleCallbacks(stream DataNodeLifecycleCallback) returns (stream DataNodeLifecycleAck);
+  rpc WatchJobStatus(DataNodeJobStatusRequest) returns (stream DataNodeJobStatusEvent);
+}
+
+message Status {
+  bool ok = 1;
+  string code = 2;
+  string message = 3;
+}
+
+message ExecuteRequest {
+  uint64 shard_id = 1;
+  uint64 trace_id = 2;
+  Command command = 3;
+}
+
+message ExecuteResponse {
+  Status status = 1;
+  CommandResponse response = 2;
+  uint64 topology_version = 3;
+}
+
+message BatchExecuteRequest {
+  uint64 shard_id = 1;
+  uint64 trace_id = 2;
+  repeated Command commands = 3;
+}
+
+message BatchExecuteResponse {
+  Status status = 1;
+  repeated CommandResponse responses = 2;
+  uint64 topology_version = 3;
+}
+
+message OpenTableRequest {
+  string namespace_name = 1;
+  string table_name = 2;
+  string local_location = 3;
+}
+
+message OpenTableResponse {
+  Status status = 1;
+  TableTopology topology = 2;
+}
+
+message SyncTopologyRequest {
+  repeated string table_keys = 1;
+  uint64 min_topology_version = 2;
+  uint64 deadline_ms = 3;
+}
+
+message SyncTopologyResponse {
+  Status status = 1;
+  repeated TableTopology topologies = 2;
+  uint64 topology_version = 3;
+}
+
+message ClientPreflightRequest {
+  bool include_routes = 1;
+  bool include_backend_failures = 2;
+}
+
+message ClientPreflightResponse {
+  Status status = 1;
+  uint64 route_cache_entries = 2;
+  uint64 table_cache_entries = 3;
+  uint64 backend_failure_entries = 4;
+  uint64 topology_version = 5;
+  bool degraded = 6;
+  repeated string warnings = 7;
+}
+
+message ProxyStreamRequest {
+  oneof kind {
+    ExecuteRequest execute = 1;
+    BatchExecuteRequest batch_execute = 2;
+    SyncTopologyRequest sync_topology = 3;
+  }
+}
+
+message ProxyStreamEvent {
+  Status status = 1;
+  uint64 topology_version = 2;
+  ExecuteResponse execute = 3;
+  BatchExecuteResponse batch_execute = 4;
+  repeated string route_refreshes = 5;
+}
+
+message ProxyRouteCallback {
+  string table_key = 1;
+  uint64 shard_id = 2;
+  uint64 topology_version = 3;
+  string reason = 4;
+  Status status = 5;
+}
+
+message ProxyRouteAck {
+  Status status = 1;
+  string table_key = 2;
+  uint64 shard_id = 3;
+  uint64 topology_version = 4;
+}
+
+message ProxyPreflightWatchRequest {
+  bool include_routes = 1;
+  bool include_policy = 2;
+  uint64 min_topology_version = 3;
