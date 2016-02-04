@@ -1,0 +1,8 @@
+{
+  "name": "temporalstore-agent-hooks",
+  "version": "0.1.0",
+  "description": "Global Codex lifecycle hooks for MatrixArk context memory backed by TemporalStore.",
+  "author": {
+    "name": "MatrixArk"
+  },
+  "hooks": "./hooks/hooks.json",
