@@ -87,3 +87,181 @@ fn entry_for(shape: Shape, value: Vec<u8>) -> SharedStoreWalEntry {
         1024,
         dir.path().join("cache"),
         dir.path().join("blocks"),
+        dir.path().join("index"),
+    );
+    primary.load_shard(SHARD);
+    assert!(
+        primary
+            .execute(ExecuteRequest {
+                shard_id: SHARD,
+                command
+            })
+            .status
+            .ok
+    );
+    let records = primary
+        .write_ahead_log_store()
+        .scan(SHARD, 0, u64::MAX, u64::MAX)
+        .expect("scan the engine append");
+    let mut writes = records
+        .iter()
+        .map(|(_, bytes)| {
+            temporalstore_rust::wal::decode_wal_line(bytes).expect("decode engine record")
+        })
+        .filter(|record| !record.outcomes.is_empty());
+    let record = writes.next().expect("the engine must write outcomes");
+    assert!(
+        writes.next().is_none(),
+        "one write must produce one outcome record"
+    );
+    assert!(
+        record.command.is_none(),
+        "the outcome sweep must not carry a command"
+    );
+    assert_eq!(
+        record.outcomes.len(),
+        1,
+        "one string write must yield one outcome"
+    );
+    let mut staged_blocks = record.staged_blocks;
+    if staged_blocks.is_empty() {
+        for item in &record.outcomes {
+            if let Some(address) = item.resolved_address() {
+                staged_blocks.push(temporalstore_rust::wal::StagedBlock {
+                    object_id: item.object_id,
+                    component: item.component.as_deref().map(Arc::from),
+                    bytes: primary.block_store().read(&address).expect("carried page"),
+                });
+            }
+        }
+    }
+    SharedStoreWalEntry {
+        shard_id: SHARD,
+        wal_index: 1,
+        command: record.command,
+        staged_blocks,
+        outcomes: record.outcomes,
+    }
+}
+
+/// One append of `payload` bytes into a store of its own, and what the store then holds.
+async fn one_append(
+    shape: Shape,
+    cluster: &str,
+    payload: usize,
+    options: &StoreOptions,
+) -> (usize, u64, u64, usize) {
+    let store = Arc::new(
+        MatrixObjectObjectStore::new(BUCKET, options.clone()).expect("a store of its own"),
+    );
+    let replicator = SharedStoreReplicator::new(cluster, store.clone())
+        .with_wal_append_mode(SharedStoreWalAppendMode::ProtobufAppendBlob);
+
+    // Deterministic dense bytes keep page compression from hiding per-byte storage costs.
+    let mut seed = 0x1234_5678u32;
+    let value: Vec<u8> = (0..payload)
+        .map(|_| {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            seed as u8
+        })
+        .collect();
+    let user_bytes = KEY.len() + value.len();
+
+    let expected = entry_for(shape, value);
+    replicator
+        .publish_wal_entry(expected.clone())
+        .await
+        .unwrap_or_else(|err| panic!("append of {payload} bytes: {err:?}"));
+    // A fresh reader cannot answer from the writer's state. Every measured byte must recover.
+    let reader = SharedStoreReplicator::new(cluster, store.clone())
+        .with_wal_append_mode(SharedStoreWalAppendMode::ProtobufAppendBlob);
+    let read = reader
+        .read_wal_entry_by_offset_metadata(SHARD, 1)
+        .await
+        .expect("indexed read")
+        .expect("the measured entry must exist");
+    assert_eq!(
+        read.entry, expected,
+        "the measured append must read back intact"
+    );
+
+    // ---- THE ENTRY, and then EVERY object the append left behind. The sidecar is a second
+    // ---- object and it is part of what an append costs, so it is counted rather than ignored.
+    let blob_key = format!("{cluster}/shards/{SHARD}/shared/wal/wal.protobuf.blob");
+    let objects = store
+        .list(&format!("{cluster}/shards/{SHARD}/shared/wal/"))
+        .await
+        .expect("the wal listing");
+
+    let inner = store.inner();
+    let guard = inner.lock().expect("store lock poisoned");
+
+    let entry_bytes: u64 = guard
+        .get_object(BUCKET, &blob_key)
+        .expect("the append blob")
+        .metadata
+        .extents
+        .iter()
+        .map(|extent| extent.length())
+        .sum();
+
+    let mut blob_bytes = 0u64;
+    for key in &objects {
+        let object = guard
+            .get_object(BUCKET, key)
+            .expect("every listed object must be counted");
+        blob_bytes += object
+            .metadata
+            .extents
+            .iter()
+            .map(|e| e.length())
+            .sum::<u64>();
+    }
+
+    (user_bytes, entry_bytes, blob_bytes, objects.len())
+}
+
+/// Least squares over the sweep, and the largest residual it leaves.
+fn fit(points: &[(f64, f64)]) -> (f64, f64, f64) {
+    let n = points.len() as f64;
+    let sx: f64 = points.iter().map(|p| p.0).sum();
+    let sy: f64 = points.iter().map(|p| p.1).sum();
+    let sxx: f64 = points.iter().map(|p| p.0 * p.0).sum();
+    let sxy: f64 = points.iter().map(|p| p.0 * p.1).sum();
+    let denom = n * sxx - sx * sx;
+    let rate = if denom == 0.0 {
+        0.0
+    } else {
+        (n * sxy - sx * sy) / denom
+    };
+    let envelope = (sy - rate * sx) / n;
+    let worst = points
+        .iter()
+        .map(|p| (p.1 - (rate * p.0 + envelope)).abs())
+        .fold(0.0f64, f64::max);
+    (rate, envelope, worst)
+}
+
+/// Sweep the value size under one cluster id and return the fitted line for both legs.
+async fn sweep(
+    shape: Shape,
+    cluster: &str,
+    sizes: &[usize],
+    options: &StoreOptions,
+    print: bool,
+) -> (f64, f64, f64) {
+    let mut blob_points: Vec<(f64, f64)> = Vec::new();
+    let mut entry_points: Vec<(f64, f64)> = Vec::new();
+
+    if print {
+        println!("    payload   user B   entry B   sidecar B   blob B   objects   blob/user   replicated/user");
+    }
+    for &payload in sizes {
+        let (user, entry, blob, objects) = one_append(shape, cluster, payload, options).await;
+        // ---- THE OBJECT COUNT IS ASSERTED, NOT ASSUMED. A listing that came back short would
+        // ---- make every ratio below a ratio over the wrong denominator, and an empty one would
+        // ---- read as "0 bytes over 0 objects", which looks free.
+        assert_eq!(
+            objects, 2,
