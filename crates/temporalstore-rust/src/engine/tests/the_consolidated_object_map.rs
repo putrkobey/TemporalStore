@@ -96,3 +96,199 @@ fn the_control_state_mutators_keep_the_consolidated_map_right_through_removals()
 
     // IN-PLACE MUTATION through the closure, which is the member that would otherwise hand out a
     // `&mut` to one copy alone.
+    let other = crate::block_store::ElementEntry::from_parts(9, 512, 64, Some(0), Some(11));
+    let touched = shard.with_control_state_block_mut("k1", |slot| {
+        slot.set_address(&other);
+    });
+    assert!(touched.is_some(), "the in-place mutation did not find k1");
+    assert_eq!(
+        shard.control_state_blocks().get("k1").map(|slot| slot.address()),
+        Some(other),
+        "the in-place mutation did not reach the authoritative map"
+    );
+
+    // WHAT THE INLINE ARM DOES WITH A NONZERO ORDINAL, PINNED HERE BECAUSE THE TWO PATHS
+    // DISAGREE. The record's inline arm holds the ordinal's PRESENCE and not its value -- correct,
+    // and measured: a single-page object has page zero by construction, and 400 of 400 live
+    // addresses carried ordinal 0. The CONVERSION path refuses a nonzero one by name
+    // (`NonZeroBlockOrdinalDoesNotFitInline`). `set_address` does not refuse it; it writes the
+    // presence bit and drops the value.
+    //
+    // That asymmetry is correct today only because the maps holding records are single-page. It
+    // is asserted rather than trusted, so that the day a multi-page object reaches this door the
+    // behaviour is a stated fact with a test on it rather than a surprise -- and the owned element
+    // array is where such an object belongs.
+    let nonzero_ordinal =
+        crate::block_store::ElementEntry::from_parts(1, 0, 16, Some(7), Some(11));
+    let mut probe = ObjectRecord::default();
+    probe.set_address(&nonzero_ordinal);
+    assert_eq!(
+        probe.address().block_id(),
+        Some(0),
+        "the inline arm now round-trips a nonzero page ordinal. If that is deliberate, this          assertion and the note above are stale; if it is not, a page ordinal is being silently          zeroed on the compactor write-back path"
+    );
+
+    // Mutating a key that is not there must change nothing and say so.
+    assert!(
+        shard.with_control_state_block_mut("absent", |_| ()).is_none(),
+        "mutating an absent key must answer None"
+    );
+
+    // THE WHOLE-MAP REPLACEMENT, which is where a field assignment would have left the mirror
+    // holding every key the replacement dropped.
+    let mut replacement = std::collections::HashMap::new();
+    replacement.insert(std::sync::Arc::<str>::from("fresh"), a.clone());
+    shard.set_all_control_state_blocks(replacement);
+    assert_eq!(
+        shard.control_state_blocks().len(),
+        1,
+        "the whole-map replacement left keys the replacement did not contain"
+    );
+    assert!(
+        !shard.control_state_blocks().contains_key("k1"),
+        "k1 survived a whole-map replacement that did not include it -- a ghost entry"
+    );
+
+}
+
+// =================================================================================================
+// THE OUTER MAP'S ORDER
+// =================================================================================================
+
+/// THE OUTER MAP ITERATES IN ONE ORDER WHATEVER ORDER ITS KINDS ARRIVED IN.
+///
+/// # WHY THIS IS NOT A TEST ABOUT A CONTAINER CHOICE
+///
+/// The dump manifest feeds its digest from an iteration, key by key, and recomputes and compares
+/// it on restore. So the digest depends on iteration order -- and the only existing test over that
+/// key list uses `.any()`, which is order-INSENSITIVE. An ordering regression there is therefore
+/// silent today, and it would invalidate every manifest written before it.
+///
+/// This is the first thing in the tree asserting that order is stable at all, which is why it is
+/// its own named test rather than an assertion buried inside a migration test.
+///
+/// WHAT IT STOPS, CONCRETELY. Swapping the outer `BTreeMap` for a `HashMap` on the entirely
+/// reasonable grounds that there are only seventeen kinds, so the container cannot matter for
+/// lookup cost. It does not matter for cost. It decides the digest.
+#[test]
+fn the_consolidated_outer_map_iterates_in_one_order_whatever_the_insertion_order() {
+    let slot = slot_at(3, 96, 24);
+
+    // The same four kinds, inserted in two deliberately different orders.
+    let forward = [
+        StoredModelKind::String,
+        StoredModelKind::Feature,
+        StoredModelKind::ControlState,
+        StoredModelKind::ContextEvent,
+    ];
+    let mut backward = forward;
+    backward.reverse();
+
+    let build = |kinds: &[StoredModelKind]| {
+        let mut shard = ShardState::default();
+        for (n, kind) in kinds.iter().enumerate() {
+            shard
+                .objects
+                .entry(*kind)
+                .or_default()
+                .insert(std::sync::Arc::from(format!("k{n}").as_str()), slot.clone());
+        }
+        shard.objects.keys().copied().collect::<Vec<_>>()
+    };
+
+    let one = build(&forward);
+    let other = build(&backward);
+
+    assert_eq!(
+        one.len(),
+        forward.len(),
+        "the fixture did not install every kind, so this compares a shorter list than intended"
+    );
+    assert_eq!(
+        one, other,
+        "the outer map iterated {one:?} when the kinds arrived one way and {other:?} when they \
+         arrived the other. The dump manifest digest is fed from this iteration and recomputed on \
+         restore, so an order that depends on insertion order silently invalidates every manifest \
+         written before the change. If the container was swapped for a HashMap because seventeen \
+         entries cannot matter for lookup cost -- that is true, and it is not what this order is \
+         for"
+    );
+
+    // And the order is the kinds' own, not an accident of how they were inserted.
+    let mut sorted = one.clone();
+    sorted.sort();
+    assert_eq!(
+        one, sorted,
+        "the outer map's iteration order is not its key order, so it is not the deterministic \
+         order the digest needs"
+    );
+}
+
+// =================================================================================================
+// THE DECODE FOLD
+// =================================================================================================
+
+// =================================================================================================
+// THE UNKNOWN SPELLING
+// =================================================================================================
+
+/// AN UNKNOWN MODEL-KIND SPELLING IS REFUSED AND DOES NOT ABORT.
+///
+/// # WHY THIS TEST HAD TO BE WRITTEN BEFORE THE BEHAVIOUR COULD BE TRUSTED
+///
+/// `StoredModelKind`'s decoder carried a doc comment titled "AN UNKNOWN SPELLING FAILS LOUDLY,
+/// NAMING IT", claiming it "refuses the same way `model_report_code` refuses". It did not refuse;
+/// it called `panic!`. Nothing ever fed it an unknown spelling, so the divergence between the documented
+/// behaviour and the actual behaviour was invisible -- which is exactly how a panic survives under
+/// a doc asserting the opposite.
+///
+/// THE DIFFERENCE IS NOT COSMETIC. Every caller of this decode is a load path. A panic there makes
+/// a store UNOPENABLE; an `Err` makes it fall back to replaying the operation log, which is slower
+/// and correct. That is the trade `ObjectRecord::try_from` states in capitals and takes
+/// deliberately, and the trade every stamp refusal in this tree takes.
+#[test]
+fn an_unknown_model_kind_spelling_is_refused_instead_of_aborting() {
+    // A kind spelling neither half of the registry declares.
+    let refusal = serde_json::from_str::<StoredModelKind>("\"a_kind_nobody_declared\"")
+        .expect_err("an undeclared spelling must not decode successfully");
+    let text = refusal.to_string();
+    assert!(
+        text.contains("a_kind_nobody_declared"),
+        "the refusal does not name the spelling it refused, so a log line from it cannot say \
+         which kind the store and the engine disagree about: {text}"
+    );
+    assert!(
+        text.contains("model_kind_registry"),
+        "the refusal does not say where to declare the missing spelling, which is the instruction \
+         that makes it actionable: {text}"
+    );
+
+    // THE POSITIVE CONTROL. A declared spelling still decodes, and to the right variant -- so the
+    // refusal above is attributable to the spelling being unknown and not to the decoder being
+    // broken for every input.
+    let known = serde_json::from_str::<StoredModelKind>("\"control_state\"")
+        .expect("a declared spelling must still decode");
+    assert_eq!(
+        known,
+        StoredModelKind::ControlState,
+        "a declared spelling decoded to the wrong variant"
+    );
+}
+
+// =================================================================================================
+// THE TRIPWIRE
+// =================================================================================================
+
+// =================================================================================================
+// WHAT THE DUPLICATION COSTS
+// =================================================================================================
+
+// =================================================================================================
+// THE SLOT AS A SERIES
+// =================================================================================================
+
+/// THE OWNED ARRAY STAYS SORTED, AND WHAT THAT PROTECTS.
+///
+/// The array is written through `set`, which binary-searches for the insertion position, and read
+/// through `get`, which binary-searches for the value. The two agree only while the array is
+/// SORTED -- so an insert that appended blindly would make `get` miss points that are present,

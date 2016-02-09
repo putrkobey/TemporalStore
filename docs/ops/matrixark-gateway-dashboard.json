@@ -1,0 +1,166 @@
+{
+  "title": "MatrixArk Gateway",
+  "uid": "matrixark-gateway",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "tags": [
+    "matrixark",
+    "gateway",
+    "api"
+  ],
+  "description": "The customer-facing /v1 edge: configuration health, request rate, errors and latency. The three stat tiles on the top row are the ones that catch a silently misconfigured deployment -- extraction and embedding both fall back to a local deterministic path that answers 200, so a deployment running on hash vectors looks identical to a healthy one on every other panel here.",
+  "templating": {
+    "list": [
+      {
+        "name": "instance",
+        "label": "Gateway",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "query": "label_values(matrixark_gateway_requests_total, instance)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true
+      },
+      {
+        "name": "route",
+        "label": "Route",
+        "type": "query",
+        "datasource": {
+          "type": "prometheus",
+          "uid": "${DS_PROMETHEUS}"
+        },
+        "query": "label_values(matrixark_gateway_requests_total{instance=~\"$instance\"}, route)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 11,
+      "type": "stat",
+      "title": "Config last changed",
+      "description": "Time since the configuration was last written from the portal. Half of \"it started behaving differently on Tuesday\" is answered by knowing whether anyone changed it on Tuesday; without this the answer comes from asking people.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null",
+                "result": {
+                  "text": "never"
+                }
+              }
+            }
+          ]
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - max(matrixark_gateway_config_changed_timestamp_seconds{instance=~\"$instance\"} > 0)",
+          "legendFormat": "since change"
+        }
+      ]
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Settings away from stock",
+      "description": "Settings whose value is not the built-in default. The first thing to compare when one deployment behaves differently from another.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 8,
+        "y": 0
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "max(matrixark_gateway_settings_overridden{instance=~\"$instance\"})",
+          "legendFormat": "overridden"
+        }
+      ]
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "Worker uptime",
+      "description": "Time since this gateway worker started. A restart resets the in-process counters on this dashboard, so a sudden drop in a counter with a low uptime is a restart rather than a loss of traffic.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 8,
+        "x": 16,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "time() - min(matrixark_gateway_start_time_seconds{instance=~\"$instance\"})",
+          "legendFormat": "uptime"
+        }
+      ]
+    },
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Retrieval mode",
+      "description": "0 means every vector is a hash fallback: retrieval still answers, and the results are not semantic. Nothing else on this dashboard distinguishes that deployment from a healthy one.",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${DS_PROMETHEUS}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 6,
+        "x": 0,
+        "y": 4
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "hash vectors",
+                  "color": "red",
+                  "index": 0
+                }
