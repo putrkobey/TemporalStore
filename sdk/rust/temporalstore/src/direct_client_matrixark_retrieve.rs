@@ -27,3 +27,18 @@ impl Client {
         let mut error: *mut c_char = ptr::null_mut();
         let code = unsafe {
             temporalstore_matrixark_scan_candidates(
+                self.raw,
+                count_key.as_ptr(),
+                record_hash_key.as_ptr(),
+                shard_size,
+                request_json.as_ptr(),
+                &mut value,
+                &mut error,
+            )
+        };
+        check(code, error)?;
+        let out = unsafe { CStr::from_ptr(value).to_string_lossy().into_owned() };
+        unsafe { temporalstore_free_string(value) };
+        Ok(out)
+    }
+

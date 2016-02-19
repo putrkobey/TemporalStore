@@ -101,3 +101,106 @@ fn report_scope(label: &str, engine: &TemporalEngine, shards: &[ShardId]) -> (us
         "fixture did not produce a slab per shard: the node holds {} slabs for {} shards, so \
          there is nothing for an unscoped walk to over-carry and this measures nothing",
         present.len(),
+        shards.len()
+    );
+    assert!(
+        !first.is_empty(),
+        "the image for shard {} carries NO slabs, so every comparison below is vacuous",
+        shards[0]
+    );
+    (present.len(), first.len())
+}
+
+/// FINDING 1, at two shards. The image for shard 1 must not be the image for shard 2.
+#[test]
+fn a_shard_snapshot_carries_only_its_own_slabs_at_two_shards() {
+    let shards = [1 as ShardId, 2 as ShardId];
+    let engine = engine_hosting(&shards);
+    let (present, carried_one) = report_scope("two shards", &engine, &shards);
+
+    let first = carried_slabs(&engine, 1);
+    let second = carried_slabs(&engine, 2);
+    println!("slabs_carried_shard2 = {}", second.len());
+    println!(
+        "over_carry_ratio     = {:.2}x",
+        present as f64 / carried_one as f64
+    );
+
+    // THE CONTROL, and it is the whole refutation of "the walk is implicitly shard-scoped":
+    // two shards of one engine must not be answered with the same slab set. Shard 2 was given
+    // an extra roll, so a scoped answer differs in COUNT and not only in membership.
+    assert_ne!(
+        first, second,
+        "shard 1 and shard 2 of the same engine were handed the IDENTICAL slab set, so the walk \
+         is not shard-scoped: {first:?}"
+    );
+    assert_ne!(
+        first.len(),
+        second.len(),
+        "the two shards were handed the same NUMBER of slabs ({}), so this fixture cannot tell \
+         a scoped walk from an unscoped one",
+        first.len()
+    );
+
+    // THE CLAIM: shard 1's image is a strict subset of the node's slabs, i.e. the other shard's
+    // bytes were actually dropped rather than merely reordered.
+    assert!(
+        carried_one < present,
+        "shard 1's image carries all {present} slabs on the node, so it is still carrying shard \
+         2's bytes"
+    );
+    assert!(
+        !first.contains(second.iter().next().expect("shard 2 owns a slab")),
+        "shard 1's image carries a slab that shard 2's image also claims exclusively"
+    );
+}
+
+/// FINDING 1, at four shards. Same property; the point of the second size is the RATIO, which
+/// grows with the shard count because the over-carry was the whole store every time.
+#[test]
+fn a_shard_snapshot_carries_only_its_own_slabs_at_four_shards() {
+    let shards = [1 as ShardId, 2 as ShardId, 3 as ShardId, 4 as ShardId];
+    let engine = engine_hosting(&shards);
+    let (present, carried_one) = report_scope("four shards", &engine, &shards);
+    println!(
+        "over_carry_ratio     = {:.2}x",
+        present as f64 / carried_one as f64
+    );
+
+    let first = carried_slabs(&engine, 1);
+    let fourth = carried_slabs(&engine, 4);
+    assert_ne!(
+        first, fourth,
+        "shard 1 and shard 4 of the same engine were handed the IDENTICAL slab set"
+    );
+    assert!(
+        carried_one < present,
+        "shard 1's image carries all {present} slabs on the node at four shards"
+    );
+
+    // The over-carry the scope removes grows with the shard count: at four shards the node
+    // holds strictly more slabs than at two, while shard 1 still owns what it owned.
+    let two_shard_present = slabs_on_the_node(&engine_hosting(&[1 as ShardId, 2 as ShardId])).len();
+    println!("slabs_on_the_node@2  = {two_shard_present}");
+    assert!(
+        present > two_shard_present,
+        "four shards did not put more slabs on the node than two ({present} vs \
+         {two_shard_present}), so the multiplier claim is untested"
+    );
+}
+
+/// The scope must not drop a slab the installed index can still address. This is the property
+/// that matters and it is checked END TO END rather than against the same formula the scope
+/// uses: install shard 1's image into a fresh engine and read every record back.
+#[test]
+fn a_scoped_image_still_serves_every_record_the_shard_held() {
+    let shards = [1 as ShardId, 2 as ShardId, 3 as ShardId, 4 as ShardId];
+    let engine = engine_hosting(&shards);
+    let image = build_state_image(&engine, 1).expect("shard 1 must serve a state image");
+    println!("slabs_carried_shard1 = {}", image.slabs.len());
+    assert!(
+        !image.slabs.is_empty(),
+        "nothing was carried, so serving the records back proves nothing"
+    );
+
+    // Exactly what the install does with an image, on a fresh private engine.
