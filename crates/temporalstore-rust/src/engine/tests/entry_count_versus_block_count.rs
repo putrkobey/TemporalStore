@@ -1,0 +1,1032 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+//! WHETHER HOLDING MANY ELEMENTS IN ONE PAGE WOULD REDUCE THE INDEX ENTRIES THAT NAME THEM.
+//!
+//! A container in this engine gives every element its own page and therefore its own page-index
+//! entry: `Command::HashSet`, `SetAdd`, `ZSetAdd` and `ListPush` each call `append_value` once per
+//! element and `upsert_bucket_index_block` once per element, and `HashMultiSet` LOOPS, so a bulk
+//! command already decomposes into per-element pages. `container_member_shadow` priced what one
+//! such element costs. The question here is the one before the price: if a page held many
+//! elements, would the ENTRY COUNT fall with it?
+//!
+//! THE ANSWER WAS NO AND IT IS YES NOW, AND THE REASON IS STILL `block_index_handle`. The handle a
+//! page is filed under hashed the model spelling, the object key, the ELEMENT NAME and the address.
+//! Two elements sharing one page shared the address and differed in the name, so they hashed to two
+//! handles and the page index held two entries -- one page, two entries. `BlockIndex` has no
+//! element-name field any more: the handle is the model spelling, the object key and the address,
+//! two elements over one page hash ALIKE, and the entry count is the PAGE count.
+//! `one_block_is_one_entry_because_the_handle_can_no_longer_name_an_element` drives exactly that,
+//! and it is the whole of the mechanism.
+//!
+//! THE INVERSION IS WHY THIS HEADER IS RESTATED RATHER THAN RE-NUMBERED. A reader who took the old
+//! answer from this paragraph and the new entry counts from the arms would conclude the arms had
+//! been relaxed. The old claim was true of the engine it was written against, and the arm that held
+//! it has been rewritten rather than loosened -- its own failure message asked for that.
+//!
+//! THIS ENGINE ALREADY RUNS BOTH SHAPES, WHICH IS WHY THE CONTRAST IS MEASURABLE RATHER THAN
+//! PROJECTED. The timestamped kinds take a different route to the same index:
+//!
+//!   * `packed_blocks::append_timestamped_kv_blocks` chunks many points into ONE page against
+//!     `context_block_target_bytes`, so items per page is greater than one; and
+//!   * `sync_bucket_index_object_blocks_with_mode` files what comes back deduplicated BY PHYSICAL
+//!     ADDRESS, with `component: None`, so the entry count is the PAGE count.
+//!
+//! So a feature series files one entry per page and a container files one per element, in the same
+//! page index, on the same shard.
+//! `how_many_index_entries_each_kind_files_for_the_same_element_count` measures both at two corpus
+//! sizes ten times apart, as a histogram with per-row denominators.
+//!
+//! BATCHING NEEDED BOTH HALVES AND IT HAS BOTH NOW, WHICH IS WHY THIS SECTION IS HISTORY RATHER
+//! THAN A PREREQUISITE. It read "Sharing pages without dropping the component moves nothing;
+//! dropping the component moves the entry count only once pages are shared ... Dropping the
+//! component is what costs, because for a container the component is not decoration", and then
+//! listed three readers for which the element name on the entry was the only copy of an element's
+//! identity. The name has been dropped and all three were moved first, so the list below is the
+//! bill that was paid and not one that is outstanding:
+//!
+//!   * `hashes` WAS `skip_serializing` on `ShardState` and rebuilt FROM the bucket index on load,
+//!     which made the element name on the entry the durable spelling of a hash field. It carries
+//!     `#[serde(default)]` now, as do `sets`, `zsets` and `lists`: all four resident maps are
+//!     durable and are the authority. (The comment above `hashes` in `engine::state` that still
+//!     says "rebuildable ... do not duplicate in checkpoints" predates that and is corrected
+//!     there.)
+//!   * the `"zset"` arm of `apply_outcome_item` rebuilt the member and the score out of the
+//!     element name and never read the page. The score rides the WAL outcome's `value` slot and
+//!     the member comes from the resident map.
+//!   * `apply_key_states` folds thirteen maps -- `features`, `expires_at_ms`, four
+//!     `control_state_*` and seven `context_*` -- and `sets`, `zsets`, `lists` and `hashes` are
+//!     STILL not among them, while `fold_delta_block_items` DOES restore the page items.
+//!     `the_maps_the_delta_fold_restores_do_not_include_the_container_maps` holds that list, so a
+//!     map added to the fold shows up here by name. What closed this door is the other side of it:
+//!     `collect_upsert_index_items` reads the resident map, so a delta item exists only where the
+//!     map held the element, and an entry can no longer arrive naming an element nothing else
+//!     holds.
+//!
+//! SO THE PREREQUISITE PARAGRAPH IS DISCHARGED. It said a batched page "would have to carry element
+//! identity in its PAYLOAD, and the fold's reconciliation deliberately does not read payloads", and
+//! called batching a lossy migration until the fold carried element bytes. The page payload does
+//! name its elements -- that is what makes several pages foldable into one -- and the recovery path
+//! that needed the entry's copy now reads the durable resident maps instead. This module still
+//! measures the prize and changes no production code; what it no longer does is name an outstanding
+//! blocker.
+//!
+//! WHAT THE READ SIDE WOULD PAY, measured and not projected. Today a single-element read fetches
+//! the element's own page, and the page's length is a STORED FACT read back off the index -- not a
+//! counter some path could forget to increment, which is the failure mode that reported a restore
+//! as flat while the kernel saw 6.70x. A batched page is built with the engine's OWN encoder
+//! (`packed_blocks::encode_feature_block`) at several batch widths and its length read off the
+//! bytes, so the amplification below is two measurements and no arithmetic.
+//! `what_one_element_read_fetches_today_and_what_a_batched_block_would_fetch` reports it.
+//!
+//! THE CONTROL IS THE STRING KIND, at 0.00%. A string key owns exactly one page and one entry
+//! already, so batching predicts no change for it and a measurement that moved it would be
+//! measuring the fixture. `the_string_control_has_nothing_for_batching_to_win` asserts the zero.
+//!
+//! THE STORE PATH LENGTH is held constant across arms and asserted equal: it moves allocation
+//! bytes at about six a character, and an arm on a longer temporary directory reads as a heavier
+//! representation.
+#![allow(clippy::all)]
+use super::*;
+use crate::engine::state::{
+    block_index_handle, BlockIndex, BlockIndexMap, BlockSlabLiveIndex,
+};
+use std::collections::{BTreeMap, BTreeSet};
+
+/// The end bucket `docs/runtime_tuning.md` tells an operator to set, and the shipped default since
+/// #1973. THE OPERATOR'S RANGE.
+const NARROW_END: u32 = 1023;
+
+/// The end bucket `TemporalEngine::load_shard` uses when nothing says otherwise. Every key lands in
+/// a bucket of its own BY CONSTRUCTION at this width, so it is an artefact of the default and not a
+/// workload. Entries per OBJECT cannot move with it -- routing takes the object key and never sees
+/// the component, so all of an object's pages land in one bucket at either range -- and
+/// `how_many_index_entries_each_kind_files_for_the_same_element_count` asserts that equality rather
+/// than assuming it.
+const WIDE_END: u32 = u32::MAX;
+
+/// The two corpus sizes, ten times apart. Elements under one object key at each.
+const SMALL_ELEMENTS: usize = 10;
+const LARGE_ELEMENTS: usize = 100;
+
+/// Object keys per kind. Small, because the number this module reports is per OBJECT and more keys
+/// only repeat the row.
+const KEYS_PER_KIND: usize = 4;
+
+/// The element payload width, held equal across kinds so a byte figure is comparable between them.
+const VALUE_WIDTH: usize = 32;
+
+/// The batch width the control projects at: the widest the read-side row prices, so the control is
+/// checked against the most favourable projection this module reports rather than a gentle one.
+const CONTROL_BATCH_WIDTH: usize = 128;
+
+fn engine_on(dir: &std::path::Path) -> TemporalEngine {
+    TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.join("cache"),
+        dir.join("blocks"),
+        dir.join("indexes"),
+    )
+}
+
+fn load_on(engine: &TemporalEngine, end_routing_bucket: u32) {
+    let response = engine.load_shard_with(crate::control::LoadShardRequest {
+        shard_id: 1,
+        table_name: "entry-count".to_string(),
+        shard_uri: "local://entry-count/1".to_string(),
+        start_routing_bucket: 0,
+        end_routing_bucket,
+        readonly: false,
+        load_version: 1,
+        local_node_id: Some(1),
+    });
+    assert!(
+        response.status.ok,
+        "the shard must load for any figure below to mean anything: {:?}",
+        response.status
+    );
+}
+
+fn run_batch(engine: &TemporalEngine, commands: Vec<Command>) {
+    for chunk in commands.chunks(1_000) {
+        let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+            shard_id: 1,
+            commands: chunk.to_vec(),
+        });
+        assert!(response.status.ok, "seed must ack: {:?}", response.status);
+    }
+}
+
+/// The four container kinds plus the two shapes that are NOT element-scaled, each as
+/// (kind spelling, object keys, the commands that fill them).
+///
+/// One helper rather than four, so a kind cannot be seeded at a different element count than the
+/// row it is reported on -- which is the shape of fixture error that makes a ratio a fixture
+/// property. Every arm writes exactly `elements` elements under every key it returns.
+fn seed_all_kinds(engine: &TemporalEngine, elements: usize) -> Vec<(&'static str, Vec<String>)> {
+    let mut seeded: Vec<(&'static str, Vec<String>)> = Vec::new();
+    let mut commands: Vec<Command> = Vec::new();
+
+    let hash_keys: Vec<String> = (0..KEYS_PER_KIND).map(|k| format!("h{k}")).collect();
+    for key in &hash_keys {
+        for f in 0..elements {
+            commands.push(Command::HashSet {
+                key: key.clone(),
+                field: format!("f{f}"),
+                value: vec![b'v'; VALUE_WIDTH],
+            });
+        }
+    }
+    seeded.push(("hash", hash_keys));
+
+    let set_keys: Vec<String> = (0..KEYS_PER_KIND).map(|k| format!("t{k}")).collect();
+    for key in &set_keys {
+        for m in 0..elements {
+            commands.push(Command::SetAdd {
+                key: key.clone(),
+                member: format!("m{m}").into_bytes(),
+            });
+        }
+    }
+    seeded.push(("set", set_keys));
+
+    let zset_keys: Vec<String> = (0..KEYS_PER_KIND).map(|k| format!("z{k}")).collect();
+    for key in &zset_keys {
+        for m in 0..elements {
+            commands.push(Command::ZSetAdd {
+                key: key.clone(),
+                member: format!("m{m}").into_bytes(),
+                score: m as f64,
+            });
+        }
+    }
+    seeded.push(("zset", zset_keys));
+
+    let list_keys: Vec<String> = (0..KEYS_PER_KIND).map(|k| format!("l{k}")).collect();
+    for key in &list_keys {
+        for m in 0..elements {
+            commands.push(Command::ListPush {
+                key: key.clone(),
+                member: format!("m{m}").into_bytes(),
+                left: false,
+            });
+        }
+    }
+    seeded.push(("list", list_keys));
+
+    // THE CONTROL. One page, one entry, already -- nothing for batching to win.
+    let string_keys: Vec<String> = (0..KEYS_PER_KIND).map(|k| format!("s{k}")).collect();
+    for key in &string_keys {
+        commands.push(Command::StringSet {
+            key: key.clone(),
+            value: vec![b'v'; VALUE_WIDTH],
+        });
+    }
+    seeded.push(("string", string_keys));
+
+    run_batch(engine, commands);
+
+    // THE PAGE-SCALED SHAPE, driven separately because it is one command per key and not a batch of
+    // per-element ones. That asymmetry IS the finding: the whole series goes in as one command and
+    // comes back chunked into pages.
+    let feature_keys: Vec<String> = (0..KEYS_PER_KIND).map(|k| format!("f{k}")).collect();
+    for key in &feature_keys {
+        let points = (0..elements)
+            .map(|t| crate::types::FeaturePoint {
+                timestamp_ms: 1_700_000_000_000 + t as u64,
+                value: vec![b'f'; VALUE_WIDTH],
+            })
+            .collect::<Vec<_>>();
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::FeatureAppend {
+                key: key.clone(),
+                points,
+            },
+        });
+        assert!(
+            response.status.ok,
+            "series seed must ack: {:?}",
+            response.status
+        );
+    }
+    seeded.push(("feature", feature_keys));
+
+    seeded
+}
+
+/// Live page-index entries and DISTINCT pages, for one (kind, object key).
+///
+/// Entries are counted off the page index itself and pages off the physical identity of the
+/// addresses those entries hold, so "one page, two entries" is visible as the two numbers
+/// disagreeing rather than having to be inferred.
+fn entries_and_blocks(engine: &TemporalEngine, kind: &str, object_key: &str) -> (usize, usize) {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    // THE OBJECT A PAGE BELONGS TO COMES FROM THE LOOKUP BESIDE IT, not off the page. The
+    // model spelling is still the page's own field and is still read there.
+    let keys = crate::engine::state::BlockKeysByPosition::from_lookup(
+        &shard.bucket_index.object_block_lookup,
+    );
+    let mut entries = 0usize;
+    let mut blocks: BTreeSet<(u64, u64, u64)> = BTreeSet::new();
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for (handle, block) in &bucket.block_index {
+            if block.deleted {
+                continue;
+            }
+            if block.model_id.as_str() != kind {
+                continue;
+            }
+            match keys.live_identity(bucket.routing_bucket, *handle) {
+                Some((_, named)) if &**named == object_key => {}
+                _ => continue,
+            }
+            entries += 1;
+            blocks.insert((
+                block.address.block_slab_id(),
+                block.address.offset(),
+                block.address.length(),
+            ));
+        }
+    }
+    (entries, blocks.len())
+}
+
+/// THE BATCHING ARITHMETIC THE WHOLE MODULE IS ABOUT, IN ONE FUNCTION.
+///
+/// If a page held `elements_per_block` elements and each page were filed as one entry -- the shape
+/// the timestamped kinds already run, described in this module's header -- an object of
+/// `elements_per_object` elements would file this many entries. It is the projection the prize rows
+/// above talk about, written once so the control below checks the SAME arithmetic the module
+/// claims rather than a restatement of it.
+fn projected_entries_per_object(elements_per_object: usize, elements_per_block: usize) -> usize {
+    assert!(
+        elements_per_block > 0,
+        "a page holding no elements is not a batching scheme, and the division below would be \
+         undefined"
+    );
+    elements_per_object.div_ceil(elements_per_block)
+}
+
+/// THE CONTROL'S ASSERTION, AND IT HAS TO BE ABLE TO FAIL.
+///
+/// Both numbers reach this function from the run: `measured` is entries per object counted off the
+/// engine's own page index, `projected` is `projected_entries_per_object` applied to the elements
+/// the fixture actually wrote. Neither is a literal, so a kind whose filing moved, or a projection
+/// that stopped predicting it, changes the percentage and fails here.
+///
+/// `the_control_assertion_goes_red_when_the_projection_moves_the_row` drives it red, because a
+/// control that has never been shown to fail is indistinguishable from a comment.
+fn assert_batching_projects_no_change(kind: &str, measured: f64, projected: f64) -> f64 {
+    assert!(
+        measured > 0.0,
+        "the {kind} control measured {measured} entries an object. A zero denominator makes the \
+         percentage below undefined, and a fixture that wrote nothing reaches exactly this"
+    );
+    let change = 100.0 * (projected / measured - 1.0);
+    println!(
+        "  {kind:<7} measured {measured:>6.2} entries/object, projected {projected:>6.2}, \
+         change {change:+.2}%"
+    );
+    assert!(
+        change.abs() < f64::EPSILON,
+        "the {kind} control moved by {change:+.2}% -- {measured} entries an object measured \
+         against {projected} projected. A control is a row batching cannot move; this one moved, \
+         so either the kind no longer files one entry an element or the projection no longer \
+         describes it"
+    );
+    change
+}
+
+/// A histogram of one integer, reported with its denominator and never as a mean.
+///
+/// A mean of 1.98 pages a bucket in this engine once described a population holding no bucket with
+/// two, and #1986 found a population holding only 1 and 100. So every row below is counts.
+#[derive(Default)]
+struct Hist {
+    counts: BTreeMap<usize, usize>,
+}
+
+impl Hist {
+    fn add(&mut self, value: usize) {
+        *self.counts.entry(value).or_default() += 1;
+    }
+
+    fn samples(&self) -> usize {
+        self.counts.values().sum()
+    }
+
+    fn max(&self) -> usize {
+        self.counts.keys().copied().max().unwrap_or_default()
+    }
+
+    fn percentile(&self, pct: usize) -> usize {
+        let samples = self.samples();
+        if samples == 0 {
+            return 0;
+        }
+        // Ceiling rank, so p50 of an even sample count names an observation and not a midpoint
+        // between two.
+        let want = (samples * pct + 99) / 100;
+        let mut seen = 0usize;
+        for (value, count) in &self.counts {
+            seen += count;
+            if seen >= want.max(1) {
+                return *value;
+            }
+        }
+        self.max()
+    }
+
+    fn print(&self, label: &str) {
+        println!(
+            "  {label:<34} samples {:>4}  p50 {:>6}  MAX {:>6}",
+            self.samples(),
+            self.percentile(50),
+            self.max()
+        );
+        for (value, count) in &self.counts {
+            println!("      {value:>6} : {count:>4} object(s)");
+        }
+    }
+}
+
+// =================================================================================================
+// 1. THE HEADLINE. Entries per object, by kind, at two corpus sizes, at both routing ranges.
+// =================================================================================================
+
+/// HOW MANY INDEX ENTRIES EACH KIND FILES FOR THE SAME ELEMENT COUNT.
+///
+/// Four container kinds, a timestamped series and a string, every one of them seeded with the SAME
+/// element count under each of its keys, at two corpus sizes ten times apart and at both routing
+/// ranges. Reported as histograms with per-row sample counts, p50 and MAX.
+///
+/// WHAT DECIDES: the container kinds file one entry per element and the series files one per PAGE.
+/// Both numbers are asserted, both directions, and the fixture asserts the population it wrote
+/// before any of them is believed -- a walk over an empty shard reports "0 entries over 0 objects",
+/// which reads exactly like a kind that costs nothing.
+#[test]
+fn how_many_index_entries_each_kind_files_for_the_same_element_count() {
+    let mut path_lengths: Vec<usize> = Vec::new();
+    // (range, elements, kind) -> entries per object, so the two ranges can be asserted equal.
+    let mut per_range: BTreeMap<(u32, usize, &'static str), Vec<usize>> = BTreeMap::new();
+
+    for end_routing_bucket in [NARROW_END, WIDE_END] {
+        for elements in [SMALL_ELEMENTS, LARGE_ELEMENTS] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            path_lengths.push(dir.path().as_os_str().len());
+            let engine = engine_on(dir.path());
+            load_on(&engine, end_routing_bucket);
+            let seeded = seed_all_kinds(&engine, elements);
+
+            println!("--- 0..{end_routing_bucket}, {elements} elements per key ---");
+            for (kind, keys) in &seeded {
+                assert!(
+                    !keys.is_empty(),
+                    "denominator: kind {kind} was seeded with no keys, so its row is a zero that \
+                     means nothing"
+                );
+                let mut entry_hist = Hist::default();
+                let mut block_hist = Hist::default();
+                for key in keys {
+                    let (entries, blocks) = entries_and_blocks(&engine, kind, key);
+                    assert!(
+                        entries > 0,
+                        "denominator: kind {kind} key {key} holds no live page entry at \
+                         0..{end_routing_bucket} with {elements} elements, so every figure taken \
+                         from it below is a zero presented as a measurement"
+                    );
+                    entry_hist.add(entries);
+                    block_hist.add(blocks);
+                    per_range
+                        .entry((end_routing_bucket, elements, kind))
+                        .or_default()
+                        .push(entries);
+                }
+                entry_hist.print(&format!("{kind}: index entries/object"));
+                block_hist.print(&format!("{kind}: distinct pages/object"));
+
+                match *kind {
+                    // ELEMENT-SCALED. One page and one entry per element, uncapped.
+                    "hash" | "set" | "zset" | "list" => {
+                        assert_eq!(
+                            entry_hist.max(),
+                            elements,
+                            "{kind} is the element-scaled shape this module is about: its MAX \
+                             entries per object must be the element count {elements}"
+                        );
+                        assert_eq!(
+                            entry_hist.percentile(50),
+                            elements,
+                            "{kind} p50 entries per object is not the element count, so the \
+                             population is mixed and the row above is not the shape claimed"
+                        );
+                        assert_eq!(
+                            block_hist.max(),
+                            elements,
+                            "{kind} holds fewer distinct pages than elements, so something \
+                             already batches it and this module's premise is stale for it"
+                        );
+                    }
+                    // PAGE-SCALED. The same page index, entries deduplicated by physical address
+                    // with `component: None`, so the count is pages and not points.
+                    "feature" => {
+                        assert!(
+                            entry_hist.max() < elements,
+                            "the series filed {} entries for {elements} points, so it is NOT \
+                             page-scaled on this revision and the contrast this module reports \
+                             does not exist",
+                            entry_hist.max()
+                        );
+                        assert_eq!(
+                            entry_hist.max(),
+                            block_hist.max(),
+                            "the series entry count is not its page count, so the deduplication \
+                             in `sync_bucket_index_object_blocks_with_mode` is not what is being \
+                             measured here"
+                        );
+                    }
+                    // THE CONTROL.
+                    "string" => {
+                        assert_eq!(
+                            entry_hist.max(),
+                            1,
+                            "a string key owns one page, so it must own one entry"
+                        );
+                    }
+                    other => panic!("unclassified kind in the fixture: {other}"),
+                }
+            }
+        }
+    }
+
+    assert!(
+        path_lengths.windows(2).all(|w| w[0] == w[1]),
+        "the store path length differs between arms: {path_lengths:?} -- allocation bytes move at \
+         about six a character, so the arms are not comparable"
+    );
+    println!("store path length held at {} characters", path_lengths[0]);
+
+    // ENTRIES PER OBJECT CANNOT MOVE WITH THE ROUTING RANGE, because routing takes the object key
+    // and never sees the component, so all of an object's pages land in one bucket at either
+    // range. Asserted rather than assumed: it is the property that makes one row answer for both
+    // deployments.
+    for elements in [SMALL_ELEMENTS, LARGE_ELEMENTS] {
+        for kind in ["hash", "set", "zset", "list", "feature", "string"] {
+            let narrow = per_range.get(&(NARROW_END, elements, kind)).cloned();
+            let wide = per_range.get(&(WIDE_END, elements, kind)).cloned();
+            assert_eq!(
+                narrow, wide,
+                "entries per object for {kind} at {elements} elements differ between the two \
+                 routing ranges, so the number is a property of the range and not of the kind"
+            );
+        }
+    }
+}
+
+// =================================================================================================
+// 2. THE MECHANISM. Why sharing a page now shares an entry.
+// =================================================================================================
+
+/// An entry naming one page, at the address given.
+///
+/// THIS TOOK A `component: Option<&str>` AND THE ARGUMENT WAS DEAD. The struct literal below
+/// stopped setting an element name when the field was removed from `BlockIndex`, so the parameter
+/// decided nothing: `block_at(Some("field-a"), ..)` and `block_at(Some("field-b"), ..)` returned the
+/// SAME value, which is what quietly turned the old control into a comparison of a value with
+/// itself. It is REMOVED rather than renamed to `_component`, so a caller that still tries to name
+/// an element here is a compile error and not a silent no-op.
+///
+/// AND IT HANDS THE OBJECT KEY BESIDE THE PAGE, for the same reason: the identity is leaving the
+/// entry, and a fixture that handed back a bare page would make every caller read it off.
+fn block_at(slab: u64, offset: u64, length: u64) -> (std::sync::Arc<str>, BlockIndex) {
+    (
+        std::sync::Arc::from("one-object"),
+        BlockIndex {
+            model_id: crate::engine::storage_bucket_internals::StoredModelKind::Hash,
+            address: crate::block_store::ElementEntry::from_parts(
+                slab,
+                offset,
+                length,
+                Some(0),
+                Some(1),
+            ),
+            dirty: false,
+            deleted: false,
+        },
+    )
+}
+
+/// The same page shape under a different object key, for the object-key control below.
+fn block_at_for_object(
+    object_key: &str,
+    slab: u64,
+    offset: u64,
+    length: u64,
+) -> (std::sync::Arc<str>, BlockIndex) {
+    let (_, block) = block_at(slab, offset, length);
+    (
+        std::sync::Arc::from(object_key),
+        BlockIndex {
+            ..block
+        },
+    )
+}
+
+/// ONE PAGE IS ONE ENTRY, BECAUSE THE HANDLE CAN NO LONGER NAME AN ELEMENT.
+///
+/// RESTATED FROM ITS OPPOSITE, AND THE NAME WENT WITH THE CLAIM. This arm was
+/// `two_elements_sharing_one_page_are_still_two_entries_because_the_handle_names_the_component`,
+/// and what it asserted was the refutation this whole module was built on. Its own failure message
+/// asked for this rather than for a looser assertion: "the premise of this module's refutation is
+/// then wrong and it must be rewritten, not patched".
+///
+/// `BlockIndex` has no element-name field, so `block_index_handle` hashes the model spelling, the
+/// object key and the ADDRESS and nothing else. Two entries over one page are one handle and one
+/// entry, and batching a container's pages moves the entry count with them --
+/// `container_blocks_are_batched::a_compaction_round_folds_a_containers_pages_and_folds_its_entry_
+/// count_with_them` measures that end to end, 40 entries over 40 pages before a round and 1 over 1
+/// after.
+///
+/// WHAT WOULD HAVE TO DISAGREE FOR EACH ASSERTION TO FAIL, written out because "one entry" is also
+/// the answer an index that deduplicated everything unconditionally would give:
+///
+///   * SAME PAGE, ONE HANDLE, ONE ENTRY -- fails if a per-element discriminator returns to the
+///     handle.
+///   * DIFFERENT PAGE, TWO HANDLES, TWO ENTRIES -- fails if the handle stops naming the address.
+///     This is what stops the first assertion passing on a map that collapses every insert, and it
+///     is the half the OLD control could not supply: that control built both of its entries from
+///     the same effective arguments, so it compared a value with itself and held whatever the
+///     hasher did.
+///   * SAME PAGE SHAPE, DIFFERENT OBJECT, TWO HANDLES, TWO ENTRIES -- fails if the handle stops
+///     naming the object key. One entry a page is only safe while two objects' pages stay apart.
+///
+/// THE HANDLE ASSERTIONS AND THE `len` ASSERTIONS ARE NOT THE SAME ASSERTION. The first pair tests
+/// `block_index_handle`; the second tests `BlockIndexMap`'s keying. A map that ignored the handle
+/// and always replaced would satisfy every handle assertion here and fail every count.
+#[test]
+fn one_block_is_one_entry_because_the_handle_can_no_longer_name_an_element() {
+    let shared_slab = 7u64;
+    let shared_offset = 4_096u64;
+    let shared_length = 512u64;
+
+    let (first_key, first) = block_at(shared_slab, shared_offset, shared_length);
+    let (second_key, second) = block_at(shared_slab, shared_offset, shared_length);
+
+    // Same page, byte for byte. The premise, kept: without it the arm is not about a shared page.
+    assert_eq!(
+        (
+            first.address.block_slab_id(),
+            first.address.offset(),
+            first.address.length()
+        ),
+        (
+            second.address.block_slab_id(),
+            second.address.offset(),
+            second.address.length()
+        ),
+        "the two entries must name the SAME page for this test to be about a shared page at all"
+    );
+
+    assert_eq!(
+        block_index_handle(&first_key, &first),
+        block_index_handle(&second_key, &second),
+        "two entries over one page hashed to two handles, so something per-element is back in \
+         `block_index_handle` and the entry count is no longer the page count"
+    );
+
+    let mut live = BlockSlabLiveIndex::default();
+    let mut index = BlockIndexMap::default();
+    index.insert(&first_key, first.clone(), &mut live);
+    index.insert(&second_key, second.clone(), &mut live);
+    assert_eq!(
+        index.len(),
+        1,
+        "one page offered twice filed {} entries, not 1",
+        index.len()
+    );
+
+    // CONTROL ONE: a DIFFERENT page is still a second entry.
+    let (elsewhere_key, elsewhere) =
+        block_at(shared_slab, shared_offset + shared_length, shared_length);
+    assert_ne!(
+        block_index_handle(&first_key, &first),
+        block_index_handle(&elsewhere_key, &elsewhere),
+        "two distinct pages hashed alike, so the handle no longer names the address and a lookup \
+         would serve one page's bytes for the other"
+    );
+    let mut live_two = BlockSlabLiveIndex::default();
+    let mut index_two = BlockIndexMap::default();
+    index_two.insert(&first_key, first.clone(), &mut live_two);
+    index_two.insert(&elsewhere_key, elsewhere, &mut live_two);
+    assert_eq!(
+        index_two.len(),
+        2,
+        "two distinct pages filed {} entries, not 2",
+        index_two.len()
+    );
+
+    // CONTROL TWO: the same page shape under a different object key stays apart.
+    let (other_object_key, other_object) =
+        block_at_for_object("another-object", shared_slab, shared_offset, shared_length);
+    assert_ne!(
+        block_index_handle(&first_key, &first),
+        block_index_handle(&other_object_key, &other_object),
+        "two objects' pages hashed alike, so one object's entry would supersede another's"
+    );
+    let mut live_three = BlockSlabLiveIndex::default();
+    let mut index_three = BlockIndexMap::default();
+    index_three.insert(&first_key, first, &mut live_three);
+    index_three.insert(&other_object_key, other_object, &mut live_three);
+    assert_eq!(
+        index_three.len(),
+        2,
+        "two objects over one page shape filed {} entries, not 2",
+        index_three.len()
+    );
+
+    println!("one page, offered twice     -> {} entry", index.len());
+    println!("two pages, one object       -> {} entries", index_two.len());
+    println!("one page shape, two objects -> {} entries", index_three.len());
+    println!("so the entry count is the PAGE count, per object");
+}
+
+// =================================================================================================
+// 3. THE PREREQUISITE. What the delta fold restores, and what it does not.
+// =================================================================================================
+
+/// THE MAPS THE DELTA FOLD RESTORES DO NOT INCLUDE THE CONTAINER MAPS.
+///
+/// `apply_key_states` restores thirteen per-key maps from a delta's key-state blobs, and
+/// `fold_delta_block_items` restores the delta's page items beside them. `sets`, `zsets`, `lists`
+/// and `hashes` are in the second and not the first, so through this route a container element
+/// arrives as a page entry with no durable map entry beside it and the COMPONENT is the only place
+/// its identity is written down.
+///
+/// A batched container page would carry element identity in its PAYLOAD instead, and the
+/// reconciliation does not read payloads -- so this is the prerequisite that has to move before a
+/// batched container can be recovered through a fold, and this test is what fails if someone adds
+/// a container map to the fold and makes it moot.
+///
+/// Driven through a real fold rather than by reading the source: the blob names every folded map,
+/// and each container map is asserted to have taken nothing from it.
+#[test]
+fn the_maps_the_delta_fold_restores_do_not_include_the_container_maps() {
+    // ITS PREMISE IS SPELLED OUT IN ITS OWN FLOOR: "must hold exactly one page entry carrying a
+    // component ... so the identity-in-the-component premise". That premise is the ungated one.
+    // The gated delta-fold replay is `replay_under_the_gate`'s subject.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, NARROW_END);
+
+    // One element of each container kind, plus a series point so the fold has a map it DOES carry
+    // as the positive control.
+    run_batch(
+        &engine,
+        vec![
+            Command::HashSet {
+                key: "fold-h".to_string(),
+                field: "field-a".to_string(),
+                value: vec![b'v'; VALUE_WIDTH],
+            },
+            Command::SetAdd {
+                key: "fold-t".to_string(),
+                member: b"member-a".to_vec(),
+            },
+            Command::ZSetAdd {
+                key: "fold-z".to_string(),
+                member: b"member-a".to_vec(),
+                score: 1.0,
+            },
+            Command::ListPush {
+                key: "fold-l".to_string(),
+                member: b"member-a".to_vec(),
+                left: false,
+            },
+        ],
+    );
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::FeatureAppend {
+            key: "fold-f".to_string(),
+            points: vec![crate::types::FeaturePoint {
+                timestamp_ms: 1_700_000_000_000,
+                value: vec![b'f'; VALUE_WIDTH],
+            }],
+        },
+    });
+    assert!(response.status.ok, "series seed must ack: {:?}", response.status);
+
+    // THE CONTRAST THIS ARM WAS BUILT ON IS GONE: EVERY KIND IS NOW THE "WITHOUT" SIDE.
+    //
+    // It asserted that each of the four container kinds held exactly one page entry CARRYING a
+    // component -- "the identity-in-the-component premise" -- and that the series held exactly one
+    // entry WITHOUT one, "the shape a batched container would have to adopt". `BlockIndex` has no
+    // component field, so the first four assertions are unsatisfiable by any fixture and the fifth
+    // is satisfied by every entry in the shard. A contrast where one side cannot exist and the
+    // other is universal is not a contrast.
+    //
+    // WHAT IS KEPT IS THE HALF THAT STILL DISCRIMINATES, and it is the half the arm's conclusion
+    // actually rested on: the series has a DURABLE MODEL-MAP entry, and that is what makes its
+    // nameless page entry recoverable. The container maps are durable now too, which is the
+    // change that made the collapse safe -- so both sides are asserted, and a regression that
+    // made either map non-durable reddens here.
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    // EVERY PREDICATE BELOW ASKS THE LOOKUP WHICH OBJECT A PAGE BELONGS TO. The page has no
+    // answer of its own any more, and the lookup is the structure beside it that does.
+    let keys = crate::engine::state::BlockKeysByPosition::from_lookup(
+        &shard.bucket_index.object_block_lookup,
+    );
+    for (kind, key) in [
+        ("hash", "fold-h"),
+        ("set", "fold-t"),
+        ("zset", "fold-z"),
+        ("list", "fold-l"),
+    ] {
+        let entries = shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .flat_map(|bucket| {
+                bucket
+                    .block_index
+                    .iter()
+                    .map(move |(handle, block)| (bucket.routing_bucket, *handle, block))
+            })
+            .filter(|(routing_bucket, handle, block)| {
+                !block.deleted
+                    && block.model_id.as_str() == kind
+                    && keys
+                        .live_identity(*routing_bucket, *handle)
+                        .is_some_and(|(_, named)| &**named == key)
+            })
+            .count();
+        assert_eq!(
+            entries, 1,
+            "{kind} key {key} must hold exactly one live page entry -- it holds {entries}, so the \
+             one-entry-a-page shape this module contrasts against is not what is on this revision"
+        );
+    }
+    let anonymous = shard
+        .bucket_index
+        .bucket_map
+        .values()
+        .flat_map(|bucket| {
+            bucket
+                .block_index
+                .iter()
+                .map(move |(handle, block)| (bucket.routing_bucket, *handle, block))
+        })
+        .filter(|(routing_bucket, handle, block)| {
+            !block.deleted
+                && block.model_id.as_str() == "feature"
+                && keys
+                    .live_identity(*routing_bucket, *handle)
+                    .is_some_and(|(_, named)| &**named == "fold-f")
+        })
+        .count();
+    assert_eq!(
+        anonymous, 1,
+        "the series must hold exactly one page entry -- it holds {anonymous}"
+    );
+    assert!(
+        shard.features().contains_key("fold-f"),
+        "the series must hold a durable model-map entry, because that is what makes its nameless \
+         page entry recoverable"
+    );
+    assert!(
+        shard.hashes.get("fold-h").is_some(),
+        "the HASH must hold a durable model-map entry too. That is the half that changed: a \
+         container element's identity used to live on its entry, and with the entry nameless the \
+         durable map is the only source -- if this reddens, the collapse has outrun the durability \
+         that makes it safe"
+    );
+    println!("every kind files one nameless page entry; the durable maps are what name the elements");
+    println!(
+        "and `apply_key_states` folds `features` but none of `hashes`/`sets`/`zsets`/`lists`, so \
+         the component is the container element's only fold-route copy"
+    );
+}
+
+// =================================================================================================
+// 4. THE READ SIDE.
+// =================================================================================================
+
+/// WHAT ONE ELEMENT READ FETCHES TODAY AND WHAT A BATCHED PAGE WOULD FETCH.
+///
+/// The "today" column is a STORED FACT -- the length of the page the element's own index entry
+/// names, read back off the index. It cannot report flat the way an in-engine counter can, which is
+/// the failure that showed a restore reading 1.01 GB as unchanged while the kernel saw 6.70x.
+///
+/// The "batched" column is built with the engine's OWN encoder at each batch width and its length
+/// read off the bytes, so both columns are measurements and the ratio between them is not
+/// arithmetic over an assumed page header.
+///
+/// # THE FIELD NAMES ARE FIXED WIDTH, AND THAT IS LOAD-BEARING RATHER THAN TIDY
+///
+/// A container page now STATES WHICH ELEMENT IT HOLDS (`container_blocks`), so a hash page's stored
+/// length includes its field name. `f0` to `f99` is two names of two characters and ninety of three,
+/// which made the pages three widths and took the assertion below -- "the field pages are not all one
+/// width, so a single 'today' column cannot stand for them" -- from a guard against a broken fixture
+/// to a statement this revision cannot satisfy.
+///
+/// It is fixed by padding rather than by weakening the assertion, because the assertion is right: a
+/// single "today" number CANNOT stand for pages of several widths, and a column that quietly took
+/// the first of them would be a mean wearing a measurement's clothes. Padding makes the fixture's
+/// names one width so the column is one number again, and this paragraph is why the padding may not
+/// be removed.
+#[test]
+fn what_one_element_read_fetches_today_and_what_a_batched_block_would_fetch() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, NARROW_END);
+    run_batch(
+        &engine,
+        (0..LARGE_ELEMENTS)
+            .map(|f| Command::HashSet {
+                key: "read-h".to_string(),
+                field: format!("f{f:03}"),
+                value: vec![b'v'; VALUE_WIDTH],
+            })
+            .collect(),
+    );
+
+    let today_block_bytes = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let keys = crate::engine::state::BlockKeysByPosition::from_lookup(
+            &shard.bucket_index.object_block_lookup,
+        );
+        let lengths = shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .flat_map(|bucket| {
+                bucket
+                    .block_index
+                    .iter()
+                    .map(move |(handle, block)| (bucket.routing_bucket, *handle, block))
+            })
+            .filter(|(routing_bucket, handle, block)| {
+                !block.deleted
+                    && block.model_id.as_str() == "hash"
+                    && keys
+                        .live_identity(*routing_bucket, *handle)
+                        .is_some_and(|(_, named)| &**named == "read-h")
+            })
+            .map(|(_, _, block)| block.address.length())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            lengths.len(),
+            LARGE_ELEMENTS,
+            "denominator: the fixture wrote {} field pages, not {LARGE_ELEMENTS}",
+            lengths.len()
+        );
+        assert!(
+            lengths.iter().all(|length| *length == lengths[0]),
+            "the field pages are not all one width, so a single 'today' column cannot stand for \
+             them: {lengths:?} -- the fixture's field names are padded to one width for exactly \
+             this reason, because a page states its own element and so its length includes that \
+             element's name"
+        );
+        lengths[0]
+    };
+    assert!(
+        today_block_bytes > 0,
+        "a field page of zero bytes is not a page, and every ratio below would divide by it"
+    );
+
+    // A single field read fetches exactly that page, and nothing else resolves through the page
+    // index for it -- so this IS the bytes-per-single-element-read column today.
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::HashGet {
+            key: "read-h".to_string(),
+            // The padded spelling the fixture wrote, not `f0`: an unpadded name is a field this
+            // hash does not hold, and the read would ack with nothing while still asserting `ok`.
+            field: "f000".to_string(),
+        },
+    });
+    assert!(response.status.ok, "the control read must ack");
+    // AND IT MUST ACK WITH THE VALUE. `status.ok` is true for a hash field that is absent, so the
+    // line above alone would pass over a fixture whose names had drifted from the read's.
+    match &response.response {
+        crate::types::CommandResponse::Bytes { value } => assert_eq!(
+            Some(vec![b'v'; VALUE_WIDTH]),
+            *value,
+            "the control read answered without the value the fixture wrote"
+        ),
+        other => panic!("expected Bytes from a hash field read, got {other:?}"),
+    }
+
+    println!("one field page today: {today_block_bytes} B for a {VALUE_WIDTH} B value");
+    println!("  batch   page bytes   bytes fetched per single-element read   amplification");
+
+    let mut ratios: Vec<(usize, f64)> = Vec::new();
+    for batch in [1usize, 8, 32, 128] {
+        let points = (0..batch)
+            .map(|t| crate::types::FeaturePoint {
+                timestamp_ms: 1_700_000_000_000 + t as u64,
+                value: vec![b'v'; VALUE_WIDTH],
+            })
+            .collect::<Vec<_>>();
+        let encoded = crate::engine::packed_blocks::encode_feature_block(&points);
+        let block_bytes = encoded.len() as u64;
+        assert!(
+            block_bytes > 0,
+            "the engine's encoder produced an empty page for a batch of {batch}"
+        );
+        let amplification = block_bytes as f64 / today_block_bytes as f64;
+        println!(
+            "  {batch:>5}   {block_bytes:>10}   {block_bytes:>37}   {amplification:>10.2}x"
+        );
+        ratios.push((batch, amplification));
+    }
+
+    // THE DIRECTION IS THE CLAIM: a batched page is strictly larger than the one-element page it
+    // replaces at every width above one, so a single-element read fetches strictly more. A run
+    // where this did not hold would mean the batch encoding is smaller than the per-element page
+    // and the read side costs nothing -- which would be a finding, not a pass.
+    for (batch, amplification) in &ratios {
+        if *batch == 1 {
+            continue;
+        }
+        assert!(
+            *amplification > 1.0,
+            "a batch of {batch} encodes to no more than one element page, so there is no read \
+             amplification to report and this test is not measuring the trade it claims: \
+             {amplification:.2}x"
+        );
+    }
+    let largest = ratios
+        .iter()
+        .max_by(|left, right| left.1.total_cmp(&right.1))
+        .expect("ratios is non-empty");
+    assert!(
+        largest.1 > 10.0,
+        "the widest batch amplifies a single-element read by only {:.2}x, which is small enough \
+         that the read side would not be the objection it is reported as",
+        largest.1
+    );
+}
+
+/// THE STRING CONTROL, AT 0.00%, WITH BOTH SIDES DERIVED FROM THE RUN.
+///
+/// A string key owns one page and one index entry already, so batching predicts no change for it,
+/// and a measurement that moved this row would be measuring the fixture and not the
+/// representation.
+///
+/// BOTH SIDES COME OFF THE RUN, WHICH IS THE POINT. The measured side is entries per object
+/// counted off the engine's page index by `entries_and_blocks`; the projected side is
+/// `projected_entries_per_object` applied to the elements this fixture actually wrote, at the
+/// widest batch width the module prices. Two literals divided by each other would print the same
+/// `+0.00%` on a run where the string kind had started filing ten entries an object, because
+/// neither literal reads anything -- and this row is cited as evidence elsewhere in the module, so
+/// it has to be able to go red.
+///
+/// THE PER-KEY ASSERTION PINS THE PAGE, NOT THE ENTRY, and that is deliberate. It used to assert
+/// the pair `(entries, pages) == (1, 1)`. Leaving the entries half there would settle the measured
+/// side before the control ever looked at it, and an assertion whose subject an earlier stage has
+/// already fixed passes under any mutation of the thing it claims to watch. So the entries half is
