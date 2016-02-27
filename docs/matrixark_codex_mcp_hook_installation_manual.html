@@ -1,0 +1,432 @@
+<!doctype html><meta charset='utf-8'><title>MatrixArk Codex MCP And Hook Installation Manual</title><style>body{font-family:Inter,Segoe UI,Arial,sans-serif;max-width:1120px;margin:32px auto;padding:0 24px;color:#172033;line-height:1.45}pre{white-space:pre-wrap;background:#f6f8fb;border:1px solid #dde5f0;padding:14px;overflow:auto;border-radius:8px}</style><pre># MatrixArk Codex MCP And Hook Installation Manual
+
+This manual explains how Codex connects to MatrixArk, how automatic hooks differ from MCP tool calls, and how to call the MatrixArk ingestion, extraction, retrieval, feedback, replay, resource, and skill APIs from Codex.
+
+MatrixArk should not require Codex, Claude, Cursor, or another agent to understand MatrixArk&#x27;s internal data models. The agent sends messages, local context hints, files, and lifecycle events. MatrixArk resolves identity, extracts context, writes TemporalStore records, refreshes summaries, retrieves a ContextPack, and records audit/replay data.
+
+## 1. Two Integration Modes
+
+```mermaid
+flowchart TD
+  A[&quot;Codex prompt/tool/session event&quot;] --&gt; B[&quot;Codex hook command&quot;]
+  B --&gt; C[&quot;tools/matrixark_codex_hook.py&quot;]
+  C --&gt; D[&quot;matrixark_ingest&quot;]
+  C --&gt; E[&quot;matrixark_retrieve before LLM&quot;]
+  C --&gt; F[&quot;matrixark_session_commit on Stop/PostCompact/Idle&quot;]
+  D --&gt; G[&quot;TemporalStore: events, entities, segments, indexes, summaries, embeddings&quot;]
+  E --&gt; H[&quot;ContextPack returned to Codex&quot;]
+  F --&gt; I[&quot;Batch extraction + async summary refresh&quot;]
+```
+
+Use both modes when possible:
+
+| Mode | What it does | When to use |
+|---|---|---|
+| MCP tools | Exposes `matrixark_ingest`, `matrixark_retrieve`, `matrixark_feedback`, `matrixark_replay`, admin, resource, and skill APIs to Codex. | Reliable default in Codex Desktop and Codex CLI. Good for explicit agent calls and debugging. |
+| Codex hooks | Automatically captures lifecycle events and calls MatrixArk without the agent remembering to call tools. | Best for always-on ingestion, retrieval before LLM, tool-result capture, and session commits. |
+
+Important: MCP by itself does not automatically ingest every message. Codex must call the MCP tool, or a hook must call the MCP server on each lifecycle event.
+
+## 2. Install MatrixArk MCP For Codex
+
+### Recommended local TemporalStore MCP config
+
+Add this to `<workspace>\.codex\config.toml`:
+
+```toml
+[mcp_servers.matrixark]
+command = &quot;wsl.exe&quot;
+args = [&quot;--cd&quot;, &quot;<repo>&quot;, &quot;-e&quot;, &quot;bash&quot;, &quot;-lc&quot;, &quot;exec tools/matrixark_mcp_server.sh&quot;]
+startup_timeout_sec = 180
+```
+
+Why `startup_timeout_sec` matters: if the TemporalStore topology or OSS models are warming up, Codex can otherwise report:
+
+```text
+MCP client for `matrixark` timed out after 120 seconds.
+```
+
+Set `startup_timeout_sec = 180` or `240` for local development.
+
+### Rust backend MCP config
+
+Use this when validating Rust parity:
+
+```toml
+[mcp_servers.matrixark]
+command = &quot;wsl.exe&quot;
+args = [&quot;--cd&quot;, &quot;<repo>&quot;, &quot;-e&quot;, &quot;bash&quot;, &quot;-lc&quot;, &quot;exec tools/matrixark_mcp_rust_server.sh&quot;]
+startup_timeout_sec = 180
+```
+
+If a Rust-specific launcher is not present in a checkout, use the generic MCP server with environment variables:
+
+```toml
+[mcp_servers.matrixark]
+command = &quot;wsl.exe&quot;
+args = [&quot;--cd&quot;, &quot;<repo>&quot;, &quot;-e&quot;, &quot;bash&quot;, &quot;-lc&quot;, &quot;MATRIXARK_MCP_BACKEND=temporalstore-rust exec python3 tools/matrixark_mcp_server.py --line-json&quot;]
+startup_timeout_sec = 180
+```
+
+### Local debug MCP config
+
+Use this only for API debugging without conformance storage:
+
+```toml
+[mcp_servers.matrixark]
+command = &quot;wsl.exe&quot;
+args = [&quot;--cd&quot;, &quot;<repo>&quot;, &quot;-e&quot;, &quot;bash&quot;, &quot;-lc&quot;, &quot;MATRIXARK_MCP_BACKEND=local exec python3 tools/matrixark_mcp_server.py --line-json&quot;]
+startup_timeout_sec = 60
+```
+
+Restart Codex after editing `config.toml`.
+
+## 3. Backend Environment Variables
+
+The hook launcher `tools/matrixark_codex_hook.sh` defaults to:
+
+```bash
+MATRIXARK_MCP_BACKEND=temporalstore-direct
+MATRIXARK_TEMPORALSTORE_METASERVER=127.0.0.1:18000
+MATRIXARK_TEMPORALSTORE_NAMESPACE=deploy_ns
+MATRIXARK_TEMPORALSTORE_TABLE=deploy_table
+MATRIXARK_TEMPORALSTORE_PREFIX=matrixark:codex-hook
+TEMPORALSTORE_LIB=<repo>/output-ubuntu22/release/sdk/lib/libtemporalstore.so
+MATRIXARK_HOOK_FAIL_OPEN=1
+MATRIXARK_HOOK_AUTOSTART_NATIVE=1
+```
+
+The Rust hook launcher `tools/matrixark_codex_rust_hook.sh` defaults to:
+
+```bash
+MATRIXARK_MCP_BACKEND=temporalstore-rust
+MATRIXARK_TEMPORALSTORE_PREFIX=matrixark:codex-hook:rust-live-v2
+MATRIXARK_TEMPORALSTORE_RUST_CLI=<repo>/sdk/rust/temporalstore/target/release/matrixark_record_log
+MATRIXARK_HOOK_FAIL_OPEN=1
+```
+
+Production hook mode must not use local JSONL as the retrieval or serving backend. Set
+`MATRIXARK_MCP_PROFILE=production` and use `MATRIXARK_MCP_BACKEND` with
+`temporalstore-direct` or `temporalstore-rust`; when the backend is omitted in
+production profile, MatrixArk defaults to the native TemporalStore path and
+refuses local `record_log` unless `MATRIXARK_ALLOW_LOCAL_BACKEND=1` is set for
+explicit offline debugging. JSONL files are allowed for MCP line-protocol inputs,
+miss/hypothesis artifacts, and debug event logs only; they are not real full
+retrieval proof.
+
+Local identity defaults for hooks:
+
+```bash
+MATRIXARK_ACCOUNT_ID=acct_codex
+MATRIXARK_TENANT_ID=tenant_codex
+MATRIXARK_USER_ID=$USERNAME
+MATRIXARK_TEAM=codex
+MATRIXARK_PROJECT=local
+MATRIXARK_SESSION_COMMIT_THRESHOLD=20
+MATRIXARK_IDLE_COMMIT_TIMEOUT_MS=600000
+MATRIXARK_HOOK_MAX_CONTEXT_TOKENS=10000
+```
+
+For local product mode, MatrixArk can also use these defaults:
+
+```text
+account_id = acct_local
+tenant_id  = derived from agent name, for example tenant_codex
+user_id    = local OS user unless an API key/SSO mapping resolves a MatrixArk user
+session_id = optional; captured from hook/MCP payload when available
+```
+
+In cloud mode, the API key resolves and enforces the final account, tenant, user, scopes, and allowed sessions. The agent can send hints, but MatrixArk remains the authority.
+
+## 4. Install Codex Hooks
+
+Codex hook availability depends on the Codex surface/version. If hooks are not visible in the desktop command palette, use MCP tools first. If the Codex runtime supports `.codex/hooks.json`, install lifecycle hooks like this in the project or user Codex config area:
+
+```json
+{
+  &quot;hooks&quot;: {
+    &quot;UserPromptSubmit&quot;: [
+      {
+        &quot;command&quot;: &quot;<repo>/tools/matrixark_codex_hook.sh --event UserPromptSubmit&quot;,
+        &quot;timeout_ms&quot;: 60000
+      }
+    ],
+    &quot;PostToolUse&quot;: [
+      {
+        &quot;command&quot;: &quot;<repo>/tools/matrixark_codex_hook.sh --event PostToolUse&quot;,
+        &quot;timeout_ms&quot;: 60000
+      }
+    ],
+    &quot;Stop&quot;: [
+      {
+        &quot;command&quot;: &quot;<repo>/tools/matrixark_codex_hook.sh --event Stop&quot;,
+        &quot;timeout_ms&quot;: 60000
+      }
+    ],
+    &quot;PostCompact&quot;: [
+      {
+        &quot;command&quot;: &quot;<repo>/tools/matrixark_codex_hook.sh --event PostCompact&quot;,
+        &quot;timeout_ms&quot;: 60000
+      }
+    ]
+  }
+}
+```
+
+Use the Rust hook launcher for Rust parity:
+
+```json
+{
+  &quot;hooks&quot;: {
+    &quot;UserPromptSubmit&quot;: [
+      {
+        &quot;command&quot;: &quot;<repo>/tools/matrixark_codex_rust_hook.sh --event UserPromptSubmit&quot;,
+        &quot;timeout_ms&quot;: 60000
+      }
+    ],
+    &quot;Stop&quot;: [
+      {
+        &quot;command&quot;: &quot;<repo>/tools/matrixark_codex_rust_hook.sh --event Stop&quot;,
+        &quot;timeout_ms&quot;: 60000
+      }
+    ]
+  }
+}
+```
+
+Recommended hook lifecycle:
+
+| Codex event | MatrixArk action |
+|---|---|
+| `UserPromptSubmit` | Ingest user message, append session buffer, retrieve ContextPack before LLM. |
+| `PostToolUse` | Ingest tool result summary, file refs, command state, and useful output. |
+| `Stop` | Ingest assistant/final signal and force session commit. |
+| `PostCompact` | Ingest compacted session summary and force session commit. |
+| `IdleTimeout` / `SessionIdle` | Commit pending session window without requiring a new message. |
+
+## 5. What Codex Sends
+
+Codex hook payloads vary. `tools/matrixark_codex_hook.py` extracts message text from common fields:
+
+```text
+prompt
+user_prompt
+input
+text
+message
+params.prompt
+params.input
+params.text
+turn.input
+messages[].content
+items[].content
+raw_text
+```
+
+It extracts session identity in this order:
+
+```text
+1. explicit --session-id or MATRIXARK_SESSION_ID
+2. payload fields: session_id, thread_id, conversation_id, transcript_id
+3. payload path hash: transcript_path, conversation_path, thread_path, log_path
+4. persisted local fallback under MATRIXARK_CODEX_SESSION_STATE_DIR
+```
+
+It also preserves compact local context when present:
+
+```text
+local_context
+context
+open_files
+active_files
+files
+buffers
+selected_text
+selection
+tool_outputs
+terminal_output
+```
+
+Codex does not need to send MatrixArk schemas. It sends what it knows. MatrixArk extracts `ContextEvent`, `ContextEntity`, `ContextSegment`, `ContextIndex`, `ContextSummary`, and `ContextEmbedding` internally.
+
+## 6. Universal Agent Lifecycle Contract
+
+This is the installation rule for Codex, Claude, Cursor, and other agent integrations. Put this in the agent-side system/integration instructions:
+
+```text
+Before answering code/design questions, call matrixark_retrieve.
+
+Pass:
+- the raw user query as query
+- visible open files, selected text, relevant tool outputs, and short local summaries as local_context
+- estimated local_context_tokens
+- max_context_tokens based on remaining prompt budget
+- account_id, tenant_id, user_id, session_id when available
+
+Do not send hidden/internal prompt context. Only send visible user/workspace context.
+
+After answering, call matrixark_ingest with the user message, assistant answer, and useful local_context_refs.
+```
+
+The agent owns visible local context. MatrixArk owns durable context. The two should be combined deliberately:
+
+```mermaid
+sequenceDiagram
+  participant Agent
+  participant MatrixArk
+  participant Model
+
+  Agent-&gt;&gt;MatrixArk: matrixark_retrieve(query, local_context, token budget, scope)
+  MatrixArk--&gt;&gt;Agent: ContextPack(remote_context_refs, local_context_refs, audit id)
+  Agent-&gt;&gt;Model: user query + visible local context + selected MatrixArk context
+  Model--&gt;&gt;Agent: answer/tool plan
+  Agent-&gt;&gt;MatrixArk: matrixark_ingest(user message, assistant answer, useful refs)
+```
+
+Important rules:
+
+| Rule | Why |
+|---|---|
+| Send only visible local context | Prevents leakage of hidden prompts, private chain-of-thought, or agent-internal policy. |
+| Send `local_context_tokens` when known | MatrixArk can compute `remote_budget = max_context_tokens - local_context_tokens - safety_margin`. |
+| Send `max_context_tokens` when known | MatrixArk packs remote context to fit the agent&#x27;s remaining prompt budget. |
+| Keep `local_context_refs` and `remote_context_refs` separate | The agent can dedupe, display, debug, and audit what came from local workspace versus MatrixArk. |
+| Call `matrixark_ingest` after answering | MatrixArk learns from the actual outcome and can update events, entities, summaries, and audit/replay records. |
+
+Default cross-session policy: MatrixArk always considers same-user cross-session context when `session_scope=prefer`, but it keeps that lane bounded. Normal queries get about 12% of the remote MatrixArk budget, broad/evidence queries get about 15%, and current/latest/multi-hop/date queries get about 20%. Cross-session candidates still must pass the score threshold, session fanout, candidate cap, and token budget; raw cross-session events need a higher evidence score, while entities, summaries, and time-compression records are preferred for most cross-session context. Same-session continuity, shared resources, and relevant skills keep most of the budget.
+
+If an agent cannot estimate token budget, MatrixArk defaults to 32000 tokens. This is intentionally larger than the measured average retrieval payload, roughly 1.2k tokens, so MatrixArk has headroom for resource chunks, skills, and multi-hop evidence without drifting into full-history stuffing. For production integrations, prefer explicit values based on the real remaining model prompt budget:
+
+```json
+{
+  &quot;query&quot;: &quot;How should we implement the MatrixArk context budget?&quot;,
+  &quot;local_context&quot;: [
+    {&quot;ref&quot;: &quot;open-buffer:design.md&quot;, &quot;text&quot;: &quot;Visible design note...&quot;},
+    {&quot;ref&quot;: &quot;tool-output:test&quot;, &quot;text&quot;: &quot;pytest output summary...&quot;}
+  ],
+  &quot;local_context_tokens&quot;: 700,
+  &quot;max_context_tokens&quot;: 10000,
+  &quot;scope&quot;: {
+    &quot;account_id&quot;: &quot;acct_local&quot;,
+    &quot;tenant_id&quot;: &quot;tenant_codex&quot;,
+    &quot;user_id&quot;: &quot;local_user&quot;,
+    &quot;session_id&quot;: &quot;codex:thread:123&quot;
+  }
+}
+```
+
+For the post-answer ingest call, include the user message, assistant answer, and refs that were actually useful:
+
+```json
+{
+  &quot;kind&quot;: &quot;message&quot;,
+  &quot;messages&quot;: [
+    {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;How should we implement the MatrixArk context budget?&quot;},
+    {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;Use the remaining prompt budget, subtract visible local context, then pack remote refs under the remainder.&quot;}
+  ],
+  &quot;metadata&quot;: {
+    &quot;source&quot;: &quot;agent_post_answer&quot;,
+    &quot;local_context_refs&quot;: [&quot;open-buffer:design.md&quot;, &quot;tool-output:test&quot;],
+    &quot;reply_to_context_pack_id&quot;: &quot;ctxpack_123&quot;
+  },
+  &quot;scope&quot;: {
+    &quot;account_id&quot;: &quot;acct_local&quot;,
+    &quot;tenant_id&quot;: &quot;tenant_codex&quot;,
+    &quot;user_id&quot;: &quot;local_user&quot;,
+    &quot;session_id&quot;: &quot;codex:thread:123&quot;
+  }
+}
+```
+
+Agents that support automatic hooks should run this lifecycle automatically. Agents that only support MCP tools should still follow the same explicit call order: retrieve first, answer second, ingest third.
+
+For agent-specific installation text and payload examples, see:
+
+```text
+docs/matrixark_agent_integrations.md
+docs/matrixark_popular_agent_hooks.md
+docs/matrixark_agent_policy.md
+```
+
+## 7. End-To-End Hook Behavior
+
+```mermaid
+sequenceDiagram
+  participant Codex
+  participant Hook
+  participant MCP as MatrixArk MCP
+  participant TS as conformance TemporalStore
+
+  Codex-&gt;&gt;Hook: UserPromptSubmit JSON
+  Hook-&gt;&gt;MCP: matrixark_ingest(message, scope, hook metadata)
+  MCP-&gt;&gt;TS: write ContextEvent + embedding + indexes + dirty marker
+  Hook-&gt;&gt;MCP: matrixark_retrieve(query, local_context, token budget)
+  MCP-&gt;&gt;TS: tree traversal + secondary-index filter + candidate reads
+  MCP--&gt;&gt;Hook: ContextPack
+  Hook--&gt;&gt;Codex: selected refs + token count
+  Codex-&gt;&gt;Hook: PostToolUse / Stop / PostCompact
+  Hook-&gt;&gt;MCP: matrixark_ingest(tool/assistant/summary)
+  Hook-&gt;&gt;MCP: matrixark_session_commit on boundary
+  MCP-&gt;&gt;TS: batch segments/entities/indexes/summaries/audit
+```
+
+On a single incoming message, MatrixArk does lightweight online work:
+
+```text
+one message arrives
+-&gt; write ContextEvent
+-&gt; write event embedding
+-&gt; write session_buffer_event
+-&gt; update lightweight session/node summaries
+-&gt; mark node summary dirty
+-&gt; retrieve ContextPack if this is UserPromptSubmit
+-&gt; return immediately
+```
+
+Later, batch extraction runs:
+
+```text
+pending messages &gt;= 20, or Stop/PostCompact, or idle timeout, or manual commit
+-&gt; one-pass batch extraction
+-&gt; write ContextSegment records
+-&gt; update ContextEntity state
+-&gt; write ContextIndex records
+-&gt; write batch summary and embeddings
+-&gt; clear/supersede session buffer markers
+```
+
+## 8. MCP API Calls
+
+The examples below are what Codex or any MCP client can call. The MCP server schema enforces required fields; optional fields can be omitted for local debugging.
+
+### Ingest one message
+
+Minimal local message:
+
+```json
+{
+  &quot;messages&quot;: [
+    {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Alice approved the GPU request after finance reviewed the budget.&quot;}
+  ]
+}
+```
+
+Scoped message with hook metadata:
+
+```json
+{
+  &quot;kind&quot;: &quot;message&quot;,
+  &quot;messages&quot;: [
+    {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Alice approved the GPU request after finance reviewed the budget.&quot;}
+  ],
+  &quot;scope&quot;: {
+    &quot;account_id&quot;: &quot;acct_local&quot;,
+    &quot;tenant_id&quot;: &quot;tenant_codex&quot;,
+    &quot;user_id&quot;: &quot;local_user&quot;,
+    &quot;session_id&quot;: &quot;codex:local:demo&quot;
+  },
+  &quot;metadata&quot;: {
+    &quot;source&quot;: &quot;codex_mcp&quot;,
+    &quot;node_path&quot;: [
+      &quot;account:acct_local&quot;,
+      &quot;tenant:tenant_codex&quot;,
