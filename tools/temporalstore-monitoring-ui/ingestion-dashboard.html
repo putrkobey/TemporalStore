@@ -12,3 +12,18 @@
         <div><p class="eyebrow">MatrixArk</p><h1>Ingestion Dashboard</h1></div>
         <div class="toolbar">
           <a class="button-link" href="./index.html">Operations</a>
+          <a class="button-link" href="./management-portal.html">Management</a>
+          <a class="button-link" href="./access-management.html">Access</a>
+          <a class="button-link" href="./matrixark-api-reference.html">API</a>
+        </div>
+      </header>
+      <section class="panel">
+        <div class="panel-head">
+          <div><h2>Scoped Context Inventory</h2><p>Browse what MatrixArk has ingested for an account, tenant, user, session, or agent.</p></div>
+          <span id="dashboard-status" class="status-pill"><span class="dot"></span>sample</span>
+        </div>
+        <div class="dashboard-controls" aria-label="Dashboard filters">
+          <label>Account <input id="scope-account" value="acct_local" /></label>
+          <label>Tenant <input id="scope-tenant" value="tenant_codex" /></label>
+          <label>User <input id="scope-user" value="local_user" /></label>
+          <label>Session <input id="scope-session" placeholder="optional" /></label>

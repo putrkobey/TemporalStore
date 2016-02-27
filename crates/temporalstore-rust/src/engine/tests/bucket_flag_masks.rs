@@ -274,3 +274,141 @@ fn every_bucket_flag_is_read_through_its_own_bit_and_a_mis_masked_one_is_caught(
     );
 }
 
+// -------------------------------------------------------------------------------------------
+// 3. THE WIRE.
+// -------------------------------------------------------------------------------------------
+
+/// Set the five flags from a five-bit state, leaving every other field at its default.
+fn node_in_state(state: u8) -> BucketNode {
+    let mut node = BucketNode::default();
+    for (index, (_, _, set)) in accessors().into_iter().enumerate() {
+        set(&mut node, state & (1 << index) != 0);
+    }
+    node
+}
+
+fn flags_of(node: &BucketNode) -> Vec<bool> {
+    accessors().into_iter().map(|(_, get, _)| get(node)).collect()
+}
+
+/// ALL THIRTY-TWO FLAG STATES SURVIVE THE STORED SPELLING, AND TWO SWAPPED KEYS DO NOT DECODE
+/// THE SAME.
+///
+/// The five flags are one byte in memory and five separate boolean keys on the wire, and the
+/// hand-written `Serialize`/`Deserialize` impls are the join. That join is a second place to wire
+/// a flag to the wrong name, and a wrong wiring there is worse than a wrong mask: it survives a
+/// restart and it is written into the index.
+///
+/// The round trip is exhaustive for the same reason the accessor sweep is. The swap is the
+/// control: an index whose `loading` and `in_memory` keys are exchanged must decode to a
+/// different node, because if it decodes to the same one the two keys are not being read apart.
+#[test]
+fn every_flag_state_survives_the_stored_spelling_and_swapped_keys_do_not() {
+    for state in 0u8..32 {
+        let node = node_in_state(state);
+        // NO PAGES IN THIS FIXTURE, so there is no object to name -- and the empty list is
+        // CHECKED rather than ignored: a page it did not account for would panic.
+        let json = serde_json::to_string(&crate::engine::state::NodeNamedBy(&node, &[])).expect("a bucket node serializes");
+        let back: BucketNode = serde_json::from_str(&json).expect("a bucket node deserializes");
+        assert_eq!(
+            flags_of(&node),
+            flags_of(&back),
+            "flag state {state:#07b} did not survive the wire; it was written as {json}"
+        );
+    }
+    println!("\n  all 32 flag states round-tripped through the stored spelling");
+
+    // --- The control. Two keys exchanged in the text must land on a different node. ---
+    //
+    // State 8 sets `loading` alone, so exchanging the two keys is a real change and any decoder
+    // that reads them apart must see it.
+    let node = node_in_state(1 << 3);
+    assert!(
+        node.loading() && !node.in_memory(),
+        "the fixture for the swap must set exactly one of the two keys being exchanged"
+    );
+    let written = serde_json::to_string(&crate::engine::state::NodeNamedBy(&node, &[])).expect("a bucket node serializes");
+    let swapped = written
+        .replace("\"loading\":true", "\"loading\":\x00")
+        .replace("\"in_memory\":false", "\"in_memory\":true")
+        .replace("\"loading\":\x00", "\"loading\":false");
+    assert_ne!(
+        written, swapped,
+        "the swap did not change the text, so it cannot test anything"
+    );
+    let decoded: BucketNode = serde_json::from_str(&swapped).expect("the swapped node decodes");
+    println!("  swapped: {swapped}");
+    assert!(
+        !decoded.loading() && decoded.in_memory(),
+        "an index with `loading` and `in_memory` exchanged decoded to loading={} in_memory={}; \
+         the decoder is not reading the two keys apart",
+        decoded.loading(),
+        decoded.in_memory()
+    );
+    assert_ne!(
+        flags_of(&node),
+        flags_of(&decoded),
+        "exchanging two flag keys on the wire produced the same node; the stored spelling does \
+         not distinguish them"
+    );
+}
+
+
+// -------------------------------------------------------------------------------------------
+// 4. PRESENCE COMES FROM THE WIRE.
+// -------------------------------------------------------------------------------------------
+
+/// A NODE THAT OMITS A REQUIRED KEY IS REFUSED, AND ONE THAT OMITS AN OPTIONAL KEY IS NOT.
+///
+/// The hand-written deserializer has to reproduce the derive's two different answers to a missing
+/// key: the fields that carried `#[serde(default)]` fill in, and the six that did not are
+/// errors. The difference matters because a flag filled in with `false` is not an absent flag --
+/// it is a bucket that reads as clean, or as not resident, on the strength of a key that was
+/// never written. A store whose index is truncated mid-node would load as a valid node with
+/// plausible flags.
+///
+/// THIS TEST EXISTS BECAUSE A MUTATION SURVIVED. Replacing the refusal on `dirty` with
+/// `unwrap_or_default()` passed every other test in this module and in `per_item_byte_budget`,
+/// which is to say the rule was stated in two comments and enforced nowhere. Each of the six
+/// required keys is dropped in turn and the decode must FAIL; `deleted`, which really is
+/// optional, is dropped as the control and must SUCCEED.
+///
+/// IT WAS SEVEN. `last_dump_sequence` was required and is not, because the node no longer holds it
+/// and this engine no longer writes it -- a key an index we write does not carry cannot be one we
+/// refuse an index for omitting. It is still recognised and still decoded as a `u64` on the way in,
+/// which is a different property and is covered where the legacy spellings are.
+#[test]
+fn a_bucket_node_that_omits_a_required_key_is_refused_and_an_optional_one_is_not() {
+    let node = node_in_state(0b10101);
+    let json = serde_json::to_string(&crate::engine::state::NodeNamedBy(&node, &[])).expect("a bucket node serializes");
+
+    /// Remove one top-level key and its value from a flat JSON object.
+    fn without(json: &str, key: &str) -> String {
+        let needle = format!("\"{key}\":");
+        let at = json.find(&needle).unwrap_or_else(|| panic!("`{key}` is not in {json}"));
+        let end = json[at..]
+            .find(',')
+            .map(|offset| at + offset + 1)
+            .expect("every key under test is followed by another");
+        let mut out = String::with_capacity(json.len());
+        out.push_str(&json[..at]);
+        out.push_str(&json[end..]);
+        out
+    }
+
+    // SIX, NOT SEVEN. `last_dump_sequence` left this list because it left the node: an index this
+    // engine writes does not carry the key, so an index that omits it cannot be refused. The key
+    // is still RECOGNISED and still type-checked on the way in -- an older index carries it and
+    // must still load -- which the round-trip and legacy-read guards cover. Being recognised and
+    // being required are different things, and this list is the second one.
+    const REQUIRED: [&str; 6] = [
+        "routing_slot",
+        "dirty",
+        "meta_loaded",
+        "loading",
+        "in_memory",
+        "dirty_generation",
+    ];
+
+    println!("\n=== a node missing each required key ===");
+    for key in REQUIRED {
