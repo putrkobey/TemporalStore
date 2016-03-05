@@ -29,35 +29,3 @@ function makeEl(id) {
     closest() { return null; }, querySelector() { return null; }, querySelectorAll() { return []; },
     scrollIntoView() {}, focus() {}, click() {},
     classList: { add() {}, remove() {}, toggle() {} }
-  };
-}
-
-function get(id) {
-  if (!byId.has(id)) { byId.set(id, makeEl(id)); }
-  return byId.get(id);
-}
-
-function respond(body) {
-  return Promise.resolve({
-    ok: true, status: 200,
-    json: () => Promise.resolve(body),
-    text: () => Promise.resolve(JSON.stringify(body))
-  });
-}
-
-const win = {
-  document: {
-    getElementById: get,
-    querySelector: () => makeEl(),
-    querySelectorAll: () => [],
-    createElement: () => makeEl(),
-    addEventListener() {},
-    body: makeEl("body"),
-    hidden: false
-  },
-  addEventListener() {},
-  location: { origin: "http://localhost", href: "http://localhost", host: "gw.example:8080", reload() {} },
-  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
-  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
-  navigator: {},
-  setTimeout: () => 0,
