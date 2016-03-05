@@ -97,3 +97,52 @@ use serde::{Deserialize, Serialize};
 pub(super) const ROUTING_RANGE_MISMATCH: &str = "routing_range_mismatch";
 
 /// A load refused because the store has state and no stamp: the range is NOT RECOVERABLE.
+///
+/// A DIFFERENT CODE FROM THE MISMATCH, deliberately. The remedy differs -- there is no range to
+/// correct the configuration to -- and the arm this replaces was not a refusal at all, so a caller
+/// that used to see a successful load needs to be able to recognise exactly what changed.
+pub(super) const ROUTING_RANGE_UNSTAMPED: &str = "routing_range_unstamped";
+
+/// The range a store was built under.
+/// `pub(crate)`, not `pub(super)`, because a REPLICATION PAYLOAD carries one. A snapshot image and
+/// a shared-store checkpoint both name the range the index they carry was built on, and those live
+/// outside `engine`, so the type they name has to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RoutingRangeStamp {
+    pub(crate) start_routing_bucket: u32,
+    pub(crate) end_routing_bucket: u32,
+}
+
+/// Where the stamp lives: beside the base index, named for the shard, so a store copied as a
+/// directory carries it.
+pub(crate) fn routing_range_stamp_path(index_dir: &std::path::Path, shard_id: ShardId) -> PathBuf {
+    index_dir.join(format!("shard-{shard_id}.routing-range.json"))
+}
+
+pub(crate) fn read_routing_range_stamp(
+    index_dir: &std::path::Path,
+    shard_id: ShardId,
+) -> Option<RoutingRangeStamp> {
+    let bytes = fs::read(routing_range_stamp_path(index_dir, shard_id)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+pub(crate) fn write_routing_range_stamp(
+    index_dir: &std::path::Path,
+    shard_id: ShardId,
+    stamp: RoutingRangeStamp,
+) -> Result<(), std::io::Error> {
+    fs::create_dir_all(index_dir)?;
+    let bytes = serde_json::to_vec(&stamp)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    fs::write(routing_range_stamp_path(index_dir, shard_id), bytes)
+}
+
+/// Whether this shard already has state on disk -- the question that separates a NEW store from one
+/// built before the stamp existed.
+///
+/// TWO PLACES, NOT ONE. The base index file is the obvious one, but a shard whose base has never
+/// been materialized can still have durable bucket dump manifests, and a load recovers from those.
+/// Asking only about the base index would call such a store new and stamp it with the requested
+/// range, which is exactly the silent re-ranging this whole file exists to prevent.
+pub(super) fn store_has_on_disk_state(index_dir: &std::path::Path, shard_id: ShardId) -> bool {
