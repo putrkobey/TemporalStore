@@ -10,3 +10,9 @@
 services:
   temporalstore:
     build:
+      context: .
+      dockerfile: docker/Dockerfile.single-node
+    image: temporalstore:single-node
+    container_name: temporalstore-single-node
+    ports:
+      - "17101:17101"   # metaserver HTTP (health, topology)
