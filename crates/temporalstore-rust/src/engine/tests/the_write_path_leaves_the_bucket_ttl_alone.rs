@@ -32,37 +32,3 @@
 //! the sweep then COMPUTES it on the same shard. Without that second half, deleting the computation
 //! outright would pass.
 //!
-//! Both write-path arms are covered, because the write path is not always the targeted traversal:
-//! the pending refresh hands its work to the sweep once the touched set reaches half the buckets,
-//! and at the routing range production runs it essentially always does. Gating the TTL on the
-//! traversal would therefore have left the cost where it was on the configuration that matters,
-//! which is why it rides its own parameter -- and why both arms are asserted here.
-
-use crate::engine::state::{BlockIndex, BlockSlabLiveIndex, BucketNode, ShardState};
-use crate::engine::storage_bucket_internals::{
-    note_bucket_flags_stale, refresh_bucket_runtime_flags, refresh_pending_bucket_runtime_flags,
-};
-
-/// Far enough ahead that the remaining time is non-zero after the subtraction.
-///
-/// It has to be: the field is `Option<NonZeroU64>`, so a remaining time of zero is ABSENT and a
-/// fixture whose expiry has already passed would assert nothing at all.
-const FAR_FUTURE_MS: u64 = u64::MAX / 2;
-
-fn a_bucket_holding_one_block(routing_bucket: u32, object_key: &str) -> BucketNode {
-    let mut bucket = BucketNode::default();
-    bucket.routing_bucket = routing_bucket;
-    bucket.set_meta_loaded(true);
-    bucket.set_in_memory(true);
-    let mut live = BlockSlabLiveIndex::default();
-    bucket.insert_block(&object_key, 
-        BlockIndex {
-            model_id: crate::engine::storage_bucket_internals::StoredModelKind::from_stored_name(
-                "string",
-            )
-            .expect("`string` is a stored model spelling"),
-            address: Default::default(),
-            dirty: false,
-            deleted: false,
-        },
-        &mut live,
