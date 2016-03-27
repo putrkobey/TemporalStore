@@ -338,3 +338,117 @@ fn the_amplification_set_under_rewrite() {
     );
     println!();
 
+    let first = &shots[0];
+    // The last write snapshot is the one before the first reclaim round.
+    let last_write = &shots[ROUNDS];
+    let after_reclaim = &shots[shots.len() - 1];
+    println!(
+        "    SLAB-granular (published):  rewrite {:.3}x -> {:.3}x,  space {:.3}x -> {:.3}x",
+        first.rewrite_slab(),
+        last_write.rewrite_slab(),
+        first.space_slab(),
+        last_write.space_slab()
+    );
+    println!(
+        "    BLOCK-granular (the tally): rewrite {:.3}x -> {:.3}x,  space {:.3}x -> {:.3}x",
+        first.rewrite_block(),
+        last_write.rewrite_block(),
+        first.space_block(),
+        last_write.space_block()
+    );
+    println!(
+        "    RECORDED (the retired ranges): space {:.3}x -> {:.3}x, with no cycle run",
+        first.space_recorded(),
+        last_write.space_recorded()
+    );
+    println!(
+        "    after {RECLAIM_ROUNDS} reclaim rounds: space {:.3}x slab, {:.3}x block, {:.3}x recorded",
+        after_reclaim.space_slab(),
+        after_reclaim.space_block(),
+        after_reclaim.space_recorded()
+    );
+    println!("    the ceilings these ratios are held against: 5.0x space, 3.0x write");
+    println!();
+    println!(
+        "    block-granular space across the reclaim rounds: {}",
+        shots[ROUNDS..]
+            .iter()
+            .map(|s| format!("{:.3}x", s.space_block()))
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    );
+    println!(
+        "    and the footprint on disk: {}",
+        shots[ROUNDS..]
+            .iter()
+            .map(|s| s.physical.to_string())
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    );
+    println!();
+    // WHY IT DOES NOT COME DOWN HERE, STATED RATHER THAN LEFT TO BE INFERRED. The purge stage is
+    // requested above, so this is not a missing flag; what refuses is the quarantine age. A rising
+    // number with no explanation beside it is how a fixture artefact gets reported as a leak.
+    println!(
+        "    THE QUARANTINE AGE IS {} ms ({} minutes), and these rounds run in seconds -- so no",
+        crate::block_store::DELAYED_DESTROY_MIN_AGE_MS,
+        crate::block_store::DELAYED_DESTROY_MIN_AGE_MS / 60_000
+    );
+    println!(
+        "    slab quarantined by this workload is old enough to purge, with or without the flag."
+    );
+    println!(
+        "    Each round therefore compacts the live set into a new slab and leaves the old one"
+    );
+    println!(
+        "    quarantined. That is the two-phase design running with its second phase age-gated,"
+    );
+    println!("    NOT a collector that refuses to release. What the rounds show is the FIRST");
+    println!("    phase repeated, and convergence is not observable within a test's lifetime.");
+    println!();
+    println!(
+        "    SO THE FINDING THAT SURVIVES: space amplification cannot fall within the quarantine"
+    );
+    println!(
+        "    age of the rewrite that caused it -- and the published ratio cannot see any of it"
+    );
+    println!("    regardless, because its denominator is slab-granular.");
+    println!();
+
+    // ---- NON-VACUITY FIRST. Every figure above is a ratio, and a zero denominator satisfies any
+    // ---- bound while measuring nothing.
+    for shot in &shots {
+        assert!(
+            shot.live_slab_granular > 0,
+            "{}: the slab-granular figure is zero, so the published ratios are vacuous here",
+            shot.label
+        );
+        assert!(
+            shot.stored_written > 0,
+            "{}: nothing was written, so the fixture never ran",
+            shot.label
+        );
+    }
+
+    // ---- THE FIXTURE HAS TO ACTUALLY REWRITE. If the store recognised the repeated keys and
+    // ---- skipped the writes, every ratio below would be the write-once figure under a new name.
+    assert!(
+        last_write.stored_written > first.stored_written,
+        "writing every key {} times stored {} B against {} B after one pass, so the rewrites did \
+         not reach the store and this arm is measuring a write-once corpus",
+        ROUNDS + 1,
+        last_write.stored_written,
+        first.stored_written
+    );
+
+    // ---- THE PUBLISHED DENOMINATOR IS BLIND, AND THAT IS THE FINDING. `summarize_slabs` adds a
+    // ---- slab's whole `physical_bytes` to `live_physical_bytes` when the slab is `Active` or
+    // ---- `Sealed`, so the denominator grows in step with the numerator and both ratios sit at
+    // ---- 1.0x however much of the slab is dead. Asserted rather than described, so that changing
+    // ---- the denominator to a block-granular one makes this arm FAIL and say what moved.
+    assert!(
+        (last_write.space_slab() - 1.0).abs() < 0.01,
+        "the slab-granular space ratio read {:.3}x after {} rewrites of every key. It has been \
+         pinned at 1.0x because a live slab contributes its whole file size -- if it now moves, \
+         the denominator changed and this arm's finding needs restating",
+        last_write.space_slab(),
