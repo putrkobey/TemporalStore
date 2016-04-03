@@ -1,0 +1,329 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+//! WHAT THE PAGE INDEX ENTRY WEIGHS AT EACH STEP -- AND STEP ONE HAS LANDED.
+//!
+//! The target shape was twenty-four bytes carrying NO IDENTITY OF ITS OWN: a flag group, a model
+//! spelling, and an address, with the identity supplied by the position the entry is held at. THE
+//! ENTRY IS THAT SHAPE. `engine_storage_state.rs` pins it at twenty-four with nineteen bytes of field and five of
+//! slack, and the identity is resolved through `BlockKeysByPosition` from the position the page is
+//! filed at.
+//!
+//! # SO STEP ZERO AND STEP ONE ARE ONE SHAPE, AND THE MIRROR FOLDED INTO THE LIVE TYPE
+//!
+//! `StepOneTheIdentityLeaves` existed to measure what the entry WOULD weigh with the identity
+//! gone. It is gone, so the thing that mirror was a model of is the live entry, and two
+//! declarations of one shape are two things to keep in step. The mirror is deleted and step zero
+//! measures the live type; every row that was "composed on step one" is composed on step zero,
+//! which is the same field set under its real name.
+//!
+//! THAT IS THE SECOND FOLD THIS FILE HAS TAKEN FOR THE SAME REASON, and `engine_storage_state.rs` has taken two:
+//! a probe whose justification is "the number has to be real before anyone starts" is spent the
+//! moment the number is the live type's own.
+//!
+//! This file still measures what each REMAINING step costs, because every per-field reading of
+//! this structure in this campaign has been wrong in the same direction -- `size_of` steps at a
+//! word, so one to seven bytes of field saving moves it by nothing, and two savings that are each
+//! worth nothing can compose to a whole word.
+//!
+//! # EVERY MIRROR HERE DECLARED TWO FIELDS THE LIVE ENTRY NO LONGER HAS
+//!
+//! They carried `kind: IndexItemKind` and `routing_bucket: u32` -- five bytes between them -- and
+//! the commit that removed both from `BlockIndex` did not remove them from here. THE CONTROL WENT
+//! ON PASSING, which is the whole reason this is written down rather than quietly fixed: the live
+//! entry went from forty bytes of field to thirty-five, forty and thirty-five BOTH ROUND TO FORTY,
+//! and the step-zero mirror kept measuring the live entry while describing a field set the live
+//! entry had lost. The control's own doc says it discriminates at word granularity and no finer;
+//! this is that limit being reached in practice rather than in a note.
+//!
+//! WHAT THAT HID WAS NOT ONE NUMBER BUT THREE CONCLUSIONS, each now restated from a measurement:
+//!
+//!   * step one had "twenty-four bytes of field in twenty-four ... no slack for packing to
+//!     reclaim". It is NINETEEN bytes of field in twenty-four, with FIVE bytes of slack;
+//!   * step two said packing "buys nothing". Packed, the same field set measures NINETEEN -- the
+//!     step is worth five bytes, not zero;
+//!   * step two-A said a declared order "gives up the width step" at forty. It measures
+//!     THIRTY-TWO: the penalty is one word, not two.
+//!
+//! The widths of steps zero, one, three and four did not move at all, which is why the staleness
+//! was invisible: the five bytes the retired fields contributed were absorbed by the rounding in
+//! every one of those rows.
+//!
+//! # WHY A MIRROR AND NOT THE LIVE TYPE
+//!
+//! Each step is a STRUCT DECLARED HERE with the field set that step would leave behind. The live
+//! entry cannot be measured at a width it does not have yet, and a prose decomposition is the one
+//! form of this that nothing can fail. What makes these mirrors evidence rather than arithmetic is
+//! the pair of controls below: the step-zero mirror must measure the LIVE entry exactly, and a
+//! deliberately wrong mirror must NOT -- so the comparison is shown to discriminate before any
+//! step is read off it.
+//!
+//! AND THE STEP-ZERO CONTROL NOW READS OFFSETS AND NOT ONLY WIDTHS, for the reason the staleness
+//! above gives: a width is a sum, a sum hides its terms, and two different field lists round to
+//! the same width. An offset names one term and where it sits, so a mirror carrying a field the
+//! live entry does not have cannot place the rest where the live entry places them. The field sum
+//! is pinned beside the widths as well, but it is a different claim -- it moves when a field's own
+//! WIDTH moves, not when the list does.
+//!
+//! # ON THE SHAPE OF THE PINS
+//!
+//! Each width is pinned with `==` and each alignment with its own `==`. No neighbouring `!=` is
+//! written beside a width: `size_of` is always a multiple of `align_of`, so a `== N` entails every
+//! neighbour inequality and the neighbour asserts nothing. The alignment pin is NOT dominated by
+//! the width pin, because a width admits every alignment that divides it, which is exactly why it
+//! is written separately.
+//!
+//! The `!=` in the NEGATIVE CONTROL is a different claim and not that pattern: it is asserted
+//! about a DIFFERENT TYPE, to prove the instrument can refuse, and nothing else here entails it.
+
+use std::mem::{align_of, size_of};
+use std::sync::Arc;
+
+use crate::block_store::ElementEntry;
+use crate::engine::state::BlockIndex;
+use crate::engine::storage_bucket_internals::StoredModelKind;
+
+/// THE FIELD SUM OF THE LIVE ENTRY, built from the types its fields are declared with.
+///
+/// Spelled as types rather than as a literal so that a field whose own width moves elsewhere fails
+/// here instead of leaving this file describing the old one. Every row below is this sum with
+/// terms taken away, which is what makes the differences readable as the cost of one step.
+const LIVE_FIELD_SUM: usize = size_of::<StoredModelKind>() // model_id
+    + size_of::<ElementEntry>()                            // address
+    + size_of::<bool>()                                    // dirty
+    + size_of::<bool>(); // deleted
+const _: () = assert!(LIVE_FIELD_SUM == 19);
+
+/// STEP ZERO: the field set the live entry has, mirrored field for field and in declaration order.
+///
+/// FOUR fields, nineteen bytes of field in twenty-four, and so five bytes of slack. AND IT IS WHAT
+/// STEP ONE USED TO MEASURE: the identity has left, so "the live entry" and "the entry with the
+/// identity gone" are one field set and this is it.
+///
+/// ITS HISTORY IS THE WARNING THE MODULE DOC CARRIES. It read "Seven fields, forty bytes of field
+/// in forty" while two of those seven had already left the live entry, then "FIVE fields,
+/// thirty-five bytes of field in forty" while the key was still on it. Each was a decomposition
+/// that had stopped describing the type, and each survived a leg because `size_of` steps at a
+/// word. The OFFSET pins below are what that bought.
+#[allow(dead_code)]
+struct StepZeroTheLiveEntry {
+    model_id: StoredModelKind,
+    address: ElementEntry,
+    dirty: bool,
+    deleted: bool,
+}
+
+/// THE POSITIVE CONTROL: the mirror measures the live entry, or every number below is about a
+/// structure this tree does not contain.
+///
+/// Both halves are asserted, because a width alone is not an identity -- two different field sets
+/// can measure the same -- and because the alignment is the half that decides whether a later
+/// narrowing leaves the eight-aligned group or stays inside it.
+///
+/// AND NEITHER OF THEM CAN SEE A FIELD LIST, which is the whole of what went wrong here. Taking
+/// one bool off the mirror leaves thirty-four bytes of field, which rounds back to forty, and both
+/// assertions stay green; ADDING the five bytes of `kind` and `routing_bucket` back also leaves
+/// forty, and both stay green through that too. They discriminate at WORD granularity and no
+/// finer, and that is not a theory -- five bytes of field left this mirror's subject and these two
+/// assertions did not notice for a whole commit.
+const _: () = assert!(size_of::<StepZeroTheLiveEntry>() == size_of::<BlockIndex>());
+const _: () = assert!(align_of::<StepZeroTheLiveEntry>() == align_of::<BlockIndex>());
+const _: () = assert!(size_of::<StepZeroTheLiveEntry>() == 24);
+
+/// THE CONTROL THAT CAN SEE THE FIELD LIST: every field at the same offset in the mirror as in the
+/// live entry.
+///
+/// A width is a sum and a sum hides its terms. An OFFSET names one term and where it sits, so a
+/// mirror carrying a field the live entry does not have cannot place the remaining fields where
+/// the live entry places them -- the extra term pushes at least one of them. That is what the
+/// width pins above could not do: with `kind` and `routing_bucket` still declared here, this
+/// mirror put the model spelling at thirty-seven while the live entry puts it at thirty-two, and
+/// an offset pin would have refused the commit that retired them.
+///
+/// EXHAUSTIVE OVER THE LIVE ENTRY'S FIELDS, four of four. A field ADDED to `BlockIndex` does not
+/// fail here -- nothing in a list of offsets is forced to mention it -- so this is not a
+/// substitute for the destructuring guards elsewhere; it is the check that the terms named here
+/// are where the live type puts them.
+///
+/// THE `object_key` PAIR IS GONE WITH THE FIELD, and it could not have been left behind: an
+/// `offset_of!` of a field that does not exist does not compile. That is exactly the property
+/// this list was added for after the width pins let two retired fields through.
+const _: () = assert!(
+    std::mem::offset_of!(StepZeroTheLiveEntry, model_id)
+        == std::mem::offset_of!(BlockIndex, model_id)
+);
+const _: () = assert!(
+    std::mem::offset_of!(StepZeroTheLiveEntry, address) == std::mem::offset_of!(BlockIndex, address)
+);
+const _: () = assert!(
+    std::mem::offset_of!(StepZeroTheLiveEntry, dirty) == std::mem::offset_of!(BlockIndex, dirty)
+);
+const _: () = assert!(
+    std::mem::offset_of!(StepZeroTheLiveEntry, deleted) == std::mem::offset_of!(BlockIndex, deleted)
+);
+
+/// AND THE FIELD SUM, which is the half that moves when a field's own WIDTH moves rather than when
+/// the list does. Built from the live entry's field types, so a term that widens elsewhere fails
+/// here instead of leaving every decomposition below describing the old one.
+const _: () = assert!(LIVE_FIELD_SUM == 19);
+const _: () = assert!(size_of::<StepZeroTheLiveEntry>() - LIVE_FIELD_SUM == 5);
+
+/// THE NEGATIVE CONTROL: the same mirror with one word added, which must NOT measure the live
+/// entry.
+///
+/// Without this, a positive control that passed could be passing because both sides were being
+/// computed from the same stale thing, or because the comparison was satisfied by something other
+/// than the field set. This shows the comparison REFUSES when the field set genuinely differs,
+/// which is what makes its passing informative.
+///
+/// AND IT REFUSES BY A WHOLE WORD, which is the limit of what it proves. Twenty-seven bytes of
+/// field measures thirty-two, so this control is decisive against a mirror that is a WORD wrong
+/// and silent against one that is a BYTE wrong -- which is exactly the error that stood here.
+#[allow(dead_code)]
+struct StepZeroWithOneWordTooMany {
+    model_id: StoredModelKind,
+    address: ElementEntry,
+    dirty: bool,
+    deleted: bool,
+    one_word_too_many: u64,
+}
+
+const _: () = assert!(size_of::<StepZeroWithOneWordTooMany>() != size_of::<BlockIndex>());
+const _: () = assert!(size_of::<StepZeroWithOneWordTooMany>() == 32);
+
+// STEP ONE HAS LANDED AND ITS MIRROR IS FOLDED INTO STEP ZERO.
+//
+// `StepOneTheIdentityLeaves` declared `model_id`, `address`, `dirty`, `deleted` -- which is now
+// field for field what `BlockIndex` holds, and therefore field for field what the step-zero mirror
+// above declares. Two declarations of one shape are two things to keep in step, and this file has
+// already recorded what that costs: its step-zero control passed for a whole commit while
+// describing a field set the live entry had lost.
+//
+// WHAT IT MEASURED IS NOT LOST, IT IS PINNED ON THE LIVE TYPE. Nineteen bytes of field in
+// twenty-four with five of slack is asserted thirty lines above as step zero, and `engine_storage_state.rs`
+// asserts the same reconstruction on `BlockIndex` itself.
+//
+// AND THE CLAIM IT WAS WRITTEN TO CORRECT IS WORTH KEEPING. It once read "twenty-four bytes of
+// field in twenty-four ... so it lands exactly and leaves no slack for the next field to be added
+// into free of charge" -- true of a mirror carrying five bytes the live entry had already lost,
+// and false of the live field set. Nineteen is not a multiple of eight, so an eight-aligned struct
+// holding it has five bytes standing empty BY CONSTRUCTION. The entry had five bytes of slack at
+// forty too; what twenty-four changes is the width, not the room in it, and every field decision
+// taken here while the entry was believed to be exactly full still has to be re-priced.
+const STEP_ONE_FIELD_SUM: usize = LIVE_FIELD_SUM;
+
+/// STEP TWO: THE SAME FIELD SET, PACKED -- AND IT BUYS FIVE BYTES, NOT NOTHING.
+///
+/// NINETEEN, MEASURED. This said "Twenty-four is already a multiple of eight and step one already
+/// holds twenty-four bytes of field, so there is no slack for packing to reclaim: alignment one
+/// moves the ALIGNMENT and leaves the WIDTH exactly where it was." Both premises belonged to a
+/// mirror with five extra bytes of field. Step one holds nineteen, so there IS slack, and packing
+/// takes the whole of it: twenty-four to nineteen at alignment one.
+///
+/// THAT DOES NOT MAKE IT WORTH SPENDING. Packing a field of this entry costs every borrow of it --
+/// a packed field cannot be referenced -- and the entry is borrowed at every read site in the
+/// crate. What the number changes is the ARGUMENT: the case against packing here is the borrow
+/// restriction, and it can no longer be waved away as buying nothing.
+#[allow(dead_code)]
+#[repr(C, packed)]
+struct StepTwoTheSameFieldSetPacked {
+    model_id: StoredModelKind,
+    address: ElementEntry,
+    dirty: bool,
+    deleted: bool,
+}
+
+const _: () = assert!(size_of::<StepTwoTheSameFieldSetPacked>() == 19);
+const _: () = assert!(align_of::<StepTwoTheSameFieldSetPacked>() == 1);
+const _: () = assert!(size_of::<StepTwoTheSameFieldSetPacked>() == STEP_ONE_FIELD_SUM);
+
+/// STEP TWO-A: THE SAME FIELD SET UNDER A DECLARED ORDER AND NOT PACKED -- THIRTY-TWO.
+///
+/// This is the row that decides whether a stable field order is affordable, and it was found by
+/// MUTATION rather than by reasoning: taking `packed` off step two was expected to move only the
+/// alignment, and it moved the width too. A declared order cannot reorder the fields to fill its
+/// own padding, so the one-byte model spelling sits in front of an eight-aligned address and buys
+/// seven bytes of hole, and the two flags buy six more at the tail.
+///
+/// THE PENALTY IS ONE WORD AND NOT TWO. This said forty, which was measured on a mirror carrying
+/// `kind` and `routing_bucket`: with those gone it is thirty-two. So a declared order costs eight
+/// bytes over step one rather than the entire step the identity's removal won, and the conclusion
+/// it was written to support -- that `repr(C)` alone gives the width step up -- is wrong as
+/// stated. `repr(C, packed)` is still the only form that keeps the width at or below step one.
+#[allow(dead_code)]
+#[repr(C)]
+struct StepTwoAUnderADeclaredOrderUnpacked {
+    model_id: StoredModelKind,
+    address: ElementEntry,
+    dirty: bool,
+    deleted: bool,
+}
+
+const _: () = assert!(size_of::<StepTwoAUnderADeclaredOrderUnpacked>() == 32);
+const _: () = assert!(align_of::<StepTwoAUnderADeclaredOrderUnpacked>() == 8);
+const _: () =
+    assert!(size_of::<StepTwoAUnderADeclaredOrderUnpacked>() - size_of::<StepZeroTheLiveEntry>() == 8);
+
+/// STEP THREE: THE TWO FLAGS BECOME ONE FLAG GROUP -- AND IT BUYS NOTHING.
+///
+/// The dirty bit and the deleted bit are two separate bytes in step one. Folded into one byte this
+/// is EIGHTEEN bytes of field, and eighteen rounds back to twenty-four. This is the measured form
+/// of the rule that a saving smaller than the slack is a saving of nothing: the step is real, the
+/// width does not move, and a per-field reading would have reported one byte.
+///
+/// THE FOLD IS NOW TWO TERMS AND NOT THREE. It folded `kind`, `dirty` and `deleted`, and `kind`
+/// has left the entry -- so the group this describes is the two flags that remain, and the field
+/// sum it reaches is eighteen rather than twenty-two.
+#[allow(dead_code)]
+struct StepThreeTheFlagsFoldIntoOneByte {
+    flags: u8,
+    model_id: StoredModelKind,
+    address: ElementEntry,
+}
+
+const STEP_THREE_FIELD_SUM: usize =
+    size_of::<u8>() + size_of::<StoredModelKind>() + size_of::<ElementEntry>();
+const _: () = assert!(STEP_THREE_FIELD_SUM == 18);
+const _: () = assert!(size_of::<StepThreeTheFlagsFoldIntoOneByte>() == 24);
+const _: () = assert!(align_of::<StepThreeTheFlagsFoldIntoOneByte>() == 8);
+
+/// STEP FOUR: THE ADDRESS BECOMES ONE WORD, ON TOP OF STEP ONE AND NOT INSTEAD OF IT.
+///
+/// ELEVEN bytes of field in sixteen. Composed with step one this is a second whole word, which is
+/// why it is measured here rather than inferred: on the forty-byte entry the same narrowing was
+/// refused on measurement, because the three terms that travel with the address followed it into
+/// the tail and rounded the structure straight back. With the identity already gone there is no
+/// tail for them to round into, and the step lands.
+///
+/// AND IT LANDS AT SIXTEEN WITH FIVE BYTES OF SLACK, not at a full sixteen of field. That matters
+/// for the same reason step one's slack does: the end of this leg is not an entry packed exactly,
+/// it is an entry with room in it.
+#[allow(dead_code)]
+struct StepFourTheAddressBecomesOneWord {
+    model_id: StoredModelKind,
+    address: u64,
+    dirty: bool,
+    deleted: bool,
+}
+
+const STEP_FOUR_FIELD_SUM: usize = LIVE_FIELD_SUM - size_of::<ElementEntry>() + size_of::<u64>();
+const _: () = assert!(STEP_FOUR_FIELD_SUM == 11);
+const _: () = assert!(size_of::<StepFourTheAddressBecomesOneWord>() == 16);
+const _: () = assert!(align_of::<StepFourTheAddressBecomesOneWord>() == 8);
+const _: () = assert!(size_of::<StepFourTheAddressBecomesOneWord>() - STEP_FOUR_FIELD_SUM == 5);
+
+/// STEPS THREE AND FOUR COMPOSED: ten bytes of field, and still sixteen.
+///
+/// The flag fold is worth nothing on its own and nothing here either -- the pair measures exactly
+/// what step four measures alone. Recorded because the mirror case is the trap: two steps each
+/// worth nothing have composed to a whole word elsewhere in this structure, and the only way to
+/// know which way a pair goes is to declare the pair.
+#[allow(dead_code)]
+struct StepsThreeAndFourComposed {
+    flags: u8,
+    model_id: StoredModelKind,
+    address: u64,
+}
+
+const _: () = assert!(size_of::<StepsThreeAndFourComposed>() == 16);
+const _: () = assert!(align_of::<StepsThreeAndFourComposed>() == 8);
