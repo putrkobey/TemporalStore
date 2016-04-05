@@ -61,3 +61,67 @@ fn engine_on(dir: &std::path::Path) -> TemporalEngine {
         64 * 1024 * 1024,
         dir.join("cache"),
         dir.join("blocks"),
+        dir.join("indexes"),
+    )
+}
+
+fn load_on(engine: &TemporalEngine) {
+    let response = engine.load_shard_with(crate::control::LoadShardRequest {
+        shard_id: 1,
+        table_name: "folded-page-membership".to_string(),
+        shard_uri: "local://folded-page-membership/1".to_string(),
+        start_routing_bucket: 0,
+        end_routing_bucket: 1023,
+        readonly: false,
+        load_version: 1,
+        local_node_id: Some(1),
+    });
+    assert!(response.status.ok, "load failed: {:?}", response.status);
+}
+
+fn write(engine: &TemporalEngine, command: Command) {
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command,
+    });
+    assert!(response.status.ok, "write failed: {response:?}");
+}
+
+/// rust-internal: drives the engine's own command surface
+#[test]
+fn a_folded_blocks_membership_now_states_the_member_the_live_index_no_longer_names() {
+    // THE FIXTURE'S SERVED SIDE IS THE RESIDENT MAP, NOT THE PAGE INDEX. This comment predicted
+    // the red rather than fixing it: "THE FIXTURE COUNTS MEMBERS THE LIVE INDEX NAMES, which is
+    // zero once entries name pages instead of elements -- its floor says the removal did not do
+    // what this fixture assumes." It is zero, and the fix is to read the side where membership
+    // actually lives. See the re-attribution at SIDE 1 below.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    let members: Vec<Vec<u8>> = (0..MEMBERS)
+        .map(|i| format!("member-{i:04}").into_bytes())
+        .collect();
+    for member in &members {
+        write(
+            &engine,
+            Command::SetAdd {
+                key: "folded".to_string(),
+                member: member.clone(),
+            },
+        );
+    }
+
+    // FOLD FIRST. The counters are the instrument, because "one page per container" is also what an
+    // idle round over a one-element object reports.
+    crate::engine::reset_container_batch_counts();
+    engine
+        .compact_shard_blocks(1)
+        .expect("the fold round must succeed");
+    let (batches, folded) = crate::engine::container_batch_counts();
+    assert!(
+        batches > 0 && folded > 0,
+        "nothing folded ({batches} batches, {folded} pages), so this fixture is not in the state it \
+         claims to be asking about"
+    );
+
