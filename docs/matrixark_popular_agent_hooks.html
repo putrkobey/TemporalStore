@@ -271,3 +271,139 @@ thread_id
 conversation_id
 workspace_root
 cwd
+open_files[]
+tool_outputs[]
+raw_uri / uri / path / resource_path
+resource_type
+context_pack_id
+accepted_refs[] / rejected_refs[]
+local_context[]
+local_context_tokens
+max_context_tokens
+```
+
+Claude prompt payload example:
+
+```json
+{
+  &quot;prompt&quot;: &quot;Remember that Claude owns the GPU release checklist.&quot;,
+  &quot;conversation_id&quot;: &quot;claude-thread-42&quot;,
+  &quot;workspace_root&quot;: &quot;/repo/aurora&quot;,
+  &quot;local_context&quot;: [
+    {&quot;ref&quot;: &quot;open-file:docs/release.md&quot;, &quot;text&quot;: &quot;Visible release checklist notes.&quot;}
+  ],
+  &quot;local_context_tokens&quot;: 12,
+  &quot;max_context_tokens&quot;: 512
+}
+```
+
+MatrixArk derives `session_id=claude:claude-thread-42`, writes a lightweight
+`ContextEvent`, appends a same-session buffer record, and calls
+`matrixark_retrieve` before the model answer.
+
+## OpenClaw / OpenCode-Style Agent Example
+
+OpenClaw-style agents should use the same MCP server and the same universal
+hook adapter. Generate a complete config block:
+
+```bash
+cd &lt;repo&gt;
+python3 tools/matrixark_agent_config.py --client openclaw --repo-root &lt;repo&gt;
+```
+
+Prompt hook:
+
+```bash
+python3 &lt;repo&gt;/tools/matrixark_agent_hook.py \
+  --agent openclaw \
+  --event UserPromptSubmit \
+  --backend temporalstore-direct
+```
+
+Resource hook:
+
+```bash
+cat &lt;&lt;&#x27;JSON&#x27; | python3 &lt;repo&gt;/tools/matrixark_agent_hook.py \
+  --agent openclaw \
+  --event ResourceAdded \
+  --backend temporalstore-direct
+{
+  &quot;path&quot;: &quot;/repo/runbooks/openclaw_gpu_runbook.md&quot;,
+  &quot;resource_type&quot;: &quot;md&quot;,
+  &quot;thread_id&quot;: &quot;openclaw-thread-7&quot;,
+  &quot;message&quot;: &quot;OpenClaw added a GPU runbook.&quot;
+}
+JSON
+```
+
+Stop/session-boundary hook:
+
+```bash
+cat &lt;&lt;&#x27;JSON&#x27; | python3 &lt;repo&gt;/tools/matrixark_agent_hook.py \
+  --agent openclaw \
+  --event Stop \
+  --backend temporalstore-direct
+{
+  &quot;message&quot;: &quot;OpenClaw task completed.&quot;,
+  &quot;thread_id&quot;: &quot;openclaw-thread-7&quot;
+}
+JSON
+```
+
+MatrixArk derives `session_id=openclaw:openclaw-thread-7`. `ResourceAdded`
+routes to `matrixark_ingest(kind=resource|skill)`, while `Stop` routes to
+`matrixark_session_commit` so same-session messages become segments/entities.
+
+## Cursor Hook/Fallback Example
+
+Cursor should primarily use MCP. If a project or enterprise wrapper can call an
+external command before/after the agent loop, use:
+
+```bash
+python3 &lt;repo&gt;/tools/matrixark_agent_hook.py \
+  --agent cursor \
+  --event UserPromptSubmit \
+  --backend temporalstore-direct
+```
+
+Payload:
+
+```json
+{
+  &quot;prompt&quot;: &quot;What did we decide about the GPU approval?&quot;,
+  &quot;session_id&quot;: &quot;cursor-thread-123&quot;,
+  &quot;workspace_root&quot;: &quot;/repo/acme&quot;,
+  &quot;local_context_tokens&quot;: 640,
+  &quot;max_context_tokens&quot;: 3000,
+  &quot;open_files&quot;: [
+    {&quot;path&quot;: &quot;infra/budget.md&quot;, &quot;summary&quot;: &quot;Current capex budget notes&quot;}
+  ],
+  &quot;local_context&quot;: [
+    {&quot;ref&quot;: &quot;open-file:infra/budget.md&quot;, &quot;text&quot;: &quot;Current capex budget notes&quot;}
+  ]
+}
+```
+
+## Cline / Roo / Continue Example
+
+Use MCP as the default. If the agent can run a command after tool calls:
+
+```bash
+python3 &lt;repo&gt;/tools/matrixark_agent_hook.py \
+  --agent cline \
+  --event PostToolUse \
+  --backend temporalstore-direct
+```
+
+This captures durable tool outcomes and keeps raw tool output out of future
+prompts unless it becomes relevant.
+
+## Multi-Agent Framework Example
+
+For AutoGen, LangGraph, CrewAI, LlamaIndex, Semantic Kernel, Dify, or n8n,
+place MatrixArk at workflow boundaries:
+
+```text
+Before model node:
+  call matrixark_retrieve(query, scope, local_context, local_context_tokens, max_context_tokens)
+
