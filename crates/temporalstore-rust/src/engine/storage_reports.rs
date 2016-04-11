@@ -316,3 +316,321 @@ impl TemporalEngine {
         if !plan.stale_block_slab_ids.is_empty() {
             warnings.push("stale_block_segments_pending_gc".to_string());
         }
+        if !boundary.orphan_block_slab_ids.is_empty() {
+            warnings.push("orphan_block_segments_pending_gc".to_string());
+        }
+        if bucket_dump_manifest_count == 0 && recovery.total_block_refs > 0 {
+            warnings.push("no_slot_dump_manifest_for_live_blocks".to_string());
+        }
+        if policy
+            .max_dirty_buckets
+            .map(|limit| plan.dirty_buckets.len() > limit)
+            .unwrap_or(false)
+        {
+            blockers.push("dirty_slots_exceed_policy".to_string());
+        }
+        if policy
+            .max_stale_block_slabs
+            .map(|limit| plan.stale_block_slab_ids.len() > limit)
+            .unwrap_or(false)
+        {
+            blockers.push("stale_block_segments_exceed_policy".to_string());
+        }
+        if policy
+            .max_orphan_block_slabs
+            .map(|limit| boundary.orphan_block_slab_ids.len() > limit)
+            .unwrap_or(false)
+        {
+            blockers.push("orphan_block_segments_exceed_policy".to_string());
+        }
+        if policy
+            .max_undumped_wal_records
+            .map(|limit| undumped_wal_records > limit)
+            .unwrap_or(false)
+        {
+            blockers.push("undumped_wal_records_exceed_policy".to_string());
+        }
+        if policy.require_bucket_dump_manifest
+            && bucket_dump_manifest_count == 0
+            && recovery.total_block_refs > 0
+        {
+            blockers.push("slot_dump_manifest_required".to_string());
+        }
+        if policy.block_on_warnings && !warnings.is_empty() {
+            blockers.push("warnings_exceed_policy".to_string());
+        }
+
+        StorageProductionReadinessReport {
+            shard_id,
+            policy,
+            production_ready: blockers.is_empty(),
+            blockers,
+            warnings,
+            dirty_bucket_count: plan.dirty_buckets.len(),
+            stale_block_slab_count: plan.stale_block_slab_ids.len(),
+            orphan_block_slab_count: boundary.orphan_block_slab_ids.len(),
+            undumped_wal_records,
+            corrupt_block_slab_count: boundary.corrupt_block_slab_ids.len(),
+            unreadable_block_ref_count: recovery.unreadable_block_refs.len(),
+            owner_mismatch_block_ref_count: boundary.owner_mismatch_block_refs.len(),
+            missing_owner_block_ref_count: boundary.object_lifecycle.missing_owner_block_refs,
+            reused_object_id_conflict_count: boundary.object_lifecycle.reused_object_id_conflicts,
+            interrupted_bucket_dump_install_count,
+            prepared_bucket_dump_install_count: boundary.prepared_bucket_dump_install_count,
+            installed_bucket_dump_install_count: boundary.installed_bucket_dump_install_count,
+            unknown_bucket_dump_install_count: boundary.unknown_bucket_dump_install_count,
+            bucket_dump_manifest_count,
+            cache_memory_bytes: cache.memory_bytes,
+            cache_disk_bytes: cache.disk_bytes,
+            block_store_bytes_written: block_store.bytes_written,
+            boundary,
+            object_lifecycle: recovery.object_lifecycle,
+            slab_integrity,
+            log_compatibility,
+            block_format_compatibility,
+            feature_block_layout_mismatch_count: recovery.feature_block_layout.mismatch_count(),
+            corrupt_feature_block_count: recovery
+                .feature_block_layout
+                .corrupt_packed_feature_blocks
+                .len(),
+            feature_block_layout: recovery.feature_block_layout,
+        }
+    }
+
+    /// The log figures the maintenance round reads, with no walk of either log.
+    ///
+    /// `stats()` answers both of these from the piece headers and the accumulated counters, which
+    /// is work proportional to the number of PIECES. `storage_log_compatibility_report` answers
+    /// them too, and counts the records on the way -- which is work proportional to the log's
+    /// BYTES, decoded. The pressure sites want only what is here, so this is what they ask for.
+    ///
+    /// Taken from the same `stats()` calls as the full report, so the two cannot drift about what
+    /// the log holds.
+    pub fn storage_log_pressure_report(&self, shard_id: ShardId) -> StorageLogPressureReport {
+        let wal_stats = self.wal_store.stats(shard_id);
+        let index_log_stats = self.index_log_store.stats(shard_id);
+        StorageLogPressureReport {
+            shard_id,
+            wal_last_sequence: wal_stats.last_sequence,
+            index_log_last_sequence: index_log_stats.last_sequence,
+            wal_bytes: wal_stats.bytes_written,
+            index_log_bytes: index_log_stats.bytes_written,
+        }
+    }
+
+    pub fn storage_log_compatibility_report(
+        &self,
+        shard_id: ShardId,
+    ) -> StorageLogCompatibilityReport {
+        let wal_stats = self.wal_store.stats(shard_id);
+        let index_log_stats = self.index_log_store.stats(shard_id);
+        // Counted, not collected -- the twin of the pair in the recovery report. This one is
+        // reached through `storage_manager_pressure_snapshot`, so it is on the SAME maintenance
+        // round as that pair: fixing only the other would have left every round still reading
+        // both logs in full, from a second site.
+        let wal_records = self.wal_store.record_count(shard_id).unwrap_or_default();
+        let index_log_records = self.index_log_store.record_count(shard_id).unwrap_or_default();
+        StorageLogCompatibilityReport {
+            shard_id,
+            wal_format: "rust-protobuf-wal-v1".to_string(),
+            index_log_format: "rust-jsonl-shard-index-v1".to_string(),
+            compatibility_mode: "rust_native_migration_only".to_string(),
+            migration_required: true,
+            native_reader_supported: false,
+            native_writer_supported: false,
+            golden_conversion_required: true,
+            rust_native_replay_safe: true,
+            native_binary_compatible: false,
+            wal_last_sequence: wal_stats.last_sequence,
+            index_log_last_sequence: index_log_stats.last_sequence,
+            wal_records,
+            index_log_records,
+            wal_bytes: wal_stats.bytes_written,
+            index_log_bytes: index_log_stats.bytes_written,
+            compatibility_gaps: vec![
+                "compatibility mode is migration-only; direct mixed-format binary log serving is not supported"
+                    .to_string(),
+                "binary/protobuf index-log reader and writer are not implemented".to_string(),
+                "golden log conversion/replay suite is required before migration".to_string(),
+            ],
+        }
+    }
+
+    pub fn storage_block_format_compatibility_report(
+        &self,
+        shard_id: ShardId,
+    ) -> StorageBlockFormatCompatibilityReport {
+        let stats = self.block_store.stats();
+        let summary = self.block_store.slab_summary();
+        StorageBlockFormatCompatibilityReport {
+            shard_id,
+            block_format: "rust-page-envelope-v6".to_string(),
+            rust_envelope_version: 6,
+            compatibility_mode: "rust_envelope_migration_only".to_string(),
+            migration_required: true,
+            native_block_header_reader_supported: false,
+            native_block_header_writer_supported: false,
+            golden_conversion_required: true,
+            rust_native_read_safe: true,
+            native_block_header_compatible: false,
+            checksum_protected: true,
+            object_ids_embedded: true,
+            routing_buckets_embedded: true,
+            compression_supported: true,
+            active_slabs: summary.active_slabs,
+            sealed_slabs: summary.sealed_slabs,
+            delayed_destroy_slabs: summary.delayed_destroy_slabs,
+            live_physical_bytes: summary.live_physical_bytes,
+            reclaimable_physical_bytes: summary.reclaimable_physical_bytes,
+            block_store_writes: stats.writes,
+            block_store_bytes_written: stats.bytes_written,
+            logical_bytes_written: stats.logical_bytes_written,
+            compressed_records_written: stats.compressed_records_written,
+            compatibility_gaps: vec![
+                "compatibility mode is migration-only; direct mixed mixed-format page-header serving is not supported"
+                    .to_string(),
+                "binary protobuf page header reader and writer are not implemented".to_string(),
+                "slot/page layout and page-id allocation are not byte-compatible".to_string(),
+                "golden page conversion/replay suite is required before migration".to_string(),
+            ],
+        }
+    }
+
+    pub fn warm_cache_from_block_index(
+        &self,
+        shard_id: ShardId,
+        selected_buckets: impl IntoIterator<Item = u32>,
+    ) -> usize {
+        self.storage_cache_warmup_report(shard_id, selected_buckets)
+            .warmed_block_refs
+    }
+
+    pub fn storage_cache_warmup_report(
+        &self,
+        shard_id: ShardId,
+        selected_buckets: impl IntoIterator<Item = u32>,
+    ) -> StorageCacheWarmupReport {
+        let selected_buckets = selected_buckets.into_iter().collect::<BTreeSet<_>>();
+        let mut report = StorageCacheWarmupReport {
+            shard_id,
+            selected_buckets: selected_buckets.iter().copied().collect(),
+            ..StorageCacheWarmupReport::default()
+        };
+        // THE ADDRESSES ARE CHOSEN UNDER THE GUARD; THE READS HAPPEN AFTER IT DROPS.
+        //
+        // This stage used to hold the shard-table READ guard across the whole loop below -- one
+        // block-store read and one cache insert PER LIVE PAGE, with no per-round budget of any
+        // kind. A read guard admits other readers, so this looks cheap and is not: it excludes
+        // every WRITER on the shard for as long as the I/O takes, which on a warm of the whole
+        // shard is every page in the store. The rest of the maintenance round is among the
+        // writers it blocks.
+        //
+        // Nothing in the loop needs the shard. `collect_live_block_entries` already MATERIALIZES
+        // the whole set into a Vec, and after that the body touches only `entry.address` and
+        // `entry.object_key`, both owned by the Vec; `routing_bucket_for_key` reads `infos`, a
+        // different lock. So the guard was being held for the producer's sake and paid for by
+        // the consumer.
+        //
+        // WHAT A STALE ADDRESS MAKES THIS DO. Between the walk and the read a writer can delete
+        // the page this entry names. The consequence is bounded in both directions: a read that
+        // no longer resolves returns Err and is counted as `failed_page_refs`, which the loop
+        // already handles, and a page that IS read populates the cache under
+        // `CacheKey::page_with_slot` -- keyed by slab id, offset and length, i.e. by the physical
+        // location whose bytes do not change while the slab is live. The entry is a cached copy
+        // of bytes that are still on disk, not a claim that the page is live, and nothing reads
+        // the cache to decide what is live. This is a REPORT and a cache fill; it decides no
+        // reclaim, so a stale answer costs at most one wasted cache slot.
+        let mut plan: Vec<(CacheKey, ElementEntry)> = Vec::new();
+        let held_across_io = {
+            let shards = self.shards_read_marked();
+            let Some(shard) = shards.get(&shard_id) else {
+                return report;
+            };
+            for entry in collect_live_block_entries(shard) {
+                let routing_bucket = self.routing_bucket_for_key(shard_id, &entry.object_key);
+                if !selected_buckets.is_empty() && !selected_buckets.contains(&routing_bucket) {
+                    report.skipped_block_refs = report.skipped_block_refs.saturating_add(1);
+                    continue;
+                }
+                report.considered_block_refs = report.considered_block_refs.saturating_add(1);
+                let key = CacheKey::page_with_slot(
+                    shard_id,
+                    entry.address.block_slab_id(),
+                    entry.address.offset(),
+                    entry.address.length(),
+                    Some(routing_bucket),
+                );
+                plan.push((key, entry.address));
+            }
+            // The control arm of `the_cache_warmup_reads_blocks_after_the_shard_guard_drops` keeps
+            // the guard held across the reads, so the guard has a positive control to compare
+            // against rather than an assertion that nothing can fail.
+            self.warm_cache_under_shard_guard
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .then_some(shards)
+        };
+        for (key, address) in plan {
+            if self.cache.peek_tier(&key).is_some() {
+                report.already_cached_block_refs = report.already_cached_block_refs.saturating_add(1);
+                report.warmed_block_refs = report.warmed_block_refs.saturating_add(1);
+            } else if let Ok(bytes) = self.read_block_counted(&address) {
+                report.page_store_reads = report.page_store_reads.saturating_add(1);
+                report.block_store_reads = report.block_store_reads.saturating_add(1);
+                let byte_len = bytes.len() as u64;
+                match self.cache.put(key, bytes) {
+                    Ok(()) => {
+                        report.warmed_block_refs = report.warmed_block_refs.saturating_add(1);
+                        report.warmed_bytes = report.warmed_bytes.saturating_add(byte_len);
+                    }
+                    Err(_) => {
+                        report.failed_block_refs = report.failed_block_refs.saturating_add(1);
+                    }
+                }
+            } else {
+                report.failed_block_refs = report.failed_block_refs.saturating_add(1);
+            }
+        }
+        drop(held_across_io);
+        report
+    }
+
+    pub fn storage_cache_inspection_report(
+        &self,
+        shard_id: ShardId,
+    ) -> StorageCacheInspectionReport {
+        STORAGE_CACHE_INSPECTION_LISTINGS.with(|cell| cell.set(cell.get().saturating_add(1)));
+        let entries = self.cache.entries_for_shard(shard_id);
+        STORAGE_CACHE_INSPECTION_LISTING_ENTRIES
+            .with(|cell| cell.set(cell.get().saturating_add(entries.len() as u64)));
+        let mut bucket_summaries = BTreeMap::<u32, StorageCacheBucketSummary>::new();
+        for entry in &entries {
+            let Some(routing_bucket) = cache_entry_routing_bucket(entry) else {
+                continue;
+            };
+            let summary = bucket_summaries
+                .entry(routing_bucket)
+                .or_insert(StorageCacheBucketSummary {
+                    routing_bucket,
+                    ..StorageCacheBucketSummary::default()
+                });
+            summary.entry_count = summary.entry_count.saturating_add(1);
+            summary.memory_bytes = summary.memory_bytes.saturating_add(entry.memory_bytes);
+            summary.disk_bytes = summary.disk_bytes.saturating_add(entry.disk_bytes);
+            if entry.pinned {
+                summary.pinned_entries = summary.pinned_entries.saturating_add(1);
+                summary.pinned_bytes = summary.pinned_bytes.saturating_add(entry.memory_bytes);
+            }
+        }
+        StorageCacheInspectionReport {
+            shard_id,
+            stats: self.cache.stats(),
+            entries,
+            bucket_summaries: bucket_summaries.into_values().collect(),
+        }
+    }
+
+    pub fn invalidate_storage_cache_bucket(
+        &self,
+        request: StorageCacheInvalidateBucketRequest,
+    ) -> Result<CacheGcReport, Status> {
+        self.cache
