@@ -55,3 +55,61 @@ function textFromPayload(payload) {
   if (Array.isArray(payload.output)) {
     const parts = [];
     for (const item of payload.output) {
+      if (typeof item === "string" && item.trim()) {
+        parts.push(item.trim());
+      } else if (item && typeof item === "object" && typeof item.text === "string" && item.text.trim()) {
+        parts.push(item.text.trim());
+      }
+    }
+    if (parts.length) return parts.join("");
+  }
+  if (payload.message && typeof payload.message === "object") {
+    const text = textFromPayload(payload.message);
+    if (text) return text;
+  }
+  return "";
+}
+
+function roleForEvent(event) {
+  if (event === "UserPromptSubmit") return "user";
+  if (event === "PostToolUse") return "tool";
+  if (event === "AssistantResponse" || event === "Stop" || event === "PreCompact") return "assistant";
+  return "unknown";
+}
+
+function hookTypeForEvent(event) {
+  if (event === "UserPromptSubmit" || event === "SessionStart") return "before_llm";
+  if (event === "PostToolUse") return "tool_result";
+  if (event === "Stop" || event === "PreCompact") return "session_commit";
+  if (event === "AssistantResponse") return "after_llm";
+  return "agent_event";
+}
+
+function lifecycleStageForEvent(event) {
+  if (event === "UserPromptSubmit" || event === "SessionStart") return "before_llm_retrieve";
+  if (event === "PostToolUse") return "tool_evidence_ingest";
+  if (event === "AssistantResponse") return "after_llm_ingest";
+  if (event === "Stop" || event === "PreCompact") return "session_boundary_commit";
+  return "agent_event";
+}
+
+function shouldRetrieveForEvent(event) {
+  return event === "UserPromptSubmit" || event === "SessionStart";
+}
+
+function shouldCommitForEvent(event) {
+  return event === "Stop" || event === "PreCompact";
+}
+
+function extractionPhaseForEvent(event) {
+  if (event === "Stop" || event === "PreCompact") return "final";
+  return "provisional";
+}
+
+function splitList(value) {
+  if (!value) return [];
+  return String(value)
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
