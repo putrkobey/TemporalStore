@@ -163,3 +163,333 @@ fn shard_with_one_object_of_every_kind(suffix: &str) -> ShardState {
     shard
         .hashes
         .insert_element_for_test(
+            &key_for("hash", suffix),
+            std::sync::Arc::from("field-a"),
+            address(),
+        );
+    shard
+        .sets
+        .insert_element_for_test(&key_for("set", suffix), b"member-a".to_vec(), address());
+    shard.zsets.insert_element_for_test(
+        &key_for("zset", suffix),
+        b"member-a".to_vec(),
+        (7, address()),
+    );
+    shard
+        .lists
+        .insert_element_for_test(&key_for("list", suffix), 1i64, address());
+
+    let mut series = BTreeMap::new();
+    series.insert(1_000u64, address());
+    shard
+        .features_mut()
+        .insert(key_for("feature", suffix).into(), series.clone().into());
+    shard.insert_control_state_block(
+        key_for("control_state", suffix).as_str().into(),
+        {
+            // Through `set_address`, like production -- see the note on that method.
+            let mut record = crate::engine::object_record::ObjectRecord::default();
+            record.set_address(&address());
+            record.into()
+        },
+    );
+    shard
+        .context_nodes_mut()
+        .insert(key_for("context_node", suffix).as_str().into(), address());
+    shard
+        .context_audits_mut()
+        .insert(key_for("context_audit", suffix).into(), series.clone().into());
+    shard
+        .context_children_mut()
+        .insert(key_for("context_child", suffix).into(), series.clone().into());
+    shard
+        .context_summaries_mut()
+        .insert(key_for("context_summary", suffix).into(), series.clone().into());
+    shard
+        .context_compressions_mut()
+        .insert(key_for("context_compression", suffix).into(), series.clone().into());
+
+    // THE ENTITY ARM IS KEYED BY THE COLLECTION AND NOT BY THE COMPOSED KEY, which is the whole
+    // reason it is a separate verdict below. The inner u64 is the ENTITY HASH, not a timestamp.
+    let mut entities = BTreeMap::new();
+    entities.insert(ENTITY_HASH, address());
+    shard
+        .context_entities_mut()
+        .insert(entity_collection_key(suffix).into(), entities.into());
+
+    // THE TWO THAT ARE NOT WRITTEN. Populated anyway, so the arms below measure a map that HAD the
+    // key and lost it rather than a map that never held one -- which are different claims and only
+    // one of them is about durability.
+    shard.set_context_event_series(&key_for("context_event", suffix), series.clone());
+    shard
+        .context_indexes_mut()
+        .insert(key_for("context_index", suffix).into(), series.clone().into());
+    // The time index, keyed by the same object key the event map is keyed by.
+    let mut timeline = BTreeMap::new();
+    timeline.insert(TIMELINE_KEY, EVENT_ID_HASH);
+    shard
+        .context_event_timeline
+        .insert(key_for("context_event", suffix).into(), timeline);
+
+    shard
+}
+
+/// The round trip the whole module is taken across: the real encoder and the real decoder, the
+/// same pair `persistence` writes and reads.
+fn round_trip(shard: &ShardState) -> ShardState {
+    let bytes = encode_index_bytes(shard);
+    decode_index_bytes(&bytes).expect("a shard this engine wrote should decode")
+}
+
+// =================================================================================================
+// THE PRECONDITION: THE STRUCTURE UNDER SUSPICION IS NOT A SOURCE
+// =================================================================================================
+
+/// THE LOOKUP COMES BACK EMPTY, SO NOTHING BELOW IS MEASURING IT.
+///
+/// `object_block_lookup` is `skip_serializing` and `CoreIndex`'s encoder writes ONE field. If this
+/// arm failed -- if a decode handed back a populated lookup -- then every "the characters are
+/// durable" result below could be the lookup answering about itself, which is the shape this
+/// campaign has shipped before: a detector replaced by a comparison of a value against itself.
+///
+/// THE POSITIVE CONTROL IS THAT THE SHARD WAS NOT EMPTY. A round trip of nothing also produces an
+/// empty lookup, so the model maps are asserted populated on BOTH sides before the emptiness is
+/// read as meaning anything.
+#[test]
+fn the_lookup_is_empty_after_a_round_trip_so_it_cannot_be_the_source() {
+    let shard = shard_with_one_object_of_every_kind(WRITTEN_SUFFIX);
+    assert!(
+        !shard.strings().is_empty(),
+        "fixture must be populated or the round trip is of nothing"
+    );
+
+    let reloaded = round_trip(&shard);
+
+    assert!(
+        reloaded.bucket_index.object_block_lookup.is_empty(),
+        "the lookup is skip_serializing, so a decode must not hand one back -- if it does, every \
+         durability result in this module may be the lookup answering about itself"
+    );
+    assert!(
+        !reloaded.strings().is_empty(),
+        "positive control: the round trip must carry SOMETHING, or the empty lookup above is \
+         simply an empty shard"
+    );
+}
+
+// =================================================================================================
+// THE CENSUS: ONE VERDICT PER KIND, MEASURED ACROSS THE REAL CODEC
+// =================================================================================================
+
+/// Whether the shard's own map for this kind names this key.
+///
+/// ONE ARM PER KIND AND NO DEFAULT ARM THAT ANSWERS. A kind added to `model_kind_registry` and not
+/// to this match PANICS with the instruction, which is the only way this census cannot go stale
+/// beside the registry it is a census OF.
+fn kind_map_holds(shard: &ShardState, kind: &str, suffix: &str) -> bool {
+    let key = key_for(kind, suffix);
+    match kind {
+        "string" => shard.strings().contains_key(key.as_str()),
+        "hash" => shard.hashes.contains_key(&key),
+        "set" => shard.sets.contains_key(&key),
+        "zset" => shard.zsets.contains_key(&key),
+        "list" => shard.lists.contains_key(&key),
+        "feature" => shard.features().contains_key(&key[..]),
+        "control_state" => shard.control_state_blocks().contains_key(key.as_str()),
+        "context_node" => shard.context_nodes().contains_key(key.as_str()),
+        "context_audit" => shard.context_audits().contains_key(&key[..]),
+        "context_child" => shard.context_children().contains_key(&key[..]),
+        "context_summary" => shard.context_summaries().contains_key(&key[..]),
+        "context_compression" => shard.context_compressions().contains_key(&key[..]),
+        "context_event" => shard.context_events().contains_key(key.as_str()),
+        "context_index" => shard.context_indexes().contains_key(&key[..]),
+        other => panic!(
+            "no census arm for model kind {other:?}. Every kind `model_kind_registry` declares \
+             live needs a verdict here, or this census silently stops covering one."
+        ),
+    }
+}
+
+/// THE KINDS WHOSE OWN MAP IS THE DURABLE HOME.
+///
+/// `context_entity` is absent because its map is not keyed by the lookup's object key; it has its
+/// own arm. `context_event` and `context_index` are absent because they are the refusals.
+const KINDS_WHOSE_OWN_MAP_IS_DURABLE: &[&str] = &[
+    "string",
+    "hash",
+    "set",
+    "zset",
+    "list",
+    "feature",
+    "control_state",
+    "context_node",
+    "context_audit",
+    "context_child",
+    "context_summary",
+    "context_compression",
+    // BOTH ARRIVED HERE WHEN THEIR SERIES MOVED INTO `objects`. `context_event` was
+    // QUALIFIED and `context_index` REFUSED, and both were `#[serde(skip)]` -- no stored
+    // image at all. `objects` is serialized, so their own maps are durable now.
+    "context_event",
+    "context_index",
+];
+
+/// TWELVE KINDS RECOVER THEIR KEY FROM THEIR OWN DURABLE MAP, MEASURED ONE AT A TIME.
+///
+/// Each kind is asserted on BOTH controls, so a kind that passes passes because its map carried
+/// the characters and not because `contains_key` answers true for everything.
+#[test]
+fn each_durable_kind_hands_back_its_object_keys_characters() {
+    let written = shard_with_one_object_of_every_kind(WRITTEN_SUFFIX);
+    let reloaded = round_trip(&written);
+
+    for kind in KINDS_WHOSE_OWN_MAP_IS_DURABLE {
+        assert!(
+            kind_map_holds(&written, kind, WRITTEN_SUFFIX),
+            "fixture failed to write kind {kind}: the round trip below would measure nothing"
+        );
+        assert!(
+            kind_map_holds(&reloaded, kind, WRITTEN_SUFFIX),
+            "kind {kind} lost its object key across an index round trip, so its characters are \
+             NOT durably held outside the lookup and this kind refuses"
+        );
+        assert!(
+            !kind_map_holds(&reloaded, kind, NEVER_WRITTEN_SUFFIX),
+            "negative control for kind {kind}: a sibling spelling that was never written was \
+             found, so the matcher answers for keys the store does not hold"
+        );
+    }
+
+    // FOURTEEN NOW, NOT TWELVE. `context_event` and `context_index` joined this list when
+    // their series moved into the serialized `objects`; the loop above is what establishes it,
+    // having just driven both. Fifteen live kinds: fourteen recover from their own map, one
+    // (`context_entity`) recovers by composing its collection key with an entity hash, and
+    // NONE is qualified or refuses -- both of those sets are empty for the first time.
+    assert_eq!(
+        KINDS_WHOSE_OWN_MAP_IS_DURABLE.len(),
+        14,
+        "the count is part of the claim; see the census sets at the head of this module"
+    );
+}
+
+/// THE COMPOSED KEY IS RECOVERABLE EXACTLY, AND IT IS COMPARED AGAINST THE WALK'S OWN SPELLING.
+///
+/// `context_entity`'s map is keyed by the collection key with the entity hash as the inner `u64`,
+/// and the object key the lookup is keyed by is the two joined with a colon --
+/// `visit_model_live_blocks`'s entity arm composes exactly that. So the recovery is a composition
+/// of two durable terms, which is a different route to the same answer and not a weaker one.
+#[test]
+fn a_composed_entity_key_is_recoverable_from_its_two_durable_terms() {
+    let written = shard_with_one_object_of_every_kind(WRITTEN_SUFFIX);
+    assert!(
+        !written.context_entities().is_empty(),
+        "fixture must hold an entity or this arm measures nothing"
+    );
+    let reloaded = round_trip(&written);
+
+    let mut recomposed: Vec<String> = Vec::new();
+    for (collection_key, series) in reloaded.context_entities() {
+        for (entity_hash, _address) in series.points() {
+            recomposed.push(format!("{collection_key}:{entity_hash}"));
+        }
+    }
+
+    let expected = format!("{}:{}", entity_collection_key(WRITTEN_SUFFIX), ENTITY_HASH);
+    assert!(
+        recomposed.contains(&expected),
+        "the composed entity object key was not recoverable from the two durable terms; \
+         recomposed {recomposed:?}"
+    );
+    assert!(
+        !recomposed.contains(&format!(
+            "{}:{}",
+            entity_collection_key(NEVER_WRITTEN_SUFFIX),
+            ENTITY_HASH
+        )),
+        "negative control: a collection key that was never written was recomposed anyway"
+    );
+}
+
+/// CONTEXT_EVENT'S CHARACTERS SURVIVE IN BOTH THE EVENT MAP AND THE TIME INDEX.
+///
+/// THE VERDICT MOVED, AND THIS IS WHAT IT WAS. The event map was `#[serde(skip)]` and came
+/// back EMPTY; the timeline carrying the same key was what rescued the kind. The series are in
+/// the serialized `objects` now, so the primary map is durable in its own right and the rescue
+/// is no longer load-bearing. Both halves are still asserted, because the timeline alone would
+/// pass either way and would then be saying nothing about where the characters live.
+///
+/// Both halves are asserted, because either alone is misleading. The primary map coming back empty
+/// is what makes this kind a candidate refusal; the timeline coming back holding the SAME key is
+/// what rescues it. A test that only checked the timeline would pass just as well if the primary
+/// map were durable too, and would then be saying nothing about where the characters live.
+#[test]
+fn a_context_event_key_survives_in_the_event_map_and_the_time_index() {
+    let written = shard_with_one_object_of_every_kind(WRITTEN_SUFFIX);
+    let key = key_for("context_event", WRITTEN_SUFFIX);
+    assert!(
+        written.context_events().contains_key(key.as_str()),
+        "fixture must write the event map, or its emptiness after the trip is not a loss"
+    );
+    assert!(
+        written.context_event_timeline.contains_key(key.as_str()),
+        "fixture must write the timeline under the SAME key, which is the claim under test"
+    );
+
+    let reloaded = round_trip(&written);
+
+    assert!(
+        reloaded.context_events().contains_key(key.as_str()),
+        "the event map is durable now, so its own key must come back; if it did not, this kind \
+         has lost the home this change gave it"
+    );
+    assert!(
+        reloaded.context_event_timeline.contains_key(key.as_str()),
+        "the time index is the durable home of a context_event object key's characters, and it \
+         did not carry them"
+    );
+    assert!(
+        !reloaded
+            .context_event_timeline
+            .contains_key(key_for("context_event", NEVER_WRITTEN_SUFFIX).as_str()),
+        "negative control: the time index named a key that was never written"
+    );
+}
+
+/// AND THE QUALIFICATION IS GONE, WHICH IS THE POINT OF THIS ARM NOW.
+///
+/// This arm used to construct a hole and show the recovery FAILING: the timeline's key set
+/// is a subset of the event map's, so an event object with no timeline entry was
+/// representable, and for that object the time-index rescue did not apply -- it had no
+/// durable home for its characters at all. The event series are in the serialized
+/// `objects` now, so the object carries its own characters and the hole is CLOSED. The
+/// arm is kept, constructing the same state, because an arm that shows a hole closed is
+/// the only thing that would notice it reopening.
+///
+/// The timeline's key set is a subset of the event map's: the reconcile's `retain` drops a
+/// timeline whose events are gone, and the fold removes a timeline entry when its last slot goes.
+/// So an event object with no timeline entry is representable, and for THAT object the rescue
+/// above does not apply.
+///
+/// This arm builds that state directly and shows the recovery failing. It is a statement about
+/// what the structure permits, NOT a claim that production reaches it -- that would need the write
+/// and fold paths driven, and this module does not drive them.
+#[test]
+fn an_event_object_with_no_timeline_entry_now_has_a_durable_home() {
+    let mut written = shard_with_one_object_of_every_kind(WRITTEN_SUFFIX);
+    let key = key_for("context_event", WRITTEN_SUFFIX);
+    // The event stays; its timeline entry goes.
+    written.context_event_timeline.remove(key.as_str());
+    assert!(
+        written.context_events().contains_key(key.as_str()),
+        "the event must still be there, or this arm is about an object that does not exist"
+    );
+
+    let reloaded = round_trip(&written);
+
+    assert!(
+        reloaded.context_events().contains_key(key.as_str()),
+        "the hole this arm was written for is closed: the event map is durable now"
+    );
+    assert!(
+        !reloaded.context_event_timeline.contains_key(key.as_str()),
+        "the timeline entry was removed before the trip and must still be absent, or this arm is          not about the state it claims to construct"
