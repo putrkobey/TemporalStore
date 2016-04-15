@@ -137,3 +137,49 @@ impl BlockStore {
     ) -> Result<Vec<ElementEntry>, BlockStoreError> {
         let mut inner = self.inner.lock().expect("block store lock poisoned");
         if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        std::fs::create_dir_all(&inner.root)?;
+        let slab_target_bytes = effective_block_slab_target_bytes();
+        let mut file = None::<std::fs::File>;
+        let mut addresses = Vec::with_capacity(records.len());
+        let mut writes = 0u64;
+        let mut bytes_written = 0u64;
+        let mut logical_bytes_written = 0u64;
+        let mut compressed_records_written = 0u64;
+        let mut compression_bytes_saved = 0u64;
+
+        for (bytes, object_id, routing_bucket, block_ordinal) in records {
+            let block_id = u64::from(block_ordinal);
+            // Encoded once, including across a roll -- see the note on the single-record path.
+            let record =
+                encode_block_record(bytes, block_id, object_id, routing_bucket, inner.options)?;
+            if should_roll_before_append(
+                inner.write_offset,
+                record.bytes.len() as u64,
+                slab_target_bytes,
+            ) {
+                if let Some(mut current) = file.take() {
+                    current.flush()?;
+                    current.sync_data()?;
+                }
+                roll_slab_inner(&mut inner)?;
+            }
+            if file.is_none() {
+                let path = slab_path(&inner.root, inner.block_slab_id);
+                file = Some(OpenOptions::new().create(true).append(true).open(path)?);
+            }
+            // Checked, not saturated -- see the single-record path.
+            let address = ElementEntry::try_from_parts(inner.block_slab_id, inner.write_offset, record.bytes.len() as u64, Some(block_id), object_id)?;
+            if let Some(current) = file.as_mut() {
+                current.write_all(&record.bytes)?;
+            }
+            inner.write_offset += address.length();
+            let block_slab_id = inner.block_slab_id;
+            let write_offset = inner.write_offset;
+            upsert_slab_after_append(
+                &mut inner.slabs,
+                block_slab_id,
+                write_offset,
+                record.logical_len as u64,
+                block_id,
