@@ -315,3 +315,162 @@ Current segment creation:
 ```
 
 Example:
+
+```json
+{
+  &quot;record_type&quot;: &quot;context_segment&quot;,
+  &quot;topic&quot;: &quot;approval_budget&quot;,
+  &quot;coordinate_tuples&quot;: [[4, 5]],
+  &quot;summary_text&quot;: &quot;Alice approved the GPU purchase after finance review.&quot;,
+  &quot;node_path&quot;: [&quot;account:acme&quot;, &quot;tenant:eng&quot;, &quot;user:alice&quot;, &quot;sessions&quot;, &quot;locomo_0&quot;, &quot;approvals&quot;, &quot;gpu_purchase&quot;]
+}
+```
+
+How retrieval uses segment:
+
+- Segment summaries can satisfy broad planning questions.
+- Segment text can route the query to the right topic.
+- Raw events remain the final evidence for precise answers.
+- Future target: high-saliency segments can be promoted to `ContextNode(node_type=segment)`.
+
+### 5.5 ContextIndex
+
+Extraction writes compact terms:
+
+```json
+[
+  &quot;entity_type:location&quot;,
+  &quot;event_type:confirmation&quot;,
+  &quot;classification:batch_memory&quot;,
+  &quot;status:observed&quot;,
+  &quot;source_type:message&quot;,
+  &quot;segment_topic:approval_budget&quot;
+]
+```
+
+These terms are used later as prefilters.
+
+## 6. Entity Update During Extraction
+
+When a new entity is extracted, MatrixArk computes a stable entity identity:
+
+```text
+entity_hash = hash(node_hash + entity_type + entity_name)
+```
+
+Then it finds the latest entity state for that identity and applies the update.
+
+For location:
+
+```text
+old entity state: Seattle
+new extracted value: Austin for the new infra project
+updated entity state: Austin for the new infra project
+previous_state: Seattle
+```
+
+For production TemporalStore, this should be a true point/index lookup:
+
+```text
+(entity_hash) -&gt; latest ContextEntity version
+```
+
+Today the Python adapter scans the local record log for the latest matching `entity_hash`. The logical model is ready, but native serving should make this an indexed lookup.
+
+Secondary indexes help entity update in two ways:
+
+1. `entity_type:location` quickly identifies the class of state being updated.
+2. The stable `entity_hash` or future `ContextEntityIndex` finds the exact previous state without enumerating all entities.
+
+## 7. Retrieval: Layer-By-Layer L0/L1 Traversal
+
+For query:
+
+```text
+Where is the user currently located?
+```
+
+MatrixArk first embeds the query. Then it scores node summaries, not all raw events.
+
+Traversal:
+
+```text
+Layer 1: account:acme
+  score L0/L1 summary embedding
+
+Layer 2: tenant:eng
+  score only selected children
+
+Layer 3: user:alice
+  score only selected children
+
+Layer 4: sessions / shared / resources
+  select top K
+
+Layer 5: locomo_0
+  select top K
+
+Layer 6: location vs approvals vs preferences
+  choose location for the query
+```
+
+Current config examples:
+
+```json
+{
+  &quot;top_k_per_layer&quot;: 8,
+  &quot;max_children_scored_per_parent&quot;: 10000
+}
+```
+
+This is why a separate VectorDB is not required for this MVP serving path: the system does not search one global million-vector pool. It recursively narrows the tree, then scores a bounded set of leaf records.
+
+## 8. Secondary-Index Prefilter Before Leaf Scoring
+
+After tree traversal selects subtrees, MatrixArk applies the query-derived secondary-index filters.
+
+For `Where is Alice located now?`:
+
+```text
+required group: entity_type:location
+```
+
+Candidate behavior:
+
+| Candidate | Terms | Pass? |
+|---|---|---|
+| Location entity | `entity_type:location` | yes |
+| Location event | derived `event_type:dialogue_batch`, source message | maybe no unless no strict entity filter applies |
+| Approval segment | `segment_topic:approval_budget` | no |
+| Approval event | `event_type:confirmation` | no |
+
+Only after passing the filter does MatrixArk calculate leaf event/entity/segment dense similarity and sparse lexical scores.
+
+Current telemetry in `ContextPack.recall_policy.secondary_index_filter`:
+
+```json
+{
+  &quot;enabled&quot;: true,
+  &quot;required_groups&quot;: [[&quot;entity_type:location&quot;]],
+  &quot;matched_candidate_count&quot;: 1,
+  &quot;dropped_candidate_count&quot;: 3,
+  &quot;mode&quot;: &quot;AND across groups, OR within each group&quot;,
+  &quot;applied_before_embedding_scoring&quot;: true
+}
+```
+
+## 9. Event, Entity, Segment Ranking
+
+Inside selected subtrees and after index filtering:
+
+### Entity
+
+Used first for current-state questions:
+
+```text
+current location -&gt; ContextEntity(location)
+current preference -&gt; ContextEntity(preference)
+current job/status -&gt; ContextEntity(job_status)
+```
+
+### Event
