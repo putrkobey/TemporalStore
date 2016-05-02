@@ -108,3 +108,113 @@ pub(crate) fn parse_set_options(args: &[Vec<u8>]) -> Result<SetOptions, String> 
 /// A deadline that has ALREADY PASSED is a deletion, not a deadline.
 ///
 /// The three commands below can all be handed a moment that is not in the future: `EXPIRE` and
+/// `PEXPIRE` through a negative or zero relative time, `EXPIREAT` / `PEXPIREAT` and `GETEX
+/// EXAT` / `PXAT` through an absolute timestamp that is already behind us. There is no such
+/// thing as a key that expires in the past, so the answer is the same in every case -- the key
+/// goes now -- and the integer reply is about whether there WAS a key, exactly as it is when
+/// the deadline is in the future.
+///
+/// WHAT THIS REPLACES, AND WHY IT WAS WORSE THAN IT LOOKED. The absolute forms used to clamp
+/// the computed remaining time with `.max(1)`, arming a deadline one millisecond out instead.
+/// That is not a rounding difference: it leaves a window in which the key is still there and
+/// still readable, so `EXPIREAT k 1` followed immediately by `GET k` could hand back a value
+/// the caller had just asked to be rid of, and whether it did depended on how fast the next
+/// command arrived. The relative forms were worse still -- a negative time failed `parse_u64`
+/// and came back as a syntax error, so a caller using `EXPIRE key -1` to discard a key was
+/// told their command was malformed rather than having it obeyed.
+///
+/// The integer is deliberately 0 for a key that is not there, and NOT an error: asking to
+/// discard something already gone is a no-op that succeeded, which is what every other
+/// deletion on this surface answers.
+fn discard_key_now(
+    key: &str,
+    state: &mut RedisCommandState,
+    execute: &mut impl FnMut(Command) -> Result<CommandResponse, String>,
+) -> RespValue {
+    match execute(Command::CommonExists {
+        key: key.to_string(),
+    }) {
+        Ok(CommandResponse::Integer { value }) if value > 0 => {
+            if let Err(err) = execute(Command::CommonDelete {
+                key: key.to_string(),
+            }) {
+                return RespValue::Error(format!("ERR {err}"));
+            }
+            state.keyspace.remove(key);
+            RespValue::Integer(1)
+        }
+        Ok(CommandResponse::Integer { .. }) => RespValue::Integer(0),
+        Ok(_) => RespValue::Error("ERR invalid exists response".to_string()),
+        Err(err) => RespValue::Error(format!("ERR {err}")),
+    }
+}
+
+pub(crate) fn expire_response(
+    args: &[Vec<u8>],
+    factor: i64,
+    state: &mut RedisCommandState,
+    execute: &mut impl FnMut(Command) -> Result<CommandResponse, String>,
+) -> RespValue {
+    // Signed on purpose: a negative relative time is a legal request to discard the key, not
+    // a malformed number. `parse_u64` rejected it.
+    let ttl = match parse_i64_arg(&args[2], "ttl") {
+        Ok(value) => value,
+        Err(err) => return RespValue::Error(err),
+    };
+    let key = string_arg(&args[1]);
+    if ttl <= 0 {
+        return discard_key_now(&key, state, execute);
+    }
+    match execute(Command::CommonExpire {
+        key,
+        ttl_ms: ttl.saturating_mul(factor) as u64,
+    }) {
+        Ok(_) => RespValue::Integer(1),
+        Err(err) if err.contains("not_found") || err.contains("key not found") => {
+            RespValue::Integer(0)
+        }
+        Err(err) => RespValue::Error(format!("ERR {err}")),
+    }
+}
+
+pub(crate) fn expire_at_response(
+    args: &[Vec<u8>],
+    factor: i64,
+    state: &mut RedisCommandState,
+    execute: &mut impl FnMut(Command) -> Result<CommandResponse, String>,
+) -> RespValue {
+    let deadline_ms = match parse_i64_arg(&args[2], "timestamp") {
+        Ok(value) => value.saturating_mul(factor),
+        Err(err) => return RespValue::Error(err),
+    };
+    let key = string_arg(&args[1]);
+    let remaining_ms = deadline_ms.saturating_sub(unix_time_ms() as i64);
+    if remaining_ms <= 0 {
+        return discard_key_now(&key, state, execute);
+    }
+    match execute(Command::CommonExpire {
+        key,
+        ttl_ms: remaining_ms as u64,
+    }) {
+        Ok(_) => RespValue::Integer(1),
+        Err(err) if err.contains("not_found") || err.contains("key not found") => {
+            RespValue::Integer(0)
+        }
+        Err(err) => RespValue::Error(format!("ERR {err}")),
+    }
+}
+
+pub(crate) fn expire_time_response(
+    key: &[u8],
+    divisor_ms: u64,
+    execute: &mut impl FnMut(Command) -> Result<CommandResponse, String>,
+) -> RespValue {
+    match execute(Command::CommonTtl {
+        key: string_arg(key),
+    }) {
+        Ok(CommandResponse::Integer { value }) if value < 0 => RespValue::Integer(value),
+        Ok(CommandResponse::Integer { value }) => {
+            RespValue::Integer((unix_time_ms() as i64).saturating_add(value) / divisor_ms as i64)
+        }
+        Ok(_) => RespValue::Error("ERR invalid expiretime response".to_string()),
+        Err(err) => RespValue::Error(format!("ERR {err}")),
