@@ -12,33 +12,3 @@ use crate::direct_matrixark_guard::native_matrixark_c_api_bridge_allowed;
 use crate::Result;
 
 impl Client {
-    pub fn matrixark_scan_candidates(
-        &self,
-        count_key: &str,
-        record_hash_key: &str,
-        shard_size: usize,
-        request_json: &str,
-    ) -> Result<String> {
-        native_matrixark_c_api_bridge_allowed("matrixark_scan_candidates")?;
-        let count_key = cstring(count_key)?;
-        let record_hash_key = cstring(record_hash_key)?;
-        let request_json = cstring(request_json)?;
-        let mut value: *mut c_char = ptr::null_mut();
-        let mut error: *mut c_char = ptr::null_mut();
-        let code = unsafe {
-            temporalstore_matrixark_scan_candidates(
-                self.raw,
-                count_key.as_ptr(),
-                record_hash_key.as_ptr(),
-                shard_size,
-                request_json.as_ptr(),
-                &mut value,
-                &mut error,
-            )
-        };
-        check(code, error)?;
-        let out = unsafe { CStr::from_ptr(value).to_string_lossy().into_owned() };
-        unsafe { temporalstore_free_string(value) };
-        Ok(out)
-    }
-

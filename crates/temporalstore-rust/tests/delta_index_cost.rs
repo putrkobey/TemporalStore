@@ -15,3 +15,38 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use temporalstore_rust::{Command, ExecuteRequest, TemporalEngine};
+
+const SHARD_ID: u64 = 1;
+
+#[test]
+fn per_write_served_index_cost_report() {
+    let mode = if matches!(
+        std::env::var("MATRIXARK_DELTA_SERVED_INDEX")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    ) {
+        "DELTA(on)"
+    } else {
+        "BASELINE(off)"
+    };
+
+    let mut root = std::env::temp_dir();
+    root.push(format!("ts-delta-cost-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let index_dir = root.join("indexes");
+    for sub in ["cache", "pages", "indexes"] {
+        std::fs::create_dir_all(root.join(sub)).expect("create engine dir");
+    }
+    let engine =
+        TemporalEngine::with_local_dirs(4096, root.join("cache"), root.join("blocks"), &index_dir);
+    engine.load_shard(SHARD_ID);
+
+    let batch = 100usize;
+    let checkpoints = [0usize, 500, 1000, 2000, 3000];
+    let mut next = 0usize;
+    println!("\n=== per-write served-index cost [{mode}] ===");
+    for &target in &checkpoints {
+        // Grow the store up to `target` entries.
