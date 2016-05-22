@@ -63,3 +63,25 @@ const scope = {
   },
   window: { addEventListener: () => {}, location: { pathname: "/v1/admin/explore" } },
   sessionStorage: { getItem: () => "k-admin", setItem: () => {} },
+  fetch: () => Promise.resolve({
+    ok: true,
+    status: 200,
+    body: {
+      getReader: () => {
+        let sent = false;
+        return {
+          read: () => sent ? new Promise((r) => { releaseSecond = r; })
+                           : ((sent = true), Promise.resolve({ done: false, value: blocks.join("") })),
+        };
+      },
+    },
+  }),
+  TextDecoder: function () { this.decode = (v) => (v === undefined ? "" : String(v)); },
+  AbortController: function () { this.abort = () => {}; this.signal = null; },
+  Date: Object.assign(function () {}, { now: () => clock }),
+  setTimeout: () => 0,
+  setInterval: (fn) => { ticker = fn; return 1; },
+  clearInterval: () => { ticker = null; },
+  console: { log: () => {}, warn: () => {}, error: () => {} },
+};
+

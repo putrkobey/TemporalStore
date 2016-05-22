@@ -184,3 +184,376 @@ impl Fill {
 
     fn max(&self) -> usize {
         self.counts.keys().copied().next_back().unwrap_or_default()
+    }
+
+    /// A count off the histogram, never an interpolation: every value it returns is a page count
+    /// some bucket actually holds.
+    fn percentile(&self, fraction: f64) -> usize {
+        let buckets = self.buckets();
+        if buckets == 0 {
+            return 0;
+        }
+        let target = ((buckets as f64) * fraction).ceil().max(1.0) as usize;
+        let mut seen = 0usize;
+        for (held, count) in &self.counts {
+            seen += count;
+            if seen >= target {
+                return *held;
+            }
+        }
+        self.max()
+    }
+
+    fn line(&self, label: &str) {
+        let buckets = self.buckets();
+        println!(
+            "  {label:<44} occupied {buckets:>6} | pages {:>6} | p50 {:>4} p90 {:>4} p99 {:>4} \
+             MAX {:>4}",
+            self.blocks(),
+            self.percentile(0.50),
+            self.percentile(0.90),
+            self.percentile(0.99),
+            self.max(),
+        );
+        let printed: usize = self.counts.values().copied().sum();
+        assert_eq!(
+            printed, buckets,
+            "{label}: the histogram's rows sum to {printed} over a denominator of {buckets}"
+        );
+    }
+}
+
+/// THE SHIPPED DEFAULT AND A RANGE-FREE ID ARE THE SAME FUNCTION, KEY FOR KEY.
+///
+/// `bucket_for_object` is `start + hash % count`, `start` is 0 at the shipped default and
+/// `routing_bucket_count(0, 1023)` is 1,024 -- so there is nothing left for a range-free
+/// `hash % 1024` to differ on. This is the measurement that makes the pages-per-bucket comparison
+/// unnecessary rather than unreported: the distributions cannot differ because the ids do not.
+///
+/// Stated over both corpus sizes with the denominator printed, because a value-identity assertion
+/// over an empty key set passes for the wrong reason.
+#[test]
+fn a_range_free_id_is_the_same_function_as_the_shipped_default() {
+    assert_eq!(
+        OPERATOR_COUNT,
+        routing_bucket_count(0, OPERATOR_END),
+        "the shipped default's bucket count moved, and every figure in this module assumes 1,024"
+    );
+
+    println!("\n=== a range-free id against the shipped default 0..{OPERATOR_END} ===");
+    for records in [SMALL, LARGE] {
+        let keys = routed_keys(records);
+        let mut agreed = 0usize;
+        for key in &keys {
+            if block_routing_bucket(key, 0, OPERATOR_END) == range_free_bucket(key, OPERATOR_COUNT)
+            {
+                agreed += 1;
+            }
+        }
+        println!("  {records:>6} keys: agreed on {agreed} of {}", keys.len());
+        assert_eq!(
+            keys.len(),
+            records,
+            "the fixture produced {} keys and not {records}",
+            keys.len()
+        );
+        assert_eq!(
+            agreed,
+            keys.len(),
+            "at the shipped default the two schemes are the same arithmetic, so they must agree \
+             on every one of {} keys; they agreed on {agreed}",
+            keys.len()
+        );
+    }
+}
+
+/// THE CONTROL ON THE EXPLANATION: the mechanism is the MODULUS, so a comparison that changes no
+/// modulus must find no disagreement at all.
+///
+/// Every disagreement figure below is a count of keys placed differently by two schemes. If that
+/// counter fired on the key set rather than on the scheme, it would fire here too -- the same
+/// scheme against itself, over the same keys. It reports 0.00%, and the assertion below requires
+/// exactly that rather than merely requiring it to be small.
+#[test]
+fn the_same_scheme_against_itself_disagrees_on_nothing() {
+    println!("\n=== control: one scheme against itself ===");
+    for records in [SMALL, LARGE] {
+        let keys = routed_keys(records);
+        let disagreements = keys
+            .iter()
+            .filter(|key| {
+                block_routing_bucket(key, 0, OPERATOR_END)
+                    != block_routing_bucket(key, 0, OPERATOR_END)
+            })
+            .count();
+        let percent = 100.0 * disagreements as f64 / keys.len() as f64;
+        println!(
+            "  {records:>6} keys: {disagreements} of {} placed differently ({percent:.2}%)",
+            keys.len()
+        );
+        assert!(!keys.is_empty(), "the control ran over no keys at all");
+        assert_eq!(
+            0, disagreements,
+            "the disagreement counter fired {disagreements} times comparing a scheme with \
+             itself, so it is measuring the key set and not the scheme"
+        );
+    }
+}
+
+/// NO ARITHMETIC MAPS A LEGACY BUCKET ONTO A FIXED-COUNT ONE, SO A RE-FILE NEEDS THE KEY.
+///
+/// A store with no stamp is honoured on the whole keyspace, whose count is `u32::MAX` -- not a
+/// multiple of 1,024. So `(hash % 4294967295) % 1024` is not `hash % 1024`, and a legacy store's
+/// recorded bucket carries no information about where a range-free scheme would put the same key.
+///
+/// The witness is the one `shard_carried_range.rs` already pins: `inner-000000` sits in bucket 398
+/// on `0..1023` and 1,422,005,296 on the whole keyspace, and folding the wide bucket into 1,024
+/// gives 48 -- neither the narrow bucket nor anything else useful.
+///
+/// MEASURED, and the two corpus sizes do not agree on a rate: folding the stored legacy bucket
+/// into 1,024 recovers the range-free bucket for 155 of 4,000 keys (3.88%) and 255 of 40,000
+/// (0.64%). So 96.12% and 99.36% of a legacy store's pages could not be re-filed from what is
+/// stored.
+///
+/// THE RESIDUAL IS NOT A NESTING RELATION AND MUST NOT BE READ AS ONE. Nested schemes would
+/// recover EVERY key, not a twenty-fifth of them -- and a relation that held would not produce two
+/// different rates on two key sets. It is consistent with `% 1024` depending only on the hash's
+/// low ten bits while FNV-1a avalanches its high bits incompletely over a key family differing in
+/// six characters, but that mechanism is not what this test rests on: the figure that matters is
+/// the fraction that does NOT convert, and the assertion requires only a strict majority so that
+/// it cannot be satisfied by a rate chosen after seeing the answer.
+///
+/// This is what makes the migration a walk of the index rather than a computation over the
+/// buckets already stored, and it is also the half of #1977's refutation that generalises: the two
+/// schemes are not nested, so no reader can convert between them.
+#[test]
+fn no_arithmetic_maps_a_legacy_bucket_onto_a_fixed_count_bucket() {
+    const WITNESS: &str = "inner-000000";
+    let narrow = block_routing_bucket(WITNESS, 0, OPERATOR_END);
+    let wide = block_routing_bucket(WITNESS, 0, LEGACY_END);
+    let folded = wide % OPERATOR_COUNT;
+    println!("\n=== the two schemes are not nested ===");
+    println!(
+        "  {WITNESS}: narrow bucket {narrow}, legacy bucket {wide}, legacy folded into \
+         {OPERATOR_COUNT} = {folded}"
+    );
+    assert_eq!(398, narrow, "the pinned narrow bucket for {WITNESS} moved");
+    assert_eq!(
+        1_422_005_296, wide,
+        "the pinned legacy bucket for {WITNESS} moved"
+    );
+    assert_ne!(
+        narrow, folded,
+        "folding the legacy bucket into the fixed count recovered the narrow bucket, which would \
+         make the two schemes nested and this whole test pointless"
+    );
+
+    for records in [SMALL, LARGE] {
+        let keys = routed_keys(records);
+        let recoverable = keys
+            .iter()
+            .filter(|key| {
+                block_routing_bucket(key, 0, LEGACY_END) % OPERATOR_COUNT
+                    == range_free_bucket(key, OPERATOR_COUNT)
+            })
+            .count();
+        println!(
+            "  {records:>6} keys: {recoverable} of {} range-free buckets recoverable from the \
+             stored legacy bucket by arithmetic ({:.2}%)",
+            keys.len(),
+            100.0 * recoverable as f64 / keys.len() as f64
+        );
+        // A STRICT MAJORITY MUST BE UNRECOVERABLE, which is the claim that matters and the only
+        // one this comparison can support. Nested schemes would recover the range-free bucket for
+        // EVERY key; a residual minority is not a nesting relation and cannot be used as one,
+        // because a re-file that is wrong for most keys is wrong. The threshold is a strict
+        // majority rather than a rate, so that it cannot be a number chosen after seeing the
+        // answer.
+        let unrecoverable = keys.len() - recoverable;
+        assert!(
+            unrecoverable > keys.len() / 2,
+            "arithmetic over the stored legacy bucket recovered the range-free bucket for \
+             {recoverable} of {} keys, leaving only {unrecoverable} unrecoverable -- at a strict \
+             majority the two schemes would be usefully convertible and the migration claim in \
+             this module would be wrong",
+            keys.len()
+        );
+    }
+}
+
+/// A FIXED BUCKET COUNT CANNOT REPRODUCE THE FILLS THE RANGE PRODUCES, WHICH IS THE COST.
+///
+/// The range's value to an operator is that it sizes the bucket population for the corpus: the
+/// fill is `records / bucket-count`, and `docs/runtime_tuning.md` says in as many words that no
+/// fixed count is right for every corpus. A range-free id must pick one count and live with it.
+///
+/// Printed as the four shipped candidates over one key set at both corpus sizes, with p50, p99 and
+/// MAX and the occupied-bucket denominator on every row, so the spread is visible rather than
+/// asserted in prose. The assertion is that the four candidates produce four DIFFERENT p50 fills
+/// at the large corpus -- if a single count could serve them all, they would not.
+#[test]
+fn a_fixed_bucket_count_cannot_reproduce_the_fills_the_range_produces() {
+    const CANDIDATES: [u32; 4] = [255, 1_023, 4_095, 65_535];
+
+    println!("\n=== the fills the shipped candidate ranges produce ===");
+    for records in [SMALL, LARGE] {
+        println!("  --- {records} routed keys ---");
+        let keys = routed_keys(records);
+        let mut p50s = Vec::new();
+        for end in CANDIDATES {
+            let fill = Fill::of(&keys, |key| block_routing_bucket(key, 0, end));
+            fill.line(&format!("0..{end} ({} buckets)", routing_bucket_count(0, end)));
+            assert!(
+                fill.buckets() > 0,
+                "0..{end} at {records} records reached no bucket at all, so its row is not a \
+                 measurement"
+            );
+            assert_eq!(
+                fill.blocks(),
+                keys.len(),
+                "0..{end} at {records} records accounted for {} pages over {} keys",
+                fill.blocks(),
+                keys.len()
+            );
+            p50s.push(fill.percentile(0.50));
+        }
+        // And the whole keyspace, which is where the old default sat.
+        let wide = Fill::of(&keys, |key| block_routing_bucket(key, 0, LEGACY_END));
+        wide.line("0..4294967295 (the legacy range)");
+        assert_eq!(
+            1,
+            wide.max(),
+            "on the whole keyspace every key lands alone by construction, so the widest bucket \
+             must hold one page and not {}",
+            wide.max()
+        );
+
+        if records == LARGE {
+            let distinct: std::collections::BTreeSet<usize> = p50s.iter().copied().collect();
+            println!("  p50 fills at {records} records: {p50s:?}");
+            assert_eq!(
+                CANDIDATES.len(),
+                distinct.len(),
+                "the four candidate ranges produced {} distinct p50 fills, not {} -- if one \
+                 fixed bucket count served them all, the range would not be a sizing lever",
+                distinct.len(),
+                CANDIDATES.len()
+            );
+        }
+    }
+}
+
+/// THE FILL INSTRUMENT HERE REPRODUCES THE PUBLISHED FIGURE, WHICH IS WHAT LETS IT BE COMPARED.
+///
+/// `docs/runtime_tuning.md` publishes 39 pages in the p50 bucket and 50 in the MAX at 40,000
+/// routed records on `0..1023`, measured through a populated engine by `routing_range_default.rs`.
+/// This module computes the same quantity from the id function alone. If the two did not agree the
+/// figures above would not be comparable with anything, and a pure-function instrument that
+/// silently measured something else would look exactly like one that worked.
+#[test]
+fn the_fill_instrument_reproduces_the_published_figure() {
+    let keys = routed_keys(LARGE);
+    let fill = Fill::of(&keys, |key| block_routing_bucket(key, 0, OPERATOR_END));
+    fill.line("0..1023 at 40,000 records");
+    assert_eq!(
+        LARGE,
+        fill.blocks(),
+        "the instrument accounted for {} pages over {LARGE} keys",
+        fill.blocks()
+    );
+    assert_eq!(
+        OPERATOR_COUNT as usize,
+        fill.buckets(),
+        "at 40,000 keys over 1,024 buckets every bucket is occupied, so the denominator must be \
+         1,024 and not {}",
+        fill.buckets()
+    );
+    assert_eq!(
+        39,
+        fill.percentile(0.50),
+        "the published p50 fill at 40,000 records on 0..1023 is 39 pages; this instrument says {}",
+        fill.percentile(0.50)
+    );
+    assert_eq!(
+        50,
+        fill.max(),
+        "the published MAX fill at 40,000 records on 0..1023 is 50 pages; this instrument says {}",
+        fill.max()
+    );
+}
+
+/// REMOVING THE ROUTING BUCKET RECOVERS ZERO BYTES ON ITS OWN, AND EIGHT WHEN A SECOND NARROWING
+/// LANDS BESIDE IT.
+///
+/// Both structures state the rule that decides this, and both state it because it was got wrong
+/// before: only a change that takes the tail to eight bytes or fewer, or that takes a whole word out
+/// of the eight-aligned group, moves either one. `routing_bucket` is a four-byte field in the tail of
+/// both, and neither tail crosses a step when that field alone leaves.
+///
+/// THAT IS A VERDICT ON THE FIELD IN ISOLATION, WHICH IS NOT A VERDICT ON THE FIELD. The address is
+/// 24 bytes now, not 32, because the bucket left in the same change that narrowed `block_id` from 32
+/// bits to 16. Four bytes off a 29-byte payload is 25 and rounds back to 32; two bytes off is 27 and
+/// rounds back to 32; SIX bytes off is 23 and rounds to 24. Each narrowing alone is worth exactly the
+/// zero this test was written to report, and the pair is worth a whole word -- which is the third
+/// time in this campaign that an alignment step has only been crossed by a combination, after the
+/// bucket node's five bools and the address's two location words.
+///
+/// The three counterfactuals are kept below as arithmetic over the shape #1983 measured, so its
+/// finding survives verbatim rather than being replaced by the one that followed it.
+///
+/// ASSERTED AGAINST THE WIDTHS THE COMPILER REPORTS. The group figures are cross-checked by
+/// reconstructing `size_of` from them first, so a field moving between the groups fails here rather
+/// than leaving the arithmetic adding up for the wrong reason. `BlockAddress`'s fields are private to
+/// `block_store`, so its payload is what `every_byte_of_a_block_address_is_accounted_for` measures
+/// with `offset_of!` and asserts; this test reconstructs the width from it and fails if either moved.
+#[test]
+fn removing_the_routing_bucket_recovers_no_bytes_alone_and_eight_in_combination() {
+    use std::mem::{align_of, size_of};
+
+    println!("\n=== what recovering the duplicated bucket id would free ===");
+
+    // --- BlockAddress, LIVE: the merged slab word, a 32-bit length, a 16-bit block id and the
+    // --- presence byte -- 15 bytes of payload in 16. This is the drift check, so it has to
+    // --- describe the declaration as it stands.
+    // ---
+    // --- THE OBJECT ID LEFT THIS LIST, and this assertion is the reason the removal could not be
+    // --- done by scanning for width pins: it names no literal width. It pairs a hand-listed field
+    // --- SUM with `size_of`, so a sweep looking for a stale 24 beside `size_of::<BlockAddress>()`
+    // --- passes straight over it and `cargo check` cannot see it either. It failed on the first
+    // --- run of the suite, which is the only thing that could have found it.
+    const ADDRESS_PAYLOAD: usize = 8 + 4 + 2 + 1;
+    let address_width = size_of::<ElementEntry>();
+    let address_align = align_of::<ElementEntry>();
+    assert_eq!(
+        15, ADDRESS_PAYLOAD,
+        "the derived address payload is {ADDRESS_PAYLOAD}, not the 15 bytes \
+         `every_byte_of_a_block_address_is_accounted_for` measures"
+    );
+    assert_eq!(
+        ADDRESS_PAYLOAD.div_ceil(address_align) * address_align,
+        address_width,
+        "the address payload plus one rounding must reconstruct its width exactly, or the field \
+         list above has drifted from the declaration"
+    );
+
+    // --- AND THE THREE COUNTERFACTUALS, over the shape this module measured: a 29-byte payload in
+    // --- 32, carrying a four-byte routing bucket and a 32-bit block id.
+    const ADDRESS_PAYLOAD_BEFORE: usize = 8 + 8 + 4 + 4 + 4 + 1;
+    const WIDTH_BEFORE: usize = 32;
+    /// What the pair below PRODUCED, which is not the width today.
+    ///
+    /// These three counterfactuals are about the 32 -> 24 step and they were anchored to
+    /// `size_of::<BlockAddress>()`, which was 24 when they were written. A third step has landed
+    /// since -- the object id left the address, 24 -> 16 -- and two of the assertions below broke
+    /// on it. They were not wrong; they were pinned to a value that moves. So the era's result is
+    /// named here and the counterfactuals are compared against THAT, with one assertion at the end
+    /// connecting this era to the live width so the arithmetic still reaches the present.
+    const WIDTH_AFTER_THE_PAIR: usize = 24;
+    assert_eq!(29, ADDRESS_PAYLOAD_BEFORE, "the shape this module measured was 29 bytes of payload");
+    assert_eq!(
+        ADDRESS_PAYLOAD_BEFORE.div_ceil(address_align) * address_align,
+        WIDTH_BEFORE,
+        "the shape this module measured must reconstruct to 32, or the counterfactuals below are \
+         about a structure this engine never had"
+    );
+    let round = |payload: usize| payload.div_ceil(address_align) * address_align;
