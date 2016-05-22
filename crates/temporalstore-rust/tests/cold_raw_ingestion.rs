@@ -72,3 +72,40 @@ fn cold_raw_ingestion_writes_wal_and_avoids_cache_promotion() {
             node_hash: NODE,
             event: Box::new(cold_event(9001, START + 30, "cold extracted")),
             indexes: ContextExtractedEventIndexes {
+                scope_hash: 77,
+                entity_hashes: vec![901, 902],
+                status_hash: 55,
+                source_hash: 66,
+                event_time_bucket_ms: START,
+                disabled_indexes: Vec::new(),
+            },
+            first_write_only: false,
+            cold_storage: true,
+        },
+    });
+    assert!(extracted.status.ok);
+    assert!(matches!(
+        extracted.response,
+        CommandResponse::ContextExtractedEventWrite {
+            written_index_count,
+            ..
+        } if written_index_count >= 4
+    ));
+    assert_eq!(engine.cache().stats().puts, cache_puts_before);
+
+    let wal_scan = engine.scan_stream(ScanStreamRequest {
+        shard_id: 1,
+        stream_kind: StreamKind::Wal,
+        block_slab_id: 0,
+        start_offset: 0,
+        end_offset: 64 * 1024,
+        max_bytes: 64 * 1024,
+    });
+    assert!(wal_scan.status.ok);
+    let wal_records = wal_scan
+        .records
+        .iter()
+        .map(|record| decode_wal_line(&record.data).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(wal_records.len(), 4);
+    // This asserts on the OPERATION, which a record carries only when it is not carrying results
