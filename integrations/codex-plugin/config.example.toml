@@ -1,0 +1,12 @@
+# MatrixArk / TemporalStore memory for the OpenAI Codex CLI.
+#
+# Merge these blocks into ~/.codex/config.toml (install-codex.sh does this for you and
+# substitutes __MATRIXARK_HOME__ with your TemporalStore checkout path).
+#
+# Two integration surfaces:
+#   1) [mcp_servers.matrixark] — explicit recall/remember memory tools (stdio MCP server).
+#   2) notify                  — automatic memory write after each completed turn.
+
+# --- 1) Explicit memory tools over MCP -------------------------------------------------
+[mcp_servers.matrixark]
+command = "__MATRIXARK_HOME__/tools/run_matrixark_mcp_server.sh"
