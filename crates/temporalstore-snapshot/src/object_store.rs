@@ -424,3 +424,216 @@ fn connect_rpc(addr: &str) -> Result<TcpStream, ObjectStoreError> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     Ok(stream)
+}
+
+fn write_rpc_request(
+    stream: &mut TcpStream,
+    op: u8,
+    key: &[u8],
+    value: &[u8],
+) -> Result<(), ObjectStoreError> {
+    let mut header = [0; RPC_REQUEST_HEADER_LEN];
+    header[..RPC_MAGIC.len()].copy_from_slice(RPC_MAGIC);
+    header[5] = op;
+    header[6..10].copy_from_slice(&(key.len() as u32).to_le_bytes());
+    header[10..18].copy_from_slice(&(value.len() as u64).to_le_bytes());
+    stream.write_all(&header)?;
+    stream.write_all(key)?;
+    stream.write_all(value)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_rpc_response(stream: &mut TcpStream) -> Result<Vec<u8>, ObjectStoreError> {
+    let mut header = [0; RPC_RESPONSE_HEADER_LEN];
+    stream.read_exact(&mut header)?;
+    if &header[..RPC_MAGIC.len()] != RPC_MAGIC {
+        return Err(ObjectStoreError::Http(
+            "invalid rpc response magic".to_string(),
+        ));
+    }
+    let status = header[5];
+    let body_len = u64::from_le_bytes(header[6..14].try_into().unwrap()) as usize;
+    let mut body = vec![0; body_len];
+    stream.read_exact(&mut body)?;
+    match status {
+        RPC_STATUS_OK => Ok(body),
+        RPC_STATUS_NOT_FOUND => Err(ObjectStoreError::NotFound(
+            String::from_utf8_lossy(&body).to_string(),
+        )),
+        RPC_STATUS_ERROR => Err(ObjectStoreError::Http(
+            String::from_utf8_lossy(&body).to_string(),
+        )),
+        _ => Err(ObjectStoreError::Http(format!(
+            "unknown rpc status {status}"
+        ))),
+    }
+}
+
+fn matrixobject_post<Req, Res>(
+    addr: &str,
+    path: &str,
+    request: &Req,
+) -> Result<Res, ObjectStoreError>
+where
+    Req: serde::Serialize,
+    Res: serde::de::DeserializeOwned,
+{
+    let body = serde_json::to_vec(request)?;
+    let raw = http_post(addr, path, &body, "application/json")?;
+    let response = serde_json::from_slice(&raw)?;
+    Ok(response)
+}
+
+fn http_post(
+    addr: &str,
+    path: &str,
+    body: &[u8],
+    content_type: &str,
+) -> Result<Vec<u8>, ObjectStoreError> {
+    let socket_addr = addr
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| ObjectStoreError::Http(format!("cannot resolve {addr}")))?;
+    let mut stream = TcpStream::connect_timeout(&socket_addr, Duration::from_millis(500))?;
+    stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+    write!(
+        stream,
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )?;
+    stream.write_all(body)?;
+    stream.flush()?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response)?;
+    let marker = b"\r\n\r\n";
+    let header_end = response
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .ok_or_else(|| ObjectStoreError::Http("missing response headers".to_string()))?;
+    let headers = String::from_utf8_lossy(&response[..header_end]);
+    let status_ok = headers
+        .lines()
+        .next()
+        .is_some_and(|line| line.contains(" 200 "));
+    let body_start = header_end + marker.len();
+    let response_body = response[body_start..].to_vec();
+    if !status_ok {
+        let text = String::from_utf8_lossy(&response_body);
+        if text.contains("not found") {
+            return Err(ObjectStoreError::NotFound(path.to_string()));
+        }
+        return Err(ObjectStoreError::Http(text.to_string()));
+    }
+    Ok(response_body)
+}
+
+#[derive(Debug, Clone)]
+pub struct FileObjectStore {
+    root: PathBuf,
+    uri_scheme: String,
+    created_dirs: Arc<Mutex<HashSet<PathBuf>>>,
+}
+
+impl FileObjectStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self {
+            root: root.into(),
+            uri_scheme: "file".to_string(),
+            created_dirs: Arc::default(),
+        }
+    }
+
+    pub fn with_uri_scheme(root: impl Into<PathBuf>, uri_scheme: impl Into<String>) -> Self {
+        Self {
+            root: root.into(),
+            uri_scheme: uri_scheme.into(),
+            created_dirs: Arc::default(),
+        }
+    }
+
+    fn resolve(&self, key: &str) -> Result<PathBuf, ObjectStoreError> {
+        if key.contains("..") || key.starts_with('/') || key.starts_with('\\') {
+            return Err(ObjectStoreError::InvalidKey(key.to_string()));
+        }
+        Ok(self
+            .root
+            .join(key.replace('/', std::path::MAIN_SEPARATOR_STR)))
+    }
+
+    /// Filesystem path where `key` is stored. Exposed so a streaming reader (e.g.
+    /// a streamed HTTP `GET /blob/<key>`) can `stat` + read the object in chunks
+    /// straight to the socket instead of loading the whole object into memory via
+    /// [`ObjectStore::get`]. Applies the same key-safety guard as `resolve`.
+    pub fn object_path(&self, key: &str) -> Result<PathBuf, ObjectStoreError> {
+        self.resolve(key)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for FileObjectStore {
+    async fn put(&self, key: &str, bytes: Bytes) -> Result<(), ObjectStoreError> {
+        let path = self.resolve(key)?;
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        let mut file = tokio::fs::File::create(path).await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        Ok(())
+    }
+
+    async fn append_blob(
+        &self,
+        key: &str,
+        bytes: Bytes,
+    ) -> Result<AppendBlobReceipt, ObjectStoreError> {
+        let path = self.resolve(key)?;
+        if let Some(parent) = path.parent() {
+            let should_create = {
+                let mut created = self
+                    .created_dirs
+                    .lock()
+                    .expect("object-store dir cache poisoned");
+                created.insert(parent.to_path_buf())
+            };
+            if should_create {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+        }
+        let start_offset = match tokio::fs::metadata(&path).await {
+            Ok(metadata) => metadata.len(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(err) => return Err(ObjectStoreError::Io(err)),
+        };
+        let bytes_written = bytes.len() as u64;
+        let mut file = tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        let end_offset = start_offset.saturating_add(bytes_written);
+        Ok(AppendBlobReceipt {
+            key: key.to_string(),
+            start_offset,
+            end_offset,
+            bytes_written,
+            object_length: end_offset,
+            physical_slab_count: 0,
+            first_physical_offset: None,
+        })
+    }
+
+    /// Cross-process atomic compare-and-set. Mutual exclusion is provided by an atomic
+    /// `mkdir` of a per-key lock directory (POSIX `mkdir` fails if the directory already
+    /// exists, and this atomicity holds over a shared filesystem too), so a concurrent
+    /// writer on another host cannot interleave its read-compare-write with ours. Inside the
+    /// lock we read the current object, reject with [`ObjectStoreError::ConditionFailed`] if
+    /// it does not exactly equal `expected`, then durably (`sync_all`) install `new`.
+    async fn compare_and_swap(
+        &self,
