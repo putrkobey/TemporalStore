@@ -312,3 +312,318 @@ fn the_dump_threshold_counts_log_records_not_dirty_objects() {
     const THRESHOLD: u64 = 1_000;
 
     fn one_arm(records: usize, batch: usize) -> (u64, bool, usize) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = round_engine(dir.path());
+        seed_in_batches(&engine, 1, records, batch);
+        let report = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+            min_undumped_wal_records: THRESHOLD,
+            ..round_request()
+        });
+        let dirty = {
+            let shards = engine.shards.read().expect("shards lock poisoned");
+            shards
+                .get(&1)
+                .map(|shard| shard.dirty_objects.len())
+                .unwrap_or(0)
+        };
+        println!(
+            "  {records} objects in batches of {batch:<5} -> undumped log records {:>5}, \
+             dump_delayed {:<5}, dirty objects left {dirty:>5}",
+            report.plan.undumped_wal_records, report.plan.dump_delayed
+        );
+        (report.plan.undumped_wal_records, report.plan.dump_delayed, dirty)
+    }
+
+    // Same objects, same threshold. Only the grouping differs.
+    let (batched_records, batched_delayed, batched_dirty) = one_arm(RECORDS, 500);
+    let (single_records, single_delayed, single_dirty) = one_arm(RECORDS, 1);
+
+    assert_eq!(
+        single_records, RECORDS as u64,
+        "one write per batch must produce one log record per object, or the two arms below are \
+         not the same corpus"
+    );
+    assert_eq!(
+        batched_records,
+        (RECORDS / 500) as u64,
+        "a batch must be ONE log record however many objects it carries -- that is the whole \
+         mechanism this test is about"
+    );
+
+    assert!(
+        batched_delayed,
+        "the batched arm crossed the threshold, so it does not show the divergence"
+    );
+    assert!(
+        !single_delayed,
+        "the unbatched arm did not cross the threshold, so there is nothing to contrast"
+    );
+    assert_eq!(
+        batched_dirty, RECORDS,
+        "the batched arm should be holding every one of its {RECORDS} objects dirty behind a \
+         threshold that can only see {batched_records} log records"
+    );
+    assert_eq!(
+        single_dirty, 0,
+        "the unbatched arm should have drained its dirty set in one round"
+    );
+}
+
+/// THE PREPARE STAGE ROLLS A SLAB, AND A ROLL TAKES THE BLOCK-STORE MUTEX ACROSS A WHOLE-MANIFEST
+/// REWRITE.
+///
+/// `prepare_next_slab_with_target` locks the block store and calls `roll_slab_inner` while
+/// holding it, and that rewrites the entire slab manifest. So whatever a roll costs on a store
+/// with many slabs, a round that triggers one pays it with the store mutex held, and every append
+/// and read on the store waits behind it.
+///
+/// Two arms on ONE fixture, because "prepare rolled nothing" is satisfied just as well by a
+/// prepare that never ran: the control asks for a target the active slab is nowhere near and must
+/// produce NO roll, and the treatment asks for one it has passed and must produce exactly one.
+#[test]
+fn the_prepare_stage_can_roll_a_slab_and_take_the_block_store_mutex() {
+    const RECORDS: usize = 500;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = round_engine(dir.path());
+    seed_in_batches(&engine, 1, RECORDS, 100);
+
+    let offset = engine.block_store.active_slab_write_offset();
+    assert!(
+        offset > 0,
+        "the fixture wrote nothing to the active slab, so neither arm below means anything"
+    );
+
+    fn prepare_arm(engine: &TemporalEngine, target: u64) -> (Option<u64>, usize) {
+        let report = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+            shard_id: 1,
+            enable_prepare: true,
+            prepare_slab_target_bytes: target,
+            ..StorageManagerCycleRequest::default()
+        });
+        let prepared = report
+            .stages
+            .iter()
+            .find(|stage| stage.stage == "prepare")
+            .expect("the round always reports a prepare stage")
+            .prepared_block_slab_id;
+        (
+            prepared,
+            engine.block_store.slab_ids().unwrap_or_default().len(),
+        )
+    }
+
+    // CONTROL: a target the active slab has not reached. No roll.
+    let slabs_before = engine.block_store.slab_ids().unwrap_or_default().len();
+    let (control_rolled, control_slabs) = prepare_arm(&engine, offset.saturating_mul(1_000));
+    assert_eq!(
+        control_rolled, None,
+        "prepare rolled a slab at a target the active slab is {offset} bytes short of, so the \
+         treatment arm below proves nothing about the target"
+    );
+    assert_eq!(
+        control_slabs, slabs_before,
+        "the control arm changed the slab count {slabs_before} -> {control_slabs}"
+    );
+
+    // TREATMENT: a target the active slab has passed. One roll.
+    let (treatment_rolled, treatment_slabs) = prepare_arm(&engine, 1);
+    assert!(
+        treatment_rolled.is_some(),
+        "prepare did not roll at a target of 1 byte against a {offset}-byte active slab, so the \
+         round cannot reach the roll path at all and this test has stopped describing it"
+    );
+    assert_eq!(
+        treatment_slabs,
+        control_slabs + 1,
+        "the roll did not add a slab: {control_slabs} -> {treatment_slabs}"
+    );
+    println!(
+        "  active slab at {offset} bytes: target {}x above it rolled nothing, target 1 rolled \
+         slab {:?} ({control_slabs} -> {treatment_slabs} slabs)",
+        1_000, treatment_rolled
+    );
+}
+
+/// THE ROUND'S BLOCK READS ARE FLAT IN CORPUS SIZE, AND EVERY ONE OF THEM IS UNDER A GUARD.
+///
+/// Two separate facts, asserted separately.
+///
+/// FLAT: the round's readability probe is bounded per round, so the number of pages it reads off
+/// the block store does not grow with the store. Measured 512 at 8,000 records and 512 at 80,000.
+/// The assertion is that the two sizes AGREE, not that they equal 512 -- retuning the bound is a
+/// decision someone is allowed to make, and a test that fought it would be guarding the number
+/// rather than the property.
+///
+/// UNDER A GUARD: all of them. `block_reads_under_guard` equals `block_reads_total`, which means
+/// every page this round reads is read while the thread holds a shard-table guard, so those reads
+/// block every WRITE on the shard for their duration. That is tolerable only because the count is
+/// bounded -- which is why the two halves belong in one test: neither is reassuring alone. The
+/// total is the denominator, and a round that read nothing would satisfy "none under a guard"
+/// just as well as one that had moved its reads out from under it.
+#[test]
+fn the_rounds_block_reads_are_flat_in_corpus_size_and_all_under_a_guard() {
+    const SMALL: usize = 2_000;
+    const LARGE: usize = 20_000;
+
+    fn reads_of_one_steady_round(records: usize) -> (u64, u64) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = round_engine(dir.path());
+        seed_in_batches(&engine, 1, records, 1_000);
+        let _ = engine.run_storage_manager_cycle(round_request());
+        crate::engine::reset_maintenance_block_read_counts();
+        let report = engine.run_storage_manager_cycle(round_request());
+        assert!(
+            report.errors.is_empty(),
+            "{records} records: the round errored, so its read counts measure nothing: {:?}",
+            report.errors
+        );
+        let counts = crate::engine::maintenance_block_read_counts();
+        println!(
+            "  {records:>6} records -> ONE round read {} pages, {} of them under a shard guard",
+            counts.block_reads_total, counts.block_reads_under_guard
+        );
+        (counts.block_reads_under_guard, counts.block_reads_total)
+    }
+
+    let (small_guarded, small_total) = reads_of_one_steady_round(SMALL);
+    let (large_guarded, large_total) = reads_of_one_steady_round(LARGE);
+
+    // THE DENOMINATOR, before either claim below.
+    assert!(
+        small_total > 0 && large_total > 0,
+        "the round read no pages at either size ({small_total}, {large_total}), so neither the \
+         flatness claim nor the guard claim below has anything to be about"
+    );
+
+    assert_eq!(
+        small_total, large_total,
+        "one round read {small_total} pages at {SMALL} records and {large_total} at {LARGE}. The \
+         round's page reads are bounded per round, so a size-dependent count means a whole-store \
+         read has come back into the round"
+    );
+
+    assert_eq!(
+        small_guarded, small_total,
+        "at {SMALL} records {small_guarded} of {small_total} page reads happened under a shard \
+         guard. The two are expected to be EQUAL -- this test records WHERE the round's reads \
+         happen, so a change that moved some of them out from under the guard should update this \
+         deliberately rather than leave the round described wrongly"
+    );
+    assert_eq!(
+        large_guarded, large_total,
+        "at {LARGE} records {large_guarded} of {large_total} page reads happened under a shard \
+         guard"
+    );
+}
+
+/// THE RECOVERY REPORT DERIVES THREE ANSWERS FROM ONE WALK OF THE LIVE-PAGE SET.
+///
+/// `storage_recovery_report_without_boundary_sampled` needs the same live-page set three times:
+/// for the addresses its readability probe walks, for the bucket-ownership validation, and for
+/// the object-lifecycle report. It used to walk for each, three whole-store passes of the
+/// thirteen one round makes. It holds ONE shard-table read guard across all three, so they cannot
+/// disagree and the second and third could only rebuild the first.
+///
+/// TWO CLAIMS, asserted in this order.
+///
+/// SAFETY FIRST, because it is the one that is not checked anywhere else. The three consumers
+/// must still describe the same page set, with a denominator: a report over an empty shard would
+/// satisfy any agreement. A mutant that feeds one consumer a different set fails here.
+///
+/// COST SECOND. The call materialises the live-page set ONCE. Asserted as a count rather than a
+/// time, and as a count of SITES as well as entries -- `1.00x` is also what a call that walked
+/// once and then answered two of the three questions wrongly would report.
+#[test]
+fn the_recovery_report_derives_three_answers_from_one_walk_and_takes_a_second_for_layout() {
+    const RECORDS: usize = 2_000;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = round_engine(dir.path());
+    // SEEDED ACROSS MORE THAN ONE SLAB, deliberately. With every live page in slab 0 the
+    // slab-id agreement below holds whatever the id is derived from -- a mutant that replaced
+    // `entry.address.block_slab_id` with the constant 0 passed. Rolling a slab half way through
+    // the seed gives the two sides something to disagree about.
+    seed_in_batches(&engine, 1, RECORDS / 2, 1_000);
+    let rolled = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        enable_prepare: true,
+        prepare_slab_target_bytes: 1,
+        ..StorageManagerCycleRequest::default()
+    });
+    assert!(
+        rolled
+            .stages
+            .iter()
+            .any(|stage| stage.stage == "prepare" && stage.prepared_block_slab_id.is_some()),
+        "the fixture did not roll a slab, so every live page is still in one slab and the \
+         slab-id agreement below cannot fail"
+    );
+    // DISJOINT keys, matching `seed_in_batches`' own format. Re-seeding from zero would rewrite
+    // the first half onto the slab just rolled, the old pages would go stale, and every LIVE
+    // page would be in one slab again -- which is the state this fixture exists to avoid.
+    let mut commands = Vec::new();
+    let mut cursor = RECORDS / 2;
+    while cursor < RECORDS {
+        commands.push(Command::StringSet {
+            key: format!("k-{cursor:08}"),
+            value: vec![b'v'; 128],
+        });
+        cursor += 1;
+    }
+    let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+        shard_id: 1,
+        commands,
+    });
+    assert!(
+        response.status.ok,
+        "the second-half seed failed: {:?}",
+        response.status
+    );
+
+    crate::engine::reset_live_block_scan_entries();
+    crate::engine::reset_live_block_scan_sites();
+    let report = engine.storage_recovery_report_without_boundary(1);
+    let entries = crate::engine::live_block_scan_entries();
+    let sites = crate::engine::live_block_scan_sites_snapshot();
+
+    // THE DENOMINATOR, before either claim.
+    assert!(
+        report.total_block_refs > 0,
+        "the report found no live pages at all, so neither claim below is about anything"
+    );
+
+    // ---- SAFETY: the three consumers describe one page set ----------------
+    //
+    // `total_page_refs` comes from the walk itself; `live_page_refs` is counted by the
+    // object-lifecycle report, which used to do its own walk. They are the same pages.
+    assert_eq!(
+        report.total_block_refs as u64, report.object_lifecycle.live_block_refs,
+        "the readability probe walked {} live pages and the object-lifecycle report counted {}. \
+         Both describe the live-page set of one shard under one read guard, so a difference \
+         means one of them is being derived from something other than the pages the other saw",
+        report.total_block_refs, report.object_lifecycle.live_block_refs
+    );
+
+    // The per-slab live tallies are built in the same loop as the probe, and the slab id list is
+    // derived from the same entries. Every slab that holds a live page must appear in both.
+    let slabs_from_live_reports = report
+        .block_slab_live_reports
+        .iter()
+        .filter(|slab| slab.live_block_refs > 0)
+        .map(|slab| slab.block_slab_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let slabs_from_id_list = report
+        .live_block_slab_ids
+        .iter()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
+    assert!(
+        slabs_from_id_list.len() > 1,
+        "the live pages sit in {} slab(s). With one slab the agreement below holds however the \
+         slab id is derived, which is exactly how a constant-id defect passed this test once",
+        slabs_from_id_list.len()
+    );
+    assert_eq!(
+        slabs_from_live_reports, slabs_from_id_list,
+        "the slabs with live pages and the reported live-slab id list disagree"
