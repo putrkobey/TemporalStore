@@ -72,3 +72,77 @@ const SHARE_END_BUCKET: u32 = 1023;
 
 /// The cap #1995 measured at, and the one an operator is told to configure.
 const SHARE_DUMP_CAP: usize = 64;
+
+/// How many capped rounds to run before giving up on draining.
+const MAX_ROUNDS: usize = 12;
+
+/// The two transient claims, which are the only movable ones. `dirty_generation` is durable.
+const MOVABLE_BYTES_PER_NODE: usize = 16;
+
+fn share_engine(dir: &std::path::Path) -> TemporalEngine {
+    TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.join("share-cache"),
+        dir.join("share-blocks"),
+        dir.join("share-indexes"),
+    )
+}
+
+fn share_load(engine: &TemporalEngine, end_routing_bucket: u32) {
+    engine.load_shard_with(LoadShardRequest {
+        shard_id: SHARE_SHARD,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 0,
+        end_routing_bucket,
+        readonly: false,
+        table_name: String::new(),
+    });
+}
+
+fn one_capped_round(engine: &TemporalEngine) {
+    engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: SHARE_SHARD,
+        min_undumped_wal_records: 0,
+        min_undumped_wal_bytes: 0,
+        max_dump_buckets_per_round: SHARE_DUMP_CAP,
+        ..StorageManagerCycleRequest::default()
+    });
+}
+
+/// (buckets, dirty buckets, buckets holding a non-zero WAL claim).
+fn dirty_census(engine: &TemporalEngine) -> (usize, usize, usize) {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&SHARE_SHARD).expect("shard is loaded");
+    let mut buckets = 0usize;
+    let mut dirty = 0usize;
+    let mut claiming = 0usize;
+    for bucket in shard.bucket_index.bucket_map.values() {
+        buckets += 1;
+        if bucket.dirty() {
+            dirty += 1;
+        }
+        if bucket.first_dirty_wal_sequence > 0 {
+            claiming += 1;
+        }
+    }
+    (buckets, dirty, claiming)
+}
+
+fn write_corpus(engine: &TemporalEngine, keys: &[String], tag: u8) {
+    for chunk in keys.chunks(512) {
+        let commands = chunk
+            .iter()
+            .map(|key| Command::StringSet { key: key.clone(), value: vec![tag; 48] })
+            .collect::<Vec<_>>();
+        let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+            shard_id: SHARE_SHARD,
+            commands,
+        });
+        assert!(response.status.ok, "seed must ack: {:?}", response.status);
+    }
+}
+
+/// WHAT THE DIRTY SHARE DOES AS A DUMP DRAINS IT, AND WHAT EACH OF THREE SHAPES COSTS ALONG THE WAY.
+///
