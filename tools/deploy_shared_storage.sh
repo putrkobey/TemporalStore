@@ -29,18 +29,3 @@ if [[ -z "${TS_SHARED_STORE_DIR:-}" && -z "${TS_MATRIXOBJECT_ENDPOINT:-}" ]]; th
   exit 1
 fi
 : "${TS_META_ADDR:?shared storage is a multi-node profile - set TS_META_ADDR}"
-: "${TS_SERVER_NODE_ID:?shared storage needs a unique node id (TS_SERVER_NODE_ID)}"
-
-export TS_DISTRIBUTED=1
-export TS_STANDALONE=0
-
-# Name the backend from what was configured. `auto` would reach the same answer
-# when the endpoint is reachable, but it degrades to raft when it is not - and a
-# node silently serving from local disk is not the deployment that was asked
-# for. Naming it makes an unreachable store fail at startup instead.
-if [[ -n "${TS_MATRIXOBJECT_ENDPOINT:-}" ]]; then
-  export TS_STORAGE_BACKEND="${TS_STORAGE_BACKEND:-matrixobject}"
-  export TS_MATRIXOBJECT_BUCKET="${TS_MATRIXOBJECT_BUCKET:-temporalstore}"
-else
-  export TS_STORAGE_BACKEND="${TS_STORAGE_BACKEND:-shared}"
-fi

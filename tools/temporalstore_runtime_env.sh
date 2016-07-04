@@ -9,3 +9,14 @@
 #
 # The body is the loader-path block that `tools/matrixark_codex_rust_hook.sh` already runs inline,
 # lifted into the function those two scripts expect rather than invented: the SDK builds a cdylib,
+# and a binary that links it needs the directory holding it on the loader path.
+
+# Put the built SDK's library directory on the dynamic loader path, if it exists.
+# Takes the repository root. Safe to call more than once and safe when nothing is built yet --
+# a directory that is not there is skipped rather than exported as an empty entry, because an
+# empty component in LD_LIBRARY_PATH means "the current directory" to the loader.
+temporalstore_export_sdk_loader_path() {
+  local root="${1:-}"
+  if [[ -z "${root}" ]]; then
+    echo "temporalstore_export_sdk_loader_path: repository root argument is required" >&2
+    return 2
