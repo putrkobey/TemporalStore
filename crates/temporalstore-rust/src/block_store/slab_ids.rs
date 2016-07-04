@@ -87,3 +87,47 @@ pub(crate) fn restore_slab_from_delayed_destroy_unsynced(
     root: &Path,
     block_slab_id: u64,
     quarantined_path: &Path,
+) -> Result<bool, BlockStoreError> {
+    let destination = slab_path(root, block_slab_id);
+    if destination.exists() {
+        return Ok(false);
+    }
+    std::fs::rename(quarantined_path, &destination)?;
+    Ok(true)
+}
+
+pub(crate) fn delayed_destroy_slab_ids_at(root: &Path) -> Result<Vec<u64>, BlockStoreError> {
+    Ok(delayed_destroy_slab_reports_at(root)?
+        .into_iter()
+        .map(|report| report.block_slab_id)
+        .collect())
+}
+
+pub(crate) fn delayed_destroy_slab_reports_at(
+    root: &Path,
+) -> Result<Vec<BlockStoreDelayedDestroySlabReport>, BlockStoreError> {
+    let trash_dir = delayed_destroy_dir(root);
+    let mut reports = Vec::new();
+    if !trash_dir.exists() {
+        return Ok(reports);
+    }
+    // COUNTED BECAUSE NOBODY COULD SAY HOW MANY OF THESE A ROUND TAKES. This walk stats every
+    // entry and builds a `Vec` of owned reports; one periodic storage round reaches it twice
+    // before the purge opens the same directory for itself. Attributing the walks by reading the
+    // call graph is how the number was arrived at, and a read is a hypothesis -- so each walk
+    // says so instead. The lock is nanoseconds against a directory read.
+    crate::durability_metrics::record_scan("block_store_trash_dir_walk", 1);
+    for entry in std::fs::read_dir(trash_dir)? {
+        let entry = entry?;
+        if let Some(id) = delayed_destroy_slab_id_from_name(&entry.file_name()) {
+            let metadata = entry.metadata().ok();
+            reports.push(BlockStoreDelayedDestroySlabReport {
+                block_slab_id: id,
+                physical_bytes: metadata
+                    .as_ref()
+                    .map(|metadata| metadata.len())
+                    .unwrap_or_default(),
+                modified_unix_ms: metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .and_then(system_time_unix_ms),
