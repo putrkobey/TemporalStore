@@ -1,0 +1,102 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+//! A sorted set's scores and order must survive a restart -- re-scores included.
+//!
+//! Each member's page is named in the bucket index by a component encoding (score, member), and
+//! a re-score marks the OLD component deleted before publishing the new one. Recovery rebuilds
+//! the map purely from live components, so a restart must see the moved score exactly once,
+//! never the stale one -- that is the failure this pins: if the delete-then-insert ever loses
+//! its delete, the member comes back twice at two scores.
+
+use std::path::PathBuf;
+
+use temporalstore_rust::{
+    Command, CommandResponse, ExecuteRequest, LoadShardRequest, TemporalEngine,
+};
+
+const SHARD_ID: u64 = 1;
+const CACHE_BYTES: usize = 4096;
+
+fn unique_root(name: &str) -> PathBuf {
+    let pid = std::process::id();
+    let mut root = std::env::temp_dir();
+    root.push(format!("ts-zset-recovery-{name}-{pid}"));
+    root
+}
+
+fn new_engine(root: &PathBuf) -> TemporalEngine {
+    for sub in ["cache", "pages", "indexes"] {
+        std::fs::create_dir_all(root.join(sub)).expect("create engine dir");
+    }
+    let engine = TemporalEngine::with_local_dirs(
+        CACHE_BYTES,
+        root.join("cache"),
+        root.join("blocks"),
+        root.join("indexes"),
+    );
+    // `load_shard` builds this request and then drops the answer on the floor:
+    //
+    //     let _ = self.load_shard_with(request);
+    //
+    // So a load that fails is invisible until the first command comes back shard_not_loaded, and
+    // that status says only that the shard is absent, never why. Both of these tests fail exactly
+    // that way on main. Asking through load_shard_with makes the load report for itself.
+    let loaded = engine.load_shard_with(LoadShardRequest {
+        shard_id: SHARD_ID,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 0,
+        end_routing_bucket: u32::MAX,
+        readonly: false,
+        table_name: String::new(),
+    });
+    assert!(loaded.status.ok, "the shard did not load: {:?}", loaded.status);
+    engine
+}
+
+fn run(engine: &TemporalEngine, command: Command) -> CommandResponse {
+    let response = engine.execute(ExecuteRequest {
+        shard_id: SHARD_ID,
+        command,
+    });
+    assert!(response.status.ok, "command failed: {:?}", response.status);
+    response.response
+}
+
+fn zadd(engine: &TemporalEngine, member: &str, score: f64) {
+    run(
+        engine,
+        Command::ZSetAdd {
+            key: "board".to_string(),
+            member: member.as_bytes().to_vec(),
+            score,
+        },
+    );
+}
+
+fn full_range(engine: &TemporalEngine) -> Vec<String> {
+    match run(
+        engine,
+        Command::ZSetRange {
+            key: "board".to_string(),
+            start: 0,
+            stop: -1,
+            rev: false,
+        },
+    ) {
+        CommandResponse::Members { members } => members
+            .into_iter()
+            .map(|member| String::from_utf8(member).expect("utf8"))
+            .collect(),
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[test]
+fn scores_and_order_survive_restart_including_a_rescore() {
+    let root = unique_root("order");
+    let _ = std::fs::remove_dir_all(&root);
+
+    {

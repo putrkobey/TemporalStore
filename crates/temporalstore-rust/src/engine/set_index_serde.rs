@@ -13,3 +13,18 @@ pub fn serialize<S>(
 ) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
+{
+    let encoded = value
+        .iter()
+        .map(|(key, members)| {
+            (
+                key,
+                members
+                    .iter()
+                    .map(|(member, address)| (member, address))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    encoded.serialize(serializer)
+}
