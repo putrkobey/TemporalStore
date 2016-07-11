@@ -218,3 +218,113 @@ Add to `%USERPROFILE%\.codex\config.toml`:
 [mcp_servers.matrixark]
 command = &#39;wsl.exe&#39;
 args = [ &#39;--cd&#39;, &#39;<repo>&#39;, &#39;-e&#39;, &#39;bash&#39;, &#39;-lc&#39;, &#39;exec tools/matrixark_mcp_server.sh&#39; ]
+startup_timeout_sec = 120
+```
+
+Codex can then call MatrixArk MCP tools.  MCP calls are explicit; they do not
+fire for every message unless Codex is instructed or a hook is configured.
+
+### Claude Desktop
+
+Add to Claude Desktop&#39;s MCP config file:
+
+```json
+{
+  &quot;mcpServers&quot;: {
+    &quot;matrixark&quot;: {
+      &quot;args&quot;: [
+        &quot;--cd&quot;,
+        &quot;<repo>&quot;,
+        &quot;-e&quot;,
+        &quot;bash&quot;,
+        &quot;-lc&quot;,
+        &quot;exec tools/matrixark_mcp_server.sh&quot;
+      ],
+      &quot;command&quot;: &quot;wsl.exe&quot;,
+      &quot;env&quot;: {
+        &quot;MATRIXARK_LOCAL_MODE&quot;: &quot;cluster&quot;,
+        &quot;MATRIXARK_MCP_BACKEND&quot;: &quot;temporalstore-direct&quot;
+      }
+    }
+  }
+}
+```
+
+Claude should use `matrixark_retrieve` before answering when prior durable memory
+or shared resources may matter, and `matrixark_ingest` or
+`matrixark_feedback` after the answer when a new durable fact, correction,
+commitment, or accepted/rejected reference should be remembered.
+
+### Claude Code / Claude CLI-Style Agents
+
+Claude Code-style agents should use the same MatrixArk MCP stdio server when
+their local installation supports MCP.  The exact config location can differ by
+Claude product/version, so generate the server block and paste it into the MCP
+server registry used by that installation:
+
+```bash
+python3 tools/matrixark_agent_config.py --client claude-code
+```
+
+Claude should treat MatrixArk as remote durable context, not as a replacement
+for local file reading.  Recommended usage:
+
+```text
+before analysis:
+  call matrixark_retrieve with raw user query, user/session scope, and token budget
+
+during answer:
+  combine MatrixArk ContextPack with local files and tool output
+
+after answer:
+  call matrixark_feedback when the user confirms/corrects/accepts refs
+  call matrixark_ingest for durable tool outcomes or decisions
+```
+
+### Cursor
+
+Use the same MCP server shape:
+
+```json
+{
+  &quot;mcpServers&quot;: {
+    &quot;matrixark&quot;: {
+      &quot;command&quot;: &quot;wsl.exe&quot;,
+      &quot;args&quot;: [
+        &quot;--cd&quot;,
+        &quot;<repo>&quot;,
+        &quot;-e&quot;,
+        &quot;bash&quot;,
+        &quot;-lc&quot;,
+        &quot;exec tools/matrixark_mcp_server.sh&quot;
+      ],
+      &quot;env&quot;: {
+        &quot;MATRIXARK_LOCAL_MODE&quot;: &quot;cluster&quot;,
+        &quot;MATRIXARK_MCP_BACKEND&quot;: &quot;temporalstore-direct&quot;
+      }
+    }
+  }
+}
+```
+
+Cursor should keep using its local codebase context.  MatrixArk should be called
+for durable context such as historical decisions, team runbooks, project memory,
+prior debugging outcomes, approvals, resource chunks, and skills.
+
+Suggested Cursor policy text can be placed in project instructions:
+
+```text
+Use MatrixArk MCP for durable context. Before answering questions that may depend
+on prior decisions, resources, team memory, user preferences, or historical
+debugging attempts, call matrixark_retrieve. Keep using Cursor local code context
+for current files. Pass visible open files, selected text, tool outputs,
+local_context_tokens, max_context_tokens, and session_id when available. After a
+final answer, tool result, accepted ref, rejected ref, decision, correction, or
+user confirmation, call matrixark_ingest or matrixark_feedback. On task
+completion, call matrixark_session_commit.
+```
+
+Cursor should pass a stable scope when possible:
+
+```json
+{

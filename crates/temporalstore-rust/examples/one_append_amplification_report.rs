@@ -265,3 +265,92 @@ async fn sweep(
         // ---- read as "0 bytes over 0 objects", which looks free.
         assert_eq!(
             objects, 2,
+            "one append left {objects} objects behind, not the log frame and its sidecar. Every \
+             byte figure in this table is a sum over that listing, so a different object count \
+             means this is measuring something else"
+        );
+        assert!(
+            entry > 0 && blob > entry,
+            "entry {entry} B and blob {blob} B are not a log frame inside a listing that \
+             contains it"
+        );
+        let physical = blob * options.replica_count as u64;
+        if print {
+            println!(
+                "    {:>7}   {:>6}   {:>7}   {:>9}   {:>6}   {:>7}   {:>9.2}   {:>13.2}",
+                payload,
+                user,
+                entry,
+                blob - entry,
+                blob,
+                objects,
+                blob as f64 / user as f64,
+                physical as f64 / user as f64,
+            );
+        }
+        blob_points.push((payload as f64, blob as f64));
+        entry_points.push((payload as f64, entry as f64));
+    }
+
+    let (blob_rate, blob_env, blob_resid) = fit(&blob_points);
+    if print {
+        let (entry_rate, entry_env, entry_resid) = fit(&entry_points);
+        println!();
+        println!("  THE LINE, fitted over the sweep rather than quoted from a point");
+        println!();
+        println!("    log frame    = {entry_rate:.4} * payload + {entry_env:.1}      worst residual {entry_resid:.1} B");
+        println!("    both legs    = {blob_rate:.4} * payload + {blob_env:.1}      worst residual {blob_resid:.1} B");
+        println!("    the sidecar is the difference: {:.1} B, at the fitted intercept; offset varints can widen with the payload", blob_env - entry_env);
+    }
+    (blob_rate, blob_env, blob_resid)
+}
+
+#[tokio::main]
+async fn main() {
+    let options = StoreOptions {
+        page_size: 1024,
+        max_extent_bytes: 4096,
+        chunk_size: 4096,
+        replica_count: 3,
+        write_quorum: 2,
+        ..StoreOptions::default()
+    };
+
+    for shape in [Shape::Command, Shape::Outcome] {
+        report(shape, &options).await;
+    }
+}
+
+async fn report(shape: Shape, options: &StoreOptions) {
+    println!("WHAT ONE APPEND COSTS: {shape:?}");
+    println!();
+    println!("  one WAL entry per store, swept over the value size");
+    println!("  store: page_size {}  chunk_size {}  max_extent_bytes {}  replica_count {}  write_quorum {}",
+             options.page_size, options.chunk_size, options.max_extent_bytes,
+             options.replica_count, options.write_quorum);
+    println!();
+
+    let sizes = [0usize, 8, 32, 128, 512, 2048, 8192];
+    // ---- THE SWEEP MUST SPAN ENOUGH TO SEPARATE A SLOPE FROM A CONSTANT. Over a narrow range a
+    // ---- constant and a slope are not distinguishable and the fit would report whichever the
+    // ---- noise preferred.
+    assert!(
+        sizes.len() >= 5 && *sizes.last().unwrap() >= 16 * sizes[1].max(1),
+        "the sweep is too narrow to separate the slope from the envelope"
+    );
+
+    let (blob_rate, blob_env, blob_resid) = sweep(shape, CLUSTER, &sizes, options, true).await;
+
+    println!();
+    println!(
+        "  SO THE PER-APPEND ENVELOPE IS ABOUT {:.0} BYTES, and the marginal rate is {:.3}x.",
+        blob_env, blob_rate
+    );
+    println!("  A ratio quoted at one payload size is mostly that envelope divided by that size:");
+    println!(
+        "    at {:>5} B payload the envelope alone is {:>8.2}x",
+        sizes[1],
+        blob_env / (KEY.len() + sizes[1]) as f64
+    );
+    println!(
+        "    at {:>5} B payload the envelope alone is {:>8.2}x",

@@ -41,3 +41,46 @@ impl Client {
                 c_rows.len(),
                 policy as c_int,
                 &mut error,
+            )
+        };
+        check(code, error)
+    }
+
+    pub fn query_sequence_feature_rows(
+        &self,
+        key: &str,
+        start_ts: u64,
+        end_ts: u64,
+        count: u64,
+        filters: &[FeatureFilter],
+    ) -> Result<Vec<SequenceFeatureRow>> {
+        let key = cstring(key)?;
+        let c_fields: Vec<CString> = filters
+            .iter()
+            .map(|filter| cstring(&filter.field))
+            .collect::<Result<Vec<_>>>()?;
+        let c_filters: Vec<CFeatureFilter> = filters
+            .iter()
+            .zip(c_fields.iter())
+            .map(|(filter, field)| CFeatureFilter {
+                field: field.as_ptr(),
+                op: filter.op as c_int,
+                value: filter.value,
+            })
+            .collect();
+        let mut out = CSequenceFeatureRowArray {
+            count: 0,
+            rows: ptr::null_mut(),
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        let code = unsafe {
+            temporalstore_query_sequence_feature_rows(
+                self.raw,
+                key.as_ptr(),
+                start_ts,
+                end_ts,
+                count,
+                c_filters.as_ptr(),
+                c_filters.len(),
+                &mut out,
+                &mut error,
