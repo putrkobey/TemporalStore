@@ -30,3 +30,35 @@
   <h1>MatrixArk Replay And Audit Pipeline</h1>
   <p class="lead">Replay and audit are wired for MatrixArk context retrieval. Retrieval writes <code>context_pack_audit</code>, operational and access actions write <code>matrixark_audit_log</code>, and <code>matrixark_replay</code> can return the persisted record stream needed to reconstruct selected evidence.</p>
 
+  <section class="card">
+    <h2>Why This Matters</h2>
+    <p>Replay and audit answer what MatrixArk returned, why those refs were selected, what was dropped, which token budget and retrieval policy were used, and which account, tenant, user, session, or API key performed the action.</p>
+    <div>
+      <span class="pill">selected refs</span><span class="pill">dropped refs</span><span class="pill">tree traversal</span><span class="pill">secondary filters</span><span class="pill">token budget</span><span class="pill">access audit</span>
+    </div>
+  </section>
+
+  <h2>Retrieval To Replay Flow</h2>
+  <div class="diagram">
+<pre class="mermaid"><code>flowchart TD
+  A["matrixark_retrieve(query, scope, max_context_tokens)"]
+  B["Query understanding and secondary-index planning"]
+  C["Tree traversal with ContextNode L0/L1 embeddings"]
+  D["Select events, entities, segments"]
+  E["Select resource chunks"]
+  F["Select skill sections only"]
+  G["Question-type-aware token packing"]
+  H["Return ContextPack"]
+  I["Write context_pack_audit"]
+  J["matrixark_replay(context_pack_id)"]
+  K["Return raw records plus matching audit"]
+  A --> B --> C --> D --> G
+  C --> E --> G
+  C --> F --> G
+  G --> H
+  G --> I
+  I --> J --> K</code></pre>
+  </div>
+
+  <h2>What <code>context_pack_audit</code> Stores</h2>
+  <div class="grid">
