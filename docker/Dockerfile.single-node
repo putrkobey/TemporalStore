@@ -19,3 +19,14 @@ COPY crates ./crates
 COPY proto ./proto
 RUN cargo build --release -p temporalstore-rust \
       --bin matrixark_rust_metaserver \
+      --bin matrixark_rust_datanode
+
+FROM debian:bookworm-slim
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+RUN useradd --system --uid 10001 --create-home temporalstore \
+    && mkdir -p /var/lib/temporalstore \
+    && chown temporalstore:temporalstore /var/lib/temporalstore
+COPY --from=builder /src/target/release/matrixark_rust_metaserver /usr/local/bin/
+COPY --from=builder /src/target/release/matrixark_rust_datanode /usr/local/bin/
