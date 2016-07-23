@@ -31,36 +31,3 @@
 //!   2. NOTHING FILES THE COLLIDING STATE. Every container kind converges on the page, asked of
 //!      `index_entry_names_a_block` itself rather than of a comment, so no path files two entries
 //!      of one object at one address for the collision to be reached through.
-//!
-//! Either one alone is weak: (1) without (2) describes a live defect, and (2) without (1) is a
-//! predicate check with no stated consequence. Together they say why the predicate matters.
-//!
-//! # THE MIRROR IS GONE WITH THE TERM IT ISOLATED
-//!
-//! A mirror of `block_index_handle` stood here with an `include_component` switch, proved faithful
-//! against the real function and then re-run with the component dropped, to show that term was the
-//! only discriminator. There is no such term to drop: `block_index_handle` hashes the constant
-//! `None::<&str>` in that position -- which is what keeps every handle bit-for-bit what it was --
-//! and a constant cannot be isolated by omitting it. The real function is used directly below.
-
-#![allow(clippy::all)]
-use super::*;
-use crate::block_store::ElementEntry;
-use crate::engine::state::{block_index_handle, BlockIndex};
-use crate::engine::storage_bucket_internals::StoredModelKind;
-
-/// One batched page: every element of the object shares this address.
-fn batched_block_address() -> ElementEntry {
-    ElementEntry::from_parts(42, 1_048_576, 4096, Some(7), None)
-}
-
-/// An entry for one object at one address. There is no element name to vary any more, which is
-/// the whole of this module's restatement: two of these differ in nothing at all.
-fn entry_at(object_key: &str, address: ElementEntry) -> (std::sync::Arc<str>, BlockIndex) {
-    (
-        std::sync::Arc::from(object_key),
-        BlockIndex {
-            model_id: StoredModelKind::Hash,
-            address,
-            dirty: false,
-            deleted: false,
