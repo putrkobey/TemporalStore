@@ -70,3 +70,39 @@
       "description": "PurchaseMemory scope-level retention cutoff (optional), unix SECONDS. Records in this subject scope whose occurrence time < cutoff are hidden at read-time and reclaimed by the expiry sweep. Persisted as a durable scope marker.",
       "type": "number"
     },
+    "identity_key": {
+      "description": "PurchaseMemory keyed-upsert identity (optional). Logical identity of a fact within the scope (e.g. 'user.email', 'subscription.plan'). A later ingest with the same identity_key supersedes or is rank-guarded against the prior value per truth_class.",
+      "type": "string"
+    },
+    "truth_class": {
+      "description": "PurchaseMemory confidence class (optional) for the keyed-upsert rank guard. Mapped to an integer rank via a default table (asserted=3, reported=2, inferred=1, unknown=0), overridable with the MATRIXARK_TRUTH_RANK env JSON. A new write with rank >= the existing keyed record supersedes it; a lower rank is rejected (no-op).",
+      "type": "string"
+    },
+    "storage_options": {
+      "description": "Storage routing hints (storage_mode, oplog_mode, replication_mode, consistency, route, storage_family/family, write_mode, raft_mode, background_write). Validated and canonicalized into storage_route by normalize_storage_options/canonical_storage_route.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "wait": {
+      "description": "Client-facing flag: block until durable/processed instead of async.",
+      "type": "boolean"
+    },
+    "raw_object_backend": {
+      "description": "Client-facing hint selecting the raw object-store backend for resource bytes.",
+      "type": "string"
+    },
+    "max_skill_bytes": {
+      "description": "Client-facing cap on skill/resource text bytes to ingest.",
+      "type": "integer"
+    },
+    "context_pack_id": { "description": "Passthrough field copied verbatim by normalize_envelope.", "type": "string" },
+    "query_id_hash": { "description": "Passthrough field copied verbatim by normalize_envelope." },
+    "accepted_refs": { "description": "Passthrough field copied verbatim by normalize_envelope." },
+    "rejected_refs": { "description": "Passthrough field copied verbatim by normalize_envelope." },
+    "source_event_ids": { "description": "Passthrough field copied verbatim by normalize_envelope." },
+    "segment_provider": { "description": "Passthrough segmentation control copied verbatim." },
+    "segment_model": { "description": "Passthrough segmentation control copied verbatim." },
+    "segment_model_path": { "description": "Passthrough segmentation control copied verbatim." },
+    "segment_max_new_tokens": { "description": "Passthrough segmentation control copied verbatim." },
+    "segment_provider_fallback": { "description": "Passthrough segmentation control copied verbatim." },
+    "understanding_provider": { "description": "Passthrough provider selector copied verbatim." },

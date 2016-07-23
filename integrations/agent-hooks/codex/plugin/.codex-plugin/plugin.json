@@ -6,3 +6,7 @@
     "name": "MatrixArk"
   },
   "hooks": "./hooks/hooks.json",
+  "interface": {
+    "displayName": "TemporalStore Agent Hooks",
+    "shortDescription": "TemporalStore-backed memory hooks for Codex.",
+    "longDescription": "Ingests Codex prompts, tool outputs, and turn boundaries into MatrixArk backed by TemporalStore, and retrieves relevant context on UserPromptSubmit.",
