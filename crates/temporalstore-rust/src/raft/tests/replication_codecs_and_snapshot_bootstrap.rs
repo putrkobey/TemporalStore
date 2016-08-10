@@ -526,3 +526,532 @@ fn temporal_raft_data_node_backend_bootstraps_learner_and_auto_promotes_peer() {
     assert_eq!(restored_status.learner_count, 1);
 }
 
+#[cfg(feature = "temporal-raft-engine")]
+// shared-corpus: raft_matrixraft_membership_roles_joint_consensus_matrix
+#[test]
+fn temporal_raft_metaserver_backend_supports_membership_and_bounded_reads() {
+    use super::temporal_raft_integration::TemporalRaftConsensusBackend;
+
+    let dir = tempfile::tempdir().unwrap();
+    let options = DataRaftConsensusOptions {
+        shard_id: 0,
+        replica_id: 10,
+        group_id: 90,
+        wal_dir: Some(dir.path().to_path_buf()),
+        peers: vec![
+            DataRaftPeer {
+                replica_id: 11,
+                raft_addr: "127.0.0.1:17111".to_string(),
+                snapshot_addr: "127.0.0.1:18111".to_string(),
+                auto_promote: false,
+            },
+            DataRaftPeer {
+                replica_id: 12,
+                raft_addr: "127.0.0.1:17112".to_string(),
+                snapshot_addr: "127.0.0.1:18112".to_string(),
+                auto_promote: false,
+            },
+        ],
+        ..DataRaftConsensusOptions::default()
+    };
+    let mut backend = TemporalRaftConsensusBackend::new_metaserver(options.clone());
+    backend.start().unwrap();
+    assert_eq!(backend.status().unwrap().voter_count, 3);
+
+    let learner = DataRaftPeer {
+        replica_id: 13,
+        raft_addr: "127.0.0.1:17113".to_string(),
+        snapshot_addr: "127.0.0.1:18113".to_string(),
+        auto_promote: false,
+    };
+    backend.add_learner(learner.clone()).unwrap();
+    assert_eq!(backend.status().unwrap().learner_count, 1);
+    backend.promote_peer(learner.replica_id).unwrap();
+    assert_eq!(backend.status().unwrap().voter_count, 4);
+    assert_eq!(backend.status().unwrap().learner_count, 0);
+    backend.remove_peer(12).unwrap();
+    assert_eq!(backend.status().unwrap().voter_count, 3);
+    backend.can_serve_bounded_stale_read(0).unwrap();
+    assert!(backend.report().membership_change_supported);
+    assert!(backend.report().campaign_supported);
+
+    let membership = backend.temporal_raft_membership_compat();
+    let voters = membership.voter_ids().collect::<Vec<_>>();
+    assert_eq!(voters, vec![10, 11, 13]);
+
+    backend.trigger_snapshot().unwrap();
+    let snapshot_meta = backend.build_temporal_raft_snapshot_meta_compat();
+    assert!(snapshot_meta.last_log_id.is_some());
+    assert!(backend.report().snapshot_installed);
+    backend.transfer_leader(11).unwrap();
+    assert!(!backend.is_leader());
+    backend.campaign(10, false).unwrap();
+    assert!(backend.is_leader());
+    let status = backend.status().unwrap();
+    assert_eq!(status.leader_replica_id, 10);
+    assert_eq!(status.fatal_event_count, 0);
+    assert!(!status.snapshot_creating);
+    assert!(!status.snapshot_loading);
+
+    let restored = TemporalRaftConsensusBackend::new_metaserver(options);
+    let restored_status = restored.status().unwrap();
+    assert_eq!(restored_status.voter_count, 3);
+    assert_eq!(restored_status.leader_replica_id, 10);
+    assert_eq!(restored_status.last_index, 2);
+    assert!(restored.report().leader_transfer_supported);
+}
+
+#[test]
+fn committed_data_raft_applier_replays_once_and_rejects_wrong_shard() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(7);
+    let committed = serialize_data_raft_log(&DataRaftLogCodecEntry {
+        shard_id: 7,
+        raft_index: 11,
+        log_id: 13,
+        log_size: 0,
+        wal_sequence: 17,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        },
+    })
+    .unwrap();
+    let mut applier = DataRaftCommittedLogApplier::new(7);
+
+    let response = applier.apply(11, &committed, &engine).unwrap();
+    assert_eq!(response, Some(CommandResponse::Empty));
+    assert_eq!(applier.applied_raft_index(), 11);
+    assert_eq!(applier.applied_wal_sequence(), 17);
+    assert_eq!(applier.apply(11, &committed, &engine).unwrap(), None);
+
+    let read = engine.execute(ExecuteRequest {
+        shard_id: 7,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        read.response,
+        CommandResponse::Bytes {
+            value: Some(b"v".to_vec())
+        }
+    );
+
+    let wrong_shard = serialize_data_raft_log(&DataRaftLogCodecEntry {
+        shard_id: 8,
+        raft_index: 12,
+        log_id: 14,
+        log_size: 0,
+        wal_sequence: 18,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"bad".to_vec(),
+        },
+    })
+    .unwrap();
+    assert!(matches!(
+        applier.apply(12, &wrong_shard, &engine),
+        Err(RaftError::InvalidDataRaftLog(_))
+    ));
+}
+
+#[test]
+fn committed_data_raft_applier_forces_durable_storage_when_async_storage_enabled() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(7);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 7,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    let committed = serialize_data_raft_log(&DataRaftLogCodecEntry {
+        shard_id: 7,
+        raft_index: 11,
+        log_id: 13,
+        log_size: 0,
+        wal_sequence: 17,
+        command: Command::StringSet {
+            key: "raft".to_string(),
+            value: b"durable".to_vec(),
+        },
+    })
+    .unwrap();
+    let mut applier = DataRaftCommittedLogApplier::new(7);
+
+    assert_eq!(
+        applier.apply(11, &committed, &engine).unwrap(),
+        Some(CommandResponse::Empty)
+    );
+    assert_eq!(engine.block_store().stats().writes, 1);
+    assert_eq!(engine.write_ahead_log_store().stats(7).writes, 1);
+    assert_eq!(engine.index_log_store().stats(7).writes, 1);
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 7,
+                command: Command::StringGet {
+                    key: "raft".to_string(),
+                },
+            })
+            .response,
+        CommandResponse::Bytes {
+            value: Some(b"durable".to_vec())
+        }
+    );
+}
+
+#[test]
+fn raft_replicates_committed_write_to_majority_and_followers() {
+    let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);
+    cluster
+        .propose(Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        })
+        .unwrap();
+
+    for node_id in [1, 2, 3] {
+        let response = cluster
+            .read_local(
+                node_id,
+                Command::StringGet {
+                    key: "k".to_string(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            response,
+            CommandResponse::Bytes {
+                value: Some(b"v".to_vec())
+            }
+        );
+        assert_eq!(cluster.commit_index(node_id).unwrap(), 1);
+    }
+}
+
+#[test]
+fn raft_replicates_chunked_timestamped_kv_block_format_to_followers() {
+    let config = RaftConfig {
+        max_memory_replicate_log_bytes: 512 * 1024,
+        ..RaftConfig::default()
+    };
+    let cluster = RaftCluster::new_single_shard_with_config(1, [1, 2, 3], config).unwrap();
+    let points = large_feature_points();
+
+    cluster
+        .propose(Command::FeatureAppend {
+            key: "chunked-raft-feature".to_string(),
+            points: points.clone(),
+        })
+        .unwrap();
+
+    cluster.catch_up(2).unwrap();
+    cluster.catch_up(3).unwrap();
+    for node_id in [1, 2, 3] {
+        assert_eq!(cluster.commit_index(node_id).unwrap(), 1);
+        assert_eq!(
+            cluster
+                .read_from_replica(
+                    node_id,
+                    Command::FeatureQuery {
+                        key: "chunked-raft-feature".to_string(),
+                        start_ms: 0,
+                        end_ms: 2_000,
+                        count: None,
+                    },
+                )
+                .unwrap(),
+            CommandResponse::FeaturePoints {
+                points: points.clone()
+            }
+        );
+    }
+}
+
+#[test]
+fn raft_snapshot_install_preserves_chunked_timestamped_kv_block_format() {
+    let config = RaftConfig {
+        max_memory_replicate_log_bytes: 512 * 1024,
+        ..RaftConfig::default()
+    };
+    let cluster = RaftCluster::new_single_shard_with_config(1, [1, 2, 3], config).unwrap();
+    let points = large_feature_points();
+
+    cluster
+        .propose(Command::FeatureAppend {
+            key: "snapshot-chunked-feature".to_string(),
+            points: points.clone(),
+        })
+        .unwrap();
+
+    let snapshot = cluster.build_install_snapshot_request(3).unwrap().snapshot;
+    cluster.install_snapshot(3, snapshot).unwrap();
+
+    assert_eq!(
+        cluster
+            .read_from_replica(
+                3,
+                Command::FeatureQuery {
+                    key: "snapshot-chunked-feature".to_string(),
+                    start_ms: 0,
+                    end_ms: 2_000,
+                    count: None,
+                },
+            )
+            .unwrap(),
+        CommandResponse::FeaturePoints {
+            points: points.clone()
+        }
+    );
+
+    let inner = cluster.inner.read().expect("raft cluster lock poisoned");
+    let node = inner.nodes.get(&3).expect("snapshot target exists");
+    let layout = node
+        .engine
+        .storage_recovery_report(inner.shard_id)
+        .feature_block_layout;
+    assert!(layout.packed_feature_blocks > 1);
+    assert_eq!(layout.indexed_feature_points, points.len());
+    assert!(layout.corrupt_packed_feature_blocks.is_empty());
+    assert!(layout.missing_indexed_timestamps.is_empty());
+    assert!(layout.orphan_packed_timestamps.is_empty());
+    assert!(layout.duplicate_packed_timestamps.is_empty());
+}
+
+// shared-corpus: raft_matrixraft_read_lease_fault_matrix
+#[test]
+fn raft_rejects_write_without_majority() {
+    let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);
+    cluster.set_alive(2, false).unwrap();
+    cluster.set_alive(3, false).unwrap();
+
+    let err = cluster
+        .propose(Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        })
+        .unwrap_err();
+    assert_eq!(
+        err,
+        RaftError::NoMajority {
+            live: 1,
+            required: 2
+        }
+    );
+}
+
+// shared-corpus: raft_matrixraft_read_lease_fault_matrix
+#[test]
+fn raft_follower_catches_up_after_outage() {
+    let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);
+    cluster.set_alive(3, false).unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "k".to_string(),
+            value: b"v1".to_vec(),
+        })
+        .unwrap();
+
+    assert_eq!(cluster.commit_index(3).unwrap(), 0);
+    cluster.set_alive(3, true).unwrap();
+    cluster.catch_up(3).unwrap();
+    let response = cluster
+        .read_local(
+            3,
+            Command::StringGet {
+                key: "k".to_string(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        response,
+        CommandResponse::Bytes {
+            value: Some(b"v1".to_vec())
+        }
+    );
+    assert_eq!(cluster.commit_index(3).unwrap(), 1);
+}
+
+#[test]
+fn raft_rejects_electing_stale_replica_until_it_catches_up() {
+    let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);
+    cluster.set_alive(3, false).unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "stale-election".to_string(),
+            value: b"committed".to_vec(),
+        })
+        .unwrap();
+    cluster.set_alive(3, true).unwrap();
+
+    // A stale candidate is rejected because no voter will grant it -- its log is behind, so
+    // every up-to-date voter refuses and the candidate cannot reach a majority. (It used to be
+    // rejected by a local `candidate_log_would_win` precheck that reported ReplicaLagging; that
+    // precheck read cached peer state and was part of the god-view promotion path, so rejection
+    // is now the real vote round's outcome.) Either way it must NOT become leader.
+    assert_eq!(
+        cluster.elect_leader(3).unwrap_err(),
+        RaftError::NoMajority {
+            live: 1, // its own self-vote only
+            required: 2,
+        }
+    );
+    assert_eq!(cluster.leader_id(), 1);
+
+    cluster.catch_up(3).unwrap();
+    cluster.elect_leader(3).unwrap();
+    assert_eq!(cluster.leader_id(), 3);
+}
+
+#[test]
+fn raft_transport_append_entries_catches_up_lagging_replica() {
+    let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);
+    cluster.set_alive(3, false).unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "k".to_string(),
+            value: b"transport-value".to_vec(),
+        })
+        .unwrap();
+    cluster.set_alive(3, true).unwrap();
+
+    let request = cluster.build_append_entries_request(3).unwrap();
+    assert_eq!(request.leader_id, 1);
+    assert_eq!(request.target_id, 3);
+    assert_eq!(request.entries.len(), 1);
+    let response = cluster.append_entries(request).unwrap();
+    assert!(response.success);
+    assert_eq!(response.match_index, 1);
+    assert_eq!(
+        cluster
+            .read_from_replica(
+                3,
+                Command::StringGet {
+                    key: "k".to_string()
+                },
+            )
+            .unwrap(),
+        CommandResponse::Bytes {
+            value: Some(b"transport-value".to_vec())
+        }
+    );
+}
+
+#[test]
+fn raft_transport_rejects_stale_append_entries_and_behind_vote() {
+    let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);
+    cluster
+        .propose(Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        })
+        .unwrap();
+    cluster.elect_leader(2).unwrap();
+    let stale_append = AppendEntriesRequest {
+        rpc: None,
+        shard_id: 1,
+        term: 1,
+        leader_id: 1,
+        target_id: 2,
+        prev_log_index: 0,
+        prev_log_term: 0,
+        entries: Vec::new(),
+        leader_commit: 0,
+    };
+    let append_response = cluster.append_entries(stale_append).unwrap();
+    assert!(!append_response.success);
+    assert_eq!(append_response.reject_reason.as_deref(), Some("stale_term"));
+
+    let vote_response = cluster
+        .request_vote(VoteRequest {
+            pre_vote: false,
+            rpc: None,
+            shard_id: 1,
+            term: cluster.hard_state(2).unwrap().current_term + 1,
+            candidate_id: 3,
+            target_id: 2,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+        .unwrap();
+    assert!(!vote_response.vote_granted);
+    assert_eq!(
+        vote_response.reject_reason.as_deref(),
+        Some("candidate_log_behind")
+    );
+}
+
+#[test]
+fn append_entry_only_truncates_on_term_conflict_and_never_reapplies() {
+    // Raft §5.3 + exactly-once: a stale/duplicate/reordered AppendEntries that is a
+    // prefix of the committed log must NOT truncate committed entries or re-execute
+    // them (double-applying non-idempotent commands). Truncation happens only on a
+    // genuine term conflict, and the monotonic applied floor blocks re-execution.
+    let mut node = new_node(1, RaftRole::Follower, 7);
+    for index in 1..=5 {
+        append_entry(
+            &mut node,
+            RaftLogEntry {
+                leader_time_ms: 0,
+                term: 1,
+                index,
+                shard_id: 7,
+                command: Command::StringSet {
+                    key: format!("k{index}"),
+                    value: b"v".to_vec(),
+                },
+            },
+        );
+    }
+    node.commit_index = 5;
+    apply_committed(&mut node);
+    assert_eq!(node.applied_index, 5);
+    assert_eq!(node.max_applied_index, 5);
+    assert_eq!(node.log.len(), 5);
+
+    // Stale SAME-term entry at an already-committed index: no truncation, no re-apply.
+    append_entry(
+        &mut node,
+        RaftLogEntry {
+            leader_time_ms: 0,
+            term: 1,
+            index: 3,
+            shard_id: 7,
+            command: Command::StringSet {
+                key: "k3".to_string(),
+                value: b"v".to_vec(),
+            },
+        },
+    );
+    assert_eq!(
+        node.log.len(),
+        5,
+        "a same-term stale entry must not truncate the committed log"
+    );
+    assert_eq!(node.applied_index, 5);
+    assert!(
+        apply_committed(&mut node).is_none(),
+        "already-applied indices must not re-execute (monotonic floor)"
+    );
+
+    // A genuine term conflict at an UNCOMMITTED index truncates and replaces.
+    append_entry(
+        &mut node,
+        RaftLogEntry {
+            leader_time_ms: 0,
+            term: 1,
+            index: 6,
