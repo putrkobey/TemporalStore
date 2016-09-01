@@ -129,3 +129,135 @@ fn what_one_keys_series_costs_in_five_shapes_at_the_allocator() {
     println!(
         "instrument: ALLOC_CHUNK_BYTES = malloc_usable_size + {} B header; canary {} B requested, \
          {} B set aside in {} allocation(s)",
+        std::mem::size_of::<usize>(),
+        moved.alloc_bytes,
+        moved.chunk_bytes,
+        moved.allocs
+    );
+    println!("point = (u64, ElementEntry) = {} B", std::mem::size_of::<Point>());
+    println!(
+        "inline width in the map value: tree {inline_tree} B, boxed-Vec array {inline_doubling} B, \
+         exact owned slice {inline_exact} B"
+    );
+    println!("arms: {ARMS:?}\n");
+
+    println!(
+        "{:>6} | {:>11} {:>4} | {:>12} {:>4} | {:>14} {:>4} | {:>11} {:>4} | {:>12} {:>4}",
+        "points",
+        "tree_ins_B",
+        "n",
+        "tree_coll_B",
+        "n",
+        "arr_double_B",
+        "n",
+        "arr_exact_B",
+        "n",
+        "arr_hybrid_B",
+        "n"
+    );
+
+    let mut rows: Vec<(usize, [u64; 5], [u64; 5])> = Vec::new();
+
+    for n in OCCUPANCIES {
+        // The fixture is built OUTSIDE every span: constructing it allocates, and that allocation
+        // belongs to no arm.
+        let points: Vec<Point> = (0..n as u64).map(|at| (at, address(at))).collect();
+
+        // ARM 1: the B-tree as a live append-mostly series fills it, and as `serde` fills it on a
+        // decode -- one ascending insert at a time.
+        let probe = crate::alloc_probe::Probe::start();
+        let mut tree_ins: BTreeMap<u64, ElementEntry> = BTreeMap::new();
+        for (at, entry) in &points {
+            tree_ins.insert(*at, entry.clone());
+        }
+        let tree_ins_counts = probe.stop();
+
+        // ARM 2: the same B-tree built by `collect`. This arm is here because an earlier version
+        // of this module ASSUMED `collect` packs the leaves and is therefore the tree at its
+        // cheapest. THE MEASUREMENT REFUTES THAT at every occupancy in this table -- it costs more
+        // than the ascending inserts, not less -- so the arm is kept precisely to carry the
+        // correction, and the cheapest tree arm is computed below rather than assumed.
+        let probe = crate::alloc_probe::Probe::start();
+        let tree_coll: BTreeMap<u64, ElementEntry> = points.iter().cloned().collect();
+        let tree_coll_counts = probe.stop();
+
+        // ARM 3: AN AMORTISED-DOUBLING OWNED ARRAY -- `Option<Box<Vec<Point>>>`, filled by
+        // ascending appends. This is the payload shape of the owned series type on the open
+        // conversion branch, measured as the SHAPE rather than through that type, so this table
+        // stands on `main` and can inform that branch before it merges rather than after.
+        let probe = crate::alloc_probe::Probe::start();
+        let mut doubling: Option<Box<Vec<Point>>> = None;
+        for point in &points {
+            doubling
+                .get_or_insert_with(|| Box::new(Vec::new()))
+                .push(point.clone());
+        }
+        let doubling_counts = probe.stop();
+
+        // ARM 4: THE FLOOR -- an exact-capacity owned slice, `Option<Box<[Point]>>`. `to_vec`
+        // allocates exactly `len`, so `into_boxed_slice` does not reallocate and the reading is
+        // the resident cost of a buffer holding n points and nothing spare. This is a FOOTPRINT
+        // floor and not an append path: the churn an exact-growth policy would pay is arm 5.
+        let probe = crate::alloc_probe::Probe::start();
+        let exact: Option<Box<[Point]>> = Some(points.as_slice().to_vec().into_boxed_slice());
+        let exact_counts = probe.stop();
+
+        // ARM 5: THE HYBRID ALREADY PRESENT IN THIS TREE. `HashFieldMap` is a sorted owned array with
+        // `EXACT_GROWTH_BELOW: usize = 8` -- exact capacity below eight entries, amortised above --
+        // so the policy is measured here rather than proposed. Its allocation column is where the
+        // footprint-for-churn trade is paid, and the band just above the threshold is where it
+        // stops helping.
+        let probe = crate::alloc_probe::Probe::start();
+        let mut hybrid_buf: Vec<Point> = Vec::new();
+        for point in &points {
+            if hybrid_buf.len() < 8 {
+                hybrid_buf.reserve_exact(1);
+            }
+            hybrid_buf.push(point.clone());
+        }
+        let hybrid: Option<Box<Vec<Point>>> = Some(Box::new(hybrid_buf));
+        let hybrid_counts = probe.stop();
+
+        // Held live across every stop so nothing above was freed inside a span.
+        std::hint::black_box((&tree_ins, &tree_coll, &doubling, &exact, &hybrid));
+
+        // DENOMINATORS, CHECKED PER ARM. An arm holding a different number of points would make
+        // every ratio in this table a comparison of two different things.
+        assert_eq!(n, tree_ins.len(), "denominator: {n} points, tree_insert");
+        assert_eq!(n, tree_coll.len(), "denominator: {n} points, tree_collect");
+        assert_eq!(
+            n,
+            doubling.as_ref().map_or(0, |v| v.len()),
+            "denominator: {n} points, array_doubling"
+        );
+        assert_eq!(
+            n,
+            exact.as_ref().map_or(0, |s| s.len()),
+            "denominator: {n} points, array_exact"
+        );
+        assert_eq!(
+            n,
+            hybrid.as_ref().map_or(0, |v| v.len()),
+            "denominator: {n} points, array_hybrid"
+        );
+
+        let bytes = [
+            tree_ins_counts.chunk_bytes,
+            tree_coll_counts.chunk_bytes,
+            doubling_counts.chunk_bytes,
+            exact_counts.chunk_bytes,
+            hybrid_counts.chunk_bytes,
+        ];
+        let allocs = [
+            tree_ins_counts.allocs,
+            tree_coll_counts.allocs,
+            doubling_counts.allocs,
+            exact_counts.allocs,
+            hybrid_counts.allocs,
+        ];
+        println!(
+            "{:>6} | {:>11} {:>4} | {:>12} {:>4} | {:>14} {:>4} | {:>11} {:>4} | {:>12} {:>4}",
+            n, bytes[0], allocs[0], bytes[1], allocs[1], bytes[2], allocs[2], bytes[3], allocs[3],
+            bytes[4], allocs[4]
+        );
+        rows.push((n, bytes, allocs));
