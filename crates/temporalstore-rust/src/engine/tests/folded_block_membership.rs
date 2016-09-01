@@ -125,3 +125,131 @@ fn a_folded_blocks_membership_now_states_the_member_the_live_index_no_longer_nam
          claims to be asking about"
     );
 
+    // Both removal counters are floored over the removal below, so a removal that recorded NOTHING
+    // in the pages cannot pass as one that did.
+    crate::engine::container_blocks::reset_unframed_container_removal_count();
+    crate::engine::execute_on_shard::reset_tombstone_append_failure_count();
+
+    let victim = members[3].clone();
+    let victim_component = hex::encode(&victim);
+    write(
+        &engine,
+        Command::SetRemove {
+            key: "folded".to_string(),
+            member: victim.clone(),
+        },
+    );
+
+    assert_eq!(
+        0,
+        crate::engine::container_blocks::unframed_container_removal_count(),
+        "the removal could not frame a tombstone page, so the pages say nothing about it"
+    );
+    assert_eq!(
+        0,
+        crate::engine::execute_on_shard::tombstone_append_failure_count(),
+        "the removal could not append its tombstone page"
+    );
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+
+    // SIDE 1: what the engine SERVES as this object's membership -- the resident map.
+    //
+    // RE-ATTRIBUTED, AND THAT IS THE ONE EDIT THE WIDTH STEP FORCED IN THIS ARM. This side read
+    // `bucket_index_component_block_addresses` and recovered each member from the page entry's own
+    // element name. `BlockIndex` has no element-name field now, so that walk answers for NO
+    // members, and this arm's floor is what said so: "the live index names 0 of 12 members after
+    // one removal, so the removal did not do what this fixture assumes". The removal was fine; the
+    // SOURCE moved.
+    //
+    // `shard.sets` is where it moved to. It is durable (`#[serde(default)]`) and it is what
+    // `SetMembers` and `SetLen` answer from, so it is the served membership in the same sense the
+    // index walk used to be. THE PAIR IS STRONGER THAN IT WAS, not weaker: the entry's element name
+    // and the page's payload were both written by the same append, so agreeing told you little
+    // about either, whereas the resident map is maintained by the command path and the pages by the
+    // append path. Two artefacts that can disagree.
+    let served: BTreeSet<Vec<u8>> = shard
+        .sets
+        .get("folded")
+        .map(|members| members.keys().cloned().collect())
+        .unwrap_or_default();
+
+    // SIDE 2: every page this object resolves to, TOMBSTONE ENTRIES INCLUDED.
+    //
+    // NO `page.deleted` SKIP, and that is the one line that differs from the refutation's walk. A
+    // tombstone entry is precisely a deleted entry, so a walk that filtered them would read the page
+    // set as it was before this change and would resurrect the member -- which is what makes the
+    // absence of that filter the subject here rather than an incidental difference.
+    let mut addresses: Vec<crate::block_store::ElementEntry> = Vec::new();
+    let mut live_entries = 0usize;
+    let mut tombstone_entries = 0usize;
+    let named = super::BlockObjects::of(&shard.bucket_index);
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for (handle, block) in &bucket.block_index {
+            if block.model_id.as_str() != "set"
+                || &**named.at(bucket.routing_bucket, *handle) != "folded"
+            {
+                continue;
+            }
+            if block.deleted {
+                tombstone_entries += 1;
+            } else {
+                live_entries += 1;
+            }
+            addresses.push(block.address.clone());
+        }
+    }
+
+    assert!(
+        tombstone_entries > 0,
+        "DENOMINATOR: the removal left no tombstone entry, so there is no page for the derivation to \
+         read the removal out of and any agreement below would be an agreement about nothing"
+    );
+    assert!(live_entries > 0, "DENOMINATOR: no live entries for this object");
+
+    let derived = crate::engine::container_membership::derive_membership(
+        "set",
+        addresses,
+        |address| engine.block_store.read(address).ok(),
+    );
+
+    println!("=== after a fold and one removal ===");
+    println!(
+        "  entries: {live_entries} live, {tombstone_entries} tombstone; \
+         {} distinct page(s) read, {} of the first shape",
+        derived.blocks_read, derived.live_only_blocks
+    );
+    println!(
+        "  the resident map holds {} member(s); the pages derive {} live and {} removed",
+        served.len(),
+        derived.live.len(),
+        derived.removed.len()
+    );
+    println!(
+        "  the removed member: held by the resident map = {}, derived live from the pages = {}, \
+         NAMED REMOVED by the pages = {}",
+        served.contains(&victim),
+        derived.live.contains_key(&victim_component),
+        derived.removed.contains(&victim_component)
+    );
+    println!(
+        "  derivation failures: {} read, {} undecodable, {} unframed, {} unrenderable",
+        derived.read_failures, derived.undecodable, derived.unframed, derived.unrenderable_items
+    );
+
+    // DENOMINATORS FIRST. A zero on either side makes every comparison below empty.
+    assert!(
+        derived.blocks_read > 0,
+        "DENOMINATOR: no pages read for this object"
+    );
+    assert_eq!(
+        MEMBERS - 1,
+        served.len(),
+        "the resident map holds {} of {MEMBERS} members after one removal, so the removal did not \
+         do what this fixture assumes",
+        served.len()
+    );
+    // NOT VACUOUS, AND IT WAS ON ITS WAY TO BEING SO. Against the index walk this read
+    // `!named.contains(&victim)` over a set that had become EMPTY for every kind, so it could only
+    // ever pass. Against the resident map the set holds eleven real members and this asks a

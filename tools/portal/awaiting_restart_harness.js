@@ -110,3 +110,59 @@ const build = new Function("$", "esc", "say", "window",
   extract("function showSetting(key)") + "\n" +
   extract("function renderAwaiting(keys)") + "\n" +
   "return { showSetting: showSetting, renderAwaiting: renderAwaiting };");
+const panel = build($, esc, say, window_);
+
+/* ---------- what it names ---------- */
+panel.renderAwaiting([]);
+ok("nothing waiting: the panel is not shown", box.hidden === true);
+ok("nothing waiting: it says nothing", box.innerHTML === "", JSON.stringify(box.innerHTML));
+
+panel.renderAwaiting(["ingestion.bulk_ingest", "extraction.provider"]);
+ok("the panel appears when something is waiting", box.hidden === false);
+ok("it says how many", box.innerHTML.indexOf("2 settings are waiting") >= 0, box.innerHTML);
+ok("it names the first", box.innerHTML.indexOf("ingestion.bulk_ingest") >= 0);
+ok("it names the second", box.innerHTML.indexOf("extraction.provider") >= 0);
+ok("each name is something you can click",
+   (box.innerHTML.match(/data-goto="/g) || []).length === 2, box.innerHTML);
+
+panel.renderAwaiting(["extraction.provider"]);
+ok("one waiting reads as one", box.innerHTML.indexOf("1 setting is waiting") >= 0, box.innerHTML);
+
+/* ---------- where a name takes you ---------- */
+ok("FLOOR: the group starts shut", group.open === false);
+ok("FLOOR: the row starts hidden", field.classes.has("hidden") === true);
+
+const went = panel.showSetting("ingestion.bulk_ingest");
+ok("it reports having gone somewhere", went === true);
+ok("the group it was folded into is opened", group.open === true);
+ok("the group is not left hidden", group.hidden === false);
+ok("a filtered-out row is uncovered", field.classes.has("hidden") === false);
+ok("the settings tab is opened", shown.indexOf("settings") >= 0, JSON.stringify(shown));
+ok("the control is scrolled to", control.scrolled === true);
+ok("and focused, so it is obvious which one", control.focused === true);
+
+/* ---------- a name for a setting that is not loaded ---------- */
+const missing = panel.showSetting("not.a.setting");
+ok("an unloaded setting is refused rather than silently doing nothing", missing === false);
+ok("and says why", said.some((t) => /admin key/.test(t)), JSON.stringify(said));
+
+/* ---------- the wiring, run rather than read ---------- */
+const listenerSource = (() => {
+  const start = page.indexOf('$("awaitingRestart").addEventListener("click"');
+  if (start < 0) { return null; }
+  /* Match from addEventListener's OWN parenthesis. Starting at the first "(" after `start` closes
+     on `$("awaitingRestart")` and yields a statement that registers nothing -- which then reads as
+     "the page has no handler" rather than "the harness looked in the wrong place". */
+  let depth = 0;
+  for (let i = page.indexOf("(", page.indexOf("addEventListener", start)); i < page.length; i++) {
+    if (page[i] === "(") { depth += 1; }
+    else if (page[i] === ")") { depth -= 1; if (depth === 0) { return page.slice(start, i + 1); } }
+  }
+  return null;
+})();
+ok("the panel has a click handler at all", listenerSource !== null);
+if (listenerSource) {
+  let handler = null;
+  const capturing = (id) => ({ addEventListener: (_name, fn) => { handler = fn; } });
+  new Function("$", "showSetting", listenerSource + ";")(capturing, () => {});
+  ok("the handler is registered on click", typeof handler === "function");
