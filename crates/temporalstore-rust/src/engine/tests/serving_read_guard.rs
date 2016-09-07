@@ -43,3 +43,95 @@ fn cold_wide_hash(dir: &std::path::Path) -> TemporalEngine {
 fn measured_hash_get_all(
     engine: &TemporalEngine,
 ) -> (crate::engine::MaintenanceBlockReadCounts, usize) {
+    crate::engine::reset_maintenance_block_read_counts();
+    let response = engine.execute_durable(ExecuteRequest {
+        shard_id: 1,
+        command: Command::HashGetAll {
+            key: "wide".to_string(),
+        },
+    });
+    assert!(response.status.ok, "read: {:?}", response.status);
+    let fields = match response.response {
+        CommandResponse::HashEntries { entries } => entries.len(),
+        other => panic!("expected HashEntries, got {other:?}"),
+    };
+    (crate::engine::maintenance_block_read_counts(), fields)
+}
+
+/// The serving read fast path reads its pages AFTER the shard-table read guard drops.
+///
+/// A read guard is the easy one to leave in place, because admitting other readers does not look
+/// like exclusion. It is: it excludes every WRITER on the shard for as long as it is held, and
+/// this path held it across one block-store read PER FIELD. The window therefore scaled with the
+/// WIDTH of the value being served -- a 64-field hash stopped all writes on the shard for 64
+/// reads -- which is a property of the request, not of any per-round budget.
+///
+/// TWO arms, ONE process, the same fixture:
+///   * UNDER THE GUARD -- where the reads used to be. The positive control: the counter has to
+///     produce a non-zero number inside the region, or the zero below is a broken counter rather
+///     than a shortened hold.
+///   * SHIPPED -- the addresses are chosen under the guard, the pages are read after it drops.
+/// Both arms must read the same pages, which is what stops this from being satisfied by a read
+/// that found everything cached or served nothing.
+#[test]
+fn the_serving_fast_path_reads_blocks_after_the_shard_guard_drops() {
+    let control_dir = tempfile::tempdir().unwrap();
+    let control_engine = cold_wide_hash(control_dir.path());
+    crate::engine::shard_write_guard::serve_fast_path_under_shard_guard_for_test(true);
+    let (control, control_fields) = measured_hash_get_all(&control_engine);
+    crate::engine::shard_write_guard::serve_fast_path_under_shard_guard_for_test(false);
+
+    let shipped_dir = tempfile::tempdir().unwrap();
+    let shipped_engine = cold_wide_hash(shipped_dir.path());
+    let (shipped, shipped_fields) = measured_hash_get_all(&shipped_engine);
+
+    eprintln!(
+        "[serving read] under the guard: {} of {} page read(s) under the guard, \
+{control_fields} field(s) served",
+        control.block_reads_under_guard, control.block_reads_total,
+    );
+    eprintln!(
+        "[serving read] shipped:         {} of {} page read(s) under the guard, \
+{shipped_fields} field(s) served",
+        shipped.block_reads_under_guard, shipped.block_reads_total,
+    );
+
+    // DENOMINATOR ONE -- the width. Asserted on its own: a hold that scales with the field count
+    // is only demonstrated against a value that HAS fields, and "0 reads under the guard" is
+    // satisfied perfectly by a hash that served none.
+    assert_eq!(
+        control_fields, FIELDS,
+        "the control arm served {control_fields} field(s), not {FIELDS}",
+    );
+    assert_eq!(
+        shipped_fields, FIELDS,
+        "the shipped arm served {shipped_fields} field(s), not {FIELDS}",
+    );
+
+    // DENOMINATOR TWO -- the reads. Asserted apart from the width above, so the two cannot
+    // cancel, and apart from the under-guard tally below, so a path that read NOTHING cannot
+    // satisfy the claim that it read nothing under the guard.
+    assert_eq!(
+        control.block_reads_total, FIELDS as u64,
+        "the control arm went to the block store {} time(s) for a {FIELDS}-field hash; if this \
+is zero the fixture was still cached and neither arm is a subject",
+        control.block_reads_total,
+    );
+    assert_eq!(
+        shipped.block_reads_total, FIELDS as u64,
+        "the shipped arm went to the block store {} time(s) for a {FIELDS}-field hash",
+        shipped.block_reads_total,
+    );
+
+    // POSITIVE CONTROL: the counter can see a read inside the region, because here are 64.
+    assert_eq!(
+        control.block_reads_under_guard, FIELDS as u64,
+        "the control arm reads every page inside the guarded region and the counter saw {} of \
+{}. The measurement is broken, not the code under it: the assertion below would pass against an \
+engine that had stopped counting entirely",
+        control.block_reads_under_guard, control.block_reads_total,
+    );
+
+    // THE ASSERTION THE REGION CHANGE MADE.
+    assert_eq!(
+        shipped.block_reads_under_guard, 0,

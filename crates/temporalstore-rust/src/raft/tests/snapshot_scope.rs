@@ -204,3 +204,107 @@ fn a_scoped_image_still_serves_every_record_the_shard_held() {
     );
 
     // Exactly what the install does with an image, on a fresh private engine.
+    let restored = TemporalEngine::default();
+    let block_store = restored.block_store();
+    for slab in &image.slabs {
+        block_store
+            .install_slab(slab.block_slab_id, &slab.bytes)
+            .expect("installing a carried slab must succeed");
+    }
+    restored
+        .install_index_bytes(
+            1,
+            &image.index_bytes,
+            image.routing_range.expect("a built image carries its routing range"),
+        )
+        .expect("installing the served index must succeed");
+    restored.load_shard(1);
+
+    let mut index = 0usize;
+    while index < 40 {
+        assert_eq!(
+            restored
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: format!("shard1-{index:05}"),
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(vec![b'v'; 256])
+            },
+            "the scoped image dropped a slab shard 1's index still addresses: key \
+             shard1-{index:05} did not come back"
+        );
+        index += 1;
+    }
+}
+
+/// How much of finding 1 is LIVE rather than latent, stated as a measurement rather than as a
+/// reassurance. Every engine a raft node serves from is built by this crate with exactly one
+/// shard loaded into its own scratch block store, so today the over-carry multiplier on the
+/// serving path is 1.0 and the scope above is what keeps it there.
+#[test]
+fn a_raft_node_engine_hosts_exactly_one_shard_today() {
+    let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);
+    let mut index = 0usize;
+    while index < 64 {
+        cluster
+            .propose(Command::StringSet {
+                key: format!("key-{index:05}"),
+                value: vec![b'v'; 256],
+            })
+            .expect("propose must succeed");
+        index += 1;
+    }
+
+    let engine = cluster
+        .node_engine_for_test(1)
+        .expect("the leader must have an engine");
+    let this_shard = engine.live_block_slab_ids(1);
+    let whole_node = engine.live_block_slab_ids_all_shards();
+    println!("live_slabs_shard1    = {}", this_shard.len());
+    println!("live_slabs_whole_node= {}", whole_node.len());
+
+    assert!(
+        !this_shard.is_empty(),
+        "the leader engine holds no live slabs for its own shard, so this comparison is vacuous"
+    );
+    assert_eq!(
+        this_shard, whole_node,
+        "a raft node's engine is hosting a shard other than its own, so the over-carry this \
+         file scopes away is LIVE on the serving path and not merely latent"
+    );
+}
+
+/// FINDING 2, first half: no slab is installed while the cluster write guard is held.
+#[test]
+fn installing_a_snapshot_does_no_slab_work_under_the_cluster_write_guard() {
+    // POSITIVE CONTROL FIRST, so it cannot be skipped by an earlier failure. It proves the
+    // detector can attribute work to the guarded span at all -- without it, a `GuardMark` that
+    // never arms and an install that never runs under the guard are the same measurement --
+    // and that `Drop` disarms it again.
+    install_probe::reset();
+    {
+        let _mark = install_probe::GuardMark::new();
+        install_probe::note_slab_install();
+    }
+    install_probe::note_slab_install();
+    let control = install_probe::counts();
+    println!("control_total        = {}", control.slabs_total);
+    println!("control_under_guard  = {}", control.slabs_under_guard);
+    assert_eq!(
+        control.slabs_total, 2,
+        "the probe did not count both noted installs, so it cannot be trusted below"
+    );
+    assert_eq!(
+        control.slabs_under_guard, 1,
+        "the probe cannot tell work inside the guarded span from work outside it, so a zero \
+         below would mean nothing"
+    );
+
+    // Rolled between batches so the image carries SEVERAL slabs: "0 of 1" would be a much
+    // weaker statement than "0 of n", and one slab is within noise of an install that happens
+    // to carry none.
+    let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);

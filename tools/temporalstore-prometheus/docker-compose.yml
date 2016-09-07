@@ -32,3 +32,37 @@ services:
       - ./vars-exporter/metrics:/var/lib/node_exporter/textfile_collector
     command:
       - /bin/sh
+      - -c
+      - >
+        python /app/vars_to_prom.py
+        --targets "$VARS_TARGETS"
+        --interval "$VARS_INTERVAL_SECONDS"
+        --output-dir "$VARS_OUTPUT_DIR"
+        --output-file "$VARS_OUTPUT_FILE"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - temporalstore-monitor
+    depends_on:
+      - node-exporter
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: temporalstore-prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.enable-lifecycle
+    ports:
+      - "9090:9090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Every file `prometheus.yml` names under `rule_files` has to be here. Prometheus fails its
+      # config load on a rule file it cannot read, so a listed-but-unmounted one does not lose one
+      # alert group -- it stops the stack coming up at all. The gateway rules were the one missing,
+      # and they are the ones covering retrieval on hash vectors and extraction making no call.
+      - ./temporalstore-alerts.yml:/etc/prometheus/temporalstore-alerts.yml:ro
+      - ./matrixark-gateway-alerts.yml:/etc/prometheus/matrixark-gateway-alerts.yml:ro
