@@ -243,3 +243,248 @@ pub(super) fn reconcile_slab_manifest_with_disk(
         .min(ordered_slab_ids.len().max(1));
     type InspectedSlab = (u64, BlockStoreSlabReport, Option<u64>, Option<u64>, u64, u64);
     // A BATCH at a time. Fanning out over the whole list first was the same 2x, but held every
+    // slab's report until the update loop ran and took peak RSS from 385 MB to ~960 MB. Worker
+    // count made no difference to that, which is the tell: it is the retained reports, not the slab
+    // buffers. One batch in flight keeps the speed and the memory.
+    for batch in ordered_slab_ids.chunks(workers.max(1)) {
+        let mut inspected: Vec<Option<Result<InspectedSlab, std::io::Error>>> =
+            (0..batch.len()).map(|_| None).collect();
+        std::thread::scope(|scope| {
+            for (slot, block_slab_id) in inspected.iter_mut().zip(batch.iter()) {
+                scope.spawn(move || {
+                    let path = slab_path(root, *block_slab_id);
+                    // A TALLY PER WORKER, because this read happens on a thread this scope
+                    // SPAWNED. The tally publishes into the process counter when it drops at the
+                    // end of this closure, which is the only reason a worker's bytes reach the
+                    // total at all -- and the reason the counter beside it is process-wide with
+                    // no thread-local twin. These threads do not exist before the open or after
+                    // it, so `/proc/thread-self/io` on the caller never sees a byte of this, and
+                    // neither would a thread-local counter.
+                    let mut tally = BlockStoreReadTally::start();
+                    // The read is consumed FIRST, which ends its borrow of the tally; only then
+                    // can the tally be asked what it took. Reading it inside the closure below
+                    // would hold an immutable borrow inside a mutable one.
+                    let read = read_block_store_file(&path, &mut tally)
+                        .map(|read| read.into_bytes_charged_to_the_process_only());
+                    let (taken_bytes, taken_reads) = tally.taken();
+                    *slot = Some(read.map(|bytes| {
+                        let report = inspect_slab(&bytes, *block_slab_id);
+                        let created =
+                            file_created_unix_ms(&path).or_else(|| file_modified_unix_ms(&path));
+                        let updated =
+                            file_modified_unix_ms(&path).or_else(|| file_created_unix_ms(&path));
+                        (
+                            bytes.len() as u64,
+                            report,
+                            created,
+                            updated,
+                            taken_bytes,
+                            taken_reads,
+                        )
+                    }));
+                });
+            }
+        });
+
+        for (slot, block_slab_id) in inspected.iter_mut().zip(batch.iter()) {
+            let (
+                physical_bytes,
+                report,
+                created_unix_ms,
+                updated_unix_ms,
+                taken_bytes,
+                taken_reads,
+            ) = slot
+                .take()
+                .expect("every slab in the batch is inspected exactly once")?;
+            file_bytes_read = file_bytes_read.saturating_add(taken_bytes);
+            file_reads = file_reads.saturating_add(taken_reads);
+            let desired_state = if *block_slab_id == latest {
+            BlockStoreSlabState::Active
+        } else {
+            BlockStoreSlabState::Sealed
+        };
+        match slabs.get_mut(block_slab_id) {
+            Some(slab) => {
+                let old = slab.clone();
+                let content_changed = slab.stored_slab_id != *block_slab_id
+                    || slab.block_slab_id != *block_slab_id
+                    || slab.state != desired_state
+                    || slab.physical_bytes != physical_bytes
+                    || slab.logical_bytes != report.logical_bytes
+                    || slab.first_block_id != report.first_block_id
+                    || slab.last_block_id != report.last_block_id
+                    || slab.readable_prefix_physical_bytes
+                        != report.readable_prefix_physical_bytes
+                    || slab.has_corruption != report.has_corruption
+                    || slab.first_error_offset != report.first_error_offset
+                    || slab.first_error != report.first_error;
+                slab.stored_slab_id = *block_slab_id;
+                slab.block_slab_id = *block_slab_id;
+                slab.state = desired_state;
+                slab.physical_bytes = physical_bytes;
+                slab.logical_bytes = report.logical_bytes;
+                slab.created_unix_ms = slab.created_unix_ms.or(created_unix_ms);
+                if content_changed {
+                    slab.updated_unix_ms = updated_unix_ms;
+                }
+                slab.first_block_id = report.first_block_id;
+                slab.last_block_id = report.last_block_id;
+                slab.readable_prefix_physical_bytes = report.readable_prefix_physical_bytes;
+                slab.has_corruption = report.has_corruption;
+                slab.first_error_offset = report.first_error_offset;
+                slab.first_error = report.first_error;
+                // What this descriptor has now been verified against, so the next open can tell
+                // whether the file still matches without reading it.
+                slab.verified_source_mtime_unix_ms = updated_unix_ms;
+                changed |= *slab != old;
+            }
+            None => {
+                slabs.insert(
+                    *block_slab_id,
+                    BlockStoreSlabDescriptor {
+                        stored_slab_id: *block_slab_id,
+                        block_slab_id: *block_slab_id,
+                        state: desired_state,
+                        physical_bytes,
+                        logical_bytes: report.logical_bytes,
+                        created_unix_ms,
+                        updated_unix_ms,
+                        first_block_id: report.first_block_id,
+                        last_block_id: report.last_block_id,
+                        readable_prefix_physical_bytes: report.readable_prefix_physical_bytes,
+                        // Just inspected, so record what it was verified against; otherwise the
+                        // next open re-reads and re-hashes a slab this one already proved.
+                        verified_source_mtime_unix_ms: updated_unix_ms,
+                        has_corruption: report.has_corruption,
+                        first_error_offset: report.first_error_offset,
+                        first_error: report.first_error,
+                    },
+                );
+                changed = true;
+            }
+            }
+        }
+    }
+
+    for (block_slab_id, report) in &delayed_slabs {
+        let old = slabs.get(block_slab_id).cloned();
+        slabs.insert(
+            *block_slab_id,
+            BlockStoreSlabDescriptor {
+                stored_slab_id: *block_slab_id,
+                block_slab_id: *block_slab_id,
+                state: BlockStoreSlabState::DelayedDestroy,
+                physical_bytes: report.physical_bytes,
+                logical_bytes: old.as_ref().map(|slab| slab.logical_bytes).unwrap_or(0),
+                created_unix_ms: old
+                    .as_ref()
+                    .and_then(|slab| slab.created_unix_ms)
+                    .or(report.modified_unix_ms),
+                updated_unix_ms: report.modified_unix_ms,
+                first_block_id: old.as_ref().and_then(|slab| slab.first_block_id),
+                last_block_id: old.as_ref().and_then(|slab| slab.last_block_id),
+                readable_prefix_physical_bytes: 0,
+                verified_source_mtime_unix_ms: None,
+                has_corruption: false,
+                first_error_offset: None,
+                first_error: None,
+            },
+        );
+        changed |= slabs.get(block_slab_id) != old.as_ref();
+    }
+
+    let known_ids = slabs.keys().copied().collect::<Vec<_>>();
+    for block_slab_id in known_ids {
+        if live_slab_ids.contains(&block_slab_id)
+            || delayed_slabs.contains_key(&block_slab_id)
+        {
+            continue;
+        }
+        if let Some(slab) = slabs.get_mut(&block_slab_id) {
+            if slab.state != BlockStoreSlabState::Purged {
+                slab.state = BlockStoreSlabState::Purged;
+                slab.updated_unix_ms = Some(now_unix_ms());
+                changed = true;
+            }
+        }
+    }
+
+    // NORMALISE THE GROUPING ID ON EVERY DESCRIPTOR, not only on the ones this open re-read.
+    //
+    // The stored id IS the slab id, and every path that WRITES one now writes the slab id itself,
+    // so a descriptor this process builds cannot diverge. The manifest is the one way a different
+    // number enters: `stored_slab_id` serializes -- under the older `band_id` key -- and
+    // `load_slab_manifest_at` keeps whatever the file carried. The inspect loop above rewrites
+    // it, but only for the slabs it actually inspected, and by default this open deliberately
+    // SKIPS every sealed slab whose size and mtime still match what it was verified against. A
+    // descriptor on that skip route, and one for a slab no longer on disk at all, never reached
+    // that write.
+    //
+    // It matters because consumers read the STORED value instead of recomputing it:
+    // `gc_utility_candidates` groups slabs by it in two places, and `compute_slab_usage`
+    // keys its per-slab usage rows by it. Two slabs carrying one id there are summed together, so
+    // each slab's GC utility is scored against the other slab's bytes. Enforcing the invariant
+    // once, here, at the only point a stored id enters the process, is what makes every consumer
+    // -- including the next one written -- correct without having to know about this.
+    for (block_slab_id, slab) in slabs.iter_mut() {
+        let normalised_slab_id = *block_slab_id;
+        if slab.stored_slab_id != normalised_slab_id || slab.block_slab_id != *block_slab_id {
+            slab.stored_slab_id = normalised_slab_id;
+            slab.block_slab_id = *block_slab_id;
+            changed = true;
+        }
+    }
+
+    Ok(SlabManifestReconcileOutcome {
+        changed,
+        slabs_skipped_reinspection,
+        file_bytes_read,
+        file_reads,
+    })
+}
+
+/// How much of the manifest is held in memory on the way to the file.
+///
+/// One `write(2)` per full buffer, so this trades a fixed 256 KiB of resident memory against the
+/// syscall count. MEASURED over the 21 MB manifest of a shard holding 80,000 slabs: 81 syscalls,
+/// against 8,000,021 for the same document written straight at the file.
+const MANIFEST_WRITE_BUFFER_BYTES: usize = 256 * 1024;
+
+/// Write the whole slab manifest out, and COUNT that it happened.
+///
+/// THE COUNTER IS A PARAMETER, NOT THE CALLER'S RESPONSIBILITY. `slab_manifest_writes` used to be
+/// bumped by hand at the call sites, and exactly ONE of the twelve did it -- the periodic write in
+/// `install_slab`. Every other route here, the slab roll included, wrote a whole manifest the
+/// counter never saw, so a rolling round reported zero manifest writes while its roll barriers
+/// fired. Taking `stats` makes counting a condition of calling at all, the way
+/// `manifest_file_writes` counts inside the writer it wraps: a new call site cannot compile
+/// without handing over somewhere to count.
+pub(super) fn persist_slab_manifest(
+    root: &Path,
+    slabs: &BTreeMap<u64, BlockStoreSlabDescriptor>,
+    stats: &mut BlockStoreStats,
+) -> Result<(), BlockStoreError> {
+    std::fs::create_dir_all(root)?;
+    let path = slab_manifest_path(root);
+    let temp_path = path.with_extension(format!(
+        "json.tmp.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    ));
+    let manifest = BlockStoreSlabManifest {
+        version: 1,
+        slabs: slabs.values().cloned().collect(),
+    };
+    {
+        // BUFFERED, AND COMPACT. Both halves of this line were paying per slab.
+        //
+        // `serde_json` emits a document in fragments and hands each to the writer on its own, so
+        // writing straight at a `File` spent one `write(2)` per fragment: 800,021 syscalls for one
+        // 2,813,816-byte manifest at 8,000 slabs, 3.5 bytes apiece. A buffer turns that into one
+        // syscall per full buffer, and the count is what says so rather than a wall time taken on
+        // a shared box.
+        //
+        // Pretty-printing was the other half: the indentation is itself fragments, and a manifest
