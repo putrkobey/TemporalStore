@@ -140,3 +140,146 @@ pub fn reference_open_source_model_profiles() -> Vec<ContextReferenceModelProfil
                 "reference_reader_parity".to_string(),
                 "chat_context_extraction".to_string(),
                 "semantic_retrieval".to_string(),
+                "locomo_context_benchmark".to_string(),
+                "longmemeval_s_context_benchmark".to_string(),
+            ],
+            notes: "Reference benchmark reader profile using GPT-4o-mini through an OpenAI-compatible /v1/chat/completions endpoint."
+                .to_string(),
+        },
+        ContextReferenceModelProfile {
+            profile_name: "matrixark-native-oss-context".to_string(),
+            provider_name: "matrixark-native-oss-context".to_string(),
+            provider_kind: ContextProviderKind::OpenAiCompatible,
+            base_url: "http://127.0.0.1:8000/v1".to_string(),
+            chat_model: "google/flan-t5-small".to_string(),
+            vlm_model: "none".to_string(),
+            embedding_model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+            capabilities: vec![
+                "native_path_oss_model_parity".to_string(),
+                "chat_context_extraction".to_string(),
+                "embedding_vectorization".to_string(),
+                "semantic_retrieval".to_string(),
+                "locomo_context_benchmark".to_string(),
+            ],
+            notes: "Matches the MatrixArk OSS benchmark setup from the LLM Specific TemporalStore Use Cases thread: transformers extraction with google/flan-t5-small and sentence-transformers/all-MiniLM-L6-v2 embeddings."
+                .to_string(),
+        },
+        ContextReferenceModelProfile {
+            profile_name: "reference-minigpt4-gpt-style-vlm".to_string(),
+            provider_name: "reference-open-source-gpt-vlm".to_string(),
+            provider_kind: ContextProviderKind::OpenAiCompatible,
+            base_url: "http://127.0.0.1:8000/v1".to_string(),
+            chat_model: "lmsys/vicuna-7b-v1.5".to_string(),
+            vlm_model: "Vision-CAIR/MiniGPT-4".to_string(),
+            embedding_model: "BAAI/bge-m3".to_string(),
+            capabilities: vec![
+                "gpt_style_vlm_reasoning".to_string(),
+                "vlm_image_content_understanding".to_string(),
+                "chat_context_extraction".to_string(),
+                "embedding_vectorization".to_string(),
+                "semantic_retrieval".to_string(),
+            ],
+            notes: "Open-source GPT-4-style VLM profile inspired by MiniGPT-4; serve through an OpenAI-compatible gateway for reference-style image/content understanding."
+                .to_string(),
+        },
+    ]
+}
+
+pub fn reference_context_parity_cases() -> Vec<ContextReferenceParityCase> {
+    vec![
+        ContextReferenceParityCase {
+            case_name: "locomo_multi_hop_project_selection".to_string(),
+            category: "multi_hop_reasoning".to_string(),
+            query: "Which project did Lee pick because Dana suggested it during planning?"
+                .to_string(),
+            positive_memory: "Later planning note: Dana suggested the observability dashboard because the team needed better benchmark traces, so Lee picked that project.".to_string(),
+            stale_memory: "Initial planning thread: Lee considered a search cleanup project and had not chosen the final work item.".to_string(),
+            expected_terms: vec!["Dana".to_string(), "observability dashboard".to_string()],
+            expected_model_profile: "reference-gpt-4o-mini-reader".to_string(),
+            uses_vlm: false,
+            benchmark_proven: true,
+        },
+        ContextReferenceParityCase {
+            case_name: "locomo_temporal_reschedule".to_string(),
+            category: "temporal".to_string(),
+            query: "When is Maya's dentist appointment after it was rescheduled?".to_string(),
+            positive_memory: "Latest calendar update: Maya rescheduled the dentist appointment to Thursday at 3pm after the clinic called.".to_string(),
+            stale_memory: "Earlier memory: Maya had a dentist appointment scheduled for Tuesday morning.".to_string(),
+            expected_terms: vec!["Thursday".to_string(), "3pm".to_string()],
+            expected_model_profile: "reference-gpt-4o-mini-reader".to_string(),
+            uses_vlm: false,
+            benchmark_proven: true,
+        },
+        ContextReferenceParityCase {
+            case_name: "longmem_memory_update_risk_score".to_string(),
+            category: "memory_update".to_string(),
+            query: "What risk score was recorded after the latest fraud review?".to_string(),
+            positive_memory: "Latest fraud review: the checkout risk score was updated to 87 after the payment incident escalated.".to_string(),
+            stale_memory: "Earlier fraud review: the checkout risk score was 42 before the payment incident escalated.".to_string(),
+            expected_terms: vec!["87".to_string()],
+            expected_model_profile: "reference-gpt-4o-mini-reader".to_string(),
+            uses_vlm: false,
+            benchmark_proven: true,
+        },
+        ContextReferenceParityCase {
+            case_name: "locomo_stale_memory_current_pet".to_string(),
+            category: "stale_memory".to_string(),
+            query: "What is the dog's name in the latest pet update?".to_string(),
+            positive_memory: "Latest pet update: the newly adopted dog is named Miso and needs evening walks.".to_string(),
+            stale_memory: "Old profile note: the family dog was called Pepper in a previous home.".to_string(),
+            expected_terms: vec!["Miso".to_string()],
+            expected_model_profile: "reference-gpt-4o-mini-reader".to_string(),
+            uses_vlm: false,
+            benchmark_proven: true,
+        },
+        ContextReferenceParityCase {
+            case_name: "locomo_open_domain_cafe_recommendation".to_string(),
+            category: "open_domain_retrieval".to_string(),
+            query: "Who recommended the cafe that Nina booked after the conference?".to_string(),
+            positive_memory: "Later chat: Omar recommended the quiet riverside cafe, and Nina booked it after the conference.".to_string(),
+            stale_memory: "Earlier conversation: Nina wanted to book a cafe after the conference but had not chosen one yet.".to_string(),
+            expected_terms: vec!["Omar".to_string(), "riverside cafe".to_string()],
+            expected_model_profile: "reference-gpt-4o-mini-reader".to_string(),
+            uses_vlm: false,
+            benchmark_proven: true,
+        },
+        ContextReferenceParityCase {
+            case_name: "reference_vlm_receipt_context".to_string(),
+            category: "vlm_image_content_understanding".to_string(),
+            query: "What merchant and total should be remembered from the receipt image?"
+                .to_string(),
+            positive_memory: "VLM extraction note: the receipt image shows merchant Northstar Cafe and total $18.40 for the lunch order.".to_string(),
+            stale_memory: "Older image note: a different receipt showed merchant Harbor Books and total $42.00.".to_string(),
+            expected_terms: vec!["Northstar Cafe".to_string(), "$18.40".to_string()],
+            expected_model_profile: "reference-minigpt4-gpt-style-vlm".to_string(),
+            uses_vlm: true,
+            benchmark_proven: false,
+        },
+    ]
+}
+
+pub fn context_workflow_state_report() -> ContextWorkflowStateReport {
+    let reference_parity_cases = reference_context_parity_cases();
+    let mut reference_parity_categories = reference_parity_cases
+        .iter()
+        .map(|case| case.category.clone())
+        .collect::<Vec<_>>();
+    reference_parity_categories.sort();
+    reference_parity_categories.dedup();
+    let reference_model_profiles = reference_open_source_model_profiles();
+    let vlm_provider_configured = reference_model_profiles
+        .iter()
+        .any(|profile| profile.vlm_model != "none");
+    ContextWorkflowStateReport {
+        status: Status::ok(),
+        providers: default_context_model_providers(),
+        context_model_descriptors: context_model_descriptors(),
+        reference_model_profiles,
+        reference_parity_cases,
+        reference_parity_categories,
+        open_model_provider_packaged: true,
+        open_model_local_run_proven: false,
+        vlm_provider_configured,
+        vlm_benchmark_proven: false,
+        policy: ContextWorkflowPolicy::default(),
+        parity: context_pipeline_parity_evidence(),
