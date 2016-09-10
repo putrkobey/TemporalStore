@@ -13,19 +13,3 @@
 # script provisions come from one decision rather than two that can disagree.
 #
 # Usage (per node), against a shared filesystem root:
-#   TS_SHARED_STORE_DIR=/mnt/shared/ts TS_META_ADDR=10.0.0.10:17001 \
-#   TS_SERVER_NODE_ID=2 sudo -E tools/deploy_shared_storage.sh
-#
-# or against the object-store service:
-#   TS_MATRIXOBJECT_ENDPOINT=10.0.0.20:17200 TS_META_ADDR=10.0.0.10:17001 \
-#   TS_SERVER_NODE_ID=2 sudo -E tools/deploy_shared_storage.sh
-# =============================================================================
-set -euo pipefail
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deploy_profile_common.sh"
-
-if [[ -z "${TS_SHARED_STORE_DIR:-}" && -z "${TS_MATRIXOBJECT_ENDPOINT:-}" ]]; then
-  echo "[deploy] shared storage needs somewhere to be shared:" >&2
-  echo "         TS_SHARED_STORE_DIR=<root>  or  TS_MATRIXOBJECT_ENDPOINT=<host:port>" >&2
-  exit 1
-fi
-: "${TS_META_ADDR:?shared storage is a multi-node profile - set TS_META_ADDR}"
