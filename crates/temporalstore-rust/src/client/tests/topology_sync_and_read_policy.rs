@@ -678,3 +678,684 @@ fn a_batch_is_split_across_shards_the_table_gained_after_it_was_opened() {
                     json_response(
                         200,
                         &TableTopologyResponse {
+                            status: Status::ok(),
+                            table: Some(crate::meta::TableMetaInfo {
+                                table_id: 1,
+                                namespace: "ns".to_string(),
+                                table_name: "tbl".to_string(),
+                                state: crate::meta::MetaEntityState::Normal,
+                                topology_version: 7 + count,
+                                first_shard_id: 10,
+                                shard_count: count,
+                                replica_count: 1,
+                                partition_version: 0,
+                                serving_options: crate::meta::TableServingOptions::default(),
+                            }),
+                            shards,
+                            unchanged: false,
+                        },
+                    )
+                }
+                ("GET", path) if path.starts_with("/shards/") => {
+                    let shard_id: ShardId = path.trim_start_matches("/shards/").parse().unwrap();
+                    json_response(
+                        200,
+                        &GetShardResponse {
+                            status: Status::ok(),
+                            location: Some(ShardLocation {
+                                registered_at_ms: 0,
+                                state: crate::meta::MetaEntityState::Normal,
+                                shard_id,
+                                server_addr: backend_for_meta.clone(),
+                                latest_snapshot: None,
+                                // This stub pins nothing, which is what every
+                                // shard means until somebody says otherwise.
+                                preferred_location: String::new(),
+                            }),
+                        },
+                    )
+                }
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+    wait_for_http(&meta_addr);
+
+    let client = TemporalStoreClient::with_options(ClientOptions {
+        meta_addr: Some(meta_addr),
+        ..ClientOptions::default()
+    });
+    let table = client.open_table_from_meta("ns", "tbl").unwrap();
+    assert_eq!(table.options().shard_count, 1);
+
+    shard_count.store(4, Ordering::Relaxed);
+    client.sync_table_topology("ns", "tbl").unwrap();
+    assert_eq!(table.options().shard_count, 4);
+
+    let keys: Vec<String> = (0..40).map(|n| format!("key-{n}")).collect();
+    let want: std::collections::BTreeSet<ShardId> =
+        keys.iter().map(|key| table.shard_id_for_key(key)).collect();
+    assert!(
+        want.len() > 1,
+        "the test needs keys that land on different shards; got {want:?}"
+    );
+
+    seen.lock().unwrap().clear();
+    table
+        .batch_execute(
+            keys.iter()
+                .map(|key| Command::StringGet { key: key.clone() })
+                .collect(),
+        )
+        .unwrap();
+
+    let got: std::collections::BTreeSet<ShardId> = seen.lock().unwrap().iter().copied().collect();
+    assert_eq!(
+        got, want,
+        "each command must go to the shard its key routes to, not to the shard the handle was opened on"
+    );
+}
+
+#[test]
+fn a_table_that_asks_for_a_default_value_still_decides_it() {
+    // A table set to shed nothing and to retry no writes, opened by a client that
+    // sheds half its traffic and retries writes twice.
+    //
+    // Both of the table's values equal the field's default. That used to be read as
+    // "the table said nothing", so the client's settings won: the table was shed at
+    // 50% and its writes were retried, which is the reverse of what it asked for.
+    // `drop_percent: 0` is the only way to say "never shed this table" and
+    // `max_write_retries: 0` the only way to say "never retry a write here", so the
+    // two settings whose whole purpose is to hold something back were the two that
+    // could not be expressed.
+    //
+    // max_read_retries is left unset here as the control: it must still come from
+    // the client, or the fix would just be "the table always wins".
+    let meta_addr = free_local_addr();
+    let meta_addr_for_listener = meta_addr.clone();
+    std::thread::spawn(move || {
+        serve(&meta_addr_for_listener, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/tables/topology") => json_response(
+                    200,
+                    &TableTopologyResponse {
+                        status: Status::ok(),
+                        table: Some(crate::meta::TableMetaInfo {
+                            table_id: 1,
+                            namespace: "ns".to_string(),
+                            table_name: "tbl".to_string(),
+                            state: crate::meta::MetaEntityState::Normal,
+                            topology_version: 7,
+                            first_shard_id: 10,
+                            shard_count: 4,
+                            replica_count: 2,
+                            partition_version: 0,
+                            serving_options: crate::meta::TableServingOptions {
+                                drop_percent: 0,
+                                max_write_retries: 0,
+                                set_fields: ["drop_percent", "max_write_retries"]
+                                    .into_iter()
+                                    .map(str::to_string)
+                                    .collect(),
+                                ..crate::meta::TableServingOptions::default()
+                            },
+                        }),
+                        shards: Vec::new(),
+                        unchanged: false,
+                    },
+                ),
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+    wait_for_http(&meta_addr);
+
+    let client = TemporalStoreClient::with_options(ClientOptions {
+        meta_addr: Some(meta_addr.clone()),
+        drop_percent: 50,
+        max_write_retries: 2,
+        max_read_retries: 9,
+        ..ClientOptions::default()
+    });
+    let table = client.open_table_from_meta("ns", "tbl").unwrap();
+    let options = table.options();
+    assert_eq!(
+        options.drop_percent, 0,
+        "the table asked to shed nothing; the client's 50% must not override it"
+    );
+    assert_eq!(
+        options.max_write_retries, 0,
+        "the table asked for no write retries; the client's 2 must not override it"
+    );
+    assert_eq!(
+        options.max_read_retries, 9,
+        "a field the table never set must still come from the client"
+    );
+}
+
+#[test]
+fn a_table_record_written_before_set_fields_still_inherits_from_the_client() {
+    // The compatibility half. Records persisted before tables recorded which fields
+    // they set carry an empty set, and nothing can recover what was meant from the
+    // values alone. Those must keep behaving exactly as they did: a value equal to
+    // the default is read as unset and the client's own option is used.
+    let options = crate::meta::TableServingOptions::default();
+    assert!(options.set_fields.is_empty());
+    for field in [
+        crate::meta::TableServingField::DropPercent,
+        crate::meta::TableServingField::MaxWriteRetries,
+        crate::meta::TableServingField::MaxReadRetries,
+        crate::meta::TableServingField::IoTimeoutMs,
+        crate::meta::TableServingField::ConnectTimeoutMs,
+        crate::meta::TableServingField::RetryBackoffMs,
+        crate::meta::TableServingField::ContinuousFailedTimeMs,
+    ] {
+        assert!(
+            !options.table_decides(field),
+            "{} carries no record of being set, so the client must still decide it",
+            field.name()
+        );
+    }
+    // And a differing value is still read as set, which is all an older record ever
+    // had to go on.
+    let changed = crate::meta::TableServingOptions {
+        drop_percent: 23,
+        ..crate::meta::TableServingOptions::default()
+    };
+    assert!(changed.table_decides(crate::meta::TableServingField::DropPercent));
+}
+
+#[test]
+fn client_applies_metaserver_table_serving_options() {
+    let meta_addr = free_local_addr();
+    let meta_addr_for_listener = meta_addr.clone();
+    std::thread::spawn(move || {
+        serve(&meta_addr_for_listener, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/tables/topology") => json_response(
+                    200,
+                    &TableTopologyResponse {
+                        status: Status::ok(),
+                        table: Some(crate::meta::TableMetaInfo {
+                            table_id: 1,
+                            namespace: "ns".to_string(),
+                            table_name: "tbl".to_string(),
+                            state: crate::meta::MetaEntityState::Normal,
+                            topology_version: 7,
+                            first_shard_id: 10,
+                            shard_count: 4,
+                            replica_count: 2,
+                            partition_version: 0,
+                            serving_options: crate::meta::TableServingOptions {
+                                pin_primary: false,
+                                replica_read_policy: "round_robin_replica".to_string(),
+                                preferred_location: "zone-b".to_string(),
+                                drop_percent: 23,
+                                max_read_retries: 4,
+                                max_write_retries: 2,
+                                retry_backoff_ms: 17,
+                                continuous_failed_time_ms: 19,
+                                io_timeout_ms: 321,
+                                connect_timeout_ms: 123,
+                                set_fields: Default::default(),
+                            },
+                        }),
+                        shards: Vec::new(),
+                        unchanged: false,
+                    },
+                ),
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+    wait_for_http(&meta_addr);
+
+    let client = TemporalStoreClient::with_options(ClientOptions {
+        meta_addr: Some(meta_addr.clone()),
+        drop_percent: 0,
+        ..ClientOptions::default()
+    });
+    let table = client.open_table_from_meta("ns", "tbl").unwrap();
+    let options = table.options();
+    assert!(!options.pin_primary);
+    assert_eq!(
+        options.replica_read_policy,
+        ReplicaReadPolicy::RoundRobinReplica
+    );
+    assert_eq!(options.preferred_location, "zone-b");
+    assert_eq!(options.drop_percent, 23);
+    assert_eq!(options.max_read_retries, 4);
+    assert_eq!(options.max_write_retries, 2);
+    assert_eq!(options.retry_backoff_ms, 17);
+    assert_eq!(options.continuous_failed_time_ms, 19);
+    assert_eq!(options.io_timeout_ms, 321);
+    assert_eq!(options.connect_timeout_ms, 123);
+}
+
+#[test]
+fn table_read_policy_can_select_secondary_from_metaserver_topology() {
+    let primary_addr = free_local_addr();
+    let replica_addr = free_local_addr();
+    let meta_addr = free_local_addr();
+
+    let primary_server = primary_addr.clone();
+    std::thread::spawn(move || {
+        serve(&primary_server, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/execute") => {
+                    let req = parse_json::<ExecuteRequest>(&request.body).unwrap();
+                    match req.command {
+                        Command::StringSet { .. } => json_response(
+                            200,
+                            &ExecuteResponse {
+                                status: Status::ok(),
+                                response: CommandResponse::Empty,
+                            },
+                        ),
+                        Command::StringGet { .. } => json_response(
+                            200,
+                            &ExecuteResponse {
+                                status: Status::ok(),
+                                response: CommandResponse::Bytes {
+                                    value: Some(b"primary".to_vec()),
+                                },
+                            },
+                        ),
+                        _ => json_response(400, &Status::error("bad_request", "unexpected")),
+                    }
+                }
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+
+    let replica_server = replica_addr.clone();
+    std::thread::spawn(move || {
+        serve(&replica_server, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/execute") => {
+                    let req = parse_json::<ExecuteRequest>(&request.body).unwrap();
+                    match req.command {
+                        Command::StringGet { .. } => json_response(
+                            200,
+                            &ExecuteResponse {
+                                status: Status::ok(),
+                                response: CommandResponse::Bytes {
+                                    value: Some(b"replica".to_vec()),
+                                },
+                            },
+                        ),
+                        _ => json_response(
+                            200,
+                            &ExecuteResponse {
+                                status: Status::error("wrong_endpoint", "replica got write"),
+                                response: CommandResponse::Empty,
+                            },
+                        ),
+                    }
+                }
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+
+    let primary_for_meta = primary_addr.clone();
+    let replica_for_meta = replica_addr.clone();
+    let meta_addr_for_listener = meta_addr.clone();
+    std::thread::spawn(move || {
+        serve(&meta_addr_for_listener, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/tables/topology") => json_response(
+                    200,
+                    &TableTopologyResponse {
+                        status: Status::ok(),
+                        table: Some(TableMetaInfo {
+                            table_id: 7,
+                            namespace: "ns".to_string(),
+                            table_name: "tbl".to_string(),
+                            state: crate::meta::MetaEntityState::Normal,
+                            topology_version: 1,
+                            first_shard_id: 1,
+                            shard_count: 1,
+                            replica_count: 2,
+                            partition_version: 0,
+                            serving_options: crate::meta::TableServingOptions::default(),
+                        }),
+                        shards: vec![TableShard {
+                            load_version: 0,
+                            shard_id: 1,
+                            start_bucket: 0,
+                            end_bucket: u64::MAX,
+                            primary: Some(primary_for_meta.clone()),
+                            replicas: vec![primary_for_meta.clone(), replica_for_meta.clone()],
+                            primary_endpoint: None,
+                            replica_endpoints: Vec::new(),
+                        }],
+                        unchanged: false,
+                    },
+                ),
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+    wait_for_http(&primary_addr);
+    wait_for_http(&replica_addr);
+    wait_for_http(&meta_addr);
+
+    let client = TemporalStoreClient::with_options(ClientOptions {
+        proxy_addr: "127.0.0.1:1".to_string(),
+        meta_addr: Some(meta_addr.clone()),
+        route_cache_ttl_ms: 60_000,
+        ..ClientOptions::default()
+    });
+    let synced = client.sync_table_topology("ns", "tbl").unwrap();
+    let table = client.open_table(
+        "ns",
+        "tbl",
+        TableOptions {
+            pin_primary: false,
+            replica_read_policy: ReplicaReadPolicy::FirstReplica,
+            ..synced
+        },
+    );
+
+    table.set("k", b"v".to_vec()).unwrap();
+    assert_eq!(table.get("k").unwrap(), Some(b"replica".to_vec()));
+    assert!(client.stats().route_cache_hits >= 2);
+}
+
+/// A batch of reads reaches the replica; a batch carrying a write reaches the primary.
+///
+/// This is the WIRING, not the decision. `batch_read_policy` is unit-tested beside the route
+/// selection it feeds, but a correct decision that nothing consults routes nothing -- reverting
+/// the call site leaves those unit tests green. Both servers answer `/batch_execute` with their
+/// own name, so the value that comes back names the node that served the batch.
+#[test]
+fn a_read_only_batch_reaches_the_replica_and_a_write_batch_the_primary() {
+    fn answering(addr: &str, name: &'static str) {
+        let addr = addr.to_string();
+        std::thread::spawn(move || {
+            serve(&addr, move |request| {
+                match (request.method.as_str(), request.path.as_str()) {
+                    ("POST", "/batch_execute") => {
+                        let req = parse_json::<BatchExecuteRequest>(&request.body).unwrap();
+                        json_response(
+                            200,
+                            &BatchExecuteResponse {
+                                status: Status::ok(),
+                                responses: req
+                                    .commands
+                                    .iter()
+                                    .map(|_| ExecuteResponse {
+                                        status: Status::ok(),
+                                        response: CommandResponse::Bytes {
+                                            value: Some(name.as_bytes().to_vec()),
+                                        },
+                                    })
+                                    .collect(),
+                            },
+                        )
+                    }
+                    _ => json_response(404, &Status::error("not_found", "not found")),
+                }
+            })
+            .unwrap();
+        });
+    }
+
+    let primary_addr = free_local_addr();
+    let replica_addr = free_local_addr();
+    let meta_addr = free_local_addr();
+    answering(&primary_addr, "primary");
+    answering(&replica_addr, "replica");
+
+    let primary_for_meta = primary_addr.clone();
+    let replica_for_meta = replica_addr.clone();
+    let meta_addr_for_listener = meta_addr.clone();
+    std::thread::spawn(move || {
+        serve(&meta_addr_for_listener, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/tables/topology") => json_response(
+                    200,
+                    &TableTopologyResponse {
+                        status: Status::ok(),
+                        table: Some(TableMetaInfo {
+                            table_id: 7,
+                            namespace: "ns".to_string(),
+                            table_name: "tbl".to_string(),
+                            state: crate::meta::MetaEntityState::Normal,
+                            topology_version: 1,
+                            first_shard_id: 1,
+                            shard_count: 1,
+                            replica_count: 2,
+                            partition_version: 0,
+                            serving_options: crate::meta::TableServingOptions::default(),
+                        }),
+                        shards: vec![TableShard {
+                            load_version: 0,
+                            shard_id: 1,
+                            start_bucket: 0,
+                            end_bucket: u64::MAX,
+                            primary: Some(primary_for_meta.clone()),
+                            replicas: vec![primary_for_meta.clone(), replica_for_meta.clone()],
+                            primary_endpoint: None,
+                            replica_endpoints: Vec::new(),
+                        }],
+                        unchanged: false,
+                    },
+                ),
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+    wait_for_http(&primary_addr);
+    wait_for_http(&replica_addr);
+    wait_for_http(&meta_addr);
+
+    let client = TemporalStoreClient::with_options(ClientOptions {
+        proxy_addr: "127.0.0.1:1".to_string(),
+        meta_addr: Some(meta_addr.clone()),
+        route_cache_ttl_ms: 60_000,
+        ..ClientOptions::default()
+    });
+    let synced = client.sync_table_topology("ns", "tbl").unwrap();
+    let table = client.open_table(
+        "ns",
+        "tbl",
+        TableOptions {
+            pin_primary: false,
+            replica_read_policy: ReplicaReadPolicy::FirstReplica,
+            ..synced
+        },
+    );
+
+    let reads = table
+        .batch_execute(vec![
+            Command::StringGet { key: "k".to_string() },
+            Command::StringGet { key: "k2".to_string() },
+        ])
+        .unwrap();
+    assert!(reads.status.ok, "{:?}", reads.status);
+    assert_eq!(
+        reads.responses[0].response,
+        CommandResponse::Bytes { value: Some(b"replica".to_vec()) },
+        "a batch carrying no writes must follow the table's replica policy, as its reads do          one at a time"
+    );
+
+    let mixed = table
+        .batch_execute(vec![
+            Command::StringGet { key: "k".to_string() },
+            Command::StringSet { key: "k".to_string(), value: b"v".to_vec() },
+        ])
+        .unwrap();
+    assert!(mixed.status.ok, "{:?}", mixed.status);
+    assert_eq!(
+        mixed.responses[0].response,
+        CommandResponse::Bytes { value: Some(b"primary".to_vec()) },
+        "one write takes the whole batch to the primary"
+    );
+}
+
+/// A single-shard table's batch gets one answer per command, or it is refused.
+///
+/// `batch_execute_grouped_by_shard` has always refused a short answer. This path -- the one a
+/// single-shard table takes, and the one the proxy's namespaced batch goes through -- did not, so
+/// the caller got `ok` with a shorter array than it sent and no way to tell which command each
+/// answer belonged to.
+#[test]
+fn a_single_shard_batch_answer_must_cover_every_command() {
+    fn backend_answering(answers: usize) -> String {
+        let body = serde_json::to_vec(&BatchExecuteResponse {
+            status: Status::ok(),
+            responses: (0..answers)
+                .map(|_| ExecuteResponse {
+                    status: Status::ok(),
+                    response: CommandResponse::Empty,
+                })
+                .collect(),
+        })
+        .expect("canned batch response");
+        let mut canned = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        canned.extend_from_slice(&body);
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(listener) => listener,
+                Err(_) => return,
+            };
+            let bound = match listener.local_addr() {
+                Ok(addr) => addr.to_string(),
+                Err(_) => return,
+            };
+            if tx.send(bound).is_err() {
+                return;
+            }
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut scratch = [0u8; 16384];
+                loop {
+                    use std::io::{Read as _, Write as _};
+                    match stream.read(&mut scratch) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {
+                            if stream.write_all(&canned).is_err() {
+                                break;
+                            }
+                            let _ = stream.flush();
+                        }
+                    }
+                }
+            }
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the backend must report its address")
+    }
+
+    let send_five = |addr: &str| -> BatchExecuteResponse {
+        let client = TemporalStoreClient::with_options(ClientOptions {
+            proxy_addr: "127.0.0.1:1".to_string(),
+            // Routed path, with the route already cached, so the dead meta address is never used.
+            meta_addr: Some("127.0.0.1:1".to_string()),
+            route_cache_ttl_ms: 60_000,
+            ..ClientOptions::default()
+        });
+        client.insert_cached_route_for_test(1, addr.to_string());
+        let table = client.open_table(
+            "ns",
+            "tbl",
+            TableOptions {
+                first_shard_id: 1,
+                shard_count: 1,
+                ..TableOptions::default()
+            },
+        );
+        table
+            .batch_execute(
+                (0..5)
+                    .map(|i| Command::StringGet { key: format!("k{i}") })
+                    .collect(),
+            )
+            .expect("the batch answers")
+    };
+
+    // Positive control: a backend answering every command must still succeed, or a check that
+    // refused everything would pass this test just as well.
+    let complete = send_five(&backend_answering(5));
+    assert!(complete.status.ok, "{:?}", complete.status);
+    assert_eq!(complete.responses.len(), 5);
+
+    let short = send_five(&backend_answering(2));
+    assert!(
+        !short.status.ok,
+        "a batch answered 2 of 5 came back ok with {} responses",
+        short.responses.len()
+    );
+    assert_eq!(short.status.code, "bad_response");
+}
+
+#[test]
+fn client_router_matches_crc64_bucket_formula() {
+    assert_eq!(crc64_jones(b"123456789"), 0xe9c6d914c4b8d9ca);
+    assert_eq!(bucket_id_for_key("123456789"), 0x3a71_b645);
+    assert_eq!(
+        shard_id_for_key("123456789", 10, 4, 1),
+        10 + (0x3a71_b645 % 4)
+    );
+    assert_eq!(stable_key_hash("123456789"), crc64_jones(b"123456789"));
+}
+
+#[test]
+fn client_router_round_robins_secondary_reads_like_router() {
+    let mut route = CachedRoute {
+        load_version: 0,
+        table_key: String::new(),
+        partition_id: 1,
+        start_bucket: 0,
+        end_bucket: 0,
+        partition_version: 0,
+        primary_addr: "primary".to_string(),
+        replica_addrs: vec!["replica-a".to_string(), "replica-b".to_string()],
+        replica_endpoints: Vec::new(),
+        next_replica_index: std::sync::atomic::AtomicUsize::new(0),
+        fetched_at: Instant::now(),
+        topology_version: 7,
+        refresh_reason: "test_insert".to_string(),
+    };
+
+    assert_eq!(
+        choose_cached_route(&mut route, ReplicaReadPolicy::RoundRobinReplica, None),
+        "replica-a"
+    );
+    assert_eq!(
+        choose_cached_route(&mut route, ReplicaReadPolicy::RoundRobinReplica, None),
+        "replica-b"
+    );
+    assert_eq!(
+        choose_cached_route(&mut route, ReplicaReadPolicy::RoundRobinReplica, None),
+        "replica-a"
+    );
+    assert_eq!(
+        choose_cached_route(&mut route, ReplicaReadPolicy::PinPrimary, None),
+        "primary"
+    );
+}
+
+#[test]
+fn client_router_prefers_same_location_replica_when_available() {
+    let mut route = CachedRoute {
+        load_version: 0,
+        table_key: String::new(),
+        partition_id: 1,
+        start_bucket: 0,
+        end_bucket: 0,
