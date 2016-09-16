@@ -37,3 +37,83 @@ const FRAME = {
       { at: NOW - 400, route: "/v1/retrieve", method: "POST", status: 401 },
       { at: NOW - 7200, route: "/v1/memories", method: "GET", status: 404 }
     ]
+  }
+};
+
+const els = new Map();
+function makeEl(id) {
+  const el = {
+    id: id || "", hidden: false, textContent: "",
+    value: id === "key" ? "k-admin" : "", checked: true, className: "",
+    style: {}, dataset: {}, files: [], options: [], children: [], _html: "",
+    get innerHTML() { return this._html; },
+    set innerHTML(v) { this._html = String(v); },
+    addEventListener() {}, removeEventListener() {}, appendChild() {}, removeChild() {},
+    setAttribute() {}, getAttribute() { return null; }, closest() { return null; },
+    querySelector() { return null; }, querySelectorAll() { return []; },
+    scrollIntoView() {}, focus() {}, click() {},
+    classList: { add() {}, remove() {}, toggle() {} }
+  };
+  return el;
+}
+function el(id) {
+  if (!els.has(id)) { els.set(id, makeEl(id)); }
+  return els.get(id);
+}
+
+const SSE = "event: status\ndata: " + JSON.stringify(FRAME) + "\n\n";
+
+function streamingResponse() {
+  let sent = false;
+  return Promise.resolve({
+    ok: true, status: 200,
+    body: { getReader: () => ({ read: () => {
+      if (sent) { return new Promise(() => {}); }
+      sent = true;
+      return new Promise((res) => setTimeout(
+        () => res({ done: false, value: Buffer.from(SSE, "utf8") }), 5));
+    } }) },
+    json: () => Promise.resolve({}), text: () => Promise.resolve("")
+  });
+}
+
+const win = {
+  document: {
+    getElementById: (id) => el(id),
+    querySelector: () => makeEl(), querySelectorAll: () => [],
+    createElement: () => makeEl(), addEventListener() {}, body: makeEl(), hidden: false
+  },
+  addEventListener() {},
+  location: { origin: "http://localhost", href: "http://localhost", reload() {} },
+  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  navigator: {},
+  setTimeout: () => 0, setInterval: () => 0, clearInterval() {},
+  Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
+  TextDecoder: function () { this.decode = (v) => Buffer.from(v || []).toString("utf8"); },
+  AbortController: function () { this.abort = () => {}; this.signal = {}; },
+  FileReader: function () {}, Blob: function () {},
+  URL: { createObjectURL: () => "", revokeObjectURL() {} },
+  fetch: (url) => {
+    const u = String(url);
+    if (u.indexOf("/v1/admin/events") >= 0) { return streamingResponse(); }
+    return Promise.resolve({ ok: true, status: 200,
+                             json: () => Promise.resolve({ settings: {} }),
+                             text: () => Promise.resolve("{}") });
+  }
+};
+win.window = win;
+
+const names = Object.keys(win);
+const values = names.map((k) => win[k]);
+scripts.forEach((body, index) => {
+  try { new Function(...names, body)(...values); }
+  catch (e) { console.log("FAIL script " + index + " threw: " + e.message); failures += 1; }
+});
+
+setTimeout(function () {
+  const traffic = el("traffic").innerHTML;
+  const fails = el("failures").innerHTML;
+
+  ok("the traffic table was drawn from a frame", /\/v1\/memories/.test(traffic),
