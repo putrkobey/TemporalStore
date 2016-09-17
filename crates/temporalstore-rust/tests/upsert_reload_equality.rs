@@ -19,25 +19,3 @@ use std::process::Command;
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_upsert_reload_harness")
-}
-
-const GEN1_BATCHES: u64 = 2600;
-const GEN2_BATCHES: u64 = 400;
-
-fn run(mode: &str, root: &Path, batches: u64, extend: Option<u64>, legacy_recovery: bool) -> (bool, String) {
-    let mut cmd = Command::new(bin());
-    cmd.args([
-        "--mode",
-        mode,
-        "--root",
-        root.to_str().unwrap(),
-        "--batches",
-        &batches.to_string(),
-    ]);
-    if let Some(extend) = extend {
-        cmd.args(["--extend", &extend.to_string()]);
-    }
-    // No emission gate is set here. `TS_INDEXLOG_UPSERT_DELTAS` used to be one; nothing reads
-    // it now, so setting it selected nothing and this ran the default path either way. The
-    // variable below is read, which is why it is still passed.
-    if legacy_recovery {
