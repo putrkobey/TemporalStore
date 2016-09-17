@@ -79,3 +79,43 @@ fn the_raft_config_default_enables_pre_vote() {
 }
 
 /// Half two: what a metaserver raft runtime actually ends up with, built the way
+/// `runtime_options_from_env` builds it. Separate from half one on purpose -- the default
+/// could be right while the runtime still dropped it on the floor.
+#[test]
+fn a_meta_raft_runtime_built_the_production_way_enforces_pre_vote() {
+    assert!(
+        meta_runtime_pre_vote(),
+        "a meta raft runtime built with config: RaftConfig::default(), exactly as \
+         bin/metaserver.rs runtime_options_from_env builds it, must end up enforcing \
+         pre-vote"
+    );
+}
+
+/// Half two, data side: the public single-shard constructor, read back through the
+/// cluster's own admin report.
+#[test]
+fn a_single_shard_cluster_built_from_the_default_enforces_pre_vote() {
+    assert!(
+        single_shard_pre_vote(),
+        "RaftCluster::new_single_shard takes RaftConfig::default(); the cluster it \
+         returns must report pre-vote enforced"
+    );
+}
+
+/// The number: how many production-shaped raft construction sites end up with pre-vote
+/// disabled. Must be zero, out of a printed denominator.
+#[test]
+fn no_production_shaped_raft_construction_site_disables_pre_vote() {
+    // Each entry mirrors, shape for shape, a construction site compiled into a binary or
+    // is handed to a library consumer. The bool is what that shape's config ends up with.
+    let defaults = RaftConfig::default();
+    let examined: Vec<(&str, bool)> = vec![
+        // bin/metaserver.rs runtime_options_from_env -- the env-driven meta raft.
+        ("bin/metaserver.rs runtime_options_from_env", meta_runtime_pre_vote()),
+        // bin/raft_node.rs runtime_options_from_env -- the standalone data raft node.
+        ("bin/raft_node.rs runtime_options_from_env", RaftConfig::default().enable_pre_vote),
+        // bin/server.rs raft_config_from_env -- three knobs overlaid on ..defaults, and
+        // enable_pre_vote is not one of them, so it rides the default through.
+        (
+            "bin/server.rs raft_config_from_env",
+            RaftConfig {

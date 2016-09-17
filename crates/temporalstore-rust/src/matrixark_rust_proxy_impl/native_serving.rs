@@ -266,3 +266,272 @@ fn count_records_into(inventory: &mut Value, records: &[&Value]) {
                 }
                 "context_entity" => increment_inventory_count(inventory, "shared", "context_entities"),
                 "context_index" => increment_inventory_count(inventory, "shared", "context_indexes"),
+                _ => {}
+            }
+            continue;
+        }
+
+        if is_profile {
+            match record_type {
+                "context_entity" => increment_inventory_count(inventory, "profile", "context_entities"),
+                "context_index" => increment_inventory_count(inventory, "profile", "context_indexes"),
+                "context_summary" => increment_inventory_count(inventory, "profile", "context_summaries"),
+                "context_summary_dirty" => {
+                    increment_inventory_count(inventory, "profile", "summary_dirty_markers")
+                }
+                _ => {}
+            }
+            continue;
+        }
+
+        if is_session || matches!(record_type, "context_event" | "context_segment") {
+            match record_type {
+                "context_event" => increment_inventory_count(inventory, "session", "context_events"),
+                "context_segment" => increment_inventory_count(inventory, "session", "context_segments"),
+                "context_entity" => increment_inventory_count(inventory, "session", "context_entities"),
+                "context_index" => increment_inventory_count(inventory, "session", "context_indexes"),
+                "context_summary" => increment_inventory_count(inventory, "session", "context_summaries"),
+                "context_summary_dirty" => {
+                    increment_inventory_count(inventory, "session", "summary_dirty_markers")
+                }
+                _ => {}
+            }
+        }
+    }
+
+}
+
+/// Turn counts into the inventory a request is served, which is where the scope comes in.
+fn finish_inventory(mut inventory: Value, query_scope: Option<&Value>) -> Value {
+    if let Some(object) = inventory.as_object_mut() {
+        object.insert(
+            "query_scope".to_string(),
+            json!({
+                "session_scope": query_scope.map(session_scope_mode).unwrap_or("prefer"),
+                "has_session_id": query_scope
+                    .and_then(|scope| scope.get("session_id"))
+                    .and_then(Value::as_str)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false),
+                "has_user_id": query_scope
+                    .and_then(|scope| scope.get("user_id"))
+                    .and_then(Value::as_str)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false),
+                "has_tenant_id": query_scope
+                    .and_then(|scope| scope.get("tenant_id"))
+                    .and_then(Value::as_str)
+                    .map(|value| !value.trim().is_empty())
+                    .unwrap_or(false)
+            }),
+        );
+    }
+    let mut available_layers = Vec::new();
+    for layer in ["session", "profile", "shared"] {
+        if inventory_layer_available(&inventory, layer) {
+            available_layers.push(json!(layer));
+        }
+    }
+    let has_session_memory = inventory_layer_available(&inventory, "session");
+    let has_profile_memory = inventory_layer_available(&inventory, "profile");
+    let has_shared_memory = inventory_layer_available(&inventory, "shared");
+    if let Some(object) = inventory.as_object_mut() {
+        object.insert("available_layers".to_string(), Value::Array(available_layers));
+        object.insert("has_session_memory".to_string(), json!(has_session_memory));
+        object.insert("has_profile_memory".to_string(), json!(has_profile_memory));
+        object.insert("has_shared_memory".to_string(), json!(has_shared_memory));
+    }
+    inventory
+}
+
+fn native_serving_memory_layer_budget(value: &Value) -> Value {
+    let mut compact = value.clone();
+    if let Some(object) = compact.as_object_mut() {
+        for field in [
+            "by_source_role",
+            "by_hook_type",
+            "by_codex_event",
+            "source_message_counts_by_role",
+            "source_hook_counts_by_type",
+            "source_codex_event_counts_by_event",
+            "by_profile_promotion_policy",
+            "by_profile_promotion_blocker",
+        ] {
+            object.remove(field);
+        }
+    }
+    compact
+}
+
+fn native_serving_memory_layer_pressure(value: &Value) -> Value {
+    let mut compact = value.clone();
+    let lineage_dimensions: BTreeSet<&str> = [
+        "by_source_role",
+        "by_hook_type",
+        "by_codex_event",
+        "source_message_counts_by_role",
+        "source_hook_counts_by_type",
+        "source_codex_event_counts_by_event",
+        "by_profile_promotion_policy",
+        "by_profile_promotion_blocker",
+    ]
+    .into_iter()
+    .collect();
+    if let Some(object) = compact.as_object_mut() {
+        for list_field in ["pressure_dimensions", "dropped_dimensions"] {
+            if let Some(values) = object.get_mut(list_field).and_then(Value::as_array_mut) {
+                values.retain(|value| {
+                    value
+                        .as_str()
+                        .map(|dimension| !lineage_dimensions.contains(dimension))
+                        .unwrap_or(true)
+                });
+            }
+        }
+        if let Some(dimensions) = object.get_mut("by_dimension").and_then(Value::as_object_mut) {
+            dimensions.retain(|dimension, _| !lineage_dimensions.contains(dimension.as_str()));
+        }
+        for field in [
+            "assistant_memory_pressure",
+            "user_memory_pressure",
+            "tool_memory_pressure",
+            "assistant_source_message_pressure",
+            "user_source_message_pressure",
+            "tool_source_message_pressure",
+            "hook_boundary_source_pressure",
+            "after_llm_source_pressure",
+            "tool_result_source_pressure",
+            "stop_event_source_pressure",
+            "post_tool_use_source_pressure",
+        ] {
+            object.remove(field);
+        }
+    }
+    compact
+}
+
+fn native_serving_dropped_refs(mut dropped_refs: Value) -> Value {
+    if let Some(object) = dropped_refs.as_object_mut() {
+        let dropped_ref_count = object
+            .get("refs")
+            .and_then(Value::as_array)
+            .map(|refs| refs.len())
+            .unwrap_or(0);
+        object.remove("refs");
+        if dropped_ref_count > 0 {
+            object.insert(
+                "dropped_ref_detail_available_in_audit".to_string(),
+                json!(true),
+            );
+            object.insert("dropped_ref_count".to_string(), json!(dropped_ref_count));
+        }
+    }
+    dropped_refs
+}
+
+fn increment_layer_bucket(breakdown: &mut Value, bucket_name: &str, key: &str, tokens: u64) {
+    let Some(bucket_map) = breakdown
+        .get_mut(bucket_name)
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    let bucket = bucket_map
+        .entry(key.to_string())
+        .or_insert_with(|| json!({"refs": 0, "tokens": 0}));
+    if let Some(bucket_object) = bucket.as_object_mut() {
+        let refs = bucket_object
+            .get("refs")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            + 1;
+        let total_tokens = bucket_object
+            .get("tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            + tokens;
+        bucket_object.insert("refs".to_string(), json!(refs));
+        bucket_object.insert("tokens".to_string(), json!(total_tokens));
+    }
+}
+
+fn source_layer_values(
+    record: &Value,
+    source_field: &str,
+    fallback_field: &str,
+    default_value: &str,
+) -> Vec<String> {
+    let mut values = Vec::new();
+    if let Some(source_values) = record.get(source_field).and_then(Value::as_array) {
+        for value in source_values
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            if !values.iter().any(|existing| existing == value) {
+                values.push(value.to_string());
+            }
+        }
+    }
+    if values.is_empty() {
+        if let Some(value) = record
+            .get(fallback_field)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            values.push(value.to_string());
+        }
+    }
+    if values.is_empty() {
+        values.push(default_value.to_string());
+    }
+    values
+}
+
+fn selected_ref_layer_budget(refs: &[Value]) -> Value {
+    let mut breakdown = json!({
+        "by_memory_layer": {},
+        "by_memory_scope": {},
+        "by_session_continuity": {},
+        "by_extraction_phase": {},
+        "by_ref_type": {},
+        "by_entity_type": {},
+        "by_source_role": {},
+        "by_hook_type": {},
+        "by_codex_event": {},
+        "source_message_counts_by_role": {},
+        "source_hook_counts_by_type": {},
+        "source_codex_event_counts_by_event": {},
+        "by_profile_promotion_policy": {},
+        "by_profile_promotion_blocker": {},
+        "final_session_boundary_ref_count": 0,
+        "provisional_ref_count": 0,
+        "final_ref_count": 0,
+        "total_selected_refs": refs.len(),
+        "total_selected_tokens": 0
+    });
+    for item in refs {
+        let tokens = item
+            .get("token_estimate")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let total_tokens = breakdown
+            .get("total_selected_tokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            + tokens;
+        if let Some(object) = breakdown.as_object_mut() {
+            object.insert("total_selected_tokens".to_string(), json!(total_tokens));
+        }
+        let memory_layer = item
+            .get("memory_layer")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let ref_type = item
+                    .get("ref_type")
+                    .and_then(Value::as_str)
