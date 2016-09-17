@@ -34,3 +34,15 @@ const bodies = input.bodies;
 const scope = {
   $,
   query: () => ["limit=" + values.limit],
+  auth: () => ({}),
+  conn: () => {},
+  say: (node, text, cls) => said.push({ text, cls }),
+  esc: (s) => String(s == null ? "" : s),
+  matches: () => true,
+  renderSummary: () => {},
+  skillsHtml: () => "",
+  resourcesHtml: () => "",
+  fetch: (url) => Promise.resolve({
+    ok: true,
+    status: 200,
+    json: () => Promise.resolve(url.indexOf("/v1/skills") === 0 ? bodies[0] : bodies[1]),
