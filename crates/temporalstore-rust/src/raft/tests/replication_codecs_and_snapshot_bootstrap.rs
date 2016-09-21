@@ -1055,3 +1055,532 @@ fn append_entry_only_truncates_on_term_conflict_and_never_reapplies() {
             leader_time_ms: 0,
             term: 1,
             index: 6,
+            shard_id: 7,
+            command: Command::StringSet {
+                key: "k6".to_string(),
+                value: b"a".to_vec(),
+            },
+        },
+    );
+    assert_eq!(node.log.len(), 6);
+    append_entry(
+        &mut node,
+        RaftLogEntry {
+            leader_time_ms: 0,
+            term: 2,
+            index: 6,
+            shard_id: 7,
+            command: Command::StringSet {
+                key: "k6".to_string(),
+                value: b"b".to_vec(),
+            },
+        },
+    );
+    assert_eq!(node.log.len(), 6, "term conflict replaces, not appends");
+    assert_eq!(node.log.last().map(|entry| entry.term), Some(2));
+}
+
+#[test]
+fn election_up_to_date_check_is_snapshot_aware() {
+    // After log compaction a caught-up replica's committed tail lives in its installed
+    // snapshot, not `log`. The election "up-to-date" comparison must use the snapshot tail.
+    // Otherwise a fully-snapshotted-but-caught-up replica advertises (0,0), loses to peers
+    // that still hold uncompacted logs, and cannot win an election it is fully eligible for
+    // (liveness) -- while also, symmetrically, granting votes to genuinely lagging
+    // candidates (safety). The sibling meta-raft election path already does this correctly.
+    let cluster =
+        RaftCluster::new_single_shard_with_config(1, [1, 2, 3], RaftConfig::default()).unwrap();
+    cluster.elect_leader(1).unwrap();
+    for i in 0..6 {
+        cluster
+            .propose(Command::StringSet {
+                key: format!("k{i}"),
+                value: b"v".to_vec(),
+            })
+            .unwrap();
+    }
+    let commit = cluster.commit_index(1).unwrap();
+    assert!(commit >= 6, "cluster should have committed the proposals");
+
+    // Compact ONLY node 2 up to the committed index: its `log` empties while its committed
+    // tail moves into the installed snapshot. It remains fully caught up (commit == leader).
+    let snapshot_req = cluster.build_install_snapshot_request(2).unwrap();
+    let snapshot_resp = cluster.receive_install_snapshot(snapshot_req).unwrap();
+    assert!(snapshot_resp.success);
+    assert_eq!(cluster.commit_index(2).unwrap(), commit);
+
+    // The snapshotted-but-caught-up replica must be electable (pre-fix: ReplicaLagging
+    // because its empty log advertised tail (0,0)).
+    cluster
+        .elect_leader(2)
+        .expect("a fully-snapshotted, fully-caught-up replica must be electable");
+    assert_eq!(cluster.leader_id(), 2);
+}
+
+#[test]
+fn append_entries_higher_term_clears_stale_vote() {
+    // votedFor is per-term (Raft Fig-2): observing a higher term in AppendEntries must
+    // reset it, else a stale vote from the old term wrongly suppresses this node's vote in
+    // the new term (split-vote liveness bug). Mirrors the vote/snapshot-install paths.
+    let cluster =
+        RaftCluster::new_single_shard_with_config(1, [1, 2, 3], RaftConfig::default()).unwrap();
+
+    // Node 3 grants its term-5 vote to candidate 1.
+    let granted = cluster
+        .receive_vote_request(VoteRequest {
+            pre_vote: false,
+            rpc: None,
+            shard_id: 1,
+            term: 5,
+            candidate_id: 1,
+            target_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+        .unwrap();
+    assert!(granted.vote_granted, "term-5 vote for candidate 1 should be granted");
+
+    // A term-6 AppendEntries (from leader 2) advances node 3's term; the stale term-5 vote
+    // for candidate 1 must be cleared.
+    cluster
+        .receive_append_entries(AppendEntriesRequest {
+            rpc: None,
+            shard_id: 1,
+            term: 6,
+            leader_id: 2,
+            target_id: 3,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: Vec::new(),
+            leader_commit: 0,
+        })
+        .unwrap();
+
+    // Node 3 must now be free to vote for a DIFFERENT candidate (2) in term 6. Pre-fix the
+    // carried-over voted_for=1 rejected this as "already_voted".
+    let regrant = cluster
+        .receive_vote_request(VoteRequest {
+            pre_vote: false,
+            rpc: None,
+            shard_id: 1,
+            term: 6,
+            candidate_id: 2,
+            target_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+        .unwrap();
+    assert!(
+        regrant.vote_granted,
+        "a higher-term AppendEntries must clear the stale per-term vote so a new term's \
+         election is not blocked (got reject: {:?})",
+        regrant.reject_reason
+    );
+}
+
+#[test]
+fn install_snapshot_clears_stale_vote_on_term_raise() {
+    // votedFor is per-term (Raft Fig-2). Installing a snapshot that raises the term via the
+    // public install_snapshot path (not the receive_install_snapshot RPC wrapper, which
+    // pre-clears) must reset a stale vote, else a same-new-term candidate is wrongly rejected
+    // as already_voted -> split-vote liveness stall.
+    let cluster =
+        RaftCluster::new_single_shard_with_config(1, [1, 2, 3], RaftConfig::default()).unwrap();
+    // Node 3 grants a term-3 vote to candidate 1.
+    let granted = cluster
+        .receive_vote_request(VoteRequest {
+            pre_vote: false,
+            rpc: None,
+            shard_id: 1,
+            term: 3,
+            candidate_id: 1,
+            target_id: 3,
+            last_log_index: 0,
+            last_log_term: 0,
+        })
+        .unwrap();
+    assert!(granted.vote_granted);
+    assert_eq!(cluster.hard_state(3).unwrap().voted_for, Some(1));
+
+    // Install a term-5 snapshot directly on node 3.
+    cluster
+        .install_snapshot(
+            3,
+            RaftSnapshot {
+                shard_id: 1,
+                last_included_term: 5,
+                last_included_index: 1,
+                external_snapshot_ref: None,
+                entries: vec![RaftLogEntry {
+                    leader_time_ms: 0,
+                    term: 5,
+                    index: 1,
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: "k".to_string(),
+                        value: b"v".to_vec(),
+                    },
+                }],
+                state_image: None,
+                state_image_externalized: false,
+            },
+        )
+        .unwrap();
+
+    // The stale term-3 vote must be cleared by the term raise to 5.
+    assert_eq!(
+        cluster.hard_state(3).unwrap().voted_for,
+        None,
+        "snapshot term-raise must clear the per-term vote"
+    );
+    assert_eq!(cluster.hard_state(3).unwrap().current_term, 5);
+
+    // A DIFFERENT candidate can now win node 3's vote in term 5.
+    let regrant = cluster
+        .receive_vote_request(VoteRequest {
+            pre_vote: false,
+            rpc: None,
+            shard_id: 1,
+            term: 5,
+            candidate_id: 2,
+            target_id: 3,
+            last_log_index: 1,
+            last_log_term: 5,
+        })
+        .unwrap();
+    assert!(
+        regrant.vote_granted,
+        "cleared vote must let a new term-5 candidate win (got reject: {:?})",
+        regrant.reject_reason
+    );
+}
+
+#[test]
+fn append_entries_commit_clamps_to_last_new_entry_not_whole_log_tail() {
+    // Raft Figure 2: a follower advances commitIndex only to min(leaderCommit, index of
+    // the last NEW entry in THIS AppendEntries) -- never to its whole-log tail. A divergent
+    // UNCOMMITTED suffix left by a failed prior-term leader must not be committed just
+    // because it still sits in the log. Regression for the safety hole where the commit
+    // line used node_last_log_or_snapshot_index (whole log) instead of the batch endpoint,
+    // committing an entry the cluster never agreed on.
+    let cluster =
+        RaftCluster::new_single_shard_with_config(1, [1, 2, 3], RaftConfig::default()).unwrap();
+
+    let seed = |term: u64,
+                prev_index: u64,
+                prev_term: u64,
+                entries: Vec<RaftLogEntry>,
+                leader_commit: u64| {
+        cluster
+            .receive_append_entries(AppendEntriesRequest {
+                rpc: None,
+                shard_id: 1,
+                term,
+                leader_id: 1,
+                target_id: 3,
+                prev_log_index: prev_index,
+                prev_log_term: prev_term,
+                entries,
+                leader_commit,
+            })
+            .unwrap()
+    };
+    let entry = |term: u64, index: u64, key: &str| RaftLogEntry {
+        leader_time_ms: 0,
+        term,
+        index,
+        shard_id: 1,
+        command: Command::StringSet {
+            key: key.to_string(),
+            value: b"v".to_vec(),
+        },
+    };
+
+    // Committed prefix 1..=3 @ term 1.
+    seed(
+        1,
+        0,
+        0,
+        vec![entry(1, 1, "k1"), entry(1, 2, "k2"), entry(1, 3, "k3")],
+        3,
+    );
+    // Divergent UNCOMMITTED suffix from a failed term-3 then term-5 leader (leader_commit
+    // stays 3, so these never commit).
+    seed(3, 3, 1, vec![entry(3, 4, "k4-stale")], 3);
+    seed(5, 4, 3, vec![entry(5, 5, "k5-stale")], 3);
+    assert_eq!(cluster.commit_index(3).unwrap(), 3);
+
+    // The real leader now re-sends a matching-term entry 4 with a HIGH leader_commit (6).
+    // Entry 4 matches by term so append is a no-op; the divergent entry 5 survives in the
+    // log. commitIndex must clamp to 4 (this batch's last new entry), NOT 5 (whole-log tail).
+    seed(5, 3, 1, vec![entry(3, 4, "k4-stale")], 6);
+
+    assert_eq!(
+        cluster.commit_index(3).unwrap(),
+        4,
+        "commitIndex must clamp to the last new entry (4), not the divergent whole-log tail (5)"
+    );
+}
+
+// shared-corpus: raft_matrixraft_replication_backpressure
+// shared-corpus: raft_matrixraft_pipeline_reorder_backpressure_matrix raft_matrixraft_replication_backpressure
+#[test]
+fn append_entries_reorder_queue_records_gap_and_recovers_after_prefix_arrives() {
+    let cluster = RaftCluster::new_single_shard_with_config(
+        1,
+        [1, 2, 3],
+        RaftConfig {
+            enable_reorder_queue: true,
+            reorder_window_size: 4,
+            reorder_timeout_us: 1_000,
+            ..RaftConfig::default()
+        },
+    )
+    .unwrap();
+    cluster.set_alive(3, false).unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "reorder-a".to_string(),
+            value: b"a".to_vec(),
+        })
+        .unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "reorder-b".to_string(),
+            value: b"b".to_vec(),
+        })
+        .unwrap();
+    cluster.set_alive(3, true).unwrap();
+
+    let queued = cluster
+        .receive_append_entries(AppendEntriesRequest {
+            rpc: None,
+            shard_id: 1,
+            term: 1,
+            leader_id: 1,
+            target_id: 3,
+            prev_log_index: 2,
+            prev_log_term: 1,
+            entries: vec![RaftLogEntry {
+                leader_time_ms: 0,
+                term: 1,
+                index: 3,
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "reorder-c".to_string(),
+                    value: b"c".to_vec(),
+                },
+            }],
+            leader_commit: 3,
+        })
+        .unwrap();
+    assert!(!queued.success);
+    assert_eq!(
+        queued.reject_reason.as_deref(),
+        Some("out_of_order_append_queued")
+    );
+
+    let admin = cluster.matrixraft_runtime_admin_report();
+    let peer = admin
+        .peer_pipeline_states
+        .iter()
+        .find(|peer| peer.peer_id == 3)
+        .unwrap();
+    assert_eq!(peer.reorder_queue_depth, 1);
+    assert_eq!(peer.out_of_order_append_rejections, 1);
+    assert_eq!(peer.reorder_entries_rejected, 1);
+    assert_eq!(peer.reorder_entry_timeouts, 0);
+    assert!(admin.out_of_order_append_handling_present);
+
+    let prefix = cluster.build_append_entries_request(3).unwrap();
+    assert_eq!(prefix.prev_log_index, 0);
+    assert_eq!(
+        prefix
+            .entries
+            .iter()
+            .map(|entry| entry.index)
+            .collect::<Vec<_>>(),
+        vec![1, 2]
+    );
+    let recovered = cluster.receive_append_entries(prefix).unwrap();
+    assert!(recovered.success);
+    assert_eq!(cluster.commit_index(3).unwrap(), 2);
+    assert_eq!(
+        cluster
+            .read_from_replica(
+                3,
+                Command::StringGet {
+                    key: "reorder-b".to_string()
+                },
+            )
+            .unwrap(),
+        CommandResponse::Bytes {
+            value: Some(b"b".to_vec())
+        }
+    );
+}
+
+// shared-corpus: raft_matrixraft_pipeline_reorder_backpressure_matrix raft_matrixraft_replication_backpressure
+#[test]
+fn replication_pipeline_enforces_inflight_apply_memory_and_oversized_limits() {
+    let cluster = RaftCluster::new_single_shard_with_config(
+        1,
+        [1, 2, 3],
+        RaftConfig {
+            max_inflights_replicate: 1,
+            max_memory_replicate_log_bytes: 512,
+            max_inflights_apply_task: 1,
+            max_apply_batch_bytes: 16,
+            enable_reorder_queue: true,
+            reorder_window_size: 4,
+            reorder_timeout_us: 1_000,
+            ..RaftConfig::default()
+        },
+    )
+    .unwrap();
+
+    cluster.set_alive(3, false).unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "pipeline-a".to_string(),
+            value: b"a".to_vec(),
+        })
+        .unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "pipeline-b".to_string(),
+            value: b"b".to_vec(),
+        })
+        .unwrap();
+    cluster.set_alive(3, true).unwrap();
+
+    let first = cluster.build_append_entries_request(3).unwrap();
+    assert_eq!(first.entries.len(), 1);
+    // A charged window no longer refuses -- it degrades to a single-entry PROBE, because the
+    // refusal blocked the very acknowledgements that drain the window (a follower past the
+    // window was cut off for good). The limit still binds: the batch never grows past one
+    // entry while the window is charged.
+    let probe = cluster.build_append_entries_request(3).unwrap();
+    assert_eq!(
+        probe.entries.len(),
+        1,
+        "a charged window must degrade to a single-entry probe, not a bigger batch"
+    );
+
+    let apply_pressure = cluster
+        .receive_append_entries(AppendEntriesRequest {
+            rpc: None,
+            shard_id: 1,
+            term: 1,
+            leader_id: 1,
+            target_id: 2,
+            prev_log_index: 0,
+            prev_log_term: 0,
+            entries: vec![RaftLogEntry {
+                leader_time_ms: 0,
+                term: 1,
+                index: 3,
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "apply-pressure".to_string(),
+                    value: vec![b'x'; 64],
+                },
+            }],
+            leader_commit: 3,
+        })
+        .unwrap();
+    assert!(!apply_pressure.success);
+    assert_eq!(
+        apply_pressure.reject_reason.as_deref(),
+        Some("apply_batch_backpressure")
+    );
+
+    let oversized = cluster
+        .propose(Command::StringSet {
+            key: "oversized-pipeline".to_string(),
+            value: vec![b'z'; 4_096],
+        })
+        .unwrap_err();
+    assert!(matches!(oversized, RaftError::LogEntryTooLarge { .. }));
+
+    let admin = cluster.matrixraft_runtime_admin_report();
+    assert!(admin.append_backpressure_enforced);
+    assert!(admin.apply_backpressure_enforced);
+    assert!(admin.memory_replicate_bytes_enforced);
+    assert!(admin.oversized_log_rejection_present);
+    assert!(admin
+        .capability_matrix
+        .iter()
+        .any(|item| item.capability == "per_peer_replication_pipeline_state" && item.ready));
+    let lagging_peer = admin
+        .peer_pipeline_states
+        .iter()
+        .find(|peer| peer.peer_id == 3)
+        .unwrap();
+    assert_eq!(lagging_peer.append_queue_limit, 1);
+    assert_eq!(lagging_peer.inflight_bytes_limit, 512);
+    assert!(lagging_peer.append_queue_max_depth >= lagging_peer.append_queue_limit);
+    assert!(lagging_peer.append_rejected > 0);
+    let apply_peer = admin
+        .peer_pipeline_states
+        .iter()
+        .find(|peer| peer.peer_id == 2)
+        .unwrap();
+    assert_eq!(apply_peer.apply_inflight_limit, 1);
+    assert_eq!(apply_peer.apply_batch_bytes_limit, 16);
+    assert!(apply_peer.apply_queue_max_depth >= apply_peer.apply_inflight_limit);
+    assert!(apply_peer.apply_backpressure_rejections > 0);
+
+    let metrics = cluster.prometheus_metrics();
+    assert!(metrics.contains("temporalstore_raft_matrixraft_peer_append_queue_limit"));
+    assert!(metrics.contains("temporalstore_raft_matrixraft_peer_inflight_bytes_limit"));
+    assert!(metrics.contains("temporalstore_raft_matrixraft_peer_apply_inflight_limit"));
+    assert!(metrics.contains("temporalstore_raft_matrixraft_peer_apply_queue_depth"));
+    assert!(metrics.contains("temporalstore_raft_matrixraft_peer_apply_queue_max_depth"));
+    assert!(metrics.contains("temporalstore_raft_matrixraft_peer_apply_batch_bytes_limit"));
+}
+
+// shared-corpus: raft_matrixraft_replication_backpressure
+// shared-corpus: raft_matrixraft_pipeline_reorder_backpressure_matrix raft_matrixraft_replication_backpressure
+#[test]
+fn append_entries_reorder_window_timeout_and_stale_term_are_reported() {
+    let cluster = RaftCluster::new_single_shard_with_config(
+        1,
+        [1, 2, 3],
+        RaftConfig {
+            enable_reorder_queue: true,
+            reorder_window_size: 1,
+            reorder_timeout_us: 1,
+            ..RaftConfig::default()
+        },
+    )
+    .unwrap();
+    cluster.set_alive(3, false).unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "timeout-a".to_string(),
+            value: b"a".to_vec(),
+        })
+        .unwrap();
+    cluster.set_alive(3, true).unwrap();
+
+    let queued = cluster
+        .receive_append_entries(AppendEntriesRequest {
+            rpc: None,
+            shard_id: 1,
+            term: 1,
+            leader_id: 1,
+            target_id: 3,
+            prev_log_index: 1,
+            prev_log_term: 1,
+            entries: vec![RaftLogEntry {
+                leader_time_ms: 0,
+                term: 1,
+                index: 2,
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "timeout-buffered-gap".to_string(),
+                    value: b"queued".to_vec(),
+                },
+            }],
+            leader_commit: 2,
