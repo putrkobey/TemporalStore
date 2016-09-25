@@ -194,3 +194,199 @@ pub fn compute_auto_rebalance_borrowed(
         while plans.len() < options.max_moves {
             let Some((busy_addr, busy_load)) = most_loaded_server(&load) else {
                 break;
+            };
+            let idle_addr = least_loaded_server(&load);
+            let idle_load = load.get(&idle_addr).copied().unwrap_or_default();
+            if busy_load <= idle_load + 1 {
+                break;
+            }
+            // Pick a shard currently on the busy server (highest id, for
+            // determinism) to move to the idle server.
+            // A pinned shard is where an operator put it, so balancing does
+            // not take it away. Pass 1 above does not consult this: a pin is a
+            // preference, and a preference must never leave a shard stranded on
+            // an owner that is gone.
+            let Some(shard_id) = owner_map(&mut owner, shard_owners, live_servers)
+                .iter()
+                .filter(|(shard_id, owner_addr)| {
+                    **owner_addr == Some(busy_addr) && !pinned.contains(shard_id)
+                })
+                .map(|(shard_id, _)| *shard_id)
+                .max()
+            else {
+                break;
+            };
+            owner_map(&mut owner, shard_owners, live_servers).insert(shard_id, Some(idle_addr));
+            *load.get_mut(busy_addr).expect("busy is live") -= 1;
+            *load.get_mut(idle_addr).expect("idle is live") += 1;
+            plans.push(ShardReassignment {
+                shard_id,
+                from_server: Some(busy_addr.to_string()),
+                to_server: idle_addr.to_string(),
+                reason: ShardReassignmentReason::Rebalance,
+            });
+        }
+    }
+
+    plans
+}
+
+/// The working owner map, built the first time a move needs it.
+///
+/// A round that moves nothing never calls this, which is the point: building it
+/// walks every shard in the cluster, and that walk was the whole cost of
+/// deciding to do nothing.
+fn owner_map<'slot, 'data>(
+    slot: &'slot mut Option<BTreeMap<ShardId, Option<&'data str>>>,
+    shard_owners: &'data BTreeMap<ShardId, &'data str>,
+    live_servers: &'data BTreeSet<String>,
+) -> &'slot mut BTreeMap<ShardId, Option<&'data str>> {
+    slot.get_or_insert_with(|| {
+        shard_owners
+            .iter()
+            .map(|(shard_id, current)| {
+                let held = live_servers.get(*current).map(|addr| addr.as_str());
+                (*shard_id, held)
+            })
+            .collect()
+    })
+}
+
+fn least_loaded_server<'a>(load: &BTreeMap<&'a str, usize>) -> &'a str {
+    load.iter()
+        .min_by(|(addr_a, load_a), (addr_b, load_b)| {
+            load_a.cmp(load_b).then_with(|| addr_a.cmp(addr_b))
+        })
+        .map(|(addr, _)| *addr)
+        .expect("load map is non-empty when live servers exist")
+}
+
+fn most_loaded_server<'a>(load: &BTreeMap<&'a str, usize>) -> Option<(&'a str, usize)> {
+    load.iter()
+        .max_by(|(addr_a, load_a), (addr_b, load_b)| {
+            load_a.cmp(load_b).then_with(|| addr_b.cmp(addr_a))
+        })
+        .map(|(addr, count)| (*addr, *count))
+}
+
+impl SingleNodeMeta {
+    /// Snapshot of the current shard→owner locations.
+    pub fn shard_locations(&self) -> Vec<ShardLocation> {
+        let state = self.inner.read().expect("meta lock poisoned");
+        let mut locations = state.shards.values().cloned().collect::<Vec<_>>();
+        locations.sort_by_key(|location| location.shard_id);
+        locations
+    }
+
+    /// Compute the auto-rebalance plan for the current membership using default
+    /// options. Only Normal-state servers are eligible placement targets.
+    pub fn plan_auto_rebalance(&self) -> Vec<ShardReassignment> {
+        self.plan_auto_rebalance_with_options(AutoRebalanceOptions::default())
+    }
+
+    pub fn plan_auto_rebalance_with_options(
+        &self,
+        options: AutoRebalanceOptions,
+    ) -> Vec<ShardReassignment> {
+        let state = self.inner.read().expect("meta lock poisoned");
+        let live_servers = state
+            .servers
+            .values()
+            .filter(|server| server.state == MetaEntityState::Normal)
+            .map(|server| server.server_addr.clone())
+            .collect::<BTreeSet<_>>();
+        let shard_owners = serving_shard_owners(&state);
+        // Which shards an operator has placed by hand. Read here rather than
+        // inside the planner so the planner stays a function of what it is
+        // given.
+        let pinned = state
+            .shards
+            .values()
+            .filter(|location| !location.preferred_location.is_empty())
+            .map(|location| location.shard_id)
+            .collect::<BTreeSet<_>>();
+        compute_auto_rebalance_borrowed(&shard_owners, &live_servers, &pinned, options)
+    }
+
+    /// Apply a single reassignment to the shard→owner map, preserving any
+    /// recorded snapshot ref and emitting a topology event so clients observe
+    /// the new owner. This is the metaserver-driven counterpart to a datanode
+    /// self-registering a shard.
+    pub fn reassign_shard(&self, shard_id: ShardId, to_server: &str) -> AckResponse {
+        self.reassign_shard_with_reason(shard_id, to_server, "unspecified")
+    }
+
+    /// Reassign a shard, recording why it moved so `/metrics` can distinguish a
+    /// rebalance from an evacuation or a divergence repair.
+    pub fn reassign_shard_with_reason(
+        &self,
+        shard_id: ShardId,
+        to_server: &str,
+        reason: &str,
+    ) -> AckResponse {
+        // Checked before the metric: a refused reassignment did not happen, so
+        // counting it would overstate what the rebalancer actually did.
+        if let Some(status) = self.meta_change_refusal() {
+            return AckResponse { status };
+        }
+        self.metrics.record_reassignment(reason);
+        self.record_mutation(MetaMutation::RegisterShard(RegisterShardRequest {
+            registered_at_ms: 0,
+            shard_id,
+            server_addr: to_server.to_string(),
+        }));
+        let mut state = self.inner.write().expect("meta lock poisoned");
+        // What the shard knows about itself does not change because it changed
+        // owner: it still prefers the location it was pinned to, and it has not
+        // newly joined the cluster. Rebuilding the record around the new owner
+        // used to write both away -- so a pin did not survive the move it
+        // exists to constrain, and a moved shard reported that it never joined.
+        let (latest_snapshot, preferred_location, registered_at_ms) = state
+            .shards
+            .get(&shard_id)
+            .map(|location| {
+                (
+                    location.latest_snapshot.clone(),
+                    location.preferred_location.clone(),
+                    location.registered_at_ms,
+                )
+            })
+            .unwrap_or_default();
+        state.shards.insert(
+            shard_id,
+            ShardLocation {
+                registered_at_ms,
+                preferred_location,
+                state: MetaEntityState::Normal,
+                shard_id,
+                server_addr: to_server.to_string(),
+                latest_snapshot,
+            },
+        );
+        ensure_server(&mut state, to_server);
+        record_topology_event(
+            &mut state,
+            "auto_reassign_shard",
+            format!("shard:{shard_id}"),
+            format!("server_addr={to_server}"),
+        );
+        AckResponse {
+            status: Status::ok(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owners(pairs: &[(ShardId, &str)]) -> BTreeMap<ShardId, String> {
+        pairs
+            .iter()
+            .map(|(shard_id, addr)| (*shard_id, addr.to_string()))
+            .collect()
+    }
+
+    fn live(addrs: &[&str]) -> BTreeSet<String> {
+        addrs.iter().map(|addr| addr.to_string()).collect()
+    }
