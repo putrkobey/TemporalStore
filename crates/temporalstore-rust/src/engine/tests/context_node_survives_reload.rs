@@ -125,3 +125,130 @@ fn node_is_served(engine: &TemporalEngine, node_hash: u64) -> bool {
             node_hash,
         }],
     });
+    assert!(
+        response.status.ok,
+        "the read itself must ack: {:?}",
+        response.status
+    );
+    // A served node comes back as a payload; an absent one comes back empty. Asking the RESPONSE
+    // rather than an exit status, and printed either way so the verdict is the thing measured.
+    let served = response.responses.iter().any(|r| {
+        matches!(
+            r.response,
+            crate::types::CommandResponse::ContextNode { node: Some(_), .. }
+        )
+    });
+    println!("[probe] node {node_hash} served={served} raw={:?}", response.responses);
+    served
+}
+
+/// Does `HashGet` answer for this field? The CONTROL: a hash field written through `HashSet` IS
+/// registered in the bucket index, so it must survive the same reload the node is asked about.
+/// Without it, a reload that loses everything would look exactly like the defect being probed.
+fn field_is_served(engine: &TemporalEngine, key: &str, field: &str) -> bool {
+    let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+        shard_id: 1,
+        commands: vec![Command::HashGet {
+            key: key.to_string(),
+            field: field.to_string(),
+        }],
+    });
+    assert!(
+        response.status.ok,
+        "the control read must ack: {:?}",
+        response.status
+    );
+    let served = response.responses.iter().any(|r| {
+        matches!(
+            &r.response,
+            crate::types::CommandResponse::Bytes { value: Some(bytes) } if !bytes.is_empty()
+        )
+    });
+    println!("[probe] control field {key}/{field} served={served}");
+    served
+}
+
+#[test]
+fn a_context_node_is_still_served_after_an_unload_and_load() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    // A HashSet field FIRST, for two reasons. It is the control below, and it guarantees
+    // `bucket_index.bucket_map` is non-empty -- which is the only thing that stops
+    // `rebuild_unserialized_model_maps_from_bucket_index` returning early. A store holding only a
+    // context node would skip the reconcile and pass this test for the wrong reason.
+    run(
+        &engine,
+        vec![Command::HashSet {
+            key: "control-hash".to_string(),
+            field: "f-0".to_string(),
+            value: b"control-value".to_vec(),
+        }],
+    );
+    run(
+        &engine,
+        vec![Command::ContextUpsertNode {
+            tenant_hash: 7,
+            node: Box::new(node_at(1)),
+        }],
+    );
+
+    // PRECONDITION, asserted rather than assumed: if the node is not served BEFORE the reload the
+    // fixture never created the state this test is about.
+    assert!(
+        node_is_served(&engine, 1),
+        "the node was not served before any reload, so this fixture cannot ask its question"
+    );
+    assert!(
+        field_is_served(&engine, "control-hash", "f-0"),
+        "the control field was not served before any reload either -- the fixture is wrong, not the engine"
+    );
+
+    engine.unload_shard(1);
+    load_on(&engine);
+
+    // THE CONTROL FIRST. If this fails the reload lost everything and the node tells us nothing.
+    let control_after = field_is_served(&engine, "control-hash", "f-0");
+    let node_after = node_is_served(&engine, 1);
+
+    assert!(
+        control_after,
+        "the CONTROL hash field did not survive the reload, so this run cannot attribute anything \
+         to the container-only path -- fix the fixture before reading the node result"
+    );
+    assert!(
+        node_after,
+        "THE CONTAINER-ONLY ELEMENT WAS DISCARDED. The context node was served before the reload \
+         and is not served after it, while a HashSet field written to the same shard survived. \
+         That is the live-address refusal in `fill_absent_elements`: the node's block is never \
+         registered in the bucket index, so the derived base cannot name it and the live set \
+         cannot hold its address, and the reconcile drops it."
+    );
+}
+
+/// WHY DID IT SURVIVE? The question the first test forces, because its prediction was wrong.
+///
+/// Three candidates, and they have different consequences for the per-element collapse:
+///   1. the node's block IS in the bucket index after all, so the derived base names it;
+///   2. the reconcile is not on this load path at all, so nothing filters the container;
+///   3. the reconcile DOES drop it and the WAL replay puts it back afterwards.
+///
+/// This asks the index directly, then runs the reconcile BY HAND against the loaded shard and
+/// looks at the map on both sides of it. Calling the function by name is the whole point: it
+/// separates "the filter is harmless" from "the filter is not reached on this path".
+#[test]
+fn whether_the_reconcile_keeps_a_container_only_element_when_it_is_run_by_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    run(
+        &engine,
+        vec![Command::HashSet {
+            key: "control-hash".to_string(),
+            field: "f-0".to_string(),
+            value: b"control-value".to_vec(),
+        }],
+    );
+    run(
