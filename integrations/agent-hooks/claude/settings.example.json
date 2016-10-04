@@ -31,3 +31,36 @@
             "type": "command",
             "command": "bash ${CLAUDE_PROJECT_DIR}/tools/matrixark_claude_hook.sh --event PostToolUse",
             "timeout": 120
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/tools/matrixark_claude_hook.sh --event Stop",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/tools/matrixark_claude_hook.sh --event SubagentStop",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/tools/matrixark_claude_hook.sh --event PreCompact",
+            "timeout": 120
