@@ -26,3 +26,31 @@ extern "C" {
         error_message: *mut *mut c_char,
     ) -> c_int;
     pub(crate) fn temporalstore_delete_object(
+        client: *mut TemporalStoreClientOpaque,
+        key: *const c_char,
+        error_message: *mut *mut c_char,
+    ) -> c_int;
+    pub(crate) fn temporalstore_expire(
+        client: *mut TemporalStoreClientOpaque,
+        key: *const c_char,
+        ttl_ms: u64,
+        error_message: *mut *mut c_char,
+    ) -> c_int;
+    pub(crate) fn temporalstore_ttl(
+        client: *mut TemporalStoreClientOpaque,
+        key: *const c_char,
+        ttl_ms: *mut u64,
+        error_message: *mut *mut c_char,
+    ) -> c_int;
+    pub(crate) fn temporalstore_hset(
+        client: *mut TemporalStoreClientOpaque,
+        key: *const c_char,
+        field: *const c_char,
+        value: *const c_char,
+        error_message: *mut *mut c_char,
+    ) -> c_int;
+    pub(crate) fn temporalstore_hget(
+        client: *mut TemporalStoreClientOpaque,
+        key: *const c_char,
+        field: *const c_char,
+        value: *mut *mut c_char,
