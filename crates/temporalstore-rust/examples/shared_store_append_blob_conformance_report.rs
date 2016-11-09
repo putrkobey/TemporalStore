@@ -248,3 +248,253 @@ struct ReplayPhaseReport {
     single_node_reload_latency_us: u128,
     single_node_reload_report: ReplayReport,
     single_node_reload_retrieved_records: u64,
+    single_node_reload_ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct Summary {
+    direct_offsets_monotonic: bool,
+    direct_offsets_contiguous: bool,
+    direct_offset_slices_decode_expected_frames: bool,
+    direct_offset_index_maps_wal_to_blob_offsets: bool,
+    authoritative_offset_lookup_reads_all_records: bool,
+    authoritative_offset_lookup_matches_all_records: bool,
+    authoritative_offset_lookup_has_slab_metadata: bool,
+    lower_layer_blob_offset_reads_proven: bool,
+    lower_layer_range_reads_avoid_full_blob_scans: bool,
+    snapshot_reopen_restores_offset_metadata: bool,
+    snapshot_reopen_recovered_all_records: bool,
+    snapshot_reopen_cache_metrics_available: bool,
+    secondary_replay_recovered_all_records: bool,
+    single_node_reload_recovered_all_records: bool,
+    replay_uses_offset_index_metadata: bool,
+    secondary_replay_uses_offset_index_metadata: bool,
+    single_node_reload_uses_offset_index_metadata: bool,
+    sync_reports_include_offsets: bool,
+    async_flush_reports_include_offsets: bool,
+    replay_recovered_all_records: bool,
+    retrieval_recovered_all_records: bool,
+    append_latency_avg_us: u128,
+    append_latency_p95_us: u128,
+    replay_latency_total_us: u128,
+    retrieval_latency_avg_us: u128,
+}
+
+fn test_engine(root: &std::path::Path, role: &str) -> TemporalEngine {
+    TemporalEngine::with_local_dirs(
+        1024,
+        root.join(format!("{role}-cache")),
+        root.join(format!("{role}-blocks")),
+        root.join(format!("{role}-index")),
+    )
+}
+
+#[tokio::main]
+async fn main() {
+    let entry_count = std::env::var("TEMPORALSTORE_APPEND_BLOB_PARITY_ENTRIES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_ENTRY_COUNT)
+        .max(1);
+    let value_bytes = std::env::var("TEMPORALSTORE_APPEND_BLOB_PARITY_VALUE_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_VALUE_BYTES)
+        .max(1);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let persistent_journal_path = dir.path().join(PERSISTENT_JOURNAL_FILE);
+    let store = Arc::new(
+        MatrixObjectObjectStore::new(
+            "temporalstore-shared",
+            matrixobject_options(Some(&persistent_journal_path)),
+        )
+        .expect("matrixobject store"),
+    );
+    let replicator = SharedStoreReplicator::new("cluster-a", store.clone())
+        .with_wal_append_mode(SharedStoreWalAppendMode::ProtobufAppendBlob);
+
+    let direct_publish = run_direct_publish(
+        dir.path(),
+        store.clone(),
+        &replicator,
+        1,
+        entry_count,
+        value_bytes,
+    )
+    .await;
+    let sync_writer = run_sync_writer(
+        dir.path(),
+        store.clone(),
+        &replicator,
+        2,
+        entry_count,
+        value_bytes,
+    )
+    .await;
+    let async_writer = run_async_writer(
+        dir.path(),
+        store.clone(),
+        &replicator,
+        3,
+        entry_count,
+        value_bytes,
+    )
+    .await;
+    let journal_reopen = run_journal_reopen(
+        dir.path(),
+        persistent_journal_path,
+        1,
+        entry_count,
+        &["direct", "sync", "async"],
+    )
+    .await;
+
+    let append_latencies = direct_publish
+        .publish_latencies_us
+        .iter()
+        .chain(sync_writer.write_latencies_us.iter())
+        .chain(async_writer.enqueue_latencies_us.iter())
+        .copied()
+        .collect::<Vec<_>>();
+    let retrieval_latencies = direct_publish
+        .replay
+        .retrieval_latencies_us
+        .iter()
+        .chain(sync_writer.replay.retrieval_latencies_us.iter())
+        .chain(async_writer.replay.retrieval_latencies_us.iter())
+        .copied()
+        .collect::<Vec<_>>();
+
+    let summary = Summary {
+        direct_offsets_monotonic: offsets_monotonic(&direct_publish.append_receipts),
+        direct_offsets_contiguous: offsets_contiguous(&direct_publish.append_receipts),
+        direct_offset_slices_decode_expected_frames: direct_publish
+            .offset_frame_validation
+            .all_offsets_decode_expected_frame,
+        direct_offset_index_maps_wal_to_blob_offsets: direct_publish
+            .offset_index_validation
+            .all_wal_indexes_have_offset_metadata
+            && direct_publish
+                .offset_index_validation
+                .all_metadata_ranges_match_append_receipts,
+        authoritative_offset_lookup_reads_all_records: direct_publish
+            .authoritative_offset_lookup
+            .all_wal_indexes_directly_read_from_offset_metadata
+            && sync_writer
+                .authoritative_offset_lookup
+                .all_wal_indexes_directly_read_from_offset_metadata
+            && async_writer
+                .authoritative_offset_lookup
+                .all_wal_indexes_directly_read_from_offset_metadata,
+        authoritative_offset_lookup_matches_all_records: direct_publish
+            .authoritative_offset_lookup
+            .all_direct_reads_match_expected_entries
+            && sync_writer
+                .authoritative_offset_lookup
+                .all_direct_reads_match_expected_entries
+            && async_writer
+                .authoritative_offset_lookup
+                .all_direct_reads_match_expected_entries,
+        authoritative_offset_lookup_has_slab_metadata: direct_publish
+            .authoritative_offset_lookup
+            .all_direct_reads_have_slab_metadata
+            && sync_writer
+                .authoritative_offset_lookup
+                .all_direct_reads_have_slab_metadata
+            && async_writer
+                .authoritative_offset_lookup
+                .all_direct_reads_have_slab_metadata,
+        lower_layer_blob_offset_reads_proven: direct_publish
+            .authoritative_offset_lookup
+            .lower_layer_blob_offset_reads_proven
+            && sync_writer
+                .authoritative_offset_lookup
+                .lower_layer_blob_offset_reads_proven
+            && async_writer
+                .authoritative_offset_lookup
+                .lower_layer_blob_offset_reads_proven,
+        lower_layer_range_reads_avoid_full_blob_scans: direct_publish
+            .authoritative_offset_lookup
+            .lower_layer_range_reads_avoid_full_blob_scans
+            && sync_writer
+                .authoritative_offset_lookup
+                .lower_layer_range_reads_avoid_full_blob_scans
+            && async_writer
+                .authoritative_offset_lookup
+                .lower_layer_range_reads_avoid_full_blob_scans,
+        snapshot_reopen_restores_offset_metadata: journal_reopen.reopened_offset_metadata_ok,
+        snapshot_reopen_recovered_all_records: journal_reopen.reopened_replay_recovered_all_records
+            && journal_reopen.reopened_retrieval_recovered_all_records,
+        snapshot_reopen_cache_metrics_available: journal_reopen.cache_metrics_available,
+        secondary_replay_recovered_all_records: direct_publish.replay.secondary_retrieved_records
+            == entry_count
+            && sync_writer.replay.secondary_retrieved_records == entry_count
+            && async_writer.replay.secondary_retrieved_records == entry_count,
+        single_node_reload_recovered_all_records: direct_publish
+            .replay
+            .single_node_reload_retrieved_records
+            == entry_count
+            && sync_writer.replay.single_node_reload_retrieved_records == entry_count
+            && async_writer.replay.single_node_reload_retrieved_records == entry_count,
+        replay_uses_offset_index_metadata: replay_report_uses_offset_index(
+            &direct_publish.replay.replay_report,
+            entry_count,
+        ) && replay_report_uses_offset_index(
+            &sync_writer.replay.replay_report,
+            entry_count,
+        ) && replay_report_uses_offset_index(
+            &async_writer.replay.replay_report,
+            entry_count,
+        ),
+        secondary_replay_uses_offset_index_metadata: replay_report_uses_offset_index(
+            &direct_publish.replay.secondary_replay_report,
+            entry_count,
+        ) && replay_report_uses_offset_index(
+            &sync_writer.replay.secondary_replay_report,
+            entry_count,
+        ) && replay_report_uses_offset_index(
+            &async_writer.replay.secondary_replay_report,
+            entry_count,
+        ),
+        single_node_reload_uses_offset_index_metadata: replay_report_uses_offset_index(
+            &direct_publish.replay.single_node_reload_report,
+            entry_count,
+        ) && replay_report_uses_offset_index(
+            &sync_writer.replay.single_node_reload_report,
+            entry_count,
+        ) && replay_report_uses_offset_index(
+            &async_writer.replay.single_node_reload_report,
+            entry_count,
+        ),
+        sync_reports_include_offsets: sync_writer.write_reports.iter().all(|report| {
+            report.wal_blob_start_offset.is_some()
+                && report.wal_blob_end_offset.is_some()
+                && report.wal_blob_object_length.is_some()
+        }),
+        async_flush_reports_include_offsets: async_writer
+            .flush_report
+            .last_wal_blob_start_offset
+            .is_some()
+            && async_writer.flush_report.last_wal_blob_end_offset.is_some()
+            && async_writer
+                .flush_report
+                .last_wal_blob_object_length
+                .is_some(),
+        replay_recovered_all_records: direct_publish.replay.replay_report.applied
+            == entry_count as usize
+            && sync_writer.replay.replay_report.applied == entry_count as usize
+            && async_writer.replay.replay_report.applied == entry_count as usize,
+        retrieval_recovered_all_records: direct_publish.replay.retrieved_records == entry_count
+            && sync_writer.replay.retrieved_records == entry_count
+            && async_writer.replay.retrieved_records == entry_count,
+        append_latency_avg_us: avg(&append_latencies),
+        append_latency_p95_us: percentile(&append_latencies, 95),
+        replay_latency_total_us: direct_publish.replay.replay_latency_us
+            + sync_writer.replay.replay_latency_us
+            + async_writer.replay.replay_latency_us,
+        retrieval_latency_avg_us: avg(&retrieval_latencies),
+    };
+
+    // ---- TEETH FOR THE ONE CLAIM THAT CHECKS THIS REPORT'S OWN READER.
+    // ----
