@@ -32,3 +32,38 @@
 //!
 //! # THIS ARM MEASURES AND DOES NOT CHANGE THE FORMAT
 //!
+//! Re-pointing that annotation is a durable-format change: anchors already on disk are base64
+//! strings, so it needs a decoder that takes both spellings and a test that proves the old one still
+//! loads. That is a separate change carrying a compatibility obligation. Pricing it first means the
+//! decision gets made against a number.
+//!
+//! rust-internal: encodes this crate's own records, no product behaviour
+//!
+//!   cargo test -p temporalstore-rust --lib what_the_durable_byte_encodings_cost -- --ignored --nocapture
+
+/// A digest-shaped payload: uniform bytes, so about half of them sit at or above 0x80 and the
+/// array encoding charges two for each of those. A run of one low byte would hide the toll
+/// entirely, which is the fixture mistake this whole area has paid for before.
+fn digest_shaped(len: usize) -> Vec<u8> {
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        })
+        .collect()
+}
+
+#[test]
+#[ignore = "encodes a few records and compares their lengths; run by name"]
+fn what_the_durable_byte_encodings_cost() {
+    const DIGEST: usize = 32;
+    let bytes = digest_shaped(DIGEST);
+    let above = bytes.iter().filter(|byte| **byte >= 0x80).count();
+
+    // The three spellings, each encoded by the same msgpack serializer so only the SHAPE differs.
+    struct AsArray<'a>(&'a [u8]);
+    impl serde::Serialize for AsArray<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
