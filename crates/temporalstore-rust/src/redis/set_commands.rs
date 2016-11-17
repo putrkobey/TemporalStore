@@ -35,3 +35,22 @@ pub(crate) fn set_algebra_response(
     op: SetAlgebraOp,
     execute: &mut impl FnMut(Command) -> Result<CommandResponse, String>,
 ) -> RespValue {
+    let mut sets = Vec::new();
+    for key in keys {
+        match sorted_set_members(&string_arg(key), execute) {
+            Ok(members) => sets.push(members.into_iter().collect::<HashSet<_>>()),
+            Err(err) => return RespValue::Error(err),
+        }
+    }
+    let mut result = match op {
+        SetAlgebraOp::Diff => sets.first().cloned().unwrap_or_default(),
+        SetAlgebraOp::Inter => sets.first().cloned().unwrap_or_default(),
+        SetAlgebraOp::Union => HashSet::new(),
+    };
+    match op {
+        SetAlgebraOp::Diff => {
+            for set in sets.iter().skip(1) {
+                result.retain(|member| !set.contains(member));
+            }
+        }
+        SetAlgebraOp::Inter => {

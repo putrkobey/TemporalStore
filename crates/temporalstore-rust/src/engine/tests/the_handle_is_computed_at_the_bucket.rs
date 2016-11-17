@@ -75,3 +75,81 @@ fn the_hoisted_handle_is_byte_identical_to_the_one_the_map_used_to_compute() {
     let mut bucket = BucketNode::default();
     let mut live = BlockSlabLiveIndex::default();
     let mut reached_inline = false;
+    let mut reached_list = false;
+    let mut handles = Vec::new();
+
+    for (at, (object_key, entry)) in entries.iter().enumerate() {
+        let expected = block_index_handle(object_key, entry);
+        let assigned = bucket.insert_block(object_key, entry.clone(), &mut live);
+        assert_eq!(
+            expected, assigned,
+            "entry {at}: the bucket-level door assigned {assigned} where the handle composed from \
+             the identity beside the entry is {expected}. A handle that changed value invalidates \
+             every ref already written to disk, which is the one failure this hoist must not have"
+        );
+        handles.push(assigned);
+        match &bucket.block_index {
+            BlockIndexMap::One(_, _) => reached_inline = true,
+            _ => reached_list = true,
+        }
+    }
+
+    // --- BOTH ARMS REACHED, floored individually. A handle compared on one arm is compared once. ---
+    assert!(
+        reached_inline,
+        "the fixture never left the map in its inline arm, so the handle was never compared there"
+    );
+    assert!(
+        reached_list,
+        "the fixture never reached the list arm, so the handle was never compared there"
+    );
+
+    // --- EVERY HANDLE DISTINCT, or the equalities above could hold for one repeated value. ---
+    let mut sorted = handles.clone();
+    sorted.sort_unstable();
+    sorted.dedup();
+    assert_eq!(
+        handles.len(),
+        sorted.len(),
+        "the fixture produced {} distinct handles from {} entries, so some comparison above was \
+         between two copies of one value",
+        sorted.len(),
+        handles.len()
+    );
+
+    // --- NEGATIVE CONTROL ONE: PERTURB AN ADDRESS TERM. The handle must move, or it is not
+    //     reading the address at all and the equality above is insensitive to it. ---
+    let (base_key, base) = &entries[0];
+    let mut longer = base.clone();
+    longer.address = ElementEntry::from_parts(7, 0, 65, Some(7), Some(11));
+    assert_ne!(
+        block_index_handle(base_key, base),
+        block_index_handle(base_key, &longer),
+        "changing the address LENGTH left the handle alone, so `length` is not hashed and the \
+         address terms this hoist exists to free are not actually pinned by it"
+    );
+    let mut elsewhere = base.clone();
+    elsewhere.address = ElementEntry::from_parts(7, 1, 64, Some(7), Some(11));
+    assert_ne!(
+        block_index_handle(base_key, base),
+        block_index_handle(base_key, &elsewhere),
+        "changing the address OFFSET left the handle alone"
+    );
+
+    // --- NEGATIVE CONTROL TWO IS GONE: THERE IS NO NAME ON THE ENTRY TO PERTURB. ---
+    //
+    // Two controls stood here. One renamed the entry's component and asserted the handle moved;
+    // the other dropped it and asserted the same. Both existed because "the address and the name
+    // are two different sources and an instrument blind to one is not blind to both" -- a real
+    // argument while the entry had a name.
+    //
+    // `BlockIndex` has no component field, so neither perturbation can be written. The handle
+    // still hashes a name TERM -- `block_index_handle` passes the constant `None::<&str>`, which
+    // keeps every handle bit-for-bit what it was -- but a constant cannot be perturbed, so a
+    // control over it would move nothing and assert nothing. The controls that remain perturb the
+    // address slab, the address offset, the object key and the model spelling, and each still
+    // moves the handle.
+
+    println!(
+        "\n=== the handle after the hoist ===\n  {} entries, {} distinct handles, inline arm \
+         reached: {reached_inline}, list arm reached: {reached_list}\n  every handle equals the one \
