@@ -17,13 +17,3 @@ use std::env;
 fn main() {
     println!("cargo:rerun-if-env-changed=TEMPORALSTORE_LIB_DIR");
     println!("cargo:rerun-if-env-changed=TEMPORALSTORE_LIB_NAME");
-
-    if env::var_os("CARGO_FEATURE_DIRECT").is_none() {
-        return;
-    }
-
-    let lib_dir = match env::var("TEMPORALSTORE_LIB_DIR") {
-        Ok(dir) if !dir.trim().is_empty() => dir,
-        _ => panic!(
-            "feature `direct` links the native TemporalStore C ABI, which this \
-             repository does not build. Set TEMPORALSTORE_LIB_DIR to a directory \
