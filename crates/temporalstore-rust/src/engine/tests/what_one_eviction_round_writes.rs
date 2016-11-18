@@ -230,3 +230,119 @@ fn materializations_due(drops: &[u64], interval: u64) -> u64 {
 /// the OTHER whole-index encode in a round, so leaving it on would make every round encode once
 /// whatever the checkpoint did and the count would answer the wrong question. With it off the only
 /// encoder a round can reach is the checkpoint, so `encodes_total == 0` for a round that dropped
+/// objects IS a skipped checkpoint, read off the same thread-local instrument as the sweep.
+fn round_shape(keys: usize, rounds: u64, interval: u64) -> RoundShape {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = TemporalEngine::with_local_dirs(
+        64,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(SHARD);
+    seed(&engine, keys);
+
+    // READ THE SETTING BACK OUT. A knob the round consults under a different name than the arm
+    // set leaves the arm silently not running, and the arm would agree with whatever it was asked.
+    engine.set_logged_deletion_index_flush_interval_for_test(interval);
+    assert_eq!(
+        interval,
+        engine.logged_deletion_index_flush_interval(),
+        "the interval this arm set is not the interval the round will read, so the arm is not \
+         running at the interval it reports"
+    );
+
+    let mut shape = RoundShape {
+        rounds_with_drops: 0,
+        dropped_total: 0,
+        materializations: 0,
+        skipped_flushes: 0,
+        encode_bytes: 0,
+        drops: Vec::new(),
+    };
+    for _ in 0..rounds {
+        crate::engine::shard_write_guard::reset_index_encode_counts();
+        let report = engine.apply_storage_eviction(SHARD, 1, 2, false, true);
+        let counts = crate::engine::shard_write_guard::index_encode_counts();
+        if report.dropped_object_count == 0 {
+            continue;
+        }
+        shape.rounds_with_drops += 1;
+        shape.dropped_total += report.dropped_object_count as u64;
+        shape.drops.push(report.dropped_object_count as u64);
+        shape.encode_bytes += counts.encode_bytes_total;
+        if counts.encodes_total > 0 {
+            shape.materializations += 1;
+        } else {
+            shape.skipped_flushes += 1;
+        }
+    }
+    shape
+}
+
+/// A FLUSH PER ROUND BECAME A FLUSH PER INTERVAL, measured against the arm that still pays per
+/// round.
+///
+/// The control is an interval of 1, which is byte-for-byte the behaviour this change replaced:
+/// every round's deletions run a countdown of 1 straight out, so every round is due. Running both
+/// in one process on one fixture is what makes the shipped number mean something -- a guard that
+/// asserts "few materializations" against no control passes just as well against a round that
+/// stopped evicting.
+#[test]
+fn the_checkpoint_interval_turns_a_flush_per_round_into_a_flush_per_interval() {
+    const KEYS: usize = 2_000;
+    const ROUNDS: u64 = 40;
+    const INTERVAL: u64 = crate::engine::LOGGED_DELETION_INDEX_FLUSH_INTERVAL_DEFAULT;
+
+    let per_round = round_shape(KEYS, ROUNDS, 1);
+    let interval = round_shape(KEYS, ROUNDS, INTERVAL);
+
+    println!();
+    println!("  keys={KEYS} rounds={ROUNDS}");
+    println!(
+        "  interval=1          rounds_with_drops={:<3} dropped={:<4} materializations={:<3} \
+         skipped={:<3} encode_bytes={}",
+        per_round.rounds_with_drops,
+        per_round.dropped_total,
+        per_round.materializations,
+        per_round.skipped_flushes,
+        per_round.encode_bytes
+    );
+    println!(
+        "  interval={INTERVAL:<10} rounds_with_drops={:<3} dropped={:<4} materializations={:<3} \
+         skipped={:<3} encode_bytes={}",
+        interval.rounds_with_drops,
+        interval.dropped_total,
+        interval.materializations,
+        interval.skipped_flushes,
+        interval.encode_bytes
+    );
+    println!();
+
+    // THE REGIME, BOTH ARMS. Neither reading means anything over a store that evicted nothing.
+    assert!(
+        per_round.rounds_with_drops > 1,
+        "the control arm ran {} round(s) that dropped anything, so there is nothing to compare \
+         against",
+        per_round.rounds_with_drops
+    );
+    assert!(
+        interval.rounds_with_drops > 1,
+        "the interval arm ran {} round(s) that dropped anything",
+        interval.rounds_with_drops
+    );
+
+    // THE CONTROL STILL PAYS PER ROUND. This is what fails if the countdown stops being consulted
+    // at all, or if an interval of 1 stops meaning "every round".
+    assert_eq!(
+        per_round.rounds_with_drops, per_round.materializations,
+        "at interval 1 every round that drops must materialize the base index, which is the \
+         behaviour being replaced -- {} of {} did",
+        per_round.materializations, per_round.rounds_with_drops
+    );
+    assert_eq!(
+        0, per_round.skipped_flushes,
+        "at interval 1 no round may skip its checkpoint"
+    );
+
+    // THE CONTESTED CASE AROSE. Without this the arm below could pass on a fixture where every
