@@ -58,23 +58,3 @@ impl CStringOptions {
 }
 
 pub(crate) fn cstring(value: &str) -> Result<CString> {
-    CString::new(value).map_err(|_| Error {
-        code: 3,
-        message: "string contains interior null byte".to_string(),
-    })
-}
-
-pub(crate) fn check(code: c_int, error: *mut c_char) -> Result<()> {
-    if code == 0 {
-        return Ok(());
-    }
-    let message = if error.is_null() {
-        "unknown TemporalStore error".to_string()
-    } else {
-        let message = unsafe { CStr::from_ptr(error).to_string_lossy().into_owned() };
-        unsafe { temporalstore_free_string(error) };
-        message
-    };
-    Err(Error { code, message })
-}
-

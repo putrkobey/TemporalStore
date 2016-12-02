@@ -33,3 +33,38 @@ fn engine() -> TemporalEngine {
     engine.load_shard(SHARD_ID);
     engine
 }
+
+fn write_event(engine: &TemporalEngine, node: u64, ts: u64) {
+    let event = ContextEvent {
+        event_id_hash: ts.wrapping_mul(2654435761),
+        event_time_ms: ts,
+        ingestion_time_ms: ts,
+        kind: 0,
+        event_type: 1,
+        actor_hash: 0,
+        status: 0,
+        valid_until_ms: 0,
+        confidence: 1.0,
+        importance: 0.5,
+        text: format!("event at {ts}"),
+        source_ref: String::new(),
+        related_node_hashes: Vec::new(),
+        compact_attrs: Vec::new(),
+        // No vector on this fixture; empty is what a record without one holds.
+        vector: Vec::new(),
+    };
+    let r = engine
+        .execute(ExecuteRequest {
+            shard_id: SHARD_ID,
+            command: Command::ContextWriteEvent {
+                tenant_hash: TENANT,
+                node_hash: node,
+                event: Box::new(event),
+                first_write_only: false,
+                cold_storage: false,
+            },
+        })
+        .response;
+    assert!(matches!(r, CommandResponse::ContextObjectKey { .. }));
+}
+
