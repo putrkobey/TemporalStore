@@ -5,11 +5,3 @@ target
 build
 build-*
 build-ubuntu22
-output
-target-rust-bench
-benchmark_reports
-objectstorelab-master
-matrixdb2_images
-objectstore_images
-*.log
-**/CMakeFiles
