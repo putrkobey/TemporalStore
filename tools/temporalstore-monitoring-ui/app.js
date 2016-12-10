@@ -820,3 +820,1649 @@ const fallbackHealth = {
             resources: [{ raw_uri: "incident_77.pdf", type: "pdf", chunks: "3", parser: "pdf + VLM fallback" }],
             indexes: [
               { name: "resource_type", value: "pdf" },
+              { name: "event_kind", value: "incident_update" },
+              { name: "status", value: "stable" },
+            ],
+            compression: [
+              {
+                id: "77001",
+                window: "1781500000000..1781509000000",
+                summary: "Older INC-77 rollback context compressed; source event ids retained.",
+              },
+            ],
+          },
+        },
+        {
+          id: "10029901",
+          parent: "10029900",
+          label: "incident_77.pdf#page=1:L0",
+          type: "chunk",
+          depth: 5,
+          updated_at_ms: "1781509300000",
+          status: "packed",
+          score: "0.94",
+          metadata: {
+            object_key: "ctx:resource:1001:10029901",
+            model: "ResourceChunk + ContextEmbedding",
+            embedding_ref: "ctx:emb:1001:10029901",
+            pack_role: "selected citation chunk",
+          },
+          records: {
+            resources: [
+              {
+                raw_uri: "incident_77.pdf",
+                source_ref: "page=1:L0",
+                text: "INC-77 rollback stable after stream proxy restart; monitor queue drain before close.",
+              },
+            ],
+            embeddings: [{ ref: "ctx:emb:1001:10029901", model: "all-MiniLM-L6-v2", dim: 384, score: "0.94" }],
+            indexes: [
+              { name: "resource_type", value: "pdf" },
+              { name: "raw_uri", value: "incident_77.pdf" },
+            ],
+          },
+        },
+      ],
+      mock_ingestions: [
+        {
+          source: "agent_hook.before_llm",
+          input: "Alice approved GPU purchase request 8891.",
+          writes: "node path + event + entity + indexes + embedding + dirty summary",
+          node_hash: "10018891",
+          status: "accepted",
+        },
+        {
+          source: "agent_hook.resource_added",
+          input: "incident_77.pdf",
+          writes: "resource node + chunk nodes + chunk embeddings + resource_fact event",
+          node_hash: "10029900",
+          status: "accepted",
+        },
+        {
+          source: "agent_hook.after_llm",
+          input: "User confirmed INC-77 rollback answer.",
+          writes: "feedback ContextEvent + accepted refs + ContextPackAudit",
+          node_hash: "10029900",
+          status: "confirmed",
+        },
+      ],
+    },
+    filesystem: [
+      {
+        path: "/company_a",
+        node_hash: "1001000",
+        model: "ContextNode",
+        storage: "ctx:node + ctx:child",
+        children: "infra_team",
+        events: "0",
+        summary: "tenant L0 fresh",
+        status: "ready",
+      },
+      {
+        path: "/company_a/infra_team/project_1/approvals",
+        node_hash: "1001300",
+        model: "ContextNode + ContextSummary",
+        storage: "ctx:node, ctx:child, ctx:emb",
+        children: "5",
+        events: "approval refs",
+        summary: "collection L0 score 0.96",
+        status: "selected",
+      },
+      {
+        path: "/company_a/infra_team/project_1/approvals/gpu_purchase_request_8891",
+        node_hash: "10018891",
+        model: "ContextNode + ContextEvent + ContextEntity",
+        storage: "ctx:event, ctx:entity, ctxidx",
+        children: "0",
+        events: "991001",
+        summary: "dirty marker queued",
+        status: "deduped child ref",
+      },
+      {
+        path: "/company_a/infra_team/project_1/approvals/incident_77_postmortem",
+        node_hash: "10029900",
+        model: "ContextNode + ResourceChunk",
+        storage: "ctx:resource, ctx:emb",
+        children: "3 chunks",
+        events: "994020 extracted",
+        summary: "L0/L1 resource ready",
+        status: "packed",
+      },
+    ],
+    observations: [
+      {
+        label: "Node traversal",
+        value: "7 nodes",
+        detail: "selected path /company_a/infra_team/project_1/approvals/incident_77_postmortem",
+        status: "ready",
+      },
+      {
+        label: "Event freshness",
+        value: "fresh + compressed",
+        detail: "raw confirmations remain queryable; old windows retain source event ids",
+        status: "passed",
+      },
+      {
+        label: "Index health",
+        value: "AND filters",
+        detail: "status + event_type + project refs intersect before timeline reads",
+        status: "passed",
+      },
+      {
+        label: "Summary lag",
+        value: "watch",
+        detail: "dirty markers are visible; L0 refresh runs asynchronously",
+        status: "watch",
+      },
+      {
+        label: "Token pressure",
+        value: "60 / 70",
+        detail: "event and resource chunk fit the context pack budget",
+        status: "passed",
+      },
+      {
+        label: "Replay audit",
+        value: "query 77027771",
+        detail: "selected events, chunks, filters, and pack refs are replayable",
+        status: "ready",
+      },
+    ],
+    pack: {
+      query: "What confirmed PDF context supports incident INC-77 stable rollback?",
+      selected_tokens: "60 / 70",
+      events: ["994011 user-confirmed final answer", "994020 PDF abstract fact"],
+      chunks: ["10029901 incident_77.pdf#page=1:L0"],
+      filters: ["team=infra_team", "project=project_1", "type=confirmation", "resource_type=pdf"],
+    },
+    alerts: [
+      { label: "Traversal deadline", value: "ok", detail: "top_k_per_depth=1, max_candidate_nodes=3" },
+      { label: "Dirty summaries", value: "watch", detail: "async L0 refresh pending after ingest" },
+      { label: "Token budget", value: "ok", detail: "event + chunk pack below budget" },
+      { label: "Embedding model", value: "local", detail: "all-MiniLM-L6-v2 compatible test vectors" },
+      { label: "Reranker", value: "optional", detail: "bge-reranker-base after TemporalStore candidate filtering" },
+    ],
+    audit: [
+      { label: "Last query id", value: "77027771" },
+      { label: "Selected events", value: "994011, 994020" },
+      { label: "Selected chunks", value: "10029901" },
+      { label: "Feedback memory", value: "994011" },
+      { label: "Parity gate", value: "+ Rust unified" },
+    ],
+    operators: [
+      {
+        name: "Extract Query",
+        status: "ready",
+        command: "context_extract_query",
+        detail: "derive intent, status, time window, and filters from raw query and hints",
+      },
+      {
+        name: "Traverse Tree",
+        status: "ready",
+        command: "context_retrieve",
+        detail: "score child summaries layer by layer before querying leaf timelines",
+      },
+      {
+        name: "Ingest Resource",
+        status: "ready",
+        command: "context_ingest_resource",
+        detail: "parse markdown, text, and PDF pages into L0/L1/L2-style chunks with source refs",
+      },
+      {
+        name: "Pack Replay",
+        status: "ready",
+        command: "context_retrieve_with_resources",
+        detail: "assemble events and chunks under prompt budget and write audit metadata",
+      },
+      {
+        name: "Feedback Hook",
+        status: "ready",
+        command: "context_ingest_feedback",
+        detail: "store final answer confirmation as future retrievable memory",
+      },
+      {
+        name: "Summary Worker",
+        status: "watch",
+        command: "context_query_dirty",
+        detail: "refresh L0/L1 summaries asynchronously after lightweight writes",
+      },
+    ],
+    safeguards: [
+      { label: "Customer input", value: "raw query + hints", detail: "schema complexity stays service-side" },
+      { label: "Tenant boundary", value: "tenant_hash", detail: "all tree, event, chunk, and audit records scoped" },
+      { label: "Serving threshold", value: "bounded", detail: "depth, children, candidates, and token budget capped" },
+      { label: "Historical data", value: "queryable", detail: "old events can remain raw or compressed by time window" },
+      { label: "Model choice", value: "pluggable", detail: "OSS local default, provider hook for hosted models" },
+      { label: "Model isolation", value: "config driven", detail: "tenant can pin OSS model family and runtime class" },
+    ],
+    readiness_gates: [
+      {
+        label: "Contract parity",
+        value: "pass",
+        severity: "blocker",
+        owner: "runtime",
+        evidence: "context_nine_ingestion_compression_parity_gates",
+        detail: "and Rust unified corpus agree on API idempotency, stream replay, batch, resource, token, compression, and source-audit behavior",
+      },
+      {
+        label: "Tenant isolation",
+        value: "pass",
+        severity: "blocker",
+        owner: "storage",
+        evidence: "context object keys include tenant_hash",
+        detail: "tenant_hash scopes nodes, child refs, embeddings, events, resources, and audits",
+      },
+      {
+        label: "Latency budgets",
+        value: "pass",
+        severity: "blocker",
+        owner: "serving",
+        evidence: "Traversal controls cap depth, fanout, candidates, and deadline",
+        detail: "max_depth, top_k_per_depth, max_children_scored, candidates, and deadline are bounded",
+      },
+      {
+        label: "Token budgets",
+        value: "pass",
+        severity: "high",
+        owner: "packing",
+        evidence: "context_pack_token_budget_parity",
+        detail: "context pack excludes chunks that would exceed max_prompt_tokens",
+      },
+      {
+        label: "Idempotent writes",
+        value: "pass",
+        severity: "high",
+        owner: "ingestion",
+        evidence: "retry child-ref corpus checks",
+        detail: "retrying child refs preserves one unique edge without a duplicate timeline write",
+      },
+      {
+        label: "Async summaries",
+        value: "pass",
+        severity: "high",
+        owner: "workers",
+        evidence: "dirty marker without synchronous parent summary writes",
+        detail: "event writes stay lightweight and summary refresh remains dirty-marker driven",
+      },
+      {
+        label: "Replay audit",
+        value: "pass",
+        severity: "medium",
+        owner: "governance",
+        evidence: "ContextPackAudit selected refs and query id",
+        detail: "selected events, chunks, blocked refs, and prompt budget are replayable by query id",
+      },
+      {
+        label: "Local model fallback",
+        value: "pass",
+        severity: "medium",
+        owner: "model-runtime",
+        evidence: "OSS embedding registry and rules-first extraction",
+        detail: "OSS embeddings and rule extraction keep Docker/local validation independent of hosted models",
+      },
+    ],
+    ui_readiness_gates: [
+      {
+        label: "Accessible controls",
+        value: "pass",
+        severity: "blocker",
+        owner: "frontend",
+        evidence: "native button, table, details, and summary controls",
+        detail: "refresh, topology metadata, tables, and disclosure controls use browser-native accessible elements",
+      },
+      {
+        label: "Responsive layout",
+        value: "pass",
+        severity: "blocker",
+        owner: "frontend",
+        evidence: "@media breakpoints collapse grids below tablet width",
+        detail: "context panels, query workbench, topology, pack columns, model cards, and operators reflow on narrow screens",
+      },
+      {
+        label: "Overflow guard",
+        value: "pass",
+        severity: "blocker",
+        owner: "frontend",
+        evidence: "browser check confirms scrollWidth <= clientWidth",
+        detail: "long hashes, model names, evidence commands, and source refs wrap inside their containers",
+      },
+      {
+        label: "Empty state safety",
+        value: "pass",
+        severity: "high",
+        owner: "frontend",
+        evidence: "renderers use fallback arrays and text placeholders",
+        detail: "missing health fields render as empty sections or '-' instead of throwing",
+      },
+      {
+        label: "Refresh resilience",
+        value: "pass",
+        severity: "high",
+        owner: "frontend",
+        evidence: "health fetch has fallbackHealth and status pill updates",
+        detail: "dashboard stays usable when health.json cannot be fetched or is partially absent",
+      },
+      {
+        label: "Evidence visibility",
+        value: "pass",
+        severity: "high",
+        owner: "ops",
+        evidence: "owner/severity/evidence rendered under every readiness gate",
+        detail: "operators can see who owns each gate and which command or signal proves it",
+      },
+      {
+        label: "Deterministic fixture",
+        value: "pass",
+        severity: "medium",
+        owner: "qa",
+        evidence: "health.json is validated by unit tests and json.tool",
+        detail: "local UI, browser check, and CI-style tests render the same fixture payload",
+      },
+      {
+        label: "Actionable runbook",
+        value: "pass",
+        severity: "medium",
+        owner: "ops",
+        evidence: "Runbook panel links commands for corpus, contract, Rust unified, and local serve",
+        detail: "the UI exposes the exact commands operators need to reproduce readiness signals",
+      },
+      {
+        label: "Nine-lane parity",
+        value: "pass",
+        severity: "medium",
+        owner: "qa",
+        evidence: "context_nine_ingestion_compression_parity_gates",
+        detail: "end-to-end parity table renders API, stream, batch, resource, feedback, compression, audit, and lanes",
+      },
+    ],
+    runbook: [
+      { label: "Run unified tests", value: "bash tools/run_rust_unified_tests.sh" },
+      { label: "Validate corpus", value: "python3 tools/run_temporalstore_unified_tests.py --validate-only" },
+      { label: "Run contract", value: "tools/run_unified_context_contract.sh third_party/TemporalStoreTestCorpus/cases/unified_temporalstore_cases.json" },
+      { label: "Refresh health", value: "python3 tools/temporalstore-monitoring-ui/render_health_from_results.py" },
+      { label: "Serve locally", value: "python3 -m http.server 8080 -d tools/temporalstore-monitoring-ui" },
+    ],
+  },
+};
+
+function byId(id) {
+  return document.getElementById(id);
+}
+
+function asArray(value) {
+  return Array.isArray(value) ? value : [];
+}
+
+function text(value, fallback = "-") {
+  if (value === null || value === undefined || value === "") {
+    return fallback;
+  }
+  return String(value);
+}
+
+function statusClass(status) {
+  const normalized = text(status, "unknown").toLowerCase();
+  if (["ok", "pass", "passed", "healthy", "ready", "running"].includes(normalized)) {
+    return "ok";
+  }
+  if (["fail", "failed", "bad", "error", "unhealthy", "down"].includes(normalized)) {
+    return "bad";
+  }
+  return "warn";
+}
+
+function setText(id, value) {
+  const el = byId(id);
+  if (el) {
+    el.textContent = text(value);
+  }
+}
+
+function badge(status) {
+  const cls = statusClass(status);
+  return `<span class="badge ${cls}">${escapeHtml(text(status, "unknown"))}</span>`;
+}
+
+function escapeHtml(value) {
+  return text(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+const contextTreeUiState = {
+  selectedNodeId: "",
+  selectedEdgeId: "",
+  collapsedNodeIds: new Set(),
+};
+
+function renderMetricList(id, rows) {
+  const el = byId(id);
+  if (!el) {
+    return;
+  }
+  el.innerHTML = rows
+    .map(
+      (row) => `
+        <div class="metric-row">
+          <span>${escapeHtml(row.label)}</span>
+          <strong>${row.html || escapeHtml(row.value)}</strong>
+        </div>
+      `,
+    )
+    .join("");
+}
+
+function renderTableRows(id, rows, columns) {
+  const el = byId(id);
+  if (!el) {
+    return;
+  }
+  el.innerHTML = asArray(rows)
+    .map(
+      (row) => `
+        <tr>
+          ${columns.map((col) => `<td>${escapeHtml(row[col] ?? "-")}</td>`).join("")}
+        </tr>
+      `,
+    )
+    .join("");
+}
+
+function renderNodes(nodes) {
+  byId("nodes-body").innerHTML = asArray(nodes)
+    .map(
+      (node) => `
+        <tr>
+          <td><strong>${escapeHtml(node.name)}</strong></td>
+          <td>${escapeHtml(node.role)}</td>
+          <td>${badge(node.status)}</td>
+          <td>${escapeHtml(node.endpoint)}</td>
+          <td>${escapeHtml(node.cpu)}</td>
+          <td>${escapeHtml(node.memory)}</td>
+          <td>${escapeHtml(node.storage)}</td>
+          <td>${escapeHtml(node.replay)}</td>
+        </tr>
+      `,
+    )
+    .join("");
+}
+
+function renderScaleTests(tests) {
+  byId("scale-tests").innerHTML = asArray(tests)
+    .map(
+      (test) => `
+        <article class="test-card">
+          <div class="test-title">
+            <strong>${escapeHtml(test.name)}</strong>
+            ${badge(test.status)}
+          </div>
+          <p>${escapeHtml(test.workload)}</p>
+          <div class="mini-grid">
+            <span>Write QPS<strong>${escapeHtml(test.write_qps)}</strong></span>
+            <span>Read p50<strong>${escapeHtml(test.read_p50_ms)}</strong></span>
+            <span>Read p99<strong>${escapeHtml(test.read_p99_ms)}</strong></span>
+            <span>Replica lag<strong>${escapeHtml(test.secondary_lag_ms)}</strong></span>
+          </div>
+          <div class="test-meta">
+            <span>${escapeHtml(test.threads || "threads -")}</span>
+            <span>${escapeHtml(test.result_dir || "result dir -")}</span>
+          </div>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderModules(modules) {
+  byId("modules-body").innerHTML = asArray(modules)
+    .map(
+      (item) => `
+        <tr>
+          <td><strong>${escapeHtml(item.module)}</strong></td>
+          <td>${escapeHtml(item.test)}</td>
+          <td>${badge(item.status)}</td>
+          <td>${escapeHtml(item.write_path)}</td>
+          <td>${escapeHtml(item.read_path)}</td>
+          <td>${escapeHtml(item.latency)}</td>
+          <td>${escapeHtml(item.notes)}</td>
+        </tr>
+      `,
+    )
+    .join("");
+}
+
+function renderDataModels(models) {
+  const el = byId("data-models");
+  if (!el) {
+    return;
+  }
+  el.innerHTML = asArray(models)
+    .map(
+      (model) => `
+        <article class="model-card">
+          <div class="model-head">
+            <strong>${escapeHtml(model.name)}</strong>
+            ${badge(model.status)}
+          </div>
+          <p>${escapeHtml(model.use_case)}</p>
+          <dl>
+            <div><dt>Write</dt><dd>${escapeHtml(model.write_shape)}</dd></div>
+            <div><dt>Query</dt><dd>${escapeHtml(model.query_shape)}</dd></div>
+            <div><dt>Storage</dt><dd>${escapeHtml(model.storage_shape)}</dd></div>
+            <div><dt>Consistency</dt><dd>${escapeHtml(model.consistency)}</dd></div>
+          </dl>
+          <span class="model-test">${escapeHtml(model.test_status)}</span>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderProducts(products) {
+  const el = byId("products-grid");
+  if (!el) {
+    return;
+  }
+  el.innerHTML = asArray(products)
+    .map(
+      (product) => `
+        <article class="product-card">
+          <div class="product-head">
+            <div>
+              <strong>${escapeHtml(product.name)}</strong>
+              <span>${escapeHtml(product.role)}</span>
+            </div>
+            ${badge(product.status)}
+          </div>
+          <p>${escapeHtml(product.summary)}</p>
+          <div class="product-metrics">
+            <span>Topology<strong>${escapeHtml(product.topology)}</strong></span>
+            <span>Endpoint<strong>${escapeHtml(product.endpoint)}</strong></span>
+            <span>Latest test<strong>${escapeHtml(product.latest_test)}</strong></span>
+          </div>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderProductServices(services) {
+  renderTableRows("product-services-body", services, [
+    "product",
+    "service",
+    "node",
+    "status",
+    "ports",
+    "role",
+    "latest_signal",
+  ]);
+}
+
+function renderContextOps(context) {
+  const data = context || fallbackHealth.context_ops;
+  const status = data.status || "pending";
+  const statusEl = byId("context-runtime-status");
+  if (statusEl) {
+    statusEl.className = `status-pill ${statusClass(status)}`;
+    statusEl.innerHTML = `<span class="dot"></span>${escapeHtml(status)}`;
+  }
+
+  const kpis = byId("context-kpis");
+  if (kpis) {
+    kpis.innerHTML = asArray(data.kpis)
+      .map(
+        (item) => `
+          <article class="context-kpi">
+            <span>${escapeHtml(item.label)}</span>
+            <strong>${escapeHtml(item.value)}</strong>
+            <small>${escapeHtml(item.note)}</small>
+          </article>
+        `,
+      )
+      .join("");
+  }
+
+  const flow = byId("context-flow");
+  if (flow) {
+    flow.innerHTML = asArray(data.flow)
+      .map(
+        (item, index) => `
+          <article class="flow-card">
+            <span>${String(index + 1).padStart(2, "0")}</span>
+            <div>
+              <strong>${escapeHtml(item.name)}</strong>
+              <p>${escapeHtml(item.detail)}</p>
+            </div>
+            ${badge(item.status)}
+          </article>
+        `,
+      )
+      .join("");
+  }
+
+  renderScaleTestsInto("context-tests", data.tests);
+  renderOpsWorkspace(data);
+  renderDataPlane(data);
+  renderResourceSkillOps(data);
+  renderTableRows("context-pipeline-body", data.pipeline, [
+    "step",
+    "input",
+    "writes",
+    "query",
+    "output",
+    "status",
+  ]);
+  renderTableRows("context-e2e-parity-body", data.e2e_parity_runs, [
+    "run",
+    "covers",
+    "evidence",
+    "output",
+    "status",
+  ]);
+
+  const requests = byId("context-request-builder");
+  if (requests) {
+    requests.innerHTML = asArray(data.request_builder)
+      .map(
+        (request) => `
+          <article class="request-card">
+            <div>
+              <strong>${escapeHtml(request.name)}</strong>
+              <span>${escapeHtml(request.method)} ${escapeHtml(request.path)}</span>
+            </div>
+            <code>${escapeHtml(request.body)}</code>
+          </article>
+        `,
+      )
+      .join("");
+  }
+
+  const tree = byId("context-tree");
+  if (tree) {
+    const topology = hydrateContextTopology(data.topology || {});
+    tree.__matrixarkTopology = topology;
+    const selectedPath = new Set(asArray(topology.selected_path).map(String));
+    const topologyNodes = asArray(topology.nodes);
+    const selectedNode = getSelectedTopologyNode(topologyNodes, selectedPath);
+    tree.innerHTML = `
+      <h3>Node Topology</h3>
+      ${topology.summary ? `<p class="topology-summary">${escapeHtml(topology.summary)}</p>` : ""}
+      ${
+        topologyNodes.length
+          ? renderTopologyWorkspace(topology, selectedPath, selectedNode)
+          : ""
+      }
+      <h3 class="subsection-title">Traversal Path</h3>
+      ${asArray(data.tree)
+        .map(
+          (node) => `
+            <div class="tree-node" style="--depth:${Number(node.depth) || 0}">
+              <strong>${escapeHtml(node.label)}</strong>
+              <span>${escapeHtml(node.meta)}</span>
+            </div>
+          `,
+        )
+        .join("")}
+    `;
+  }
+
+  const pack = data.pack || {};
+  const packEl = byId("context-pack");
+  if (packEl) {
+    packEl.innerHTML = `
+      <h3>Context Pack</h3>
+      <div class="pack-query">${escapeHtml(pack.query)}</div>
+      <div class="pack-budget">${escapeHtml(pack.selected_tokens || "-")}</div>
+      <div class="pack-columns">
+        ${renderPackGroup("Events", pack.events)}
+        ${renderPackGroup("Chunks", pack.chunks)}
+        ${renderPackGroup("Filters", pack.filters)}
+      </div>
+    `;
+  }
+
+  renderFilesystemExplorer(data.filesystem, data.topology);
+  wireContextTreeControls(hydrateContextTopology(data.topology || {}));
+  renderContextObservation(data.observations);
+  renderQueryWorkbench(data.query_workbench);
+  renderContextConfig(data.config);
+  renderModelRegistry(data.model_registry);
+  renderContextOperators(data.operators);
+  renderMetricList(
+    "context-alerts",
+    asArray(data.alerts).map((item) => ({
+      label: item.label,
+      html: `${badge(item.value)} <small>${escapeHtml(item.detail || "")}</small>`,
+    })),
+  );
+  renderMetricList("context-audit", data.audit);
+  renderMetricList("context-runbook", data.runbook);
+  renderMetricList(
+    "context-safeguards",
+    [
+      ...asArray(data.safeguards),
+      ...asArray(data.readiness_gates).map((item) => ({
+        ...item,
+        label: `Gate: ${item.label}`,
+      })),
+      ...asArray(data.ui_readiness_gates).map((item) => ({
+        ...item,
+        label: `UI Gate: ${item.label}`,
+      })),
+    ].map((item) => ({
+      label: item.label,
+      html: renderSafeguardHtml(item),
+    })),
+  );
+  const uiReadiness = byId("context-ui-readiness");
+  const uiReadinessSummary = byId("context-ui-readiness-summary");
+  if (uiReadinessSummary) {
+    uiReadinessSummary.innerHTML = renderUiReadinessSummary(data);
+  }
+  if (uiReadiness) {
+    uiReadiness.innerHTML = asArray(data.ui_readiness_gates)
+      .map(
+        (gate, index) => `
+          <article class="ui-readiness-card">
+            <div>
+              <span>${String(index + 1).padStart(2, "0")}</span>
+              ${badge(gate.value)}
+            </div>
+            <strong>${escapeHtml(gate.label)}</strong>
+            <p>${escapeHtml(gate.detail || "")}</p>
+            <code>${escapeHtml(`owner=${text(gate.owner)} / severity=${text(gate.severity)} / evidence=${text(gate.evidence)}`)}</code>
+          </article>
+        `,
+      )
+      .join("");
+  }
+}
+
+function renderOpsWorkspace(data) {
+  const el = byId("context-ops-workspace");
+  if (!el) {
+    return;
+  }
+  const passedE2e = asArray(data.e2e_parity_runs).filter((item) => text(item.status).toLowerCase() === "passed").length;
+  const configGroups = asArray(data.config).length;
+  const modelRoles = asArray(data.model_registry).length;
+  const operatorCount = asArray(data.operators).length;
+  const evidenceCount = asArray(data.audit).length + asArray(data.alerts).length + asArray(data.readiness_gates).length + asArray(data.ui_readiness_gates).length;
+  const cards = [
+    {
+      label: "Operations",
+      href: "#operations",
+      value: `${operatorCount} operators`,
+      detail: "runbook, safeguards, alerts, replay audit",
+      status: data.status || "pending",
+    },
+    {
+      label: "Configurations",
+      href: "#configuration",
+      value: `${configGroups} groups / ${modelRoles} model roles`,
+      detail: "runtime knobs, local OSS models, provider choices",
+      status: "ready",
+    },
+    {
+      label: "Testing",
+      href: "#testing",
+      value: `${passedE2e}/${asArray(data.e2e_parity_runs).length} e2e passed`,
+      detail: "pipeline cases, parity lanes, request builder",
+      status: passedE2e === asArray(data.e2e_parity_runs).length ? "passed" : "watch",
+    },
+    {
+      label: "Evidence",
+      href: "#evidence",
+      value: `${evidenceCount} signals`,
+      detail: "topology, context pack, alerts, audit, readiness",
+      status: "ready",
+    },
+  ];
+  el.innerHTML = cards
+    .map(
+      (card) => `
+        <a class="ops-workspace-card" href="${escapeHtml(card.href)}">
+          <div>
+            <span>${escapeHtml(card.label)}</span>
+            ${badge(card.status)}
+          </div>
+          <strong>${escapeHtml(card.value)}</strong>
+          <small>${escapeHtml(card.detail)}</small>
+        </a>
+      `,
+    )
+    .join("");
+}
+
+function renderDataPlane(data) {
+  const el = byId("context-data-plane");
+  if (!el) {
+    return;
+  }
+  const pipeline = asArray(data.pipeline);
+  const tests = asArray(data.tests);
+  const topologyNodes = asArray(data.topology?.nodes);
+  const pack = data.pack || {};
+  const fallbackCards = [
+    {
+      label: "Context Nodes",
+      value: `${topologyNodes.length} visible`,
+      detail: "tenant/team/project/collection/resource/chunk topology with hashes and parent refs",
+      evidence: "ContextNode + ChildRef",
+      status: topologyNodes.length ? "ready" : "watch",
+    },
+    {
+      label: "Events",
+      value: `${countMatches(pipeline, "contextevent")} writes`,
+      detail: "timestamped event leaves, feedback events, incident facts, and approval facts",
+      evidence: "ContextEvent",
+      status: "passed",
+    },
+    {
+      label: "Extractions",
+      value: `${countMatches(pipeline, "extracted") + countMatches(tests, "extraction")} lanes`,
+      detail: "raw query/event/resource text into event type, status, filters, and time hints",
+      evidence: "rules + optional LLM",
+      status: "passed",
+    },
+    {
+      label: "Ingestions",
+      value: `${countMatches(pipeline, "ingest")} pipeline steps`,
+      detail: "raw event, resource, feedback, API, stream, and batch ingestion paths",
+      evidence: "idempotency + offsets",
+      status: "passed",
+    },
+    {
+      label: "Resources",
+      value: `${countMatches(pipeline, "resource")} lanes`,
+      detail: "markdown/text/pdf chunks, raw_uri refs, resource filters, and chunk embeddings",
+      evidence: "ResourceChunk + embedding",
+      status: "passed",
+    },
+    {
+      label: "Feedback",
+      value: `${countMatches(pipeline, "feedback")} path`,
+      detail: "final answer confirmation becomes future retrievable memory",
+      evidence: "feedback ContextEvent",
+      status: "passed",
+    },
+    {
+      label: "Summaries",
+      value: `${countMatches(pipeline, "compression")} compression lanes`,
+      detail: "dirty summary markers, non-destructive time compression, source event audit",
+      evidence: "ContextCompressionEvent",
+      status: "passed",
+    },
+    {
+      label: "Context Packs",
+      value: text(pack.selected_tokens || "audited"),
+      detail: "token-budgeted events, chunks, filters, replay metadata, and pack audit",
+      evidence: "ContextPackAudit",
+      status: "passed",
+    },
+  ];
+  const cards = asArray(data.data_plane).length ? data.data_plane : fallbackCards;
+  el.innerHTML = cards
+    .map(
+      (card) => `
+        <article class="data-plane-card">
+          <div>
+            <span>${escapeHtml(card.label)}</span>
+            ${badge(card.status)}
+          </div>
+          <strong>${escapeHtml(card.value)}</strong>
+          <p>${escapeHtml(card.detail)}</p>
+          <code>${escapeHtml(card.evidence)}</code>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function countMatches(items, needle) {
+  const pattern = needle.toLowerCase();
+  return asArray(items).filter((item) => JSON.stringify(item).toLowerCase().includes(pattern)).length;
+}
+
+function defaultResourceSkillOps() {
+  return {
+    status: "watch",
+    metrics: [
+      { label: "Import duration", value: "-", unit: "ms", status: "watch", detail: "ResourceImportTask end-to-end duration" },
+      { label: "Parser duration by type", value: "-", unit: "ms", status: "watch", detail: "parser p95 grouped by resource type" },
+      { label: "Chunk count", value: "-", unit: "chunks", status: "watch", detail: "chunks written for current import window" },
+      { label: "Dedupe count", value: "-", unit: "chunks", status: "watch", detail: "content_hash duplicates skipped" },
+      { label: "Embedding duration", value: "-", unit: "ms", status: "watch", detail: "chunk and summary embedding latency" },
+      { label: "Extraction duration", value: "-", unit: "ms", status: "watch", detail: "resource fact/entity extraction latency" },
+      { label: "Summary dirty lag", value: "-", unit: "ms", status: "watch", detail: "oldest dirty resource parent node" },
+      { label: "Resource retrieval hit rate", value: "-", unit: "%", status: "watch", detail: "accepted selected resource refs" },
+      { label: "Skill retrieval hit rate", value: "-", unit: "%", status: "watch", detail: "accepted selected skill sections" },
+      { label: "Parse failure count", value: "-", unit: "failures", status: "watch", detail: "failed parser tasks" },
+    ],
+    import_tasks: [],
+    parse_warnings: [],
+    resource_tree: [],
+    chunk_preview: [],
+    skill_registry: [],
+    version_history: [],
+    summary_lag: [],
+    retrieval_replay: [],
+  };
+}
+
+function renderResourceSkillOps(data) {
+  const ops = {
+    ...defaultResourceSkillOps(),
+    ...(data.resource_skill_ops || {}),
+  };
+  const statusEl = byId("resource-skill-status");
+  if (statusEl) {
+    statusEl.className = `status-pill ${statusClass(ops.status)}`;
+    statusEl.innerHTML = `<span class="dot"></span>${escapeHtml(ops.status)}`;
+  }
+  renderResourceSkillMetrics(ops.metrics);
+  renderCardStack("resource-import-tasks", ops.import_tasks, [
+    ["task_id", "task"],
+    ["raw_uri", "raw uri"],
+    ["status", "status"],
+    ["progress", "progress"],
+    ["chunks", "chunks"],
+    ["warnings", "warnings"],
+    ["summary_status", "summary"],
+  ]);
+  renderCompactRecords("resource-parse-warnings", ops.parse_warnings, [
+    ["raw_uri", "raw uri"],
+    ["parser", "parser"],
+    ["warning", "warning"],
+    ["action", "action"],
+  ]);
+  renderCardStack("resource-tree-view", ops.resource_tree, [
+    ["path", "path"],
+    ["resource_id", "resource"],
+    ["resource_type", "type"],
+    ["version", "version"],
+    ["scope", "scope"],
+    ["chunks", "chunks"],
+    ["indexes", "indexes"],
+  ]);
+  renderCardStack("resource-chunk-preview", ops.chunk_preview, [
+    ["chunk_id", "chunk"],
+    ["source_ref", "source"],
+    ["unit_kind", "unit"],
+    ["tokens", "tokens"],
+    ["selected", "selected"],
+    ["reason", "reason"],
+    ["text", "preview"],
+  ]);
+  renderCardStack("skill-registry-view", ops.skill_registry, [
+    ["skill_id", "skill"],
+    ["version", "version"],
+    ["status", "status"],
+    ["precedence", "precedence"],
+    ["scope", "scope"],
+    ["triggers", "triggers"],
+    ["allowed_tools", "tools"],
+  ]);
+  renderCompactRecords("resource-version-history", ops.version_history, [
+    ["raw_uri", "raw uri"],
+    ["version", "version"],
+    ["content_hash", "hash"],
+    ["supersedes", "supersedes"],
+    ["normal_retrieval", "latest-version filter"],
+  ]);
+  renderCompactRecords("resource-summary-lag", ops.summary_lag, [
+    ["node_path", "node"],
+    ["dirty_reason", "reason"],
+    ["lag_ms", "lag ms"],
+    ["status", "status"],
+  ]);
+  renderCardStack("resource-retrieval-replay", ops.retrieval_replay, [
+    ["query_id", "query"],
+    ["selected_refs", "selected"],
+    ["dropped_refs", "dropped"],
+    ["audit_ref", "audit"],
+    ["reason", "reason"],
+  ]);
+}
+
+function renderResourceSkillMetrics(metrics) {
+  const el = byId("resource-skill-metrics");
+  if (!el) {
+    return;
+  }
+  const rows = asArray(metrics);
+  if (!rows.length) {
+    el.innerHTML = `<p class="empty-records">No metrics yet.</p>`;
+    return;
+  }
+  el.innerHTML = rows
+    .map(
+      (metric) => `
+        <article class="resource-metric-card">
+          <div>
+            <span>${escapeHtml(metric.label)}</span>
+            ${badge(metric.status || "watch")}
+          </div>
+          <strong>${escapeHtml(metric.value)}</strong>
+          <small>${escapeHtml(metric.unit || "")}</small>
+          <p>${escapeHtml(metric.detail || "")}</p>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderCardStack(id, records, fields) {
+  const el = byId(id);
+  if (!el) {
+    return;
+  }
+  const items = asArray(records);
+  if (!items.length) {
+    el.innerHTML = `<p class="empty-records">No records yet.</p>`;
+    return;
+  }
+  el.innerHTML = items
+    .map(
+      (record) => `
+        <article class="ops-mini-card">
+          <dl>
+            ${fields.map(([key, label]) => renderMetadataRow(label, record[key])).join("")}
+          </dl>
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderCompactRecords(id, records, fields) {
+  const el = byId(id);
+  if (!el) {
+    return;
+  }
+  const items = asArray(records);
+  if (!items.length) {
+    el.innerHTML = `<p class="empty-records">No records yet.</p>`;
+    return;
+  }
+  el.innerHTML = items
+    .map(
+      (record) => `
+        <article class="compact-record-card">
+          ${fields.map(([key, label]) => renderMetadataRow(label, record[key])).join("")}
+        </article>
+      `,
+    )
+    .join("");
+}
+
+function renderMetadataRow(key, value) {
+  const rendered = Array.isArray(value) ? value.join(", ") : value ?? "-";
+  return `
+    <div class="metadata-line">
+      <dt>${escapeHtml(key)}</dt>
+      <dd>${escapeHtml(rendered)}</dd>
+    </div>
+  `;
+}
+
+function hydrateContextTopology(topology) {
+  const fallbackTopology = fallbackHealth.context_ops?.topology || {};
+  const fallbackById = new Map(asArray(fallbackTopology.nodes).map((node) => [String(node.id), node]));
+  const sourceNodes = asArray(topology.nodes).length ? topology.nodes : fallbackTopology.nodes;
+  return {
+    ...fallbackTopology,
+    ...topology,
+    selected_path: asArray(topology.selected_path).length ? topology.selected_path : fallbackTopology.selected_path,
+    mock_ingestions: asArray(topology.mock_ingestions).length ? topology.mock_ingestions : fallbackTopology.mock_ingestions,
+    nodes: asArray(sourceNodes).map((node) => {
+      const fallbackNode = fallbackById.get(String(node.id)) || {};
+      return {
+        ...fallbackNode,
+        ...node,
+        metadata: {
+          ...(fallbackNode.metadata || {}),
+          ...(node.metadata || {}),
+        },
+        records: Object.keys(node.records || {}).length ? node.records : fallbackNode.records,
+      };
+    }),
+  };
+}
+
+function renderUiReadinessSummary(data) {
+  const runtimeGates = asArray(data.readiness_gates);
+  const uiGates = asArray(data.ui_readiness_gates);
+  const allGates = [...runtimeGates, ...uiGates];
+  const passed = allGates.filter((gate) => text(gate.value).toLowerCase() === "pass").length;
+  const blockers = allGates.filter((gate) => text(gate.severity).toLowerCase() === "blocker").length;
+  const evidence = allGates.filter((gate) => text(gate.evidence).trim() !== "").length;
+  const runbook = asArray(data.runbook).length;
+  const status = allGates.length > 0 && passed === allGates.length ? "pass" : "watch";
+  const items = [
+    { label: "Gates passed", value: `${passed}/${allGates.length}` },
+    { label: "Blockers covered", value: `${blockers}` },
+    { label: "Evidence linked", value: `${evidence}/${allGates.length}` },
+    { label: "Runbook commands", value: `${runbook}` },
+  ];
+  return `
+    <div class="ui-readiness-summary-head">
+      <strong>Production posture</strong>
+      ${badge(status)}
+    </div>
+    <div class="ui-readiness-summary-grid">
+      ${items
+        .map(
+          (item) => `
+            <span>
+              <small>${escapeHtml(item.label)}</small>
+              <b>${escapeHtml(item.value)}</b>
+            </span>
+          `,
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function renderSafeguardHtml(item) {
+  const extras = [];
+  if (item.owner) {
+    extras.push(`owner=${text(item.owner)}`);
+  }
+  if (item.severity) {
+    extras.push(`severity=${text(item.severity)}`);
+  }
+  if (item.evidence) {
+    extras.push(`evidence=${text(item.evidence)}`);
+  }
+  return `
+    <strong>${escapeHtml(item.value || "-")}</strong>
+    <small>${escapeHtml(item.detail || "")}</small>
+    ${extras.length ? `<code>${escapeHtml(extras.join(" / "))}</code>` : ""}
+  `;
+}
+
+function getSelectedTopologyNode(nodes, selectedPath) {
+  const bySelectedState = nodes.find((node) => text(node.status).toLowerCase() === "selected");
+  if (contextTreeUiState.selectedNodeId) {
+    const manuallySelected = nodes.find((node) => String(node.id) === contextTreeUiState.selectedNodeId);
+    if (manuallySelected) {
+      return manuallySelected;
+    }
+  }
+  if (bySelectedState) {
+    contextTreeUiState.selectedNodeId = String(bySelectedState.id);
+    return bySelectedState;
+  }
+  const selectedPathNodes = nodes.filter((node) => selectedPath.has(String(node.id)));
+  const deepestSelected = selectedPathNodes.sort((a, b) => (Number(b.depth) || 0) - (Number(a.depth) || 0))[0];
+  const fallbackNode = deepestSelected || nodes[0] || null;
+  contextTreeUiState.selectedNodeId = fallbackNode ? String(fallbackNode.id) : "";
+  return fallbackNode;
+}
+
+function renderTopologyWorkspace(topology, selectedPath, selectedNode) {
+  return `
+    <div class="topology-actions" aria-label="Context graph controls">
+      <button class="topology-action" type="button" data-tree-action="expand-all">Expand All</button>
+      <button class="topology-action secondary" type="button" data-tree-action="collapse-all">Collapse All</button>
+      <span>${escapeHtml(asArray(topology.nodes).length)} nodes / ${escapeHtml(asArray(topology.mock_ingestions).length)} mock ingestions</span>
+    </div>
+    <div class="topology-workspace">
+      <div class="topology-map interactive" aria-label="Interactive context node graph">
+        ${renderTopologyGraph(topology, selectedPath)}
+      </div>
+      <aside id="context-node-detail" class="context-node-detail" aria-live="polite">
+        ${contextTreeUiState.selectedEdgeId ? renderEdgeDetailById(contextTreeUiState.selectedEdgeId, topology) : renderNodeDetail(selectedNode, topology)}
+      </aside>
+    </div>
+  `;
+}
+
+function renderTopologyGraph(topology, selectedPath) {
+  const graph = buildTopologyGraph(topology);
+  const visibleNodes = graph.nodes.filter((node) => !hasCollapsedAncestor(node, graph.nodeById));
+  const visibleIds = new Set(visibleNodes.map((node) => String(node.id)));
+  const visibleEdges = graph.edges.filter((edge) => visibleIds.has(edge.parentId) && visibleIds.has(edge.childId));
+  const maxDepth = Math.max(0, ...visibleNodes.map((node) => Number(node.depth) || 0));
+  const laneHeight = 92;
+  const laneWidth = 220;
+  const width = Math.max(760, (maxDepth + 1) * laneWidth + 120);
+  const height = Math.max(360, visibleNodes.length * laneHeight + 80);
+  visibleNodes.forEach((node, index) => {
+    node.__x = 44 + (Number(node.depth) || 0) * laneWidth;
+    node.__y = 40 + index * laneHeight;
+  });
+  const selectedNodeId = contextTreeUiState.selectedNodeId;
+  const selectedEdgeId = contextTreeUiState.selectedEdgeId;
+  return `
+    <div class="graph-shell">
+      <svg class="topology-svg" viewBox="0 0 ${width} ${height}" role="img" aria-label="MatrixArk context tree graph">
+        <defs>
+          <marker id="edge-arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z"></path>
+          </marker>
+        </defs>
+        <g class="graph-edges">
+          ${visibleEdges.map((edge) => renderGraphEdge(edge, graph.nodeById, selectedEdgeId)).join("")}
+        </g>
+        <g class="graph-nodes">
+          ${visibleNodes.map((node) => renderGraphNode(node, graph.childrenByParent, selectedPath, selectedNodeId)).join("")}
+        </g>
+      </svg>
+      <div class="graph-legend">
+        <span><b></b> selected path</span>
+        <span><b></b> selected item</span>
+        <span>Click node for data. Click edge for parent-child metadata.</span>
+      </div>
+    </div>
+    <div class="graph-edge-table">
+      <h4>Visible Edges</h4>
+      ${visibleEdges
+        .map((edge) => {
+          const parent = graph.nodeById.get(edge.parentId);
+          const child = graph.nodeById.get(edge.childId);
+          const active = edge.id === selectedEdgeId ? " active" : "";
+          return `
+            <button class="edge-row${active}" type="button" data-edge-id="${escapeHtml(edge.id)}">
+              <span>${escapeHtml(parent?.label || edge.parentId)} -> ${escapeHtml(child?.label || edge.childId)}</span>
+              <small>${escapeHtml(edge.metadata.storage_key || edge.metadata.parent_ref || edge.id)}</small>
+            </button>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
+function buildTopologyGraph(topology) {
+  const nodes = asArray(topology.nodes).map((node) => ({ ...node, id: String(node.id), parent: text(node.parent, "") }));
+  const nodeById = new Map(nodes.map((node) => [String(node.id), node]));
+  const childrenByParent = new Map();
+  nodes.forEach((node) => {
+    const parentKey = text(node.parent, "");
+    if (!childrenByParent.has(parentKey)) {
+      childrenByParent.set(parentKey, []);
+    }
+    childrenByParent.get(parentKey).push(node);
+  });
+  childrenByParent.forEach((children) => {
+    children.sort((a, b) => (Number(a.depth) || 0) - (Number(b.depth) || 0) || text(a.label || a.id).localeCompare(text(b.label || b.id)));
+  });
+  const edges = nodes
+    .filter((node) => node.parent && nodeById.has(String(node.parent)))
+    .map((node) => {
+      const parent = nodeById.get(String(node.parent));
+      const edgeId = `${node.parent}->${node.id}`;
+      return {
+        id: edgeId,
+        parentId: String(node.parent),
+        childId: String(node.id),
+        metadata: buildEdgeMetadata(parent, node, edgeId),
+      };
+    });
+  return { nodes, nodeById, childrenByParent, edges };
+}
+
+function buildEdgeMetadata(parent, child, edgeId) {
+  const childMetadata = child?.metadata || {};
+  const parentMetadata = parent?.metadata || {};
+  return {
+    edge_id: edgeId,
+    parent_hash: parent?.id || "",
+    parent_label: parent?.label || "",
+    child_hash: child?.id || "",
+    child_label: child?.label || "",
+    child_type: child?.type || "node",
+    child_depth: text(child?.depth, "0"),
+    storage_model: "ContextChildRef",
+    storage_key: parentMetadata.child_ref_key || `ctx:child:tenant:${parent?.id || "root"}`,
+    parent_ref: childMetadata.parent_ref || `${parent?.id || "root"} -> ${child?.id || ""}`,
+    updated_at_ms: child?.updated_at_ms || parent?.updated_at_ms || "",
+    child_status: child?.status || "",
+    child_object_key: childMetadata.object_key || "",
+    child_embedding_ref: childMetadata.embedding_ref || "",
+    query_role: childMetadata.query_role || childMetadata.pack_role || "",
+  };
+}
+
+function hasCollapsedAncestor(node, nodeById) {
+  let cursor = node;
+  while (cursor?.parent) {
+    if (contextTreeUiState.collapsedNodeIds.has(String(cursor.parent))) {
+      return true;
+    }
+    cursor = nodeById.get(String(cursor.parent));
+  }
+  return false;
+}
+
+function renderGraphEdge(edge, nodeById, selectedEdgeId) {
+  const parent = nodeById.get(edge.parentId);
+  const child = nodeById.get(edge.childId);
+  if (!parent || !child) {
+    return "";
+  }
+  const x1 = parent.__x + 156;
+  const y1 = parent.__y + 31;
+  const x2 = child.__x;
+  const y2 = child.__y + 31;
+  const midX = x1 + Math.max(42, (x2 - x1) / 2);
+  const active = edge.id === selectedEdgeId ? " selected" : "";
+  const labelX = (x1 + x2) / 2;
+  const labelY = (y1 + y2) / 2 - 7;
+  const path = `M ${x1} ${y1} C ${midX} ${y1}, ${midX} ${y2}, ${x2} ${y2}`;
+  return `
+    <g class="graph-edge${active}" data-edge-id="${escapeHtml(edge.id)}">
+      <path class="edge-hit" d="${path}"></path>
+      <path class="edge-line" d="${path}" marker-end="url(#edge-arrow)"></path>
+      <text x="${labelX}" y="${labelY}">${escapeHtml(edge.metadata.storage_model)}</text>
+    </g>
+  `;
+}
+
+function renderGraphNode(node, childrenByParent, selectedPath, selectedNodeId) {
+  const children = childrenByParent.get(String(node.id)) || [];
+  const hasChildren = children.length > 0;
+  const collapsed = contextTreeUiState.collapsedNodeIds.has(String(node.id));
+  const selected = String(node.id) === String(selectedNodeId);
+  const inSelectedPath = selectedPath.has(String(node.id));
+  const classes = ["graph-node"];
+  if (selected) classes.push("selected");
+  if (inSelectedPath) classes.push("in-path");
+  if (hasChildren) classes.push("has-children");
+  const status = text(node.status, "ready");
+  const title = text(node.label || node.id);
+  const shortTitle = title.length > 24 ? `${title.slice(0, 21)}...` : title;
+  const meta = `${text(node.type, "node")} / ${text(node.id)}`;
+  return `
+    <g class="${classes.join(" ")}" transform="translate(${node.__x}, ${node.__y})" data-node-id="${escapeHtml(node.id)}">
+      <rect width="158" height="62" rx="8"></rect>
+      <text class="node-title" x="12" y="22">${escapeHtml(shortTitle)}</text>
+      <text class="node-meta" x="12" y="41">${escapeHtml(meta)}</text>
+      <text class="node-status" x="12" y="55">${escapeHtml(status)}</text>
+      ${
+        hasChildren
+          ? `<g class="graph-toggle" data-toggle-id="${escapeHtml(node.id)}" transform="translate(136, 10)">
+              <circle r="10"></circle>
+              <text text-anchor="middle" y="4">${collapsed ? "+" : "-"}</text>
+            </g>`
+          : ""
+      }
+    </g>
+  `;
+}
+
+function renderEdgeDetailById(edgeId, topology) {
+  const graph = buildTopologyGraph(topology || {});
+  const edge = graph.edges.find((item) => item.id === edgeId);
+  if (!edge) {
+    contextTreeUiState.selectedEdgeId = "";
+    const selectedPath = new Set(asArray(topology?.selected_path).map(String));
+    return renderNodeDetail(getSelectedTopologyNode(asArray(topology?.nodes), selectedPath), topology);
+  }
+  return `
+    <h3>Edge Details</h3>
+    <div class="node-detail-head">
+      <div>
+        <strong>${escapeHtml(edge.metadata.parent_label)} -> ${escapeHtml(edge.metadata.child_label)}</strong>
+        <span>${escapeHtml(edge.metadata.storage_model)} / ${escapeHtml(edge.id)}</span>
+      </div>
+      ${badge(edge.metadata.child_status || "ready")}
+    </div>
+    <dl class="node-detail-grid">
+      ${Object.entries(edge.metadata).map(([key, value]) => renderDetailCell(key.replaceAll("_", " "), value)).join("")}
+    </dl>
+  `;
+}
+
+function renderInteractiveTopology(nodes, selectedPath) {
+  const childrenByParent = new Map();
+  asArray(nodes).forEach((node) => {
+    const parentKey = text(node.parent, "");
+    if (!childrenByParent.has(parentKey)) {
+      childrenByParent.set(parentKey, []);
+    }
+    childrenByParent.get(parentKey).push(node);
+  });
+  childrenByParent.forEach((children) => {
+    children.sort((a, b) => {
+      const depthDelta = (Number(a.depth) || 0) - (Number(b.depth) || 0);
+      return depthDelta || text(a.label || a.id).localeCompare(text(b.label || b.id));
+    });
+  });
+  const roots = childrenByParent.get("") || asArray(nodes).filter((node) => !node.parent);
+  return roots.map((node) => renderTopologyBranch(node, childrenByParent, selectedPath)).join("");
+}
+
+function renderTopologyBranch(node, childrenByParent, selectedPath) {
+  const children = childrenByParent.get(String(node.id)) || [];
+  const selected = contextTreeUiState.selectedNodeId === String(node.id);
+  const inSelectedPath = selectedPath.has(String(node.id));
+  const depth = Math.max(0, Number(node.depth) || 0);
+  const shouldOpen = inSelectedPath || depth < 3;
+  return `
+    <details class="topology-branch" data-node-id="${escapeHtml(node.id)}" ${shouldOpen ? "open" : ""}>
+      <summary>
+        ${renderTopologyNode(node, selected, inSelectedPath)}
+      </summary>
+      <div class="topology-branch-tools">
+        <button class="topology-inspect" type="button" data-node-id="${escapeHtml(node.id)}">Inspect Node Data</button>
+      </div>
+      ${
+        children.length
+          ? `<div class="topology-children">${children.map((child) => renderTopologyBranch(child, childrenByParent, selectedPath)).join("")}</div>`
+          : ""
+      }
+    </details>
+  `;
+}
+
+function renderTopologyNode(node, selected, inSelectedPath) {
+  const depth = Math.max(0, Number(node.depth) || 0);
+  const classes = ["topology-node"];
+  if (selected) {
+    classes.push("selected");
+  }
+  if (inSelectedPath) {
+    classes.push("in-selected-path");
+  }
+  const metadata = node.metadata || {};
+  const parent = node.parent ? `parent ${node.parent}` : "root";
+  const details = [
+    { label: "node hash", value: node.id },
+    { label: "parent", value: node.parent || "root" },
+    { label: "type", value: node.type || "node" },
+    { label: "updated", value: text(node.updated_at_ms) },
+    { label: "score", value: text(node.score) },
+    { label: "object key", value: metadata.object_key },
+    { label: "child ref", value: metadata.child_ref_key || metadata.parent_ref },
+    { label: "embedding", value: metadata.embedding_ref },
+    { label: "filter", value: metadata.serving_filter || metadata.resource_type || metadata.raw_uri },
+  ].filter((item) => text(item.value, "") !== "");
+  return `
+    <article class="${classes.join(" ")}" style="--depth:${depth}" data-node-id="${escapeHtml(node.id)}">
+      <div class="topology-main">
+        <span class="topology-depth">L${depth}</span>
+        <div>
+          <strong>${escapeHtml(node.label || node.id)}</strong>
+          <small>${escapeHtml(node.type || "node")} / ${escapeHtml(parent)}</small>
+        </div>
+      </div>
+      <div class="topology-flags">
+        <span class="topology-state">${escapeHtml(node.status || "ready")}</span>
+        ${inSelectedPath ? `<span class="topology-selected">selected path</span>` : ""}
+      </div>
+      <dl class="topology-detail-grid">
+        ${details
+          .map(
+            (item) => `
+              <div>
+                <dt>${escapeHtml(item.label)}</dt>
+                <dd>${escapeHtml(text(item.value))}</dd>
+              </div>
+            `,
+          )
+          .join("")}
+      </dl>
+      <details class="topology-metadata" onclick="event.stopPropagation()">
+        <summary>Metadata Details (${Object.keys(metadata).length})</summary>
+        <dl>${renderMetadataRows(metadata)}</dl>
+      </details>
+    </article>
+  `;
+}
+
+function renderNodeDetail(node, topology) {
+  if (!node) {
+    return `
+      <h3>Node Details</h3>
+      <p class="topology-summary">No node selected.</p>
+    `;
+  }
+  const metadata = node.metadata || {};
+  const records = Object.keys(node.records || {}).length ? node.records : defaultMockRecordsForNode(node);
+  const ingestions = [
+    ...asArray(topology?.mock_ingestions),
+    ...defaultMockIngestionsForNode(node),
+  ].filter((item, index, all) => String(item.node_hash) === String(node.id) && all.findIndex((candidate) => candidate.source === item.source && candidate.input === item.input) === index);
+  return `
+    <h3>Node Details</h3>
+    <div class="node-detail-head">
+      <div>
+        <strong>${escapeHtml(node.label || node.id)}</strong>
+        <span>${escapeHtml(node.type || "ContextNode")} / ${escapeHtml(node.id)}</span>
+      </div>
+      ${badge(node.status || "ready")}
+    </div>
+    <dl class="node-detail-grid">
+      ${renderDetailCell("Parent", node.parent || "root")}
+      ${renderDetailCell("Updated", text(node.updated_at_ms))}
+      ${renderDetailCell("Score", text(node.score))}
+      ${renderDetailCell("Object Key", metadata.object_key)}
+      ${renderDetailCell("Embedding", metadata.embedding_ref)}
+    </dl>
+    ${renderRecordSection("Mock Ingestions", ingestions, ["source", "input", "writes", "status"])}
+    ${renderRecordSection("Events", records.events, ["id", "type", "text", "ingestion_time_ms", "event_time_ms", "confidence"])}
+    ${renderRecordSection("Entities", records.entities, ["name", "type", "value", "confidence"])}
+    ${renderRecordSection("Summaries", records.summaries, ["level", "text"])}
+    ${renderRecordSection("Embeddings", records.embeddings, ["ref", "model", "dim", "score"])}
+    ${renderRecordSection("Indexes", records.indexes, ["name", "value"])}
+    ${renderRecordSection("Resources", records.resources, ["raw_uri", "source_ref", "type", "chunks", "parser", "text"])}
+    ${renderRecordSection("Compression", records.compression, ["id", "window", "summary"])}
+    <details class="topology-metadata detail-metadata" open>
+      <summary>Metadata Details (${Object.keys(metadata).length})</summary>
+      <dl>${renderMetadataRows(metadata)}</dl>
+    </details>
+  `;
+}
+
+function defaultMockIngestionsForNode(node) {
+  const id = String(node?.id || "");
+  const defaults = {
+    "10018891": [
+      {
+        source: "agent_hook.before_llm",
+        input: "Alice approved GPU purchase request 8891.",
+        writes: "node path + event + entity + indexes + embedding + dirty summary",
+        node_hash: "10018891",
+        status: "accepted",
+      },
+    ],
+    "10029900": [
+      {
+        source: "agent_hook.resource_added",
+        input: "incident_77.pdf",
+        writes: "resource node + chunk nodes + chunk embeddings + resource_fact event",
+        node_hash: "10029900",
+        status: "accepted",
+      },
+      {
+        source: "agent_hook.after_llm",
+        input: "User confirmed INC-77 rollback answer.",
+        writes: "feedback ContextEvent + accepted refs + ContextPackAudit",
+        node_hash: "10029900",
+        status: "confirmed",
+      },
+    ],
+  };
+  return defaults[id] || [];
+}
+
+function defaultMockRecordsForNode(node) {
+  const id = String(node?.id || "");
+  if (id === "10018891") {
+    return {
+      events: [
+        {
+          id: "991001",
+          type: "approval_confirmation",
+          text: "Alice approved GPU purchase request 8891 for project_1.",
+          ingestion_time_ms: "1781500000500",
+          event_time_ms: "1781499900000",
+          confidence: "0.96",
+        },
+        {
+          id: "991002",
+          type: "cost_update",
+          text: "Finance attached 42000 USD budget for GPU purchase request 8891.",
+          ingestion_time_ms: "1781500000600",
+          event_time_ms: "1781499950000",
+          confidence: "0.91",
+        },
+      ],
+      entities: [
+        { name: "GPU purchase request 8891", type: "approval", value: "approved", confidence: "0.96" },
+        { name: "budget", type: "cost", value: "42000 USD", confidence: "0.91" },
+      ],
+      summaries: [{ level: "L0", text: "GPU request 8891 is approved with 42000 USD budget evidence." }],
+      embeddings: [{ ref: "ctx:emb:1001:10018891", model: "all-MiniLM-L6-v2", dim: 384, score: "0.92" }],
+      indexes: [
+        { name: "event_kind", value: "approval_confirmation" },
+        { name: "entity", value: "gpu_purchase_request_8891" },
+        { name: "status", value: "approved" },
+        { name: "event_time_bucket", value: "1781499600000" },
+      ],
+    };
+  }
+  if (id === "10029900") {
+    return {
+      events: [
+        {
+          id: "994020",
+          type: "resource_fact",
+          text: "Incident INC-77 rollback was stable after stream proxy restart.",
+          ingestion_time_ms: "1781509300000",
+          event_time_ms: "1781509200000",
+          confidence: "0.95",
+        },
+      ],
+      summaries: [
+        { level: "L0", text: "INC-77 postmortem confirms rollback stability and source runbook evidence." },
+        { level: "L1", text: "PDF resource with page-level chunks covering rollback sequence, confirmation, and postmortem notes." },
+      ],
+      embeddings: [{ ref: "ctx:emb:1001:10029900", model: "all-MiniLM-L6-v2", dim: 384, score: "0.98" }],
+      resources: [{ raw_uri: "incident_77.pdf", type: "pdf", chunks: "3", parser: "pdf + VLM fallback" }],
+      indexes: [
+        { name: "resource_type", value: "pdf" },
+        { name: "event_kind", value: "incident_update" },
+        { name: "status", value: "stable" },
+      ],
+      compression: [
+        {
+          id: "77001",
+          window: "1781500000000..1781509000000",
+          summary: "Older INC-77 rollback context compressed; source event ids retained.",
+        },
+      ],
+    };
+  }
+  if (id === "10029901") {
+    return {
+      resources: [
+        {
+          raw_uri: "incident_77.pdf",
+          source_ref: "page=1:L0",
