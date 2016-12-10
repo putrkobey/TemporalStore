@@ -62,25 +62,3 @@ impl Client {
         let c_filters: Vec<CFeatureFilter> = filters
             .iter()
             .zip(c_fields.iter())
-            .map(|(filter, field)| CFeatureFilter {
-                field: field.as_ptr(),
-                op: filter.op as c_int,
-                value: filter.value,
-            })
-            .collect();
-        let mut out = CSequenceFeatureRowArray {
-            count: 0,
-            rows: ptr::null_mut(),
-        };
-        let mut error: *mut c_char = ptr::null_mut();
-        let code = unsafe {
-            temporalstore_query_sequence_feature_rows(
-                self.raw,
-                key.as_ptr(),
-                start_ts,
-                end_ts,
-                count,
-                c_filters.as_ptr(),
-                c_filters.len(),
-                &mut out,
-                &mut error,

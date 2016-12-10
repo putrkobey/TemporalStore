@@ -54,3 +54,60 @@
 //! The second is reported rather than quietly kept, because a green arm has two readings and this
 //! one is "nothing needs it", not "it works".
 
+/// Every `pub(super)` field of `ShardState`, as `(name, type)` with the type on one line.
+///
+/// Wrapped types are joined before matching, which is the defect this whole module exists for.
+fn shard_state_fields() -> Vec<(String, String)> {
+    let state = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("engine")
+        .join("engine_storage_state.rs");
+    let text = std::fs::read_to_string(&state).expect("engine_storage_state.rs must be readable");
+
+    // BRACE-MATCH THE STRUCT. This arm is DEFENSIVE AND CURRENTLY UNEXERCISED, and saying so is
+    // the point: a plant swapped it for the naive `find("\n}\n")` and the guard still passed, even
+    // with a doc comment carrying a braced example planted inside the body. Every brace inside a
+    // struct body is INDENTED, so only the struct's own closing brace sits at column zero and the
+    // naive query is correct for Rust's standard formatting.
+    //
+    // It stays because it costs nothing and does not depend on formatting, but it is not what
+    // fixed the wrong count -- see the field-joining below, which is.
+    let decl = text
+        .find("pub(super) struct ShardState")
+        .expect("ShardState must be declared");
+    let open = text[decl..].find('{').expect("the struct must have a body") + decl;
+    let mut depth = 0usize;
+    let mut close = open;
+    for (offset, ch) in text[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = open + offset;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(close > open, "the struct body must be brace-matched");
+
+    // Drop doc comments, line comments and attributes, so a braced example or a `#[serde(...)]`
+    // cannot contribute a field.
+    let kept: Vec<&str> = text[open..close]
+        .lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            !(t.starts_with("///") || t.starts_with("//") || t.starts_with("#["))
+        })
+        .collect();
+
+    // JOIN A WRAPPED TYPE ONTO ITS NAME. `control_state_changes:` sits alone on its line with the
+    // type beneath it, and requiring one line is exactly what lost it.
+    let mut joined: Vec<String> = Vec::new();
+    for line in kept {
+        let trimmed = line.trim_end();
+        if trimmed.trim_end().ends_with(':') {
+            joined.push(trimmed.trim_end().to_string());
+            continue;
