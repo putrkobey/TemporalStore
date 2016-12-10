@@ -1,0 +1,187 @@
+<meta charset="utf-8">
+<title>Control State on TemporalStore — Use Cases &amp; Usage Guide</title>
+<style>
+  :root{
+    --paper:#f5f7f8; --surface:#ffffff; --surface-2:#eef2f4;
+    --ink:#131b26; --muted:#57687a; --line:#dce3e8;
+    --accent:#0d6e6e; --accent-soft:#e0efee; --accent-ink:#0a5150;
+    --allow:#157f43; --allow-soft:#e4f2ea;
+    --block:#b12a30; --block-soft:#f6e6e6;
+    --warn:#8f6300; --warn-soft:#f4ecd9;
+    --code-bg:#0f1a22; --code-ink:#d6e4ea; --code-line:#26333d;
+    --shadow:0 1px 2px rgba(16,26,38,.06),0 8px 24px rgba(16,26,38,.06);
+    --serif:Georgia,"Iowan Old Style","Charter","Times New Roman",serif;
+    --sans:system-ui,"Segoe UI",-apple-system,"Helvetica Neue",sans-serif;
+    --mono:ui-monospace,"SF Mono","Cascadia Code","JetBrains Mono",Menlo,monospace;
+  }
+  @media (prefers-color-scheme:dark){
+    :root{
+      --paper:#0c131a; --surface:#111b23; --surface-2:#0f1820;
+      --ink:#e9eff4; --muted:#98abb9; --line:#243440;
+      --accent:#3bb9b1; --accent-soft:#12302e; --accent-ink:#7fd8d1;
+      --allow:#43cf8c; --allow-soft:#123026;
+      --block:#f2757a; --block-soft:#331b1d;
+      --warn:#d9a441; --warn-soft:#2e2612;
+      --code-bg:#0a1319; --code-ink:#d6e4ea; --code-line:#20303a;
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.32);
+    }
+  }
+  :root[data-theme="light"]{
+    --paper:#f5f7f8; --surface:#ffffff; --surface-2:#eef2f4;
+    --ink:#131b26; --muted:#57687a; --line:#dce3e8;
+    --accent:#0d6e6e; --accent-soft:#e0efee; --accent-ink:#0a5150;
+    --allow:#157f43; --allow-soft:#e4f2ea; --block:#b12a30; --block-soft:#f6e6e6;
+    --warn:#8f6300; --warn-soft:#f4ecd9;
+    --code-bg:#0f1a22; --code-ink:#d6e4ea; --code-line:#26333d;
+    --shadow:0 1px 2px rgba(16,26,38,.06),0 8px 24px rgba(16,26,38,.06);
+  }
+  :root[data-theme="dark"]{
+    --paper:#0c131a; --surface:#111b23; --surface-2:#0f1820;
+    --ink:#e9eff4; --muted:#98abb9; --line:#243440;
+    --accent:#3bb9b1; --accent-soft:#12302e; --accent-ink:#7fd8d1;
+    --allow:#43cf8c; --allow-soft:#123026; --block:#f2757a; --block-soft:#331b1d;
+    --warn:#d9a441; --warn-soft:#2e2612;
+    --code-bg:#0a1319; --code-ink:#d6e4ea; --code-line:#20303a;
+    --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 30px rgba(0,0,0,.32);
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--paper);color:var(--ink);font-family:var(--serif);
+    line-height:1.6;-webkit-font-smoothing:antialiased;font-size:17px}
+  .wrap{max-width:920px;margin:0 auto;padding:0 24px}
+  a{color:var(--accent-ink);text-underline-offset:2px}
+
+  /* header */
+  header.site{border-bottom:1px solid var(--line);background:
+    linear-gradient(180deg,var(--surface),var(--paper));}
+  .site .wrap{padding-top:52px;padding-bottom:40px}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.18em;
+    text-transform:uppercase;color:var(--accent-ink);margin:0 0 14px}
+  h1{font-family:var(--sans);font-weight:640;font-size:clamp(30px,5vw,46px);
+    line-height:1.08;letter-spacing:-.02em;margin:0 0 16px;text-wrap:balance}
+  .lede{font-size:20px;color:var(--muted);max-width:64ch;margin:0}
+  .loop{display:inline-flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:26px;
+    font-family:var(--mono);font-size:13px}
+  .loop span{background:var(--surface);border:1px solid var(--line);border-radius:999px;
+    padding:6px 13px;color:var(--ink)}
+  .loop b{color:var(--accent-ink)}
+  .loop i{color:var(--muted);font-style:normal}
+
+  /* section scaffolding */
+  section{padding:46px 0;border-bottom:1px solid var(--line)}
+  .kicker{font-family:var(--mono);font-size:12px;letter-spacing:.16em;text-transform:uppercase;
+    color:var(--muted);margin:0 0 10px;display:flex;align-items:center;gap:10px}
+  .kicker::before{content:"";width:22px;height:2px;background:var(--accent);border-radius:2px}
+  h2{font-family:var(--sans);font-weight:620;font-size:clamp(23px,3.4vw,30px);
+    letter-spacing:-.015em;margin:0 0 16px;text-wrap:balance}
+  h3{font-family:var(--sans);font-weight:600;font-size:19px;letter-spacing:-.01em;margin:30px 0 10px}
+  p{margin:0 0 16px;max-width:68ch}
+  .muted{color:var(--muted)}
+
+  /* use-case cards */
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(250px,1fr));gap:16px;margin-top:8px}
+  .card{background:var(--surface);border:1px solid var(--line);border-radius:14px;padding:20px;
+    box-shadow:var(--shadow)}
+  .card .tag{font-family:var(--mono);font-size:11px;letter-spacing:.1em;text-transform:uppercase;
+    color:var(--accent-ink);background:var(--accent-soft);border-radius:6px;padding:3px 8px;display:inline-block}
+  .card h3{margin:12px 0 6px;font-size:18px}
+  .card p{font-size:15px;color:var(--muted);margin:0}
+  .card .prim{font-family:var(--mono);font-size:12.5px;color:var(--ink);margin-top:12px;
+    padding-top:12px;border-top:1px dashed var(--line)}
+
+  /* diagram */
+  figure{margin:22px 0 6px}
+  .diagram{background:var(--surface);border:1px solid var(--line);border-radius:14px;
+    padding:22px;box-shadow:var(--shadow);overflow-x:auto}
+  figcaption{font-family:var(--sans);font-size:13.5px;color:var(--muted);margin-top:12px;text-align:center}
+  svg .node{fill:var(--surface);stroke:var(--line);stroke-width:1.5}
+  svg .lbl{font-family:var(--sans);font-size:13px;fill:var(--ink)}
+  svg .lblm{font-family:var(--mono);font-size:12px;fill:var(--muted)}
+  svg .flow{stroke:var(--muted);stroke-width:1.6;fill:none;marker-end:url(#arrow)}
+  svg .allow{fill:var(--allow-soft);stroke:var(--allow)}
+  svg .block{fill:var(--block-soft);stroke:var(--block)}
+  svg .dnode{fill:var(--accent-soft);stroke:var(--accent)}
+  svg .edgelbl{font-family:var(--mono);font-size:11px;fill:var(--muted)}
+  svg .ok{fill:var(--allow);font-family:var(--mono);font-size:11px}
+  svg .no{fill:var(--block);font-family:var(--mono);font-size:11px}
+
+  /* code */
+  pre{background:var(--code-bg);color:var(--code-ink);border:1px solid var(--code-line);
+    border-radius:12px;padding:16px 18px;overflow-x:auto;font-family:var(--mono);font-size:13.5px;
+    line-height:1.62;margin:14px 0}
+  code{font-family:var(--mono);font-size:.92em;background:var(--surface-2);border:1px solid var(--line);
+    border-radius:5px;padding:.08em .38em}
+  pre code{background:none;border:none;padding:0;font-size:inherit}
+  .cmt{color:#7d94a3}
+  .kw{color:var(--accent);font-weight:600} .str{color:#8fd0a6} .fn{color:#e0c07a}
+
+  /* tables */
+  .twrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);margin:14px 0}
+  table{border-collapse:collapse;width:100%;font-size:14.5px;background:var(--surface)}
+  th,td{text-align:left;padding:11px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+  thead th{font-family:var(--sans);font-size:12px;letter-spacing:.05em;text-transform:uppercase;
+    color:var(--muted);background:var(--surface-2)}
+  tbody tr:last-child td{border-bottom:none}
+  td code{font-size:12.5px;white-space:nowrap}
+  .tabular{font-variant-numeric:tabular-nums}
+
+  /* callouts */
+  .note{border-left:3px solid var(--accent);background:var(--accent-soft);border-radius:0 10px 10px 0;
+    padding:14px 18px;margin:18px 0;font-size:15.5px}
+  .note.warn{border-color:var(--warn);background:var(--warn-soft)}
+  .note b{font-family:var(--sans)}
+  .pill{display:inline-block;font-family:var(--mono);font-size:11px;letter-spacing:.03em;
+    padding:3px 9px;border-radius:999px;border:1px solid}
+  .pill.allow{color:var(--allow);border-color:var(--allow);background:var(--allow-soft)}
+  .pill.block{color:var(--block);border-color:var(--block);background:var(--block-soft)}
+
+  .statrow{display:flex;flex-wrap:wrap;gap:16px;margin:6px 0 18px}
+  .stat{flex:1 1 150px;background:var(--surface);border:1px solid var(--line);border-radius:14px;
+    padding:18px 20px;box-shadow:var(--shadow)}
+  .stat .num{font-family:var(--sans);font-weight:680;font-size:34px;letter-spacing:-.02em;
+    line-height:1;font-variant-numeric:tabular-nums}
+  .stat .num.allow{color:var(--allow)}
+  .stat .cap{font-family:var(--mono);font-size:11px;letter-spacing:.09em;text-transform:uppercase;
+    color:var(--muted);margin-top:8px}
+  ul.check{list-style:none;padding:0;margin:8px 0;display:grid;gap:9px}
+  ul.check li{padding-left:28px;position:relative;max-width:70ch}
+  ul.check li::before{content:"✓";position:absolute;left:0;top:0;color:var(--accent);
+    font-family:var(--sans);font-weight:700}
+
+  footer{padding:40px 0 60px;color:var(--muted);font-size:14px}
+  footer .wrap{display:flex;flex-wrap:wrap;gap:18px;justify-content:space-between;align-items:baseline}
+  .prov{font-family:var(--mono);font-size:12px}
+  @media (prefers-reduced-motion:no-preference){
+    .card{transition:transform .18s ease, box-shadow .18s ease}
+    .card:hover{transform:translateY(-2px)}
+  }
+</style>
+
+<header class="site">
+  <div class="wrap">
+    <p class="eyebrow">TemporalStore · Control State</p>
+    <h1>Frequency caps, quotas, pacing &amp; risk — one serving primitive</h1>
+    <p class="lede">Control State is TemporalStore's capability for fast-changing serving signals:
+      counters, caps, quotas, pacing, eligibility, and suppression. One shape answers them all —
+      read the current state, apply a rule, atomically update, return a decision.</p>
+    <div class="loop" aria-label="serving loop">
+      <span><b>read</b> current state</span><i>→</i>
+      <span>apply <b>rule</b></span><i>→</i>
+      <span><b>atomically</b> update</span><i>→</i>
+      <span>return <b>decision</b></span>
+    </div>
+  </div>
+</header>
+
+<main>
+  <section id="usecases">
+    <div class="wrap">
+      <p class="kicker">What you can build</p>
+      <h2>Six use cases, one primitive</h2>
+      <p class="muted">Each is a counter or piece of state under a time window or TTL. The atomic
+        increment-then-read operator (<code>HSETANDGET</code>) does the accept-decision in a single
+        round trip; the rest are queries and variations on the same key layout.</p>
+      <div class="grid">
+        <div class="card"><span class="tag">Frequency cap</span>
+          <h3>Cap impressions per user</h3>
+          <p>“Has this user seen campaign c123 more than 5× today?” Increment the daily bucket and
+            allow while <code>count ≤ limit</code>.</p>

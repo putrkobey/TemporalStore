@@ -25,3 +25,30 @@ matrixcache = { git = "https://github.com/matrixarkai/MatrixCache.git", rev = "5
 matrixobjectstore-rs = { git = "https://github.com/matrixarkai/MatrixObject.git", rev = "70bef0aecb649d2128a67c34c2082c4e7ea4f39b", optional = true }
 temporalstore-snapshot = { path = "../temporalstore-snapshot" }
 thiserror = "1"
+tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync"] }
+tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "=1.8.0", features = ["v4", "serde"] }
+zstd = "0.13"
+
+[build-dependencies]
+protoc-bin-vendored = "3"
+tonic-build = "0.12"
+
+[features]
+default = ["temporal-raft-engine"]
+temporal-raft-engine = []
+open-source-surface = []
+# Installs a counting global allocator in TEST builds so a request path's allocations can be
+# measured directly; process RSS cannot resolve a per-request change. Off by default and never
+# part of a normal `cargo test`: a global allocator wrapper adds two atomics to every allocation
+# in the process, and with it installed a full single-threaded run turned 17 socket-bound proxy
+# and raft tests red that pass individually, as a group, and in a run without it. A measurement
+# tool has no business perturbing the suite that is meant to be checking the change.
+#   cargo test --features alloc-probe --lib what_a_retrieve_allocates -- --ignored --nocapture
+alloc-probe = []
+# The object-store backend, used to put a shared store behind a set of
+# otherwise stateless nodes. The store crate is Apache-2.0 open source and is
+# pinned by revision above, exactly as the cache and consensus dependencies
+# are, so this feature builds from a clean checkout with nothing to re-add.
