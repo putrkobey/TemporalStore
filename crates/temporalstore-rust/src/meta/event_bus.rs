@@ -146,3 +146,53 @@ impl MetaEventBus {
             return;
         }
         if lost > 0 {
+            for subscriber in state.subscribers.iter_mut() {
+                subscriber.missed = subscriber.missed.saturating_add(lost);
+            }
+        }
+        let mut dropped = Vec::new();
+        for event in events {
+            for subscriber in state.subscribers.iter_mut() {
+                if !subscriber.kinds.is_empty() && !subscriber.kinds.contains(&event.kind) {
+                    continue;
+                }
+                let notice = TopologyNotice {
+                    event: event.clone(),
+                    missed: subscriber.missed,
+                };
+                match subscriber.sender.try_send(notice) {
+                    Ok(()) => subscriber.missed = 0,
+                    Err(TrySendError::Full(_)) => {
+                        // Not reading fast enough. Drop this one and say so on
+                        // the next notice that does get through, rather than
+                        // blocking the pump on the slowest subscriber.
+                        subscriber.missed = subscriber.missed.saturating_add(1);
+                    }
+                    Err(TrySendError::Disconnected(_)) => dropped.push(subscriber.id),
+                }
+            }
+        }
+        if !dropped.is_empty() {
+            state
+                .subscribers
+                .retain(|subscriber| !dropped.contains(&subscriber.id));
+        }
+    }
+}
+
+impl SingleNodeMeta {
+    /// Subscribe to every metadata change.
+    pub fn subscribe_topology(&self) -> TopologySubscription {
+        self.events.subscribe(BTreeSet::new())
+    }
+
+    /// Subscribe to the given event kinds only -- `"server_state"`,
+    /// `"shard_state"`, `"add_table"` and so on, as recorded on the event.
+    pub fn subscribe_topology_kinds<I, S>(&self, kinds: I) -> TopologySubscription
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.events
+            .subscribe(kinds.into_iter().map(Into::into).collect())
+    }
