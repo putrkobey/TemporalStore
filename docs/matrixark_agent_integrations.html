@@ -328,3 +328,113 @@ Cursor should pass a stable scope when possible:
 
 ```json
 {
+  &quot;account_id&quot;: &quot;acct_customer&quot;,
+  &quot;tenant_id&quot;: &quot;tenant_workspace&quot;,
+  &quot;user_id&quot;: &quot;cursor_user_123&quot;,
+  &quot;session_id&quot;: &quot;cursor_workspace_thread_456&quot;,
+  &quot;source&quot;: &quot;cursor&quot;
+}
+```
+
+### Generic HTTP Agent
+
+For agents that cannot use MCP, expose the same operations over HTTP.  The
+request body should stay close to the MCP tool schema:
+
+```http
+POST /v1/context/retrieve
+Content-Type: application/json
+Authorization: Bearer mk_live_...
+
+{
+  &quot;query&quot;: &quot;What did we decide about GPU budget approvals?&quot;,
+  &quot;scope&quot;: {
+    &quot;account_id&quot;: &quot;acct_acme&quot;,
+    &quot;tenant_id&quot;: &quot;tenant_prod&quot;,
+    &quot;user_id&quot;: &quot;user_123&quot;,
+    &quot;session_id&quot;: &quot;thread_456&quot;
+  },
+  &quot;max_context_tokens&quot;: 10000,
+  &quot;local_context&quot;: [
+    {&quot;ref&quot;: &quot;open-buffer:infra/budget.md&quot;, &quot;text&quot;: &quot;short local summary&quot;}
+  ]
+}
+```
+
+```http
+POST /v1/context/ingest
+Content-Type: application/json
+Authorization: Bearer mk_live_...
+
+{
+  &quot;messages&quot;: [
+    {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;The GPU request is approved under capex.&quot;}
+  ],
+  &quot;scope&quot;: {
+    &quot;account_id&quot;: &quot;acct_acme&quot;,
+    &quot;tenant_id&quot;: &quot;tenant_prod&quot;,
+    &quot;user_id&quot;: &quot;user_123&quot;,
+    &quot;session_id&quot;: &quot;thread_456&quot;
+  },
+  &quot;metadata&quot;: {&quot;source&quot;: &quot;vertical_agent&quot;, &quot;event&quot;: &quot;after_llm&quot;}
+}
+```
+
+### Vertical Agents
+
+Vertical agents can integrate through MCP or HTTP.  They should send:
+
+```text
+required:
+  messages or raw query
+  account_id or tenant_id
+  user_id or session_id
+
+strongly recommended:
+  session_id
+  source
+  task_type
+  max_context_tokens
+  local_context refs or summary
+  accepted_refs / rejected_refs after final answer
+```
+
+If a session id is missing, MatrixArk can fall back to user scope, but
+confirmation detection and same-session batch extraction are much better when
+`session_id` is present.
+
+## What Each Agent Sends
+
+```text
+Codex:
+  MCP explicit tool calls, or hook payloads such as UserPromptSubmit, Stop,
+  PostCompact, and PostToolUse. MatrixArk wrapper normalizes raw hook payloads.
+
+Claude Desktop / Claude Code:
+  MCP explicit tool calls. Claude keeps local context and calls MatrixArk when
+  durable memory, resources, or prior decisions matter.
+
+Cursor:
+  MCP explicit tool calls from chat/agent workflows. Cursor keeps local code
+  context and sends MatrixArk raw query plus optional local refs/summaries.
+
+Vertical AI harness:
+  MCP or HTTP. Best integration can also send lifecycle hooks before LLM,
+  after LLM, tool-result, feedback, idle-timeout, and session-commit events.
+```
+
+## Agent Policy File
+
+Use this local policy doc as project/agent instruction material:
+
+```text
+docs/matrixark_agent_policy.md
+```
+
+It describes exactly when to call `matrixark_retrieve`, `matrixark_ingest`,
+`matrixark_feedback`, and `matrixark_session_commit`.
+
+For automatic lifecycle capture across popular agents, use:
+
+```text
+docs/matrixark_popular_agent_hooks.md
