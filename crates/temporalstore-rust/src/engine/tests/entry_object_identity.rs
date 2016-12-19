@@ -398,3 +398,203 @@ fn the_block_id_names_an_object_so_one_object_key_holds_exactly_one_id() {
 }
 
 // =================================================================================================
+// 2. THE STORED SPELLING IS THE KEY'S CHARACTERS.
+// =================================================================================================
+
+/// THE WRITTEN KEY OF A PAGE SPELLS ITS OBJECT KEY, SO AN ID CANNOT RENDER IT.
+///
+/// `blocks_per_bucket` pinned the COMPONENT's place in this string after a mutation that dropped it
+/// survived every test in the crate -- dropping any field from the written key leaves every key
+/// DISTINCT, because the addresses differ, so uniqueness, key counts and ordering all still pass.
+/// The object key's place in it was pinned by nothing and the identical mutation would have survived
+/// for the identical reason.
+///
+/// THE POSITION IS DERIVED FROM THE AUTHORITY rather than restated. `block_ref_key_from_parts`
+/// builds `kind:object_key:component:...`, so the object key is the field after the kind -- and the
+/// precondition that makes that split meaningful, that neither the kind nor the key contains the
+/// separator, is ASSERTED rather than assumed.
+///
+/// rust-internal: reads declarations, no product behaviour
+#[test]
+fn the_written_key_of_a_block_spells_its_object_key_so_an_id_cannot_render_it() {
+    let object_key = "container";
+    let (block_key, block) = entry_named(object_key, Some("body"));
+    let written = crate::engine::state::block_index_written_key(&block_key, &block);
+    println!("\n=== the written key of one page ===\n  {written}");
+
+    // --- THE PRECONDITION FOR SPLITTING IT, ENFORCED RATHER THAN PRINTED. ---
+    assert!(
+        !FIXTURE_KIND.as_str().contains(':') && !object_key.contains(':'),
+        "the separator appears inside the kind {:?} or the key {object_key:?}, so the field split \
+         below does not mean what it says",
+        FIXTURE_KIND.as_str()
+    );
+
+    // --- THE KEY'S CHARACTERS ARE THE FIELD AFTER THE KIND. ---
+    let mut fields = written.split(':');
+    assert_eq!(
+        Some(FIXTURE_KIND.as_str()),
+        fields.next(),
+        "the written key does not open with the model spelling: {written:?}"
+    );
+    assert_eq!(
+        Some(object_key),
+        fields.next(),
+        "the field after the model spelling is not the object key's characters. \
+         `block_ref_key_from_parts` renders `kind:object_key:component:...` and this string is the \
+         page index's own stored map key, shared with the replay log -- so the entry cannot hand it \
+         over without holding those characters: {written:?}"
+    );
+
+    // --- AND THE ID IS NOT IN IT, so the characters are not substitutable by the id. ---
+    let id = block.object_id(1, &block_key);
+    assert_ne!(
+        0, id,
+        "the fixture page carries no object id, so the comparison below is vacuous"
+    );
+    assert!(
+        !written.contains(&id.to_string()),
+        "the written key contains the object id {id}, which would make the id a candidate spelling \
+         for it: {written:?}"
+    );
+
+    // --- TWO PAGES DIFFERING ONLY IN THE KEY RENDER DIFFERENT STORED SPELLINGS. ---
+    let other_key = "containee";
+    assert_eq!(
+        object_key.len(),
+        other_key.len(),
+        "the two keys differ in length as well as in text, so a difference below could be about the \
+         length rather than about the characters"
+    );
+    let (other_object_key, other) = entry_named(other_key, Some("body"));
+    let other_written =
+        crate::engine::state::block_index_written_key(&other_object_key, &other);
+    println!("  the same page under {other_key:?}\n  {other_written}");
+    assert_ne!(
+        written, other_written,
+        "two pages at the SAME address under different object keys render the same written key, so \
+         the key has stopped reaching the stored spelling"
+    );
+
+    // --- AND THE HANDLE MOVES WITH IT, which is what keeps the two from naming different pages. ---
+    let handle = crate::engine::state::block_index_handle(&block_key, &block);
+    let other_handle = crate::engine::state::block_index_handle(&other_object_key, &other);
+    assert_ne!(
+        handle, other_handle,
+        "two pages differing only in their object key hash to one handle {handle}. \
+         `block_index_handle`'s contract is to hash exactly the fields `block_index_written_key` \
+         renders, and those handles are written to disk inside the lookup's refs"
+    );
+}
+
+// =================================================================================================
+// 3. THE READER THAT REFUTES IT, DRIVEN.
+// =================================================================================================
+
+/// THE WHOLE-OBJECT READ PATH ASKS FOR EVERY COMPONENT OF ONE KEY, AND THE ID CANNOT EXPRESS THAT.
+///
+/// `bucket_index_component_block_addresses(shard, model_id, object_key)` takes a key and NO
+/// component and returns one pair per component. This drives it over a real container and shows that
+/// the pages it returns resolve to as many distinct ids as there are pages -- so an id-keyed index
+/// could not have answered it: the caller would have to know the components in order to compute the
+/// ids, and the components are what it called to find out.
+///
+/// THE DENOMINATOR IS PRINTED AND THE POPULATION ASSERTED, because this reader driven over an empty
+/// store returns an empty vector and reads exactly like a reader that answered.
+///
+/// rust-internal: drives one index read over a seeded store
+#[test]
+fn the_whole_object_read_path_asks_for_every_component_of_one_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = identity_engine(dir.path());
+    load_operator_shard(&engine);
+    seed_hash_containers(&engine);
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+
+    println!(
+        "\n=== bucket_index_component_block_addresses over {CONTAINER_KEYS} container keys ==="
+    );
+    let mut answered = 0usize;
+    for k in 0..CONTAINER_KEYS {
+        let object_key = format!("h{k}");
+        let pairs = crate::engine::bucket_store::bucket_index_component_block_addresses(
+            shard,
+            FIXTURE_KIND.as_str(),
+            &object_key,
+        );
+        // WHAT SEPARATES THE ELEMENTS OF THE ANSWER IS THE ADDRESS NOW, NOT A NAME.
+        //
+        // This collected the pairs' COMPONENTS and asserted there were `MEMBERS_PER_KEY` distinct
+        // ones -- "the COMPONENT is what separates the elements; if these collapsed too, the reader
+        // would have no way to tell one element of the answer from another". The pair's first slot
+        // is dead on both of `bucket_index_component_block_addresses`'s arms, so that set is now a
+        // single `None` for every key and the assertion could never pass again.
+        //
+        // THE CLAIM IS NOT ABANDONED, IT MOVED TO THE TERM THAT STILL CARRIES IT. The reader is
+        // handed a KEY and answers a page per element; what distinguishes those pages is the
+        // ADDRESS each one is at, and that is counted here instead. It is a claim this can still
+        // get wrong -- a filing that collapsed two elements onto one page, or a reader that
+        // returned the same address twice, drops this count below the member count -- which is
+        // exactly the failure the component set was watching for, observed through the term that
+        // still exists.
+        let separators: BTreeSet<String> = pairs
+            .iter()
+            .map(|(_, address)| format!("{address:?}"))
+            .collect();
+        // THE IDS THESE PAIRS RESOLVE TO. One per KEY now, not one per page -- which is why
+        // the loop below counts them rather than the components: the component set is what the
+        // reader actually answers with, and the id set is what an id-keyed reader would have.
+        let ids: BTreeSet<u64> = pairs
+            .iter()
+            .map(|_| stable_block_object_id(1, FIXTURE_KIND.as_str(), &object_key))
+            .collect();
+        println!(
+            "  {object_key:<6} pairs={:<4} distinct addresses={:<4} distinct ids={:<4}",
+            pairs.len(),
+            separators.len(),
+            ids.len()
+        );
+        assert_eq!(
+            MEMBERS_PER_KEY,
+            pairs.len(),
+            "{object_key} answered with {} pairs, not the {MEMBERS_PER_KEY} components the seed \
+             wrote. An empty or short answer here reads exactly like a reader that resolved",
+            pairs.len()
+        );
+        // AND THE REASON THIS READER CANNOT BE HANDED AN ID, RESTATED THE OTHER WAY UP.
+        //
+        // It used to be that the id set was as LARGE as the answer and computable only from it.
+        // Since the component left the identity the id set has collapsed to ONE, and the point
+        // stands more strongly: a single number cannot name which of {MEMBERS_PER_KEY} elements
+        // is wanted, so the reader still has to be given the key and answer with components.
+        assert_eq!(
+            1,
+            ids.len(),
+            "{object_key}'s {} pages resolve to {} distinct ids, not 1. Every page of one key is \
+             an element of one object now",
+            pairs.len(),
+            ids.len()
+        );
+        assert_eq!(
+            MEMBERS_PER_KEY,
+            separators.len(),
+            "{object_key} answered {} distinct ADDRESSES for {} pages. The address is what \
+             separates the elements of this answer now -- if these collapsed, the reader would \
+             have no way to tell one element of the answer from another",
+            separators.len(),
+            pairs.len()
+        );
+        assert!(
+            separators.len() > ids.len(),
+            "{object_key}: {} addresses against {} ids. The whole reason this reader takes the KEY \
+             and not an id is that the id is coarser than the answer",
+            separators.len(),
+            ids.len()
+        );
+        answered += 1;
+    }
+    assert_eq!(
+        CONTAINER_KEYS, answered,
+        "{answered} of {CONTAINER_KEYS} keys were driven through the read path; a loop that \

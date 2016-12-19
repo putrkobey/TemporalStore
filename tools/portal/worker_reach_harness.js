@@ -66,37 +66,3 @@ const win = {
   document: {
     getElementById: (id) => el(id),
     querySelector: () => makeEl(), querySelectorAll: () => [],
-    createElement: () => makeEl(), addEventListener() {}, body: makeEl(), hidden: false
-  },
-  addEventListener() {},
-  location: { origin: "http://localhost", href: "http://localhost", reload() {} },
-  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
-  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
-  navigator: {},
-  setTimeout: (fn) => { if (typeof fn === "function") { fn(); } return 0; },
-  setInterval: () => 0, clearInterval() {},
-  Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
-  encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
-  TextDecoder: function () { this.decode = () => ""; },
-  AbortController: function () { this.abort = () => {}; this.signal = {}; },
-  FileReader: function () {}, Blob: function () {},
-  URL: { createObjectURL: () => "", revokeObjectURL() {} },
-  fetch: (url, opts) => {
-    const method = ((opts || {}).method || "GET").toUpperCase();
-    if (String(url).indexOf("/v1/admin/config") >= 0 && method === "POST") {
-      const body = { status: "ok", applied: [], restart_required: [] };
-      if (WORKERS) { body.workers = WORKERS; }
-      return reply(body);
-    }
-    if (String(url).indexOf("/v1/admin/config") >= 0) { return reply(snapshot()); }
-    return new Promise(() => {});
-  }
-};
-win.window = win;
-
-const names = Object.keys(win);
-const values = names.map((k) => win[k]);
-scripts.forEach((body, index) => {
-  try { new Function(...names, body)(...values); }
-  catch (e) { console.log("FAIL script " + index + " threw at load: " + e.message); failures += 1; }
-});
