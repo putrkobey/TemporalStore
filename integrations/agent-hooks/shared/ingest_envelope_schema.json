@@ -106,3 +106,39 @@
     "segment_max_new_tokens": { "description": "Passthrough segmentation control copied verbatim." },
     "segment_provider_fallback": { "description": "Passthrough segmentation control copied verbatim." },
     "understanding_provider": { "description": "Passthrough provider selector copied verbatim." },
+    "extraction_provider": { "description": "Passthrough provider selector copied verbatim." }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "message" } }, "required": ["kind"] },
+      "then": { "required": ["messages"], "properties": { "messages": { "minItems": 1 } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "feedback" } }, "required": ["kind"] },
+      "then": { "required": ["messages"], "properties": { "messages": { "minItems": 1 } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "business_data" } }, "required": ["kind"] },
+      "then": { "required": ["messages"], "properties": { "messages": { "minItems": 1 } } }
+    },
+    {
+      "if": { "properties": { "kind": { "enum": ["resource", "skill"] } }, "required": ["kind"] },
+      "then": {
+        "anyOf": [
+          { "required": ["messages"], "properties": { "messages": { "minItems": 1 } } },
+          { "required": ["text"], "properties": { "text": { "minLength": 1 } } },
+          { "required": ["resource_text"], "properties": { "resource_text": { "minLength": 1 } } },
+          { "required": ["raw_uri"], "properties": { "raw_uri": { "minLength": 1 } } }
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "message": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["role", "content"],
+      "properties": {
+        "role": {
+          "description": "Turn author role. Canonical values are user, assistant, tool, system. The normalizer (normalize_message_role) also accepts documented aliases that collapse to a canonical role: human/prompt -> user; agent/ai/bot/llm/model/assistant_response -> assistant; function/function_call_output/custom_tool_call_output/tool_call_output/tool_result/tool_output/tool-output/tooloutput -> tool. Matching is case-insensitive after trimming.",
+          "type": "string",
