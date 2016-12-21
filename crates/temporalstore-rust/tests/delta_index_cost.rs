@@ -50,3 +50,20 @@ fn per_write_served_index_cost_report() {
     println!("\n=== per-write served-index cost [{mode}] ===");
     for &target in &checkpoints {
         // Grow the store up to `target` entries.
+        while next < target {
+            let key = format!("key-{next:08}");
+            let response = engine.execute(ExecuteRequest {
+                shard_id: SHARD_ID,
+                command: Command::StringSet {
+                    key,
+                    value: b"payload-value".to_vec(),
+                },
+            });
+            assert!(response.status.ok);
+            next += 1;
+        }
+        // Time a fixed batch of writes at this store size.
+        let start = Instant::now();
+        for i in 0..batch {
+            let key = format!("probe-{target}-{i:04}");
+            let response = engine.execute(ExecuteRequest {

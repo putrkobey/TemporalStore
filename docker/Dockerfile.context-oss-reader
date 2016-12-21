@@ -1,0 +1,10 @@
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    TEMPORALSTORE_READER_MODEL=google/flan-t5-small \
+    TEMPORALSTORE_HF_READER_HOST=0.0.0.0 \
+    TEMPORALSTORE_HF_READER_PORT=8000
+
+RUN python -m pip install --no-cache-dir --upgrade pip \
+    && python -m pip install --no-cache-dir \
+      torch --index-url https://download.pytorch.org/whl/cpu \

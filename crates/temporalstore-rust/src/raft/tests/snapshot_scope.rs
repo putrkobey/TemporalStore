@@ -308,3 +308,106 @@ fn installing_a_snapshot_does_no_slab_work_under_the_cluster_write_guard() {
     // weaker statement than "0 of n", and one slab is within noise of an install that happens
     // to carry none.
     let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);
+    let leader = cluster
+        .node_engine_for_test(1)
+        .expect("the leader must have an engine");
+    let mut batch = 0usize;
+    while batch < 4 {
+        let mut index = 0usize;
+        while index < 200 {
+            cluster
+                .propose(Command::StringSet {
+                    key: format!("key-{batch}-{index:05}"),
+                    value: vec![b'v'; 256],
+                })
+                .expect("propose must succeed");
+            index += 1;
+        }
+        leader
+            .block_store()
+            .roll_slab()
+            .expect("rolling the active slab must succeed");
+        batch += 1;
+    }
+    let snapshot = cluster.create_snapshot().expect("create_snapshot must succeed");
+    let slabs_in_image = snapshot
+        .state_image
+        .as_ref()
+        .expect("the state-image path must be the one under test")
+        .slabs
+        .len() as u64;
+
+    install_probe::reset();
+    cluster
+        .install_snapshot(3, snapshot)
+        .expect("install must succeed");
+    let counts = install_probe::counts();
+    println!("slabs_in_image       = {slabs_in_image}");
+    println!("slabs_installed      = {}", counts.slabs_total);
+    println!("slabs_under_guard    = {}", counts.slabs_under_guard);
+
+    // VACUITY FLOOR: there must have been slab work to place on one side or the other.
+    assert!(
+        slabs_in_image >= 2,
+        "the image carries {slabs_in_image} slab(s); below 2 an install that does no slab work \
+         under the guard is not distinguishable from one with no slab work to do"
+    );
+    assert_eq!(
+        counts.slabs_total, slabs_in_image,
+        "the install did not install every slab the image carries"
+    );
+
+    // THE CLAIM.
+    assert_eq!(
+        counts.slabs_under_guard, 0,
+        "{} of {slabs_in_image} slab installs ran while the cluster WRITE guard was held, which \
+         excludes every reader and proposer for the length of the install",
+        counts.slabs_under_guard
+    );
+}
+
+/// FINDING 2, second half, asserted separately: the applied-set fill is the O(history) step
+/// inside an otherwise O(state) install -- one element per committed index -- and it must not
+/// run under the write guard either.
+#[test]
+fn installing_a_snapshot_fills_the_applied_set_off_the_cluster_write_guard() {
+    install_probe::reset();
+    {
+        let _mark = install_probe::GuardMark::new();
+        install_probe::note_applied_fill(5);
+    }
+    install_probe::note_applied_fill(3);
+    let control = install_probe::counts();
+    println!("control_total        = {}", control.applied_total);
+    println!("control_under_guard  = {}", control.applied_under_guard);
+    assert_eq!(
+        control.applied_total, 8,
+        "the probe did not count both noted fills, so it cannot be trusted below"
+    );
+    assert_eq!(
+        control.applied_under_guard, 5,
+        "the probe cannot tell a fill inside the guarded span from one outside it"
+    );
+
+    let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);
+    let mut index = 0usize;
+    while index < 400 {
+        cluster
+            .propose(Command::StringSet {
+                key: format!("key-{index:05}"),
+                value: vec![b'v'; 64],
+            })
+            .expect("propose must succeed");
+        index += 1;
+    }
+    let snapshot = cluster.create_snapshot().expect("create_snapshot must succeed");
+    let last_included = snapshot.last_included_index;
+
+    install_probe::reset();
+    cluster
+        .install_snapshot(3, snapshot)
+        .expect("install must succeed");
+    let counts = install_probe::counts();
+    println!("last_included_index  = {last_included}");
+    println!("applied_filled       = {}", counts.applied_total);
+    println!("applied_under_guard  = {}", counts.applied_under_guard);

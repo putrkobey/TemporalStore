@@ -48,3 +48,28 @@ For `Stop` and `PostCompact`, the useful field is usually a message or compacted
 1. explicit --session-id or MATRIXARK_SESSION_ID
 2. raw payload fields such as session_id, thread_id, conversation_id, transcript_id
 3. raw payload path fields such as transcript_path, conversation_path, thread_path
+4. persisted local fallback state under MATRIXARK_CODEX_SESSION_STATE_DIR
+```
+
+So MatrixArk receives access-control scope from hook config, while session scope can follow the Codex thread when Codex exposes a thread/conversation id.
+
+## What The Hook Sends To MatrixArk
+
+The hook converts raw Codex input into:
+
+```json
+{
+  &quot;messages&quot;: [{&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;Alice approved the GPU purchase after finance reviewed the budget.&quot;}],
+  &quot;scope&quot;: {
+    &quot;account_id&quot;: &quot;acct_codex&quot;,
+    &quot;tenant_id&quot;: &quot;tenant_codex&quot;,
+    &quot;user_id&quot;: &quot;local_user&quot;,
+    &quot;session_id&quot;: &quot;codex:thread-abc&quot;,
+    &quot;team&quot;: &quot;codex&quot;,
+    &quot;project&quot;: &quot;local&quot;
+  },
+  &quot;metadata&quot;: {
+    &quot;source&quot;: &quot;codex_hook&quot;,
+    &quot;codex_event&quot;: &quot;UserPromptSubmit&quot;,
+    &quot;codex_session_id_source&quot;: &quot;payload_field&quot;,
+    &quot;raw_hook_payload&quot;: {&quot;prompt&quot;: &quot;...&quot;}
