@@ -440,3 +440,150 @@ pub fn validate_resource_skill_secondary_indexes(
         );
         checked_ref_count += refs.len();
         found_ref_count += refs.len().saturating_sub(family_missing.len());
+        missing_refs.extend(family_missing.iter().cloned());
+        families.push(ContextSecondaryIndexFamilyValidationReport {
+            index_name: index_name.to_string(),
+            checked_ref_count: refs.len(),
+            found_ref_count: refs.len().saturating_sub(family_missing.len()),
+            missing_refs: family_missing,
+        });
+    }
+
+    missing_refs.sort();
+    missing_refs.dedup();
+    let query_back_ok = checked_ref_count > 0 && missing_refs.is_empty();
+    let status = if query_back_ok {
+        Status::ok()
+    } else if checked_ref_count == 0 {
+        Status::error(
+            "context_resource_skill_secondary_index_empty",
+            "resource/skill ingest produced no secondary index refs to validate",
+        )
+    } else {
+        Status::error(
+            "context_resource_skill_secondary_index_missing",
+            "resource/skill secondary indexes were not fully queryable",
+        )
+    };
+
+    ContextResourceSkillSecondaryIndexValidationReport {
+        status,
+        query_back_ok,
+        checked_ref_count,
+        found_ref_count,
+        missing_refs,
+        families,
+    }
+}
+
+pub(crate) fn verify_resource_skill_fanout(
+    engine: &TemporalEngine,
+    shard_id: ShardId,
+    tenant_hash: u64,
+    extracts: &[ContextExtractReport],
+    start_time_ms: u64,
+    end_time_ms: u64,
+    secondary_indexes: &mut ContextResourceSkillSecondaryIndexReport,
+    fanout: &mut ContextResourceSkillModelFanoutReport,
+) {
+    let root_hash = stable_hash64(&format!("resource-skill-root:{tenant_hash}"));
+    let mut missing = Vec::new();
+
+    for extract in extracts {
+        let node = engine.execute(ExecuteRequest {
+            shard_id,
+            command: Command::ContextGetNode {
+                tenant_hash,
+                node_hash: extract.node.node_hash,
+            },
+        });
+        if !matches!(
+            node.response,
+            CommandResponse::ContextNode { node: Some(_), .. }
+        ) {
+            missing.push("ContextNodeModel".to_string());
+        }
+
+        let events = engine.execute(ExecuteRequest {
+            shard_id,
+            command: Command::ContextQueryEvents {
+                tenant_hash,
+                node_hash: extract.node.node_hash,
+                start_time_ms: extract.event.event_time_ms.saturating_sub(1),
+                end_time_ms: extract.event.event_time_ms.saturating_add(1),
+                limit: Some(8),
+                max_scan: None,
+                current_valid_only: false,
+                as_of_ms: 0,
+                kinds: Vec::new(),
+                statuses: Vec::new(),
+                min_confidence: 0.0,
+                min_importance: 0.0,
+            },
+        });
+        if !matches!(
+            events.response,
+            CommandResponse::ContextEvents { ref events, .. }
+                if events.iter().any(|event| event.event_id_hash == extract.event.event_id_hash)
+        ) {
+            missing.push("ContextEventModel".to_string());
+            missing.push("ContextSegment".to_string());
+        }
+
+        let entity_hash = stable_hash64(&format!("entity:{}", extract.node.canonical_name));
+        let entity = engine.execute(ExecuteRequest {
+            shard_id,
+            command: Command::ContextGetEntity {
+                tenant_hash,
+                node_hash: extract.node.node_hash,
+                entity_hash,
+            },
+        });
+        if !matches!(
+            entity.response,
+            CommandResponse::ContextEntity {
+                entity: Some(_),
+                ..
+            }
+        ) {
+            missing.push("ContextEntityModel".to_string());
+        }
+
+        let summaries_l0 = engine.execute(ExecuteRequest {
+            shard_id,
+            command: Command::ContextQuerySummaries {
+                tenant_hash,
+                node_hash: extract.node.node_hash,
+                level: 1,
+                as_of_ms: extract.event.event_time_ms,
+                limit: Some(2),
+            },
+        });
+        let summaries_l1 = engine.execute(ExecuteRequest {
+            shard_id,
+            command: Command::ContextQuerySummaries {
+                tenant_hash,
+                node_hash: extract.node.node_hash,
+                level: 2,
+                as_of_ms: extract.event.event_time_ms,
+                limit: Some(2),
+            },
+        });
+        if !matches!(
+            summaries_l0.response,
+            CommandResponse::ContextSummaries { ref summaries, .. } if !summaries.is_empty()
+        ) || !matches!(
+            summaries_l1.response,
+            CommandResponse::ContextSummaries { ref summaries, .. } if !summaries.is_empty()
+        ) {
+            missing.push("ContextSummaryModel".to_string());
+        }
+
+        let compression = engine.execute(ExecuteRequest {
+            shard_id,
+            command: Command::ContextQueryCompressionEvents {
+                tenant_hash,
+                node_hashes: vec![extract.node.node_hash],
+                start_time_ms: extract.event.event_time_ms.saturating_sub(1),
+                end_time_ms: extract.event.event_time_ms.saturating_add(2),
+                limit: Some(2),
