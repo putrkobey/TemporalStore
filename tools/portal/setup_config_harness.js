@@ -33,39 +33,3 @@ const FIELD = { key: "extraction.provider", value: "deterministic", kind: "text"
                 applies: "live", group: "models" };
 const CONFIG = { settings: { groups: { models: [FIELD] },
                              group_meta: { models: { title: "Models", order: 1 } },
-                             updated_at: 1000, config_file: "/tmp/runtime.json" } };
-
-function frame(changedAt) {
-  const f = { ts: Date.now() / 1000, traffic: { routes: {} }, imports: {}, warnings: 0,
-              embedding: { total: 1, encoded: 1, pending: 0, encoder: {} } };
-  if (changedAt !== undefined) { f.config_changed_at = changedAt; }
-  return "event: status\ndata: " + JSON.stringify(f) + "\n\n";
-}
-
-const configReads = [];
-const seenUrls = [];
-const listeners = {};
-const els = new Map();
-
-function makeEl(id) {
-  const el = {
-    id: id || "", hidden: false, textContent: "", _html: "",
-    get innerHTML() { return this._html; },
-    set innerHTML(v) { this._html = String(v); },
-    value: id === "key" ? "k-admin" : "", checked: true, className: "",
-    style: {}, dataset: {}, files: [], options: [], children: [],
-    addEventListener(type, fn) { (listeners[(id || "") + ":" + type] = fn); },
-    removeEventListener() {}, appendChild() {}, removeChild() {},
-    setAttribute() {}, getAttribute() { return null; }, closest() { return null; },
-    querySelector() { return null; }, querySelectorAll() { return []; },
-    scrollIntoView() {}, focus() {}, click() {},
-    classList: { add() {}, remove() {}, toggle() {} }
-  };
-  return el;
-}
-function el(id) {
-  if (!els.has(id)) { els.set(id, makeEl(id)); }
-  return els.get(id);
-}
-
-let release = null;
