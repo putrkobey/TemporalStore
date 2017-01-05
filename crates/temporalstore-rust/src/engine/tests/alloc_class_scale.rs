@@ -385,3 +385,196 @@ fn the_class_probe_recovers_exactly_the_allocations_planted_in_a_class() {
         assert_eq!(
             0,
             counts.classes.row(*class).allocs,
+            "{} moved during a span that only entered block_bytes",
+            class.label()
+        );
+    }
+}
+
+/// NEGATIVE CONTROL: the same allocations OUTSIDE a scope move no row at all.
+///
+/// Without this, a probe that charged everything to the last class it saw would pass the positive
+/// control exactly as a correct one does.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn allocations_outside_every_class_move_no_row() {
+    use crate::alloc_probe::{AllocClass, ClassSpan};
+    const PLANTED: usize = 64;
+
+    // Enter and leave a class first, so this also proves the scope is RESTORED rather than merely
+    // set -- a scope that never put the previous class back would charge everything after it,
+    // which is the failure this ordering is chosen to expose.
+    crate::alloc_probe::in_class(AllocClass::BucketIndex, || {
+        let sink: Vec<u8> = Vec::with_capacity(256);
+        drop(sink);
+    });
+
+    let span = ClassSpan::open();
+    for _ in 0..PLANTED {
+        let sink: Vec<u8> = Vec::with_capacity(4096);
+        drop(sink);
+    }
+    let counts = span.close().expect("built with `alloc-probe`");
+
+    assert!(
+        counts.total.allocs >= PLANTED as u64,
+        "the whole-span counter saw {} allocations for {PLANTED} planted, so the span total is not \
+         measuring either",
+        counts.total.allocs
+    );
+    assert_eq!(
+        0,
+        counts.classes.summed().allocs,
+        "{PLANTED} allocations made outside every scope were charged to a class: {}",
+        counts.classes.report_line()
+    );
+    assert_eq!(
+        counts.total.allocs as i64,
+        counts.residual_allocs(),
+        "everything in this span is residual by construction of the test"
+    );
+}
+
+/// Nesting: the innermost scope owns the allocation, and the outer one resumes afterwards.
+///
+/// This is what lets the carried-page copy and the payload encode be told apart from the slab
+/// append they both happen inside, which is the one place classes are genuinely nested in
+/// production.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn a_nested_class_takes_the_allocation_and_gives_the_scope_back() {
+    use crate::alloc_probe::{AllocClass, ClassSpan};
+    let span = ClassSpan::open();
+    crate::alloc_probe::in_class(AllocClass::SlabAppend, || {
+        let outer_first: Vec<u8> = Vec::with_capacity(1024);
+        crate::alloc_probe::in_class(AllocClass::CarriedBlock, || {
+            let inner: Vec<u8> = Vec::with_capacity(2048);
+            drop(inner);
+        });
+        let outer_second: Vec<u8> = Vec::with_capacity(1024);
+        drop(outer_first);
+        drop(outer_second);
+    });
+    let counts = span.close().expect("built with `alloc-probe`");
+    assert_eq!(
+        2,
+        counts.classes.row(AllocClass::SlabAppend).allocs,
+        "the outer class should hold its own two allocations and not the nested one"
+    );
+    assert_eq!(
+        1,
+        counts.classes.row(AllocClass::CarriedBlock).allocs,
+        "the nested class should hold exactly the allocation made inside it"
+    );
+    assert_eq!(
+        2048,
+        counts.classes.row(AllocClass::CarriedBlock).alloc_bytes,
+        "the nested class should hold exactly the bytes asked for inside it"
+    );
+}
+
+/// Entering the same class twice, nested, charges it once.
+///
+/// The bucket-index primitive re-enters `staged_outcome` around the item it builds while
+/// `stage_outcome` enters the same class again inside, so this is a production arrangement and not
+/// a hypothetical.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn re_entering_the_same_class_does_not_double_charge_it() {
+    use crate::alloc_probe::{AllocClass, ClassSpan};
+    let span = ClassSpan::open();
+    crate::alloc_probe::in_class(AllocClass::StagedOutcome, || {
+        crate::alloc_probe::in_class(AllocClass::StagedOutcome, || {
+            let sink: Vec<u8> = Vec::with_capacity(1024);
+            drop(sink);
+        });
+    });
+    let counts = span.close().expect("built with `alloc-probe`");
+    assert_eq!(
+        1,
+        counts.classes.row(AllocClass::StagedOutcome).allocs,
+        "one allocation inside two nested scopes of the same class should be charged once"
+    );
+    assert_eq!(
+        1024,
+        counts.classes.row(AllocClass::StagedOutcome).alloc_bytes
+    );
+}
+
+/// A panic inside a scoped primitive must not leave the class set for the rest of the thread.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn a_panic_inside_a_class_gives_the_scope_back() {
+    use crate::alloc_probe::{AllocClass, ClassSpan};
+    let unwound = std::panic::catch_unwind(|| {
+        crate::alloc_probe::in_class(AllocClass::DirtyObjects, || {
+            let sink: Vec<u8> = Vec::with_capacity(512);
+            drop(sink);
+            panic!("deliberate");
+        })
+    });
+    assert!(unwound.is_err(), "the panic should have propagated");
+    let span = ClassSpan::open();
+    let sink: Vec<u8> = Vec::with_capacity(4096);
+    drop(sink);
+    let counts = span.close().expect("built with `alloc-probe`");
+    assert_eq!(
+        0,
+        counts.classes.summed().allocs,
+        "a panic left a class in scope, so everything after it is charged to {}",
+        counts.classes.report_line()
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The measurement.
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(feature = "alloc-probe")]
+struct Ingest {
+    records: usize,
+    value_bytes: usize,
+    counts: crate::alloc_probe::ClassifiedCounts,
+}
+
+/// Ingest `records` values of `value_bytes` into a fresh shard, measured as one span.
+///
+/// The engine is built and the shard loaded BEFORE the span opens, so the fixed cost of standing a
+/// store up is not divided by the record count and reported as a per-record figure.
+#[cfg(feature = "alloc-probe")]
+fn ingest(
+    records: usize,
+    value_bytes: usize,
+    batch: usize,
+) -> (Ingest, tempfile::TempDir) {
+    use crate::alloc_probe::ClassSpan;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    // One write before the span, so a lazily built table created on first use is not charged to
+    // whichever class happens to run first.
+    engine.execute(crate::types::ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "warm".to_string(),
+            value: incompressible(value_bytes, u64::MAX),
+        },
+    });
+
+    // THE CORPUS IS BUILT BEFORE THE SPAN OPENS. A probe that builds its commands inside the
+    // measured window charges the store for its own fixture: this crate's write-ahead budget read
+    // three allocations a write too high for four rounds because the command was assembled inside
+    // the window, and a measurement wrong by a constant still moves the right way after every
+    // change, which feels like confirmation and is no evidence at all.
+    let mut batches: Vec<Vec<Command>> = Vec::new();
+    let mut index = 0usize;
+    while index < records {
+        let end = (index + batch).min(records);
+        let mut commands = Vec::with_capacity(end - index);
+        let mut cursor = index;
+        while cursor < end {
