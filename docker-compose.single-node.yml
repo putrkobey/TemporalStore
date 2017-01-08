@@ -16,3 +16,9 @@ services:
     container_name: temporalstore-single-node
     ports:
       - "17101:17101"   # metaserver HTTP (health, topology)
+      - "17102:17102"   # datanode HTTP (health + writes/reads via POST /execute)
+    volumes:
+      - temporalstore-data:/var/lib/temporalstore
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:17102/health"]
+      interval: 10s
