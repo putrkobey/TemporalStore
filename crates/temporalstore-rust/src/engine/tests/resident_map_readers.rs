@@ -382,3 +382,388 @@ fn an_emptied_container_key_does_not_report_as_present() {
             "list",
             "phantom-list",
             Command::ListPush {
+                key: "phantom-list".to_string(),
+                member: b"m".to_vec(),
+                left: false,
+            },
+            Command::ListPop {
+                key: "phantom-list".to_string(),
+                left: false,
+            },
+        ),
+        (
+            "set",
+            "phantom-set",
+            Command::SetAdd {
+                key: "phantom-set".to_string(),
+                member: b"m".to_vec(),
+            },
+            Command::SetRemove {
+                key: "phantom-set".to_string(),
+                member: b"m".to_vec(),
+            },
+        ),
+    ];
+
+    let mut rows: Vec<(&str, i64, i64, i64, i64)> = Vec::new();
+    let mut phantom_kinds: Vec<&str> = Vec::new();
+
+    for (kind, key, add, remove) in kinds {
+        run(&engine, add);
+        // THE CONTROL SIDE OF EVERY ROW: the fixture wrote something and the key is present for the
+        // honest reason.
+        let len_before = listed_len(&engine, kind, key);
+        let exists_before = exists(&engine, key);
+        assert_eq!(
+            1, len_before,
+            "{kind}: the fixture wrote {len_before} element(s), not 1, so the removal below has \
+             nothing to prove"
+        );
+        assert_eq!(
+            1, exists_before,
+            "{kind}: EXISTS answered {exists_before} for a key holding one element, so this \
+             fixture's EXISTS says nothing"
+        );
+
+        run(&engine, remove);
+        let len_after = listed_len(&engine, kind, key);
+        assert_eq!(
+            0, len_after,
+            "{kind}: the listing still reports {len_after} element(s) after the removal, so this \
+             row never emptied its container"
+        );
+        let exists_after = exists(&engine, key);
+        if exists_after != 0 {
+            phantom_kinds.push(kind);
+        }
+        rows.push((kind, len_before, exists_before, len_after, exists_after));
+    }
+
+    println!("\n=== EXISTS after the last element of a container is removed ===");
+    println!("  kind  len before  EXISTS before  len after  EXISTS after");
+    for (kind, len_before, exists_before, len_after, exists_after) in &rows {
+        println!(
+            "  {kind:<5} {len_before:>11} {exists_before:>14} {len_after:>10} {exists_after:>13}"
+        );
+    }
+    println!(
+        "  {} of {} kind(s) report a key with no elements as present",
+        phantom_kinds.len(),
+        rows.len()
+    );
+
+    // THE DENOMINATOR. Four kinds exercised, each proven to have emptied.
+    assert_eq!(
+        4,
+        rows.len(),
+        "DENOMINATOR: {} kind(s) exercised, not the 4 this claim is about",
+        rows.len()
+    );
+    assert!(
+        phantom_kinds.is_empty(),
+        "{:?} report a container key with no elements as present. `record_exists_exact` reads \
+         `shard.<kind>.contains_key(key)`, so a removal that leaves an empty inner map behind \
+         leaves a key that EXISTS answers 1 for and every listing answers empty for",
+        phantom_kinds
+    );
+}
+
+/// AND THE SAME PHANTOM ACCEPTS A DEADLINE, which is the reader behind `EXPIRE` rather than
+/// `EXISTS`.
+///
+/// `CommonExpire` records a deadline only `for record_key in associated_record_keys(&key)` where
+/// `record_exists_exact(shard, &record_key)`, and `ttl_ms` gates on the same function before it
+/// reads `expires_at_ms`. So the phantom is not one reader answering oddly: it puts a live deadline
+/// into `shard.expires_at_ms` for a key with nothing under it, and `TTL` reports that deadline
+/// instead of the -2 that means "no such key".
+///
+/// THE CONTROL IS THE SAME KEY WITH A MEMBER STILL IN IT: `EXPIRE` must be accepted there, or this
+/// test would pass against an `EXPIRE` that had simply stopped working.
+///
+/// rust-internal: command surface only
+#[test]
+fn an_emptied_set_does_not_accept_a_deadline() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    // THE CONTROL: a set that still holds a member takes a deadline.
+    run(
+        &engine,
+        Command::SetAdd {
+            key: "ttl-control".to_string(),
+            member: b"stays".to_vec(),
+        },
+    );
+    run(
+        &engine,
+        Command::CommonExpire {
+            key: "ttl-control".to_string(),
+            ttl_ms: 600_000,
+        },
+    );
+    let control_ttl = integer_of(&run(
+        &engine,
+        Command::CommonTtl {
+            key: "ttl-control".to_string(),
+        },
+    ));
+    assert!(
+        control_ttl > 0,
+        "the control set with a live member reports TTL {control_ttl}, so EXPIRE is not working \
+         here and the subject below would pass for the wrong reason"
+    );
+
+    // THE SUBJECT: the same shape, emptied first.
+    run(
+        &engine,
+        Command::SetAdd {
+            key: "ttl-phantom".to_string(),
+            member: b"goes".to_vec(),
+        },
+    );
+    run(
+        &engine,
+        Command::SetRemove {
+            key: "ttl-phantom".to_string(),
+            member: b"goes".to_vec(),
+        },
+    );
+    assert_eq!(
+        0,
+        listed_len(&engine, "set", "ttl-phantom"),
+        "the subject set is not empty, so this test never built a phantom"
+    );
+    // NOT asserted ok: the refusal IS the fixed behaviour, and it is stronger than "no deadline was
+    // recorded". Before the cleanup this answered ok and `TTL` then reported the deadline it had
+    // recorded; now the key is genuinely absent and `CommonExpire` refuses it by name.
+    let phantom_expire = try_run(
+        &engine,
+        Command::CommonExpire {
+            key: "ttl-phantom".to_string(),
+            ttl_ms: 600_000,
+        },
+    );
+    let phantom_ttl = match try_run(
+        &engine,
+        Command::CommonTtl {
+            key: "ttl-phantom".to_string(),
+        },
+    ) {
+        Ok(response) => integer_of(&response),
+        // A refusal here says the same thing -2 says, and more loudly.
+        Err(_) => -2,
+    };
+
+    println!(
+        "\n=== EXPIRE then TTL ===\n  control (one member) EXPIRE ok, TTL {control_ttl} ms\n  \
+         emptied set         EXPIRE {:?}, TTL {phantom_ttl} (-2 means no such key)",
+        phantom_expire.as_ref().map(|_| "ok")
+    );
+
+    assert!(
+        phantom_expire.is_err(),
+        "EXPIRE was ACCEPTED for a set with no members, so `record_exists_exact` can still see the \
+         key in `shard.sets` and a deadline is now recorded against nothing"
+    );
+    assert_eq!(
+        -2, phantom_ttl,
+        "TTL answered {phantom_ttl} for a set with no members, so a deadline stands against a key \
+         every listing reports as empty"
+    );
+}
+
+// =================================================================================================
+// 2. THE OTHER FOUR READERS, ASKED ON #2017's OVER-COMPLETE STATE
+// =================================================================================================
+
+/// One key's divergence fixture: `population` members written, `removed` of them removed, and the
+/// pre-removal durable map captured so it can be put back the way a stale snapshot would.
+struct Divergence {
+    key: String,
+    members: Vec<Vec<u8>>,
+    removed: Vec<Vec<u8>>,
+    persisted_before_removal: BTreeMap<Vec<u8>, ElementEntry>,
+}
+
+fn build_divergence(
+    engine: &TemporalEngine,
+    key: &str,
+    population: usize,
+    remove_count: usize,
+) -> Divergence {
+    let members: Vec<Vec<u8>> = (0..population)
+        .map(|index| format!("{key}-member-{index:03}").into_bytes())
+        .collect();
+    for member in &members {
+        run(
+            engine,
+            Command::SetAdd {
+                key: key.to_string(),
+                member: member.clone(),
+            },
+        );
+    }
+    // What `set_index_serde` would have serialized at this moment: the map as it stands, before any
+    // removal. Captured off the live map, which is exactly what it serializes.
+    let persisted_before_removal = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 is loaded");
+        shard
+            .sets
+            .get(key)
+            .expect("the seeded key is in the resident map")
+            .clone()
+    };
+    assert_eq!(
+        population,
+        persisted_before_removal.len(),
+        "{key}: the pre-removal snapshot holds {} member(s), not the {population} written",
+        persisted_before_removal.len()
+    );
+    let removed: Vec<Vec<u8>> = members.iter().take(remove_count).cloned().collect();
+    for member in &removed {
+        run(
+            engine,
+            Command::SetRemove {
+                key: key.to_string(),
+                member: member.clone(),
+            },
+        );
+    }
+    let live_now = resident_members(engine, key).len();
+    assert_eq!(
+        population - remove_count,
+        live_now,
+        "{key}: {live_now} member(s) in the map after removing {remove_count} of {population}, so \
+         the fixture's removals did not land"
+    );
+    Divergence {
+        key: key.to_string(),
+        members,
+        removed,
+        persisted_before_removal,
+    }
+}
+
+/// EVERY READER OF THE RESIDENT MAP, ASKED ON THE STATE #2017 BUILT.
+///
+/// TWO KEYS, AND THE DISCRIMINATOR IS A COUNT. `ghost` gets a stale snapshot put back under it, so
+/// the merge is asked to resurrect; `control` gets its own real snapshot put back, so the merge is
+/// asked for something and resurrects nothing. A one-key fixture would differ from its own fix only
+/// in which address won a walk, which is the shape #2016's first mutation run survived.
+///
+/// # WHAT MOVED, AND WHY THE LOCK IS NOW SCOPED
+///
+/// The population each row was compared against came out of the index entry's component. The entry
+/// stopped naming its element, so that read returns NOTHING for every key and the per-row control
+/// fired -- correctly: it says in as many words that this fixture's page index says nothing. The
+/// population is re-attributed to the SERVING PATH, which means releasing the shard lock to ask the
+/// command surface, so the readers below run inside a scope and the comparison happens after it.
+///
+/// # AND THE MERGE RESURRECTS AGAIN, SO TWO ASSERTIONS ARE TURNED OVER RATHER THAN RE-GOLDENED
+///
+/// #2017's fix made `fill_absent_elements` ask "is there still a page at this address?". Its premise
+/// was ONE PAGE PER ELEMENT, and the collapse removed it: with one index entry a page, a page
+/// SURVIVES the removal of one of its elements, so the address stays live while the element on it is
+/// dead. Measured here at ghost map 4 against a served 2.
+///
+/// SO THE READER-4 DENOMINATOR IS RE-ATTRIBUTED, NOT RE-GOLDENED. It read `assert_eq!(6,
+/// named_by_map)` on the arithmetic "8 members written, 2 removed". The merge now restores the 2, so
+/// the maps name all 8 -- and 8 is written as the two fixtures' own populations rather than as a
+/// literal, because it is the fixture's number and not the store's.
+///
+/// AND READER 4'S SAFETY PROPERTY STILL HOLDS, FOR A BETTER REASON THAN BEFORE. Every address the
+/// resident maps name is a live page -- including the resurrected ones, whose pages are live exactly
+/// because the collapse keeps them. `compact_shard_blocks_relocating` therefore relocates nothing
+/// that is not there, and the hazard reader 2 was asserted against -- re-rendering a component for a
+/// member whose page was REMOVED -- is now unreachable rather than absent.
+///
+/// rust-internal: calls the engine's own reconcile and its map readers directly, then the commands
+#[test]
+fn the_resident_map_readers_asked_in_the_over_complete_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    // 4 written, 2 removed -> the stale snapshot is over-complete by 2.
+    let ghost = build_divergence(&engine, "ghost", 4, 2);
+    // 4 written, 0 removed -> its own snapshot is exact. THE CONTROL.
+    let control = build_divergence(&engine, "control", 4, 0);
+
+    let (rows, emitted_set_entries) = {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1 is loaded");
+
+        // The load path's input: the durable map as an index snapshot predating the removals.
+        shard
+            .sets
+            .insert_elements_for_test(&ghost.key, ghost.persisted_before_removal.clone());
+        shard
+            .sets
+            .insert_elements_for_test(&control.key, control.persisted_before_removal.clone());
+
+        let live_blocks: usize = shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .map(|bucket| {
+                bucket
+                    .block_index
+                    .values()
+                    .filter(|block| !block.deleted)
+                    .count()
+            })
+            .sum();
+        assert!(
+            live_blocks >= 6,
+            "DENOMINATOR: {live_blocks} live page(s), so the derived view is too thin for the merge \
+             below to be doing anything"
+        );
+
+        crate::engine::storage_bucket_internals::reconcile_secondary_views_from_bucket_index(
+            &engine.block_store,
+            shard,
+            None,
+        );
+
+        let mut rows: Vec<(&str, BTreeSet<Vec<u8>>)> = Vec::new();
+        for divergence in [&ghost, &control] {
+            let in_map = shard
+                .sets
+                .get(&divergence.key)
+                .map(|members| members.keys().cloned().collect::<BTreeSet<_>>())
+                .unwrap_or_default();
+            rows.push((
+                if divergence.key == "ghost" {
+                    "ghost"
+                } else {
+                    "control"
+                },
+                in_map,
+            ));
+        }
+
+        // -----------------------------------------------------------------------------------------
+        // READER 1: record_exists_exact -- KEY granularity, so an extra MEMBER cannot move it.
+        // -----------------------------------------------------------------------------------------
+        assert!(
+            crate::engine::record_exists_exact(shard, "ghost"),
+            "the ghost key has a live member and a live page, so EXISTS must be true here -- if \
+             this fails the fixture is not the over-complete state this module is about"
+        );
+        println!(
+            "  reader record_exists_exact       LATENT: key granularity \
+             (`shard.sets.contains_key`), the key is in both populations"
+        );
+
+        // -----------------------------------------------------------------------------------------
+        // READER 2: visit_model_live_blocks -- walks the map and re-renders the component.
+        // -----------------------------------------------------------------------------------------
+        let emitted_set_entries =
+            crate::engine::storage_bucket_internals::collect_model_live_block_entries(shard)
+                .into_iter()
+                .filter(|entry| entry.kind.as_str() == "set" && &*entry.object_key == "ghost")
+                .count();
+        println!(
+            "  reader visit_model_live_blocks   emitted {emitted_set_entries} live set entr(ies) \

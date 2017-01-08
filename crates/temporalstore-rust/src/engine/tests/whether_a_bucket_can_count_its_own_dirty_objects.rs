@@ -259,3 +259,133 @@ fn whether_a_bucket_can_count_its_own_dirty_objects() {
         });
         assert!(out.status.ok, "re-dirtying {index}: {:?}", out.status);
     }
+    // ---- AND TWO REMOVALS, which is what puts a dirty object with NO PAGE in the set. A removal
+    // ---- marks a `control_state:cpc:*` record alongside the data object, control state is not
+    // ---- page-backed, and that record routes to a bucket of its OWN. Without this the fixture
+    // ---- holds only page-backed dirty objects and cannot see the term that decides the question.
+    for index in [2usize, 6] {
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::CommonDelete { key: format!("dirty-count-{index:04}") },
+        });
+        assert!(out.status.ok, "removing {index}: {:?}", out.status);
+    }
+
+    // ---- WHAT THE PRODUCER ITSELF REPORTS, read BEFORE the shard lock is taken because
+    // ---- `bucket_storage_summaries` takes that lock on its own. `DIRTY_SUMMARY_VISITS` counts
+    // ---- the entries its dirty half looks at, so the work it does is measured here rather than
+    // ---- argued from the shape of the loop.
+    let visits_before = crate::engine::storage_reporting::DIRTY_SUMMARY_VISITS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let produced_summaries: BTreeMap<u32, (u64, u64)> = engine
+        .bucket_storage_summaries(1)
+        .into_iter()
+        .map(|summary| {
+            (
+                summary.routing_bucket,
+                (summary.dirty_object_count, summary.dirty_generation),
+            )
+        })
+        .collect();
+    let produced: BTreeMap<u32, u64> = produced_summaries
+        .iter()
+        .map(|(bucket, (count, _))| (*bucket, *count))
+        .collect();
+    let producer_visits = crate::engine::storage_reporting::DIRTY_SUMMARY_VISITS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .saturating_sub(visits_before);
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1");
+
+    let by_set = authority(shard);
+    let by_objects = derived_distinct_objects(shard);
+    let by_blocks = derived_dirty_blocks(shard);
+    let by_node = node_state(shard);
+
+    let bucket_total = shard.bucket_index.bucket_map.len();
+    // What a per-bucket page walk would have to look at: a page's own `dirty` bit is the only
+    // thing that marks it, so finding the dirty ones means visiting all of them.
+    let block_total_in_shard: usize = shard
+        .bucket_index
+        .bucket_map
+        .values()
+        .map(|bucket| bucket.block_index.len())
+        .sum();
+    let set_total: u64 = by_set.values().sum();
+    let object_total: u64 = by_objects.values().sum();
+    let block_total: u64 = by_blocks.values().sum();
+
+    // How many pages the busiest dirty object holds, so "not every object is single-page" is a
+    // measured property of this fixture rather than an expectation about the write path.
+    let mut blocks_per_object: BTreeMap<String, u64> = BTreeMap::new();
+    for (_bucket, _handle, object_key, _block) in super::blocks_with_identity(&shard.bucket_index) {
+        *blocks_per_object.entry(object_key.to_string()).or_default() += 1;
+    }
+    let widest_object = blocks_per_object.values().copied().max().unwrap_or(0);
+
+    // How much of the set has no live page anywhere -- the term no page walk can ever reach.
+    let any_block: BTreeSet<String> = super::blocks_with_identity(&shard.bucket_index)
+        .into_iter()
+        .map(|(_, _, object_key, _)| object_key.to_string())
+        .collect();
+    let set_members_with_no_block = shard
+        .dirty_objects
+        .iter()
+        .filter(|key| !any_block.contains(*key))
+        .count();
+
+    println!();
+    println!("  {KEYS} keys on a {}-bucket routing range", END_ROUTING_BUCKET + 1);
+    println!();
+    println!("    buckets in the map                      {bucket_total:>6}");
+    println!("    dirty objects left by the dump          {after_dump:>6}");
+    println!("    pages held by the widest object         {widest_object:>6}");
+    println!();
+    println!("    buckets with a count, via the SET       {:>6}", by_set.len());
+    println!("    buckets with a count, via the PAGES     {:>6}", by_objects.len());
+    println!("    total, via the SET (the authority)      {set_total:>6}");
+    println!("    total, distinct objects via the PAGES   {object_total:>6}");
+    println!("    total, dirty PAGES                      {block_total:>6}");
+    println!("    set members with NO live page at all    {set_members_with_no_block:>6}");
+    println!();
+    println!("    the producer's loop visited              {producer_visits:>6}  (one per dirty bucket)");
+    println!("    a page walk would have to visit         {block_total_in_shard:>6}  (every page in the shard)");
+    println!();
+    println!("    after the dump: {after_dump} dirty object(s) in {after_dump_set_buckets} bucket(s), {after_dump_nodes_dirty} node(s) still reading dirty");
+    println!();
+    println!("    bucket   set  set>0  node.dirty  page>0   objects  pages   node.gen  summ.gen");
+    // THE UNION OF EVERY BUCKET EITHER SIDE NAMES, so a bucket one method knows and the other
+    // does not shows up as a row rather than being absent from the comparison.
+    let every_bucket: BTreeSet<u32> = by_set
+        .keys()
+        .chain(by_objects.keys())
+        .chain(by_blocks.keys())
+        .chain(by_node.keys())
+        .chain(produced_summaries.keys())
+        .copied()
+        .collect();
+    for bucket in &every_bucket {
+        let set_count = by_set.get(bucket).copied().unwrap_or(0);
+        let (node_dirty, node_gen) = by_node.get(bucket).copied().unwrap_or((false, 0));
+        let blocks = by_blocks.get(bucket).copied().unwrap_or(0);
+        println!(
+            "    {bucket:>6} {set_count:>5} {:>6} {:>11} {:>7} {:>9} {blocks:>6} {node_gen:>10} {:>9}",
+            set_count > 0,
+            node_dirty,
+            blocks > 0,
+            by_objects.get(bucket).copied().unwrap_or(0),
+            produced_summaries.get(bucket).map(|(_, gen)| *gen).unwrap_or(0),
+        );
+    }
+    println!();
+
+    // WHERE THE THREE PRESENCE SIGNALS DISAGREE, over that same union.
+    let node_says_dirty_set_does_not: Vec<u32> = every_bucket
+        .iter()
+        .copied()
+        .filter(|bucket| {
+            by_node.get(bucket).map(|(dirty, _)| *dirty).unwrap_or(false)
+                && by_set.get(bucket).copied().unwrap_or(0) == 0
+        })
+        .collect();
