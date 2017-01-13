@@ -36,3 +36,41 @@ const ROUTES = [
 const FRAME = {
   ts: 1, imports: {}, warnings: 0, embedding: { total: 1 },
   traffic: {
+    total_requests: 9, total_errors: 2, in_flight: 0,
+    routes: {
+      "/v1/memories": { requests: 7, errors: 0, avg_ms: 4.5 },
+      "/v1/memory/{id}": { requests: 2, errors: 2, avg_ms: 11 }
+    }
+  }
+};
+
+let cells = [];
+function parseCells(html) {
+  cells = [...String(html || "").matchAll(/<span class="route-live" data-metric="([^"]*)"([^>]*)>/g)]
+    .map((m) => ({
+      metric: m[1], attrs: m[2], textContent: "", className: "route-live",
+      getAttribute(k) { return k === "data-metric" ? this.metric : null; }
+    }));
+}
+
+function makeEl(id) {
+  const el = {
+    id: id || "", hidden: false, textContent: "", value: "", checked: false, className: "",
+    style: {}, dataset: {}, files: [], options: [], children: [],
+    _html: "",
+    get innerHTML() { return this._html; },
+    set innerHTML(v) { this._html = v; if (this.id === "routes") { parseCells(v); } },
+    addEventListener() {}, removeEventListener() {}, appendChild() {}, removeChild() {},
+    setAttribute() {}, getAttribute() { return null; }, closest() { return null; },
+    querySelector() { return null; }, querySelectorAll() { return []; },
+    scrollIntoView() {}, focus() {}, click() {},
+    classList: { add() {}, remove() {}, toggle() {} }
+  };
+  return el;
+}
+
+const els = new Map();
+function el(id) {
+  if (!els.has(id)) { els.set(id, makeEl(id)); }
+  return els.get(id);
+}
