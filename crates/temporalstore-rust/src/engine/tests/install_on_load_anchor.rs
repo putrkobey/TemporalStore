@@ -84,32 +84,3 @@ fn a_refused_install_on_load_leaves_the_durable_index_untouched() {
     assert!(
         log_path.exists(),
         "fixture must have produced an index-log at {log_path:?}"
-    );
-
-    // Corrupt the tail of the delta log. The last bytes are inside the final record's payload and
-    // its integrity envelope, so flipping them fails the decode rather than the frame walk.
-    let mut log_bytes = fs::read(&log_path).expect("index log should read");
-    let log_len = log_bytes.len();
-    assert!(
-        log_len > 16,
-        "vacuous: the index log must be long enough to corrupt, it is {log_len} bytes"
-    );
-    let flip_from = log_len - 8;
-    for byte in log_bytes[flip_from..].iter_mut() {
-        *byte ^= 0xFF;
-    }
-    fs::write(&log_path, &log_bytes).expect("index log should write");
-
-    // The corruption actually took. Without this the whole test would pass vacuously against a
-    // build where the flipped bytes happened to still decode.
-    assert!(
-        engine.load_index_checked(SHARD, false).is_err(),
-        "vacuous: the {log_len}-byte index log must read as corrupt after flipping its last 8 \
-         bytes, but the checked loader accepted it"
-    );
-
-    let index_before = fs::read(&index_path).expect("durable index should read");
-    assert!(
-        !index_before.is_empty(),
-        "vacuous: the durable index must be non-empty to notice it being overwritten"
-    );
