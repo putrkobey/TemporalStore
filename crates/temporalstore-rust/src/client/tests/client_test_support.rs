@@ -13,3 +13,10 @@ pub(super) fn key_for_shard(table: &TemporalStoreTable, shard_id: ShardId) -> St
 }
 
 pub(super) fn free_local_addr() -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.local_addr().unwrap().to_string()
+}
+
+pub(super) fn wait_for_http(addr: &str) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
