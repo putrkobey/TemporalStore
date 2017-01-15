@@ -1,0 +1,318 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+//! Async batched embedding drainer.
+//!
+//! Raw-first bulk ingest (`context_batch_ingest` with
+//! `MATRIXARK_BACKFILL_RAW_FIRST=1`) and the live extraction path on embed failure
+//! both store context nodes WITHOUT vectors and mark them embedding-dirty
+//! (`ctx:embdirty:{tenant}:{node}`). This drainer is the background worker that
+//! closes the gap: it queries only the pending embedding-dirty set (O(pending), a
+//! bounded scan of the in-memory dirty index, NOT a corpus scan), reads each dirty
+//! node's event text, batch-embeds it through the SAME provider path live
+//! extraction uses (`context_backfill_embeddings`), upserts the `node_l0`
+//! embedding under the exact ref-hash the retrieve path reads, then clears the
+//! embedding-dirty marker for every node it embedded.
+//!
+//! It is event-driven-ish: while pending work exists it drains back-to-back with
+//! no sleep, so ingest bursts clear quickly; only when the pending set is empty
+//! does it sleep for a short fallback interval (an empty dirty set costs one empty
+//! query). Gated OFF by default via `MATRIXARK_EMBED_DRAINER`.
+
+use std::time::Duration;
+
+use super::*;
+use crate::types::BatchExecuteRequest;
+
+/// A timestamp comfortably in the future but well within the context timeline's
+/// valid range (`u64::MAX / CONTEXT_TIMELINE_FANOUT`), used as the query window's
+/// upper bound so every pending marker overlaps.
+const EMBED_DRAINER_MAX_TIME_MS: u64 = 9_000_000_000_000;
+
+/// Configuration for a single drain pass / the drain loop.
+#[derive(Debug, Clone)]
+pub struct EmbedDrainerConfig {
+    /// Shard to drain (single-shard local/resident engine).
+    pub shard_id: ShardId,
+    /// Tenant filter for the pending scan: 0 = all tenants on the shard (the
+    /// normal setting, since bulk-ingest tenant hashes are per-session), or a
+    /// specific tenant to scope the drain.
+    pub tenant_hash: u64,
+    /// Provider used to compute embeddings (mock/deterministic works offline).
+    pub provider: ContextModelProviderConfig,
+    /// Embedding batch size (>= 1; the task calls for >= 64 per call).
+    pub batch_size: usize,
+    /// Max pending nodes processed per pass (bounds one drain's work + memory).
+    pub max_nodes_per_pass: usize,
+    /// Max events read per node when picking the text to embed.
+    pub max_events_per_node: usize,
+    /// Idle fallback interval between passes when nothing was pending.
+    pub interval: Duration,
+}
+
+impl Default for EmbedDrainerConfig {
+    fn default() -> Self {
+        Self {
+            shard_id: 1,
+            tenant_hash: 0,
+            provider: ContextModelProviderConfig::default(),
+            batch_size: 64,
+            max_nodes_per_pass: 512,
+            max_events_per_node: 4,
+            interval: Duration::from_millis(1500),
+        }
+    }
+}
+
+/// Outcome of one drain pass.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct EmbedDrainReport {
+    /// Pending nodes returned by the O(pending) query this pass.
+    pub pending_scanned: usize,
+    /// Nodes whose embedding was upserted successfully.
+    pub embedded: usize,
+    /// Embedding-dirty nodes cleared (== embedded, minus any clear failures).
+    pub cleared: usize,
+    /// Dirty nodes skipped because they had no event text to embed. These are
+    /// still cleared so the drainer does not spin on them forever.
+    pub empty_text: usize,
+    /// Nodes whose embedding batch failed (left dirty for a later pass).
+    pub failed: usize,
+}
+
+// A local name for the crate vocabulary, not a second one. See the twin of this shadow in
+// engine/engine_context.rs: spelled out, it took `1` and `true` and answered `false` for everything
+// else, including the default it was handed.
+fn env_bool(name: &str, default: bool) -> bool {
+    crate::env_flag::env_bool(name, default)
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    crate::env_flag::env_number(name, default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    crate::env_flag::env_number(name, default)
+}
+
+/// Whether the background drainer is enabled (`MATRIXARK_EMBED_DRAINER`, default off).
+pub fn embed_drainer_enabled() -> bool {
+    env_bool("MATRIXARK_EMBED_DRAINER", false)
+}
+
+/// Build an [`EmbedDrainerConfig`] from environment, given the target shard and a
+/// provider (identity/base-url is the caller's concern, mirroring the backfill bin).
+pub fn embed_drainer_config_from_env(
+    shard_id: ShardId,
+    tenant_hash: u64,
+    provider: ContextModelProviderConfig,
+) -> EmbedDrainerConfig {
+    let d = EmbedDrainerConfig::default();
+    EmbedDrainerConfig {
+        shard_id,
+        tenant_hash,
+        provider,
+        batch_size: env_usize("MATRIXARK_EMBED_DRAINER_BATCH", d.batch_size).max(1),
+        max_nodes_per_pass: env_usize(
+            "MATRIXARK_EMBED_DRAINER_MAX_NODES_PER_PASS",
+            d.max_nodes_per_pass,
+        )
+        .max(1),
+        max_events_per_node: env_usize(
+            "MATRIXARK_EMBED_DRAINER_MAX_EVENTS",
+            d.max_events_per_node,
+        )
+        .max(1),
+        interval: Duration::from_millis(env_u64(
+            "MATRIXARK_EMBED_DRAINER_INTERVAL_MS",
+            d.interval.as_millis() as u64,
+        )),
+    }
+}
+
+/// Read the text to embed for a node: the longest stored event text (matches the
+/// backfill bin and gives the richest signal).
+fn node_embed_text(engine: &TemporalEngine, config: &EmbedDrainerConfig, tenant_hash: u64, node_hash: u64) -> String {
+    let response = engine.execute(ExecuteRequest {
+        shard_id: config.shard_id,
+        command: Command::ContextQueryEvents {
+            tenant_hash,
+            node_hash,
+            start_time_ms: 0,
+            end_time_ms: EMBED_DRAINER_MAX_TIME_MS,
+            limit: Some(config.max_events_per_node.max(1)),
+            max_scan: None,
+            current_valid_only: false,
+            as_of_ms: 0,
+            kinds: Vec::new(),
+            statuses: Vec::new(),
+            min_confidence: 0.0,
+            min_importance: 0.0,
+        },
+    });
+    match response.response {
+        CommandResponse::ContextEvents { events, .. } => events
+            .into_iter()
+            .map(|event| event.text)
+            .max_by_key(|text| text.len())
+            .unwrap_or_default(),
+        _ => String::new(),
+    }
+}
+
+/// Clear the embedding-dirty marker for a node (write path). Returns true on ok.
+fn clear_marker(
+    engine: &TemporalEngine,
+    config: &EmbedDrainerConfig,
+    tenant_hash: u64,
+    node_hash: u64,
+    event_time_ms: u64,
+) -> bool {
+    engine
+        .execute_durable(ExecuteRequest {
+            shard_id: config.shard_id,
+            command: Command::ContextMarkEmbeddingDirty {
+                tenant_hash,
+                node_hash,
+                event_time_ms: event_time_ms.max(1),
+                reason: 0,
+                propagate_depth: 0,
+                clear: true,
+            },
+        })
+        .status
+        .ok
+}
+
+/// Run a single drain pass: query pending -> read text -> batch embed -> upsert ->
+/// clear. Pure with respect to time (no sleeping); returns what it did so it is
+/// unit-testable and O(pending).
+pub fn drain_embedding_dirty_once(
+    engine: &TemporalEngine,
+    config: &EmbedDrainerConfig,
+) -> EmbedDrainReport {
+    let mut report = EmbedDrainReport::default();
+
+    // 1) O(pending) scan of the embedding-dirty index (all tenants when tenant==0).
+    let query = engine.execute(ExecuteRequest {
+        shard_id: config.shard_id,
+        command: Command::ContextQueryEmbeddingDirty {
+            tenant_hash: config.tenant_hash,
+            node_hash: 0,
+            start_time_ms: 0,
+            end_time_ms: EMBED_DRAINER_MAX_TIME_MS,
+            limit: Some(config.max_nodes_per_pass.max(1)),
+        },
+    });
+    let (nodes, tenant_hashes) = match query.response {
+        CommandResponse::ContextEmbeddingDirtyNodes {
+            nodes,
+            tenant_hashes,
+            ..
+        } => (nodes, tenant_hashes),
+        _ => return report,
+    };
+    report.pending_scanned = nodes.len();
+    if nodes.is_empty() {
+        return report;
+    }
+
+    // 2) Collect (tenant, node, event_time, text). Nodes with no text are cleared
+    //    immediately so the drainer does not re-scan them every pass.
+    struct Pending {
+        tenant_hash: u64,
+        node_hash: u64,
+        event_time_ms: u64,
+        text: String,
+    }
+    let mut pending: Vec<Pending> = Vec::with_capacity(nodes.len());
+    for (index, marker) in nodes.iter().enumerate() {
+        let tenant_hash = tenant_hashes
+            .get(index)
+            .copied()
+            .filter(|value| *value != 0)
+            .unwrap_or(config.tenant_hash);
+        if tenant_hash == 0 {
+            // No tenant recoverable (shouldn't happen for embedding-dirty entries).
+            report.failed += 1;
+            continue;
+        }
+        let text = node_embed_text(engine, config, tenant_hash, marker.node_hash);
+        if text.trim().is_empty() {
+            report.empty_text += 1;
+            if clear_marker(engine, config, tenant_hash, marker.node_hash, marker.last_event_time_ms) {
+                report.cleared += 1;
+            }
+            continue;
+        }
+        pending.push(Pending {
+            tenant_hash,
+            node_hash: marker.node_hash,
+            // The coalesced entry spans a range of event times; the drain clears against the
+            // latest, which is what the mark advanced to.
+            event_time_ms: marker.last_event_time_ms,
+            text,
+        });
+    }
+
+    // 3) Batch-embed (>= batch_size per call) and upsert node_l0 vectors, then
+    //    clear the nodes for the nodes that embedded successfully.
+    let model_hash = context_embedding_model_hash(&config.provider.embedding_model);
+    let updated_at_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(1)
+        .max(1);
+    for chunk in pending.chunks(config.batch_size.max(1)) {
+        let texts: Vec<&str> = chunk.iter().map(|item| item.text.as_str()).collect();
+        let vectors = match context_backfill_embeddings(&config.provider, &texts) {
+            Ok(vectors) if vectors.len() == chunk.len() => vectors,
+            _ => {
+                // Leave this chunk dirty for a later pass.
+                report.failed += chunk.len();
+                continue;
+            }
+        };
+        let commands: Vec<Command> = chunk
+            .iter()
+            .zip(vectors.into_iter())
+            .map(|(item, vector)| Command::ContextSetNodeEmbedding {
+                tenant_hash: item.tenant_hash,
+                node_hash: item.node_hash,
+                model_hash,
+                vector,
+                updated_at_ms,
+            })
+            .collect();
+        let response = engine.batch_execute(BatchExecuteRequest {
+            shard_id: config.shard_id,
+            commands,
+        });
+        for (item, entry) in chunk.iter().zip(response.responses.iter()) {
+            if entry.status.ok {
+                report.embedded += 1;
+                if clear_marker(
+                    engine,
+                    config,
+                    item.tenant_hash,
+                    item.node_hash,
+                    item.event_time_ms,
+                ) {
+                    report.cleared += 1;
+                }
+            } else {
+                report.failed += 1;
+            }
+        }
+    }
+    report
+}
+
+/// Run the drain loop until `should_stop` returns true. Drains back-to-back while
+/// pending work exists; sleeps `config.interval` only when a pass found nothing.
+pub fn run_embed_drainer_loop<F: Fn() -> bool>(
+    engine: &TemporalEngine,
+    config: &EmbedDrainerConfig,
+    should_stop: F,
+) {
+    while !should_stop() {

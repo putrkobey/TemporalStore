@@ -25,3 +25,17 @@ function parseArgs(argv) {
   }
   return args;
 }
+
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+  loadPluginEnv();
+  const env = process.env;
+  const mode = args.dryRun ? "dry-run" : (env.TEMPORALSTORE_AGENT_MODE || "dry-run").toLowerCase();
+  const payload = await loadPayloadFromStdin();
+  const normalizedEvent = normalizePayload({ event: args.event, payload, env });
+
+  if (args.printConfig) {
+    process.stdout.write(JSON.stringify({
+      mode,
+      event: args.event,
+      repo: env.TEMPORALSTORE_REPO || "",
