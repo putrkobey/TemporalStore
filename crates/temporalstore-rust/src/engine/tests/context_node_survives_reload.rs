@@ -252,3 +252,257 @@ fn whether_the_reconcile_keeps_a_container_only_element_when_it_is_run_by_name()
         }],
     );
     run(
+        &engine,
+        vec![Command::ContextUpsertNode {
+            tenant_hash: 7,
+            node: Box::new(node_at(1)),
+        }],
+    );
+
+    let node_key = "ctx:node:7:1";
+    let mut shards = engine.shards.write().expect("engine lock poisoned");
+    let shard = shards.get_mut(&1).expect("shard is loaded");
+
+    // 1. IS THE NODE IN THE BUCKET INDEX? Asked of the index itself rather than of a comment.
+    let named = super::BlockObjects::of(&shard.bucket_index);
+    let mut index_entries_for_node = Vec::new();
+    let mut index_entries_for_control = 0usize;
+    for (bucket_id, bucket) in &shard.bucket_index.bucket_map {
+        for (handle, block) in &bucket.block_index {
+            let object_key = named.at(*bucket_id, *handle);
+            if object_key.as_ref() == node_key {
+                index_entries_for_node.push((
+                    block.model_id.to_string(),
+                    None::<String>,
+                    block.deleted,
+                ));
+            }
+            if object_key.as_ref() == "control-hash" {
+                index_entries_for_control += 1;
+            }
+        }
+    }
+    println!(
+        "[why] bucket-index entries naming {node_key}: {index_entries_for_node:?}  \
+         (control-hash entries: {index_entries_for_control})"
+    );
+    assert!(
+        index_entries_for_control > 0,
+        "CONTROL: the index holds no entry for a HashSet field either, so this walk is not reading \
+         the index correctly and its answer about the node means nothing"
+    );
+
+    // 2. IS IT IN THE RESIDENT MAP before the reconcile?
+    let in_map_before = shard
+        .hashes
+        .get(node_key)
+        .map(|fields| fields.get("meta").is_some())
+        .unwrap_or(false);
+    println!("[why] resident hashes holds {node_key}/meta before the reconcile: {in_map_before}");
+    assert!(
+        in_map_before,
+        "the node is not in the resident map before the reconcile, so this test cannot ask what \
+         the reconcile does to it"
+    );
+
+    // 3. RUN THE RECONCILE BY NAME, which is what no load path here is proven to do.
+    crate::engine::storage_bucket_internals::rebuild_unserialized_model_maps_from_bucket_index(
+        shard,
+    );
+
+    let in_map_after = shard
+        .hashes
+        .get(node_key)
+        .map(|fields| fields.get("meta").is_some())
+        .unwrap_or(false);
+    let control_after = shard
+        .hashes
+        .get("control-hash")
+        .map(|fields| fields.get("f-0").is_some())
+        .unwrap_or(false);
+    println!(
+        "[why] after the reconcile: node={in_map_after} control={control_after}"
+    );
+    assert!(
+        control_after,
+        "CONTROL: the reconcile dropped the index-registered HashSet field too, so it is not \
+         behaving as its own documentation describes and nothing here is attributable"
+    );
+
+    // No assertion on `in_map_after` either way -- this test REPORTS it. Which value is correct is
+    // the open question; pinning today's answer as an expectation would freeze the thing under
+    // discussion.
+    println!(
+        "[why] VERDICT: a container-only element {} the reconcile when it is run by name",
+        if in_map_after { "SURVIVES" } else { "DOES NOT SURVIVE" }
+    );
+}
+
+/// SO IS A CONTAINER-ONLY ELEMENT REACHABLE AT ALL, AND WHAT HAPPENS TO ONE?
+///
+/// The test above refuted the premise that a context node is container-only: the index holds a
+/// `("hash", Some("meta"))` entry for it, so the derived base names it like any other hash field.
+/// That leaves the question the per-element collapse actually depends on, which no production path
+/// here is shown to produce: if an element IS in the resident map and NOT in the index, does the
+/// reconcile keep it or refuse it?
+///
+/// Built through the production exception rather than by hand -- `replay_install_element` is the
+/// method the `context_node` replay arm uses, and it is the one path that installs without filing.
+/// The element is given an object key the index has never heard of, which is what makes it
+/// container-only.
+#[test]
+fn a_container_only_element_survives_the_reconcile_when_its_block_is_still_live() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    // An index-registered field, so `bucket_map` is non-empty (or the reconcile returns early) and
+    // so there is a control that must survive whatever happens to the subject.
+    run(
+        &engine,
+        vec![Command::HashSet {
+            key: "control-hash".to_string(),
+            field: "f-0".to_string(),
+            value: b"control-value".to_vec(),
+        }],
+    );
+
+    let mut shards = engine.shards.write().expect("engine lock poisoned");
+    let shard = shards.get_mut(&1).expect("shard is loaded");
+
+    // Borrow a real, live address from the control's own block so the subject cannot be refused
+    // merely for pointing at a page that does not exist. The ONLY thing that differs between the
+    // control and the subject is whether the INDEX names it.
+    let live_address = shard
+        .hashes
+        .get("control-hash")
+        .and_then(|fields| fields.get("f-0"))
+        .cloned()
+        .expect("the control field must be in the resident map to lend its address");
+
+    shard
+        .hashes
+        .replay_install_element("orphan-object", std::sync::Arc::from("meta"), live_address);
+
+    let orphan_before = shard
+        .hashes
+        .get("orphan-object")
+        .map(|fields| fields.get("meta").is_some())
+        .unwrap_or(false);
+    let named = super::BlockObjects::of(&shard.bucket_index);
+    let mut index_names_orphan = false;
+    for (bucket_id, bucket) in &shard.bucket_index.bucket_map {
+        for (handle, _block) in &bucket.block_index {
+            if named.at(*bucket_id, *handle).as_ref() == "orphan-object" {
+                index_names_orphan = true;
+            }
+        }
+    }
+    println!(
+        "[orphan] before the reconcile: in resident map={orphan_before} named by index={index_names_orphan}"
+    );
+    assert!(
+        orphan_before && !index_names_orphan,
+        "the fixture failed to build a CONTAINER-ONLY element (map={orphan_before}, \
+         index={index_names_orphan}), so this test cannot ask its question"
+    );
+
+    crate::engine::storage_bucket_internals::rebuild_unserialized_model_maps_from_bucket_index(
+        shard,
+    );
+
+    let orphan_after = shard
+        .hashes
+        .get("orphan-object")
+        .map(|fields| fields.get("meta").is_some())
+        .unwrap_or(false);
+    let control_after = shard
+        .hashes
+        .get("control-hash")
+        .map(|fields| fields.get("f-0").is_some())
+        .unwrap_or(false);
+    println!("[orphan] after the reconcile: orphan={orphan_after} control={control_after}");
+    assert!(
+        control_after,
+        "CONTROL: the index-registered field was dropped too, so the reconcile is not doing what \
+         its documentation says and the orphan result is not attributable to the live filter"
+    );
+    println!(
+        "[orphan] VERDICT: a container-only element {} the reconcile",
+        if orphan_after { "SURVIVES" } else { "IS REFUSED BY" }
+    );
+
+    // THE COMPLEMENTARY CONTROL, and without it the result above is unreadable: if the filter
+    // never fires at all, "survives" says nothing about why. A second orphan gets an address for a
+    // page NOTHING holds, so the only live-set lookup that can decide it must fail.
+    shard.hashes.replay_install_element(
+        "orphan-dead-page",
+        std::sync::Arc::from("meta"),
+        crate::engine::ElementEntry::from_parts(9_999, 1_234_567, 64, None, None),
+    );
+    assert!(
+        shard
+            .hashes
+            .get("orphan-dead-page")
+            .map(|fields| fields.get("meta").is_some())
+            .unwrap_or(false),
+        "the dead-page control was not installed, so it cannot test the filter"
+    );
+    crate::engine::storage_bucket_internals::rebuild_unserialized_model_maps_from_bucket_index(
+        shard,
+    );
+    let dead_after = shard
+        .hashes
+        .get("orphan-dead-page")
+        .map(|fields| fields.get("meta").is_some())
+        .unwrap_or(false);
+    println!("[orphan] dead-page control after the reconcile: {dead_after} (must be false)");
+    assert!(
+        !dead_after,
+        "THE LIVE FILTER NEVER FIRES: an element pointing at a page nothing holds also survived,          so the first result above cannot be read as `the page was live`"
+    );
+    // MEASURED, and it REFUTED the prediction this test was written to confirm: a container-only
+    // element whose PAGE is live SURVIVES. `LiveBlockKey` is `(slab_id, offset, length)` -- a page
+    // identity carrying no element, component or object key -- so the filter asks only whether the
+    // page is still there, never whether the index names this element.
+    assert!(
+        orphan_after,
+        "a container-only element on a LIVE page was dropped, contradicting the measured behaviour          this assertion records"
+    );
+}
+
+/// THE SAME QUESTION FOR THE OTHER THREE KINDS, ASKED OF THE FUNCTION THAT DECIDES.
+///
+/// `replay_install_element` is gated on `ReplaysInstallsUnrecorded` and only `HashKind` declares
+/// it, so the end-to-end arm above cannot be written for `sets`, `zsets` or `lists`. What CAN be
+/// measured per kind is `fill_absent_elements` itself -- the function both reconcile sites call
+/// through `RecordedMap::reconcile_from_durable`, and the only place the live-address refusal
+/// lives. Each kind is driven with its OWN element and value type, because the whole question is
+/// whether the filter looks at anything but the page, and a single type could not show that.
+///
+/// Two elements per kind, and the pair is the test: one on a page the live set holds, one on a page
+/// it does not. The first must be KEPT and the second REFUSED. Either outcome alone would be
+/// unreadable -- all-kept means the filter is inert, all-refused means it ignores liveness.
+#[test]
+fn the_live_filter_keeps_an_unnamed_element_on_a_live_block_for_every_kind() {
+    use std::collections::{BTreeMap, HashMap, HashSet};
+
+    let live_address = crate::engine::ElementEntry::from_parts(1, 4_096, 64, None, None);
+    let dead_address = crate::engine::ElementEntry::from_parts(9_999, 1_234_567, 64, None, None);
+    let live: HashSet<(u64, u64, u64)> = [crate::engine::live_block_key(&live_address)]
+        .into_iter()
+        .collect();
+    assert!(
+        !live.contains(&crate::engine::live_block_key(&dead_address)),
+        "the fixture's two addresses collide in the live set, so nothing here can distinguish \
+         kept from refused"
+    );
+
+    // HASHES -- a sorted vector keyed by field name.
+    {
+        let mut persisted: HashMap<String, crate::engine::hash_field_map::HashFieldMap> =
+            HashMap::new();
+        let fields = persisted.entry("obj".to_string()).or_default();
+        fields.insert(std::sync::Arc::from("on-live-page"), live_address.clone());
+        fields.insert(std::sync::Arc::from("on-dead-page"), dead_address.clone());
+        let mut refused = 0usize;

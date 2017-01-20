@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MatrixArk Resource And Skill Parsing Pipeline</title>
+  <style>
+    :root { color-scheme: light; --ink:#17202a; --line:#d6dbdf; --bg:#f8fafc; --panel:#ffffff; }
+    body { margin:0; font-family: Inter, Segoe UI, Arial, sans-serif; color:var(--ink); background:var(--bg); line-height:1.55; }
+    main { max-width: 1120px; margin: 0 auto; padding: 40px 28px 80px; }
+    article { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:32px; box-shadow:0 10px 30px rgba(15,23,42,.06); }
+    h1 { margin-top:0; font-size:32px; line-height:1.15; }
+    pre { overflow:auto; white-space:pre-wrap; background:#111827; color:#f8fafc; padding:18px; border-radius:7px; font-size:13px; line-height:1.45; }
+  </style>
+</head>
+<body><main><article><pre># MatrixArk Resource And Skill Parsing Pipeline
+
+This document explains how MatrixArk ingests resources and skills, parses them into serving-ready chunks, generates embeddings, extracts facts into context memory, and writes the resulting records into TemporalStore-backed context models.
+
+The important product boundary is simple: callers send a `raw_uri`, optional `resource_type`, `scope`, and `metadata.node_path`. MatrixArk owns parsing, chunking, extraction, indexing, summaries, embeddings, and ContextPack assembly.
+
+## Product Serving Model
+
+MatrixArk keeps four lanes separate:
+
+| Lane | Stored as | Retrieval role |
+|---|---|---|
+| Resources | cited `ResourceChunk` records, `resource_l0` summaries, `ContextEmbedding`, and `ContextIndex` records | Source evidence with citations. Chunks answer &quot;show me the policy/runbook/source&quot; questions. |
+| Resource facts | normal `ContextEvent` and `ContextEntity` records with `source_chunk_hash` and `source_ref` | Compact memory extracted from resources: decisions, owners, deadlines, costs, approvals, procedures, risks, API contracts, and troubleshooting facts. |
+| Skills | separate `SkillManifest`, `SkillRegistry`, and `SkillSection` records, plus skill summaries, embeddings, and skill indexes | Operational instructions. Retrieval returns only relevant skill sections, not the whole skill bundle by default. |
+| Audit/replay | `ContextPackAudit`, debug records, selected/dropped refs, token costs, access decisions, stale/superseded reasons | Observability and governance. Audit explains why retrieval/extraction behaved a certain way; it is not a primary serving memory lane. |
+
+This gives MatrixArk baseline-like resource handling, baseline-like event/entity memory, and stronger MatrixArk-specific replay/debug governance in one TemporalStore-native model.
+
+```mermaid
+flowchart TD
+  A[&quot;Resource file&quot;] --&gt; B[&quot;ResourceChunk + resource_l0 + embedding + indexes&quot;]
+  B --&gt; C[&quot;Resource facts extracted&quot;]
+  C --&gt; D[&quot;ContextEvent / ContextEntity with source_chunk_hash&quot;]
+  E[&quot;SKILL.md or skill bundle&quot;] --&gt; F[&quot;SkillManifest / SkillSection retrieval lane&quot;]
+  G[&quot;Query&quot;] --&gt; H[&quot;Retrieve events/entities/resources/skills separately&quot;]
+  H --&gt; I[&quot;Question-type-aware ContextPack&quot;]
+  I --&gt; J[&quot;ContextPackAudit + replay/debug&quot;]
+```
+
+## Raw File Storage Modes
+
+MatrixArk MCP supports both local and cloud handling for resource and skill files.
+
+```mermaid
+flowchart TD
+  A[&quot;matrixark_ingest(kind=resource|skill, raw_uri, raw_storage_mode)&quot;]
+  B{&quot;raw_storage_mode&quot;}
+  C[&quot;local: keep local file URI/path&quot;]
+  D[&quot;cloud: upload local file or inline text to S3&quot;]
+  E[&quot;download/read S3 object for parser input&quot;]
+  F[&quot;parse chunks, summaries, embeddings, indexes&quot;]
+  G[&quot;TemporalStore records store raw_uri only, never raw bytes&quot;]
+
+  A --&gt; B
+  B --&gt; C --&gt; F
+  B --&gt; D --&gt; E --&gt; F
+  F --&gt; G
+```
+
+Local mode:
+
+- Set `raw_storage_mode=local`, or omit it when `deployment_scope` is not `cloud`.
+- MatrixArk stores the caller-provided `raw_uri`, such as `/repo/runbooks/gpu.md`.
+- The parser reads the local path directly.
+- TemporalStore stores parsed serving data and the local URI, not raw bytes.
+
+Cloud mode:
+
+- Set `raw_storage_mode=cloud`, or set `deployment_scope=cloud`.
+- MatrixArk uploads a local file or inline resource text to S3 before parsing.
+- Existing `s3://...` URIs are accepted and downloaded to a temporary parser file.
+- TemporalStore stores the resolved `s3://bucket/key` as `raw_uri`.
+- The original caller value is preserved as `requested_raw_uri`.
+- Parser citations and chunk `source_ref` values are rewritten to the S3 URI.
+
+Cloud configuration:
+
+- `s3_bucket` or `MATRIXARK_RESOURCE_S3_BUCKET`
+- `s3_prefix` or `MATRIXARK_RESOURCE_S3_PREFIX` (defaults to `matrixark/raw`)
+- optional `MATRIXARK_S3_ENDPOINT_URL` or `AWS_ENDPOINT_URL_S3` for S3-compatible storage
+- standard AWS credentials/profile/region environment variables when using AWS S3
+
+The records expose `raw_storage_mode`, `raw_storage_policy`, `upload_status`, `cloud_bucket`, and `cloud_key` for import tasks, manifests, registries, and list APIs.
+
+## Current Resource Flow
+
+```mermaid
+flowchart TD
+  A[&quot;matrixark_ingest(kind=resource, raw_uri, resource_type, scope, metadata.node_path)&quot;]
+  B[&quot;ResourceImportTask queued/running&quot;]
+  C[&quot;ResourceParser dispatch by type&quot;]
+  D[&quot;Parse into bounded cited chunks&quot;]
+  E[&quot;Dedupe chunks by content_hash&quot;]
+  F[&quot;Generate chunk embeddings&quot;]
+  G[&quot;Write resource records&quot;]
+  H[&quot;Extract resource facts&quot;]
+  I[&quot;Mark node summary dirty&quot;]
+  J[&quot;ResourceImportTask completed&quot;]
+
+  A --&gt; B --&gt; C --&gt; D --&gt; E --&gt; F --&gt; G --&gt; H --&gt; I --&gt; J
+```
+
+Supported parser inputs now include:
+
+- `.md`, `.txt`, `.log`
+- `.html`
+- `.pdf`
+- `.docx`, `.pptx`, `.xlsx`
+- `.csv`, `.tsv`
+- `.json`, `.jsonl`
+- local directories and repos, skipping folders such as `.git`, `node_modules`, `target`, `build`, caches, and virtualenvs
+- images and scanned documents through the OCR/VLM command path when configured
+
+Raw bytes are not copied into TemporalStore. TemporalStore stores `raw_uri`, parsed chunks, citations, summaries, embeddings, secondary indexes, registry records, import task state, and replay metadata.
+
+## Chunking
+
+MatrixArk creates bounded, citation-friendly chunks. The chunk text stays readable for final prompts, while embedding text can include richer metadata.
+
+Chunking rules:
+
+- Markdown, HTML, text, and logs: heading-aware sections first, then bounded token/character windows.
+- CSV, TSV, and XLSX: row-group/table chunks rather than one tiny row per chunk.
+- JSON and JSONL: top-level object/path chunks or record groups.
+- PDF, PPTX, and DOCX: page, slide, paragraph, and table-derived chunks with source position metadata.
+- Code and directories: preserve relative paths; use symbol-aware parsing when available, otherwise bounded token windows.
+- Images/scanned PDFs: emit VLM/OCR-derived caption chunks when the provider command is configured; otherwise keep parse warnings.
+
+Each `resource_chunk` includes:
+
+- `chunk_hash`
+- `source_ref`
+- `text`
+- `token_estimate`
+- `content_hash`
+- `resource_version`
+- `unit_kind`
+- `relative_path`
+- optional `heading_slug`, `page_number`, `slide_number`, `row_range`, and `parse_warnings`
+
+`content_hash` powers dedupe. `resource_version` powers refresh semantics: a new version creates new chunks, old chunks remain replayable, and superseded chunks are excluded from normal retrieval unless historical replay asks for them.
+
+## Embeddings
+
+```mermaid
+flowchart LR
+  A[&quot;Chunk text&quot;]
+  B[&quot;embedding_text_for_chunk()&quot;]
+  C[&quot;Adds source path, headings, columns, keywords&quot;]
+  D[&quot;embedding_for_text() / embeddings_for_texts()&quot;]
+  E[&quot;context_embedding record&quot;]
+
+  A --&gt; B --&gt; C --&gt; D --&gt; E
+```
+
+The text used for citations and prompt evidence is not always identical to the text used for embedding. `embedding_text_for_chunk()` enriches the embedding payload with source ref, relative path, heading path, table columns, keywords, and chunk content so retrieval can match both semantic content and structural hints.
+
+`context_embedding` records are written for:
+
+- `resource_chunk`
+- `resource_l0`
+- `skill_l0`
+- `skill_summary`
+- resource-derived `event_text`
+- resource-derived `entity_state`
+- node-level `node_l0` and `node_l1` summaries when summary refresh runs
+
+Embedding provider configuration:
+
+```bash
+export MATRIXARK_EMBEDDING_PROVIDER=oss
+export MATRIXARK_EMBEDDING_MODEL=sentence-transformers/all-MiniLM-L6-v2
+export MATRIXARK_EMBEDDING_MODEL_PATH=/models/all-MiniLM-L6-v2
+export MATRIXARK_REQUIRE_OSS_EMBEDDINGS=1
+```
+
+If local OSS models are unavailable in test mode, deterministic hashing embeddings can still be used for CI/debugging, but benchmark claims should identify the provider explicitly.
+
+## Resource Records Written
+
+```mermaid
+flowchart TD
+  A[&quot;Resource chunks&quot;]
+  B[&quot;resource_manifest&quot;]
+  C[&quot;resource_registry&quot;]
+  D[&quot;resource_chunk&quot;]
+  E[&quot;context_summary(resource_l0)&quot;]
+  F[&quot;context_embedding(resource_l0/resource_chunk)&quot;]
+  G[&quot;context_index&quot;]
+  H[&quot;context_event(resource_fact)&quot;]
+  I[&quot;context_entity(resource fact/entity state)&quot;]
+
+  A --&gt; B
+  A --&gt; C
+  A --&gt; D
+  A --&gt; E
+  D --&gt; F
