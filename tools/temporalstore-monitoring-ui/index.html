@@ -119,3 +119,246 @@
                 </tr>
               </thead>
               <tbody id="context-pipeline-body"></tbody>
+            </table>
+          </div>
+          <div class="section-gap">
+            <div class="panel-head compact">
+              <h2>End-to-End Parity</h2>
+            </div>
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Run</th>
+                    <th>Covers</th>
+                    <th>Evidence</th>
+                    <th>Expected Output</th>
+                    <th>Status</th>
+                  </tr>
+                </thead>
+                <tbody id="context-e2e-parity-body"></tbody>
+              </table>
+            </div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head compact">
+            <h2>Request Builder</h2>
+          </div>
+          <div id="context-request-builder" class="request-stack"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head compact">
+            <h2>Runbook</h2>
+          </div>
+          <div id="context-runbook" class="metric-list"></div>
+        </article>
+      </section>
+
+      <section id="configuration" class="layout context-layout">
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <div>
+              <h2>Query Workbench</h2>
+              <p>Raw query understanding, traversal controls, filters, pack budget, and replayable output.</p>
+            </div>
+          </div>
+          <div id="context-query-workbench" class="query-workbench"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head compact">
+            <h2>Context Config</h2>
+          </div>
+          <div id="context-config" class="config-stack"></div>
+        </article>
+      </section>
+
+      <section id="models" class="panel">
+        <div class="panel-head">
+          <div>
+            <h2>Open Source Model Registry</h2>
+            <p>Local-first model choices for embeddings, reranking, extraction, summaries, and document/VLM parsing.</p>
+          </div>
+        </div>
+        <div id="context-model-registry" class="model-registry-grid"></div>
+      </section>
+
+      <section id="evidence" class="layout context-layout">
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <div>
+              <h2>Context Tree And Retrieval Pack</h2>
+              <p>Layered navigation, bounded vector scoring, filters, resource chunks, and prompt-token budget.</p>
+            </div>
+          </div>
+          <div class="context-tree-pack">
+            <div id="context-tree" class="tree-view"></div>
+            <div id="context-pack" class="pack-view"></div>
+          </div>
+          <div class="context-observability">
+            <div id="context-filesystem-explorer" class="filesystem-explorer"></div>
+            <div id="context-observation" class="observation-grid"></div>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head compact">
+            <h2>Alerts</h2>
+          </div>
+          <div id="context-alerts" class="metric-list"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head compact">
+            <h2>Replay Audit</h2>
+          </div>
+          <div id="context-audit" class="metric-list"></div>
+        </article>
+      </section>
+
+
+      <section id="resource-skill-ops" class="panel resource-skill-panel">
+        <div class="panel-head">
+          <div>
+            <h2>Resource And Skill Operations</h2>
+            <p>Import lifecycle, parse warnings, resource tree, chunk preview, skill registry, versions, summary lag, and replay.</p>
+          </div>
+          <span id="resource-skill-status" class="status-pill">
+            <span class="dot"></span>
+            pending
+          </span>
+        </div>
+        <div class="resource-skill-grid">
+          <article class="resource-skill-metrics-card">
+            <div class="panel-head compact"><h2>Resource Metrics</h2></div>
+            <div id="resource-skill-metrics" class="resource-skill-metrics"></div>
+          </article>
+          <article>
+            <div class="panel-head compact"><h2>Import Tasks</h2></div>
+            <div id="resource-import-tasks" class="ops-card-stack"></div>
+          </article>
+          <article>
+            <div class="panel-head compact"><h2>Parse Warnings</h2></div>
+            <div id="resource-parse-warnings" class="metric-list"></div>
+          </article>
+          <article>
+            <div class="panel-head compact"><h2>Resource Tree</h2></div>
+            <div id="resource-tree-view" class="resource-tree-view"></div>
+          </article>
+          <article>
+            <div class="panel-head compact"><h2>Chunk Preview</h2></div>
+            <div id="resource-chunk-preview" class="chunk-preview-list"></div>
+          </article>
+          <article>
+            <div class="panel-head compact"><h2>Skill Registry</h2></div>
+            <div id="skill-registry-view" class="skill-registry-list"></div>
+          </article>
+          <article>
+            <div class="panel-head compact"><h2>Version History</h2></div>
+            <div id="resource-version-history" class="version-history-list"></div>
+          </article>
+          <article>
+            <div class="panel-head compact"><h2>Dirty Summary Lag</h2></div>
+            <div id="resource-summary-lag" class="summary-lag-list"></div>
+          </article>
+          <article>
+            <div class="panel-head compact"><h2>Retrieval Replay</h2></div>
+            <div id="resource-retrieval-replay" class="replay-list"></div>
+          </article>
+        </div>
+      </section>
+
+      <section id="operations" class="layout context-layout">
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <div>
+              <h2>Operator Console</h2>
+              <p>Resource ingestion, summary refresh, compression, feedback hooks, and parity test controls.</p>
+            </div>
+          </div>
+          <div id="context-operators" class="operator-grid"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head compact">
+            <h2>Safeguards</h2>
+          </div>
+          <div id="context-safeguards" class="metric-list"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head compact">
+            <h2>UI Production Readiness</h2>
+          </div>
+          <div id="context-ui-readiness-summary" class="ui-readiness-summary"></div>
+          <div id="context-ui-readiness" class="ui-readiness-grid"></div>
+        </article>
+      </section>
+
+      <section class="layout">
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <div>
+              <h2>MatrixDB And MatrixKV Services</h2>
+              <p>Process state, ports, role, and latest API or scale-test status.</p>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Product</th>
+                  <th>Service</th>
+                  <th>Node</th>
+                  <th>Status</th>
+                  <th>Ports</th>
+                  <th>Role</th>
+                  <th>Latest Signal</th>
+                </tr>
+              </thead>
+              <tbody id="product-services-body"></tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head compact">
+            <h2>MatrixKV Scale</h2>
+          </div>
+          <div id="MatrixKV-scale-list" class="metric-list"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head compact">
+            <h2>MatrixDB Redis API</h2>
+          </div>
+          <div id="MatrixDB-api-list" class="metric-list"></div>
+        </article>
+      </section>
+
+      <section class="layout">
+        <article class="panel panel-wide">
+          <div class="panel-head">
+            <div>
+              <h2>Node Level View</h2>
+              <p>Service state, role, cache, and recent replay position.</p>
+            </div>
+            <span id="last-refresh" class="timestamp">not refreshed</span>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Node</th>
+                  <th>Role</th>
+                  <th>Status</th>
+                  <th>Endpoint</th>
+                  <th>CPU</th>
+                  <th>Memory</th>
+                  <th>Storage</th>
+                  <th>Replay</th>
+                </tr>
+              </thead>
