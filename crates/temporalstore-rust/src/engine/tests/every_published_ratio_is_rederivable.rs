@@ -42,3 +42,138 @@ const KEYS: usize = 400;
 const VALUE: usize = 256;
 
 /// The same arithmetic the engine's own `ppm_ratio` performs, including its zero-denominator
+/// convention. Restated here rather than borrowed, so the arm compares the published figure
+/// against an INDEPENDENT computation instead of against the function that produced it.
+fn ppm(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 {
+        return 0;
+    }
+    numerator.saturating_mul(1_000_000) / denominator
+}
+
+#[test]
+#[ignore = "seeds a store and reads its published status; run by name"]
+fn every_published_ratio_is_rederivable_from_published_counters() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("rederive-{index:06}"),
+                value: vec![b'v'; VALUE],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let published = engine
+        .shard_stats(1)
+        .expect("a loaded shard reports stats")
+        .storage;
+
+    println!();
+    println!("  PUBLISHED COUNTERS");
+    println!("    bytes_written          {:>12}", published.bytes_written);
+    println!("    logical_bytes_written  {:>12}", published.logical_bytes_written);
+    println!("    live_block_bytes       {:>12}", published.live_block_bytes);
+    println!("    storage_slab_total     {:>12}", published.storage_slab_total_bytes);
+    println!("    storage_slab_used      {:>12}", published.storage_slab_used_bytes);
+    println!("    non_purged_physical    {:>12}", published.non_purged_physical_bytes);
+    println!("    pending_discard_bytes  {:>12}", published.pending_discard_bytes);
+    println!();
+    println!("  PUBLISHED RATIOS, each beside the same figure recomputed from the counters above");
+
+    // (name, published ppm, numerator, denominator)
+    let identities: [(&str, u64, u64, u64); 7] = [
+        (
+            "storage_write_amplification_ppm",
+            published.storage_write_amplification_ppm,
+            published.bytes_written,
+            published.logical_bytes_written,
+        ),
+        (
+            "lifetime_write_amplification_ppm",
+            published.lifetime_write_amplification_ppm,
+            published.bytes_written,
+            published.live_block_bytes,
+        ),
+        // THE WINDOWED WRITE RATIO, whose numerator is its own published term rather than
+        // `bytes_written`. That is the point of publishing the term: the lifetime figure above and
+        // this one divide DIFFERENT numerators by the same denominator, and from the two ppm
+        // values alone a consumer could not tell which window either covers.
+        (
+            "write_amplification_since_compaction_ppm",
+            published.write_amplification_since_compaction_ppm,
+            published.bytes_written_since_compaction,
+            published.live_block_bytes,
+        ),
+        // THE USER-BYTE RATIO, whose BOTH halves are in the caller's units. It is the only
+        // identity here that cannot be checked against `bytes_written` at all: its numerator is
+        // `logical_bytes_written` and its denominator the maintained class total, so a consumer
+        // reading only the stored counters could not re-derive it. That is the reason both terms
+        // are published.
+        (
+            "user_write_amplification_ppm",
+            published.user_write_amplification_ppm,
+            published.logical_bytes_written,
+            published.live_user_bytes,
+        ),
+        (
+            "space_amplification_ppm",
+            published.space_amplification_ppm,
+            published.storage_slab_total_bytes,
+            published.storage_slab_used_bytes,
+        ),
+        // THE FOURTH: the space figure whose terms can actually fall. Both of its halves are
+        // published, which is the whole point of it being here -- the pinned one above divides
+        // terms that cannot see a purge or an overwrite, and a consumer could not tell that from
+        // the ppm figure alone.
+        (
+            "block_space_amplification_ppm",
+            published.block_space_amplification_ppm,
+            published.non_purged_physical_bytes,
+            published.live_block_bytes,
+        ),
+        // THE FIFTH, AND THE ONLY IDENTITY HERE WHOSE NUMERATOR ADDS. It is the reason the retired
+        // bytes are published as a counter beside the ratio instead of only inside it: without
+        // `pending_discard_bytes` on the status, this figure would be the one ratio a consumer
+        // could not check, which is precisely what the published denominators exist to prevent.
+        //
+        // IT IS NOT A SECOND SPELLING OF THE FOURTH. That one divides non-purged file bytes by the
+        // live tally and is reload-independent; this one divides the live set plus what the index
+        // has retired and not had collected, moves at the instant of the overwrite, and is derived
+        // state that reads zero after a reload. They agree in the steady state and diverge after a
+        // restart, which makes each the other's cross-check.
+        (
+            "recorded_space_amplification_ppm",
+            published.recorded_space_amplification_ppm,
+            published
+                .live_block_bytes
+                .saturating_add(published.pending_discard_bytes),
+            published.live_block_bytes,
+        ),
+    ];
+
+    let mut exercised = 0_usize;
+    for (name, reported, numerator, denominator) in identities {
+        let recomputed = ppm(numerator, denominator);
+        println!(
+            "    {name:<34} {reported:>9} published, {recomputed:>9} recomputed  \
+             ({numerator} / {denominator})"
+        );
+        // DENOMINATOR FIRST. The engine reports 0 ppm when a denominator is unavailable, so an
+        // identity over a zero denominator would hold at 0 == 0 while checking nothing.
+        if denominator == 0 {
+            println!(
+                "      .. NOT exercised: the denominator is 0, so this identity would hold \
+                 vacuously"
+            );
+            continue;
+        }

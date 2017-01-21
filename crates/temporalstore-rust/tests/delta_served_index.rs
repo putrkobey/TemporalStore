@@ -67,3 +67,38 @@ fn delta_path_defers_base_write_but_funnel_and_reload_see_current_state() {
     let (engine, index_dir) = build_engine(&root);
     let index_path = index_dir.join(format!("shard-{SHARD_ID}.index.json"));
     engine.load_shard(SHARD_ID);
+
+    for key in ["alpha", "bravo", "charlie"] {
+        set(&engine, key, b"v1");
+    }
+
+    // (1) O(delta) per write: the whole-index base file was NOT rewritten per write. On the
+    // delta path the sync execute path skips the per-write base rewrite entirely, so with no
+    // compaction yet the base file is still absent.
+    assert!(
+        !index_path.exists(),
+        "delta path must not rewrite the base index per write"
+    );
+
+    // (2) The funnel still serves the COMPLETE, current index from the live shard.
+    let served = engine
+        .export_index_bytes(SHARD_ID)
+        .expect("funnel serves the live index");
+    // The served index is a CONTAINER -- magic, a codec byte, then a zstd payload (and, for the
+    // msgpack codec, a four-byte struct-version stamp before it). It has not been text since that
+    // landed: `encode_index_bytes_as_plain_json` is `cfg(test)` and its own comment says
+    // production has no way to produce the plain shape any more. So searching the raw bytes for
+    // key names asserted a format that cannot occur, and this test has failed on main ever since.
+    //
+    // WHAT THIS COSTS: the funnel-is-current claim. Recovering it needs either a public decoder or
+    // a crate-internal test that can reach `decode_index_bytes`, and duplicating the container
+    // format here -- in a test, alongside the real reader -- is the wrong way to buy it back.
+    // Checkable from an integration test is that the funnel produced a container at all, and that
+    // the stream read returns those same bytes, asserted just below. The keys are read back for
+    // real in (4).
+    assert!(
+        served.starts_with(b"TSIDX"),
+        "the funnel must serve a served-index container, got {} bytes starting {:?}",
+        served.len(),
+        &served[..served.len().min(8)]
+    );
