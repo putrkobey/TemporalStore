@@ -447,3 +447,453 @@
 <body>
 <main class="wrap">
 
+  <header>
+    <h1>mem0 API</h1>
+    <span class="conn" role="status" aria-live="polite"><span id="dot" class="dot"></span><span id="conn">connecting…</span></span>
+  </header>
+  <nav class="portalnav">
+    <a href="/v1/admin">Overview</a>
+    <a href="/v1/admin/onebox">One-box</a>
+    <a href="/v1/admin/setup">Setup &amp; metrics</a>
+    <a href="/v1/admin/catalog">Skills &amp; resources</a>
+    <a href="/v1/admin/explore">Explore</a>
+    <a href="/v1/admin/mem0" aria-current="page">mem0 API</a>
+    <a href="/v1/admin/ingestion">Ingestion</a>
+    <a href="/v1/admin/portal">API keys</a>
+    <a href="/v1/admin/api">API</a>
+    <div class="livestrip" id="liveStrip" hidden>
+      <a class="live-seg" href="/v1/admin/setup#encoding" id="liveEnc" hidden></a>
+      <a class="live-seg" href="/v1/admin/ingestion" id="liveImp" hidden></a>
+      <a class="live-seg" href="/v1/admin/setup#traffic" id="liveReq" hidden></a>
+      <a class="live-seg warn" href="/v1/admin/setup#warnings" id="liveWarn" hidden></a><span class="live-seg" id="liveNode" hidden></span><a class="live-seg warn" href="/v1/admin/setup#awaitingRestart" id="liveWaiting" hidden></a>
+      <button class="live-seg" id="liveCalls" type="button" aria-expanded="false"
+              aria-controls="callLog" title="What this page has asked the gateway, and what came back"></button>
+      <span class="live-dot" id="liveDot" title="live"></span>
+    </div>
+  </nav>
+  <div class="calllog" id="callLog" hidden>
+    <table class="inv"><thead><tr><th>When</th><th>Call</th><th>Answered</th><th>Took</th></tr>
+      </thead><tbody id="callLogRows"></tbody></table>
+  </div>
+  <p class="lede">Every method of the mem0 API, by the name you call it by rather than the URL that
+    serves it &mdash; run against this deployment, with the whole exchange shown. It is the worked
+    example for writing the call yourself, and the first place to look when one of them answers
+    something you did not expect.</p>
+
+  <section>
+    <div class="sechead"><h2>Access</h2><span class="aux"><label class="check"><input type="checkbox" id="remember"> remember for this browser tab</label></span></div>
+    <label for="key">API key</label>
+    <input id="key" type="password" placeholder="Key carrying context:ingest / context:retrieve" autocomplete="off" spellcheck="false">
+    <div class="hint">An ordinary scoped key, not an admin one: these are the same routes an
+      application calls. The tenant is pinned from the key, so a key can never address another
+      tenant&rsquo;s memories.</div>
+  </section>
+
+  <section>
+    <h2>Scope</h2>
+    <div class="grid2">
+      <div>
+        <label for="user">User</label>
+        <input id="user" type="text" placeholder="leave blank for the whole tenant" spellcheck="false">
+        <label for="agent">Agent</label>
+        <input id="agent" type="text" placeholder="optional" spellcheck="false">
+      </div>
+      <div>
+        <label for="session">Session</label>
+        <input id="session" type="text" placeholder="optional" spellcheck="false">
+      </div>
+    </div>
+    <div class="hint">These fill the scope of every operation that takes one. An operation that
+      addresses a single memory by id says so on its own form and ignores these.</div>
+  </section>
+
+  <section>
+    <h2>Operation</h2>
+    <div id="ops"></div>
+    <div id="opForm"><div class="empty">Choose an operation.</div></div>
+    <div id="opMsg" role="status" aria-live="polite"></div>
+  </section>
+
+  <section>
+    <h2>The exchange</h2>
+    <p class="hint" style="margin-top:0">What went out and what came back, headers included. The
+      key is never shown: it is the one header worth redacting and the one people paste into
+      tickets by accident.</p>
+    <div id="opWire"><div class="empty">Nothing sent yet.</div></div>
+  </section>
+
+  <section>
+    <h2>This session&rsquo;s calls</h2>
+    <p class="hint" style="margin-top:0">Every call this page has made, newest first. Kept in the
+      page and nowhere else &mdash; it is gone when the tab is. Two runs side by side is how you
+      tell a request that changed from a deployment that did.</p>
+    <div id="opLog"><div class="empty">None yet.</div></div>
+  </section>
+
+</main>
+<script>
+/* Helpers every page may call, placed before the page's own script.
+
+   This one lived in the nav block, which is emitted AFTER the page script. Three pages
+   called it from their own script and read as working, because a browser runs both blocks
+   before anyone clicks anything. The cost only showed when something ran a page's script on
+   its own: the call threw, the browse path caught it along with everything else, and the
+   screen said "Could not reach the gateway" about a gateway it had never asked. A helper
+   that is shared is defined where every caller can already see it. */
+  window.__matrixarkCopyText = function (text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text).then(
+          function () { return true; }, function () { return false; });
+      }
+    } catch (e) { /* falls through to the failure below */ }
+    return Promise.resolve(false);
+  };
+
+  window.__matrixarkWhy = function (body, fallback) {
+    body = body || {};
+    var text = body.detail || body.error || fallback;
+    if (body.required && body.required.length) {
+      text += " — this needs " + [].concat(body.required).join(" or ");
+    }
+    /* A backend failure now answers with a sentence that deliberately says nothing about the
+       inside of the deployment, and a token naming the log entry that does. Showing the token is
+       the whole point of it: without it the reader has a polite sentence and no way to get any
+       further, and an operator has a log they cannot tie to the report. */
+    if (body.incident) {
+      text += " — incident " + body.incident;
+    }
+    return text;
+  };
+
+  window.__matrixarkNeverArrived = function (e) {
+    /* True when the request never left. A status means it did leave and was answered, and any
+       other throw happened here, with the answer already in hand. The messages fetch itself
+       produces are a short known set; anything else is this page's own. */
+    if (typeof e === "number") { return false; }
+    var text = e && e.message ? String(e.message) : (e == null ? "" : String(e));
+    return !text
+      || /failed to fetch|networkerror|load failed|network request failed|the network connection was lost/i.test(text);
+  };
+
+  window.__matrixarkConnState = function (e) {
+    /* What the connection strip should say about this failure, as [state, words].
+
+       Three cases, not two. A first version asked only whether the request arrived and called
+       everything that did a fault in the page -- so a 404 or a 500, which is the deployment
+       answering, turned the strip amber. It showed up the moment the page was opened with
+       nothing behind it: every fetch came back 404 and the strip blamed the page. */
+    if (window.__matrixarkNeverArrived(e)) { return ["down", "gateway unreachable"]; }
+    if (typeof e === "number") { return ["live", "connected"]; }
+    return ["warn", "this page could not show the answer"];
+  };
+
+  window.__matrixarkWhyFailed = function (e, failure) {
+    /* A rejection carrying a status is the deployment answering. A rejection from fetch itself is
+       the request never leaving. A throw after the answer arrived is THIS PAGE failing to show
+       what it was given -- and that used to read "Could not reach the gateway", about a gateway
+       that had just answered.
+
+       The last two are told apart by the message fetch produces, which is one of a short known
+       set. Where it is not recognised the page repeats what it caught rather than guessing: an
+       unfamiliar message shown as it came is still more than a sentence about the network. */
+    if (typeof e === "number") {
+      return (failure || window.__matrixarkFailure)(e);
+    }
+    if (window.__matrixarkNeverArrived(e)) {
+      return "Could not reach the gateway.";
+    }
+    var text = e && e.message ? String(e.message) : String(e);
+    return "The gateway answered, but this page could not show it \u2014 " + text
+      + ". That is a fault in this page, not in the deployment.";
+  };
+
+  window.__matrixarkFailure = function (status, overrides) {
+    if (overrides && overrides[status]) { return overrides[status]; }
+    if (status === 401) { return "This key was not accepted."; }
+    if (status === 403) { return "This key lacks the scope for that call."; }
+    if (status === 413) { return "That request is larger than this deployment accepts."; }
+    if (status === 429) { return "Rate limited — the edge is throttling this key."; }
+    if (status === 502) { return "The gateway could not reach the storage behind it."; }
+    if (status === 503) { return "The gateway is not ready to serve this yet."; }
+    if (status === 504) { return "The backend did not answer in time."; }
+    return "The gateway answered " + status + ".";
+  };
+
+  window.__matrixarkTrace = (function () {
+    /* The last calls this page made, newest last. Bounded: a portal tab is left open for days and
+       an unbounded list of every request is a leak that only shows on the busiest deployment. */
+    var calls = [], LIMIT = 60;
+    var listeners = [];
+
+    function note(entry) {
+      calls.push(entry);
+      if (calls.length > LIMIT) { calls.shift(); }
+      for (var i = 0; i < listeners.length; i++) {
+        try { listeners[i](calls.length); } catch (e) { /* a listener must not break a request */ }
+      }
+    }
+
+    var original = typeof window.fetch === "function" ? window.fetch : null;
+    if (original) {
+      window.fetch = function (input, init) {
+        var at = Date.now();
+        var method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
+        var url = String((input && input.url) || input || "");
+        return original.apply(this, arguments).then(function (response) {
+          /* Untouched. Reading the body here to pull out an incident token would consume it and
+             hand the caller an empty one -- breaking the panels this exists to help diagnose. */
+          note({ at: at, ms: Date.now() - at, method: method, url: url, status: response.status });
+          return response;
+        }, function (err) {
+          /* Status 0 is "never answered", which is a different row from a 500 and has to read as
+             one. The message is the browser's own; it is what tells a blocked request from a
+             refused one. */
+          note({ at: at, ms: Date.now() - at, method: method, url: url, status: 0,
+                 detail: (err && err.message) ? String(err.message) : String(err) });
+          throw err;
+        });
+      };
+    }
+
+    return {
+      calls: function () { return calls.slice(); },
+      onChange: function (fn) { if (typeof fn === "function") { listeners.push(fn); } },
+      note: note
+    };
+  }());
+
+  window.__matrixarkWhen = function (ms) {
+    /* 0 is "no timestamp" here, not the epoch: the catalog site this replaces read
+       `ms ? ... : dash`, and a record with no time would otherwise date to 1970. */
+    if (!ms) { return "—"; }
+    var at = new Date(Number(ms));
+    if (isNaN(at.getTime())) { return "—"; }
+    try { return at.toLocaleString(undefined, { timeZoneName: "short" }); }
+    catch (e) { return at.toLocaleString(); }
+  };
+</script>
+<script>
+(function () {
+  "use strict";
+  function $(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function say(el, text, cls) {
+    el.innerHTML = text ? '<div class="msg ' + (cls || "info") + '">' + esc(text) + "</div>" : "";
+  }
+  function auth() {
+    var k = $("key").value.trim();
+    return k ? { Authorization: "Bearer " + k } : {};
+  }
+  function failure(status) { return window.__matrixarkFailure(status); }
+  function reason(body, status) {
+    return (body && body.detail) || failure(status) || (body && body.error) || "";
+  }
+  function conn(state, text) {
+    $("dot").className = "dot " + state;
+    $("conn").textContent = text;
+  }
+  conn("live", "ready");
+
+  try {
+    var saved = sessionStorage.getItem("matrixark_admin_key");
+    if (saved) { $("key").value = saved; $("remember").checked = true; }
+  } catch (e) { /* ignore */ }
+  $("remember").addEventListener("change", function () {
+    try {
+      if ($("remember").checked) { sessionStorage.setItem("matrixark_admin_key", $("key").value); }
+      else { sessionStorage.removeItem("matrixark_admin_key"); }
+    } catch (e) { /* ignore */ }
+  });
+
+/* ---------- mem0 console ---------- */
+  /* Generated from the gateway's own MEM0_OPERATIONS, so an operation that gains an argument gains
+     a field here without anyone remembering to add one. */
+  var MEM0_OPS = [
+    {
+      "id": "add",
+      "label": "add()",
+      "group": "Write",
+      "method": "POST",
+      "path": "/v1/ingest",
+      "scope": "context:ingest",
+      "destructive": false,
+      "needs_scope": true,
+      "summary": "Write a turn. Acknowledged at 202 with extraction running behind it, which is why a search issued immediately afterwards can legitimately not see it yet.",
+      "fields": [
+        {
+          "name": "content",
+          "in": "message",
+          "kind": "textarea",
+          "required": true,
+          "label": "Message",
+          "placeholder": "The team agreed to keep the coupon stacking rule for ACME until Q4.",
+          "help": "Sent as one user turn."
+        },
+        {
+          "name": "finalize",
+          "in": "body",
+          "kind": "bool",
+          "default": true,
+          "label": "Extract before answering",
+          "help": "Off is how production behaves: the write is acknowledged and extraction runs in the background."
+        },
+        {
+          "name": "metadata",
+          "in": "body",
+          "kind": "json",
+          "label": "Metadata",
+          "placeholder": "{\"source\": \"portal\"}",
+          "help": "Stored alongside the memory and returned with it."
+        }
+      ]
+    },
+    {
+      "id": "search",
+      "label": "search()",
+      "group": "Read",
+      "method": "POST",
+      "path": "/v1/retrieve",
+      "scope": "context:retrieve",
+      "destructive": false,
+      "needs_scope": true,
+      "summary": "The retrieval path an agent uses: ranked, then packed to fit a token budget.",
+      "fields": [
+        {
+          "name": "query",
+          "in": "body",
+          "kind": "text",
+          "required": true,
+          "label": "Query",
+          "placeholder": "when do we ship?"
+        },
+        {
+          "name": "max_budget_tokens",
+          "in": "body",
+          "kind": "number",
+          "default": 2048,
+          "label": "Token budget",
+          "help": "The pack is built to fit this. A budget far below what the answer needs is indistinguishable from poor retrieval."
+        }
+      ]
+    },
+    {
+      "id": "get_all",
+      "label": "get_all()",
+      "group": "Read",
+      "method": "POST",
+      "path": "/v1/memories",
+      "scope": "context:retrieve",
+      "destructive": false,
+      "needs_scope": true,
+      "summary": "The memories in the scope, unranked -- the listing, not the search. A limit does not make it a sample of the whole scope: it takes the NEWEST that many.",
+      "fields": [
+        {
+          "name": "limit",
+          "in": "body",
+          "kind": "number",
+          "default": 50,
+          "label": "Limit",
+          "help": "The NEWEST this many, listed oldest first. 0 or blank for the whole scope."
+        }
+      ]
+    },
+    {
+      "id": "get",
+      "label": "get()",
+      "group": "Read",
+      "method": "GET",
+      "path": "/v1/memory/{id}",
+      "scope": "context:retrieve",
+      "destructive": false,
+      "needs_scope": false,
+      "summary": "One memory's stored record, by id.",
+      "fields": [
+        {
+          "name": "id",
+          "in": "path",
+          "kind": "text",
+          "required": true,
+          "label": "Memory id",
+          "placeholder": "mem_7f21"
+        }
+      ]
+    },
+    {
+      "id": "history",
+      "label": "history()",
+      "group": "Read",
+      "method": "GET",
+      "path": "/v1/memory/{id}/history",
+      "scope": "context:retrieve",
+      "destructive": false,
+      "needs_scope": false,
+      "summary": "How that memory changed: each supersede, with what it said before.",
+      "fields": [
+        {
+          "name": "id",
+          "in": "path",
+          "kind": "text",
+          "required": true,
+          "label": "Memory id",
+          "placeholder": "mem_7f21"
+        }
+      ]
+    },
+    {
+      "id": "get_by_key",
+      "label": "by identity key",
+      "group": "Read",
+      "method": "GET",
+      "path": "/v1/memory/by-key",
+      "scope": "context:retrieve",
+      "destructive": false,
+      "needs_scope": false,
+      "summary": "The one live value for an identity key in a scope — the shape a profile field wants, where the answer is a value and not a ranked list.",
+      "fields": [
+        {
+          "name": "identity_key",
+          "in": "query",
+          "kind": "text",
+          "required": true,
+          "label": "Identity key",
+          "placeholder": "ship_date"
+        },
+        {
+          "name": "user_id",
+          "in": "query",
+          "kind": "text",
+          "label": "User",
+          "from_scope": "user"
+        }
+      ]
+    },
+    {
+      "id": "users",
+      "label": "users()",
+      "group": "Read",
+      "method": "POST",
+      "path": "/v1/users",
+      "scope": "context:retrieve",
+      "destructive": false,
+      "needs_scope": true,
+      "summary": "Which users, agents and runs hold memories in this tenant.",
+      "fields": []
+    },
+    {
+      "id": "update",
+      "label": "update()",
+      "group": "Write",
+      "method": "POST",
+      "path": "/v1/update",
+      "scope": "context:ingest",
+      "destructive": false,
+      "needs_scope": false,
+      "summary": "Supersede a memory: the amended text is ingested and the old id tombstoned, so history keeps both.",
+      "fields": [
+        {
+          "name": "memory_id",
