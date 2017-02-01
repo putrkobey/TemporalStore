@@ -92,3 +92,50 @@ pub(super) fn task_canceled_output(task: &QueuedTask, message: &str) -> DataNode
         DataNodeTaskKind::Reload => DataNodeTaskOutput::Reload(LoadShardResponse { status }),
         DataNodeTaskKind::Unload => DataNodeTaskOutput::Unload(UnloadShardResponse { status }),
         DataNodeTaskKind::Execute => DataNodeTaskOutput::Execute(ExecuteResponse {
+            status,
+            response: CommandResponse::Empty,
+        }),
+        DataNodeTaskKind::CheckedExecute => {
+            DataNodeTaskOutput::CheckedExecute(CheckedExecuteResponse {
+                status: status.clone(),
+                response: ExecuteResponse {
+                    status,
+                    response: CommandResponse::Empty,
+                },
+            })
+        }
+        DataNodeTaskKind::Dump => DataNodeTaskOutput::Dump(DumpShardResponse {
+            status,
+            shard_id,
+            index_bytes: 0,
+            dirty_objects_flushed: 0,
+            bucket_dump_manifest: None,
+        }),
+        DataNodeTaskKind::Compact => DataNodeTaskOutput::Compact(CompactionResponse {
+            status,
+            shard_id,
+            compacted_objects: 0,
+            relocated_bytes: 0,
+            rewritten_object_blocks: 0,
+            delete_marked_object_ids_before: 0,
+            delete_marked_object_ids_after: 0,
+            model_layouts: Vec::new(),
+            previous_block_slab_id: 0,
+            compacted_block_slab_id: 0,
+            stale_block_slab_ids: Vec::new(),
+            before: ShardCompactionUtilityReport::default(),
+            after: ShardCompactionUtilityReport::default(),
+        }),
+        DataNodeTaskKind::Gc => DataNodeTaskOutput::Gc(GcResponse {
+            status,
+            shard_id,
+            collected_objects: 0,
+            cache_entries_removed: 0,
+            cache_disk_bytes_removed: 0,
+            wal_records_removed: 0,
+            index_log_records_removed: 0,
+            block_slabs_removed: 0,
+            block_slabs_removed_physical_bytes: 0,
+            block_slabs_retained_physical_bytes: 0,
+            block_slabs_retained_live: 0,
+            block_slabs_retained_live_physical_bytes: 0,
