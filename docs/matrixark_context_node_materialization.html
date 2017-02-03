@@ -13,3 +13,19 @@ incoming message or batch
 -&gt; normalize or infer node_path
 -&gt; ensure every prefix exists as context_node
 -&gt; ensure every parent/child edge exists as context_child_ref
+-&gt; write event/entity/segment/summary/embedding/index records at the selected node
+```
+
+## Default Records Written
+
+If the caller does not provide `metadata.node_path`, MatrixArk now keeps the default path intentionally shallow:
+
+```text
+user:&lt;user_id&gt; / session:&lt;session_id&gt;
+```
+
+That creates two `context_node` records and one `context_child_ref`:
+
+```text
+user:alice
+user:alice / session:thread-1
