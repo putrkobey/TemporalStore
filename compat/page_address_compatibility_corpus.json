@@ -93,3 +93,194 @@
       "length": 16,
       "checksum": "sha256:block-c"
     }
+  ],
+  "expected_stable_order": [
+    "a1",
+    "a2",
+    "b1",
+    "c1"
+  ],
+  "expected_block_stable_order": [
+    "ba1",
+    "ba2",
+    "ba3"
+  ],
+  "timestamp_page_index": {
+    "logical_key": "feature:tenant=77:user=9:object=storage-feature",
+    "entries": [
+      {
+        "start_ms": 1000,
+        "end_ms": 1019,
+        "address_id": "a1"
+      },
+      {
+        "start_ms": 1020,
+        "end_ms": 1039,
+        "address_id": "a2"
+      },
+      {
+        "start_ms": 1040,
+        "end_ms": 1059,
+        "address_id": "b1"
+      }
+    ],
+    "queries": [
+      {
+        "name": "middle_range",
+        "start_ms": 1010,
+        "end_ms": 1045,
+        "expected_address_ids": [
+          "a1",
+          "a2",
+          "b1"
+        ]
+      },
+      {
+        "name": "exact_second_page",
+        "start_ms": 1020,
+        "end_ms": 1039,
+        "expected_address_ids": [
+          "a2"
+        ]
+      }
+    ]
+  },
+  "page_split_case": {
+    "name": "target_bytes_splits_timestamp_ordered_pages",
+    "target_page_bytes": 32,
+    "records": [
+      {
+        "timestamp_ms": 2000,
+        "encoded_bytes": 14,
+        "value": "p0"
+      },
+      {
+        "timestamp_ms": 2010,
+        "encoded_bytes": 14,
+        "value": "p1"
+      },
+      {
+        "timestamp_ms": 2020,
+        "encoded_bytes": 14,
+        "value": "p2"
+      },
+      {
+        "timestamp_ms": 2030,
+        "encoded_bytes": 14,
+        "value": "p3"
+      }
+    ],
+    "expected_pages": [
+      {
+        "start_ms": 2000,
+        "end_ms": 2010,
+        "record_count": 2
+      },
+      {
+        "start_ms": 2020,
+        "end_ms": 2030,
+        "record_count": 2
+      }
+    ]
+  },
+  "compaction_rewrite_case": {
+    "name": "rewrite_preserves_logical_records_and_advances_generation",
+    "before": [
+      {
+        "address_id": "a1",
+        "records": [
+          {
+            "timestamp_ms": 1000,
+            "value": "v1000"
+          },
+          {
+            "timestamp_ms": 1010,
+            "value": "v1010"
+          }
+        ]
+      },
+      {
+        "address_id": "a2",
+        "records": [
+          {
+            "timestamp_ms": 1020,
+            "value": "v1020"
+          }
+        ]
+      }
+    ],
+    "after": [
+      {
+        "address": {
+          "id": "compact1",
+          "shard_id": 1,
+          "zone_id": 12,
+          "segment_id": 1,
+          "page_id": 1,
+          "offset": 0,
+          "length": 96,
+          "generation": 2,
+          "checksum": "sha256:compact1"
+        },
+        "records": [
+          {
+            "timestamp_ms": 1000,
+            "value": "v1000"
+          },
+          {
+            "timestamp_ms": 1010,
+            "value": "v1010"
+          },
+          {
+            "timestamp_ms": 1020,
+            "value": "v1020"
+          }
+        ]
+      }
+    ],
+    "stale_address_ids": [
+      "a1",
+      "a2"
+    ]
+  },
+  "tombstone_case": {
+    "name": "tombstone_skips_stale_records",
+    "records": [
+      {
+        "timestamp_ms": 3000,
+        "value": "live-before"
+      },
+      {
+        "timestamp_ms": 3010,
+        "value": "deleted",
+        "tombstone": {
+          "deleted_at_ms": 9000,
+          "reason": "ttl_expired"
+        }
+      },
+      {
+        "timestamp_ms": 3020,
+        "value": "live-after"
+      }
+    ],
+    "query": {
+      "start_ms": 2990,
+      "end_ms": 3030,
+      "include_tombstoned": false,
+      "expected_values": [
+        "live-before",
+        "live-after"
+      ]
+    },
+    "debug_replay_query": {
+      "start_ms": 2990,
+      "end_ms": 3030,
+      "include_tombstoned": true,
+      "expected_values": [
+        "live-before",
+        "deleted",
+        "live-after"
+      ]
+    }
+  },
+  "tombstone_compaction_case": {
