@@ -12,18 +12,3 @@ for (let i = page.indexOf("{", start); i < page.length; i++) {
   if (page[i] === "{") depth++;
   else if (page[i] === "}") { depth--; if (depth === 0) { end = i + 1; break; } }
 }
-
-const shown = [];
-const nodes = {
-  usageTable: {
-    style: {},
-    querySelector: () => ({ innerHTML: "", appendChild() {} }),
-  },
-};
-const scope = {
-  $: (id) => nodes[id] || { style: {}, innerHTML: "", appendChild() {} },
-  hideMsg: () => {},
-  showMsg: (id, kind, text) => shown.push({ id, kind, text }),
-  escapeHtml: (s) => String(s == null ? "" : s),
-  fmtTime: () => "",
-  gwBase: () => "http://gw",
