@@ -508,3 +508,173 @@ fn a_committed_entry_is_not_refused_by_the_storage_ceiling() {
     for index in 0..10 {
         assert!(write(&engine, &format!("seed{index}")).ok);
     }
+    engine.set_config(SetConfigRequest {
+        shard_id: 1,
+        config: Config {
+            version: 2,
+            maxmemory_bytes: Some(1),
+            ..Config::default()
+        },
+    });
+    // The DENOMINATOR: the ceiling is genuinely over on the client path.
+    let client = write(&engine, "client");
+    assert_eq!(
+        client.code, "storage_quota_exceeded",
+        "the ceiling did not refuse a client write, so this test would prove nothing"
+    );
+
+    let mut applied = 0;
+    let mut refused = Vec::new();
+    for index in 0..ENTRIES {
+        let response = engine.execute_raft_apply(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("committed{index}"),
+                value: b"v".to_vec(),
+            },
+        });
+        if response.status.ok {
+            applied += 1;
+        } else {
+            refused.push(response.status.code.clone());
+        }
+    }
+    assert_eq!(
+        applied, ENTRIES,
+        "only {applied} of {ENTRIES} committed entries applied; refused as {refused:?} -- a \
+         follower that refuses a committed entry diverges from its leader, and the ceiling it \
+         refused on is not something the follower can act on"
+    );
+}
+
+/// And it must still rebuild itself from its own log.
+#[test]
+fn wal_replay_is_not_refused_by_the_storage_ceiling() {
+    const RECORDS: usize = 20;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_at(dir.path());
+    for index in 0..10 {
+        assert!(write(&engine, &format!("seed{index}")).ok);
+    }
+    for index in 0..RECORDS {
+        engine
+            .wal_store
+            .append_with_sync(
+                1,
+                Command::StringSet {
+                    key: format!("replayed{index}"),
+                    value: b"v".to_vec(),
+                },
+                true,
+            )
+            .expect("the log should accept a record");
+    }
+    let readable = |engine: &TemporalEngine| {
+        (0..RECORDS)
+            .filter(|index| {
+                matches!(
+                    engine
+                        .execute(ExecuteRequest {
+                            shard_id: 1,
+                            command: Command::StringGet {
+                                key: format!("replayed{index}"),
+                            },
+                        })
+                        .response,
+                    CommandResponse::Bytes { value: Some(_) }
+                )
+            })
+            .count()
+    };
+    // The DENOMINATOR: the shard holds none of these yet, so anything readable after the replay
+    // came from the replay.
+    assert_eq!(
+        readable(&engine),
+        0,
+        "the records were appended to the log only; the shard should hold none of them yet"
+    );
+
+    engine.set_config(SetConfigRequest {
+        shard_id: 1,
+        config: Config {
+            version: 2,
+            maxmemory_bytes: Some(1),
+            ..Config::default()
+        },
+    });
+    // ...and the ceiling really is over.
+    assert_eq!(
+        write(&engine, "client").code,
+        "storage_quota_exceeded",
+        "the ceiling did not refuse a client write, so this test would prove nothing"
+    );
+
+    let replayed = engine.replay_wal_into_shard(1, 0);
+    assert!(
+        replayed.is_ok(),
+        "replay was refused: {:?} -- a shard that cannot replay cannot be loaded, and cannot \
+         reach the maintenance that would bring it back under the ceiling",
+        replayed.err()
+    );
+    assert_eq!(
+        readable(&engine),
+        RECORDS,
+        "the replay was reported as successful but did not bring every record back"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Where the limit has to be charged.
+//
+// The single-command path charges before anything else, including its own read-only fast path,
+// and the comment there gives the rule: a read served without taking the shard lock still costs
+// the shard, and a limit the cheapest reads slip past is not a limit. The batch path is not a
+// cheap read -- it is the path that carries most of the traffic in this engine -- and it charged
+// nothing.
+
+/// A batch of writes is charged against the same limit a sequence of writes is.
+#[test]
+fn a_batch_is_charged_against_the_shard_write_limit() {
+    const COMMANDS: usize = 40;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_at(dir.path());
+    engine.set_shard_quota(
+        1,
+        ShardQuotaConfig {
+            write_qps: 10,
+            write_burst: 5,
+            ..Default::default()
+        },
+    );
+
+    let batch = engine.batch_execute(BatchExecuteRequest {
+        shard_id: 1,
+        commands: (0..COMMANDS)
+            .map(|index| Command::StringSet {
+                key: format!("k{index}"),
+                value: b"v".to_vec(),
+            })
+            .collect(),
+    });
+    // The DENOMINATOR: every command was actually offered to the batch path.
+    assert!(batch.status.ok, "{}", batch.status.message);
+    assert_eq!(
+        batch.responses.len(),
+        COMMANDS,
+        "the batch did not carry every command, so counting refusals below means nothing"
+    );
+
+    let counters = engine
+        .shard_quota_counters(1)
+        .expect("the shard carries a limit");
+    // Both halves, separately. A batch that charged nothing shows zero on BOTH, and a combined
+    // total would hide which of the two was wrong.
+    assert_eq!(
+        counters.write_allowed + counters.write_refused,
+        COMMANDS as u64,
+        "the limit saw {} of {COMMANDS} batched writes (allowed {}, refused {})",
+        counters.write_allowed + counters.write_refused,
+        counters.write_allowed,
+        counters.write_refused
