@@ -4023,3 +4023,2016 @@ fn validate_downloaded_snapshot_ref(
         return Err(RaftError::SnapshotStore(format!(
             "snapshot log index mismatch: manifest={}, ref={}",
             manifest.last_log_index, snapshot_ref.last_log_index
+        )));
+    }
+    let index_entry = manifest
+        .checksums
+        .iter()
+        .find(|entry| entry.relative_path == "index.bin")
+        .ok_or_else(|| {
+            RaftError::SnapshotStore("snapshot manifest missing index.bin".to_string())
+        })?;
+    if index_bytes.len() as u64 != index_entry.byte_size {
+        return Err(RaftError::SnapshotStore(format!(
+            "snapshot index byte size mismatch: actual={}, manifest={}",
+            index_bytes.len(),
+            index_entry.byte_size
+        )));
+    }
+    let index_checksum = hex::encode(Sha256::digest(index_bytes));
+    if index_checksum != index_entry.sha256 {
+        return Err(RaftError::SnapshotStore(format!(
+            "snapshot index checksum mismatch: actual={index_checksum}, manifest={}",
+            index_entry.sha256
+        )));
+    }
+
+    let mut total_bytes = 0;
+    let mut aggregate = Sha256::new();
+    for entry in &manifest.checksums {
+        total_bytes += entry.byte_size;
+        aggregate.update(entry.sha256.as_bytes());
+    }
+    if total_bytes != snapshot_ref.byte_size {
+        return Err(RaftError::SnapshotStore(format!(
+            "snapshot byte size mismatch: manifest={}, ref={}",
+            total_bytes, snapshot_ref.byte_size
+        )));
+    }
+    let aggregate_checksum = hex::encode(aggregate.finalize());
+    if aggregate_checksum != snapshot_ref.checksum {
+        return Err(RaftError::SnapshotStore(format!(
+            "snapshot checksum mismatch: manifest={aggregate_checksum}, ref={}",
+            snapshot_ref.checksum
+        )));
+    }
+    Ok(())
+}
+
+#[derive(Clone)]
+pub struct RaftCluster {
+    inner: Arc<RwLock<RaftClusterInner>>,
+    /// The per-follower senders, built on first use and rebuilt when the peer set changes.
+    /// Shared by clone: every handle to a cluster must ring the same senders.
+    follower_pipeline: Arc<Mutex<Option<follower_pipeline::FollowerPipeline>>>,
+    /// Bumped whenever the quorum commit advances; proposers wait on it instead of counting
+    /// acknowledgements themselves.
+    commit_signal: Arc<(Mutex<u64>, Condvar)>,
+}
+
+impl std::fmt::Debug for RaftCluster {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_struct("RaftCluster").finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+struct RaftClusterInner {
+    /// Indices some proposer is waiting on; apply records their responses so each
+    /// waiter gets its own command's answer rather than whichever applied last.
+    response_waiters: BTreeSet<u64>,
+    /// Responses captured for registered waiters, taken by index.
+    pending_responses: BTreeMap<u64, CommandResponse>,
+    shard_id: ShardId,
+    leader_id: RaftNodeId,
+    nodes: BTreeMap<RaftNodeId, RaftNode>,
+    config: RaftConfig,
+    wal: Option<LocalRaftWal>,
+    logical_time_ms: u64,
+    leader_lease_deadline_ms: u64,
+    election_elapsed_tick: u64,
+    joint_membership: Option<JointConsensusMembership>,
+    latest_external_snapshot_ref: Option<RaftExternalSnapshotRef>,
+    pending_snapshots: BTreeMap<(RaftNodeId, String), PendingSnapshotChunks>,
+    read_safety_state: RaftReadSafetyRuntimeState,
+    membership_evidence: RaftMembershipRuntimeEvidence,
+    /// P1: last durable fingerprint persisted per node (see `raft_durable_fingerprint`). Only
+    /// consulted while `wal_coalesce` is on; otherwise left untouched.
+    last_durable_fingerprint: BTreeMap<RaftNodeId, u64>,
+    /// Whether a node whose durability-relevant state is unchanged skips its fdatasync.
+    ///
+    /// True everywhere but a test measuring what the skip saves.
+    wal_coalesce: bool,
+    /// Whether replication runs through the per-follower senders.
+    ///
+    /// FALSE. The senders were correctness-clean on a live cluster where the fan-out was not,
+    /// but two throughput anomalies are open -- the text-body arm lost about a third under
+    /// concurrency, and the binary-body arm amplified the leader's log writes -- so the proven
+    /// default stays until both are run down on hardware. Four tests turn it on, each of one
+    /// cluster, because each IS the pipeline's invariant and must not silently test the default.
+    follower_pipeline: bool,
+    /// Whether proposers run concurrently through those senders, rather than one at a time.
+    ///
+    /// TRUE, and only read when `follower_pipeline` is on. Serializing proposers starved the
+    /// senders of batches -- every entry paying the whole doorbell/sender/ack/commit-signal
+    /// chain alone -- which is the concurrency collapse measured on small machines. One test
+    /// takes the serialized fallback, which has to stay correct too.
+    pipeline_concurrent_propose: bool,
+    /// R4: whether a leader withholds read-index and lease reads until it has committed an entry
+    /// in its own term.
+    ///
+    /// FALSE, and it cannot simply be turned on. Raft releases this barrier by having a new
+    /// leader append a no-op entry at its own term the moment it is elected (S8). This
+    /// implementation never appends one, so `leader_has_committed_current_term` is satisfiable
+    /// only by a CLIENT write landing at the new term -- and enabling the barrier would reject
+    /// every leader-served read from the end of an election until that write commits,
+    /// indefinitely on an idle cluster. Appending the election no-op is a new `Command` variant
+    /// and so a wire-format change for `#[serde(tag = "kind")]` peers.
+    ///
+    /// The same missing entry is what `overlap_leader_barrier` below waits on. One test turns
+    /// this on, of the cluster it built, to hold the property for when the entry exists.
+    leader_ready_barrier: bool,
+    /// Whether a leader takes its durability barrier alongside replication rather than after.
+    ///
+    /// FALSE, and only a test that runs the path sets it. It relies on the commit index being
+    /// recoverable, which holds once every leader commits an entry of its own term on taking
+    /// office -- and this implementation never appends that entry, as the note on
+    /// `raft_leader_ready_barrier_on` says of the same missing mechanism. Adding it is a new
+    /// `Command` variant, and so a wire-format change; until then this stays off, and being a
+    /// field rather than a variable is what keeps a deployment from reaching it.
+    overlap_leader_barrier: bool,
+    /// Whether a snapshot carries an opaque state image instead of the replayable entries.
+    ///
+    /// True everywhere but a test about entry chunking, for which one image is a single unit and
+    /// therefore not the thing under test.
+    snapshot_state_image: bool,
+    /// P2: serialize proposes into the log in order. Held across the whole
+    /// append+replicate+commit critical section, so index N commits before N+1 begins.
+    propose_serialize: Arc<Mutex<()>>,
+    /// P3/P6: which node THIS process actually is, when the deployed runtime declares it.
+    /// `None` for the in-process test cluster, which genuinely hosts every node -- so both of
+    /// the local-only narrowings key off this and are inert there.
+    local_node_id: Option<RaftNodeId>,
+    /// P4: the thread currently owing durability barriers instead of taking them, set for the
+    /// span of one propose. Thread-scoped ON PURPOSE. The propose path releases the cluster
+    /// write lock for its network phase, so another path can persist inside this window -- and
+    /// one of them is the vote grant, which must be durable BEFORE it is answered or a crash
+    /// lets the same term be voted twice and elect two leaders. Only the thread that opened the
+    /// deferral defers; every other path takes its real barrier as before.
+    persist_deferred_owner: Option<std::thread::ThreadId>,
+    /// P4: whether anything was actually deferred, so a propose that persisted nothing flushes
+    /// nothing.
+    persist_dirty: bool,
+    /// Bumped on every accepted AppendEntries. A follower's timer loop watches it to
+    /// tell "the leader is quiet" from "the leader is fine"; nothing else in the data
+    /// raft path observes leader liveness at all.
+    leader_contact_epoch: u64,
+    /// True for the in-process cluster model, where `tick_election` may promote any
+    /// node from local shadow state. The production runtime clears it: there, an
+    /// election has to be won over the wire, so a local promotion of a *remote* node
+    /// would just make this process disagree with the rest of the group.
+    local_shadow_election: bool,
+}
+
+impl RaftCluster {
+    /// Tell the cluster which node THIS process actually is. Set by the deployed production
+    /// runtime, which hosts exactly one node per process; left unset by the in-process test
+    /// cluster, which hosts every node. Everything scoped to the local node keys off this, so
+    /// leaving it unset preserves whole-cluster behaviour exactly.
+    pub fn set_local_node_id(&self, node_id: RaftNodeId) {
+        let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+        inner.local_node_id = Some(node_id);
+    }
+
+    /// Local single-shard Raft model for unit tests and validation harnesses.
+    ///
+    /// Production runtime/deployment paths must use the distributed production
+    /// Raft runtime and are rejected by readiness if they select this local model.
+    pub fn new_single_shard(
+        shard_id: ShardId,
+        node_ids: impl IntoIterator<Item = RaftNodeId>,
+    ) -> Self {
+        Self::new_single_shard_with_config(shard_id, node_ids, RaftConfig::default())
+            .expect("default raft config must be valid")
+    }
+
+    /// Local single-shard Raft model with explicit config for tests/harnesses.
+    pub fn new_single_shard_with_config(
+        shard_id: ShardId,
+        node_ids: impl IntoIterator<Item = RaftNodeId>,
+        config: RaftConfig,
+    ) -> Result<Self, RaftError> {
+        config
+            .validate()
+            .map_err(|err| RaftError::InvalidConfig(err.to_string()))?;
+        let mut nodes = BTreeMap::new();
+        let mut iter = node_ids.into_iter();
+        let leader_id = iter.next().unwrap_or(1);
+        nodes.insert(leader_id, new_node(leader_id, RaftRole::Leader, shard_id));
+        for node_id in iter {
+            nodes.insert(node_id, new_node(node_id, RaftRole::Follower, shard_id));
+        }
+        let leader_lease_deadline_ms = initial_leader_lease_deadline_ms(&config);
+        Ok(Self {
+            follower_pipeline: Arc::new(Mutex::new(None)),
+            commit_signal: Arc::new((Mutex::new(0), Condvar::new())),
+            inner: Arc::new(RwLock::new(RaftClusterInner {
+                response_waiters: BTreeSet::new(),
+                pending_responses: BTreeMap::new(),
+                shard_id,
+                leader_id,
+                nodes,
+                config,
+                wal: None,
+                logical_time_ms: 0,
+                leader_lease_deadline_ms,
+                election_elapsed_tick: 0,
+                joint_membership: None,
+                latest_external_snapshot_ref: None,
+                pending_snapshots: BTreeMap::new(),
+                read_safety_state: RaftReadSafetyRuntimeState::default(),
+                membership_evidence: RaftMembershipRuntimeEvidence::default(),
+                last_durable_fingerprint: BTreeMap::new(),
+                wal_coalesce: true,
+                follower_pipeline: false,
+                pipeline_concurrent_propose: true,
+                leader_ready_barrier: false,
+                overlap_leader_barrier: false,
+                snapshot_state_image: true,
+                propose_serialize: Arc::new(Mutex::new(())),
+                local_node_id: None,
+                persist_deferred_owner: None,
+                persist_dirty: false,
+                leader_contact_epoch: 0,
+                local_shadow_election: true,
+            })),
+        })
+    }
+
+    /// WAL-backed local Raft fixture for durability tests and harnesses only.
+    /// Persist every node's WAL record on every call, skipping nothing, for a test measuring
+    /// what the fingerprint skip saves. Scoped to this cluster: `TS_RAFT_WAL_COALESCE` used to
+    /// turn it off for every cluster in the process.
+    /// Whether replication runs through the per-follower senders. Read on the propose path and
+    /// by the production runtime's heartbeat, which must not start a second sender.
+    pub(crate) fn follower_pipeline_on(&self) -> bool {
+        self.inner
+            .read()
+            .expect("raft cluster lock poisoned")
+            .follower_pipeline
+    }
+
+    /// Replicate through the per-follower senders, for the tests that assert their invariant.
+    #[cfg(test)]
+    pub(crate) fn use_follower_pipeline_for_test(&self) {
+        self.inner
+            .write()
+            .expect("raft cluster lock poisoned")
+            .follower_pipeline = true;
+    }
+
+    /// Take the serialized fallback -- one propose at a time through the same senders -- for the
+    /// test that keeps it correct.
+    #[cfg(test)]
+    pub(crate) fn propose_one_at_a_time_for_test(&self) {
+        self.inner
+            .write()
+            .expect("raft cluster lock poisoned")
+            .pipeline_concurrent_propose = false;
+    }
+
+    /// Withhold leader-served reads until the leader has committed in its own term, for the test
+    /// that holds that property. Scoped to this cluster; see the field for why it is off.
+    #[cfg(test)]
+    pub(crate) fn withhold_reads_until_leader_ready_for_test(&self) {
+        self.inner
+            .write()
+            .expect("raft cluster lock poisoned")
+            .leader_ready_barrier = true;
+    }
+
+    /// Overlap the leader's durability barrier with replication, for the test that runs that
+    /// path. Scoped to this cluster; see the field for why it is not on anywhere else.
+    #[cfg(test)]
+    pub(crate) fn overlap_leader_barrier_for_test(&self) {
+        self.inner
+            .write()
+            .expect("raft cluster lock poisoned")
+            .overlap_leader_barrier = true;
+    }
+
+    /// Take entry-carrying snapshots rather than state images, for a test about how entries
+    /// chunk. Scoped to this cluster.
+    #[cfg(test)]
+    pub(crate) fn snapshot_carries_entries_for_test(&self) {
+        self.inner
+            .write()
+            .expect("raft cluster lock poisoned")
+            .snapshot_state_image = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn persist_every_wal_record_for_test(&self) {
+        self.inner
+            .write()
+            .expect("raft cluster lock poisoned")
+            .wal_coalesce = false;
+    }
+
+    pub fn new_single_shard_with_wal(
+        root: impl AsRef<Path>,
+        shard_id: ShardId,
+        node_ids: impl IntoIterator<Item = RaftNodeId>,
+        config: RaftConfig,
+    ) -> Result<Self, RaftError> {
+        let cluster = Self::new_single_shard_with_config(shard_id, node_ids, config)?;
+        {
+            let mut inner = cluster.inner.write().expect("raft cluster lock poisoned");
+            inner.wal = Some(LocalRaftWal::new(root.as_ref().to_path_buf()));
+            inner.persist_configured_wal()?;
+        }
+        Ok(cluster)
+    }
+
+    pub fn restore_single_shard_from_wal(
+        root: impl AsRef<Path>,
+        shard_id: ShardId,
+        node_ids: impl IntoIterator<Item = RaftNodeId>,
+        config: RaftConfig,
+    ) -> Result<Self, RaftError> {
+        config
+            .validate()
+            .map_err(|err| RaftError::InvalidConfig(err.to_string()))?;
+        let wal = LocalRaftWal::new(root.as_ref().to_path_buf());
+        let mut nodes = BTreeMap::new();
+        let mut leader_id = None;
+        let mut joint_membership = None;
+        let mut latest_external_snapshot_ref = None;
+        let mut read_safety_state = RaftReadSafetyRuntimeState::default();
+        let mut membership_evidence = RaftMembershipRuntimeEvidence::default();
+        for node_id in node_ids {
+            let record = wal
+                .load_node(shard_id, node_id)
+                .map_err(|err| RaftError::Wal(err.to_string()))?;
+            let mut node = if let Some(record) = record {
+                validate_raft_apply_snapshot_fence(&record)?;
+                validate_raft_storage_apply_fence(&record)?;
+                let mut node = new_node(
+                    node_id,
+                    if record.membership.leader_id == node_id {
+                        RaftRole::Leader
+                    } else {
+                        RaftRole::Follower
+                    },
+                    shard_id,
+                );
+                node.replica_role = record.replica_role;
+                node.current_term = record.hard_state.current_term;
+                node.voted_for = record.hard_state.voted_for;
+                node.commit_index = record.hard_state.commit_index;
+                node.pipeline_state = record.pipeline_state;
+                if let Some(snapshot) = record.installed_snapshot.clone() {
+                    if node.replica_role.can_serve_data() {
+                        install_snapshot_state(&mut node, snapshot);
+                    } else {
+                        node.current_term = node.current_term.max(snapshot.last_included_term);
+                        node.commit_index = node.commit_index.max(snapshot.last_included_index);
+                        node.applied_index = snapshot.last_included_index;
+                        node.max_applied_index = node.max_applied_index.max(snapshot.last_included_index);
+                        node.installed_snapshot = Some(snapshot);
+                    }
+                }
+                node.log = record.entries;
+                if node.replica_role.can_serve_data() {
+                    apply_committed(&mut node);
+                }
+                leader_id.get_or_insert(record.membership.leader_id);
+                if joint_membership.is_none() {
+                    joint_membership = record.joint_membership;
+                }
+                if latest_external_snapshot_ref.is_none() {
+                    latest_external_snapshot_ref = record.latest_external_snapshot_ref;
+                }
+                read_safety_state = record.read_safety_state;
+                merge_membership_evidence(&mut membership_evidence, &record.membership_evidence);
+                node
+            } else {
+                new_node(node_id, RaftRole::Follower, shard_id)
+            };
+            if leader_id == Some(node_id) {
+                node.role = RaftRole::Leader;
+            }
+            nodes.insert(node_id, node);
+        }
+        let leader_id = leader_id
+            .or_else(|| nodes.keys().next().copied())
+            .unwrap_or(1);
+        if let Some(leader) = nodes.get_mut(&leader_id) {
+            leader.role = RaftRole::Leader;
+        }
+        if joint_membership.is_some() {
+            membership_evidence.pending_joint_consensus_restore_count = membership_evidence
+                .pending_joint_consensus_restore_count
+                .saturating_add(1);
+        }
+        refresh_all_pipeline_states(&mut nodes, leader_id, None, &config);
+        let leader_lease_deadline_ms = initial_leader_lease_deadline_ms(&config);
+        Ok(Self {
+            follower_pipeline: Arc::new(Mutex::new(None)),
+            commit_signal: Arc::new((Mutex::new(0), Condvar::new())),
+            inner: Arc::new(RwLock::new(RaftClusterInner {
+                response_waiters: BTreeSet::new(),
+                pending_responses: BTreeMap::new(),
+                shard_id,
+                leader_id,
+                nodes,
+                config,
+                wal: Some(wal),
+                logical_time_ms: 0,
+                leader_lease_deadline_ms,
+                election_elapsed_tick: 0,
+                joint_membership,
+                latest_external_snapshot_ref,
+                pending_snapshots: BTreeMap::new(),
+                read_safety_state,
+                membership_evidence,
+                last_durable_fingerprint: BTreeMap::new(),
+                wal_coalesce: true,
+                follower_pipeline: false,
+                pipeline_concurrent_propose: true,
+                leader_ready_barrier: false,
+                overlap_leader_barrier: false,
+                snapshot_state_image: true,
+                propose_serialize: Arc::new(Mutex::new(())),
+                local_node_id: None,
+                persist_deferred_owner: None,
+                persist_dirty: false,
+                leader_contact_epoch: 0,
+                local_shadow_election: true,
+            })),
+        })
+    }
+
+    /// Take the barriers a set of staged appends owes, holding NO cluster lock.
+    ///
+    /// The lock is needed to decide WHAT to write and to keep those writes ordered, not to make
+    /// them durable: an fsync covers every byte already in the file whoever wrote it. Holding a
+    /// lock here would block the next proposer for the length of an fsync and serialise exactly
+    /// the writers this is meant to let share a barrier.
+    fn finish_staged_unlocked(
+        &self,
+        staged: Vec<local_wal::StagedWalAppend>,
+    ) -> Result<(), RaftError> {
+        if staged.is_empty() {
+            return Ok(());
+        }
+        let wal = {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            inner.wal.clone()
+        };
+        let Some(wal) = wal else {
+            return Ok(());
+        };
+        for append in staged {
+            wal.finish_staged(append)
+                .map_err(|err| RaftError::Wal(err.to_string()))?;
+        }
+        Ok(())
+    }
+
+    pub fn propose(&self, command: Command) -> Result<CommandResponse, RaftError> {
+        let limit = self
+            .inner
+            .read()
+            .expect("raft cluster lock poisoned")
+            .config
+            .max_memory_replicate_log_bytes;
+        let chunks = match split_command_for_raft_limit(command, limit) {
+            Ok(chunks) => chunks,
+            Err(err @ RaftError::LogEntryTooLarge { .. }) => {
+                let _ = self.record_leader_oversized_rejection();
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
+        // Defer the writes, then flush them with no lock held. `propose_one` takes the cluster
+        // write lock for its whole body, barrier included, so proposers could never reach the
+        // barrier together and each paid for one of its own -- measured flat at 1.0 barriers per
+        // write from 1 to 16 concurrent writers. Deferring does not reduce how many writes there
+        // are; it moves the barrier out from under the lock so writers can share one. A command
+        // split across chunks takes one barrier for the whole command: no chunk is acknowledged
+        // until every chunk is written and flushed.
+        //
+        // The deferral is a per-thread claim recorded in SHARED state, so the span from opening
+        // it to staging it must not interleave with another proposer's. Unserialised, two
+        // proposers race: A marks the state dirty, B opens its own deferral and clears that flag,
+        // and A then stages nothing and returns success for a write no barrier ever covered. The
+        // replicated path already holds this same lock for this same span. It costs no throughput
+        // here -- `propose_one` serialises on the cluster write lock anyway -- and it is released
+        // before the barrier, so the flushes still coalesce.
+        let local_propose_gate = {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            inner.propose_serialize.clone()
+        };
+        let local_propose_guard = local_propose_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.inner
+            .write()
+            .expect("raft cluster lock poisoned")
+            .begin_deferred_persist();
+        let mut outcome = Ok(CommandResponse::Empty);
+        for chunk in chunks {
+            match self.propose_one(chunk) {
+                Ok(response) => outcome = Ok(response),
+                Err(err) => {
+                    outcome = Err(err);
+                    break;
+                }
+            }
+        }
+        let staged = self
+            .inner
+            .write()
+            .expect("raft cluster lock poisoned")
+            .stage_deferred_persist();
+        // The writes are done and ordered; the barrier needs no ordering, so release before it.
+        drop(local_propose_guard);
+        // Flush on the failure path too: a propose that failed part-way still owes a barrier for
+        // whatever it already wrote, and nothing is returned to the caller before it is taken.
+        let flushed = match staged {
+            Ok(staged) => self.finish_staged_unlocked(staged),
+            Err(err) => Err(err),
+        };
+        match (outcome, flushed) {
+            (Ok(response), Ok(())) => Ok(response),
+            (Ok(_), Err(err)) => Err(err),
+            (Err(err), _) => Err(err),
+        }
+    }
+
+    fn propose_one(&self, command: Command) -> Result<CommandResponse, RaftError> {
+        let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+        inner.ensure_live_leader()?;
+        let entry_bytes = command_size_bytes(&command);
+        if entry_bytes > inner.config.max_memory_replicate_log_bytes {
+            let leader_id = inner.leader_id;
+            if let Some(leader) = inner.nodes.get_mut(&leader_id) {
+                leader.pipeline_state.oversized_log_rejections = leader
+                    .pipeline_state
+                    .oversized_log_rejections
+                    .saturating_add(1);
+                leader.pipeline_state.memory_backpressure_rejections = leader
+                    .pipeline_state
+                    .memory_backpressure_rejections
+                    .saturating_add(1);
+            }
+            inner.persist_configured_wal()?;
+            return Err(RaftError::LogEntryTooLarge {
+                bytes: entry_bytes,
+                limit: inner.config.max_memory_replicate_log_bytes,
+            });
+        }
+        if let Some((live, required)) = inner.joint_majority_failure() {
+            return Err(RaftError::NoMajority { live, required });
+        }
+        let required = inner.required_majority();
+        let live = inner.live_quorum_participants();
+        if live < required {
+            return Err(RaftError::NoMajority { live, required });
+        }
+        if !inner.leader_lease_valid() {
+            return Err(RaftError::LeaderUnavailable);
+        }
+
+        let shard_id = inner.shard_id;
+        let leader_id = inner.leader_id;
+        let leader = inner
+            .nodes
+            .get(&leader_id)
+            .filter(|node| node.alive && node.role == RaftRole::Leader)
+            .ok_or(RaftError::LeaderUnavailable)?;
+        let entry = RaftLogEntry {
+            leader_time_ms: current_time_ms(),
+            term: leader.current_term,
+            index: node_next_log_index(leader),
+            shard_id,
+            command,
+        };
+
+        let mut replicated = 0;
+        for node in inner.nodes.values_mut().filter(|node| node.alive) {
+            append_entry(node, entry.clone());
+            if node.replica_role.participates_in_quorum() {
+                replicated += 1;
+            }
+        }
+        if replicated < required || inner.joint_majority_failure().is_some() {
+            return Err(RaftError::NoMajority {
+                live: replicated,
+                required,
+            });
+        }
+
+        let mut leader_response = CommandResponse::Empty;
+        // P6: every `RaftNode` owns a `TemporalEngine`, so applying a committed entry into every
+        // node held by this process drives one engine WAL -- and one durability barrier -- per
+        // node. In a deployed process the peers are shadows: the real ones apply in their own
+        // processes off AppendEntries, so these applies are pure cost. Apply only into our own
+        // engine. Log and commit bookkeeping still advance for every node; only the apply and
+        // its barrier are skipped. Read before the mutable borrow below.
+        let apply_local_only = inner.local_node_id;
+        for node in inner.nodes.values_mut().filter(|node| node.alive) {
+            node.commit_index = entry.index;
+            if !node.replica_role.can_serve_data() {
+                continue;
+            }
+            if let Some(local) = apply_local_only {
+                if node.id != local {
+                    continue;
+                }
+            }
+            if let Some(response) = apply_committed(node) {
+                if node.id == leader_id {
+                    leader_response = response;
+                }
+            }
+        }
+        if inner
+            .nodes
+            .values()
+            .any(|node| node.pipeline_state.transfer_leader_target)
+        {
+            inner.membership_evidence.leader_transfer_write_count = inner
+                .membership_evidence
+                .leader_transfer_write_count
+                .saturating_add(1);
+            inner
+                .membership_evidence
+                .leader_transfer_exact_once_commit_count = inner
+                .membership_evidence
+                .leader_transfer_exact_once_commit_count
+                .saturating_add(1);
+            if !inner
+                .membership_evidence
+                .leader_transfer_exact_once_commit_ids
+                .contains(&entry.index)
+            {
+                inner
+                    .membership_evidence
+                    .leader_transfer_exact_once_commit_ids
+                    .push(entry.index);
+            }
+        }
+        let config = inner.config.clone();
+        let local_node_id_for_refresh = inner.local_node_id;
+        refresh_all_pipeline_states(&mut inner.nodes, leader_id, local_node_id_for_refresh, &config);
+        inner.renew_leader_lease();
+        inner.persist_configured_wal()?;
+        Ok(leader_response)
+    }
+
+    pub fn propose_distributed<T>(
+        &self,
+        command: Command,
+        transport: &T,
+    ) -> Result<CommandResponse, RaftError>
+    where
+        T: RaftTransport + Clone + Send + 'static,
+    {
+        let limit = self
+            .inner
+            .read()
+            .expect("raft cluster lock poisoned")
+            .config
+            .max_memory_replicate_log_bytes;
+        let chunks = match split_command_for_raft_limit(command, limit) {
+            Ok(chunks) => chunks,
+            Err(err @ RaftError::LogEntryTooLarge { .. }) => {
+                let _ = self.record_leader_oversized_rejection();
+                return Err(err);
+            }
+            Err(err) => return Err(err),
+        };
+        let mut last_response = CommandResponse::Empty;
+        for chunk in chunks {
+            last_response = self.propose_distributed_one(chunk, transport)?;
+        }
+        Ok(last_response)
+    }
+
+    fn record_leader_oversized_rejection(&self) -> Result<(), RaftError> {
+        let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+        let leader_id = inner.leader_id;
+        if let Some(leader) = inner.nodes.get_mut(&leader_id) {
+            leader.pipeline_state.oversized_log_rejections = leader
+                .pipeline_state
+                .oversized_log_rejections
+                .saturating_add(1);
+            leader.pipeline_state.memory_backpressure_rejections = leader
+                .pipeline_state
+                .memory_backpressure_rejections
+                .saturating_add(1);
+        }
+        inner.persist_configured_wal()
+    }
+
+    fn propose_distributed_one<T>(
+        &self,
+        command: Command,
+        transport: &T,
+    ) -> Result<CommandResponse, RaftError>
+    where
+        T: RaftTransport + Clone + Send + 'static,
+    {
+        // With the senders on, proposers skip the serialize gate entirely: order to any one
+        // follower is that follower's single sender thread, and entry order is the write
+        // lock's index assignment. Serializing proposers here starved the senders of batches --
+        // every entry paid the whole doorbell -> sender -> ack -> commit-signal chain alone,
+        // which is exactly the concurrency collapse measured on small machines. =0 falls back
+        // to one propose at a time through the same senders.
+        let (pipeline, concurrent) = {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            (inner.follower_pipeline, inner.pipeline_concurrent_propose)
+        };
+        if pipeline && concurrent {
+            return self.propose_pipelined_concurrent(command, transport);
+        }
+        // P2: serialize proposes into the log in order. Concurrent proposers otherwise append
+        // under the write lock (sequential indices) but release it before the async network phase,
+        // so their AppendEntries race and can reach a follower out of order -> `prev_log` mismatch
+        // -> reject -> a full-deadline stall. Holding this per-cluster lock across the whole
+        // append+replicate+commit critical section forces index N to commit before N+1 begins.
+        let propose_gate = {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            inner.propose_serialize.clone()
+        };
+        let _propose_guard = propose_gate
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // P4: the propose lock makes us the only proposer, so nested persists can record that a
+        // barrier is owed and let one flush below cover the final state -- before the ack. That
+        // single owner is what the lock buys; a shared deferral among several proposers would
+        // have none, which is why the deferral lives inside the lock rather than beside it.
+        self.inner
+            .write()
+            .expect("raft cluster lock poisoned")
+            .begin_deferred_persist();
+        let mut entry_barrier = None;
+        // The senders replicate when the pipeline is on; this thread then appends, rings them,
+        // and waits on the quorum-commit signal instead of sending to any peer itself. Branching
+        // here keeps both paths inside the same deferral bookkeeping: the caller-side staging
+        // and barrier-join below are what propose_pipelined leaves for its caller, exactly as
+        // the fan-out body does.
+        let outcome = if pipeline {
+            self.propose_pipelined(command, transport, &mut entry_barrier)
+        } else {
+            self.propose_distributed_one_locked(command, transport, &mut entry_barrier)
+        };
+        // Write what the deferral owes while the propose lock still orders it. Records carry the
+        // log, so an older record landing after a newer one would regress the log on recovery --
+        // the write must stay ordered.
+        //
+        // With the barrier overlapped, the entry is already written and being flushed, and what
+        // is owed here is only the commit index -- which is recoverable and so is left for the
+        // next record to carry rather than paid for on this write's critical path.
+        let staged = if entry_barrier.is_some() {
+            self.inner
+                .write()
+                .expect("raft cluster lock poisoned")
+                .discard_deferred_persist();
+            Ok(Vec::new())
+        } else {
+            self.inner
+                .write()
+                .expect("raft cluster lock poisoned")
+                .stage_deferred_persist()
+        };
+        // The barrier needs no such ordering: an fsync makes every byte already in the file
+        // durable whoever wrote it. Releasing the lock here is what finally gives group commit a
+        // queue to coalesce -- while the barrier was taken under this lock only one writer ever
+        // reached it, and barriers per write stayed flat however many writers there were.
+        // Nothing is acknowledged before its barrier: the flush still happens below, on the
+        // failure path as well as the success path.
+        drop(_propose_guard);
+        let mut flushed = match staged {
+            Ok(staged) => self.finish_staged_unlocked(staged),
+            Err(err) => Err(err),
+        };
+        // Join the overlapped barrier before acknowledging: the entry has to be durable here, it
+        // just did not have to wait for replication to start becoming so.
+        if let Some(handle) = entry_barrier {
+            let joined = handle
+                .join()
+                .unwrap_or_else(|_| Err(RaftError::Wal("barrier thread panicked".to_string())));
+            if flushed.is_ok() {
+                flushed = joined;
+            }
+        }
+        // Never ack a write whose barrier failed: a flush error wins over a successful propose.
+        match (outcome, flushed) {
+            (Ok(response), Ok(())) => Ok(response),
+            (Ok(_), Err(err)) => Err(err),
+            (Err(err), _) => Err(err),
+        }
+    }
+
+    /// Propose through the per-follower senders WITHOUT the propose-serialize gate.
+    ///
+    /// The gate exists for the fan-out, where concurrent proposers each send their own
+    /// AppendEntries and the network can reorder them. The senders make it not just
+    /// unnecessary but harmful: with one sender thread per follower carrying every append in
+    /// log order, serializing proposers guarantees the senders never see more than one new
+    /// entry at a time, so each propose pays the whole doorbell -> sender -> ack ->
+    /// commit-signal chain by itself. Appending concurrently under the write lock keeps index
+    /// order, the senders batch whatever has accumulated, and one wake chain carries every
+    /// waiting proposer.
+    ///
+    /// Durability: the entry's record bytes are staged under the write lock (which orders
+    /// them) and the barrier is taken on a side thread while the senders replicate, then
+    /// joined before the ack -- nothing is acknowledged before its bytes are durable, and
+    /// concurrent proposers share barriers through the WAL flush gate. The commit index stays
+    /// recoverable and is never waited on. No deferral bookkeeping: that machinery assumes one
+    /// owning proposer, which is the constraint this path removes.
+    fn propose_pipelined_concurrent<T>(
+        &self,
+        command: Command,
+        transport: &T,
+    ) -> Result<CommandResponse, RaftError>
+    where
+        T: RaftTransport + Clone + Send + 'static,
+    {
+        self.ensure_follower_pipeline(transport);
+        let (entry_index, staged) = {
+            let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+            inner.ensure_live_leader()?;
+            let entry_bytes = command_size_bytes(&command);
+            if entry_bytes > inner.config.max_memory_replicate_log_bytes {
+                let leader_id = inner.leader_id;
+                if let Some(leader) = inner.nodes.get_mut(&leader_id) {
+                    leader.pipeline_state.oversized_log_rejections = leader
+                        .pipeline_state
+                        .oversized_log_rejections
+                        .saturating_add(1);
+                    leader.pipeline_state.memory_backpressure_rejections = leader
+                        .pipeline_state
+                        .memory_backpressure_rejections
+                        .saturating_add(1);
+                }
+                inner.persist_configured_wal()?;
+                return Err(RaftError::LogEntryTooLarge {
+                    bytes: entry_bytes,
+                    limit: inner.config.max_memory_replicate_log_bytes,
+                });
+            }
+            if let Some((live, required)) = inner.joint_majority_failure() {
+                return Err(RaftError::NoMajority { live, required });
+            }
+            let required = inner.required_majority();
+            let live = inner.live_quorum_participants();
+            if live < required {
+                return Err(RaftError::NoMajority { live, required });
+            }
+            if !inner.leader_lease_valid() {
+                return Err(RaftError::LeaderUnavailable);
+            }
+            let leader_id = inner.leader_id;
+            let shard_id = inner.shard_id;
+            let leader = inner
+                .nodes
+                .get(&leader_id)
+                .filter(|node| node.alive && node.role == RaftRole::Leader)
+                .ok_or(RaftError::LeaderUnavailable)?;
+            let entry = RaftLogEntry {
+                leader_time_ms: current_time_ms(),
+                term: leader.current_term,
+                index: node_next_log_index(leader),
+                shard_id,
+                command,
+            };
+            let index = entry.index;
+            let leader = inner
+                .nodes
+                .get_mut(&leader_id)
+                .ok_or(RaftError::LeaderUnavailable)?;
+            append_entry(leader, entry);
+            inner.response_waiters.insert(index);
+            // Write the record's bytes while the lock orders them; the barrier happens below,
+            // off the lock, shared with every concurrent proposer through the flush gate.
+            let staged = inner.stage_configured_wal()?;
+            (index, staged)
+        };
+
+        // The leader's disk wait runs alongside the followers' replication, exactly like the
+        // fan-out's overlapped barrier -- joined before the ack, never skipped.
+        let entry_barrier = if staged.is_empty() {
+            None
+        } else {
+            let cluster = self.clone();
+            Some(thread::spawn(move || cluster.finish_staged_unlocked(staged)))
+        };
+
+        self.ring_replication();
+
+        let deadline_ms = {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            let configured = inner.config.replication_deadline_ms;
+            if configured == 0 {
+                default_replication_deadline_ms()
+            } else {
+                configured
+            }
+        };
+        let committed =
+            self.wait_for_quorum_commit(entry_index, Duration::from_millis(deadline_ms));
+
+        let outcome = {
+            let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+            inner.response_waiters.remove(&entry_index);
+            if !committed {
+                inner.pending_responses.remove(&entry_index);
+                let required = inner.required_majority();
+                let live = inner.live_quorum_participants();
+                // The entry stays in the log and may commit later; the caller only learns that
+                // it did not commit within the deadline, which is all a replication deadline
+                // ever meant.
+                Err(RaftError::NoMajority { live, required })
+            } else {
+                Ok(inner
+                    .pending_responses
+                    .remove(&entry_index)
+                    .unwrap_or(CommandResponse::Empty))
+            }
+        };
+
+        // Never ack a write whose barrier failed, and never report a flush error as success.
+        let flushed = match entry_barrier {
+            Some(handle) => handle
+                .join()
+                .unwrap_or_else(|_| Err(RaftError::Wal("barrier thread panicked".to_string()))),
+            None => Ok(()),
+        };
+        match (outcome, flushed) {
+            (Ok(response), Ok(())) => Ok(response),
+            (Ok(_), Err(err)) => Err(err),
+            (Err(err), _) => Err(err),
+        }
+    }
+
+    /// Propose through the per-follower senders: append under the lock, ring the senders,
+    /// wait for the quorum commit signal. This path never sends to a peer itself -- one sender
+    /// per follower does, which is what keeps that follower's appends in order -- and the commit
+    /// index reaches followers on their next append or heartbeat instead of a dedicated second
+    /// round trip per propose.
+    fn propose_pipelined<T>(
+        &self,
+        command: Command,
+        transport: &T,
+        entry_barrier: &mut Option<thread::JoinHandle<Result<(), RaftError>>>,
+    ) -> Result<CommandResponse, RaftError>
+    where
+        T: RaftTransport + Clone + Send + 'static,
+    {
+        self.ensure_follower_pipeline(transport);
+        let entry_index = {
+            let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+            inner.ensure_live_leader()?;
+            let entry_bytes = command_size_bytes(&command);
+            if entry_bytes > inner.config.max_memory_replicate_log_bytes {
+                let leader_id = inner.leader_id;
+                if let Some(leader) = inner.nodes.get_mut(&leader_id) {
+                    leader.pipeline_state.oversized_log_rejections = leader
+                        .pipeline_state
+                        .oversized_log_rejections
+                        .saturating_add(1);
+                    leader.pipeline_state.memory_backpressure_rejections = leader
+                        .pipeline_state
+                        .memory_backpressure_rejections
+                        .saturating_add(1);
+                }
+                inner.persist_configured_wal()?;
+                return Err(RaftError::LogEntryTooLarge {
+                    bytes: entry_bytes,
+                    limit: inner.config.max_memory_replicate_log_bytes,
+                });
+            }
+            if let Some((live, required)) = inner.joint_majority_failure() {
+                return Err(RaftError::NoMajority { live, required });
+            }
+            let required = inner.required_majority();
+            let live = inner.live_quorum_participants();
+            if live < required {
+                return Err(RaftError::NoMajority { live, required });
+            }
+            if !inner.leader_lease_valid() {
+                return Err(RaftError::LeaderUnavailable);
+            }
+            let leader_id = inner.leader_id;
+            let shard_id = inner.shard_id;
+            let leader = inner
+                .nodes
+                .get(&leader_id)
+                .filter(|node| node.alive && node.role == RaftRole::Leader)
+                .ok_or(RaftError::LeaderUnavailable)?;
+            let entry = RaftLogEntry {
+                leader_time_ms: current_time_ms(),
+                term: leader.current_term,
+                index: node_next_log_index(leader),
+                shard_id,
+                command,
+            };
+            let index = entry.index;
+            let leader = inner
+                .nodes
+                .get_mut(&leader_id)
+                .ok_or(RaftError::LeaderUnavailable)?;
+            append_entry(leader, entry);
+            inner.response_waiters.insert(index);
+            index
+        };
+
+        // The entry is in the log. Write it and start its barrier NOW, so the leader's disk
+        // wait runs alongside the followers' instead of after them. Unchanged from the fan-out
+        // path: the commit index is recoverable and never has to be durable before the ack.
+        if self
+            .inner
+            .read()
+            .expect("raft cluster lock poisoned")
+            .overlap_leader_barrier
+        {
+            let staged = self
+                .inner
+                .write()
+                .expect("raft cluster lock poisoned")
+                .stage_deferred_persist();
+            if let Ok(staged) = staged {
+                if !staged.is_empty() {
+                    let cluster = self.clone();
+                    *entry_barrier =
+                        Some(thread::spawn(move || cluster.finish_staged_unlocked(staged)));
+                }
+            }
+            self.inner
+                .write()
+                .expect("raft cluster lock poisoned")
+                .begin_deferred_persist();
+        }
+
+        self.ring_replication();
+
+        let deadline_ms = {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            let configured = inner.config.replication_deadline_ms;
+            if configured == 0 {
+                default_replication_deadline_ms()
+            } else {
+                configured
+            }
+        };
+        let committed =
+            self.wait_for_quorum_commit(entry_index, Duration::from_millis(deadline_ms));
+
+        let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+        inner.response_waiters.remove(&entry_index);
+        if !committed {
+            inner.pending_responses.remove(&entry_index);
+            let required = inner.required_majority();
+            let live = inner.live_quorum_participants();
+            // The entry stays in the log and may commit later; the caller only learns that it
+            // did not commit within the deadline, which is all a replication deadline ever meant.
+            return Err(RaftError::NoMajority { live, required });
+        }
+        let response = inner
+            .pending_responses
+            .remove(&entry_index)
+            .unwrap_or(CommandResponse::Empty);
+        // No persist here: the commit advance already persisted the record that carries the new
+        // commit index, and the outer deferral flushes what this propose itself owes. A persist
+        // here charged every proposer a duplicate barrier.
+        Ok(response)
+    }
+
+    fn propose_distributed_one_locked<T>(
+        &self,
+        command: Command,
+        transport: &T,
+        entry_barrier: &mut Option<thread::JoinHandle<Result<(), RaftError>>>,
+    ) -> Result<CommandResponse, RaftError>
+    where
+        T: RaftTransport + Clone + Send + 'static,
+    {
+        let (entry, leader_id, target_ids, required) = {
+            let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+            inner.ensure_live_leader()?;
+            let entry_bytes = command_size_bytes(&command);
+            if entry_bytes > inner.config.max_memory_replicate_log_bytes {
+                let leader_id = inner.leader_id;
+                if let Some(leader) = inner.nodes.get_mut(&leader_id) {
+                    leader.pipeline_state.oversized_log_rejections = leader
+                        .pipeline_state
+                        .oversized_log_rejections
+                        .saturating_add(1);
+                    leader.pipeline_state.memory_backpressure_rejections = leader
+                        .pipeline_state
+                        .memory_backpressure_rejections
+                        .saturating_add(1);
+                }
+                inner.persist_configured_wal()?;
+                return Err(RaftError::LogEntryTooLarge {
+                    bytes: entry_bytes,
+                    limit: inner.config.max_memory_replicate_log_bytes,
+                });
+            }
+            if let Some((live, required)) = inner.joint_majority_failure() {
+                return Err(RaftError::NoMajority { live, required });
+            }
+            let required = inner.required_majority();
+            let live = inner.live_quorum_participants();
+            if live < required {
+                return Err(RaftError::NoMajority { live, required });
+            }
+            if !inner.leader_lease_valid() {
+                return Err(RaftError::LeaderUnavailable);
+            }
+            let leader_id = inner.leader_id;
+            let shard_id = inner.shard_id;
+            let leader = inner
+                .nodes
+                .get(&leader_id)
+                .filter(|node| node.alive && node.role == RaftRole::Leader)
+                .ok_or(RaftError::LeaderUnavailable)?;
+            let entry = RaftLogEntry {
+                leader_time_ms: current_time_ms(),
+                term: leader.current_term,
+                index: node_next_log_index(leader),
+                shard_id,
+                command,
+            };
+            let leader = inner
+                .nodes
+                .get_mut(&leader_id)
+                .ok_or(RaftError::LeaderUnavailable)?;
+            append_entry(leader, entry.clone());
+            let (live_target_ids, fallback_target_ids): (Vec<_>, Vec<_>) = inner
+                .nodes
+                .iter()
+                .filter(|(node_id, _)| **node_id != leader_id)
+                .map(|(node_id, node)| (*node_id, node.alive))
+                .partition(|(_, alive)| *alive);
+            let mut target_ids = live_target_ids;
+            target_ids.extend(fallback_target_ids);
+            (entry, leader_id, target_ids, required)
+        };
+
+        // The entry is in the log. Write it and start its barrier NOW, so the leader's disk wait
+        // runs alongside the followers' instead of after them. The commit index is not known yet
+        // and does not need to be: it is recoverable, so it never has to be durable before the
+        // acknowledgement.
+        if self
+            .inner
+            .read()
+            .expect("raft cluster lock poisoned")
+            .overlap_leader_barrier
+        {
+            let staged = self
+                .inner
+                .write()
+                .expect("raft cluster lock poisoned")
+                .stage_deferred_persist();
+            if let Ok(staged) = staged {
+                if !staged.is_empty() {
+                    let cluster = self.clone();
+                    *entry_barrier =
+                        Some(thread::spawn(move || cluster.finish_staged_unlocked(staged)));
+                }
+            }
+            // Anything persisted from here on is the commit index, which this path discards.
+            self.inner
+                .write()
+                .expect("raft cluster lock poisoned")
+                .begin_deferred_persist();
+        }
+
+        let mut replicated = {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            inner
+                .nodes
+                .get(&leader_id)
+                .map(|node| usize::from(node.replica_role.participates_in_quorum()))
+                .unwrap_or_default()
+        };
+        let mut successful_targets = Vec::new();
+        let mut failed_targets = Vec::new();
+        let mut fallback_targets = Vec::new();
+        let mut live_requests = Vec::new();
+        let mut live_target_ids = Vec::new();
+        for (target_id, alive) in target_ids {
+            if !alive {
+                fallback_targets.push(target_id);
+                continue;
+            }
+            let request = self.build_append_entries_request(target_id)?;
+            live_target_ids.push(target_id);
+            live_requests.push((target_id, request));
+        }
+        let (tx, rx) = mpsc::channel();
+        for (target_id, request) in live_requests {
+            let transport = transport.clone();
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let _ = tx.send((target_id, transport.append_entries(request)));
+            });
+        }
+        drop(tx);
+        // P2: configurable replication deadline (legacy hardcoded 5 s). A config that leaves the
+        // field at 0 resolves to the 5000 ms default so behavior stays byte-identical.
+        let replication_deadline_ms = {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            let configured = inner.config.replication_deadline_ms;
+            if configured == 0 {
+                default_replication_deadline_ms()
+            } else {
+                configured
+            }
+        };
+        let replication_deadline =
+            Instant::now() + Duration::from_millis(replication_deadline_ms);
+        while replicated < required {
+            let remaining = replication_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            let Ok((target_id, result)) =
+                rx.recv_timeout(remaining.min(Duration::from_millis(250)))
+            else {
+                if Instant::now() >= replication_deadline {
+                    break;
+                }
+                continue;
+            };
+            match result {
+                Ok(response) if response.success && response.match_index >= entry.index => {
+                    let _ = self.record_append_entries_response(target_id, &response);
+                    let counts_for_quorum = self
+                        .inner
+                        .read()
+                        .expect("raft cluster lock poisoned")
+                        .nodes
+                        .get(&target_id)
+                        .map(|node| node.replica_role.participates_in_quorum())
+                        .unwrap_or(false);
+                    if counts_for_quorum {
+                        replicated += 1;
+                    }
+                    successful_targets.push(target_id);
+                }
+                Ok(response) => {
+                    let _ = self.record_append_entries_response(target_id, &response);
+                    failed_targets.push(target_id);
+                }
+                Err(_) => {
+                    let _ = self.record_append_entries_send_failure(target_id);
+                    failed_targets.push(target_id);
+                }
+            }
+        }
+        while let Ok((target_id, result)) = rx.try_recv() {
+            match result {
+                Ok(response) if response.success && response.match_index >= entry.index => {
+                    let _ = self.record_append_entries_response(target_id, &response);
+                    if !successful_targets.contains(&target_id) {
+                        successful_targets.push(target_id);
+                    }
+                }
+                Ok(response) => {
+                    let _ = self.record_append_entries_response(target_id, &response);
+                    if !failed_targets.contains(&target_id) {
+                        failed_targets.push(target_id);
+                    }
+                }
+                Err(_) => {
+                    let _ = self.record_append_entries_send_failure(target_id);
+                    if !failed_targets.contains(&target_id) {
+                        failed_targets.push(target_id);
+                    }
+                }
+            }
+        }
+        failed_targets.extend(fallback_targets);
+        if replicated < required {
+            for target_id in failed_targets {
+                if transport
+                    .install_snapshot(self.build_install_snapshot_request(target_id)?)
+                    .map(|response| response.success)
+                    .unwrap_or(false)
+                {
+                    let retry_request = {
+                        let inner = self.inner.read().expect("raft cluster lock poisoned");
+                        let leader = inner
+                            .nodes
+                            .get(&leader_id)
+                            .ok_or(RaftError::LeaderUnavailable)?;
+                        let prev_log_index = entry.index.saturating_sub(1);
+                        let prev_log_term =
+                            node_term_at_log_or_snapshot_index(leader, prev_log_index)
+                                .unwrap_or_default();
+                        AppendEntriesRequest {
+                            rpc: None,
+                            shard_id: entry.shard_id,
+                            term: entry.term,
+                            leader_id,
+                            target_id,
+                            prev_log_index,
+                            prev_log_term,
+                            entries: vec![entry.clone()],
+                            leader_commit: entry.index,
+                        }
+                    };
+                    if let Ok(response) = transport.append_entries(retry_request) {
+                        let success = response.success && response.match_index >= entry.index;
+                        let _ = self.record_append_entries_response(target_id, &response);
+                        if success {
+                            let counts_for_quorum = self
+                                .inner
+                                .read()
+                                .expect("raft cluster lock poisoned")
+                                .nodes
+                                .get(&target_id)
+                                .map(|node| node.replica_role.participates_in_quorum())
+                                .unwrap_or(false);
+                            if counts_for_quorum {
+                                replicated += 1;
+                            }
+                            let _ = self.catch_up(target_id);
+                            successful_targets.push(target_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        if replicated < required {
+            return Err(RaftError::NoMajority {
+                live: replicated,
+                required,
+            });
+        }
+
+        let leader_response = {
+            let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+            let leader = inner
+                .nodes
+                .get_mut(&leader_id)
+                .ok_or(RaftError::LeaderUnavailable)?;
+            leader.commit_index = entry.index;
+            let response = if leader.replica_role.can_serve_data() {
+                apply_committed(leader).unwrap_or(CommandResponse::Empty)
+            } else {
+                CommandResponse::Empty
+            };
+            inner.renew_leader_lease();
+            inner.persist_configured_wal()?;
+            response
+        };
+
+        for target_id in &live_target_ids {
+            let request = AppendEntriesRequest {
+                rpc: None,
+                shard_id: entry.shard_id,
+                term: entry.term,
+                leader_id,
+                target_id: *target_id,
+                prev_log_index: entry.index,
+                prev_log_term: entry.term,
+                entries: Vec::new(),
+                leader_commit: entry.index,
+            };
+            let committed = match transport.append_entries(request) {
+                Ok(response) => {
+                    let success = response.success;
+                    let _ = self.record_append_entries_response(*target_id, &response);
+                    success
+                }
+                Err(_) => false,
+            };
+            if committed {
+                let _ = self.catch_up(*target_id);
+            }
+        }
+
+        Ok(leader_response)
+    }
+
+
+
+
+}
+
+
+fn joint_majority_failure(
+    nodes: &BTreeMap<RaftNodeId, RaftNode>,
+    membership: &JointConsensusMembership,
+) -> Option<(usize, usize)> {
+    let old_live = live_voters_in(nodes, &membership.old_voters);
+    let old_required = majority(membership.old_voters.len());
+    if old_live < old_required {
+        return Some((old_live, old_required));
+    }
+    let new_live = live_voters_in(nodes, &membership.new_voters);
+    let new_required = majority(membership.new_voters.len());
+    if new_live < new_required {
+        return Some((new_live, new_required));
+    }
+    None
+}
+
+fn live_voters_in(nodes: &BTreeMap<RaftNodeId, RaftNode>, voters: &[RaftNodeId]) -> usize {
+    voters
+        .iter()
+        .filter(|node_id| {
+            nodes
+                .get(node_id)
+                .map(|node| node.alive && node.replica_role.participates_in_quorum())
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+impl RaftTransport for RaftCluster {
+    fn append_entries(
+        &self,
+        request: AppendEntriesRequest,
+    ) -> Result<AppendEntriesResponse, RaftError> {
+        self.receive_append_entries(request)
+    }
+
+    fn request_vote(&self, request: VoteRequest) -> Result<VoteResponse, RaftError> {
+        self.receive_vote_request(request)
+    }
+
+    fn install_snapshot(
+        &self,
+        request: InstallSnapshotRequest,
+    ) -> Result<InstallSnapshotResponse, RaftError> {
+        self.receive_install_snapshot(request)
+    }
+
+    fn install_snapshot_chunk(
+        &self,
+        request: InstallSnapshotChunkRequest,
+    ) -> Result<InstallSnapshotChunkResponse, RaftError> {
+        self.receive_install_snapshot_chunk(request)
+    }
+}
+
+/// One replica's row in a `/raft/status` reply.
+///
+/// Only the row whose `node_id` equals the REPORTING process's own node id is a statement
+/// about a real replica. Every other row is that process's local shadow of a peer, carrying
+/// whatever bookkeeping happened to pass through it, and `applied_index` in particular is not
+/// the peer's: a three-node group has been observed reporting a peer's `applied_index` as 0 in
+/// the same instant that peer reported 9 about itself. Ask a node about itself.
+fn node_status(node: &RaftNode, leader_commit_index: u64) -> RaftNodeStatus {
+    RaftNodeStatus {
+        node_id: node.id,
+        role: node.role,
+        replica_role: node.replica_role,
+        current_term: node.current_term,
+        commit_index: node.commit_index,
+        last_log_index: node_last_log_or_snapshot_index(node),
+        applied_index: node.applied_index,
+        alive: node.alive,
+        lag: leader_commit_index.saturating_sub(node.commit_index),
+    }
+}
+
+fn node_last_log_or_snapshot_index(node: &RaftNode) -> u64 {
+    node.log
+        .last()
+        .map(|entry| entry.index)
+        .or_else(|| {
+            node.installed_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.last_included_index)
+        })
+        .unwrap_or_default()
+}
+
+fn node_next_log_index(node: &RaftNode) -> u64 {
+    node_last_log_or_snapshot_index(node).saturating_add(1)
+}
+
+fn node_term_at_log_or_snapshot_index(node: &RaftNode, index: u64) -> Option<u64> {
+    if index == 0 {
+        return Some(0);
+    }
+    node.log
+        .iter()
+        .find(|entry| entry.index == index)
+        .map(|entry| entry.term)
+        .or_else(|| {
+            node.installed_snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.last_included_index == index)
+                .map(|snapshot| snapshot.last_included_term)
+        })
+}
+
+fn replication_health_from_status(
+    status: RaftClusterStatus,
+    max_allowed_lag: u64,
+) -> RaftReplicationHealth {
+    let mut max_lag = 0;
+    let mut caught_up_voters = Vec::new();
+    let mut lagging_voters = Vec::new();
+    for node in status.nodes {
+        max_lag = max_lag.max(node.lag);
+        if !node.replica_role.participates_in_quorum() {
+            continue;
+        }
+        if node.alive && node.lag <= max_allowed_lag {
+            caught_up_voters.push(node.node_id);
+        } else {
+            lagging_voters.push(RaftReplicaLag {
+                node_id: node.node_id,
+                lag: node.lag,
+                alive: node.alive,
+            });
+        }
+    }
+    let healthy = status.has_majority
+        && status.leader_lease_valid
+        && lagging_voters.is_empty()
+        && caught_up_voters.len() >= status.majority;
+    RaftReplicationHealth {
+        leader_id: status.leader_id,
+        leader_commit_index: status.commit_index,
+        max_allowed_lag,
+        max_lag,
+        caught_up_voters,
+        lagging_voters,
+        live_voters: status.live_voters,
+        majority: status.majority,
+        healthy,
+    }
+}
+
+fn raft_apply_health_from_status(
+    status: RaftClusterStatus,
+    max_allowed_apply_lag: u64,
+) -> RaftApplyHealth {
+    let mut fully_applied_nodes = Vec::new();
+    let mut slow_appliers = Vec::new();
+    let mut max_apply_lag = 0;
+    for node in &status.nodes {
+        if !node.alive || !node.replica_role.can_serve_data() {
+            continue;
+        }
+        let apply_lag = node.commit_index.saturating_sub(node.applied_index);
+        max_apply_lag = max_apply_lag.max(apply_lag);
+        if apply_lag <= max_allowed_apply_lag && node.applied_index >= status.commit_index {
+            fully_applied_nodes.push(node.node_id);
+        }
+        if apply_lag > max_allowed_apply_lag {
+            slow_appliers.push(RaftApplyLag {
+                node_id: node.node_id,
+                commit_index: node.commit_index,
+                applied_index: node.applied_index,
+                apply_lag,
+                alive: node.alive,
+            });
+        }
+    }
+    RaftApplyHealth {
+        leader_id: status.leader_id,
+        leader_commit_index: status.commit_index,
+        max_allowed_apply_lag,
+        max_apply_lag,
+        fully_applied_nodes,
+        healthy: slow_appliers.is_empty(),
+        slow_appliers,
+    }
+}
+
+fn raft_observer_apply_health_from_status(
+    status: RaftClusterStatus,
+    observer_node_id: RaftNodeId,
+    max_allowed_apply_lag: u64,
+) -> RaftApplyHealth {
+    let Some(node) = status
+        .nodes
+        .iter()
+        .find(|node| node.node_id == observer_node_id)
+    else {
+        return RaftApplyHealth {
+            leader_id: status.leader_id,
+            leader_commit_index: status.commit_index,
+            max_allowed_apply_lag,
+            max_apply_lag: status.commit_index,
+            fully_applied_nodes: Vec::new(),
+            slow_appliers: vec![RaftApplyLag {
+                node_id: observer_node_id,
+                commit_index: status.commit_index,
+                applied_index: 0,
+                apply_lag: status.commit_index,
+                alive: false,
+            }],
+            healthy: false,
+        };
+    };
+    if !node.replica_role.can_serve_data() {
+        return RaftApplyHealth {
+            leader_id: status.leader_id,
+            leader_commit_index: status.commit_index,
+            max_allowed_apply_lag,
+            max_apply_lag: 0,
+            fully_applied_nodes: Vec::new(),
+            slow_appliers: Vec::new(),
+            healthy: node.alive && status.has_majority && status.leader_lease_valid,
+        };
+    }
+    let apply_lag = node.commit_index.saturating_sub(node.applied_index);
+    let fully_applied =
+        node.alive && apply_lag <= max_allowed_apply_lag && node.applied_index >= node.commit_index;
+    let slow_appliers = if fully_applied {
+        Vec::new()
+    } else {
+        vec![RaftApplyLag {
+            node_id: node.node_id,
+            commit_index: node.commit_index,
+            applied_index: node.applied_index,
+            apply_lag,
+            alive: node.alive,
+        }]
+    };
+    RaftApplyHealth {
+        leader_id: status.leader_id,
+        leader_commit_index: status.commit_index,
+        max_allowed_apply_lag,
+        max_apply_lag: apply_lag,
+        fully_applied_nodes: if fully_applied {
+            vec![node.node_id]
+        } else {
+            Vec::new()
+        },
+        healthy: fully_applied && status.has_majority && status.leader_lease_valid,
+        slow_appliers,
+    }
+}
+
+fn new_node(id: RaftNodeId, role: RaftRole, shard_id: ShardId) -> RaftNode {
+    let engine = TemporalEngine::default();
+    engine.load_shard(shard_id);
+    RaftNode {
+        id,
+        role,
+        replica_role: RaftReplicaRole::Voter,
+        current_term: 1,
+        voted_for: None,
+        commit_index: 0,
+        alive: true,
+        log: Vec::new(),
+        installed_snapshot: None,
+        applied_index: 0,
+        applied: BTreeSet::new(),
+        max_applied_index: 0,
+        engine,
+        pipeline_state: RaftPeerPipelineRuntimeState {
+            next_index: 1,
+            ..RaftPeerPipelineRuntimeState::default()
+        },
+    }
+}
+
+fn merge_membership_evidence(
+    target: &mut RaftMembershipRuntimeEvidence,
+    source: &RaftMembershipRuntimeEvidence,
+) {
+    target.learner_add_count = target.learner_add_count.max(source.learner_add_count);
+    target.learner_catchup_count = target
+        .learner_catchup_count
+        .max(source.learner_catchup_count);
+    target.learner_promote_count = target
+        .learner_promote_count
+        .max(source.learner_promote_count);
+    target.voter_remove_count = target.voter_remove_count.max(source.voter_remove_count);
+    target.witness_add_count = target.witness_add_count.max(source.witness_add_count);
+    target.auto_promote_count = target.auto_promote_count.max(source.auto_promote_count);
+    target.leader_transfer_write_count = target
+        .leader_transfer_write_count
+        .max(source.leader_transfer_write_count);
+    target.leader_transfer_exact_once_commit_count = target
+        .leader_transfer_exact_once_commit_count
+        .max(source.leader_transfer_exact_once_commit_count);
+    let mut commit_ids = target
+        .leader_transfer_exact_once_commit_ids
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    commit_ids.extend(source.leader_transfer_exact_once_commit_ids.iter().copied());
+    target.leader_transfer_exact_once_commit_ids = commit_ids.into_iter().collect();
+    target.pending_joint_consensus_persist_count = target
+        .pending_joint_consensus_persist_count
+        .max(source.pending_joint_consensus_persist_count);
+    target.pending_joint_consensus_restore_count = target
+        .pending_joint_consensus_restore_count
+        .max(source.pending_joint_consensus_restore_count);
+}
+
+fn refresh_all_pipeline_states(
+    nodes: &mut BTreeMap<RaftNodeId, RaftNode>,
+    leader_id: RaftNodeId,
+    local_node_id: Option<RaftNodeId>,
+    config: &RaftConfig,
+) {
+    // `local_node_id` is set only by the deployed runtime, which hosts exactly ONE node.
+    let deployed = local_node_id.is_some();
+    // This runs on every propose and every accepted AppendEntries. Cloning the leader's
+    // whole log here and re-scanning all of it per node made each of those O(log length),
+    // which is exactly the growth incremental WAL records were meant to remove. The log is
+    // index-ordered, so the bytes still owed to a peer are a suffix: find where that suffix
+    // starts and sum only it, against a borrowed log.
+    let Some(leader) = nodes.get(&leader_id) else {
+        return;
+    };
+    let leader_commit_index = leader.commit_index;
+    let leader_next_index = node_next_log_index(leader);
+    let progress = nodes
+        .iter()
+        .map(|(node_id, node)| {
+            (
+                *node_id,
+                node.commit_index.max(node.pipeline_state.match_index),
+            )
+        })
+        .collect::<Vec<_>>();
+    let inflight_bytes = {
+        let leader_log = &nodes
+            .get(&leader_id)
+            .expect("leader present, checked above")
+            .log;
+        progress
+            .into_iter()
+            .map(|(node_id, known_progress)| {
+                let start = leader_log.partition_point(|entry| entry.index <= known_progress);
+                let bytes = leader_log[start..]
+                    .iter()
+                    .map(|entry| command_size_bytes(&entry.command))
+                    .sum::<u64>();
+                (node_id, bytes)
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    for node in nodes.values_mut() {
+        let bytes = inflight_bytes.get(&node.id).copied().unwrap_or_default();
+        refresh_node_pipeline_state(
+            node,
+            leader_id,
+            leader_commit_index,
+            bytes,
+            leader_next_index,
+            deployed,
+            config,
+        );
+    }
+}
+
+fn refresh_node_pipeline_state(
+    node: &mut RaftNode,
+    leader_id: RaftNodeId,
+    leader_commit_index: u64,
+    inflight_bytes: u64,
+    leader_next_index: u64,
+    deployed: bool,
+    config: &RaftConfig,
+) {
+    // How far this peer has actually got, as far as THIS leader knows. `commit_index` is
+    // a shadow copy that is only ever updated for peers this process replicated to
+    // itself, so a leader that was just promoted still reads 0 there and would conclude
+    // its whole log is in flight -- enough to trip the backpressure limit on its first
+    // append and leave the shard unable to commit. `match_index` is what AppendEntries
+    // responses actually confirm, so take the better of the two.
+    let known_progress = node.commit_index.max(node.pipeline_state.match_index);
+    let inflight_entries = leader_commit_index.saturating_sub(known_progress);
+    let snapshot_installed_index = node
+        .installed_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.last_included_index)
+        .unwrap_or_default();
+    // Never walk a confirmed cursor backwards. `commit_index` here is this process's
+    // shadow copy of the peer, which is 0 for any peer it has not itself replicated to --
+    // a newly promoted leader would otherwise forget everything the send/ack path had
+    // already confirmed and re-ship the whole log on every heartbeat.
+    node.pipeline_state.match_index = node.commit_index.max(node.pipeline_state.match_index);
+    // `match_index` is only ever set from a SUCCESSFUL append, so it is authoritative:
+    // the next entry to send is never below it. Deriving `next_index` purely from the
+    // peer's shadow log (empty on a node this process never replicated to) reset a newly
+    // promoted leader's cursor to 1, making every heartbeat look like a full-log catch-up
+    // and tripping backpressure. Clamping keeps the in-process model's behaviour, where
+    // the shadow log IS the peer's log.
+    if deployed && node.id != leader_id {
+        // Deployed, this process hosts ONE node, so a peer's `log` here is an empty
+        // placeholder -- deriving `next_index` from it starts every catch-up at index 1 and
+        // re-ships a log the follower already has. Raft starts a peer optimistically at the
+        // leader's next index and lets rejections walk it back, so only INITIALISE it here;
+        // the send/ack path owns it from then on.
+        // "No progress established yet" is next_index <= 1 with nothing confirmed -- 1 is
+        // the default a fresh RaftNode carries, not evidence that the follower is empty.
+        if node.pipeline_state.match_index == 0 && node.pipeline_state.next_index <= 1 {
+            node.pipeline_state.next_index = leader_next_index;
+        }
+        node.pipeline_state.next_index = node
+            .pipeline_state
+            .next_index
+            .max(node.pipeline_state.match_index.saturating_add(1));
+    } else {
+        // In-process cluster: the shadow log IS the peer's log, so derive as before.
+        node.pipeline_state.next_index = node_next_log_index(node)
+            .max(node.pipeline_state.match_index.saturating_add(1));
+    }
+    node.pipeline_state.inflight_entries = inflight_entries;
+    node.pipeline_state.inflight_bytes = inflight_bytes;
+    node.pipeline_state.append_queue_depth = inflight_entries;
+    node.pipeline_state.reorder_queue_depth = if config.enable_reorder_queue {
+        node.commit_index.saturating_sub(node.applied_index)
+    } else {
+        0
+    };
+    node.pipeline_state.snapshot_sending = snapshot_installed_index > 0 && node.id != leader_id;
+    node.pipeline_state.snapshot_installed_index = snapshot_installed_index;
+    // transfer_leader_target is owned by begin_leader_transfer / transfer_leader /
+    // refresh_leader_transfer_timeouts. The per-refresh recompute here clobbered a
+    // pending transfer target (so it never timed out) and wrongly marked the leader
+    // itself as its own transfer target; leave the field untouched during refresh.
+    node.pipeline_state.pre_vote_rejections = if config.enable_pre_vote && !node.alive {
+        node.pipeline_state.pre_vote_rejections.max(1)
+    } else {
+        node.pipeline_state.pre_vote_rejections
+    };
+    node.pipeline_state.election_rejections = if config.prohibits_election && node.id != leader_id {
+        node.pipeline_state.election_rejections.max(1)
+    } else {
+        node.pipeline_state.election_rejections
+    };
+}
+
+fn append_entry(node: &mut RaftNode, entry: RaftLogEntry) {
+    if node
+        .installed_snapshot
+        .as_ref()
+        .map(|snapshot| entry.index <= snapshot.last_included_index)
+        .unwrap_or(false)
+    {
+        return;
+    }
+    // Raft §5.3: truncate ONLY on a genuine term conflict (same index, different term).
+    // An entry already present with the SAME term is a no-op -- unconditionally
+    // truncating on index<=last (a stale/duplicate/reordered AppendEntries that is a
+    // prefix of the committed log) would delete committed suffix entries, rewind
+    // applied state, and double-execute non-idempotent commands on re-apply.
+    if let Some(existing) = node.log.iter().find(|existing| existing.index == entry.index) {
+        if existing.term == entry.term {
+            return;
+        }
+        // Raft §5.3 one step further: THE CONFLICT IS FLOORED AT THE COMMIT POINT. A
+        // conflicting entry at or below `commit_index` would overwrite an entry this group has
+        // already committed, which Raft forbids, so it is refused here instead of absorbed.
+        // Without the floor the truncation below rewinds `applied` while `max_applied_index`
+        // deliberately stays put, and the apply loops then SKIP the replacement entry -- the
+        // apply cursor advances over a command that never ran and the state machine keeps the
+        // superseded one. Refusing is what makes that state unreachable rather than papered over.
+        if entry.index <= node.commit_index {
+            node.pipeline_state.committed_overwrite_rejections = node
+                .pipeline_state
+                .committed_overwrite_rejections
+                .saturating_add(1);
+            return;
+        }
+        node.log.retain(|existing| existing.index < entry.index);
+        node.applied.retain(|applied| *applied < entry.index);
+        node.applied_index = node.applied.iter().next_back().copied().unwrap_or_default();
+        // max_applied_index is intentionally NOT lowered (monotonic exactly-once floor); with the
+        // floor above, nothing can rewind the log below it any more, so the floor can no longer
+        // be reached by an entry that has not actually been applied.
+    }
+    node.log.push(entry);
+}
+
+fn command_size_bytes(command: &Command) -> u64 {
+    serde_json::to_vec(command)
+        .map(|bytes| bytes.len() as u64)
+        .unwrap_or_default()
+}
+
+fn raft_log_bytes_after(log: &[RaftLogEntry], index: u64) -> u64 {
+    log.iter()
+        .filter(|entry| entry.index > index)
+        .map(|entry| command_size_bytes(&entry.command))
+        .sum()
+}
+
+fn meta_log_bytes_after(log: &[MetaLogEntry], index: u64) -> u64 {
+    log.iter()
+        .filter(|entry| entry.index > index)
+        .map(|entry| {
+            serde_json::to_vec(&entry.command)
+                .map(|bytes| bytes.len() as u64)
+                .unwrap_or_default()
+        })
+        .sum()
+}
+
+fn split_command_for_raft_limit(command: Command, limit: u64) -> Result<Vec<Command>, RaftError> {
+    let bytes = command_size_bytes(&command);
+    if bytes <= limit {
+        return Ok(vec![command]);
+    }
+    match command {
+        Command::SequenceAdd { key, rows } if rows.len() > 1 => {
+            let mut chunks = Vec::new();
+            let mut current = Vec::new();
+            for row in rows {
+                let mut candidate = current.clone();
+                candidate.push(row.clone());
+                let candidate_command = Command::SequenceAdd {
+                    key: key.clone(),
+                    rows: candidate,
+                };
+                let candidate_bytes = command_size_bytes(&candidate_command);
+                if candidate_bytes <= limit {
+                    current.push(row);
+                    continue;
+                }
+                if current.is_empty() {
+                    return Err(RaftError::LogEntryTooLarge {
+                        bytes: candidate_bytes,
+                        limit,
+                    });
+                }
+                chunks.push(Command::SequenceAdd {
+                    key: key.clone(),
+                    rows: std::mem::take(&mut current),
+                });
+                let single_command = Command::SequenceAdd {
+                    key: key.clone(),
+                    rows: vec![row.clone()],
+                };
+                let single_bytes = command_size_bytes(&single_command);
+                if single_bytes > limit {
+                    return Err(RaftError::LogEntryTooLarge {
+                        bytes: single_bytes,
+                        limit,
+                    });
+                }
+                current.push(row);
+            }
+            if !current.is_empty() {
+                chunks.push(Command::SequenceAdd { key, rows: current });
+            }
+            Ok(chunks)
+        }
+        other => Err(RaftError::LogEntryTooLarge {
+            bytes: command_size_bytes(&other),
+            limit,
+        }),
+    }
+}
+
+/// The engine status code an apply carries when its DURABLE WAL commit failed. Both the
+/// per-entry write and the coalesced raft-apply batch barrier report exactly this code.
+const WAL_COMMIT_FAILED_CODE: &str = "wal_commit_failed";
+
+/// Did this apply actually reach durable storage?
+///
+/// A command that fails DETERMINISTICALLY -- a wrong type, a rejected argument, a limit -- is a
+/// real applied outcome: every replica reaches the same answer from the same entry, and the apply
+/// floor must advance or one bad command wedges the whole group forever. A command whose durable
+/// WAL commit failed is not an outcome at all: the bytes are not on disk, so a crash loses them.
+/// `execute_raft_apply_batch_at` marks every response in a batch whose coalesced barrier failed
+/// so that raft apply "surfaces the durability failure instead of acking" -- this is the read of
+/// that mark. Advancing `max_applied_index` over such an entry would bar the raft-log replay that
+/// the non-fsync'd index-log tail is explicitly documented to rely on.
+fn apply_reached_durable_storage(response: &crate::types::ExecuteResponse) -> bool {
+    response.status.ok || response.status.code != WAL_COMMIT_FAILED_CODE
+}
+
+/// How many leading entries of `batch_indexes` are durably applied, and therefore may move the
+/// apply cursor and the exactly-once floor.
+///
+/// A PREFIX, not a filter: apply is ordered, so index N+1 cannot count as applied while N is not.
+/// The indexes past the prefix are pulled back out of `node.applied`, because the collection loop
+/// inserted them before the apply ran and `applied.insert` returning false is what would otherwise
+/// make a later pass skip them in silence -- leaving the cursor stuck below an entry nothing will
+/// ever re-batch.
+fn durable_apply_prefix(
+    node: &mut RaftNode,
+    batch_indexes: &[u64],
+    responses: &[crate::types::ExecuteResponse],
+) -> usize {
+    let prefix = responses
+        .iter()
+        .position(|response| !apply_reached_durable_storage(response))
+        .unwrap_or(responses.len());
+    for index in &batch_indexes[prefix.min(batch_indexes.len())..] {
+        node.applied.remove(index);
+    }
+    prefix
+}
+
+/// Apply newly committed entries, capturing the response of every index in `waiters` so each
+/// waiting proposer gets its own command's answer. The twin of [`apply_committed`] for the path
+/// where the applier is a sender thread and the interested parties are elsewhere; the exactly-
+/// once and cursor rules are identical, and both run under the caller's `inner` write lock.
+fn apply_committed_recording(
+    node: &mut RaftNode,
+    waiters: &BTreeSet<u64>,

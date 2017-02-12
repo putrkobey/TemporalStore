@@ -64,3 +64,69 @@ fn engine_on(dir: &std::path::Path) -> TemporalEngine {
 fn load_on(engine: &TemporalEngine) {
     let response = engine.load_shard_with(crate::control::LoadShardRequest {
         shard_id: 1,
+        table_name: "authority".to_string(),
+        shard_uri: "local://authority/1".to_string(),
+        start_routing_bucket: 0,
+        end_routing_bucket: 1023,
+        readonly: false,
+        load_version: 1,
+        local_node_id: Some(1),
+    });
+    assert!(response.status.ok, "load failed: {:?}", response.status);
+}
+
+fn member_bytes(index: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; VALUE_WIDTH];
+    let stamp = format!("a-{index:05}");
+    for (slot, byte) in stamp.as_bytes().iter().enumerate() {
+        if slot < VALUE_WIDTH {
+            bytes[slot] = *byte;
+        }
+    }
+    bytes
+}
+
+fn write_to(engine: &TemporalEngine, command: Command) {
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command,
+    });
+    assert!(response.status.ok, "write failed: {response:?}");
+}
+
+/// Seed one folded set, re-derive the projection under `gate_on`, then run the authority check
+/// ONCE and report what it did.
+///
+/// The re-derivation comes first on purpose: the check compares the model maps against the index,
+/// so both sides have to be speaking the same projection for the answer to mean anything. That is
+/// the question -- whether a projection that files entries with no component makes a check that
+/// asks about a named one report every element missing.
+fn one_check_under(gate_on: bool) -> (u64, u64, u64, bool) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+    // BOTH DIRECTIONS AS VALUES. `remove_var` for the off arm selects the compiled-in default,
+    // which is ON, so this would have measured the gated path twice.
+    if gate_on {
+    } else {
+    }
+
+    for index in 0..MEMBERS {
+        write_to(
+            &engine,
+            Command::SetAdd {
+                key: "authority/set".to_string(),
+                member: member_bytes(index),
+            },
+        );
+    }
+    engine
+        .compact_shard_blocks(1)
+        .expect("the fold round must succeed");
+
+    let mut shards = engine.shards.write().expect("engine lock poisoned");
+    let shard = shards.get_mut(&1).expect("shard 1 loaded");
+    let (start, end) = shard.routing_range();
+    // The index as this projection would derive it, so both sides of the comparison agree about
+    // what shape the entries are in.
+    crate::engine::storage_bucket_internals::rebuild_bucket_first_index(1, shard, start, end);
