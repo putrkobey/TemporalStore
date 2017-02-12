@@ -1,0 +1,146 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+//! Crash reconstruction across the index-log + base-snapshot boundary, ON THE DEFAULT PATH.
+//!
+//! The index-log is always-on: every write appends a delta record, and this file asserts that a
+//! store reopened after a crash comes back with what it acked -- before any dump (no base at all)
+//! and after one (base plus the writes that followed it). The index-log itself is bounded by the
+//! consumer-aware storage-manager index GC, exercised by the lib test
+//! `storage_wal_index_gc_reclaim_requires_durable_generation_and_retention_release` (records
+//! removed + budget + restart reconstruction).
+//!
+//! WHAT THESE TWO TESTS DO NOT COVER, SO NOBODY READS THE FILENAME AND ASSUMES THEY DO. They do
+//! not exercise the load-time delta FOLD. Under the single-barrier default -- which is what runs
+//! here, and in production -- `load_shard_with` calls `load_index_base_only`, which passes
+//! `fold_deltas = false`; `fold_index_log_deltas` is not on that path at all. Reconstruction
+//! below is the durable base plus a WAL replay of the tail beyond its anchor, and the delta
+//! records are written, retained, GC'd and never read. Measured, not inferred: replacing the body
+//! of `fold_index_log_deltas` with `panic!` leaves both tests green.
+//!
+//! The fold is reached only through `load_index_checked`, i.e. only under the
+//! `TS_WAL_LEGACY_RECOVERY` escape hatch, and what it does is asserted by the lib test
+//! `a_delta_fold_recovery_applies_the_tombstones_a_stale_base_still_denies` (engine::tests::
+//! expiry_scale), which folds an expiry delta onto a deliberately stale base and fails when the
+//! fold applies nothing. Add a fold claim HERE only with a fixture that makes the delta the only
+//! source of its answer -- against a fresh base and a live WAL, replay produces the same answer
+//! with the fold deleted.
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use temporalstore_rust::{
+    Command, CommandResponse, ExecuteRequest, LocalIndexLogStore, TemporalEngine,
+};
+
+const SHARD: u64 = 1;
+
+fn root(tag: &str) -> PathBuf {
+    let mut root = std::env::temp_dir();
+    root.push(format!("ts-idxlog-gc-{tag}-{}", std::process::id()));
+    root
+}
+
+fn build(root: &Path) -> TemporalEngine {
+    for sub in ["cache", "pages", "indexes"] {
+        fs::create_dir_all(root.join(sub)).expect("create engine dir");
+    }
+    TemporalEngine::with_local_dirs(4096, root.join("cache"), root.join("blocks"), root.join("indexes"))
+}
+
+fn set(engine: &TemporalEngine, key: &str, value: &str) {
+    let response = engine.execute(ExecuteRequest {
+        shard_id: SHARD,
+        command: Command::StringSet {
+            key: key.to_string(),
+            value: value.as_bytes().to_vec(),
+        },
+    });
+    assert!(response.status.ok, "set {key}: {response:?}");
+}
+
+fn get(engine: &TemporalEngine, key: &str) -> Option<String> {
+    match engine
+        .execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringGet {
+                key: key.to_string(),
+            },
+        })
+        .response
+    {
+        CommandResponse::Bytes { value } => value.map(|v| String::from_utf8_lossy(&v).to_string()),
+        other => panic!("unexpected get response for {key}: {other:?}"),
+    }
+}
+
+// Where the engine keeps its index-logs: `LocalIndexLogStore::new(index_dir.join("indexlogs"))`
+// in `engine::lifecycle`.
+fn index_log_dir(root: &Path) -> PathBuf {
+    root.join("indexes").join("indexlogs")
+}
+
+/// Bytes of the shard's index-log, counted the way the store counts its own.
+///
+/// `log_len_bytes` walks `index_log_segment_paths`, which is the enumeration every reader of
+/// this log shares, so this cannot disagree with the store about which files are the log.
+/// Do NOT spell a filename here. This helper used to stat
+/// `shard-{id}.indexlog.jsonl` directly, and when the pieces were renamed to `.bin` it stopped
+/// finding anything -- for six days, silently, because it turned "no such file" into a zero via
+/// `unwrap_or(0)`. Naming a file also cannot be right in both rolling configurations: a shard's
+/// log is one file when `TS_INDEX_LOG_SEGMENT_BYTES` is 0 and a run of sealed pieces named
+/// `shard-{id}.indexlog.{start}-{end}-{anchor}.bin` otherwise, and asking the store covers both.
+///
+/// Only stats, never opens: `piece_count` and `log_len_bytes` read metadata, so calling them
+/// against a live engine's directory cannot disturb an append in flight. (`record_count` would
+/// -- its scan trims a torn tail -- which is why the count below is of pieces and bytes.)
+fn index_log_on_disk(root: &Path) -> (usize, u64) {
+    let dir = index_log_dir(root);
+    let store = LocalIndexLogStore::new(&dir);
+    let pieces = store.piece_count(SHARD);
+    // The loud not-found case. The old helper answered 0 here, which is also what a log that
+    // exists and carries nothing answers, so the failure could not say which of the two had
+    // happened -- and a rename sat behind that 0 for six days. The listing is what separates
+    // them, so branch on it and say which one this is.
+    if pieces == 0 {
+        let present = dir_listing(&dir);
+        assert!(
+            !present.is_empty(),
+            "no index-log at all for shard {SHARD}: {} holds no files, so nothing wrote a delta. \
+             This is the writer's side, not the name's.",
+            dir.display()
+        );
+        panic!(
+            "the store enumerates 0 index-log pieces for shard {SHARD} in {}, which holds {} \
+             file(s): {present:?}. The files are there and the enumeration does not recognise \
+             them -- writer and reader disagree about the name. This is the shape of the rename \
+             to `.bin` that left this test looking for `.jsonl`.",
+            dir.display(),
+            present.len()
+        );
+    }
+    (pieces, store.log_len_bytes(SHARD))
+}
+
+/// Every name in the index-log directory, for the message above. Sorted, so it reads the same
+/// way twice.
+fn dir_listing(dir: &Path) -> Vec<String> {
+    let mut names = fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    names.sort();
+    names
+}
+
+#[test]
+fn crash_before_any_dump_reconstructs_from_full_delta_log() {
+    // No dump ever happens: the base is absent, so the whole write history has to come back
+    // from the log. On the default path that is the WAL replay, with the index-log deltas
+    // written beside it and not read -- see the note at the top of this file.
+    let root = root("nodump");
+    let _ = fs::remove_dir_all(&root);
+    let engine = build(&root);
+    engine.load_shard(SHARD);
