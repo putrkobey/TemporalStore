@@ -87,3 +87,182 @@ function boot(clipboard) {
     return els.get(id);
   }
 
+  function reply(body) {
+    return Promise.resolve({
+      ok: true, status: 200,
+      text: () => Promise.resolve(JSON.stringify(body)),
+      json: () => Promise.resolve(body)
+    });
+  }
+
+  let createResponse = { api_key_id: "ak_new", api_key: CREATED_KEY };
+  let createStatus = 200;
+  const rotateResponse = { api_key_id: "ak_rotated", api_key: ROTATED_KEY };
+
+  const store = { mtx_admin_key: "admin-key-for-the-harness" };
+  const storage = {
+    getItem: (k) => (k in store ? store[k] : null),
+    setItem(k, v) { store[k] = String(v); },
+    removeItem(k) { delete store[k]; }
+  };
+
+  const win = {
+    document: {
+      getElementById: (id) => el(id),
+      querySelector: () => null,
+      querySelectorAll: () => [],
+      createElement() { const e = makeEl(); created.push(e); return e; },
+      createTextNode() { return makeEl(); },
+      addEventListener() {}, body: makeEl(), hidden: false
+    },
+    addEventListener() {},
+    location: { origin: "http://localhost", href: "http://localhost", reload() {} },
+    localStorage: storage, sessionStorage: storage,
+    navigator: clipboard === null ? {} : { clipboard: clipboard },
+    /* Recorded, never fired: the label restores after 1.4s, and firing that would erase the very
+       thing each case asserts. That the restore was scheduled is checked on its own. */
+    setTimeout(fn) { timers.push(fn); return timers.length; },
+    setInterval: () => 0, clearInterval() {}, clearTimeout() {},
+    wireTabs() {}, requestAnimationFrame: () => 0,
+    confirm(message) { asked.push(String(message)); return answer; },
+    Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
+    encodeURIComponent, decodeURIComponent, parseInt, parseFloat, console,
+    TextDecoder: function () { this.decode = () => ""; },
+    AbortController: function () { this.abort = () => {}; this.signal = {}; },
+    FileReader: function () {}, Blob: function () {},
+    URL: { createObjectURL: () => "", revokeObjectURL() {} },
+    fetch: (url) => {
+      const u = String(url);
+      if (u.indexOf("create_api_key") >= 0) {
+        if (createStatus !== 200) {
+          const body = JSON.stringify(createResponse);
+          return Promise.resolve({
+            ok: false, status: createStatus,
+            text: () => Promise.resolve(body), json: () => Promise.resolve(createResponse)
+          });
+        }
+        return reply({ result: createResponse });
+      }
+      if (u.indexOf("rotate_api_key") >= 0) { return reply({ result: rotateResponse }); }
+      if (u.indexOf("list_api_keys") >= 0) {
+        /* The field names are the served ones: the list reads `api_keys`, and only a row whose
+           status is exactly "active" gets a Rotate button built for it. A fixture shaped to a
+           guess would render nothing and let the rotate case pass having tested nothing. */
+        return reply({ result: { api_keys: [{
+          api_key_id: "ak_new", tenant_id: "t1", account_id: "a1", role: "service",
+          scopes: ["read", "write"], status: "active", request_quota: 0, quota_window: 0,
+          created_at_ms: 1756000000000, last_used_at_ms: 1756000090000, usage_count: 3
+        }] } });
+      }
+      return new Promise(() => {});
+    }
+  };
+  win.window = win;
+
+  const names = Object.keys(win);
+  const values = names.map((k) => win[k]);
+  scripts.forEach((body, index) => {
+    try { new Function(...names, body)(...values); }
+    catch (e) { console.log("FAIL script " + index + " threw: " + e.message); failures += 1; }
+  });
+
+  return {
+    el, created, timers, asked,
+    answerDialogs(value) { answer = value; },
+    setCreateResponse(v) { createResponse = v; },
+    setCreateStatus(v) { createStatus = v; },
+    create() {
+      /* Both are required, and createKey returns quietly without either -- which would leave the
+         output empty and let an "is no button offered?" check pass having rendered nothing. */
+      el("ckScopes").value = "read";
+      el("ckTenant").value = "t1";
+      const btn = el("createBtn");
+      if (!btn.onclick) { throw new Error("createBtn has no handler"); }
+      btn.onclick({});
+    },
+    rotate() {
+      const b = created.filter((c) => c.textContent === "Rotate")[0];
+      if (!b) { throw new Error("no Rotate button was built"); }
+      b.onclick({});
+    }
+  };
+}
+
+function clipboardThat(behaviour) {
+  const seen = [];
+  return {
+    seen,
+    api: {
+      writeText(text) {
+        seen.push(text);
+        return behaviour === "resolve" ? Promise.resolve() : Promise.reject(new Error("denied"));
+      }
+    }
+  };
+}
+
+function settle() { return new Promise((r) => setImmediate(() => setImmediate(r))); }
+async function quiet() { for (let i = 0; i < 60; i += 1) { await settle(); } }
+
+(async function () {
+  /* ---- A. a key comes back: the button is offered, and copies the secret alone -------------- */
+  {
+    const cb = clipboardThat("resolve");
+    const page = boot(cb.api);
+    page.create();
+    await quiet();
+    const out = page.el("createKeyOut").innerHTML;
+    ok("A the created key is shown", out.indexOf(CREATED_KEY) >= 0, JSON.stringify(out).slice(0, 200));
+    ok("A a copy button is offered", out.indexOf("id='copyNewKey'") >= 0,
+       JSON.stringify(out).slice(0, 240));
+    page.el("copyNewKey").dispatch("click");
+    await quiet();
+    ok("A clicking it copies the secret and nothing else",
+       cb.seen.length === 1 && cb.seen[0] === CREATED_KEY, JSON.stringify(cb.seen));
+    ok("A the button confirms the copy", page.el("copyNewKey").textContent === "Copied",
+       JSON.stringify(page.el("copyNewKey").textContent));
+    ok("A the label is scheduled to restore", page.timers.length > 0,
+       "timers: " + page.timers.length);
+  }
+
+  /* ---- B. no key came back: nothing to copy, so nothing is offered -------------------------- */
+  {
+    const cb = clipboardThat("resolve");
+    const page = boot(cb.api);
+    page.setCreateResponse({ api_key_id: "ak_new" });
+    page.create();
+    await quiet();
+    const out = page.el("createKeyOut").innerHTML;
+    ok("B the page says the key was not returned", out.indexOf("(not returned)") >= 0,
+       JSON.stringify(out).slice(0, 240));
+    /* Requires the output to exist: "no button in an empty string" is true of a page that
+       rendered nothing at all, and would pass while proving nothing. */
+    ok("B no copy button is offered when there is no key",
+       out.length > 0 && out.indexOf("copyNewKey") < 0, JSON.stringify(out).slice(0, 280));
+  }
+
+  /* ---- C. the clipboard refuses: the button must NOT claim a copy --------------------------- */
+  {
+    const cb = clipboardThat("reject");
+    const page = boot(cb.api);
+    page.create();
+    await quiet();
+    page.el("copyNewKey").dispatch("click");
+    await quiet();
+    ok("C a refused copy is reported as failed, not as copied",
+       page.el("copyNewKey").textContent === "Copy failed",
+       JSON.stringify(page.el("copyNewKey").textContent));
+  }
+
+  /* ---- D. no clipboard API at all -- an http:// origin, which a self-hosted portal often is -- */
+  {
+    const page = boot(null);
+    page.create();
+    await quiet();
+    page.el("copyNewKey").dispatch("click");
+    await quiet();
+    ok("D with no clipboard API the button says so rather than quietly doing nothing",
+       page.el("copyNewKey").textContent === "Copy failed",
+       JSON.stringify(page.el("copyNewKey").textContent));
+  }
+
