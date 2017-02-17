@@ -296,3 +296,601 @@ fn every_adopted_context_map_holds_the_block_index_own_key() {
                     vector: Vec::new(),
                     embedding_model_hash: 0,
                     embedding_updated_at_ms: 0,
+                    summary_vector: Vec::new(),
+                    summary_vector_valid_from_ms: 0,
+                    summary_vector_model_hash: 0,
+                }),
+            },
+            Command::ContextWriteEvent {
+                tenant_hash: TENANT,
+                node_hash: node,
+                event: Box::new(ContextEvent {
+                    event_id_hash: 100 + node,
+                    event_time_ms: NOW_MS + node,
+                    ingestion_time_ms: NOW_MS + node,
+                    kind: 0,
+                    event_type: 1,
+                    actor_hash: 0,
+                    status: 0,
+                    valid_until_ms: 0,
+                    confidence: 1.0,
+                    importance: 1.0,
+                    text: format!("event on node {node}"),
+                    source_ref: String::new(),
+                    related_node_hashes: Vec::new(),
+                    compact_attrs: Vec::new(),
+                    vector: Vec::new(),
+                }),
+                first_write_only: false,
+                cold_storage: false,
+            },
+            Command::ContextWriteIndexRef {
+                tenant_hash: TENANT,
+                index_name: "kind".to_string(),
+                index_value_hash: 200 + node,
+                scope_hash: 0,
+                event_time_ms: NOW_MS + node,
+                index_ref: ContextIndexRef {
+                    primary_node_hash: node,
+                    primary_event_time_ms: NOW_MS + node,
+                    event_id_hash: 100 + node,
+                },
+            },
+            Command::ContextWritePackAudit {
+                tenant_hash: TENANT,
+                audit: ContextPackAudit {
+                    query_id: format!("q-{node}"),
+                    session_hash: 300 + node,
+                    request_time_ms: NOW_MS + node,
+                    query_hash: 400 + node,
+                    max_prompt_tokens: 1_024,
+                    selected_tokens: 16,
+                    selected_refs: Vec::new(),
+                    blocked_refs: Vec::new(),
+                },
+            },
+            Command::ContextUpsertEntity {
+                tenant_hash: TENANT,
+                entity: ContextEntity {
+                    entity_hash: 500 + node,
+                    node_hash: node,
+                    entity_type: 1,
+                    name: format!("entity-{node}"),
+                    value: format!("value-{node}"),
+                    updated_at_ms: NOW_MS + node,
+                    valid_from_ms: NOW_MS,
+                    confidence: 1.0,
+                    source_event_hashes: Vec::new(),
+                    vector: Vec::new(),
+                },
+            },
+            Command::ContextUpsertChildRef {
+                tenant_hash: TENANT,
+                child_ref: ContextChildRef {
+                    parent_hash: node,
+                    child_hash: 600 + node,
+                    updated_at_ms: NOW_MS + node,
+                },
+            },
+            Command::ContextUpsertSummary {
+                tenant_hash: TENANT,
+                summary: ContextSummary {
+                    node_hash: node,
+                    level: 1,
+                    text: format!("level-1 summary of node {node}"),
+                    valid_from_ms: NOW_MS + node,
+                    vector: Vec::new(),
+                    embedding_model_hash: 0,
+                },
+            },
+            Command::ContextWriteCompressionEvent {
+                tenant_hash: TENANT,
+                event: ContextCompressionEvent {
+                    compression_id_hash: 700 + node,
+                    node_hash: node,
+                    source_start_ms: NOW_MS,
+                    source_end_ms: NOW_MS + node,
+                    compressed_time_ms: NOW_MS + node,
+                    summary: format!("compressed node {node}"),
+                },
+            },
+        ] {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command,
+            });
+            assert!(
+                response.status.ok,
+                "write node {node}: {:?}",
+                response.status
+            );
+        }
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+
+    // Every map named in `adopt_object_key_allocations`'s context half, with the address of each
+    // key's characters. A `ModelKey` exposes `as_ptr()` through its deref, so this needs no
+    // knowledge of what any map is keyed by -- which is what kept the first guard from going
+    // stale when a map changed key type.
+    let holders: Vec<(&str, Vec<(&str, usize)>)> = vec![
+        (
+            "context_nodes",
+            shard
+                .context_nodes()
+                .keys()
+                .map(|k| (&**k, k.as_ptr() as usize))
+                .collect(),
+        ),
+        (
+            "context_events_series",
+            shard
+                .context_events()
+                .keys()
+                .map(|k| (&**k, k.as_ptr() as usize))
+                .collect(),
+        ),
+        (
+            "context_event_timeline",
+            shard
+                .context_event_timeline
+                .keys()
+                .map(|k| (&**k, k.as_ptr() as usize))
+                .collect(),
+        ),
+        (
+            "context_indexes",
+            shard
+                .context_indexes()
+                .keys()
+                .map(|k| (&**k, k.as_ptr() as usize))
+                .collect(),
+        ),
+        (
+            "context_audits",
+            shard
+                .context_audits()
+                .keys()
+                .map(|k| (&**k, k.as_ptr() as usize))
+                .collect(),
+        ),
+        (
+            "context_entities",
+            shard
+                .context_entities()
+                .keys()
+                .map(|k| (&**k, k.as_ptr() as usize))
+                .collect(),
+        ),
+        (
+            "context_children",
+            shard
+                .context_children()
+                .keys()
+                .map(|k| (&**k, k.as_ptr() as usize))
+                .collect(),
+        ),
+        (
+            "context_summaries",
+            shard
+                .context_summaries()
+                .keys()
+                .map(|k| (&**k, k.as_ptr() as usize))
+                .collect(),
+        ),
+        (
+            "context_compressions",
+            shard
+                .context_compressions()
+                .keys()
+                .map(|k| (&**k, k.as_ptr() as usize))
+                .collect(),
+        ),
+        (
+            "context_compression_watermark",
+            shard
+                .context_compression_watermark()
+                .keys()
+                .map(|k| (&**k, k.as_ptr() as usize))
+                .collect(),
+        ),
+    ];
+
+    // --- WHAT THIS RUN ACTUALLY FILED, printed before anything divides by it. ---
+    #[derive(Default)]
+    struct Tally {
+        keys: usize,
+        borrowed: usize,
+        minted: usize,
+        unfiled: usize,
+    }
+    let mut tally: std::collections::BTreeMap<&str, Tally> = std::collections::BTreeMap::new();
+    let mut minted: Vec<(&str, &str)> = Vec::new();
+    for (name, keys) in &holders {
+        let row = tally.entry(name).or_default();
+        row.keys = keys.len();
+        for (text, ptr) in keys {
+            match shard
+                .bucket_index
+                .object_block_lookup
+                .any_shared_object_key(text)
+            {
+                None => row.unfiled += 1,
+                Some(canonical) if canonical.as_ptr() as usize == *ptr => row.borrowed += 1,
+                Some(_) => {
+                    row.minted += 1;
+                    minted.push((name, text));
+                }
+            }
+        }
+    }
+    println!();
+    println!("    map                              keys   borrowed   minted   no page entry");
+    for (name, row) in &tally {
+        println!(
+            "    {name:<32} {:>4}   {:>8}   {:>6}   {:>13}",
+            row.keys, row.borrowed, row.minted, row.unfiled
+        );
+    }
+
+    // --- THE TWO MAPS THIS FIXTURE CANNOT SPEAK FOR, AND WHY. ---
+    //
+    // Each is excused for a reason that was MEASURED, and each excuse is checked below so that it
+    // cannot outlive the fact it rests on.
+    //
+    // `context_nodes`: there is no production write to it at all. Grepped from the crate root for
+    //   every `insert`, `entry(`, `remove`, `retain` and `clear` naming it: one test fixture in
+    //   `storage_bucket_internals.rs`, and one `remove` in the expiry path. `ContextUpsertNode`
+    //   files the node into `hashes` under `CONTEXT_NODE_FIELD`; this map is the PRE-HASHES
+    //   location, still read so a stored image written before that change still serves, and filled
+    //   only by `Deserialize`. Its sharing is therefore a decode-path question, which
+    //   `adopt_canonical_key_allocations_in_hashed` and the reload tests answer, not a write-path
+    //   one this fixture could ask.
+    //
+    // `context_entities`: the write arm files NO page entry under the key this map holds. The map
+    //   is keyed by the node's COLLECTION key (`ctx:entity:{tenant}:{node}`) while the block is
+    //   addressed per entity, so the staged outcome and the stored page entry both carry
+    //   `ctx:entity:{tenant}:{node}:{entity_hash}`. `any_shared_object_key` on a collection key
+    //   therefore answers None, there is no handle to borrow, and -- checked -- no other resident
+    //   structure holds that text either, so the minted key is the ONLY copy rather than a second
+    //   one. The `adopt_key_in` line for this map cannot fire in either direction.
+    //
+    // `context_compression_watermark`: its only writer is `maybe_auto_compress_context_node`, on
+    //   the event-write path, behind `MATRIXARK_CONTEXT_COMPRESSION_ENABLED` --
+    //   `ContextCompressionPolicy::default()` has `enabled: false`, so the trigger does not run.
+    //   A default-run test cannot turn it on: `set_var` is process-global and every other test in
+    //   this binary would inherit it. `Command::ContextCompressEvents` is a DIFFERENT path and
+    //   files the series, not the watermark -- checked by putting it in this fixture and watching
+    //   the map stay empty, which is why it is not here.
+    const NOT_REACHABLE: &[&str] = &[
+        "context_nodes",
+        "context_entities",
+        "context_compression_watermark",
+    ];
+
+    let nodes = tally.get("context_nodes").expect("named above");
+    assert_eq!(
+        0, nodes.keys,
+        "`context_nodes` now holds {} keys after a write-only fixture, so the reason it is excused \
+         -- that no production write files it -- has stopped being true. Move it into the checked \
+         set rather than leaving it excused.",
+        nodes.keys
+    );
+
+    let entities = tally.get("context_entities").expect("named above");
+    assert_eq!(
+        entities.keys,
+        entities.unfiled,
+        "{} of `context_entities`'s {} keys now HAVE a page entry, so the reason it is excused -- \
+         that the block is addressed per entity while the map is keyed per collection -- has \
+         stopped being true. It can borrow now, so move it into the checked set.",
+        entities.keys - entities.unfiled,
+        entities.keys
+    );
+    assert!(
+        entities.keys > 0,
+        "`context_entities` is empty, so the fixture stopped writing entities and neither the \
+         exclusion above nor anything else was actually checked"
+    );
+
+    let watermark = tally
+        .get("context_compression_watermark")
+        .expect("named above");
+    assert_eq!(
+        0, watermark.keys,
+        "`context_compression_watermark` now holds {} keys without the environment flag that          gates its only writer, so the reason it is excused has stopped being true. Move it into          the checked set.",
+        watermark.keys
+    );
+
+    // --- DENOMINATORS for the maps that ARE checked. ---
+    let checked: Vec<(&&str, &Tally)> = tally
+        .iter()
+        .filter(|(name, _)| !NOT_REACHABLE.contains(name))
+        .collect();
+    assert_eq!(
+        7,
+        checked.len(),
+        "the checked set is {} maps, not the 7 this fixture drives -- a map was added to or \
+         removed from the list above without the count following it",
+        checked.len()
+    );
+    let empty: Vec<&&str> = checked
+        .iter()
+        .filter(|(_, row)| row.keys == 0)
+        .map(|(name, _)| *name)
+        .collect();
+    assert!(
+        empty.is_empty(),
+        "these maps are EMPTY after one write per family, so this run could not have checked them \
+         at all -- either the command that files one stopped doing so, or it was never in this \
+         fixture: {empty:?}"
+    );
+    let unfiled: Vec<(&&str, usize)> = checked
+        .iter()
+        .filter(|(_, row)| row.unfiled > 0)
+        .map(|(name, row)| (*name, row.unfiled))
+        .collect();
+    assert!(
+        unfiled.is_empty(),
+        "these maps hold keys with no page entry, so the adoption had no handle to take and this \
+         run proves nothing about them: {unfiled:?}. A map that CANNOT borrow belongs in \
+         NOT_REACHABLE with the reason, not in the checked set reporting a pass."
+    );
+
+    // --- THE INVARIANT. ---
+    assert!(
+        minted
+            .iter()
+            .all(|(name, _)| NOT_REACHABLE.contains(name)),
+        "{} keys are a SECOND copy of characters the page index already holds -- the map's key and \
+         the page index's handle report different addresses for the same text: {:?}. A map keyed \
+         by a `ModelKey` must take its handle from \
+         `object_block_lookup::any_shared_object_key`, which is what \
+         `ShardState::adopt_object_key_allocations` does; nothing else fails when it does not, \
+         because the data is correct either way.",
+        minted.len(),
+        &minted[..minted.len().min(4)]
+    );
+}
+
+/// ONE FIELD NAME, ONE ALLOCATION -- across every object that uses it, and across a decode.
+///
+/// # WHY THE FIELD NAME NEEDS ITS OWN GUARD
+///
+/// Every other test in this file is about the object KEY. A hash's FIELD name is a second axis of
+/// the same invariant and it behaves differently in the way that matters: the product write path
+/// files every context node under ONE constant, `CONTEXT_NODE_FIELD` (`"meta"`), so the question
+/// is not whether two maps agree on a key but whether ten thousand objects agree on one
+/// four-character name. Before the conversion they did not -- one allocation per object, measured
+/// at 32.0 bytes and one allocation per field in
+/// `what_the_one_constant_field_name_costs_at_the_shape_the_product_writes`.
+///
+/// # AND THE DECODE HALF IS THE HALF THAT WOULD HAVE BEEN MISSED
+///
+/// The wire shape is a map of OWNED names -- that is what keeps the index format from moving -- so
+/// a decode mints a fresh handle per field with the pool taking no part in it. A guard that only
+/// looked at a freshly written shard would pass while every recovered shard held the duplication
+/// back, with nothing failing, because the names are equal either way. So this asserts the
+/// invariant on both sides of a dump and install, and asserts that the decode pass RAN -- a
+/// sharing mechanism that is wired and never fires looks exactly like one that works.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+fn one_field_name_is_one_allocation_across_objects_and_across_a_decode() {
+    use crate::types::ContextNode;
+
+    const NODES: u64 = 16;
+    const TENANT: u64 = 7;
+    const NOW_MS: u64 = 1_787_270_070_000;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+
+    for node in 1..=NODES {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextUpsertNode {
+                tenant_hash: TENANT,
+                node: Box::new(ContextNode {
+                    node_hash: node,
+                    parent_hash: 0,
+                    kind: 1,
+                    canonical_name: format!("node-{node}"),
+                    l0: format!("summary of node {node}"),
+                    status: 0,
+                    last_event_time_ms: NOW_MS,
+                    l1_ref: String::new(),
+                    raw_metadata_ref: String::new(),
+                    vector: Vec::new(),
+                    embedding_model_hash: 0,
+                    embedding_updated_at_ms: 0,
+                    summary_vector: Vec::new(),
+                    summary_vector_valid_from_ms: 0,
+                    summary_vector_model_hash: 0,
+                }),
+            },
+        });
+        assert!(response.status.ok, "node {node}: {:?}", response.status);
+    }
+
+    // How many DISTINCT addresses hold each field text, over every hash in the shard. A text in one
+    // allocation reports 1 however many objects carry it; a text each object owns reports one per
+    // object. Contents cannot tell those apart.
+    let per_text = |engine: &TemporalEngine| -> std::collections::BTreeMap<String, usize> {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let mut addresses: std::collections::BTreeMap<String, std::collections::HashSet<usize>> =
+            std::collections::BTreeMap::new();
+        for (_, fields) in shard.hashes.iter() {
+            for name in fields.keys() {
+                addresses
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(name.as_ptr() as usize);
+            }
+        }
+        addresses
+            .into_iter()
+            .map(|(text, ptrs)| (text, ptrs.len()))
+            .collect()
+    };
+
+    let field = crate::engine::constants::CONTEXT_NODE_FIELD;
+
+    // --- DENOMINATORS, because every claim below divides by them. ---
+    let fresh = per_text(&engine);
+    println!();
+    println!("  fresh:  {fresh:?}");
+    let total_fields: usize = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        shard.hashes.iter().map(|(_, fields)| fields.len()).sum()
+    };
+    assert_eq!(
+        NODES as usize, total_fields,
+        "the fixture wrote {NODES} nodes but the shard holds {total_fields} hash fields, so this \
+         is not the one-field-per-node shape the product write path produces: {fresh:?}"
+    );
+    assert!(
+        fresh.contains_key(field),
+        "no field is named {field:?}, which is the constant `write_context_node` files under, so \
+         this guard is measuring something else: {fresh:?}"
+    );
+
+    // --- THE INVARIANT, ON THE WRITE PATH. ---
+    assert_eq!(
+        Some(&1usize),
+        fresh.get(field),
+        "{NODES} objects share the field name {field:?} and it is held in {:?} separate \
+         allocations. One per object is what the pooled handle removed, and nothing fails when it \
+         comes back, because the names are equal either way",
+        fresh.get(field)
+    );
+
+    // --- AND ACROSS A DECODE, which mints its own handles by construction. ---
+    let calls_before =
+        crate::engine::state::REPACK_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let adopted_before =
+        crate::engine::state::REPACK_ADOPTED_FIELDS.load(std::sync::atomic::Ordering::Relaxed);
+    let manifest = engine
+        .create_bucket_dump_manifest(1, Vec::new())
+        .expect("the dump manifest persists");
+    engine
+        .install_bucket_dump_manifest(&manifest)
+        .expect("the dump manifest installs");
+    let calls_after = crate::engine::state::REPACK_CALLS.load(std::sync::atomic::Ordering::Relaxed);
+    let adopted_after =
+        crate::engine::state::REPACK_ADOPTED_FIELDS.load(std::sync::atomic::Ordering::Relaxed);
+
+    let after = per_text(&engine);
+    println!("  after:  {after:?}");
+    println!(
+        "  decode pass ran {} time(s); field names adopted: {}",
+        calls_after - calls_before,
+        adopted_after - adopted_before
+    );
+
+    // The install has to have gone through a decode, or the assertion below is about the shard the
+    // write path left and says nothing about recovery.
+    assert!(
+        calls_after > calls_before,
+        "the install did not run the decode pass, so nothing here measures what a recovery holds"
+    );
+    let total_after: usize = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        shard.hashes.iter().map(|(_, fields)| fields.len()).sum()
+    };
+    assert_eq!(
+        NODES as usize, total_after,
+        "the decode served {total_after} hash fields for {NODES} nodes, so the recovery lost \
+         or duplicated rows and the allocation count below would be about the wrong \
+         population: {after:?}"
+    );
+    assert_eq!(
+        Some(&1usize),
+        after.get(field),
+        "after a dump and install the field name {field:?} is held in {:?} separate allocations. \
+         The wire shape is a map of owned names, so a decode mints one handle per field; \
+         `adopt_element_names` on the decode pass points them back at the pool, and this is what \
+         fails when that pass stops running, or runs before the pool it borrows from exists",
+        after.get(field)
+    );
+
+    // AND THE ORDER THE ADOPTION MUST NOT DISTURB, checked rather than argued. `HashFieldMap`
+    // keeps its entries sorted by field name and every lookup in it is a binary search, so an
+    // adoption that re-pointed a name and left the vector unsorted would not fail here -- it
+    // would fail later, as a field that is present and cannot be found. A handle to an equal
+    // string sorts identically, which is why this holds; reasoning of that shape is worth one
+    // assertion, and `adopt_field_names`'s own doc says this caller makes it.
+    {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let unsorted: Vec<String> = shard
+            .hashes
+            .iter()
+            .filter(|(_, fields)| !fields.is_sorted_by_field())
+            .map(|(key, _)| key.to_string())
+            .collect();
+        assert!(
+            unsorted.is_empty(),
+            "the field map of {} object(s) is no longer in field-name order after the adoption, \
+             so a binary search in it can miss a field that is present: {unsorted:?}",
+            unsorted.len()
+        );
+    }
+}
+
+/// THE EVENT SERIES IS KEYED BY EVENT ID, NOT BY TIMELINE KEY -- and the auto-compression trigger
+/// read it as though it were the other one.
+///
+/// # THE BUG THIS PINS
+///
+/// The write arm files two things per context event, into two maps, under two different key spaces:
+///
+///   `context_events_series`   point key = `event_id_hash`
+///   `context_event_timeline`  key = `context_timeline_key(event_time_ms, ..)` -> event id
+///
+/// `maybe_auto_compress_context_node` built its event times from the FIRST map and divided its keys
+/// by `CONTEXT_TIMELINE_FANOUT`, naming the variable `timeline_key`. An event id hash below the
+/// fanout divides to ZERO, so a node's whole history read as one repeated instant. The planner then
+/// takes the events strictly newer than the watermark; with every time 0 and the watermark 0 that
+/// slice is empty, so it returned None and the trigger never fired -- at any event count, for any
+/// node, on any store. It was invisible because the policy also defaults off, so nothing reached
+/// the line to be wrong.
+///
+/// # WHY THIS TEST IS PURE
+///
+/// The engine reads its policy from the environment, so an end-to-end check has to set a
+/// process-global and is `#[ignore]`d. This needs none of that: it builds both key spaces exactly
+/// as the write arm does and asks the planner the same question twice. It runs on a plain
+/// `cargo test`, which is what the dead path lacked.
+///
+/// rust-internal: exercises this crate's own key encoding, no product behaviour
+#[test]
+fn the_event_series_is_keyed_by_event_id_not_by_timeline_key() {
+    use crate::engine::constants::CONTEXT_TIMELINE_FANOUT;
+    use crate::engine::context::{context_timeline_key, plan_next_compression_window,
+        ContextCompressionPolicy};
+
+    const EVENTS: u64 = 120;
+    const NOW_MS: u64 = 1_787_270_070_000;
+
+    let policy = ContextCompressionPolicy {
+        enabled: true,
+        ..ContextCompressionPolicy::default()
+    };
+
+    // The two key spaces, built as the write arm builds them.
+    let event_ids: Vec<u64> = (0..EVENTS).map(|index| 1_000 + index).collect();
+    let timeline_keys: Vec<u64> = (0..EVENTS)
+        .map(|index| context_timeline_key(NOW_MS + index * 1_000, 1_000 + index))
+        .collect();
+
+    // WHAT THE OLD READ PRODUCED: every id below the fanout divides to zero.
+    let from_series: Vec<u64> = event_ids
+        .iter()
+        .map(|id| id / CONTEXT_TIMELINE_FANOUT)
+        .collect();
+    // WHAT THE TIMELINE PRODUCES: the times back, in order.

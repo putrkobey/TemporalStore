@@ -17,3 +17,23 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// one edit it is watching for. At `sync_dir`/`sync_parent_dir` it cannot: every directory fsync
 /// the block store performs goes through one of these two functions, wherever it is called from.
 ///
+/// `wal.rs`, `index_log.rs` and `engine.rs` each keep their own private `sync_parent_dir`, so this
+/// counts block-store directory fsyncs and nothing else.
+static DIRECTORY_FSYNCS: AtomicU64 = AtomicU64::new(0);
+
+/// Directory fsyncs issued by the block store so far.
+///
+/// A caller measuring a stage must take a delta across it, never an absolute: this is
+/// process-global and every store in the process contributes.
+pub(crate) fn directory_fsyncs() -> u64 {
+    DIRECTORY_FSYNCS.load(Ordering::Relaxed)
+}
+
+pub(super) fn slab_path(root: &Path, block_slab_id: u64) -> PathBuf {
+    root.join(format!("block_segment_{block_slab_id:020}.seg"))
+}
+
+pub(super) fn slab_manifest_path(root: &Path) -> PathBuf {
+    root.join("block_extent_manifest.json")
+}
+

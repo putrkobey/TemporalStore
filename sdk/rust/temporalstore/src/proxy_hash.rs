@@ -35,3 +35,40 @@ impl ProxyClient {
             .iter()
             .map(|(field, value)| serde_json::json!([field, value.as_bytes()]))
             .collect::<Vec<_>>();
+        let body = self.proxy_service_body(key, &[("entries", serde_json::json!(entries))]);
+        self.proxy_service_execute("/ProxyService/HMSet", body)
+            .map(|_| ())
+    }
+
+    pub fn hmget(&self, key: &str, fields: &[&str]) -> Result<Vec<Option<String>>> {
+        let body = self.proxy_service_body(key, &[("fields", serde_json::json!(fields))]);
+        let response = self.proxy_service_execute("/ProxyService/HMGet", body)?;
+        let raw_values = response
+            .get("values")
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let exists = response
+            .get("exists")
+            .and_then(|value| value.as_array())
+            .cloned();
+        let values = raw_values
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| {
+                let present = exists
+                    .as_ref()
+                    .and_then(|items| items.get(index))
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(!value.is_null());
+                if present {
+                    Some(json_byte_array_to_string(value))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        Ok(values)
+    }
+
+    pub fn hgetall(&self, key: &str) -> Result<Vec<(String, String)>> {
