@@ -39,3 +39,17 @@ async function main() {
       mode,
       event: args.event,
       repo: env.TEMPORALSTORE_REPO || "",
+      endpoint: env.TEMPORALSTORE_AGENT_ENDPOINT || "",
+      normalized_event: normalizedEvent
+    }, null, 2) + "\n");
+    return;
+  }
+
+  if (mode === "dry-run") {
+    process.stdout.write(JSON.stringify({ status: "dry_run", event: normalizedEvent }, null, 2) + "\n");
+    return;
+  }
+
+  if (mode === "remote" || mode === "docker") {
+    process.stdout.write(await callRemoteHook({ event: args.event, normalizedEvent, payload, env }));
+    return;
