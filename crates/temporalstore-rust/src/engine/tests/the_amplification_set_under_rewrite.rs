@@ -111,3 +111,117 @@ struct Snapshot {
     published_recorded_space_ppm: u64,
 }
 
+fn ratio(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 { 0.0 } else { numerator as f64 / denominator as f64 }
+}
+
+impl Snapshot {
+    /// Rewrite pressure as the published denominator computes it.
+    fn rewrite_slab(&self) -> f64 {
+        ratio(self.stored_written, self.live_slab_granular)
+    }
+    /// Rewrite pressure against the blocks the index still points at.
+    fn rewrite_block(&self) -> f64 {
+        ratio(self.stored_written, self.live_block_granular.unwrap_or(0))
+    }
+    /// Space as the published denominator computes it.
+    fn space_slab(&self) -> f64 {
+        ratio(self.physical, self.live_slab_granular)
+    }
+    /// Space against the blocks the index still points at.
+    fn space_block(&self) -> f64 {
+        ratio(self.physical, self.live_block_granular.unwrap_or(0))
+    }
+    /// Space from the RECORD: the live set plus what has been retired and not collected, over the
+    /// live set. Both halves are sums of `ElementEntry::length`, so unlike the two above this one
+    /// does not put a file size over a block-length total.
+    fn space_recorded(&self) -> f64 {
+        let live = self.live_block_granular.unwrap_or(0);
+        ratio(live.saturating_add(self.pending_discard), live)
+    }
+    /// Stored bytes per user byte offered: COMPRESSION, the one ratio that mixes the units on
+    /// purpose because that relationship is its subject.
+    fn compression(&self) -> f64 {
+        if self.logical_written == 0 {
+            0.0
+        } else {
+            self.stored_written as f64 / self.logical_written as f64
+        }
+    }
+}
+
+fn snapshot(engine: &crate::TemporalEngine, label: impl Into<String>) -> Snapshot {
+    let store = engine.block_store.stats();
+    let slabs = engine.block_store.slab_summary();
+    // THE BLOCK-GRANULAR FIGURE, read from the shard's own maintained tally rather than
+    // recomputed here, so this arm and the GC's candidate selection are reading one number.
+    let live_block_granular = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        if shard.bucket_index.block_slab_live.is_ready() {
+            Some(
+                shard
+                    .bucket_index
+                    .block_slab_live
+                    .iter()
+                    .fold(0_u64, |total, (_, tally)| total.saturating_add(tally.bytes)),
+            )
+        } else {
+            None
+        }
+    };
+    // THE RECORDED COLUMN, from the shard's own retired-range record and from the field the shard
+    // publishes out of it. Read together so that a disagreement between them shows up here.
+    let pending_discard = engine
+        .recorded_stale_summary(1)
+        .map(|stale| stale.pending_discard_bytes)
+        .unwrap_or_default();
+    let published_recorded_space_ppm = engine
+        .shard_stats(1)
+        .map(|stats| stats.storage.recorded_space_amplification_ppm)
+        .unwrap_or_default();
+    Snapshot {
+        label: label.into(),
+        stored_written: store.bytes_written,
+        logical_written: store.logical_bytes_written,
+        live_slab_granular: slabs.live_physical_bytes,
+        live_block_granular,
+        physical: slabs.total_known_physical_bytes,
+        reclaimable: slabs.reclaimable_physical_bytes,
+        pending_discard,
+        published_recorded_space_ppm,
+    }
+}
+
+#[test]
+#[ignore = "writes 2,000 keys five times over and runs a reclaim cycle; run by name"]
+fn the_amplification_set_under_rewrite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    let mut shots = Vec::new();
+    for round in 0..=ROUNDS {
+        for index in 0..KEYS {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("amp-{index:06}"),
+                    value: noisy_value(index, round, VALUE),
+                },
+            });
+            assert!(response.status.ok, "round {round} write {index}: {:?}", response.status);
+        }
+        shots.push(snapshot(&engine, if round == 0 {
+            "after 1 write".to_string()
+        } else {
+            format!("after {} writes", round + 1)
+        }));
+    }
+
+    // THE RECLAIM CYCLE, through the production round rather than by reaching into the store. Every
