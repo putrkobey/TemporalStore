@@ -27,3 +27,18 @@ if [ -d "${DATA_DIR}/blocks" ] && [ ! -d "${DATA_DIR}/blocks" ]; then
   export TS_BLOCK_STORE_DIR="${DATA_DIR}/blocks"
 else
   export TS_BLOCK_STORE_DIR="${DATA_DIR}/blocks"
+fi
+export TS_INDEX_DIR="${DATA_DIR}/indexes"
+export TS_REPLICA_REPLAY_CURSOR_DIR="${DATA_DIR}/replica-replay-cursors"
+export TS_CACHE_MEMORY_BYTES="${TS_CACHE_MEMORY_BYTES:-67108864}"
+
+mkdir -p "$TS_CACHE_DIR" "$TS_BLOCK_STORE_DIR" "$TS_INDEX_DIR" \
+  "$TS_REPLICA_REPLAY_CURSOR_DIR"
+
+pids=()
+cleanup() { kill "${pids[@]}" 2>/dev/null || true; }
+trap cleanup EXIT INT TERM
+
+echo "[temporalstore] starting metaserver on 0.0.0.0:${META_PORT}"
+matrixark_rust_metaserver &
+pids+=("$!")
