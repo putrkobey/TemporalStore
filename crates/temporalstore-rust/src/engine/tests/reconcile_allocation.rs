@@ -117,3 +117,63 @@ fn inputs(keys: usize, points: usize, covered: usize) -> (SeriesMap, SeriesMap) 
 
 /// The two forms agree, including on the cases that distinguish them.
 #[test]
+fn refreshing_in_place_gives_the_same_map_as_rebuilding_it() {
+    for (keys, points, covered) in [(8usize, 5usize, 8usize), (8, 5, 4), (8, 5, 0)] {
+        let (persisted, derived) = inputs(keys, points, covered);
+        // DENOMINATORS: both inputs are populated, or the agreement below is between two empties.
+        assert_eq!(keys, persisted.len(), "denominator: persisted keys");
+        assert_eq!(covered, derived.len(), "denominator: derived keys");
+
+        let rebuilt = reconcile_by_rebuilding(&persisted, derived.clone());
+        let mut in_place = persisted.clone();
+        reconcile_in_place(&mut in_place, derived.clone());
+        assert_eq!(
+            rebuilt, in_place,
+            "the two forms disagree at {keys} keys, {points} points, {covered} covered -- so the \
+             transcription and the shipped form are not the same function and nothing below prices \
+             anything"
+        );
+        // And the refresh really happened, or both arms are agreeing on having done nothing.
+        if covered > 0 {
+            let refreshed = in_place
+                .get("f0")
+                .and_then(|series| series.get(&0))
+                .cloned()
+                .expect("f0 at 0 is there");
+            assert_eq!(
+                address(1_000_000),
+                refreshed,
+                "the covered key's address was not refreshed, so the equivalence is vacuous"
+            );
+        }
+        // A derived-only key must arrive, and a persisted-only key must survive.
+        assert!(in_place.contains_key(&format!("f{}", keys - 1)), "every persisted key survives");
+    }
+}
+
+/// What each form allocates, at three corpus sizes.
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "reconciles three corpora twice under the counting allocator; run by name"]
+fn what_a_reconcile_allocates_rebuilding_against_refreshing_in_place() {
+    let mut rows: Vec<(usize, usize, u64, u64, u64, u64)> = Vec::new();
+    for (keys, points) in [(40usize, 1_000usize), (400, 100), (4_000, 10)] {
+        // EVERY KEY COVERED, which is the normal reload: the blocks exist, so this is the case the
+        // path actually takes rather than the failure case.
+        let (persisted, derived) = inputs(keys, points, keys);
+        let total_points = keys * points;
+        assert_eq!(
+            total_points,
+            persisted.values().map(|s| s.len()).sum::<usize>(),
+            "denominator: every point is in the persisted map"
+        );
+
+        let rebuilt_input = derived.clone();
+        let probe = Probe::start();
+        let rebuilt = reconcile_by_rebuilding(&persisted, rebuilt_input);
+        let rebuild_counts = probe.stop();
+        std::hint::black_box(&rebuilt);
+        drop(rebuilt);
+
+        let mut in_place = persisted.clone();
+        let in_place_input = derived.clone();
