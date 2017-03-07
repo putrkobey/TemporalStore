@@ -3283,3 +3283,3288 @@ thread_local! {
     /// Per thread, not per process: appending happens on the calling thread, and a test that set a
     /// process-wide threshold would make every other test running beside it roll too.
     static SEGMENT_BYTES_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set the rolling threshold for THIS THREAD. The environment variable is the supported way to set
+/// it; this exists so a test can roll without disturbing anything running beside it.
+pub fn set_wal_segment_bytes_for_test(threshold: Option<u64>) {
+    SEGMENT_BYTES_OVERRIDE.with(|value| value.set(threshold));
+}
+
+/// The log id one past everything the sealed pieces hold.
+///
+/// Derived rather than stored: sealing is a rename and creating the next piece is a separate step,
+/// so a crash can land between them. Computing this from what is on disk gives the same answer
+/// either way.
+fn log_id_after_sealed(root: &Path, shard_id: ShardId) -> Result<u64, WriteAheadLogError> {
+    let mut end = 0;
+    for path in wal_segment_paths(root, shard_id) {
+        if path == write_ahead_log_path(root, shard_id) || !path.exists() {
+            continue;
+        }
+        let (base, header_len) = read_wal_base(&path)?;
+        let length = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        end = end.max(base.saturating_add(length.saturating_sub(header_len)));
+    }
+    Ok(end)
+}
+
+/// Seal the piece being written and start a fresh one, if it has grown past the threshold.
+///
+/// Called with the append lock held, after a record has been made durable, so the piece being
+/// sealed is complete.
+/// Make sure there is a piece to append to, starting where the sealed pieces end.
+///
+/// Sealing is a rename and creating the next piece is a separate step, so a crash can leave sealed
+/// pieces and nothing being written. An absent piece reads as starting at log id zero, which would
+/// hand out log ids the sealed pieces already own. Creating it here, from what is on disk, gives
+/// the same answer whether or not that crash happened.
+fn ensure_active_wal_segment(
+    inner: &mut WriteAheadLogInner,
+    shard_id: ShardId,
+) -> Result<(), WriteAheadLogError> {
+    let path = active_wal_path(inner, shard_id);
+    // A piece of zero length is one that was created and never got its header, which a crash
+    // between the two leaves behind. It has to be treated as absent: `read_wal_base` reads an
+    // empty file as starting at log id ZERO, and if there are sealed pieces then zero is an
+    // address they already own, so leaving it alone hands the same address out twice.
+    //
+    // Absent and empty take the same branch, so ONE answer decides both. Asking `metadata()`
+    // for the length and `exists()` for the presence was the same `statx` issued twice about
+    // the same file, back to back, under the same append lock.
+    if wal_path_len(path.as_path()).is_some_and(|length| length > 0) {
+        return Ok(());
+    }
+    let start = log_id_after_sealed(&inner.root, shard_id)?;
+    if start == 0 {
+        // No sealed pieces: a log that starts at the beginning needs no header, exactly as before.
+        return Ok(());
+    }
+    let header = crate::log_framing::encode_base_header(start);
+    let mut file = File::create(path.as_path())?;
+    file.write_all(&header)?;
+    file.flush()?;
+    file.sync_all()?;
+    sync_parent_dir(&path)?;
+    inner
+        .base_by_shard
+        .insert(shard_id, (start, header.len() as u64));
+    inner
+        .verified_len_by_shard
+        .insert(shard_id, header.len() as u64);
+    Ok(())
+}
+
+fn roll_wal_segment_if_due(
+    inner: &mut WriteAheadLogInner,
+    shard_id: ShardId,
+    record_end: Option<u64>,
+) -> Result<bool, WriteAheadLogError> {
+    let threshold = wal_segment_bytes();
+    if threshold == 0 {
+        return Ok(false);
+    }
+    let path = active_wal_path(inner, shard_id);
+    let length = wal_path_len(path.as_path()).unwrap_or(0);
+    // From the cache, not the file. This runs on EVERY append to answer "is the piece full", and
+    // `read_wal_base` opens the file and reads its header to do it -- through a `BufReader`, whose
+    // buffer is eight kilobytes. That was 8,240 bytes and an open per write, to learn a number the
+    // shard already knows: `base_by_shard` is written when a piece is created and refreshed by
+    // both reclaim and the roll below, which are the only things that move it.
+    let (base, header_len) = cached_wal_base(inner, shard_id)?;
+    // Where the records stop. Under preallocation the file is longer than the records, and both
+    // decisions below -- is this piece full, and what log id does the next piece start at --
+    // must come from the records: log ids are cumulative RECORD bytes, and a base derived from
+    // the reservation would hand out ids nothing ever occupies.
+    let record_end = record_end.unwrap_or(length).min(length);
+    let holds = record_end.saturating_sub(header_len);
+    if holds < threshold {
+        return Ok(false);
+    }
+
+    // Trim the reservation before sealing, so a sealed piece's length IS its contents and every
+    // reader that derives a sealed piece's end from its file length keeps being right.
+    //
+    // The fsync here is what makes the piece's CONTENTS durable, and it has to happen whether or
+    // not there was anything to trim. A record appended with sync=false sits in the page cache
+    // until a barrier, and the barrier that follows -- `group_commit_sync` -- opens the piece
+    // being written, which after this rename is the NEW one. Sealing an unsynced piece would
+    // therefore leave those bytes with no barrier that ever covers them, while the commit returns
+    // success: acked and not durable.
+    //
+    // Until now that only held by accident. The trim runs when a preallocated file is longer than
+    // its records, which is the default, so the fsync usually happened -- for an unrelated reason.
+    // With preallocation off it did not happen at all. The block store's own roll has always done
+    // this deliberately ("the outgoing slab may hold relaxed (un-fsynced) bulk appends; make them
+    // durable before we seal"); this one now does too.
+    {
+        let file = OpenOptions::new().write(true).open(path.as_path())?;
+        if record_end < length {
+            file.set_len(record_end)?;
+        }
+        crate::durability_metrics::record_barrier("wal_seal_outgoing_piece");
+        file.sync_all()?;
+    }
+    inner.prealloc_physical_by_shard.remove(&shard_id);
+
+    // Seal by rename: atomic, so the piece is either being written or sealed, never neither.
+    let sealed = sealed_wal_path(&inner.root, shard_id, base);
+    fs::rename(path.as_path(), &sealed)?;
+    sync_parent_dir(&sealed)?;
+    // Sealed, and nothing to append to yet. A crash here leaves a log whose pieces are all sealed,
+    // and an absent piece reads as starting at log id zero -- which those pieces already own.
+    crate::fault::point("wal/roll/after_rename");
+
+    // Start the next piece where this one ended. If a crash lands before this, the next append
+    // derives the same starting point from the sealed pieces.
+    let next_base = base.saturating_add(holds);
+    let mut file = File::create(path.as_path())?;
+    // Created, no header yet. A crash here leaves a piece of zero length, which reads as starting
+    // at log id zero for the same reason.
+    crate::fault::point("wal/roll/after_create");
+    file.write_all(&crate::log_framing::encode_base_header(next_base))?;
+    file.flush()?;
+    // No barrier for the header, and none for the directory entry. The header rides the barrier
+    // that makes the first record in this piece durable -- same file, and fsync covers the inode
+    // rather than the handle -- and if no record ever lands here the header was worth nothing. The
+    // directory entry is owed until the next durable barrier, which is before any record in this
+    // piece can be acked.
+    inner.dir_sync_owed_by_shard.insert(shard_id);
+
+    let new_header_len = crate::log_framing::encode_base_header(next_base).len() as u64;
+    inner
+        .base_by_shard
+        .insert(shard_id, (next_base, new_header_len));
+    inner.verified_len_by_shard.insert(shard_id, new_header_len);
+    // Whether a log is written in blocks is a property of the PIECE, and this just replaced it.
+    // The decision is cached per shard because it is answered once per piece, not once per
+    // append -- but nothing invalidated it here, so a shard that latched "no blocks" over a
+    // piece that was already occupied when this process first appended to it kept that answer
+    // for every piece it rolled into afterwards, however empty they started. Measured on the
+    // serving store: the binary carries the footer writer, the log rolls steadily, and not one
+    // piece across the whole store carries a footer.
+    //
+    // Dropping the entry rather than setting it: the next append re-reads the new piece, which is
+    // the same question this asks, and there is only one place that answers it.
+    inner.block_mode_by_shard.remove(&shard_id);
+    // The offset and sequence a footer would record belong to the piece that just sealed.
+    inner.block_last_record_by_shard.remove(&shard_id);
+    // How many bytes of the ACTIVE piece a barrier has covered -- and the active piece is now a
+    // different, empty one. The piece just sealed is counted from the filesystem as a sealed
+    // piece from here on, so leaving its length here counts it twice, and
+    // `persistent_length_bytes` then reports more durable bytes than the log physically holds.
+    // That is the direction the field exists to rule out: understating is survivable, overstating
+    // says unsynced records are on disk to survive a crash.
+    //
+    // It could not correct itself either. One of the three writers takes a `.max()` rather than
+    // overwriting, so a stale high value survives every barrier that path serves.
+    //
+    // Removed rather than set: absent reads as zero, and zero is what a piece whose header has
+    // not been barriered yet has actually got durable.
+    inner.durable_active_bytes_by_shard.remove(&shard_id);
+    Ok(true)
+}
+
+/// The suffix a piece of the log is written with.
+///
+/// The records inside are binary -- a frame magic, then protobuf -- and have been since the log
+/// stopped encoding JSON. The name said `.jsonl` for long enough that reading a store by eye
+/// suggested a format it had not used for a while.
+const WAL_PIECE_SUFFIX: &str = "bin";
+
+/// What the same piece used to be called. Still read, never written.
+///
+/// A store written before the rename has its pieces under this name, and the live one does. If
+/// this were dropped rather than kept, opening such a store would find no log where a log exists,
+/// which is indistinguishable from an empty log and loses every record in it.
+const LEGACY_WAL_PIECE_SUFFIX: &str = "jsonl";
+
+fn write_ahead_log_path(root: &Path, shard_id: ShardId) -> PathBuf {
+    #[cfg(test)]
+    WAL_PATH_BUILDS.with(|builds| builds.set(builds.get() + 1));
+    let renamed = root.join(format!("shard-{shard_id}.wal.{WAL_PIECE_SUFFIX}"));
+    if renamed.exists() {
+        return renamed;
+    }
+    // An existing store keeps the name it already has, so a rename never splits one shard's log
+    // across two names. A store that has neither yet is new, and starts under the current one.
+    let legacy = root.join(format!("shard-{shard_id}.wal.{LEGACY_WAL_PIECE_SUFFIX}"));
+    if legacy.exists() {
+        return legacy;
+    }
+    renamed
+}
+
+/// The active piece's path for this shard, built once and kept.
+///
+/// Same answer as [`write_ahead_log_path`], without rebuilding it. Used on the append path, which
+/// asked for it six times a write; callers that are not per-write can keep using the free
+/// function.
+/// How many times an append asks for the active path. Test-only: the answer decides whether
+/// returning the cached `Arc` instead of a copy of it is worth the call sites it would touch.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static ACTIVE_PATH_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn active_wal_path(inner: &mut WriteAheadLogInner, shard_id: ShardId) -> std::sync::Arc<PathBuf> {
+    #[cfg(test)]
+    ACTIVE_PATH_CALLS.with(|calls| calls.set(calls.get() + 1));
+    if let Some(path) = inner.active_path_by_shard.get(&shard_id) {
+        // The Arc, not a copy of what it holds. Measured at four asks per append and a
+        // thirty-three byte name, the copies were 132 of the append's 225 allocated bytes.
+        return path.clone();
+    }
+    // NOTE: the free function, deliberately. This IS the thing that builds the name; calling the
+    // accessor here would be infinite recursion.
+    let built = std::sync::Arc::new(write_ahead_log_path(&inner.root, shard_id));
+    inner.active_path_by_shard.insert(shard_id, built.clone());
+    built
+}
+
+/// An earlier piece of a shard's log, named by the log id its contents start at.
+///
+/// Zero-padded so the names sort into log order, which is the order the pieces are read in.
+fn sealed_wal_path(root: &Path, shard_id: ShardId, start_log_id: u64) -> PathBuf {
+    root.join(format!(
+        "shard-{shard_id}.wal.{start_log_id:020}.{WAL_PIECE_SUFFIX}"
+    ))
+}
+
+/// Whether this file is an earlier piece of the given shard's log.
+///
+/// The piece being written has no number in its name, so it is not one of these -- an empty middle
+/// section does not parse as a log id.
+fn sealed_wal_start_log_id(path: &Path, shard_id: ShardId) -> Option<u64> {
+    sealed_wal_start_log_id_with(path, &SealedNameParts::for_shard(shard_id))
+}
+
+/// The three fixed strings `sealed_wal_start_log_id` matches a name against, built ONCE.
+///
+/// They depend only on the shard id, and a listing asks the same shard about every file in the
+/// directory -- so building them inside the per-file test allocated three `String`s per file per
+/// listing to re-derive three constants. A replay lists once per window, which puts that at
+/// windows x pieces x 3 allocations: about 35 million for a whole-log replay of an eight-million
+/// record log, none of which had to happen. Hoisted, not cached globally: a local value cannot go
+/// stale and needs no invalidation.
+struct SealedNameParts {
+    prefix: String,
+    suffix: String,
+    legacy_suffix: String,
+}
+
+impl SealedNameParts {
+    fn for_shard(shard_id: ShardId) -> Self {
+        Self {
+            prefix: format!("shard-{shard_id}.wal."),
+            suffix: format!(".{WAL_PIECE_SUFFIX}"),
+            legacy_suffix: format!(".{LEGACY_WAL_PIECE_SUFFIX}"),
+        }
+    }
+}
+
+/// The log id a sealed piece's NAME says its contents start at, matched against prebuilt parts.
+///
+/// Same answer as `sealed_wal_start_log_id`, which is this with the parts built for one call.
+fn sealed_wal_start_log_id_with(path: &Path, parts: &SealedNameParts) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let middle = name.strip_prefix(parts.prefix.as_str())?;
+    // Either name is a piece of the log. A store part-way through the rename holds both, and
+    // reading only one of them would silently skip whichever half it did not recognise.
+    let middle = middle
+        .strip_suffix(parts.suffix.as_str())
+        .or_else(|| middle.strip_suffix(parts.legacy_suffix.as_str()))?;
+    middle.parse().ok()
+}
+
+/// Every file that makes up a shard's log, oldest first, with the one being written last.
+///
+/// A log that has never been rolled is one file, and this returns just that -- the same path the
+/// rest of the code has always used.
+/// Bytes of every piece of this shard's log, sealed pieces included.
+///
+/// The active segment alone is not the log: after a roll its length is the size of the newest
+/// piece, so reporting it as the log's length makes a log SHRINK as it grows.
+fn wal_all_segment_bytes(root: &Path, shard_id: ShardId) -> u64 {
+    wal_segment_paths(root, shard_id)
+        .into_iter()
+        .filter_map(|path| path.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+fn wal_segment_paths(root: &Path, shard_id: ShardId) -> Vec<PathBuf> {
+    wal_segment_pieces(root, shard_id)
+        .into_iter()
+        .map(|piece| piece.path)
+        .collect()
+}
+
+/// One piece of a shard's log, as the listing knows it.
+///
+/// `starts_at` is the log id the piece's contents begin at, taken from its NAME. A sealed piece is
+/// named for that number (`sealed_wal_path`), so the listing already knows it; the piece being
+/// written has no number in its name and answers `None`.
+struct WalPiece {
+    path: PathBuf,
+    starts_at: Option<u64>,
+}
+
+/// Every file that makes up a shard's log, oldest first, with the one being written last -- and
+/// what each sealed one's name says about where it starts.
+///
+/// `wal_segment_paths` already parsed those numbers to SORT by them and then threw them away, so
+/// every reader that wanted to know where a piece begins opened the piece and read its header to
+/// find out. Keeping them costs nothing and is what lets a walk decide from the name alone that a
+/// piece is behind it.
+fn wal_segment_pieces(root: &Path, shard_id: ShardId) -> Vec<WalPiece> {
+    #[cfg(test)]
+    WAL_SEGMENT_LISTINGS.with(|listings| listings.set(listings.get() + 1));
+    // Built once for the whole listing rather than once per file: see `SealedNameParts`.
+    let parts = SealedNameParts::for_shard(shard_id);
+    let mut sealed = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .inspect(|_| {
+            // The ENTRIES, not the call. This is the quantity that grows with the directory, and
+            // the one a per-window listing pays over and over; the call count above cannot show it.
+            #[cfg(test)]
+            WAL_SEGMENT_LISTING_ENTRIES.with(|seen| seen.set(seen.get() + 1));
+        })
+        .filter_map(|path| {
+            sealed_wal_start_log_id_with(&path, &parts).map(|start| (start, path))
+        })
+        .collect::<Vec<_>>();
+    sealed.sort_by_key(|(start, _)| *start);
+    let mut pieces = sealed
+        .into_iter()
+        .map(|(start, path)| WalPiece { path, starts_at: Some(start) })
+        .collect::<Vec<_>>();
+    pieces.push(WalPiece {
+        path: write_ahead_log_path(root, shard_id),
+        starts_at: None,
+    });
+    pieces
+}
+
+/// What each piece of a shard's log says about itself: its name's number, its header's base, and
+/// the log id one past its last record.
+///
+/// The skip in `scan_collect` rests on two claims about this list, and this is what lets a test
+/// assert them rather than take them on trust: a sealed piece's NAME agrees with its HEADER, and
+/// no piece's contents reach into the next piece's range. `None` for the name's number is the
+/// piece being written, which has no number in its name.
+#[cfg(test)]
+pub(crate) fn wal_piece_extents_for_test(
+    root: &Path,
+    shard_id: ShardId,
+) -> Vec<(PathBuf, Option<u64>, u64, u64)> {
+    wal_segment_pieces(root, shard_id)
+        .into_iter()
+        .filter(|piece| piece.path.exists())
+        .map(|piece| {
+            let (base, header_len) = read_wal_base(&piece.path).unwrap_or((0, 0));
+            let length = piece.path.metadata().map(|meta| meta.len()).unwrap_or(0);
+            let end = base.saturating_add(length.saturating_sub(header_len));
+            (piece.path, piece.starts_at, base, end)
+        })
+        .collect()
+}
+
+/// Where a log id lives: which piece of the log, and how far into it.
+///
+/// `None` when the log id is behind everything still kept -- reclaimed -- or ahead of everything
+/// written.
+fn locate_log_id(
+    root: &Path,
+    shard_id: ShardId,
+    log_id: u64,
+) -> Result<Option<(PathBuf, u64)>, WriteAheadLogError> {
+    for path in wal_segment_paths(root, shard_id) {
+        if !path.exists() {
+            continue;
+        }
+        let (base, header_len) = read_wal_base(&path)?;
+        let length = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        if length <= header_len {
+            continue;
+        }
+        let holds = length - header_len;
+        if log_id < base {
+            // Behind this piece, and the pieces are in order, so behind the whole log.
+            return Ok(None);
+        }
+        if log_id - base < holds {
+            return Ok(Some((path, header_len + (log_id - base))));
+        }
+    }
+    Ok(None)
+}
+
+/// Whether a handle still refers to a file that exists under some name.
+///
+/// A descriptor outlives the unlinking of its file, and `flock` on an unlinked inode succeeds --
+/// so a cached lock handle whose file has been removed would grant a lock nobody else contends
+/// for. Checked per acquisition; a link count of zero means re-open.
+#[cfg(unix)]
+fn still_linked(file: &File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    file.metadata().map(|meta| meta.nlink() > 0).unwrap_or(false)
+}
+
+/// Locks are advisory no-ops off unix, so a stale handle costs nothing there.
+#[cfg(not(unix))]
+fn still_linked(_file: &File) -> bool {
+    true
+}
+
+struct WalAppendLock {
+    file: std::sync::Arc<File>,
+}
+
+impl WalAppendLock {
+    /// Take the append lock, opening the lock file only the first time this shard needs it.
+    ///
+    /// An `Arc` clone is a refcount bump, so taking the lock allocates nothing once the handle
+    /// exists. What still happens every time is the `flock` and its release -- that is the lock.
+    fn acquire(
+        inner: &mut WriteAheadLogInner,
+        shard_id: ShardId,
+    ) -> Result<Self, WriteAheadLogError> {
+        let file = match inner.append_lock_by_shard.get(&shard_id) {
+            // Only if the handle still names a file. A cached descriptor on an UNLINKED inode
+            // would still lock successfully while another process, opening the path afresh, locked
+            // a different inode -- both would think they held the append lock. Re-opening by path
+            // every time made that impossible; this restores the guarantee for the cost of one
+            // fstat, which is still cheaper than the open and close it replaces.
+            Some(file) if still_linked(file) => file.clone(),
+            _ => {
+                fs::create_dir_all(&inner.root)?;
+                let path = inner.root.join(format!("shard-{shard_id}.wal.lock"));
+                let file = std::sync::Arc::new(
+                    OpenOptions::new()
+                        .create(true)
+                        .read(true)
+                        .write(true)
+                        .open(path)?,
+                );
+                inner.append_lock_by_shard.insert(shard_id, file.clone());
+                file
+            }
+        };
+        lock_file_exclusive(&file)?;
+        Ok(Self { file })
+    }
+}
+
+impl Drop for WalAppendLock {
+    fn drop(&mut self) {
+        let _ = unlock_file(&self.file);
+    }
+}
+
+#[cfg(unix)]
+fn lock_file_exclusive(file: &File) -> Result<(), std::io::Error> {
+    const LOCK_EX: i32 = 2;
+    loop {
+        let rc = unsafe { flock(file.as_raw_fd(), LOCK_EX) };
+        if rc == 0 {
+            return Ok(());
+        }
+        let err = std::io::Error::last_os_error();
+        if err.kind() != std::io::ErrorKind::Interrupted {
+            return Err(err);
+        }
+    }
+}
+
+#[cfg(unix)]
+fn unlock_file(file: &File) -> Result<(), std::io::Error> {
+    const LOCK_UN: i32 = 8;
+    let rc = unsafe { flock(file.as_raw_fd(), LOCK_UN) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn flock(fd: i32, operation: i32) -> i32;
+}
+
+#[cfg(not(unix))]
+fn lock_file_exclusive(_file: &File) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn unlock_file(_file: &File) -> Result<(), std::io::Error> {
+    Ok(())
+}
+
+/// Process-unique atomic-batch identifier. Only needs to disambiguate concurrently-live batches
+/// within one WAL replay window (a monotonic counter is more than enough); it is never persisted
+/// as a stable key across restarts.
+fn next_batch_id() -> u64 {
+    static BATCH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    BATCH_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+fn wal_bulk_relaxed_durability() -> bool {
+    crate::engine::bulk_ingest_mode()
+}
+
+
+/// Resolve the last WAL sequence for `shard_id` immediately before an append, under the `inner`
+/// lock. Fast path (gate on): if a cached sequence AND a verified file length are both present and
+/// the file on disk is still exactly that length, the warm cache is authoritative -- return it
+/// without the O(records) `last_wal_sequence_at` scan. Otherwise fall back to the full scan (which
+/// also repairs a torn tail via `set_len`), reconcile the verified length against the resulting
+/// on-disk length, and return `max(cache, disk)` exactly as the pre-gate path did.
+///
+/// Also reports the log's length as it was observed, because the caller is about to append at
+/// exactly that offset and the append lock is held across both -- so asking again would be asking
+/// a question already answered.
+fn resolve_last_sequence_for_append(
+    inner: &mut WriteAheadLogInner,
+    shard_id: ShardId,
+    flat_append: bool,
+) -> Result<(u64, u64), WriteAheadLogError> {
+    let cached_last_sequence = inner
+        .last_sequence_by_shard
+        .get(&shard_id)
+        .copied()
+        .unwrap_or_default();
+    if flat_append {
+        if let (true, Some(&verified_len)) = (
+            inner.last_sequence_by_shard.contains_key(&shard_id),
+            inner.verified_len_by_shard.get(&shard_id),
+        ) {
+            let path = active_wal_path(inner, shard_id);
+            let on_disk_len = wal_path_len(path.as_path()).unwrap_or(0);
+            // Under preallocation the file is allowed to be longer than the records; unchanged
+            // means "still exactly the size this process grew it to". Either way, the offset
+            // handed back is where the RECORDS end, which is where the next one goes.
+            let expected_physical = if wal_preallocate_enabled() {
+                inner
+                    .prealloc_physical_by_shard
+                    .get(&shard_id)
+                    .copied()
+                    .unwrap_or(verified_len)
+            } else {
+                verified_len
+            };
+            if on_disk_len == expected_physical {
+                // An unchanged length is not enough under preallocation: another process
+                // appending INSIDE the reservation leaves the file the same size. Its write
+                // starts with a frame byte, never NUL, so one byte read at our record end tells
+                // the two apart -- zero (or reading at the very end) means the reservation is
+                // still ours from here on.
+                let interloper = wal_preallocate_enabled()
+                    && verified_len < on_disk_len
+                    && byte_at(&path, verified_len)?.is_some_and(|byte| byte != 0);
+                if !interloper {
+                    return Ok((cached_last_sequence, verified_len));
+                }
+            }
+        }
+    }
+    inner.stats.append_full_scans = inner.stats.append_full_scans.saturating_add(1);
+    let (disk_last_sequence, active_record_end) = last_wal_sequence_at(&inner.root, shard_id)?;
+    // The scan may have truncated a torn tail, and under preallocation it reports where the
+    // records stop rather than where the file ends -- the file may keep a zeros reservation
+    // after them. The next append belongs at the record end; the fast path compares the file
+    // against its physical size separately.
+    let reconciled_physical = active_wal_path(inner, shard_id)
+        .metadata()
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    let record_end = active_record_end.min(reconciled_physical);
+    inner.verified_len_by_shard.insert(shard_id, record_end);
+    if wal_preallocate_enabled() {
+        inner
+            .prealloc_physical_by_shard
+            .insert(shard_id, reconciled_physical);
+    }
+    Ok((cached_last_sequence.max(disk_last_sequence), record_end))
+}
+
+/// TS_WAL_RECLAIM_MAX_SEGMENTS_PER_PASS: how many sealed pieces one reclaim pass may unlink.
+///
+/// The unlinking happens while the log's lock is held, and every append takes that lock, so an
+/// unbounded pass stops every writer for as long as it takes -- about 45 microseconds per piece,
+/// measured. Zero means unbounded, which is what this did before.
+///
+/// A bound does not reduce total work; it increases it, because every extra pass pays the
+/// directory barrier again. It bounds how long the lock is held in one pass, which is the thing
+/// writers actually feel.
+/// How many whole pieces one reclaim pass may unlink before stopping.
+///
+/// The pass runs under the append lock, so this bounds how long writers wait. 64 was chosen when
+/// deciding a piece was droppable meant decoding it forward: 24.9-72.2 ms per real piece, so even
+/// 64 was 1.6-4.6 s of held lock. Since the droppability test became a single record read from the
+/// next piece it costs 0.354-0.546 ms per piece, measured on real pieces and confirmed at 0.498 ms
+/// across 43 drops on a rolled log -- so the old number now bounds a cost that is ~50-100x smaller
+/// than the one it was set against.
+///
+/// That gap is not free. Pieces arrive faster than 64 per reclaim round on a busy log, so the
+/// backlog grows and the log never drains, and a log that does not drain is paid for at every
+/// restart: on a store whose page scan has been removed, draining the WAL took a restart from
+/// 5,456 ms to 1,908 ms.
+///
+/// 1024 is ~0.5 s of held lock at the measured rate and drains a backlog like that in one pass. It
+/// stays a bound rather than becoming unlimited, so a pathological backlog is still spread over
+/// several passes instead of stalling every writer at once.
+fn wal_reclaim_max_segments_per_pass() -> usize {
+    std::env::var("TS_WAL_RECLAIM_MAX_SEGMENTS_PER_PASS")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(1024)
+}
+
+/// TS_WAL_PREALLOCATE (default ON): write records inside a file that has already been grown
+/// to size instead of growing it on every append. fdatasync on a growing file must persist the
+/// new length -- the bytes are unreadable without it -- so every barrier pays a metadata write.
+/// Growing the file in chunks moves that cost to once per chunk: measured 42-55% cheaper at a
+/// barrier per record (issue #188). Live by default now that the full suite runs green with it
+/// forced on; the env var remains the escape hatch (=0 restores growing appends, and a log
+/// written either way reads back under the other, since the tail scan treats a zeros run as
+/// room and a plain file simply ends at its records).
+fn wal_preallocate_enabled() -> bool {
+    crate::engine::env_flag_default_on("TS_WAL_PREALLOCATE")
+}
+
+/// TS_WAL_PREALLOCATE_CHUNK: how far past the write the file is grown when it runs out of room.
+/// Bounds both how often the size-persisting barrier is paid and how many zero bytes a crash
+/// leaves for the tail scan to walk back over.
+fn wal_preallocate_chunk() -> u64 {
+    std::env::var("TS_WAL_PREALLOCATE_CHUNK")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|bytes| *bytes >= 4096)
+        .unwrap_or(256 * 1024)
+}
+
+/// Group commit is unconditional: concurrent WAL fsyncs coalesce into shared durability
+/// barriers. The append records every byte durably before ack; only the fsync is batched across
+/// writers, so an acked write is durable whether or not it shared its barrier.
+///
+/// This was gated and default-ON. The off path forced an exact per-append fsync and no test
+/// exercised it, so it was a configuration that shipped untested -- removed rather than kept.
+pub fn group_commit_configured() -> bool {
+    true
+}
+
+/// `TS_WAL_COMMIT_DELAY_US` (config `[wal] commit_delay_us`): optional deliberate widening of the
+/// group-commit batch window under extreme load. Default 0 = pure timer-less coalescing (the group
+/// is exactly what accumulates during one durable barrier's in-flight duration).
+pub fn group_commit_delay() -> std::time::Duration {
+    let micros = std::env::var("TS_WAL_COMMIT_DELAY_US")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    std::time::Duration::from_micros(micros)
+}
+
+/// The redundant per-append WAL parent-dir fsync is always skipped -- it is safe once the file
+/// exists, and group commit is unconditional.
+///
+/// This read `!TS_WAL_LEGACY_RECOVERY || group_commit_enabled()`. With group commit always on the
+/// disjunction was already always true, so the legacy-recovery hatch had no effect here even
+/// before the gate was removed.
+fn wal_relaxed_dir_sync() -> bool {
+    true
+}
+
+
+/// Whether THIS log is written in blocks, decided once and remembered.
+///
+/// block mode is a property of the log, not of a flag. A log written without blocks has records
+/// sitting exactly where footer slots would go, and there is no safe way to start blocking it
+/// afterwards: writing a footer lands on durable bytes, and skipping the slot leaves a gap that
+/// only a footer could tell a reader to cross. Both were tried; the first corrupts a record and
+/// the second orphans every record written after it.
+///
+/// So a log gets blocks if it is EMPTY when this process first appends to it. An existing log
+/// keeps the shape it already has, whatever the flag says, for as long as it exists.
+fn shard_uses_blocks(
+    inner: &mut WriteAheadLogInner,
+    shard_id: ShardId,
+    path: &Path,
+) -> Result<bool, WriteAheadLogError> {
+    // The footer is unconditional: the record framing that ships ON cannot locate the log tail
+    // without it, and a store written with framing but no footer degrades 3.8x and keeps growing.
+    // Kept as a `false` branch rather than deleted so the surrounding shape stays reviewable.
+    if false {
+        return Ok(false);
+    }
+    if let Some(known) = inner.block_mode_by_shard.get(&shard_id) {
+        return Ok(*known);
+    }
+    let (_, header_len) = read_wal_base(path)?;
+    let empty = match path.metadata() {
+        Ok(meta) => meta.len() <= header_len,
+        Err(_) => true,
+    };
+    // An existing log qualifies only if it already carries a footer, which means it was written
+    // in blocks from the start.
+    let uses_blocks = if empty {
+        true
+    } else {
+        let mut tally = WalReadTally::start();
+        let mut file = open_wal_read(path, &mut tally)?;
+        let len = file.metadata()?.len();
+        last_written_footer(&mut file, header_len, len)?.is_some()
+    };
+    inner.block_mode_by_shard.insert(shard_id, uses_blocks);
+    Ok(uses_blocks)
+}
+
+/// How many times an append OPENS the active piece, and how many times it asks the filesystem for
+/// that piece's physical length.
+///
+/// A batch is one crash-atomic group under one barrier, but it used to open, write, stat and close
+/// the piece once per record -- 4N syscalls against that single barrier. It now opens once and
+/// reads the length once, and these say so as a COUNT, which is the honest measurement when the
+/// syscalls are the cost and the machine cannot resolve the wall clock.
+///
+/// Thread-local and test-only, like `ACTIVE_PATH_CALLS` above, and for the same reason: the suite
+/// runs tests in parallel and every one of them that touches a log opens a file. A process-global
+/// counter reads other tests' work as its own -- which it did, as a flake on `main`.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WAL_FILE_OPENS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static WAL_FILE_STATS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times a walk LISTS the log's directory, and how many pieces it reads a HEADER from.
+///
+/// The read side's analogue of `WAL_FILE_OPENS`, and counted for the same reason: a replay is a
+/// loop of bounded windows, and what a window costs beyond the records it returns is metadata --
+/// a directory listing, and a header read per piece it walks past to find where the window starts.
+/// Neither shows up in the record count, in the bytes returned, or in a wall clock this machine
+/// can resolve, so neither is measurable except by counting it here.
+///
+/// Thread-local and test-only for the same reason the two above are: every test that touches a log
+/// lists a directory, and a process-global counter reads their work as this one's.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WAL_SEGMENT_LISTINGS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    /// Directory ENTRIES those listings walked, summed across all of them.
+    ///
+    /// `WAL_SEGMENT_LISTINGS` counts the CALL. One call over a 14-piece log and one over a
+    /// 5,000-piece log both count as one, so a walk that lists once per window reads as linear in
+    /// the windows -- which is exactly what a per-window listing over a growing directory is not.
+    /// The work is the entries, and the entries are windows x pieces: the same product
+    /// `scan_collect` stopped paying in piece-header reads, still being paid one directory entry
+    /// at a time where no counter looked.
+    ///
+    /// Invisible below a few hundred pieces for a mechanical reason: one `getdents64` returns the
+    /// whole directory until it no longer fits in the kernel's buffer, so at the 14, 54 and 67
+    /// piece logs every measurement of this log has been taken on, the syscall count is flat and
+    /// says nothing about the entries behind it. This counts the entries.
+    pub(crate) static WAL_SEGMENT_LISTING_ENTRIES: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    pub(crate) static WAL_SEGMENT_HEADER_READS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    /// Pieces a walk stepped over on the strength of the NEXT piece's NAME, without opening them.
+    ///
+    /// The row the fix in `scan_collect` adds, counted where the decision is taken rather than
+    /// where it is used, so a second skip site cannot appear without counting.
+    pub(crate) static WAL_PIECES_SKIPPED_BY_NAME: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    /// Pieces a walk opened to READ RECORDS out of, as opposed to reading a header from.
+    pub(crate) static WAL_PIECE_BODY_READS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    /// Pieces a walk read the LAST SEQUENCE out of (`last_wal_sequence_in`).
+    ///
+    /// A separate row from the header reads because it answers a different question and cannot be
+    /// answered the same way: a piece's NAME carries the log id it starts at, and nothing carries
+    /// the sequence it ends at. `log_id_after_sequence` walks the pieces asking exactly that, once
+    /// per replay, and this is what makes that walk's cost visible rather than folded into the
+    /// window cost beside it.
+    pub(crate) static WAL_PIECE_TAIL_READS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    /// EVERY open the read side makes, counted inside the open itself.
+    ///
+    /// The outer total the residual is taken against. It is deliberately NOT the sum of the rows
+    /// above: it counts in `open_wal_read`, which is the one primitive every read-side open goes
+    /// through, so an open that belongs to no named row shows up as residual rather than
+    /// disappearing. A row is an audit of this number, never an ingredient of it.
+    pub(crate) static WAL_READ_FILE_OPENS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Bytes this process has pulled off log PIECES, and the read calls that fetched them.
+///
+/// The store's own `bytes_read` counts what a scan HANDS BACK -- the records inside the window
+/// the caller asked for. A windowed replay reads a great deal more than it hands back, and none
+/// of it was anybody's row: at 200,000 records a restore read 987,705,371 bytes off one 32.8 MB
+/// log piece while every counter this engine keeps about itself reported the restore flat. A
+/// quantity nothing counts is a quantity nothing can report a regression in.
+///
+/// Process-wide rather than per-store, and deliberately: the primitive is reached from free
+/// functions that hold no store, so charging a store would mean threading one through the whole
+/// read side to buy a number that is already obtainable. The thread-local beside it is what a
+/// single restore wants, because a restore runs on one thread while the process does not.
+static WAL_PIECE_BYTES_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WAL_PIECE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static WAL_PIECE_BYTES_READ_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static WAL_PIECE_READS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Bytes and read calls this PROCESS has made against log pieces since it started.
+pub fn wal_piece_read_counts() -> (u64, u64) {
+    (
+        WAL_PIECE_BYTES_READ.load(AtomicOrdering::Relaxed),
+        WAL_PIECE_READS.load(AtomicOrdering::Relaxed),
+    )
+}
+
+/// Bytes and read calls THIS THREAD has made against log pieces since it started.
+///
+/// A restore runs on one thread; the suite runs many at once. Measuring a restore against the
+/// process counter would read another test's reads as this one's.
+pub fn wal_piece_read_counts_on_this_thread() -> (u64, u64) {
+    (
+        WAL_PIECE_BYTES_READ_HERE.with(|bytes| bytes.get()),
+        WAL_PIECE_READS_HERE.with(|reads| reads.get()),
+    )
+}
+
+/// What one span of reading against log pieces cost, published when it goes out of scope.
+///
+/// Held mutably by the [`CountedWalFile`] it is passed to, so the handle cannot outlive it and a
+/// new read of a piece cannot be written without one to hand over.
+pub(crate) struct WalReadTally {
+    bytes: u64,
+    reads: u64,
+}
+
+impl WalReadTally {
+    fn start() -> Self {
+        Self { bytes: 0, reads: 0 }
+    }
+}
+
+impl Drop for WalReadTally {
+    fn drop(&mut self) {
+        if self.reads == 0 {
+            return;
+        }
+        WAL_PIECE_BYTES_READ.fetch_add(self.bytes, AtomicOrdering::Relaxed);
+        WAL_PIECE_READS.fetch_add(self.reads, AtomicOrdering::Relaxed);
+        WAL_PIECE_BYTES_READ_HERE.with(|bytes| bytes.set(bytes.get() + self.bytes));
+        WAL_PIECE_READS_HERE.with(|reads| reads.set(reads.get() + self.reads));
+    }
+}
+
+/// A readable handle on one piece of a log, which charges every byte the kernel hands it.
+///
+/// This is the only thing [`open_wal_read`] returns, and [`open_wal_read`] is the only way the
+/// read side opens a piece -- so the counting is not a call site anyone has to remember. It is
+/// what makes 957 MB of reading a QUANTITY rather than a residual.
+pub(crate) struct CountedWalFile<'a> {
+    file: File,
+    tally: &'a mut WalReadTally,
+}
+
+impl CountedWalFile<'_> {
+    fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+
+    /// Exactly `buf.len()` bytes from `at`, charged as one read.
+    ///
+    /// The footer probes used to do this through a `BufReader`, which fills 8 KiB to hand back
+    /// the 32 a footer slot holds. Reading the slot itself is the same answer for 256 times
+    /// fewer bytes, and it is the only shape that can be charged honestly.
+    fn read_exact_at(&mut self, at: u64, buf: &mut [u8]) -> std::io::Result<()> {
+        self.file.seek(SeekFrom::Start(at))?;
+        self.file.read_exact(buf)?;
+        self.tally.bytes += buf.len() as u64;
+        self.tally.reads += 1;
+        Ok(())
+    }
+
+    /// Up to `buf.len()` bytes from the current position, stopping at end of file.
+    ///
+    /// Loops, because a SHORT READ IS NOT AN END OF FILE: a reader that took the first `read`'s
+    /// return value for the whole answer would see a truncated header on a file that has one, and
+    /// a header that fails to decode reads as a base of zero -- the silent direction.
+    fn read_window(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut filled = 0usize;
+        while filled < buf.len() {
+            match self.read(&mut buf[filled..]) {
+                Ok(0) => break,
+                Ok(read) => filled += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(filled)
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.file.set_len(len)
+    }
+
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
+impl Read for CountedWalFile<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file.read(buf)?;
+        self.tally.bytes += read as u64;
+        self.tally.reads += 1;
+        Ok(read)
+    }
+}
+
+impl Seek for CountedWalFile<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
+/// Open a piece of the log for reading, and count what comes off it.
+///
+/// Every read-side open in this module goes through here, which is the one place a total can be
+/// taken: it is what makes the per-record residual in `wal_replay_scale` a measurement of the
+/// whole operation rather than a restatement of the rows it audits, and it is what makes the
+/// BYTES a quantity at all. `File::open` on its own is no longer the same thing -- it hands back
+/// a handle that counts nothing -- so the handle this returns is the only readable one, and a
+/// new read of a piece cannot be written without a tally to pass.
+fn open_wal_read<'a>(
+    path: &Path,
+    tally: &'a mut WalReadTally,
+) -> std::io::Result<CountedWalFile<'a>> {
+    #[cfg(test)]
+    WAL_READ_FILE_OPENS.with(|opens| opens.set(opens.get() + 1));
+    Ok(CountedWalFile {
+        file: File::open(path)?,
+        tally,
+    })
+}
+
+/// Exactly `len` bytes from `at` in a piece, through the one handle the read side uses.
+///
+/// The planted-marker control for the piece counter needs a read whose byte count IT decided,
+/// and the counted handle is private to this module. See
+/// `wal_replay_windows::the_piece_byte_counter_recovers_a_planted_read_exactly`.
+#[cfg(test)]
+pub(crate) fn read_piece_for_test(
+    path: &Path,
+    at: u64,
+    len: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut tally = WalReadTally::start();
+    let mut file = open_wal_read(path, &mut tally)?;
+    let mut bytes = vec![0u8; len];
+    file.read_exact_at(at, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Open a piece for the tail repair, which rewrites it in place.
+///
+/// Read-WRITE, and still one of the read side's opens of a piece: it is counted as one, and the
+/// bytes it reads are charged like any other, or the counter would stop seeing this branch the
+/// moment binary framing were turned off.
+fn open_wal_repair<'a>(
+    path: &Path,
+    tally: &'a mut WalReadTally,
+) -> std::io::Result<CountedWalFile<'a>> {
+    #[cfg(test)]
+    WAL_READ_FILE_OPENS.with(|opens| opens.set(opens.get() + 1));
+    Ok(CountedWalFile {
+        file: OpenOptions::new().read(true).write(true).open(path)?,
+        tally,
+    })
+}
+
+/// Open a piece to walk its TAIL for the last sequence it holds.
+///
+/// The same open as `open_wal_read` under a second name, so the residual has a row for it. One
+/// `last_wal_sequence_in` is two or three of these -- a footer hint, then the walk the hint points
+/// at -- and counting at the call instead of at the open reported one where three happened.
+fn open_wal_tail_scan<'a>(
+    path: &Path,
+    tally: &'a mut WalReadTally,
+) -> std::io::Result<CountedWalFile<'a>> {
+    #[cfg(test)]
+    WAL_PIECE_TAIL_READS.with(|reads| reads.set(reads.get() + 1));
+    open_wal_read(path, tally)
+}
+
+/// How many times an append asks the FILESYSTEM for the active piece's length, and how many
+/// times it rebuilds that piece's NAME.
+///
+/// Both are metadata, and metadata is what a round of appends actually spends itself on.
+/// Measured on the release binary at 2,000 and 20,000 records of 128 incompressible bytes, a
+/// steady-state append issues 22 syscalls; one `write` and one `fdatasync` are the durable
+/// work and nine of the other twenty are `statx`. Counted here rather than inferred, because
+/// a syscall nobody counts is a syscall that comes back.
+///
+/// `WAL_PATH_LEN_ASKS` counts the asks made through [`wal_path_len`] -- one ask, one `statx`.
+/// `WAL_PATH_BUILDS` counts [`write_ahead_log_path`], which decides the piece's name by asking
+/// whether each candidate exists and so costs a `statx` of its own; the append path holds that
+/// name cached and should not rebuild it at all.
+///
+/// Thread-local and test-only for the same reason the counters above are: the suite runs tests
+/// in parallel and a process-global counter reads another test's appends as this one's.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static WAL_PATH_LEN_ASKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    pub(crate) static WAL_PATH_BUILDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// The active piece's length, or `None` when there is no file.
+///
+/// ONE ask, not two. `Path::exists` is itself a `metadata()` call, so a site that wanted both
+/// "is it there" and "how long is it" asked the filesystem the same question twice running --
+/// and got two answers from two different instants, which is strictly weaker than one answer
+/// from one instant. Nothing is remembered here: the question is still put to the filesystem
+/// on every call, so there is no cached length to go stale and no invalidation to get wrong.
+fn wal_path_len(path: &Path) -> Option<u64> {
+    #[cfg(test)]
+    WAL_PATH_LEN_ASKS.with(|asks| asks.set(asks.get() + 1));
+    path.metadata().ok().map(|metadata| metadata.len())
+}
+
+/// Where the shard's active piece's RECORDS end, without asking for the file's length.
+///
+/// The append primitive maintains `verified_len_by_shard` as exactly this, so the common answer
+/// costs nothing at all; a shard this process has not appended to this lifetime falls back to
+/// the tail scan, which is the only other thing that knows. Neither is the file's LENGTH, which
+/// under preallocation is the reservation -- see `note_durable_record_end` for what reporting
+/// that costs.
+fn active_record_end(inner: &mut WriteAheadLogInner, shard_id: ShardId) -> u64 {
+    if let Some(&record_end) = inner.verified_len_by_shard.get(&shard_id) {
+        return record_end;
+    }
+    let path = active_wal_path(inner, shard_id);
+    last_wal_sequence_in(path.as_path())
+        .map(|(_, record_end)| record_end)
+        .unwrap_or(0)
+}
+
+/// The ONE place a barrier records how far a shard's ACTIVE piece has been made durable.
+///
+/// Three barrier paths reach this field -- `flush`, the group-commit barrier and the append
+/// primitive's own sync -- and two of them used to take the file's LENGTH. Under preallocation
+/// (`TS_WAL_PREALLOCATE`, default ON) the file has been grown with `set_len` to a
+/// `TS_WAL_PREALLOCATE_CHUNK` boundary -- 256 KiB by default -- past the last record, so its
+/// length is the RESERVATION: zeros that no record occupies and that a crash leaves holding
+/// nothing. Measured on this tree at the default chunk, the file's length reported 262,144
+/// durable bytes for a log holding 10,100 of records (25.9x) and the same 262,144 for a log
+/// holding 30 (8,738x).
+///
+/// `info()` states the direction this figure must never err in -- "understating is survivable;
+/// overstating is the failure this field exists to prevent" -- and `roll_wal_segment_if_due`
+/// repeats it when it clears the entry. A file length errs in exactly that direction. A record
+/// end cannot: it is where the bytes stop.
+///
+/// Taking the record end as an argument rather than measuring it here is deliberate. Every
+/// caller already holds one -- the append primitive has just written to it, `flush` gets it back
+/// from the tail scan it pays for anyway, and the group-commit barrier reads the cache the
+/// primitive maintains -- so there is no call site that has to reach for the filesystem, and the
+/// call that used to do so is one `statx` per append that no longer happens.
+///
+/// `monotonic` is the group-commit barrier alone. Barriers for one shard can complete out of
+/// order there, so it must not lower a figure a later one already raised; the other two hold the
+/// shard's lock across the write and set it outright. The roll clears the entry, which is what
+/// stops that `max` carrying a sealed piece's figure into the next piece.
+fn note_durable_record_end(
+    inner: &mut WriteAheadLogInner,
+    shard_id: ShardId,
+    record_end: u64,
+    monotonic: bool,
+) {
+    let entry = inner
+        .durable_active_bytes_by_shard
+        .entry(shard_id)
+        .or_default();
+    *entry = if monotonic {
+        (*entry).max(record_end)
+    } else {
+        record_end
+    };
+}
+
+fn append_record_locked(
+    inner: &mut WriteAheadLogInner,
+    record: &WriteAheadLogRecord,
+    sync: bool,
+    known_offset: Option<u64>,
+) -> Result<WriteAheadLogAppendReport, WriteAheadLogError> {
+    append_record_locked_on(inner, record, sync, known_offset, None)
+}
+
+/// The same append, optionally writing through a handle the caller already opened.
+///
+/// Only the atomic batch passes one. It holds the append lock and the `inner` lock across its
+/// whole loop and rolls the piece only AFTER the batch, so the path cannot be sealed and renamed
+/// underneath a handle held across records -- which is the one thing that would make reusing it
+/// unsafe.
+fn append_record_locked_on(
+    inner: &mut WriteAheadLogInner,
+    record: &WriteAheadLogRecord,
+    sync: bool,
+    known_offset: Option<u64>,
+    reuse: Option<(&mut std::fs::File, &mut u64)>,
+) -> Result<WriteAheadLogAppendReport, WriteAheadLogError> {
+    let path = active_wal_path(inner, record.shard_id);
+    // The caller has usually just measured this under the same append lock, so taking its answer
+    // costs nothing and asking again costs a stat. With no answer in hand, the record end comes
+    // from the cache this function itself maintains -- under preallocation the file's length is
+    // the RESERVATION, so the metadata fallback would put the record after the zeros; and a
+    // caller looping appends (the atomic batch) needs each write to advance the next one's
+    // offset, which only holds if the cache is updated here, where the write happens.
+    let mut offset = match known_offset {
+        Some(offset) => offset,
+        None => match inner.verified_len_by_shard.get(&record.shard_id) {
+            Some(&record_end) if wal_preallocate_enabled() => record_end,
+            _ => {
+                if wal_preallocate_enabled() && path.exists() {
+                    // Cold under the gate: the file may end in a reservation another process
+                    // left, so ask the tail scan where the records stop.
+                    let (_, record_end) = last_wal_sequence_in(&path)?;
+                    record_end
+                } else {
+                    path.metadata().map(|metadata| metadata.len()).unwrap_or(0)
+                }
+            }
+        },
+    };
+    // Frame the record with a length + SHA-256 digest so a later value-preserving bit-flip in
+    // this committed line is detected on read (see `crate::log_framing`). Offsets/stats below
+    // use the real byte length, so framing is transparent to the append report and replication.
+    // Taken out and returned below: framing borrows the buffer while the rest of `inner` is still
+    // needed, and `mem::take` is the cheap way to say that without splitting the struct.
+    let mut bytes = std::mem::take(&mut inner.encode_scratch);
+    // BOTH flags, not just the first. The fused path writes the RAW marker and unescaped
+    // protobuf, which is what the length-prefixed frame wants and what the LINE frame cannot
+    // take: a line frame has to escape the newlines out of the payload first, and carries a
+    // different marker to say so. Fusing on `binary_records` alone wrote raw bytes into a line
+    // frame, and a value containing a newline then split into two unreadable records --
+    // `what_each_frame_costs_on_disk` toggles the frame flag precisely to catch that, and did.
+    // Compression is excluded from the borrowing writer deliberately: it reserves
+    // the frame from a length the payload does not have yet. See `encode`.
+    if crate::log_framing::binary_frame_enabled()
+        && !crate::wal_proto::compress_records_enabled()
+    {
+        // The payload lands directly in the frame. Building it separately meant carrying the
+        // record twice -- once into its own buffer and once into this one -- and at a four
+        // kilobyte value the second copy was four kilobytes of pure duplication.
+        let prepared = crate::wal_proto::prepare(record).map_err(|err| {
+            WriteAheadLogError::Corruption(format!("engine wal record encode failed: {err}"))
+        })?;
+        let written = crate::log_framing::encode_framed_into(
+            prepared.payload_len(),
+            |out| prepared.put(record, out),
+            &mut bytes,
+        );
+        match written {
+            // The record wrote a different number of bytes than it measured. The frame declares
+            // its length up front, so writing it would make every record after it unreadable --
+            // fail the append instead, with the buffer already cleared.
+            Err(mismatch) => {
+                inner.encode_scratch = bytes;
+                return Err(WriteAheadLogError::Corruption(format!(
+                    "engine wal record framing failed: {mismatch}"
+                )));
+            }
+            Ok(Err(err)) => {
+                inner.encode_scratch = bytes;
+                return Err(WriteAheadLogError::Corruption(format!(
+                    "engine wal record encode failed: {err}"
+                )));
+            }
+            Ok(Ok(())) => {}
+        }
+    } else {
+        let payload = encode_wal_payload(record)?;
+        crate::log_framing::encode_record_into(&payload, &mut bytes);
+    }
+    // Close the block if this record will not fit in what is left of it, and start the next.
+    //
+    // A record is never split across the boundary: the one that does not fit moves whole into
+    // the next block. That wastes the tail of a block -- bounded by the largest record -- and
+    // buys a reader that never has to reassemble anything, which is the trade a log makes when
+    // its own footer is the thing keeping recovery cheap.
+    let mut close_block_and_advance: Option<(u64, Vec<u8>)> = None;
+    if shard_uses_blocks(inner, record.shard_id, &path)? {
+        let (_, header_len) = cached_wal_base(inner, record.shard_id)?;
+        if offset >= header_len {
+            let relative = offset - header_len;
+            let index = block_of(relative);
+            let data_end = block_data_end(index);
+            // A footer never writes a footer behind where records already reach. In a log that
+            // was written WITHOUT blocks -- every log that predates this gate -- the bytes at a
+            // slot's offset belong to a record, and closing that block would write the footer
+            // straight through durable data. The window is small, about 128 bytes in 131072, and
+            // that is exactly what makes it dangerous: a corruption that rare survives testing
+            // and turns up in a log nobody is watching.
+            //
+            // When the slot is already occupied the block simply does not get a footer. Readers
+            // fall back to walking it, which is correct and only unoptimised.
+            let slot_is_free = relative <= data_end;
+            if relative + bytes.len() as u64 > data_end && slot_is_free {
+                // What this block ends up describing: the last record that STARTED in it.
+                let (last_offset, last_sequence) = inner
+                    .block_last_record_by_shard
+                    .get(&record.shard_id)
+                    .copied()
+                    .unwrap_or((offset, record.sequence.saturating_sub(1)));
+                let slot = encode_block_footer(
+                    index,
+                    (relative.saturating_sub(index * WAL_BLOCK_BYTES)) as u32,
+                    last_offset,
+                    last_sequence,
+                    0,
+                );
+                close_block_and_advance = Some((header_len + block_footer_at(index), slot));
+                offset = header_len + (index + 1) * WAL_BLOCK_BYTES;
+            }
+            // When the slot is occupied nothing happens at all: no footer, and no advance
+            // either. Advancing was the first attempt and it lost every record written
+            // afterwards -- skipping the slot leaves a run of zeros, and the ONLY thing that
+            // tells a reader records continue past a gap is a footer, which is precisely what
+            // an occupied slot cannot have. So this block keeps being written straight through,
+            // exactly as it was before blocks existed, and there is no gap to cross. Later
+            // blocks, whose slots this log has not reached, close normally.
+        }
+    }
+    let prealloc = wal_preallocate_enabled();
+    let mut opened;
+    let mut carried_physical: Option<&mut u64> = None;
+    let file: &mut std::fs::File = match reuse {
+        Some((handle, physical)) => {
+            carried_physical = Some(physical);
+            handle
+        }
+        None => {
+            #[cfg(test)]
+            WAL_FILE_OPENS.with(|opens| opens.set(opens.get() + 1));
+            opened = if prealloc {
+                // Positioned write, not O_APPEND: with a reservation, the physical end of the
+                // file is zeros, and O_APPEND would put this record after them.
+                OpenOptions::new().create(true).write(true).open(path.as_path())?
+            } else {
+                OpenOptions::new().create(true).append(true).open(path.as_path())?
+            };
+            &mut opened
+        }
+    };
+    if prealloc {
+        let needed = offset.saturating_add(bytes.len() as u64);
+        // The batch carries the length it already knows. Nothing else can change it while the
+        // append lock and the `inner` lock are both held, and the batch updates its copy below
+        // whenever it grows the file -- so asking the filesystem again would be a syscall to
+        // learn a number already in hand.
+        let physical = match carried_physical.as_deref() {
+            Some(&known) if known > 0 => known,
+            _ => {
+                #[cfg(test)]
+                WAL_FILE_STATS.with(|stats| stats.set(stats.get() + 1));
+                file.metadata()?.len()
+            }
+        };
+        // Carried rather than re-read. The length after this block is either the one just read or
+        // the one just set, so asking the filesystem again is a second stat a write to learn a
+        // number already in hand.
+        let physical = if physical < needed {
+            // Grow to a chunk boundary. This is the one place the file's length changes, so it
+            // is the one place a barrier still has to persist a size -- once per chunk instead
+            // of once per record.
+            let chunk = wal_preallocate_chunk();
+            let target = needed
+                .saturating_add(chunk.saturating_sub(1))
+                .saturating_div(chunk)
+                .saturating_mul(chunk);
+            file.set_len(target)?;
+            target
+        } else {
+            physical
+        };
+        if let Some(known) = carried_physical.as_deref_mut() {
+            *known = physical;
+        }
+        inner
+            .prealloc_physical_by_shard
+            .insert(record.shard_id, physical);
+        if let Some((at, slot)) = close_block_and_advance.as_ref() {
+            file.seek(SeekFrom::Start(*at))?;
+            file.write_all(slot)?;
+        }
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(&bytes)?;
+    } else {
+        if let Some((at, slot)) = close_block_and_advance.as_ref() {
+            // Without preallocation the file is opened for append, so the footer needs its own
+            // positioned handle: a footer belongs at a computed offset, never at the end.
+            let mut positioned = OpenOptions::new().write(true).open(path.as_path())?;
+            positioned.seek(SeekFrom::Start(*at))?;
+            positioned.write_all(slot)?;
+            positioned.flush()?;
+        }
+        file.write_all(&bytes)?;
+    }
+    if inner
+        .block_mode_by_shard
+        .get(&record.shard_id)
+        .copied()
+        .unwrap_or(false)
+    {
+        // Remember what this block will say when it closes.
+        inner
+            .block_last_record_by_shard
+            .insert(record.shard_id, (offset, record.sequence));
+    }
+    if sync {
+        file.flush()?;
+        crate::durability_metrics::record_barrier("engine_wal_append");
+        file.sync_data()?;
+        // The parent-directory entry for the WAL file only needs a durable barrier when
+        // the file is first created; appends grow the file (inode) without changing the
+        // directory. Under relaxed-sync -- the single-barrier default, with group commit
+        // unconditional -- skip the redundant per-append dir fsync once the file already has
+        // content (offset > 0).
+        // `offset == 0` is the file's first write, which is the usual reason the directory entry
+        // is not yet durable. After a roll it is not zero -- the header is already there -- so the
+        // debt the roll recorded is what says the entry still has to reach disk.
+        let owed = inner.dir_sync_owed_by_shard.contains(&record.shard_id);
+        if offset == 0 || owed || !wal_relaxed_dir_sync() {
+            sync_parent_dir(&path)?;
+            inner.dir_sync_owed_by_shard.remove(&record.shard_id);
+        }
+        inner.stats.flushes += 1;
+        inner.stats.syncs += 1;
+        inner.stats.last_flushed_sequence = record.sequence;
+    }
+    // Ask the handle that was just written, not the path: it is cheaper, and it is the file
+    // this record actually went into rather than whatever the name refers to now. Under
+    // preallocation the file's length is the reservation, not the records, so the record end is
+    // where this write stopped.
+    let persistent_bytes = if prealloc {
+        offset.saturating_add(bytes.len() as u64)
+    } else {
+        file.metadata()?.len()
+    };
+    // The record-end cache advances with the write itself, so a caller that appends in a loop
+    // without re-measuring (the atomic batch) still places every record after the previous one.
+    inner
+        .verified_len_by_shard
+        .insert(record.shard_id, persistent_bytes);
+    inner.stats.writes += 1;
+    inner.stats.bytes_written += bytes.len() as u64;
+    inner.stats.persistent_bytes = persistent_bytes;
+    if sync {
+        // EVERY path that makes a record durable records it per shard, not just flush() and the
+        // group-commit barrier: a replayed append syncs here and nowhere else, and a durability
+        // figure that misses one sync path understates exactly the writes a follower just took.
+        note_durable_record_end(inner, record.shard_id, persistent_bytes, false);
+        let durable_sequence = inner
+            .durable_sequence_by_shard
+            .entry(record.shard_id)
+            .or_default();
+        *durable_sequence = (*durable_sequence).max(record.sequence);
+    }
+    let size = bytes.len() as u64;
+    // Every append path funnels through here, so this is the one place the undumped growth has
+    // to be counted for all of them.
+    *inner
+        .undumped_bytes_by_shard
+        .entry(record.shard_id)
+        .or_default() += size;
+    // The same funnel, in the quantity the writer's batching cannot move. A record built from
+    // outcomes carries one per object it mutated (`append_batch_as_one_record` is the whole batch
+    // in one record); a record that carries none is one command, so one mutation. `max(1)` is not
+    // a floor against an empty batch -- a batch with nothing staged takes the command path and
+    // arrives here one record per command -- it is the count for exactly that shape.
+    *inner
+        .undumped_objects_by_shard
+        .entry(record.shard_id)
+        .or_default() += record.outcomes.len().max(1) as u64;
+    // Give the buffer back with its capacity, which is the whole reason it was borrowed. An early
+    // return above simply drops it and the next append allocates once -- correct either way, just
+    // not free that once.
+    inner.encode_scratch = bytes;
+    Ok(WriteAheadLogAppendReport {
+        shard_id: record.shard_id,
+        requested_sequence: record.sequence,
+        current_sequence: record.sequence,
+        appended: true,
+        offset,
+        size,
+        persistent_bytes,
+    })
+}
+
+/// Read the reclaim-base header, returning `(base_offset, header_len_bytes)`.
+///
+/// A file with no header has never been reclaimed, so nothing has shifted: base 0, header
+/// length 0. Every reader skips `header_len` bytes; every address resolves against `base`.
+/// Cached `(base, header_len)` for a shard, reading it from disk only the first time.
+fn cached_wal_base(
+    inner: &mut WriteAheadLogInner,
+    shard_id: ShardId,
+) -> Result<(u64, u64), WriteAheadLogError> {
+    if let Some(cached) = inner.base_by_shard.get(&shard_id) {
+        return Ok(*cached);
+    }
+    let path = active_wal_path(inner, shard_id);
+    let base = read_wal_base(&path)?;
+    inner.base_by_shard.insert(shard_id, base);
+    Ok(base)
+}
+
+/// Whether a reclaim pass buys enough space to justify the copy it requires.
+///
+/// `removed_bytes` is what the pass would free; `retained_bytes` is what it must rewrite to do
+/// so. Below `min_copy_bytes` the rewrite is cheap and the ratio is a meaningless measure of a
+/// small log, so the pass always proceeds; above it the pass must free at least `min_freed_percent`
+/// of what it copies.
+fn reclaim_is_worth_rewriting(
+    removed_bytes: u64,
+    retained_bytes: u64,
+    min_copy_bytes: u64,
+    min_freed_percent: u32,
+) -> bool {
+    retained_bytes <= min_copy_bytes
+        || removed_bytes.saturating_mul(100)
+            >= retained_bytes.saturating_mul(u64::from(min_freed_percent))
+}
+
+/// TS_WAL_RECLAIM_MIN_COPY_BYTES: below this much retained data, always reclaim. The rewrite is
+/// cheap at that size and the freed fraction is a meaningless measure of a small log.
+fn reclaim_min_copy_bytes() -> u64 {
+    std::env::var("TS_WAL_RECLAIM_MIN_COPY_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(64 * 1024 * 1024)
+}
+
+/// TS_WAL_RECLAIM_MIN_FREED_PERCENT: above the copy floor, how much a pass must free as a
+/// percentage of what it would have to copy before the rewrite is worth running at all.
+fn reclaim_min_freed_percent() -> u32 {
+    std::env::var("TS_WAL_RECLAIM_MIN_FREED_PERCENT")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .filter(|percent| *percent > 0)
+        .unwrap_or(25)
+}
+
+fn read_wal_base(path: &Path) -> Result<(u64, u64), WriteAheadLogError> {
+    // An absent piece answers (0, 0) rather than failing, and `scan` DEPENDS on that. A piece can
+    // be reclaimed between being listed and being read -- reclaim removes whole pieces from the
+    // front -- and answering zero here makes the length check in `scan` treat it as ending before
+    // any window, so the loop skips it instead of opening a file that is gone.
+    //
+    // Turning this into an error would surface as shards refusing to load: recovery treats ANY
+    // scan failure as data loss, so a piece legitimately reclaimed mid-scan would stop a shard
+    // coming up. If this ever has to report absence distinctly, `scan` needs to skip on it
+    // explicitly at the same time.
+    #[cfg(test)]
+    WAL_SEGMENT_HEADER_READS.with(|reads| reads.set(reads.get() + 1));
+    if !path.exists() {
+        return Ok((0, 0));
+    }
+    let mut tally = WalReadTally::start();
+    let mut window = [0u8; WAL_BASE_HEADER_PROBE_BYTES];
+    let read = {
+        let mut file = open_wal_read(path, &mut tally)?;
+        file.read_window(&mut window)?
+    };
+    let scanned = &window[..read];
+    let line: &[u8] = match scanned.iter().position(|byte| *byte == b'\n') {
+        // The terminated header line, inside the window. Every piece this engine has ever
+        // written is this shape.
+        Some(end) => &scanned[..=end],
+        // No terminator, and the read stopped SHORT of the window: the window is the whole file,
+        // so these are exactly the bytes the buffered reader would have handed the decoder. A
+        // piece truncated part-way through its header is this shape and it still decodes.
+        None if read < WAL_BASE_HEADER_PROBE_BYTES => scanned,
+        // A FULL window, no terminator, and it opens with the header magic. This writer cannot
+        // produce a header that long -- `wal_base_header_read::
+        // the_probe_window_is_wider_than_the_widest_header_the_writer_can_make` holds that
+        // arithmetically, against `encode_base_header` rather than against a comment -- so this
+        // is corrupt or foreign, and the one thing that must not happen to it is being quietly
+        // called base zero. Read it the way the buffered reader did and let the decoder refuse
+        // it.
+        None if scanned.starts_with(crate::log_framing::BASE_HEADER_MAGIC) => {
+            return read_wal_base_buffered(path);
+        }
+        // A full window with no terminator and no magic: not a header, and the buffered reader
+        // would have read to the first newline in the file to reach the same conclusion.
+        None => return Ok((0, 0)),
+    };
+    if line.is_empty() {
+        return Ok((0, 0));
+    }
+    match crate::log_framing::decode_base_header(line)? {
+        Some(base) => Ok((base, line.len() as u64)),
+        None => Ok((0, 0)),
+    }
+}
+
+/// How far into a piece a base header is looked for.
+///
+/// A header is `#tsb1 ` plus a CRC, a space, a `u64` in decimal and a newline, so the widest one
+/// this writer can produce is well under fifty bytes. 256 leaves a factor of five over it, and
+/// the test above turns that slack into an assertion rather than a hope.
+///
+/// It replaces an 8 KiB `BufReader` fill. The fill was bought and thrown away: the reader was a
+/// local, it was dropped at the end of the function, and what escaped was two integers -- nothing
+/// after the header read reused a byte of it. #1936 priced it at 483,328 of the 34,779,419 bytes
+/// a 200,000-record restore reads off its log, one fill per piece per replay window.
+pub(crate) const WAL_BASE_HEADER_PROBE_BYTES: usize = 256;
+
+/// `read_wal_base`'s reader as it stood before the window: a `BufReader` filling 8 KiB and
+/// reading on until it finds a line terminator, however far away it is.
+///
+/// Kept, and in PRODUCTION rather than behind `cfg(test)`, for two reasons. It is the fallback
+/// above for a piece that opens with the header magic and does not terminate inside the window --
+/// a shape the writer cannot produce, which is exactly why it must not be guessed at. And it is
+/// the CONTROL the bounded reader is compared against field by field, so the comparison is
+/// against the code that actually ran rather than against a copy of it in a test, which drifts.
+fn read_wal_base_buffered(path: &Path) -> Result<(u64, u64), WriteAheadLogError> {
+    if !path.exists() {
+        return Ok((0, 0));
+    }
+    let mut tally = WalReadTally::start();
+    let mut reader = BufReader::new(open_wal_read(path, &mut tally)?);
+    let mut line = Vec::new();
+    let read = reader.read_until(b'\n', &mut line)?;
+    if read == 0 {
+        return Ok((0, 0));
+    }
+    match crate::log_framing::decode_base_header(&line)? {
+        Some(base) => Ok((base, read as u64)),
+        None => Ok((0, 0)),
+    }
+}
+
+/// The two readers, side by side, for the test that compares their ANSWERS field by field.
+///
+/// Both are private to this module; the comparison has to be made from outside it.
+#[cfg(test)]
+pub(crate) fn read_wal_base_bounded_for_test(
+    path: &Path,
+) -> Result<(u64, u64), WriteAheadLogError> {
+    read_wal_base(path)
+}
+
+#[cfg(test)]
+pub(crate) fn read_wal_base_unbounded_for_test(
+    path: &Path,
+) -> Result<(u64, u64), WriteAheadLogError> {
+    read_wal_base_buffered(path)
+}
+
+/// The probe window, for the test that holds it against what the writer can produce.
+#[cfg(test)]
+pub(crate) fn wal_base_header_probe_bytes() -> usize {
+    WAL_BASE_HEADER_PROBE_BYTES
+}
+
+/// The sequence the log last reached, found by reading its END rather than all of it.
+///
+/// A restart needs this before it can append. Reading and decoding every record made the cost grow
+/// with the whole log -- about 83 ms per megabyte, forever -- when the answer is in the last
+/// record. This walks backward to the last complete one instead.
+///
+/// A trailing write with no newline is a torn tail: it is truncated away, exactly as before, and
+/// nothing at or below the last complete record is ever cut. A corrupt record in the MIDDLE is no
+/// longer reported here, since reaching it meant decoding everything; replay still refuses it, and
+/// replay is the path that would act on it.
+/// `(last sequence across the log, record end of the ACTIVE piece)`. The active piece's record
+/// end is what an appender needs -- it is where the next record goes -- and under preallocation
+/// it is the one length the file's own size no longer answers.
+fn last_wal_sequence_at(root: &Path, shard_id: ShardId) -> Result<(u64, u64), WriteAheadLogError> {
+    // Newest first: the piece being written is empty right after a roll, and an empty piece is not
+    // where the log ends. Only the piece being written can have a torn tail -- the sealed ones were
+    // whole when they were renamed -- so this repairs that one and reads the rest.
+    let mut pieces = wal_segment_paths(root, shard_id);
+    pieces.reverse();
+    let mut active_record_end = None;
+    for piece in pieces {
+        let (sequence, record_end) = last_wal_sequence_in(&piece)?;
+        let active_record_end = *active_record_end.get_or_insert(record_end);
+        if sequence > 0 {
+            return Ok((sequence, active_record_end));
+        }
+    }
+    Ok((0, active_record_end.unwrap_or(0)))
+}
+
+/// `(last sequence, record end)` for one piece. The record end is the byte offset just past the
+/// last complete record -- the file's length, unless a torn tail was repaired or a preallocated
+/// zeros reservation follows the records (kept, not truncated: it is not damage, it is room).
+/// `(last sequence, record end)` found by walking the records FORWARD from the start.
+///
+/// The windowed scan below finds a log's last record by searching backward for the final
+/// newline. That is exact for records that end in one and wrong for records that do not: a
+/// length-framed payload carries 0x0A bytes of its own, so the search lands in the middle of a
+/// payload and reports a boundary that was never a boundary. There is no backward equivalent --
+/// a length prefix can only be read from in front of the record it describes -- so the frames
+/// have to be walked in order.
+///
+/// The cost is the file rather than its last window, which is why the binary frame is opt-in.
+
+/// Step a walking reader over a block's footer slot when it reaches one.
+///
+/// Blocks make the record stream discontinuous, which every walker here assumed it was not: a
+/// footer sits between the last record of one block and the first of the next, and a reader that
+/// meets it sees bytes that are not a frame and concludes the log ended. It does not -- it
+/// continues in the next block. Returns the offset the reader should now be at.
+///
+/// This is the cost of a footer, and it is the reason the reference's readers know about blocks
+/// rather than treating a stream as a flat run of records.
+
+/// Whether the block holding `at` has been closed, i.e. its footer slot is written.
+///
+/// This is what tells zeros apart. A run of zeros inside a CLOSED block is the padding between
+/// its last record and its footer -- the records continue in the next block. The same zeros in
+/// the OPEN block are the preallocated reservation, and the records really have ended. Without
+/// the footer to distinguish them a walker stops at the first block boundary and reports a log
+/// a fraction of its real length, which is precisely what it did before this existed.
+fn block_is_closed<R: std::io::BufRead + std::io::Seek>(
+    reader: &mut R,
+    at: u64,
+    header_len: u64,
+    len: u64,
+) -> Result<Option<u64>, WriteAheadLogError> {
+    if at < header_len {
+        return Ok(None);
+    }
+    let index = block_of(at - header_len);
+    let slot_at = header_len + block_footer_at(index);
+    if slot_at + WAL_BLOCK_FOOTER_BYTES <= len {
+        reader.seek(SeekFrom::Start(slot_at))?;
+        let mut slot = vec![0u8; WAL_BLOCK_FOOTER_BYTES as usize];
+        if reader.read_exact(&mut slot).is_ok() && decode_block_footer(&slot).is_some() {
+            let next = header_len + (index + 1) * WAL_BLOCK_BYTES;
+            if next >= len {
+                return Ok(None);
+            }
+            reader.seek(SeekFrom::Start(next))?;
+            return Ok(Some(next));
+        }
+    }
+    // Nothing on the grid. That is usually the truth -- the block never closed, and this is the
+    // end of the records -- but it is also what a RECLAIMED log looks like, and there the answer
+    // is wrong in the direction that loses data.
+    displaced_block_footer_end(reader, at, len)
+}
+
+/// A footer that a past reclaim moved off the grid: where the records resume after it, if it is
+/// there at all.
+///
+/// Reclaim copies the bytes it keeps VERBATIM, which is what moves every survivor down by the
+/// same amount and so keeps its log id stable. A footer inside those bytes is copied along with
+/// them -- but a block boundary is measured from the file's own header, and the rewritten file's
+/// header is a different length: a never-reclaimed file has none at all, and a reclaimed one
+/// carries a base written as decimal digits. So the copied footer lands where the new grid has
+/// no boundary, `block_is_closed` looks at the grid slot, finds record bytes, and correctly says
+/// "not closed" -- and the walk stops at the footer instead of stepping over it.
+///
+/// Measured before this existed, on a 300-record log reclaimed from sequence 10: the tail walk
+/// reported 123 as the highest sequence in a file that still held all 300. That number is what
+/// the next append seeds from, so it is sequence REUSE on the next restart, which replay's
+/// `sequence > watermark` filter then drops silently -- the failure the tail-continuity clamp in
+/// `gc_before_sequence_unchecked` exists to prevent, arriving by another door.
+///
+/// Only ever used to say YES, and only on the magic: the writer leaves the bytes between the last
+/// record and the footer slot unwritten, so they read as zeros, and the search is for the first
+/// NON-zero byte within one block of here. A zeros run with no footer after it -- a preallocated
+/// tail, or simply the end -- finds nothing and the caller stops exactly as it did before. A
+/// footer is only believed when `decode_block_footer` finds its magic, so record bytes cannot be
+/// mistaken for one.
+///
+/// This does not cover a block whose records end FLUSH against the footer slot, leaving no zeros
+/// to find: there the walk reads the footer as a record and reports corruption, which is loud
+/// rather than silent and is the safer of the two ways to be wrong.
+fn displaced_block_footer_end<R: std::io::BufRead + std::io::Seek>(
+    reader: &mut R,
+    at: u64,
+    len: u64,
+) -> Result<Option<u64>, WriteAheadLogError> {
+    // Padding before a footer cannot exceed the block that holds it, so neither can the search.
+    let window = WAL_BLOCK_BYTES.min(len.saturating_sub(at));
+    if window < WAL_BLOCK_FOOTER_BYTES {
+        return Ok(None);
+    }
+    reader.seek(SeekFrom::Start(at))?;
+    let mut bytes = vec![0u8; window as usize];
+    if reader.read_exact(&mut bytes).is_err() {
+        return Ok(None);
+    }
+    let Some(start) = bytes.iter().position(|byte| *byte != 0) else {
+        return Ok(None);
+    };
+    let end = start + WAL_BLOCK_FOOTER_BYTES as usize;
+    if end > bytes.len() || decode_block_footer(&bytes[start..end]).is_none() {
+        return Ok(None);
+    }
+    let next = at + end as u64;
+    if next >= len {
+        return Ok(None);
+    }
+    reader.seek(SeekFrom::Start(next))?;
+    Ok(Some(next))
+}
+
+fn skip_block_footer_if_due<R: std::io::BufRead + std::io::Seek>(
+    reader: &mut R,
+    at: u64,
+    header_len: u64,
+) -> Result<u64, WriteAheadLogError> {
+    if at < header_len {
+        return Ok(at);
+    }
+    let relative = at - header_len;
+    let index = block_of(relative);
+    if relative < block_data_end(index) {
+        return Ok(at);
+    }
+    // At or past this block's data end -- but that is a statement about POSITION, and a log
+    // written before footers existed has records occupying exactly these bytes. Skipping on
+    // position alone discards up to 128 bytes of record and resumes mid-record, which decodes
+    // as garbage and refuses a load whose bytes were entirely intact: measured on a real
+    // store, 92 bytes holding the start of a record were stepped over and the walk resumed
+    // on `"key":...`, reported as `invalid type: string "key" ... at line 1 column 5`.
+    //
+    // So verify the slot before believing it: a written footer carries its magic, and
+    // `block_is_closed` already refuses to treat a slot without one as a footer. Reading the
+    // slot moves the cursor, so the position it was read from is restored on the way out.
+    let slot_at = header_len + block_footer_at(index);
+    let resume = reader.stream_position()?;
+    let mut slot = vec![0u8; WAL_BLOCK_FOOTER_BYTES as usize];
+    reader.seek(SeekFrom::Start(slot_at))?;
+    let footer_present =
+        reader.read_exact(&mut slot).is_ok() && decode_block_footer(&slot).is_some();
+    if !footer_present {
+        // Records, not a footer. Carry on reading where we were.
+        reader.seek(SeekFrom::Start(resume))?;
+        return Ok(at);
+    }
+    let next = header_len + (index + 1) * WAL_BLOCK_BYTES;
+    reader.seek(SeekFrom::Start(next))?;
+    Ok(next)
+}
+
+/// The sequence of the FIRST record in a piece, or None when there is not one to read.
+///
+/// One record, where `last_wal_sequence_in` decodes the whole file. Used only to prove that an
+/// EARLIER piece is entirely below a retain floor: records are appended in strictly ascending
+/// sequence, so `last(N) < first(N+1)`.
+///
+/// None on anything unusual -- no header, no first record, a head that will not decode -- because
+/// every caller treats None as "cannot tell, go and look properly". It must never guess.
+fn first_wal_sequence_in(path: &Path) -> Result<Option<u64>, WriteAheadLogError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let (_, header_len) = read_wal_base(path)?;
+    let mut tally = WalReadTally::start();
+    let file = open_wal_read(path, &mut tally)?;
+    let len = file.metadata()?.len();
+    if len <= header_len {
+        return Ok(None);
+    }
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(header_len))?;
+    let record_end = skip_block_footer_if_due(&mut reader, header_len, header_len)?;
+    if record_end >= len {
+        return Ok(None);
+    }
+    let Some(raw) = read_raw_record(&mut reader)? else {
+        return Ok(None);
+    };
+    if raw.is_empty() || raw.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok(None);
+    }
+    Ok(decode_wal_line(&raw).ok().map(|record| record.sequence))
+}
+
+fn last_wal_sequence_forward(path: &Path) -> Result<(u64, u64), WriteAheadLogError> {
+    let (_, header_len) = read_wal_base(path)?;
+    let mut tally = WalReadTally::start();
+    let file = open_wal_tail_scan(path, &mut tally)?;
+    let len = file.metadata()?.len();
+    if len <= header_len {
+        return Ok((0, len.min(header_len)));
+    }
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(header_len))?;
+    let mut last_sequence = 0u64;
+    let mut record_end = header_len;
+    loop {
+        record_end = skip_block_footer_if_due(&mut reader, record_end, header_len)?;
+        if record_end >= len {
+            break;
+        }
+        let Some(raw) = read_raw_record(&mut reader)? else {
+            // No record here. In a CLOSED block that means padding before its footer and the
+            // records go on in the next one; in the open block it means the end.
+            match block_is_closed(&mut reader, record_end, header_len, len)? {
+                Some(next) => {
+                    record_end = next;
+                    continue;
+                }
+                None => break,
+            }
+        };
+        if raw.is_empty() {
+            break;
+        }
+        // A blank line carries nothing and is skipped, exactly as the windowed scan skips it.
+        if raw.iter().all(|byte| byte.is_ascii_whitespace()) {
+            record_end = record_end.saturating_add(raw.len() as u64);
+            continue;
+        }
+        // A record that will not decode is one of two different things, and conflating them
+        // either loses committed data or refuses a load that should succeed. If nothing follows
+        // it, the append was interrupted -- a torn tail is not corruption, and everything before
+        // it stands. If bytes follow it, a complete record went bad while records around it are
+        // fine, which is interior corruption and must stay fatal.
+        match decode_wal_line(&raw) {
+            Ok(record) => {
+                last_sequence = last_sequence.max(record.sequence);
+                record_end = record_end.saturating_add(raw.len() as u64);
+            }
+            Err(err) => {
+                let at_end = {
+                    let buffered = reader.fill_buf()?;
+                    buffered.is_empty() || buffered.iter().all(|byte| *byte == 0)
+                };
+                if at_end {
+                    break;
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok((last_sequence, record_end))
+}
+
+
+/// Fixed-size blocks, so a footer can be found by ARITHMETIC instead of by searching.
+///
+/// This is the piece that pays for length framing. A delimited log finds its tail by scanning
+/// backward for the last delimiter; a length-framed one cannot, because a length prefix is only
+/// readable from in front of the record it describes, so the tail has to be walked to from the
+/// start. Walking is correct and costs the file.
+///
+/// Blocks fix that by making the answer writable in advance: every block ends with a footer
+/// naming the last record that started inside it, and because blocks are a fixed size, block N's
+/// footer is at a computed offset. Reopening reads the last footer present -- one seek, one small
+/// read -- and then walks only the final, still-open block. The walk stops being the file and
+/// becomes at most one block.
+const WAL_BLOCK_BYTES: u64 = 128 * 1024;
+
+/// Reserved at the end of every block for its footer. The encoded footer is far smaller; the
+/// slot is fixed so that the arithmetic above stays arithmetic.
+const WAL_BLOCK_FOOTER_BYTES: u64 = 128;
+
+/// Marks a footer slot that has actually been written, so a slot inside preallocated zeros is
+/// not mistaken for a footer describing block zero.
+const WAL_BLOCK_FOOTER_MAGIC: u64 = 0xB10C_F007_E12A_5EEDu64;
+
+/// Block footers are UNCONDITIONAL.
+///
+/// Every fixed-size block reserves a footer at its end holding the offset and sequence of the last
+/// record that starts in that block. Finding the log tail is then: seek to the final block, read
+/// its footer, jump straight to the last record. O(1) in the size of the log.
+///
+/// This is not an optimisation, it is the prerequisite for the record framing that ships ON.
+/// A length-framed record cannot be found by scanning BACKWARD -- there is no sentinel to
+/// resynchronise on -- so without a footer the only way to locate the tail is to read FORWARD from
+/// the start of the log, and that cost grows with every record ever written.
+///
+/// Measured, same binary, only the two flags differing, over one run of sustained appends:
+///
+///     frame on, footer off    643.2 ms p50, degrading 3.83x across the run
+///     frame on, footer on     110.2 / 103.1 ms, 0.97x / 1.21x
+///     frame off (unframed)     94.5 ms, 1.10x
+///
+/// The middle row is the shipped configuration. The top row is what shipped when framing was
+/// defaulted ON and the footer was left OFF "while it earned trust": neither decision was wrong
+/// alone, and together they made the configuration everyone runs the only one with neither fast
+/// path. There is deliberately no way to turn the footer off any more.
+///
+/// Reading stays tolerant: a log written before footers existed has records occupying what would
+/// be the footer slots, so the readers below handle a footerless block and fall back to the
+/// forward scan for it. `turning_blocks_on_over_a_log_written_without_them` and
+/// `blocks_turned_on_over_a_log_that_ends_inside_a_slot` cover both transitions.
+fn block_footer_at(index: u64) -> u64 {
+    index * WAL_BLOCK_BYTES + (WAL_BLOCK_BYTES - WAL_BLOCK_FOOTER_BYTES)
+}
+
+/// The last byte a record may occupy in block `index`, relative to the start of the records.
+fn block_data_end(index: u64) -> u64 {
+    block_footer_at(index)
+}
+
+fn block_of(relative_offset: u64) -> u64 {
+    relative_offset / WAL_BLOCK_BYTES
+}
+
+/// Encode a footer into its fixed-size slot, zero-padded.
+fn encode_block_footer(
+    index: u64,
+    block_end: u32,
+    last_record_offset: u64,
+    last_record_sequence: u64,
+    block_crc: u32,
+) -> Vec<u8> {
+    use prost::Message;
+    let footer = crate::storage_descriptor::BlockFooter {
+        magic: WAL_BLOCK_FOOTER_MAGIC,
+        version: WRITE_AHEAD_LOG_FORMAT_VERSION,
+        timestamp_ms: current_time_ms(),
+        block_crc,
+        block_number: index,
+        block_end,
+        last_record_offset,
+        // Records never straddle a block here: one that does not fit starts the next block
+        // instead. That is what keeps this field zero and the reader free of the case.
+        last_record_left_size: 0,
+        last_record_sequence,
+        client_token: Vec::new(),
+        truncated_offset: 0,
+    };
+    let message = footer.encode_to_vec();
+    assert!(
+        message.len() as u64 + 2 <= WAL_BLOCK_FOOTER_BYTES,
+        "a block footer must fit its slot: {} + 2 > {}",
+        message.len(),
+        WAL_BLOCK_FOOTER_BYTES
+    );
+    // The slot says how long the message is, because the slot is a FIXED size and the message is
+    // not. Padding the message out to the slot and handing the whole thing to a decoder does not
+    // work: a trailing zero byte reads as field number 0, which is not a legal field, so every
+    // padded footer fails to decode and reads as absent. That failure is silent and total -- the
+    // footers were being written correctly and nothing could see any of them.
+    let mut slot = Vec::with_capacity(WAL_BLOCK_FOOTER_BYTES as usize);
+    slot.extend_from_slice(&(message.len() as u16).to_le_bytes());
+    slot.extend_from_slice(&message);
+    slot.resize(WAL_BLOCK_FOOTER_BYTES as usize, 0);
+    slot
+}
+
+/// Read a footer out of its slot. `None` for a slot that was never written -- which is what a
+/// preallocated block looks like, and what a crash before the footer leaves.
+fn decode_block_footer(slot: &[u8]) -> Option<crate::storage_descriptor::BlockFooter> {
+    use prost::Message;
+    if slot.len() < 2 || slot.iter().all(|byte| *byte == 0) {
+        return None;
+    }
+    let declared = u16::from_le_bytes([slot[0], slot[1]]) as usize;
+    if declared == 0 || 2 + declared > slot.len() {
+        return None;
+    }
+    let footer = crate::storage_descriptor::BlockFooter::decode(&slot[2..2 + declared]).ok()?;
+    if footer.magic != WAL_BLOCK_FOOTER_MAGIC {
+        return None;
+    }
+    Some(footer)
+}
+
+/// The last footer this file holds, if any: `(block index, footer)`.
+///
+/// Reads backwards through the footer SLOTS, which is not the same as scanning backwards through
+/// the file -- each slot is at a computed offset, so this is a handful of small reads whatever
+/// the log's size, and it stops at the first one that was written.
+fn last_written_footer(
+    file: &mut CountedWalFile<'_>,
+    header_len: u64,
+    file_len: u64,
+) -> Result<Option<(u64, crate::storage_descriptor::BlockFooter)>, WriteAheadLogError> {
+    if file_len <= header_len {
+        return Ok(None);
+    }
+    let data_len = file_len - header_len;
+    let mut index = block_of(data_len.saturating_sub(1));
+    loop {
+        let at = header_len + block_footer_at(index);
+        if at + WAL_BLOCK_FOOTER_BYTES <= file_len {
+            let mut slot = vec![0u8; WAL_BLOCK_FOOTER_BYTES as usize];
+            if file.read_exact_at(at, &mut slot).is_ok() {
+                if let Some(footer) = decode_block_footer(&slot) {
+                    return Ok(Some((index, footer)));
+                }
+            }
+        }
+        if index == 0 {
+            return Ok(None);
+        }
+        index -= 1;
+    }
+}
+
+
+/// What the last written footer knows: the highest sequence it covers, and the offset the still
+/// open block begins at. `None` when no block has closed yet -- a young log, or one whose first
+/// block is still filling.
+fn footer_tail_hint(path: &Path) -> Result<Option<(u64, u64)>, WriteAheadLogError> {
+    let (_, header_len) = read_wal_base(path)?;
+    let mut tally = WalReadTally::start();
+    let mut file = open_wal_tail_scan(path, &mut tally)?;
+    let file_len = file.metadata()?.len();
+    let Some((index, footer)) = last_written_footer(&mut file, header_len, file_len)? else {
+        return Ok(None);
+    };
+    Ok(Some((
+        footer.last_record_sequence,
+        header_len + (index + 1) * WAL_BLOCK_BYTES,
+    )))
+}
+
+/// The forward walk, started from a position a footer vouched for rather than from the top.
+fn last_wal_sequence_forward_from(
+    path: &Path,
+    from: u64,
+    known_sequence: u64,
+) -> Result<(u64, u64), WriteAheadLogError> {
+    let mut tally = WalReadTally::start();
+    let file = open_wal_tail_scan(path, &mut tally)?;
+    let len = file.metadata()?.len();
+    if from >= len {
+        return Ok((known_sequence, from.min(len)));
+    }
+    let mut reader = BufReader::new(file);
+    reader.seek(SeekFrom::Start(from))?;
+    let mut last_sequence = known_sequence;
+    let mut record_end = from;
+    let (_, header_len) = read_wal_base(path)?;
+    loop {
+        record_end = skip_block_footer_if_due(&mut reader, record_end, header_len)?;
+        if record_end >= len {
+            break;
+        }
+        let Some(raw) = read_raw_record(&mut reader)? else {
+            // No record here. In a CLOSED block that means padding before its footer and the
+            // records go on in the next one; in the open block it means the end.
+            match block_is_closed(&mut reader, record_end, header_len, len)? {
+                Some(next) => {
+                    record_end = next;
+                    continue;
+                }
+                None => break,
+            }
+        };
+        if raw.is_empty() {
+            break;
+        }
+        if raw.iter().all(|byte| byte.is_ascii_whitespace()) {
+            record_end = record_end.saturating_add(raw.len() as u64);
+            continue;
+        }
+        match decode_wal_line(&raw) {
+            Ok(record) => {
+                last_sequence = last_sequence.max(record.sequence);
+                record_end = record_end.saturating_add(raw.len() as u64);
+            }
+            Err(err) => {
+                let at_end = {
+                    let buffered = reader.fill_buf()?;
+                    buffered.is_empty() || buffered.iter().all(|byte| *byte == 0)
+                };
+                if at_end {
+                    break;
+                }
+                return Err(err);
+            }
+        }
+    }
+    Ok((last_sequence, record_end))
+}
+
+/// Where the records of one log end, for measurements that need bytes rather than counts.
+pub fn last_wal_sequence_in_for_test(path: &Path) -> Result<(u64, u64), WriteAheadLogError> {
+    last_wal_sequence_in(path)
+}
+
+fn last_wal_sequence_in(path: &Path) -> Result<(u64, u64), WriteAheadLogError> {
+    if !path.exists() {
+        return Ok((0, 0));
+    }
+    if crate::log_framing::binary_frame_enabled() {
+        // The footer says where to start, so the walk covers the open block instead of the log.
+        // Without one -- a log written before blocks, or an empty one -- the walk starts at the
+        // header and covers everything, which is the same answer for more reading.
+        if let Some((sequence, from)) = footer_tail_hint(path)? {
+            return last_wal_sequence_forward_from(path, from, sequence);
+        }
+        return last_wal_sequence_forward(path);
+    }
+    let (_, header_len) = read_wal_base(path)?;
+    // Read-WRITE, because this branch repairs a torn tail in place -- but it is still one of the
+    // read side's opens of a piece, and counted as one, or the residual would stop seeing this
+    // branch the moment binary framing were turned off.
+    #[cfg(test)]
+    WAL_PIECE_TAIL_READS.with(|reads| reads.set(reads.get() + 1));
+    let mut tally = WalReadTally::start();
+    let mut file = open_wal_repair(path, &mut tally)?;
+    let len = file.metadata()?.len();
+    if len <= header_len {
+        return Ok((0, len.min(header_len)));
+    }
+
+    // Pull in the tail, growing the window until it holds a whole record. Records are small and
+    // the first window almost always suffices; the loop is for the ones that are not.
+    let mut window = 64 * 1024u64;
+    let (line, good_offset, tail_is_reservation) = loop {
+        let window_start = header_len.max(len.saturating_sub(window));
+        let mut data = vec![0u8; (len - window_start) as usize];
+        file.read_exact_at(window_start, &mut data)?;
+
+        // Everything after the final newline was never finished being written.
+        let Some(last_newline) = data.iter().rposition(|byte| *byte == b'\n') else {
+            if window_start == header_len {
+                // Not one complete record in the file: the whole body is either a torn write or
+                // an untouched preallocated reservation.
+                let zeros = data.iter().all(|byte| *byte == 0);
+                break (None, header_len, zeros);
+            }
+            window = window.saturating_mul(4);
+            continue;
+        };
+        let good_offset = window_start + last_newline as u64 + 1;
+        // Whatever follows the last complete record: all zeros is a preallocated reservation
+        // (kept -- it is room, not damage); anything else is a torn write (repaired as always).
+        let tail_is_reservation = data[last_newline + 1..].iter().all(|byte| *byte == 0)
+            && last_newline as u64 + 1 < (len - window_start);
+
+        // Walk back over any blank lines to the last record that actually says something.
+        let mut line_end = last_newline;
+        loop {
+            let line_start = data[..line_end]
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map(|index| index + 1);
+            let (line_start, reached_the_front) = match line_start {
+                Some(index) => (index, false),
+                None => (0usize, true),
+            };
+            let candidate = &data[line_start..line_end];
+            if !candidate.iter().all(|byte| byte.is_ascii_whitespace()) {
+                break;
+            }
+            if line_start == 0 {
+                if reached_the_front && window_start > header_len {
+                    // The blank run may continue below this window.
+                    line_end = usize::MAX;
+                    break;
+                }
+                // Blank all the way back to the start: no record in this log.
+                return Ok((0, header_len));
+            }
+            line_end = line_start - 1;
+        }
+        if line_end == usize::MAX {
+            window = window.saturating_mul(4);
+            continue;
+        }
+
+        let line_start = data[..line_end]
+            .iter()
+            .rposition(|byte| *byte == b'\n')
+            .map(|index| index + 1);
+        match line_start {
+            Some(index) => break (Some(data[index..line_end].to_vec()), good_offset, tail_is_reservation),
+            None if window_start == header_len => {
+                break (Some(data[..line_end].to_vec()), good_offset, tail_is_reservation)
+            }
+            // The record starts before the window: widen and look again.
+            None => window = window.saturating_mul(4),
+        }
+    };
+
+    if good_offset < len && !tail_is_reservation {
+        file.set_len(good_offset)?;
+        file.sync_all()?;
+        sync_parent_dir(path)?;
+    }
+    let Some(line) = line else {
+        return Ok((0, good_offset));
+    };
+    Ok((decode_wal_line(&line)?.sequence, good_offset))
+}
+
+/// Test-only override for the wall clock stamped onto a record. Recovery tests need records
+/// whose leader timestamps are OLD relative to restart, and the only honest way to get that
+/// is to state the timestamp: the alternative is sleeping for the difference and racing every
+/// other thread on the machine for it.
+///
+/// Process-wide rather than per-thread, and that is the whole point. A write does not promise
+/// to append on the thread that executed it -- group commit exists precisely so it does not --
+/// so a per-thread pin was applied or skipped depending on where the append happened to land,
+/// which made the record's timestamp real often enough to fail one run in twenty-five. Zero
+/// means unset; callers pin it only inside a guard that restores it.
+#[cfg(test)]
+static TEST_RECORD_CLOCK_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) fn set_test_record_clock_ms(clock_ms: Option<u64>) {
+    TEST_RECORD_CLOCK_MS.store(
+        clock_ms.unwrap_or(0),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+fn current_time_ms() -> u64 {
+    #[cfg(test)]
+    {
+        let pinned = TEST_RECORD_CLOCK_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if pinned != 0 {
+            return pinned;
+        }
+    }
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+fn command_variant_name(command: &Command) -> Option<String> {
+    let value = serde_json::to_value(command).ok()?;
+    let object = value.as_object()?;
+    object
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+}
+
+fn command_payload(command: &Command) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let value = serde_json::to_value(command).ok()?;
+    let object = value.as_object()?;
+    let mut payload = object.clone();
+    payload.remove("kind");
+    Some(payload)
+}
+
+fn command_object_key(command: &Command) -> Option<String> {
+    let payload = command_payload(command)?;
+    if let Some(key) = payload.get("key").and_then(|value| value.as_str()) {
+        return Some(key.to_string());
+    }
+    let tenant = payload.get("tenant_hash").and_then(|value| value.as_u64());
+    let node = payload
+        .get("node_hash")
+        .or_else(|| payload.get("parent_hash"))
+        .or_else(|| payload.get("start_node_hash"))
+        .and_then(|value| value.as_u64());
+    match (tenant, node) {
+        (Some(tenant), Some(node)) => Some(format!("context:{tenant}:{node}")),
+        (Some(tenant), None) => Some(format!("context:{tenant}")),
+        _ => None,
+    }
+}
+
+fn command_ttl_ms(command: &Command) -> Option<u64> {
+    let payload = command_payload(command)?;
+    payload.get("ttl_ms").and_then(|value| value.as_u64())
+}
+
+fn command_bucket_id(key: &str) -> u64 {
+    const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+    const FNV_PRIME: u64 = 0x100000001b3;
+    let mut hash = FNV_OFFSET;
+    for byte in key.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(FNV_PRIME);
+    }
+    hash & 0x3fff
+}
+
+fn command_model(command: &Command) -> WriteAheadLogModel {
+    let Some(name) = command_variant_name(command) else {
+        return WriteAheadLogModel::Unknown;
+    };
+    if name.starts_with("common_") {
+        WriteAheadLogModel::Common
+    } else if name.starts_with("string_") {
+        WriteAheadLogModel::String
+    } else if name.starts_with("hash_") {
+        WriteAheadLogModel::Hash
+    } else if name.starts_with("set_") {
+        WriteAheadLogModel::Set
+    } else if name.starts_with("feature_") {
+        WriteAheadLogModel::Feature
+    } else if name.starts_with("sequence_") {
+        WriteAheadLogModel::Sequence
+    } else if name.starts_with("control_state_") {
+        WriteAheadLogModel::ControlState
+    } else if name.starts_with("context_") {
+        WriteAheadLogModel::Context
+    } else {
+        WriteAheadLogModel::Unknown
+    }
+}
+
+fn command_item_kind(command: &Command) -> WriteAheadLogItemKind {
+    let Some(name) = command_variant_name(command) else {
+        return WriteAheadLogItemKind::Admin;
+    };
+    if name.contains("delete") || name.contains("remove") {
+        WriteAheadLogItemKind::DeleteObject
+    } else if name.contains("expire") || name.ends_with("ttl") {
+        WriteAheadLogItemKind::Ttl
+    } else if name.contains("get")
+        || name.contains("query")
+        || name.contains("count")
+        || name.contains("stat")
+        || name.contains("debug")
+        || name.contains("manager")
+        || name.contains("members")
+        || name.contains("exists")
+    {
+        WriteAheadLogItemKind::Query
+    } else {
+        WriteAheadLogItemKind::Kv
+    }
+}
+
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            crate::durability_metrics::record_barrier("engine_wal_dir");
+            dir.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    /// Both names a sealed piece can carry are read, and nothing else is.
+    ///
+    /// Pieces were named `.jsonl` before the rename and are named `.bin` now, and a store caught
+    /// part-way through that rename holds both -- so the predicate every walk reads its piece list
+    /// with has to accept either. Nothing exercised the legacy half: a mutation that deleted the
+    /// legacy branch outright left the whole suite green, because every fixture in the tree writes
+    /// the current name and no test ever puts the old one on disk.
+    ///
+    /// The active piece and the lock file are the negative side, and they matter as much: this
+    /// predicate is what tells a sealed piece from the one being written, and a version of it that
+    /// accepted the active piece would have a walk skip the records still being appended to.
+    #[test]
+    fn a_sealed_piece_is_recognised_under_either_name_and_nothing_else_is() {
+        use super::sealed_wal_start_log_id;
+        let root = std::path::Path::new("/tmp/does-not-need-to-exist");
+
+        // CURRENT name.
+        assert_eq!(
+            sealed_wal_start_log_id(&root.join("shard-1.wal.00000000000000004096.bin"), 1),
+            Some(4096),
+            "the current piece name must parse, or no log rolls"
+        );
+        // LEGACY name -- the half with no coverage until now.
+        assert_eq!(
+            sealed_wal_start_log_id(&root.join("shard-1.wal.00000000000000004096.jsonl"), 1),
+            Some(4096),
+            "a piece written before the rename must still be read; dropping this branch loses \
+             every record in every piece a part-way-renamed store still holds under the old name"
+        );
+        // Same number under both names: the suffix says nothing about where the piece starts.
+        assert_eq!(
+            sealed_wal_start_log_id(&root.join("shard-1.wal.00000000000000004096.bin"), 1),
+            sealed_wal_start_log_id(&root.join("shard-1.wal.00000000000000004096.jsonl"), 1),
+            "the two names must answer the same log id"
+        );
+
+        // NOT a sealed piece: the one being written has no number in its name.
+        assert_eq!(
+            sealed_wal_start_log_id(&root.join("shard-1.wal.bin"), 1),
+            None,
+            "the ACTIVE piece must not read as sealed; a walk that skipped it would step over \
+             every record still being appended"
+        );
+        assert_eq!(sealed_wal_start_log_id(&root.join("shard-1.wal.jsonl"), 1), None);
+        // NOT this shard.
+        assert_eq!(
+            sealed_wal_start_log_id(&root.join("shard-2.wal.00000000000000004096.bin"), 1),
+            None,
+            "another shard's piece must not join this shard's log"
+        );
+        // Not a piece at all.
+        assert_eq!(sealed_wal_start_log_id(&root.join("shard-1.wal.lock"), 1), None);
+        assert_eq!(sealed_wal_start_log_id(&root.join("shard-1.wal.notanumber.bin"), 1), None);
+    }
+
+
+    /// eight records against one record holding eight items, on identical outcomes.
+    ///
+    /// An ingest writes eight things. Today that is eight records, each paying a frame, a shard
+    /// id, a sequence, a timestamp and — in a batch — three more fields of batch bookkeeping so
+    /// the group can be recovered as a unit. The record format already carries `repeated items`,
+    /// so the same eight outcomes fit in one record that is atomic by construction and needs no
+    /// commit marker at all.
+    ///
+    /// This encodes both shapes from the same items and compares them, which says what the change
+    /// is worth before anything is rebuilt to get it.
+    #[test]
+    fn eight_records_against_one_record_holding_eight() {
+        fn item(index: usize) -> WalOutcomeItem {
+            WalOutcomeItem {
+                kind: "string".to_string(),
+                object_key: format!("ingest-00042/{index}"),
+                component: None,
+                object_id: 1000 + index as u64,
+                routing_bucket: 7,
+                address: None,
+                value: Some(vec![b'v'; 96]),
+                ttl: None,
+                deleted: false,
+                meta: false,
+            }
+        }
+
+        // Shape one: eight records, one item each, as a batch (so batch metadata is counted).
+        let mut separate = 0usize;
+        for index in 0..8 {
+            let record = WriteAheadLogRecord {
+                shard_id: 1,
+                sequence: 100 + index as u64,
+                command: None,
+                metadata: Some(WriteAheadLogRecordMetadata {
+                    version: WRITE_AHEAD_LOG_FORMAT_VERSION,
+                    timestamp_ms: 1_787_270_070_192,
+                    items: Vec::new(),
+                    batch_id: Some(9),
+                    batch_size: Some(8),
+                    batch_index: Some(index as u32 + 1),
+                }),
+                staged_blocks: Vec::new(),
+                outcomes: vec![item(index)],
+            };
+            separate += crate::log_framing::encode_record(&encode_wal_payload(&record).unwrap()).len();
+        }
+
+        // Shape two: one record carrying all eight. Atomic because it is one record.
+        let record = WriteAheadLogRecord {
+            shard_id: 1,
+            sequence: 100,
+            command: None,
+            metadata: Some(WriteAheadLogRecordMetadata {
+                version: WRITE_AHEAD_LOG_FORMAT_VERSION,
+                timestamp_ms: 1_787_270_070_192,
+                items: Vec::new(),
+                batch_id: None,
+                batch_size: None,
+                batch_index: None,
+            }),
+            staged_blocks: Vec::new(),
+            outcomes: (0..8).map(item).collect(),
+        };
+        let together = crate::log_framing::encode_record(&encode_wal_payload(&record).unwrap()).len();
+
+        println!(
+            "  eight records   {separate:>6} B\n  \
+             one record      {together:>6} B\n  \
+             saving          {:>6} B   {:.1}%",
+            separate.saturating_sub(together),
+            100.0 * (separate as f64 - together as f64) / separate as f64,
+        );
+        // And it must still decode to the same eight outcomes.
+        let framed = crate::log_framing::encode_record(&encode_wal_payload(&record).unwrap());
+        let back = decode_wal_line(&framed).unwrap();
+        assert_eq!(back.outcomes.len(), 8, "one record must carry all eight");
+        assert!(
+            together < separate,
+            "one record should not cost more than eight: {together} against {separate}"
+        );
+    }
+
+    /// Resident bytes this process holds, from the kernel rather than from a guess.
+    fn resident_bytes() -> u64 {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        for line in status.lines() {
+            if let Some(rest) = line.strip_prefix("VmRSS:") {
+                let kb: u64 = rest
+                    .trim()
+                    .trim_end_matches(" kB")
+                    .trim()
+                    .parse()
+                    .unwrap_or(0);
+                return kb * 1024;
+            }
+        }
+        0
+    }
+
+    /// what the log holds in memory, and whether it grows with the LOG or with the SHARDS.
+    ///
+    /// The claim this exists to check is one I had been repeating from reading the struct: every
+    /// map the log retains is keyed by shard, so memory is bounded by shard count and not by how
+    /// much has been written. That is an argument. This is the measurement.
+    ///
+    /// Ignored: it allocates thousands of shards and reads RSS, which is a process-wide number
+    /// and useless beside other tests.
+    ///
+    ///   cargo test -p temporalstore-rust --lib what_the_log_holds_in_memory -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn what_the_log_holds_in_memory() {
+        // Some(0) is "never roll"; None takes the default, which rolls.
+        set_wal_segment_bytes_for_test(Some(0));
+        const SHARDS: u64 = 1_000;
+
+        // A: one record per shard. Whatever the log keeps per shard is now resident.
+        let dir_a = tempfile::tempdir().unwrap();
+        let before_a = resident_bytes();
+        let store_a = LocalWriteAheadLogStore::new(dir_a.path());
+        for shard in 1..=SHARDS {
+            store_a
+                .append_with_sync(
+                    shard,
+                    Command::StringSet {
+                        key: format!("k{shard}"),
+                        value: vec![b'v'; 128],
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        let after_a = resident_bytes();
+        let per_shard = (after_a.saturating_sub(before_a)) as f64 / SHARDS as f64;
+
+        // B: the same shards, a hundred times the records. If memory tracks the LOG this grows a
+        // hundredfold; if it tracks the SHARDS it does not move.
+        let dir_b = tempfile::tempdir().unwrap();
+        let before_b = resident_bytes();
+        let store_b = LocalWriteAheadLogStore::new(dir_b.path());
+        for shard in 1..=SHARDS {
+            for index in 0..100 {
+                store_b
+                    .append_with_sync(
+                        shard,
+                        Command::StringSet {
+                            key: format!("k{shard}-{index}"),
+                            value: vec![b'v'; 128],
+                        },
+                        false,
+                    )
+                    .unwrap();
+            }
+        }
+        let after_b = resident_bytes();
+        let per_shard_deep = (after_b.saturating_sub(before_b)) as f64 / SHARDS as f64;
+
+        println!(
+            "  {SHARDS} shards, 1 record each     resident +{:>9} B   {:>8.0} B/shard\n  \
+             {SHARDS} shards, 100 records each   resident +{:>9} B   {:>8.0} B/shard\n  \
+             records written: {} against {}   ratio of per-shard cost: {:.2}x",
+            after_a.saturating_sub(before_a),
+            per_shard,
+            after_b.saturating_sub(before_b),
+            per_shard_deep,
+            SHARDS,
+            SHARDS * 100,
+            per_shard_deep / per_shard.max(1.0),
+        );
+        // A hundredfold more log for the same shards must not cost a hundredfold more memory.
+        // Ten is a wide bar on purpose: RSS is a high-water mark and the allocator keeps what it
+        // has taken, so a strict bound would be measuring malloc rather than the log.
+        assert!(
+            per_shard_deep < per_shard * 10.0 + 4096.0,
+            "memory looks like it tracks the log rather than the shards: {per_shard:.0} B/shard \
+             at one record, {per_shard_deep:.0} B/shard at a hundred"
+        );
+        drop(store_a);
+        drop(store_b);
+    }
+
+    /// what a byte of value costs in the log, across payload sizes.
+    ///
+    /// Ignored: a measurement. The ratio is meaningless without its payload size -- the frame is
+    /// fixed and the key is per record, so both dilute as the value grows. Quoting one number
+    /// for "amplification" is quoting a coincidence, which is why this prints a table.
+    ///
+    ///   cargo test -p temporalstore-rust --lib what_a_byte_of_value_costs -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn what_a_byte_of_value_costs() {
+        // Some(0) is "never roll"; None takes the default, which rolls and would split the bytes
+        // this measures across pieces it does not stat.
+        set_wal_segment_bytes_for_test(Some(0));
+        println!("  value     records      payload        wal bytes    per record   ratio");
+        for value_bytes in [64usize, 256, 1024, 4096, 16384] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalWriteAheadLogStore::new(dir.path());
+            let records = 400usize;
+            for index in 0..records {
+                store
+                    .append_with_sync(
+                        1,
+                        Command::StringSet {
+                            key: format!("tenant/7/object/{index:06}"),
+                            value: vec![b'v'; value_bytes],
+                        },
+                        false,
+                    )
+                    .unwrap();
+            }
+            let path = write_ahead_log_path(dir.path(), 1);
+            let (_, record_end) = last_wal_sequence_in(&path).unwrap();
+            let (_, header_len) = read_wal_base(&path).unwrap();
+            let wal_bytes = record_end.saturating_sub(header_len);
+            let payload = (records * value_bytes) as u64;
+            println!(
+                "  {value_bytes:>5}   {records:>7}   {payload:>10}   {wal_bytes:>12}   \
+                 {:>10.1}   {:>5.2}x",
+                wal_bytes as f64 / records as f64,
+                wal_bytes as f64 / payload as f64,
+            );
+        }
+        // And what the file COSTS, which is not the same as what the records occupy:
+        // preallocation reserves ahead, and that reservation is real disk.
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        for index in 0..400 {
+            store
+                .append_with_sync(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:06}"),
+                        value: vec![b'v'; 1024],
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        let path = write_ahead_log_path(dir.path(), 1);
+        let (_, record_end) = last_wal_sequence_in(&path).unwrap();
+        let file_len = std::fs::metadata(&path).unwrap().len();
+        println!(
+            "\n  records occupy {record_end} bytes; the file is {file_len} bytes ({:.2}x), the \
+             difference being the reservation",
+            file_len as f64 / record_end.max(1) as f64
+        );
+    }
+
+    /// The narrow case: a log written WITHOUT blocks whose records end INSIDE where a footer
+    /// slot would go. About 128 bytes in 131072 of log lengths land here.
+    ///
+    /// IGNORED, and honestly rather than quietly. Turning blocks on over an existing log is not
+    /// a supported transition: block layout is a property a log is born with, which is what
+    /// `shard_uses_blocks` decides. This case says that decision is not yet holding -- the 50
+    /// records written after the switch land past a gap the readers cannot cross, and four
+    /// attempts (guarding the slot, not advancing, deciding per log, pinning the rolling
+    /// threshold) each produced the SAME numbers, which means none of them was the cause.
+    ///
+    /// Identical numbers across four different fixes is the finding: the thing being changed is
+    /// not the thing deciding the outcome. What is known: the writer puts the records at 131072
+    /// leaving 130971..131072 unparseable, and only the footer-hint path finds them afterwards.
+    /// Left here as a red flag rather than deleted, because the day this is defaulted is the day
+    /// it has to be answered.
+    /// Was ignored while the footer was a flag: the transition was unsupported and the guard did
+    /// not exist. The footer is unconditional now, this passes, and it is the regression test for
+    /// the case the comment above said had to be answered "the day this is defaulted".
+    #[test]
+    fn blocks_turned_on_over_a_log_that_ends_inside_a_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        // Some(0) is "never roll"; None takes the default, which rolls.
+        set_wal_segment_bytes_for_test(Some(0));
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        let path = write_ahead_log_path(dir.path(), 1);
+        // Fill until the records end inside block 0's footer slot.
+        let mut written = 0usize;
+        loop {
+            store
+                .append_with_sync(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{written:05}"),
+                        value: vec![b'v'; 64],
+                    },
+                    false,
+                )
+                .unwrap();
+            written += 1;
+            let (_, end) = last_wal_sequence_in(&path).unwrap();
+            if end > block_footer_at(0) {
+                break;
+            }
+            assert!(written < 20_000, "never reached the slot");
+        }
+        let (_, end_before) = last_wal_sequence_in(&path).unwrap();
+        assert!(
+            end_before > block_footer_at(0),
+            "the log must end past the slot start for this to be the case under test"
+        );
+        drop(store);
+
+        // Now turn blocks on and keep writing.
+        // rolling is off for this test. The segment threshold is a THREAD-LOCAL override and
+        // these tests share a thread, so whatever the previous test left is inherited -- and a
+        // log that rolls mid-test splits across files the assertions never look at.
+        //
+        // `Some(0)`, not `None`: None clears the override and takes the DEFAULT, and the default
+        // rolls now. These assertions are about blocks within one piece, so they say "off"
+        // explicitly instead of relying on what the default happens to be.
+        set_wal_segment_bytes_for_test(Some(0));
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        for index in written..written + 50 {
+            store
+                .append_with_sync(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:05}"),
+                        value: vec![b'v'; 64],
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        let (_, end_after) = last_wal_sequence_in(&path).unwrap();
+        let after = store.scan(1, 0, u64::MAX, u64::MAX).unwrap();
+        // walk the file by hand, with no store state involved at all, so the two readers can be
+        // compared on the same bytes. Whichever disagrees with this one is the one at fault.
+        let raw = std::fs::read(&path).unwrap();
+        let mut by_hand = 0usize;
+        let mut at = 0usize;
+        while at < raw.len() {
+            if raw[at] == 0 {
+                break;
+            }
+            match crate::log_framing::next_frame(&raw[at..]) {
+                Ok(Some((consumed, _))) if consumed > 0 => {
+                    by_hand += 1;
+                    at += consumed;
+                }
+                _ => break,
+            }
+        }
+        println!("  by hand: {by_hand} records, stopping at {at}");
+        // narrow-case diagnostic: say what moved, because "50 records missing" does not
+        // distinguish a writer that put them somewhere unreadable from a reader that stops early.
+        println!(
+            "  wrote {written} before, then 50 more\n  \
+             records end: {end_before} -> {end_after}  (slot at {})\n  \
+             scan returned {}",
+            block_footer_at(0),
+            after.len()
+        );
+        assert_eq!(
+            after.len(),
+            written + 50,
+            "records written before blocks were turned on must survive turning them on"
+        );
+        for (_, line) in &after {
+            decode_wal_line(line).expect("no record may be written through");
+        }
+    }
+
+    /// Turning blocks on over a log that was written without them.
+    ///
+    /// The footer slot is at a computed offset, so in a log written WITHOUT block reservations
+    /// those bytes belong to a record. Writing a footer there would land in the middle of one.
+    /// This is the case that decides whether the gate can be defaulted or has to be a property
+    /// of the log, and it is worth knowing before flipping it rather than after.
+    #[test]
+    fn turning_blocks_on_over_a_log_written_without_them() {
+        // Off for BOTH phases. This test writes before it configures anything, and the phase-one
+        // log has to stay one file for the boundary check below to mean what it says -- pinning
+        // only the second phase left the first rolling on the default.
+        set_wal_segment_bytes_for_test(Some(0));
+        let dir = tempfile::tempdir().unwrap();
+        // Phase one: no blocks. Records run straight through where slots would be.
+        let written = {
+            let store = LocalWriteAheadLogStore::new(dir.path());
+            for index in 0..600 {
+                store
+                    .append_with_sync(
+                        1,
+                        Command::StringSet {
+                            key: format!("k{index:05}"),
+                            value: incompressible(1024),
+                        },
+                        false,
+                    )
+                    .unwrap();
+            }
+            store.scan(1, 0, u64::MAX, u64::MAX).unwrap().len()
+        };
+        let path = write_ahead_log_path(dir.path(), 1);
+        let (_, end_before) = last_wal_sequence_in(&path).unwrap();
+        assert!(
+            end_before > WAL_BLOCK_BYTES,
+            "the log must already run past a block boundary for this to mean anything: \
+             {end_before}"
+        );
+
+        // Phase two: blocks on, same log, more records.
+        // rolling is off for this test. The segment threshold is a THREAD-LOCAL override and
+        // these tests share a thread, so whatever the previous test left is inherited -- and a
+        // log that rolls mid-test splits across files the assertions never look at.
+        //
+        // `Some(0)`, not `None`: None clears the override and takes the DEFAULT, and the default
+        // rolls now. These assertions are about blocks within one piece, so they say "off"
+        // explicitly instead of relying on what the default happens to be.
+        set_wal_segment_bytes_for_test(Some(0));
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        for index in 600..700 {
+            store
+                .append_with_sync(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:05}"),
+                        value: incompressible(1024),
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        let after = store.scan(1, 0, u64::MAX, u64::MAX).unwrap();
+        assert_eq!(
+            after.len(),
+            written + 100,
+            "every record written before the switch must still be readable after it"
+        );
+        for (_, line) in &after {
+            decode_wal_line(line).expect("every record must still decode");
+        }
+    }
+
+    /// Durable bytes never exceed the bytes the log holds, across a roll.
+    ///
+    /// `persistent_length_bytes` is "the sealed pieces, plus how far a barrier reached into the
+    /// active one". The second half is remembered per shard. A roll replaces the active piece, so
+    /// a value left behind describes a piece that is now counted from the filesystem as a sealed
+    /// one -- counted twice.
+    ///
+    /// The append that rolls usually repairs this by syncing straight afterwards and overwriting
+    /// the entry. This drives the case it does not: a barrier lands, THEN a roll happens on an
+    /// append that does not sync. One of the three writers of this entry takes a `.max()` rather
+    /// than overwriting, so once the value is stale-high it cannot come back down that way.
+    ///
+    /// Overstating is the direction this field exists to rule out: it claims unsynced records are
+    /// on disk to survive a crash. Reporting more durable bytes than the log physically holds is
+    /// the plainest form of that.
+    #[test]
+    fn durable_bytes_never_exceed_the_bytes_the_log_holds() {
+        let segment = 2 * WAL_BLOCK_BYTES;
+        set_wal_segment_bytes_for_test(Some(segment));
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+
+        // Ask the production namer which files are sealed pieces instead of re-spelling the
+        // suffix here. Spelling it out is what broke this test. It used to read
+        // `ends_with(".jsonl") && name != "shard-1.wal.jsonl"`, which was right while the pieces
+        // were named that way. When they were renamed to `.bin` the exclusion was updated and the
+        // suffix test was not, leaving `ends_with(".jsonl") && name != "shard-1.wal.bin"` -- a
+        // filter no file can satisfy. It then counted zero forever: the "nothing has rolled yet"
+        // check below passed vacuously and the roll loop ran to its bound while the log rolled
+        // underneath it, so the invariant this test exists for was never once evaluated.
+        // `sealed_wal_start_log_id` is the predicate the log itself reads its pieces with, it
+        // accepts both names, and it already rejects the active piece and the lock file, so this
+        // cannot drift from the naming again.
+        let sealed_count = || {
+            let entries = std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .collect::<Vec<_>>();
+            // The denominator. Zero sealed out of zero files means this was not looking where it
+            // thought it was, which is a different answer from "nothing has rolled".
+            assert!(
+                !entries.is_empty(),
+                "the log directory must hold files for a count of sealed pieces to mean anything"
+            );
+            entries
+                .iter()
+                .filter(|entry| sealed_wal_start_log_id(&entry.path(), 1).is_some())
+                .count()
+        };
+        let append = |index: usize, sync: bool| {
+            store
+                .append_with_sync(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:06}"),
+                        value: vec![b'v'; 1024],
+                    },
+                    sync,
+                )
+                .unwrap();
+        };
+
+        // Fill the ACTIVE piece to a little over half the roll threshold, then put a barrier on
+        // it. `info().length_bytes` is the whole log, pieces included, so it is the wrong ruler
+        // here -- reading it as the active piece's length ran this loop straight past the roll.
+        let active = write_ahead_log_path(dir.path(), 1);
+        let active_len = || active.metadata().map(|meta| meta.len()).unwrap_or(0);
+        let mut index = 0usize;
+        while active_len() < segment / 2 {
+            append(index, false);
+            index += 1;
+            assert!(index < 40_000, "the piece must fill within a bounded number of appends");
+        }
+        store.flush(1).unwrap();
+        let before = store.info(1).unwrap();
+        assert!(
+            before.persistent_length_bytes > 0,
+            "the barrier must have recorded a durable extent for this to be the case that matters"
+        );
+        assert_eq!(sealed_count(), 0, "nothing should have rolled yet");
+
+        // Now roll, on appends that do not ask for a barrier of their own.
+        while sealed_count() == 0 {
+            append(index, false);
+            index += 1;
+            assert!(index < 40_000, "the log must roll within a bounded number of appends");
+        }
+
+        // The roll loop above exits on a count, and a count can be wrong in the direction that
+        // ends the loop as well as the one that hangs it. Name what it saw.
+        let rolled = sealed_count();
+        assert!(
+            rolled >= 1,
+            "the roll loop must have exited because a piece sealed, and it saw {rolled}"
+        );
+
+        let info = store.info(1).unwrap();
+        // Positive control on the comparison below. `a <= b` is also satisfied by `0 <= 0`, and a
+        // durable extent of zero is exactly what a reset -- rather than a correct reset -- would
+        // leave. Both sides have to carry bytes before the inequality says anything.
+        assert!(
+            info.persistent_length_bytes > 0,
+            "the durable extent must be non-zero across the roll, or the inequality is arithmetic \
+             rather than the invariant; the log holds {} bytes over {rolled} sealed piece(s)",
+            info.length_bytes
+        );
+        assert!(
+            info.length_bytes > 0,
+            "the log must hold bytes for its durable extent to be compared against"
+        );
+        assert!(
+            info.persistent_length_bytes <= info.length_bytes,
+            "durable bytes ({}) must not exceed what the log holds ({}) -- the piece that just \
+             sealed is counted both as a sealed piece and as the active piece's durable extent",
+            info.persistent_length_bytes,
+            info.length_bytes
+        );
+        set_wal_segment_bytes_for_test(None);
+    }
+
+    /// A piece rolled into gets blocks, even when the piece before it had none.
+    ///
+    /// Whether a log is written in blocks is decided per PIECE and cached per SHARD. Nothing
+    /// invalidated that cache when the log rolled, so a shard that latched "no blocks" -- which is
+    /// what happens whenever a process first appends to a piece that already has records in it,
+    /// i.e. after any restart -- kept the answer for every piece it rolled into afterwards.
+    ///
+    /// This is not hypothetical. On the serving store the deployed binary carries the footer
+    /// writer and the log rolls steadily, and the footer magic appears zero times in every piece
+    /// of the whole store. Without a footer a reader cannot find the tail from one block and walks
+    /// the log instead.
+    #[test]
+    fn a_rolled_piece_is_written_in_blocks_even_when_the_one_before_it_was_not() {
+        // Big enough that a piece holds more than one 128 KiB block before it rolls, so a block
+        // can actually close and write its footer.
+        let segment = 6 * WAL_BLOCK_BYTES;
+        set_wal_segment_bytes_for_test(Some(segment));
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_ahead_log_path(dir.path(), 1);
+
+        let append = |store: &LocalWriteAheadLogStore, index: usize| {
+            store
+                .append_with_sync(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:06}"),
+                        value: incompressible(1024),
+                    },
+                    false,
+                )
+                .unwrap();
+        };
+
+        // Phase one leaves the piece with records in it, and then goes away. This is the state a
+        // restart finds: an active piece that is not empty.
+        {
+            let store = LocalWriteAheadLogStore::new(dir.path());
+            for index in 0..40 {
+                append(&store, index);
+            }
+        }
+        assert!(
+            path.metadata().unwrap().len() > 0,
+            "the piece must be non-empty for this to be the case that matters"
+        );
+
+        // Phase two is a fresh process over that piece: it decides "no blocks", correctly, for
+        // THIS piece -- and then rolls into new ones.
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        let mut index = 40usize;
+        let mut rolled = 0usize;
+        let sealed_now = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .flatten()
+                .filter(|entry| {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    name.contains("wal.") && name != "shard-1.wal.bin"
+                })
+                .count()
+        };
+        let before = sealed_now();
+        // Enough to roll at least twice and then fill more than a block of the newest piece.
+        while rolled < 2 || index < 40 + (segment / 1024) as usize * 3 {
+            append(&store, index);
+            index += 1;
+            rolled = sealed_now().saturating_sub(before);
+            assert!(index < 40_000, "the log must roll within a bounded number of appends");
+        }
+
+        let active_len = path.metadata().unwrap().len();
+        assert!(
+            active_len > WAL_BLOCK_BYTES,
+            "the piece rolled into must hold more than one block for a footer to be due: \
+             {active_len}"
+        );
+
+        let mut tally = WalReadTally::start();
+        let mut file = open_wal_read(&path, &mut tally).unwrap();
+        let (_, header_len) = read_wal_base(&path).unwrap();
+        let footer = last_written_footer(&mut file, header_len, active_len).unwrap();
+        assert!(
+            footer.is_some(),
+            "a piece the log rolled into starts empty, so it is written in blocks and its first \
+             closed block carries a footer -- found none in {active_len} bytes"
+        );
+
+        // And the records are all still there, which is what the footer is in service of.
+        let scanned = store.scan(1, 0, u64::MAX, u64::MAX).unwrap();
+        assert!(
+            scanned.len() >= index - 40,
+            "every record written to the rolled pieces must still read back: {} of {}",
+            scanned.len(),
+            index - 40
+        );
+        for (_, line) in &scanned {
+            decode_wal_line(line).expect("every record must still decode");
+        }
+        set_wal_segment_bytes_for_test(None);
+    }
+
+    /// What compressing a record costs the append that writes it.
+    ///
+    /// The fused writer exists so an append does not build the record twice: it declares the
+    /// frame's length up front and lets the encoder append straight into the buffer that goes to
+    /// the file. Compression cannot use it -- the compressed length is not knowable until the
+    /// payload has been compressed -- so that arm builds the payload into its own buffer, hands it
+    /// to the compressor, and frames the result.
+    ///
+    /// Compression became the default after the fused writer landed, so every append now takes the
+    /// arm the fused writer was written to avoid. This measures what that is worth in allocations
+    /// and bytes, which is the question a default flip should have been able to answer.
+    #[test]
+    #[ignore]
+    #[cfg(feature = "alloc-probe")]
+    fn what_compression_costs_an_append() {
+        for value_len in [64usize, 1024, 4096] {
+            let measure = |compress: bool| -> (f64, f64) {
+                std::env::set_var("TS_WAL_COMPRESS_RECORDS", if compress { "1" } else { "0" });
+                let dir = tempfile::tempdir().unwrap();
+                let store = LocalWriteAheadLogStore::new(dir.path());
+                let runs = 32usize;
+                // warm the piece and any once-only work
+                store
+                    .append(
+                        1,
+                        Command::StringSet {
+                            key: "warm".to_string(),
+                            value: incompressible_seeded(value_len, 9_999),
+                        },
+                    )
+                    .unwrap();
+
+                let probe = crate::alloc_probe::Probe::start();
+                for index in 0..runs {
+                    store
+                        .append(
+                            1,
+                            Command::StringSet {
+                                key: format!("k{index:06}"),
+                                value: incompressible_seeded(value_len, index as u64),
+                            },
+                        )
+                        .unwrap();
+                }
+                let counts = probe.stop();
+                (
+                    counts.allocs as f64 / runs as f64,
+                    counts.alloc_bytes as f64 / runs as f64,
+                )
+            };
+
+            let (off_allocs, off_bytes) = measure(false);
+            let (on_allocs, on_bytes) = measure(true);
+            std::env::remove_var("TS_WAL_COMPRESS_RECORDS");
+
+            println!(
+                "  COMPALLOC value {value_len:>5}B | off {off_allocs:>5.1} allocs {off_bytes:>8.0} B | on {on_allocs:>5.1} allocs {on_bytes:>8.0} B | compression adds {:>5.1} allocs {:>8.0} B ({:>5.2}x the bytes)",
+                on_allocs - off_allocs,
+                on_bytes - off_bytes,
+                on_bytes / off_bytes.max(1.0),
+            );
+
+            assert!(on_allocs > 0.0, "the probe must observe appends at {value_len}B");
+        }
+    }
+
+    /// A payload the record compressor cannot shrink.
+    ///
+    /// These tests are about block geometry, rolling and truncation, and every one of them used a
+    /// single byte repeated. Once records began being compressed by default that payload encoded
+    /// to almost nothing, so the workloads stopped filling blocks and stopped rolling, and the
+    /// tests failed saying so: "the workload must span several blocks or this proves nothing:
+    /// 115870", "at a 262144-byte threshold this log should be several pieces, got 1 file(s)".
+    /// One of them subtracted 40 from a payload that was no longer 40 bytes long and panicked.
+    ///
+    /// A test that measures how bytes are LAID OUT needs bytes the compressor cannot remove.
+    fn incompressible(len: usize) -> Vec<u8> {
+        incompressible_seeded(len, 0)
+    }
+
+    /// The same, but a caller that builds MANY payloads must vary the seed.
+    ///
+    /// Seeding from the length alone gives every payload of a given size the SAME bytes. That is
+    /// harmless when each one lands in its own record -- records compress independently -- and
+    /// badly wrong for a batch, where they all land in ONE record and sixteen identical payloads
+    /// compress to almost nothing. Measured: sixteen 256-byte payloads accounted for 4,160 bytes
+    /// of an uncompressed record and 279 of a compressed one, which is not a compression ratio any
+    /// real payload would reach.
+    fn incompressible_seeded(len: usize, seed: u64) -> Vec<u8> {
+        // xorshift64*, seeded by length and caller seed so runs stay repeatable.
+        let mut state = 0x2545_F491_4F6C_DD1D_u64
+            ^ (len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03);
+        (0..len)
+            .map(|_| {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 32) as u8
+            })
+            .collect()
+    }
+
+    /// WHAT ONE LOCAL WAL RECORD COSTS, as a line rather than a point.
+    ///
+    /// # WHY THIS EXISTS SEPARATELY FROM THE SHARED STORE'S FIGURE
+    ///
+    /// The per-append envelope measured by `one_append_amplification_report` is the SHARED STORE's
+    /// (`SharedStoreWalAppendMode::ProtobufAppendBlob`, summed over objects under the shard's
+    /// shared WAL prefix). This log is a different encoder on a different path, so none of that
+    /// figure carries over and neither does its direction.
+    ///
+    /// # COMPRESSION IS WHY THE PAYLOADS HERE ARE RANDOM
+    ///
+    /// Records are zstd-compressed by default (`wal_proto::compress_records_enabled`). A sweep
+    /// over repeated bytes would therefore fit a line through the COMPRESSOR, not through this
+    /// log: `vec![b'v'; 8192]` leaves almost nothing on disk and the slope collapses towards
+    /// zero. The second half of this test measures exactly that, so the reason for the first half
+    /// is evidence rather than a warning in a comment.
+    ///
+    /// Random payloads also put the measurement where a field-level decomposition is MEANINGFUL.
+    /// `compress_payload` returns `None` when compression does not help, so an incompressible
+    /// record travels uncompressed -- which the test ASSERTS by its marker rather than assuming --
+    /// and clearing a field then changes the bytes by that field's own size. On the compressed
+    /// branch the same subtraction would name nothing.
+    mod one_record_envelope_terms {
+        use super::*;
+
+        /// The same sweep the shared-store report uses, so the two lines are over like shapes even
+        /// though they are not over the same path.
+        const SWEEP: [usize; 7] = [0, 8, 32, 128, 512, 2048, 8192];
+        const KEY: &str = "amp-key";
+
+        fn record_of(value: Vec<u8>) -> WriteAheadLogRecord {
+            WriteAheadLogRecord {
+                shard_id: 1,
+                sequence: 1,
+                command: Some(Command::StringSet {
+                    key: KEY.to_string(),
+                    value,
+                }),
+                metadata: Some(WriteAheadLogRecordMetadata {
+                    version: WRITE_AHEAD_LOG_FORMAT_VERSION,
+                    timestamp_ms: 1_787_270_070_192,
+                    items: Vec::new(),
+                    batch_id: None,
+                    batch_size: None,
+                    batch_index: None,
+                }),
+                staged_blocks: Vec::new(),
+                outcomes: Vec::new(),
+            }
+        }
+
+        /// The payload as it is written, and the record's bytes AS FRAMED -- what reaches the file.
+        fn encoded(record: &WriteAheadLogRecord) -> (Vec<u8>, usize) {
+            let payload = encode_wal_payload(record).expect("the record encodes");
+            let framed = crate::log_framing::encode_record(&payload).len();
+            (payload, framed)
+        }
+
+        fn fit(points: &[(f64, f64)]) -> (f64, f64, f64) {
+            let n = points.len() as f64;
+            let sx: f64 = points.iter().map(|p| p.0).sum();
+            let sy: f64 = points.iter().map(|p| p.1).sum();
+            let sxx: f64 = points.iter().map(|p| p.0 * p.0).sum();
+            let sxy: f64 = points.iter().map(|p| p.0 * p.1).sum();
+            let denom = n * sxx - sx * sx;
+            let rate = if denom == 0.0 {
+                0.0
+            } else {
+                (n * sxy - sx * sy) / denom
+            };
+            let envelope = (sy - rate * sx) / n;
+            let worst = points
+                .iter()
+                .map(|p| (p.1 - (rate * p.0 + envelope)).abs())
+                .fold(0.0f64, f64::max);
+            (rate, envelope, worst)
+        }
+
+        /// THE LINE, over incompressible payloads, with the regime asserted at every point.
+        #[test]
+        fn what_one_local_wal_record_costs() {
+            let mut points: Vec<(f64, f64)> = Vec::new();
+            println!("    payload   user B   record B   framed B   framed/user");
+            for size in SWEEP {
+                let value = incompressible_seeded(size, size as u64);
+                let record = record_of(value);
+                let (payload, framed) = encoded(&record);
+                let user = KEY.len() + size;
+
+                // THE REGIME, ASSERTED. If the compressor took this payload, the number below is
+                // a fact about zstd and the fit is not a fact about this log at all.
+                assert_eq!(
+                    payload.first().copied(),
+                    Some(crate::wal_proto::RAW_PAYLOAD_MARKER),
+                    "a {size}-byte incompressible payload was encoded as marker {:?}, not the raw \
+                     one -- this point is on the compressed branch and cannot be decomposed",
+                    payload.first()
+                );
+                assert!(
+                    framed > user || size == 0,
+                    "a record of {framed} B cannot hold {user} B of user data"
+                );
+
+                println!(
