@@ -232,3 +232,238 @@ fn engine_over_a_planted_base_index(stamp: u32) -> (tempfile::TempDir, TemporalE
 
     let dir = tempfile::tempdir().expect("tempdir");
     let indexes = dir.path().join("indexes");
+    std::fs::create_dir_all(&indexes).expect("mkdir indexes");
+    std::fs::write(indexes.join(format!("shard-{SHARD}.index.json")), &image)
+        .expect("plant the index image");
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        indexes,
+    );
+    (dir, engine)
+}
+
+/// The door that always read the stamp still reads it, through the shared predicate.
+#[test]
+fn the_base_index_door_refuses_a_stale_stamp() {
+    let stale = SHARD_INDEX_FORMAT_VERSION - 1;
+    let (_dir, engine) = engine_over_a_planted_base_index(stale);
+    crate::engine::persistence::reset_index_load_path_counts();
+    let loaded = engine
+        .load_index_checked(SHARD, false)
+        .expect("a refusal is Ok(None), not Err");
+    let (accepted, refused_stale, absent, undecodable) =
+        crate::engine::persistence::index_load_path_counts();
+    println!(
+        "\n=== base door, stamp {stale} against {SHARD_INDEX_FORMAT_VERSION} ===\n  \
+         accepted {accepted}, refused-stale {refused_stale}, absent {absent}, undecodable \
+         {undecodable}"
+    );
+    assert!(
+        loaded.is_none(),
+        "the base-index door accepted a stale-stamped image; the shared predicate has inverted \
+         the comparison this whole change rests on"
+    );
+    assert!(refused_stale > 0, "the refusal was not counted");
+}
+
+/// And accepts the same image at the current stamp, so arm 1 is not a door that refuses
+/// everything.
+#[test]
+fn the_base_index_door_accepts_the_same_image_at_the_current_stamp() {
+    let (_dir, engine) = engine_over_a_planted_base_index(SHARD_INDEX_FORMAT_VERSION);
+    let loaded = engine
+        .load_index_checked(SHARD, false)
+        .expect("the load must not error");
+    let state = loaded.expect(
+        "the same image at the CURRENT stamp was refused, so arm 1 proves nothing about the stamp",
+    );
+    assert!(
+        state.features().contains_key(SERIES_KEY),
+        "the accepted image did not carry the series, so this control is about nothing"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// ARMS 3 AND 4: the dump-manifest install. THE NEW BEHAVIOUR.
+// ---------------------------------------------------------------------------------------------
+
+/// THE INSTALL DOOR NOW REFUSES, WHERE IT USED TO INSTALL SILENTLY.
+#[test]
+fn the_dump_manifest_install_refuses_a_stale_stamped_image() {
+    let stale = SHARD_INDEX_FORMAT_VERSION - 1;
+    let mut fixture = a_real_dump_manifest();
+    re_stamp(&mut fixture.manifest, stale);
+
+    let (target, _index_dir) = a_restore_target(fixture.dir.path());
+    crate::engine::persistence::reset_index_load_path_counts();
+    let installed = target.install_bucket_dump_manifest(&fixture.manifest);
+    let (accepted, refused_stale, absent, undecodable) =
+        crate::engine::persistence::index_load_path_counts();
+    println!(
+        "\n=== install of a stamp-{stale} manifest ===\n  install -> {installed:?}\n  \
+         accepted {accepted}, refused-stale {refused_stale}, absent {absent}, undecodable \
+         {undecodable}"
+    );
+    let status = installed.expect_err(
+        "install_bucket_dump_manifest ACCEPTED a stale-stamped image. That is the defect this \
+         change exists to close: the image reaches a live shard and a persisted index without \
+         ever meeting the stamp",
+    );
+    assert_eq!(
+        "slot_dump_stale_index_stamp", status.code,
+        "the install refused with {:?} rather than on the stamp, so this arm is measuring some \
+         other guard -- a fixture that fails validation for an unrelated reason refuses correctly \
+         and proves nothing",
+        status.code
+    );
+    assert!(
+        refused_stale > 0,
+        "the install refused on the stamp and did not COUNT it: accepted {accepted}, \
+         refused-stale {refused_stale}, absent {absent}, undecodable {undecodable}. A refusal \
+         that is not counted is indistinguishable downstream from an absent index"
+    );
+}
+
+/// AND IT REFUSES BEFORE IT CAN DESTROY ANYTHING.
+///
+/// The old behaviour was not merely "installs an image it should not": the install re-serialized
+/// the decoded state into the durable base index, so whatever the decode dropped was written away.
+/// Refusing inside `validate_bucket_dump_manifest` -- which every install calls first -- is what
+/// puts the refusal BEFORE the first write rather than after it.
+#[test]
+fn the_refused_install_writes_no_index_and_installs_no_shard() {
+    let stale = SHARD_INDEX_FORMAT_VERSION - 1;
+    let mut fixture = a_real_dump_manifest();
+    re_stamp(&mut fixture.manifest, stale);
+
+    let (target, index_dir) = a_restore_target(fixture.dir.path());
+    target
+        .install_bucket_dump_manifest(&fixture.manifest)
+        .expect_err("arm 3 is what establishes that this refuses");
+
+    let wrote_an_index = persisted_index_exists(&index_dir, SHARD);
+    println!(
+        "\n=== after the refused install ===\n  a base index was written: {}\n  the shard is \
+         loaded: {}",
+        wrote_an_index,
+        target
+            .shards
+            .read()
+            .expect("engine lock poisoned")
+            .contains_key(&SHARD)
+    );
+    assert!(
+        !wrote_an_index,
+        "the refused install still wrote a base index. The refusal has to come before the first \
+         write, or a store is left describing an image this binary has just said it cannot read"
+    );
+    assert!(
+        !target
+            .shards
+            .read()
+            .expect("engine lock poisoned")
+            .contains_key(&SHARD),
+        "the refused install still installed a shard state"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// ARM 5: the attribution control. The gate is the stamp, not the fixture.
+// ---------------------------------------------------------------------------------------------
+
+/// THE SAME MANIFEST AT THE CURRENT STAMP INSTALLS, AND ITS SERIES SURVIVES END TO END.
+///
+/// Without this, arms 3 and 4 pass for a fixture that could never have installed at all -- a
+/// manifest broken in some unrelated way refuses correctly and says nothing about the stamp.
+#[test]
+fn the_same_manifest_at_the_current_stamp_installs_and_round_trips_its_series() {
+    let mut fixture = a_real_dump_manifest();
+    // Through the same re-stamping helper as the refused arms, so the ONLY difference between
+    // this arm and arm 3 is the number.
+    re_stamp(&mut fixture.manifest, SHARD_INDEX_FORMAT_VERSION);
+
+    let (target, index_dir) = a_restore_target(fixture.dir.path());
+    target
+        .install_bucket_dump_manifest(&fixture.manifest)
+        .expect("a current-stamped manifest must still install");
+
+    let on_disk = persisted_index_has_series(&index_dir, SHARD);
+    target.load_shard(SHARD);
+    let loaded = {
+        let shards = target.shards.read().expect("engine lock poisoned");
+        shards
+            .get(&SHARD)
+            .expect("the shard is loaded")
+            .features()
+            .contains_key(SERIES_KEY)
+    };
+    println!(
+        "\n=== the same manifest at stamp {SHARD_INDEX_FORMAT_VERSION} ===\n  \
+         series in the persisted index: {on_disk}\n  series in `features` after the load: {loaded}"
+    );
+    assert!(
+        on_disk && loaded,
+        "the current-stamped manifest installed but its series did not survive (on disk \
+         {on_disk}, loaded {loaded}). Then the refusals above are not attributable to the stamp: \
+         this door loses an object-keyed series map whatever its stamp says, which is a separate \
+         and larger finding"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// ARM 6: the door nobody has to call. An ordinary restart.
+// ---------------------------------------------------------------------------------------------
+
+/// THE ORDINARY RECOVERY LOAD REFUSES A STALE MANIFEST AND FALLS BACK RATHER THAN FAILING.
+///
+/// This is the door that made the defect serious: `load_shard_with`'s single-barrier arm -- the
+/// DEFAULT, since `wal_single_barrier()` is `!wal_legacy_recovery()` -- reads a durable dump
+/// manifest's embedded index as its recovery base, decoding it directly. No endpoint is involved;
+/// a store with an old manifest on disk met this on a plain restart.
+///
+/// The refusal here is a FALLBACK, not a failure: the arm answers with the base file and the log
+/// instead, which is the same trade `load_index_inner` makes. So the load must still succeed.
+#[test]
+fn the_ordinary_recovery_load_refuses_a_stale_dump_manifest_and_falls_back() {
+    let stale = SHARD_INDEX_FORMAT_VERSION - 1;
+    let mut fixture = a_real_dump_manifest();
+    re_stamp(&mut fixture.manifest, stale);
+    assert!(
+        fixture.manifest.wal_sequence > 0,
+        "DENOMINATOR: the manifest anchors at 0, so it is not newer than an absent base index and \
+         the recovery arm this drives is never entered"
+    );
+
+    let (target, index_dir) = a_restore_target(fixture.dir.path());
+    // A real pre-change store has both of these beside each other, and the routing-range stamp is
+    // what keeps `decide_routing_range` from refusing before the index is read at all -- a
+    // refusal for THAT reason leaves every index-load counter at zero and would read exactly like
+    // the one under test.
+    target
+        .persist_bucket_dump_manifest(&fixture.manifest)
+        .expect("plant the durable manifest the load will find");
+    crate::engine::routing_range_stamp::write_routing_range_stamp(
+        &index_dir,
+        SHARD,
+        crate::engine::routing_range_stamp::RoutingRangeStamp {
+            start_routing_bucket: 0,
+            end_routing_bucket: u32::MAX,
+        },
+    )
+    .expect("plant the routing-range stamp");
+
+    crate::engine::persistence::reset_index_load_path_counts();
+    // `load_shard_with`, not `load_shard`: the plain one discards the status, and whether this
+    // load SUCCEEDS is half of what this arm asserts.
+    let response = target.load_shard_with(crate::control::LoadShardRequest {
+        shard_id: SHARD,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 0,
+        end_routing_bucket: u32::MAX,
+        readonly: false,
+        table_name: String::new(),
+    });
