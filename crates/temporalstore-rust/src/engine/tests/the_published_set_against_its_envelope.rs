@@ -73,3 +73,78 @@ fn noisy(seed: u64, len: usize) -> Vec<u8> {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
+            (state & 0xFF) as u8
+        })
+        .collect()
+}
+
+fn write_round(engine: &TemporalEngine, round: usize) {
+    for index in 0..KEYS {
+        let value = noisy(
+            (index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ round as u64,
+            VALUE_LEN,
+        );
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet { key: format!("env-{index:06}"), value },
+        });
+        assert!(response.status.ok, "round {round} write {index}: {:?}", response.status);
+    }
+}
+
+fn report(label: &str, s: &crate::control::ShardCanonicalStorageStats) {
+    let x = |ppm: u64| ppm as f64 / 1_000_000.0;
+    println!("  === {label} ===");
+    println!(
+        "    {:<44} {:>10} {:>9}  {}",
+        "ratio", "ppm", "x", "bound"
+    );
+    for (name, ppm, bound) in [
+        ("storage_write_amplification_ppm", s.storage_write_amplification_ppm, "none (codec; below 1.0x by design)"),
+        ("lifetime_write_amplification_ppm", s.lifetime_write_amplification_ppm, "none (rises with uptime)"),
+        ("write_amplification_since_compaction_ppm", s.write_amplification_since_compaction_ppm, "<= 3.0x trigger"),
+        ("user_write_amplification_ppm", s.user_write_amplification_ppm, "none (lifetime over current; rises with uptime)"),
+        ("space_amplification_ppm", s.space_amplification_ppm, "<= 5.0x (slab-granular, pinned)"),
+        ("block_space_amplification_ppm", s.block_space_amplification_ppm, "<= 5.0x (this one moves)"),
+    ] {
+        println!("    {:<44} {:>10} {:>8.3}x  {}", name, ppm, x(ppm), bound);
+    }
+    println!(
+        "    terms: logical_written={} live_block={} live_user={} covered={}",
+        s.logical_bytes_written, s.live_block_bytes, s.live_user_bytes, s.live_objects_with_logical_size
+    );
+    println!();
+}
+
+#[test]
+fn the_published_set_against_its_envelope() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    println!();
+
+    // ---------- 1. WRITTEN ONCE. Every ratio is at its floor, or below it.
+    write_round(&engine, 0);
+    let once = engine.shard_stats(1).expect("stats").storage.clone();
+    report("written once", &once);
+
+    assert_eq!(
+        KEYS as u64, once.live_objects_with_logical_size,
+        "coverage must be complete before any figure here is read as describing the live set"
+    );
+    assert_eq!(
+        NOMINAL_FLOOR_PPM, once.user_write_amplification_ppm,
+        "written once, the user-byte ratio must be exactly 1.0x and read {} ppm",
+        once.user_write_amplification_ppm
+    );
+    // ---------- THE FLOOR STRADDLE, measured on a SECOND store whose values compress.
+    //
+    // The store above writes incompressible bytes and its codec ratio is ABOVE the floor:
+    // framing slightly exceeds the payload. A store of compressible values is BELOW it. Neither
+    // number alone says anything about the ratio -- together they say the floor is decided by the
