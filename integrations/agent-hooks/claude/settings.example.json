@@ -14,3 +14,36 @@
     ],
     "UserPromptSubmit": [
       {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/tools/matrixark_claude_hook.sh --event UserPromptSubmit",
+            "timeout": 30
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/tools/matrixark_claude_hook.sh --event PostToolUse",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ${CLAUDE_PROJECT_DIR}/tools/matrixark_claude_hook.sh --event Stop",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
