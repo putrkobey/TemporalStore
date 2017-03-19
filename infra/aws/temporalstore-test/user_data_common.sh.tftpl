@@ -19,3 +19,25 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 
+mkdir -p \
+  /opt/temporalstore/bin \
+  /opt/temporalstore/conf \
+  /opt/temporalstore/monitoring-ui \
+  /var/log/temporalstore \
+  /mnt/temporalstore-shared/storage \
+  /mnt/temporalstore-shared/wal \
+  /mnt/temporalstore-shared/page \
+  /mnt/temporalstore-shared/index \
+  /mnt/temporalstore-shared/snapshots
+
+cat >/opt/temporalstore/node.env <<EOF
+TEMPORALSTORE_SHARED_PATH=/mnt/temporalstore-shared
+TEMPORALSTORE_CACHE_PATH=
+EOF
+
+cat >/etc/nginx/sites-available/temporalstore-monitoring <<'EOF'
+server {
+  listen 8088 default_server;
+  listen [::]:8088 default_server;
+  server_name _;
+
