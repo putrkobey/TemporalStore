@@ -12,3 +12,10 @@ pub(super) fn push_metric(out: &mut String, name: &str, labels: &[(&str, String)
             out.push_str(key);
             out.push_str("=\"");
             out.push_str(&escape_metric_label(value));
+            out.push('"');
+        }
+        out.push('}');
+    }
+    out.push(' ');
+    out.push_str(&value.to_string());
+    out.push('\n');

@@ -13,3 +13,11 @@ pub struct RedisCommandState {
     pub authenticated: bool,
     pub loaded_shard_id: Option<ShardId>,
 }
+
+impl Default for RedisCommandState {
+    fn default() -> Self {
+        let mut config = HashMap::new();
+        config.insert("requirepass".to_string(), String::new());
+        config.insert("maxmemory".to_string(), "0".to_string());
+        config.insert("maxmemory-policy".to_string(), "noeviction".to_string());
+        Self {
