@@ -48,28 +48,3 @@ impl Client {
         check(code, error)?;
         let out = unsafe { CStr::from_ptr(value).to_string_lossy().into_owned() };
         unsafe { temporalstore_free_string(value) };
-        Ok(out)
-    }
-
-    pub fn hgetall(&self, key: &str) -> Result<Vec<(String, String)>> {
-        let key = cstring(key)?;
-        let mut out = CHashEntryArray {
-            count: 0,
-            entries: ptr::null_mut(),
-        };
-        let mut error: *mut c_char = ptr::null_mut();
-        let code = unsafe { temporalstore_hgetall(self.raw, key.as_ptr(), &mut out, &mut error) };
-        check(code, error)?;
-        let entries = if out.entries.is_null() {
-            Vec::new()
-        } else {
-            let slice = unsafe { std::slice::from_raw_parts(out.entries, out.count) };
-            slice
-                .iter()
-                .map(|entry| {
-                    let field = if entry.field.is_null() {
-                        String::new()
-                    } else {
-                        unsafe { CStr::from_ptr(entry.field).to_string_lossy().into_owned() }
-                    };
-                    let value = if entry.value.is_null() {
