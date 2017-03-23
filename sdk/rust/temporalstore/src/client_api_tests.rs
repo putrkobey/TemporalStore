@@ -46,3 +46,51 @@ fn direct_client_exposes_c_abi_parity_methods() {
     let _: fn(
         &Client,
         &str,
+        crate::ControlStatePrecision,
+        crate::ControlStateWindow,
+    ) -> crate::Result<i64> = Client::control_state_count;
+    let _: fn(&Client, &[(&str, &str, &str)], Option<&str>, Option<&str>) -> crate::Result<()> =
+        Client::matrixark_batch_append_records;
+}
+
+#[cfg(feature = "proxy")]
+#[test]
+fn proxy_client_exposes_proxy_parity_methods() {
+    let _: fn(&ProxyClient, &str, &[crate::FeaturePoint]) -> crate::Result<()> =
+        ProxyClient::feature_add;
+    let _: fn(
+        &ProxyClient,
+        &str,
+        u64,
+        u64,
+        Option<usize>,
+    ) -> crate::Result<Vec<crate::FeaturePoint>> = ProxyClient::feature_query;
+    let _: fn(
+        &ProxyClient,
+        &str,
+        u64,
+        u64,
+        Option<usize>,
+        &[crate::FeatureFilter],
+    ) -> crate::Result<Vec<crate::FeaturePoint>> = ProxyClient::feature_query_filtered;
+    let _: fn(&ProxyClient, &str, u64, u64, &str, Option<usize>) -> crate::Result<i64> =
+        ProxyClient::feature_aggregate;
+    let _: fn(
+        &ProxyClient,
+        &str,
+        i64,
+        u64,
+        crate::ControlStatePrecision,
+        &str,
+        u64,
+    ) -> crate::Result<()> = ProxyClient::control_state_increment;
+    let _: fn(
+        &ProxyClient,
+        &str,
+        crate::ControlStatePrecision,
+        crate::ControlStateWindow,
+    ) -> crate::Result<i64> = ProxyClient::control_state_count;
+    let _: fn(&ProxyClient, &str, &str) -> crate::Result<()> = ProxyClient::set;
+    let _: fn(&ProxyClient, &str) -> crate::Result<Option<String>> = ProxyClient::get;
+    let _: fn(&ProxyClient, &str, u64, i64) -> crate::Result<()> =
+        ProxyClient::control_state_hset;
