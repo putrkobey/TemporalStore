@@ -663,3 +663,669 @@
        other throw happened here, with the answer already in hand. The messages fetch itself
        produces are a short known set; anything else is this page's own. */
     if (typeof e === "number") { return false; }
+    var text = e && e.message ? String(e.message) : (e == null ? "" : String(e));
+    return !text
+      || /failed to fetch|networkerror|load failed|network request failed|the network connection was lost/i.test(text);
+  };
+
+  window.__matrixarkConnState = function (e) {
+    /* What the connection strip should say about this failure, as [state, words].
+
+       Three cases, not two. A first version asked only whether the request arrived and called
+       everything that did a fault in the page -- so a 404 or a 500, which is the deployment
+       answering, turned the strip amber. It showed up the moment the page was opened with
+       nothing behind it: every fetch came back 404 and the strip blamed the page. */
+    if (window.__matrixarkNeverArrived(e)) { return ["down", "gateway unreachable"]; }
+    if (typeof e === "number") { return ["live", "connected"]; }
+    return ["warn", "this page could not show the answer"];
+  };
+
+  window.__matrixarkWhyFailed = function (e, failure) {
+    /* A rejection carrying a status is the deployment answering. A rejection from fetch itself is
+       the request never leaving. A throw after the answer arrived is THIS PAGE failing to show
+       what it was given -- and that used to read "Could not reach the gateway", about a gateway
+       that had just answered.
+
+       The last two are told apart by the message fetch produces, which is one of a short known
+       set. Where it is not recognised the page repeats what it caught rather than guessing: an
+       unfamiliar message shown as it came is still more than a sentence about the network. */
+    if (typeof e === "number") {
+      return (failure || window.__matrixarkFailure)(e);
+    }
+    if (window.__matrixarkNeverArrived(e)) {
+      return "Could not reach the gateway.";
+    }
+    var text = e && e.message ? String(e.message) : String(e);
+    return "The gateway answered, but this page could not show it \u2014 " + text
+      + ". That is a fault in this page, not in the deployment.";
+  };
+
+  window.__matrixarkFailure = function (status, overrides) {
+    if (overrides && overrides[status]) { return overrides[status]; }
+    if (status === 401) { return "This key was not accepted."; }
+    if (status === 403) { return "This key lacks the scope for that call."; }
+    if (status === 413) { return "That request is larger than this deployment accepts."; }
+    if (status === 429) { return "Rate limited — the edge is throttling this key."; }
+    if (status === 502) { return "The gateway could not reach the storage behind it."; }
+    if (status === 503) { return "The gateway is not ready to serve this yet."; }
+    if (status === 504) { return "The backend did not answer in time."; }
+    return "The gateway answered " + status + ".";
+  };
+
+  window.__matrixarkTrace = (function () {
+    /* The last calls this page made, newest last. Bounded: a portal tab is left open for days and
+       an unbounded list of every request is a leak that only shows on the busiest deployment. */
+    var calls = [], LIMIT = 60;
+    var listeners = [];
+
+    function note(entry) {
+      calls.push(entry);
+      if (calls.length > LIMIT) { calls.shift(); }
+      for (var i = 0; i < listeners.length; i++) {
+        try { listeners[i](calls.length); } catch (e) { /* a listener must not break a request */ }
+      }
+    }
+
+    var original = typeof window.fetch === "function" ? window.fetch : null;
+    if (original) {
+      window.fetch = function (input, init) {
+        var at = Date.now();
+        var method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
+        var url = String((input && input.url) || input || "");
+        return original.apply(this, arguments).then(function (response) {
+          /* Untouched. Reading the body here to pull out an incident token would consume it and
+             hand the caller an empty one -- breaking the panels this exists to help diagnose. */
+          note({ at: at, ms: Date.now() - at, method: method, url: url, status: response.status });
+          return response;
+        }, function (err) {
+          /* Status 0 is "never answered", which is a different row from a 500 and has to read as
+             one. The message is the browser's own; it is what tells a blocked request from a
+             refused one. */
+          note({ at: at, ms: Date.now() - at, method: method, url: url, status: 0,
+                 detail: (err && err.message) ? String(err.message) : String(err) });
+          throw err;
+        });
+      };
+    }
+
+    return {
+      calls: function () { return calls.slice(); },
+      onChange: function (fn) { if (typeof fn === "function") { listeners.push(fn); } },
+      note: note
+    };
+  }());
+
+  window.__matrixarkWhen = function (ms) {
+    /* 0 is "no timestamp" here, not the epoch: the catalog site this replaces read
+       `ms ? ... : dash`, and a record with no time would otherwise date to 1970. */
+    if (!ms) { return "—"; }
+    var at = new Date(Number(ms));
+    if (isNaN(at.getTime())) { return "—"; }
+    try { return at.toLocaleString(undefined, { timeZoneName: "short" }); }
+    catch (e) { return at.toLocaleString(); }
+  };
+</script>
+<script>
+/* Tabs, for every portal page whose body declares a tablist.
+ *
+ * Shared rather than per page. The explore page had the only copy and this is the second caller;
+ * two copies of a behaviour that looks identical is how they stop being identical.
+ *
+ * Click alone is not enough for role="tablist". Someone arriving on the selected tab expects the
+ * arrow keys to move between them -- that is what the role announces -- and roving tabindex is
+ * what makes those arrows the way through rather than one more thing to tab past.
+ */
+(function () {
+  "use strict";
+
+  window.wireTabs = function (onShow) {
+    var tabs = Array.prototype.slice.call(document.querySelectorAll(".tabs button"));
+    if (!tabs.length) { return; }
+
+    function show(button) {
+      tabs.forEach(function (b) {
+        var selected = b === button;
+        b.setAttribute("aria-selected", String(selected));
+        b.tabIndex = selected ? 0 : -1;
+      });
+      Array.prototype.forEach.call(document.querySelectorAll(".pane"), function (pane) {
+        pane.hidden = pane.id !== "pane-" + button.dataset.pane;
+      });
+      if (typeof onShow === "function") { onShow(button.dataset.pane); }
+    }
+
+    tabs.forEach(function (button, index) {
+      button.addEventListener("click", function () { show(button); });
+      button.addEventListener("keydown", function (event) {
+        var next = null;
+        if (event.key === "ArrowRight") { next = tabs[(index + 1) % tabs.length]; }
+        else if (event.key === "ArrowLeft") { next = tabs[(index - 1 + tabs.length) % tabs.length]; }
+        else if (event.key === "Home") { next = tabs[0]; }
+        else if (event.key === "End") { next = tabs[tabs.length - 1]; }
+        if (!next) { return; }
+        event.preventDefault();
+        show(next);
+        next.focus();
+      });
+    });
+
+    /* A fragment can name something inside a pane that is not showing.
+     *
+     * The live strip does exactly that from every page: "/v1/admin/setup#encoding" is a div inside
+     * the Settings pane, "#traffic" one inside Checks, and both panes load hidden. The browser
+     * scrolls to a fragment once, at load, and a hidden element is nowhere to scroll to -- so the
+     * badge arrived at the page, the default tab came up, and the state it was reporting on was not
+     * on screen. Nothing said so; the link worked in the only sense a link can be said to work.
+     *
+     * Which pane holds the target is the page's business, not this helper's, so it is read off the
+     * element rather than listed here: any fragment naming anything inside any pane opens it. */
+    function fromHash(hash) {
+      var name;
+      try { name = decodeURIComponent((hash || "").replace(/^#/, "")); }
+      catch (error) { name = (hash || "").replace(/^#/, ""); }
+      if (!name) { return false; }
+      var target = document.getElementById(name);
+      var pane = target && target.closest ? target.closest(".pane") : null;
+      if (!pane) { return false; }
+      var button = document.getElementById("tab-" + pane.id.replace(/^pane-/, ""));
+      if (!button) { return false; }
+      show(button);
+      /* The pane was hidden when the browser did its own scrolling, so it did not scroll. */
+      if (target.scrollIntoView) { target.scrollIntoView(); }
+      return true;
+    }
+
+    /* Clicking "#traffic" while already on this page changes no document, so nothing reloads and
+       the only signal is this event. That is the strip's own page -- the case most likely to be
+       reached and the one where doing nothing looks most like a dead control. */
+    if (window.addEventListener) {
+      window.addEventListener("hashchange", function () {
+        fromHash(window.location && window.location.hash);
+      });
+    }
+
+    var already = tabs.filter(function (b) {
+      return b.getAttribute("aria-selected") === "true";
+    });
+    if (!fromHash(window.location && window.location.hash)) {
+      show(already[0] || tabs[0]);
+    }
+  };
+
+  /* Show a pane from code. Needed whenever one pane's control writes into another's: without
+     it the change lands somewhere the person cannot see, and any instruction about what to do
+     next refers to a part of the page that is not on screen. */
+  window.showTab = function (pane) {
+    var button = document.getElementById("tab-" + pane);
+    if (button) { button.click(); }
+  };
+
+  /* Put a count on a tab. A pane that is hidden cannot report anything itself, and the case that
+     matters is a form with unsaved changes in it. */
+  window.markTab = function (pane, badge) {
+    var button = document.getElementById("tab-" + pane);
+    if (!button) { return; }
+    button.setAttribute("data-badge", badge ? String(badge) : "");
+  };
+}());
+</script>
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+  function auth() {
+    var k = $("key").value.trim();
+    return k ? { Authorization: "Bearer " + k } : {};
+  }
+  function jsonAuth() {
+    return Object.assign({ "Content-Type": "application/json" }, auth());
+  }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function say(el, text, cls) {
+    el.innerHTML = text ? '<div class="msg ' + (cls || "info") + '">' + esc(text) + "</div>" : "";
+  }
+  function conn(state, text) {
+    $("dot").className = "dot " + state;
+    $("conn").textContent = text;
+  }
+  function scope() {
+    var s = {};
+    ["user", "agent", "session"].forEach(function (f) {
+      var v = $(f).value.trim();
+      if (v) { s[f + "_id"] = v; }
+    });
+    return s;
+  }
+  function scopeQuery() {
+    return Object.keys(scope()).map(function (k) {
+      return k + "=" + encodeURIComponent(scope()[k]);
+    }).join("&");
+  }
+  function failure(status) {
+    /* A file, not a request: this page is sending one, and saying so is the difference between
+       a reader checking their upload and checking their gateway. */
+    return window.__matrixarkFailure(status, {
+      413: "That file is larger than this deployment accepts."
+    });
+  }
+  /* `detail` is a sentence when the server has something specific to say; `error` is a code word
+     like "unauthorized", which is the machine's word for it and answers nothing. Prefer the
+     sentence, then our own phrasing, and fall back to the code word only when neither exists. */
+  function reason(body, status) {
+    return (body && body.detail) || failure(status) || (body && body.error) || "";
+  }
+
+  /* ---------- tabs ---------- */
+  window.wireTabs(function (pane) { if (pane === "browse") { loadBrowse(); } });
+
+  /* ---------- ask ---------- */
+  /* The response shape differs between backends and versions; pick the first list of items that
+     looks like a pack rather than insisting on one field name, so this keeps working. */
+  function packItems(d) {
+    var candidates = [d.pack, d.context_pack, d.items, d.results, d.memories, d.refs];
+    for (var i = 0; i < candidates.length; i++) {
+      if (Array.isArray(candidates[i])) { return candidates[i]; }
+    }
+    if (d.context_pack && Array.isArray(d.context_pack.items)) { return d.context_pack.items; }
+    return [];
+  }
+  function itemText(it) {
+    if (typeof it === "string") { return it; }
+    return it.text || it.content || it.memory || it.summary || it.value || JSON.stringify(it);
+  }
+  function itemMeta(it) {
+    if (typeof it === "string") { return ""; }
+    var bits = [];
+    ["layer", "kind", "record_type", "source", "session_id"].forEach(function (k) {
+      if (it[k]) { bits.push(k + "=" + it[k]); }
+    });
+    if (typeof it.score === "number") { bits.push("score=" + it.score.toFixed(3)); }
+    if (it.id || it.memory_id) { bits.push(String(it.id || it.memory_id)); }
+    return bits.join(" · ");
+  }
+
+  /* The backend explains a thin answer; this is where a person sees it. Without this the pack
+     arrives shorter than it should be with nothing saying why, which reads as bad retrieval -- and
+     the fix for bad retrieval is not the fix for a changed encoder. */
+  var ASSEMBLY_LABELS = {
+    python_local_adapter: "the Python adapter",
+    native_rust_proxy: "the native Rust pack",
+    native_backend: "the native backend",
+    rust_proxy_native_context_pack: "the native Rust pack"
+  };
+
+  /* Whether the deployment declined to retrieve rather than finding nothing.
+
+     Under load the gateway sheds: it answers with an empty pack in about 100 ms and says so in
+     `warnings`. That is a third cause of "nothing matched", and it is the one that must not be
+     answered with "check your embedding provider" -- the provider is fine, and the reader who
+     goes to look will find it fine and be no wiser.
+
+     Read off the warning text, which is how this page already tells its other cases apart. The
+     served/empty/shed rule lives in the gateway, where it is measured; this only asks whether the
+     answer said why it was empty. */
+  function wasShed(d) {
+    return ((d && d.warnings) || []).some(function (w) {
+      return /backpressure/i.test(String(w));
+    });
+  }
+
+  function renderAskWarnings(d) {
+    var conflicts = d.embedding_conflicts || {};
+    var blocks = [];
+
+    /* Which implementation answered, and whether it consulted the encoder. Two implementations rank
+       this same store differently, and the results alone do not say which one ran. */
+    var served = d.served_by || {};
+    if (served.assembly) {
+      var who = ASSEMBLY_LABELS[served.assembly] || served.assembly;
+      var how = served.ranking
+        ? " · ranked by " + esc(String(served.ranking).replace(/_/g, " "))
+        : "";
+      $("askServed").innerHTML = "Answered by " + esc(who) + how;
+      $("askServed").hidden = false;
+    } else {
+      $("askServed").hidden = true;
+    }
+    if (served.ranking_uses_vectors === false) {
+      /* The sentence that matters: an encoder is configured, the encoding panel shows vectors
+         stored, and this answer was ordered without reading one of them. */
+      /* Kept as one literal. Split across a concatenation the sentence stops being greppable in
+         the built page, which is how a test asserting the customer can read it passed on a page
+         where they could not. */
+      blocks.push('<div class="note"><b>These results were ranked without using the embedding model.</b> ' +
+        esc(ASSEMBLY_LABELS[served.assembly] || served.assembly) +
+        " orders candidates by how many of your query's words appear in the text, not by meaning. " +
+        "Stored vectors are not consulted on this path, so a paraphrase that shares no words with " +
+        "the original will not match however well the encoder is configured.</div>");
+    }
+    if (conflicts.encoder_change) {
+      blocks.push('<div class="mwarn"><b>' + esc(conflicts.encoder_change) + " stored memor" +
+        (conflicts.encoder_change === 1 ? "y was" : "ies were") + " not searched</b>" +
+        "Their vectors were made by a different embedding model than the one in use now" +
+        (conflicts.active_embedding_model
+          ? " (" + esc(conflicts.active_embedding_model) + ")" : "") +
+        ". Vectors from two models cannot be compared, so those memories cannot match any query " +
+        "until the store is re-embedded — or until you switch back to the model that wrote them. " +
+        'Nothing else reports this: the two are often the same width, so no error is raised.</div>');
+    }
+    if (conflicts.vector_width) {
+      blocks.push('<div class="note"><b>' + esc(conflicts.vector_width) + " stored memor" +
+        (conflicts.vector_width === 1 ? "y was" : "ies were") + " not searched.</b> Their vectors " +
+        "are a different width from this query's, which is what happens when the encoder was " +
+        "unavailable and fallback vectors were written in its place.</div>");
+    }
+    (d.warnings || []).forEach(function (w) {
+      /* The two above say the same thing with more room; do not say it twice. */
+      if (/embedded by a different model|different width from this query/.test(String(w))) {
+        return;
+      }
+      /* Said in full below, in words a reader can act on. `service_backpressure` on its own is
+         the backend's vocabulary, not a sentence. */
+      if (/backpressure/i.test(String(w))) {
+        return;
+      }
+      blocks.push('<div class="note">' + esc(w) + "</div>");
+    });
+    $("askWarnings").innerHTML = blocks.join("");
+  }
+
+  /* Why the pack came back with nothing in it.
+
+     Three causes look identical from here, and naming the wrong one sends the reader to check a
+     setting that is already right -- which is worse than saying nothing, because they will find
+     it right and conclude the page is broken.
+
+     Shedding goes first because it is the only one of the three that is not about this store at
+     all: nothing was searched, so nothing about the encoder or the vectors explains it. It is
+     also the only one the answer states outright, in `warnings`. */
+  function emptyPackMessage(d) {
+    if (wasShed(d)) {
+      return "<b>This deployment did not run the search.</b> It is shedding retrieves under load "
+        + "and answered immediately with an empty result. Nothing is wrong with the query, the "
+        + "store or the embedding model. It clears when the load does.";
+    }
+    var conflicts = (d && d.embedding_conflicts) || {};
+    if (conflicts.encoder_change) {
+      return "Nothing matched. The stored vectors were made by a different embedding model than "
+        + "the one in use now, so they cannot be compared with this query \u2014 see above.";
+    }
+    return "Nothing matched. If the store is not empty, the usual cause is an embedding provider "
+      + "that is still deterministic \u2014 hash vectors do not match on meaning.";
+  }
+
+  function ask() {
+    var q = $("query").value.trim();
+    if (!q) { say($("askMsg"), "Type a question first.", "info"); return; }
+    var body = { query: q, scope: scope() };
+    var budget = parseInt($("budget").value, 10);
+    if (budget > 0) { body.max_budget_tokens = budget; }
+    var topk = parseInt($("topk").value, 10);
+    if (topk > 0) { body.limit = topk; }
+    $("ask").disabled = true;
+    say($("askMsg"), "");
+    $("pack").innerHTML = '<div class="empty">Retrieving…</div>';
+    var started = Date.now();
+    fetch("/v1/retrieve", { method: "POST", headers: jsonAuth(), body: JSON.stringify(body) })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (d) {
+        $("ask").disabled = false;
+        conn("live", "connected");
+        var items = packItems(d);
+        var ms = Date.now() - started;
+        $("askStats").textContent = items.length + " item" + (items.length === 1 ? "" : "s") +
+          (d.tokens ? " · " + d.tokens + " tokens" : "") + " · " + ms + " ms";
+        renderAskWarnings(d);
+        if (!items.length) {
+          $("pack").innerHTML = '<div class="empty">' + emptyPackMessage(d) + "</div>";
+          return;
+        }
+        $("pack").innerHTML = items.map(function (it) {
+          var meta = itemMeta(it);
+          return '<div class="packitem">' +
+            (meta ? '<div class="meta">' + esc(meta) + "</div>" : "") +
+            "<p>" + esc(itemText(it)) + "</p></div>";
+        }).join("");
+      })
+      .catch(function (e) {
+        $("ask").disabled = false;
+        $("pack").innerHTML = '<div class="empty">Nothing retrieved.</div>';
+        say($("askMsg"), window.__matrixarkWhyFailed(e, failure), "err");
+      });
+  }
+
+  /* ---------- add ---------- */
+  function add() {
+    var text = $("note").value.trim();
+    if (!text) { say($("addMsg"), "Type something to ingest.", "info"); return; }
+    var body = {
+      scope: scope(),
+      messages: [{ role: "user", content: text }],
+      finalize: $("finalize").checked
+    };
+    $("add").disabled = true;
+    fetch("/v1/ingest", { method: "POST", headers: jsonAuth(), body: JSON.stringify(body) })
+      .then(function (r) {
+        return r.json().catch(function () { return {}; }).then(function (b) {
+          return { ok: r.ok, status: r.status, body: b };
+        });
+      })
+      .then(function (res) {
+        $("add").disabled = false;
+        if (!res.ok) { say($("addMsg"), reason(res.body, res.status), "err"); return; }
+        say($("addMsg"), $("finalize").checked
+          ? "Ingested and extracted. Ask a question about it on the Ask tab."
+          : "Accepted. Extraction runs in the background, so a retrieve issued right now may not "
+            + "see it yet.", "ok");
+        $("note").value = "";
+      })
+      .catch(function (e) {
+        $("add").disabled = false;
+        say($("addMsg"), window.__matrixarkWhyFailed(e), "err");
+      });
+  }
+
+  /* ---------- browse ---------- */
+  function loadBrowse() {
+    say($("browseMsg"), "");
+    fetch("/v1/users?" + scopeQuery(), { headers: auth() })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (d) {
+        var rows = d.users || d.results || [];
+        $("users").innerHTML = rows.length
+          ? rows.map(function (u) {
+              var name = typeof u === "string" ? u : (u.user_id || u.agent_id || u.run_id || u.id);
+              var n = typeof u === "object" && u.count != null ? u.count : "";
+              return "<div><span>" + esc(name) + "</span><b>" + esc(n) + "</b></div>";
+            }).join("")
+          : '<div class="empty">No subjects hold memories in this scope yet.</div>';
+      })
+      .catch(function (e) {
+        /* Blanking the panel made a failed request indistinguishable from an empty scope -- and
+           the empty scope has WORDS ("No subjects hold memories in this scope yet"), so a blank
+           panel was a third state saying nothing at all. With the sibling fetch below succeeding
+           the screen contradicted itself: memories listed, and no subject holding any.
+
+           Same wording and the same message line as that sibling, which already named the cause
+           on failure while this one was silent. */
+        $("users").innerHTML = '<div class="empty">Not loaded.</div>';
+        say($("browseMsg"), window.__matrixarkWhyFailed(e, failure),
+            "err");
+      });
+
+    $("memories").innerHTML = '<div class="empty">Loading…</div>';
+    fetch("/v1/memories?" + scopeQuery() + "&limit=50", { headers: auth() })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (d) {
+        conn("live", "connected");
+        var rows = d.memories || d.results || d.records || [];
+        if (!rows.length) {
+          $("memories").innerHTML = '<div class="empty">No memories in this scope.</div>';
+          return;
+        }
+        $("memories").innerHTML = "<table><thead><tr><th>Memory</th><th>Kind</th><th>Updated</th>" +
+          "</tr></thead><tbody>" + rows.map(function (m) {
+            var id = m.id || m.memory_id || "";
+            var when = m.updated_at_ms || m.created_at_ms;
+            return '<tr class="rowlink" data-id="' + esc(id) + '"><td>' +
+              esc(String(m.memory || m.text || m.content || "").slice(0, 160)) + "</td><td>" +
+              esc(m.record_type || m.kind || "—") + "</td><td>" +
+              esc(window.__matrixarkWhen(when)) + "</td></tr>";
+          }).join("") + "</tbody></table>";
+      })
+      .catch(function (e) {
+        $("memories").innerHTML = '<div class="empty">Not loaded.</div>';
+        say($("browseMsg"), window.__matrixarkWhyFailed(e, failure),
+            "err");
+      });
+  }
+
+
+  /* ---------- batch ingest ---------- */
+  /* Parsed here so the count and the unusable lines are visible before anything is submitted, and
+     parsed AGAIN on the server, which is the copy that decides. This one is a courtesy. */
+  function parseBatch(text) {
+    var records = [], problems = [];
+    text.split(/\r?\n/).forEach(function (line, index) {
+      var trimmed = line.trim();
+      if (!trimmed) { return; }
+      if (trimmed.charAt(0) === "{") {
+        try {
+          var parsed = JSON.parse(trimmed);
+          if (!parsed.text && !parsed.content) {
+            problems.push("Line " + (index + 1) + " is JSON with no text in it.");
+            return;
+          }
+          records.push(parsed);
+        } catch (e) {
+          problems.push("Line " + (index + 1) + " starts like JSON but does not parse.");
+        }
+        return;
+      }
+      records.push({ text: trimmed });
+    });
+    return { records: records, problems: problems };
+  }
+
+  function batchCount() {
+    var parsed = parseBatch($("batchText").value);
+    $("batchCount").textContent = parsed.records.length
+      ? parsed.records.length + " record" + (parsed.records.length === 1 ? "" : "s") +
+        (parsed.problems.length
+          ? ", " + parsed.problems.length + " line(s) unusable and skipped" : "")
+      : "Nothing entered yet.";
+    return parsed;
+  }
+
+  $("batchText").addEventListener("input", batchCount);
+
+  $("batchFile").addEventListener("change", function () {
+    var file = $("batchFile").files && $("batchFile").files[0];
+    if (!file) { return; }
+    var reader = new FileReader();
+    reader.onload = function () {
+      $("batchText").value = String(reader.result || "");
+      batchCount();
+      say($("batchMsg"), "Loaded " + file.name + ". Nothing has been sent yet.", "info");
+    };
+    reader.onerror = function () { say($("batchMsg"), "Could not read that file.", "err"); };
+    reader.readAsText(file);
+  });
+
+  function submitBatch(preview) {
+    if (!$("key").value.trim()) { say($("batchMsg"), "Enter an API key first.", "info"); return; }
+    var parsed = batchCount();
+    if (!parsed.records.length) {
+      say($("batchMsg"), "There is nothing to send." +
+        (parsed.problems.length ? " " + parsed.problems[0] : ""), "warn");
+      return;
+    }
+    var sc = scope();
+    fetch("/v1/admin/ingestion/records", {
+      method: "POST",
+      headers: Object.assign({ "Content-Type": "application/json" }, auth()),
+      body: JSON.stringify({
+        records: parsed.records,
+        preview: !!preview,
+        user_id: sc.user_id || "default",
+        agent_id: sc.agent_id || "",
+        session_id: sc.session_id || "",
+        api_key_env: $("batchKeyEnv").value.trim() || "MATRIXARK_API_KEY"
+      })
+    })
+      .then(function (r) {
+        return r.json().then(function (b) { return { ok: r.ok, status: r.status, body: b }; });
+      })
+      .then(function (res) {
+        if (!res.ok) {
+          say($("batchMsg"), reason(res.body, res.status), "err");
+          return;
+        }
+        if (preview) {
+          say($("batchMsg"), "Nothing was sent. " + res.body.total + " record" +
+            (res.body.total === 1 ? "" : "s") + " would be ingested as " +
+            (res.body.user_id || "default") + ".", "info");
+          $("batchResult").innerHTML = "<pre>" +
+            esc(JSON.stringify(res.body.sample || [], null, 2)) + "</pre>";
+          return;
+        }
+        say($("batchMsg"), "Started job " + res.body.job_id + " over " + res.body.total +
+          " records. It runs on the server — this tab can be closed.", "ok");
+        watchBatch(res.body.job_id, res.body.total);
+      })
+      .catch(function (e) { say($("batchMsg"), window.__matrixarkWhyFailed(e), "err"); });
+  }
+
+  /* Watched from the shared stream rather than a timer of its own: the job's progress is already
+     being pushed to this page for the strip. */
+  var watchedJob = null;
+
+  function watchBatch(jobId, total) {
+    watchedJob = { id: jobId, total: total, seen: false };
+    renderBatchJob({ job_id: jobId, total: total, done: 0, failed: 0, state: "queued" });
+  }
+
+  function renderBatchJob(job) {
+    var done = (job.done || 0) + (job.failed || 0);
+    var total = job.total || 0;
+    var pct = total ? Math.round((done / total) * 1000) / 10 : 0;
+    var eta = job.eta_s ? " · about " + Math.round(job.eta_s) + "s left" : "";
+    $("batchResult").innerHTML =
+      '<div class="upl"><div class="upl-head"><span class="upl-name">job ' + esc(job.job_id) +
+      '</span><span class="upl-size">' + esc(job.state || "running") + eta + "</span></div>" +
+      '<div class="upl-bar"><i style="width:' + pct + '%"></i></div>' +
+      '<div class="hint" style="margin-top:6px">' + done + " of " + total + " records" +
+      (job.failed ? " · <b>" + job.failed + "</b> failed" : "") +
+      (job.current ? " · " + esc(String(job.current).slice(0, 80)) : "") + "</div></div>";
+  }
+
+  function finishBatchJob() {
+    /* One request when it leaves the running set, rather than polling to find out how it ended.
+       The frame says a job is no longer active; it does not say whether it succeeded. */
+    fetch("/v1/admin/ingestion/jobs", { headers: auth() })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (d) {
+        var job = (d.jobs || []).filter(function (j) {
+          return j.job_id === (watchedJob || {}).id;
+        })[0];
+        watchedJob = null;
+        if (!job) { return; }
+        renderBatchJob(job);
+        var failed = job.failed || 0;
+        say($("batchMsg"), failed
+          ? job.done + " stored, " + failed + " failed" +
+            (job.retryable_failures
+              ? " — " + job.retryable_failures + " worth retrying on Ingestion." : ".")
+          : "All " + job.done + " records stored.", failed ? "warn" : "ok");
+        if (failed) {
+          $("batchResult").innerHTML += '<p class="hint">Retry the failures on ' +
+            '<a href="/v1/admin/ingestion">Ingestion</a>.</p>';
+        }
+      })
+      .catch(function () { watchedJob = null; });
+  }
+

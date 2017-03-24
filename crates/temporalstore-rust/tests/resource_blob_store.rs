@@ -59,3 +59,125 @@ fn run(engine: &TemporalEngine, command: Command) -> CommandResponse {
         shard_id: SHARD_ID,
         command,
     });
+    assert!(
+        response.status.ok,
+        "command failed: {:?}",
+        response.status
+    );
+    response.response
+}
+
+fn put(engine: &TemporalEngine, payload: &[u8]) -> (String, u64, u64) {
+    match run(
+        engine,
+        Command::ContextResourceBlobPut {
+            tenant_hash: TENANT,
+            payload_base64: BASE64.encode(payload),
+        },
+    ) {
+        CommandResponse::ContextResourceBlobCommitted {
+            uri,
+            size_bytes,
+            content_hash,
+        } => (uri, size_bytes, content_hash),
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+fn fetch(engine: &TemporalEngine, uri: &str, offset: u64, length: u64) -> (Vec<u8>, u64, bool) {
+    match run(
+        engine,
+        Command::ContextResourceBlobFetch {
+            uri: uri.to_string(),
+            offset,
+            length,
+        },
+    ) {
+        CommandResponse::ContextResourceBlobChunk {
+            payload_base64,
+            total_size,
+            eof,
+        } => (
+            BASE64.decode(payload_base64).expect("valid base64"),
+            total_size,
+            eof,
+        ),
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[test]
+fn multipart_upload_commits_and_fetches_back_byte_identical() {
+    let engine = new_engine("multipart");
+    let part_a = vec![7u8; 300_000];
+    let part_b = vec![9u8; 200_000];
+
+    let token = match run(
+        &engine,
+        Command::ContextResourceBlobBegin {
+            tenant_hash: TENANT,
+        },
+    ) {
+        CommandResponse::ContextResourceBlobUpload { upload_token, .. } => upload_token,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    for part in [&part_a, &part_b] {
+        match run(
+            &engine,
+            Command::ContextResourceBlobAppend {
+                tenant_hash: TENANT,
+                upload_token: token.clone(),
+                payload_base64: BASE64.encode(part),
+            },
+        ) {
+            CommandResponse::ContextResourceBlobUpload { .. } => {}
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+    let (uri, size, _hash) = match run(
+        &engine,
+        Command::ContextResourceBlobCommit {
+            tenant_hash: TENANT,
+            upload_token: token,
+        },
+    ) {
+        CommandResponse::ContextResourceBlobCommitted {
+            uri,
+            size_bytes,
+            content_hash,
+        } => (uri, size_bytes, content_hash),
+        other => panic!("unexpected response: {other:?}"),
+    };
+    assert_eq!(size, (part_a.len() + part_b.len()) as u64);
+
+    let (bytes, total, eof) = fetch(&engine, &uri, 0, 0);
+    assert_eq!(total, size);
+    assert!(eof);
+    let mut expected = part_a.clone();
+    expected.extend_from_slice(&part_b);
+    assert_eq!(bytes, expected);
+}
+
+#[test]
+fn identical_content_lands_on_the_same_uri() {
+    let engine = new_engine("dedup");
+    let payload = b"the same attachment bytes".repeat(1000);
+    let (first_uri, first_size, _) = put(&engine, &payload);
+    let (second_uri, second_size, _) = put(&engine, &payload);
+    assert_eq!(first_uri, second_uri);
+    assert_eq!(first_size, second_size);
+    let (different_uri, _, _) = put(&engine, b"different bytes");
+    assert_ne!(first_uri, different_uri);
+}
+
+#[test]
+fn range_fetches_honor_offset_length_and_eof() {
+    let engine = new_engine("ranges");
+    let payload: Vec<u8> = (0..=255u8).cycle().take(10_000).collect();
+    let (uri, _, _) = put(&engine, &payload);
+
+    let (bytes, total, eof) = fetch(&engine, &uri, 100, 50);
+    assert_eq!(total, 10_000);
+    assert_eq!(bytes, &payload[100..150]);
+    assert!(!eof);
+
