@@ -6568,3 +6568,3288 @@ mod tests {
                 );
 
                 println!(
+                    "    {:>7}   {:>6}   {:>8}   {:>8}   {:>11.2}",
+                    size,
+                    user,
+                    payload.len(),
+                    framed,
+                    framed as f64 / user as f64
+                );
+                points.push((size as f64, framed as f64));
+            }
+
+            let (rate, envelope, resid) = fit(&points);
+            println!();
+            println!("  one local WAL record = {rate:.4} * payload + {envelope:.1}      worst residual {resid:.1} B");
+
+            // THE FIT HAS TO BE A FIT, same rule as the shared-store report: a line quoted over
+            // points that do not lie on one is a summary of nothing.
+            assert!(
+                resid < envelope.abs().max(1.0),
+                "the fit leaves a residual of {resid:.1} B against an envelope of {envelope:.1} B, \
+                 so `rate * payload + envelope` is not the shape of this cost"
+            );
+            assert!(
+                rate >= 1.0,
+                "the marginal rate is {rate:.4}, under 1.0 -- an uncompressed record cannot store \
+                 less than it was given"
+            );
+
+            // The envelope is small enough that this log is NOT the one to attack, and that is
+            // the headline. Bounded so a regression in it fails here.
+            assert!(
+                envelope < 80.0,
+                "the per-record envelope is {envelope:.1} B, over the 80 B bound this log has \
+                 held; re-price it term by term before raising this"
+            );
+        }
+
+        /// THE ENVELOPE, TERM BY TERM, by clearing and re-encoding -- valid only because the
+        /// regime above is uncompressed.
+        #[test]
+        fn where_one_local_wal_records_envelope_goes() {
+            let size = 512usize;
+            let value = incompressible_seeded(size, size as u64);
+            let record = record_of(value);
+            let (payload, framed) = encoded(&record);
+            let user = KEY.len() + size;
+
+            assert_eq!(
+                payload.first().copied(),
+                Some(crate::wal_proto::RAW_PAYLOAD_MARKER),
+                "this decomposition is only meaningful on an uncompressed record"
+            );
+
+            // The framing log_framing adds: a marker, a varint length, and four CRC bytes.
+            let framing_term = framed - payload.len();
+            // What the record costs on top of the user's bytes, inside the payload.
+            let record_term = payload.len() - user;
+
+            // CLEAR AND RE-ENCODE, per field.
+            let metadata_term = {
+                let mut without = record.clone();
+                without.metadata = None;
+                payload.len() - encode_wal_payload(&without).expect("encodes").len()
+            };
+
+            println!(
+                "local WAL record {framed} B = user {user} B + record fields {record_term} B + \
+                 framing {framing_term} B   (of the record fields, metadata is {metadata_term} B)"
+            );
+
+            // EACH TERM NON-ZERO. A decomposition whose terms sum to the whole can still be wrong
+            // in every term -- that happened on the shared-store frame, where a probe cleared a
+            // field the frame did not populate, reported zero, and the residue silently absorbed
+            // it. So each term is asserted to be a term.
+            assert!(
+                framing_term > 0,
+                "the framing term is {framing_term} B, so this is not measuring the frame"
+            );
+            assert!(
+                record_term > 0,
+                "the record term is {record_term} B, so the record costs nothing over the user's \
+                 bytes, which cannot be true of an encoding that carries a sequence and a shard"
+            );
+            assert!(
+                metadata_term > 0,
+                "clearing the metadata changed nothing, so this probe is clearing a field the \
+                 record does not populate"
+            );
+
+            // THE ACCOUNTING IDENTITY.
+            assert_eq!(
+                user + record_term + framing_term,
+                framed,
+                "user {user} + record {record_term} + framing {framing_term} is not the framed \
+                 record ({framed} B)"
+            );
+
+            // THE FRAMING TERM IS NOT A CONSTANT, which is why it is derived here rather than
+            // pinned. The binary frame is a marker, a VARINT length, and four CRC bytes, so it
+            // costs 6 B for a payload under 128 bytes and 7 B from there to 16 KiB.
+            // `log_framing`'s own test pins 6 -- at a 100-byte payload. Copying that 6 to this
+            // 512-byte record is how this assertion was first written, and it was wrong: the same
+            // "a figure at one size is not a line" that applies to the envelope applies to the
+            // terms inside it.
+            let varint_len = match payload.len() {
+                0..=127 => 1,
+                128..=16_383 => 2,
+                _ => 3,
+            };
+            assert_eq!(
+                framing_term,
+                1 + varint_len + 4,
+                "the binary frame costs {framing_term} B over a {}-byte payload; a marker, a \
+                 {varint_len}-byte varint and four CRC bytes is {}",
+                payload.len(),
+                1 + varint_len + 4
+            );
+        }
+
+        /// WHY THE SWEEP ABOVE USES RANDOM BYTES: the same sweep over repeated ones fits a line
+        /// through the compressor instead.
+        ///
+        /// Not a warning in a comment -- the two slopes are measured and compared, so the reason
+        /// the first test looks the way it does is evidence.
+        #[test]
+        fn a_sweep_over_compressible_payloads_measures_the_compressor_not_the_log() {
+            let mut random: Vec<(f64, f64)> = Vec::new();
+            let mut repeated: Vec<(f64, f64)> = Vec::new();
+            for size in SWEEP {
+                let (_, framed_random) = encoded(&record_of(incompressible_seeded(size, size as u64)));
+                let (payload_repeated, framed_repeated) = encoded(&record_of(vec![b'v'; size]));
+                random.push((size as f64, framed_random as f64));
+                repeated.push((size as f64, framed_repeated as f64));
+                if size >= 512 {
+                    // The regime for THIS arm: the compressor must actually have taken it.
+                    assert_eq!(
+                        payload_repeated.first().copied(),
+                        Some(crate::wal_proto::COMPRESSED_RAW_PAYLOAD_MARKER),
+                        "a {size}-byte run of one byte was not compressed, so this arm is not \
+                         contrasting anything"
+                    );
+                }
+            }
+
+            let (random_rate, _, _) = fit(&random);
+            let (repeated_rate, _, _) = fit(&repeated);
+            println!(
+                "slope over random payloads {random_rate:.4}; over repeated payloads \
+                 {repeated_rate:.4}"
+            );
+
+            assert!(
+                repeated_rate < random_rate / 2.0,
+                "the two slopes are {repeated_rate:.4} and {random_rate:.4}. They are supposed to \
+                 differ by a lot: if a run of one byte costs nearly as much as random bytes, \
+                 compression is not running and the first test's payload choice is unnecessary"
+            );
+        }
+
+        /// EVERY BYTE OF ONE RECORD, ATTRIBUTED TO THE FIELD THAT OWNS IT.
+        ///
+        /// # WHY A WIRE WALK AND NOT A CLEAR-AND-RE-ENCODE
+        ///
+        /// `where_one_local_wal_records_envelope_goes` prices a field by clearing it and
+        /// re-encoding. That answers "what does this field cost" only when the field was
+        /// populated: clear one the record never filled and the probe reports 0 B while the
+        /// bytes it was looking for sit in some other term. This store has already been bitten
+        /// by exactly that -- a term probe cleared a digest field a frame did not populate,
+        /// reported `digest 0 B`, and the five real bytes were absorbed into the residue, with
+        /// the accounting identity still holding, because a remainder takes up whatever the
+        /// named terms miss.
+        ///
+        /// So this walks the wire instead. Every byte is attributed to a field by its own tag,
+        /// an UNKNOWN TAG IS A PANIC rather than a skip, and there is no residue term for
+        /// anything to hide in: the sum of the named terms is asserted equal to the framed
+        /// record, so a byte that is not named is a failure rather than a rounding.
+        ///
+        /// # THE SURFACE, NAMED
+        ///
+        /// This is the LOCAL log's record: `encode_wal_payload` (a hand-written and generated
+        /// protobuf of `EngineWalRecord`, marker byte first) inside `log_framing::encode_record`
+        /// (a marker, a varint length and a CRC32C). It is NOT the shared store's log frame,
+        /// which `one_append_amplification_report` measures over two objects, and it is not the
+        /// `TSIDX` container, whose byte figure is a compressed size and cannot name a field.
+        mod every_byte_named {
+            use super::*;
+
+            /// Which message a stretch of bytes belongs to. The walk needs this because a
+            /// protobuf field's bytes mean nothing without the message that declares its tags.
+            #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+            enum Schema {
+                Record,
+                Command,
+                StringSet,
+                HashSet,
+                Metadata,
+                Item,
+                BlockAddress,
+                StagedBlock,
+            }
+
+            /// The tag table, transcribed from `proto/temporalstore/v1/temporalstore.proto`.
+            ///
+            /// `None` as the nested schema means the field's value bytes are a leaf and are
+            /// named as one term. `Some` means the walk descends and names the fields inside.
+            fn field(schema: Schema, tag: u32) -> Option<(&'static str, Option<Schema>)> {
+                Some(match (schema, tag) {
+                    // EngineWalRecord
+                    (Schema::Record, 1) => ("shard_id", None),
+                    (Schema::Record, 2) => ("sequence", None),
+                    (Schema::Record, 3) => ("command", Some(Schema::Command)),
+                    (Schema::Record, 4) => ("metadata", Some(Schema::Metadata)),
+                    (Schema::Record, 5) => ("item", Some(Schema::Item)),
+                    (Schema::Record, 6) => ("staged_block", Some(Schema::StagedBlock)),
+                    // WalCommand
+                    (Schema::Command, 1) => ("string_set", Some(Schema::StringSet)),
+                    (Schema::Command, 2) => ("hash_set", Some(Schema::HashSet)),
+                    (Schema::Command, 99) => ("verbatim", None),
+                    // StringSet
+                    (Schema::StringSet, 1) => ("key", None),
+                    (Schema::StringSet, 2) => ("value", None),
+                    (Schema::StringSet, 3) => ("ttl_ms", None),
+                    // HashSet
+                    (Schema::HashSet, 1) => ("key", None),
+                    (Schema::HashSet, 2) => ("field", None),
+                    (Schema::HashSet, 3) => ("value", None),
+                    // EngineWalMetadata
+                    (Schema::Metadata, 1) => ("version", None),
+                    (Schema::Metadata, 2) => ("timestamp_ms", None),
+                    (Schema::Metadata, 3) => ("item", Some(Schema::Item)),
+                    (Schema::Metadata, 4) => ("batch_id", None),
+                    (Schema::Metadata, 5) => ("batch_size", None),
+                    (Schema::Metadata, 6) => ("batch_index", None),
+                    // EngineWalItem
+                    (Schema::Item, 1) => ("item_kind", None),
+                    (Schema::Item, 2) => ("model", None),
+                    (Schema::Item, 3) => ("object_key", None),
+                    (Schema::Item, 4) => ("bucket_id", None),
+                    (Schema::Item, 5) => ("object_id", None),
+                    (Schema::Item, 6) => ("block_id", None),
+                    (Schema::Item, 7) => ("ttl_ms", None),
+                    (Schema::Item, 8) => ("deleted", None),
+                    (Schema::Item, 9) => ("meta_log", None),
+                    (Schema::Item, 10) => ("block_log", None),
+                    (Schema::Item, 11) => ("component", None),
+                    (Schema::Item, 12) => ("block", Some(Schema::BlockAddress)),
+                    (Schema::Item, 13) => ("value", None),
+                    (Schema::Item, 14) => ("kind_name", None),
+                    (Schema::Item, 15) => ("routing_bucket", None),
+                    (Schema::Item, 16) => ("timestamp_ms", None),
+                    (Schema::Item, 17) => ("entry_id", None),
+                    (Schema::Item, 18) => ("object_deleted", None),
+                    (Schema::Item, 19) => ("kind_code", None),
+                    // WalBlockAddress
+                    (Schema::BlockAddress, 1) => ("block_slab_id", None),
+                    (Schema::BlockAddress, 2) => ("offset", None),
+                    (Schema::BlockAddress, 3) => ("length", None),
+                    (Schema::BlockAddress, 4) => ("block_id", None),
+                    (Schema::BlockAddress, 5) => ("object_id", None),
+                    (Schema::BlockAddress, 6) => ("routing_bucket", None),
+                    (Schema::BlockAddress, 7) => ("generation", None),
+                    (Schema::BlockAddress, 8) => ("slab_id", None),
+                    (Schema::BlockAddress, 9) => ("checksum", None),
+                    (Schema::BlockAddress, 10) => ("checksum_raw", None),
+                    // WalStagedBlock
+                    (Schema::StagedBlock, 1) => ("object_id", None),
+                    (Schema::StagedBlock, 2) => ("block", None),
+                    (Schema::StagedBlock, 3) => ("routing_bucket", None),
+                    (Schema::StagedBlock, 4) => ("component", None),
+                    _ => return None,
+                })
+            }
+
+            fn varint(bytes: &[u8], at: &mut usize) -> u64 {
+                let mut value = 0u64;
+                let mut shift = 0u32;
+                loop {
+                    let byte = *bytes
+                        .get(*at)
+                        .unwrap_or_else(|| panic!("a varint ran off the end at byte {}", *at));
+                    *at += 1;
+                    value |= u64::from(byte & 0x7f) << shift;
+                    if byte & 0x80 == 0 {
+                        return value;
+                    }
+                    shift += 7;
+                    assert!(shift < 64, "a varint longer than ten bytes at byte {}", *at);
+                }
+            }
+
+            /// Name every byte of one message, descending into the messages inside it.
+            fn attribute(body: &[u8], schema: Schema, path: &str, out: &mut Vec<(String, usize)>) {
+                let mut at = 0usize;
+                while at < body.len() {
+                    let key_at = at;
+                    let key = varint(body, &mut at);
+                    let tag = (key >> 3) as u32;
+                    let wire = key & 0x7;
+                    let (name, nested) = field(schema, tag).unwrap_or_else(|| {
+                        panic!(
+                            "UNCLASSIFIED FIELD: tag {tag} of {schema:?} at byte {key_at} under \
+                             {path:?}. Every byte of this record must be attributable to a named \
+                             field. A tag with no name here means this tag table is behind the \
+                             message it transcribes -- add the field rather than letting its \
+                             bytes fall into a remainder, which is how a decomposition comes to \
+                             be wrong in a term and still sum to the whole"
+                        )
+                    });
+                    out.push((format!("{path}{name} tag"), at - key_at));
+                    match wire {
+                        0 => {
+                            let value_at = at;
+                            varint(body, &mut at);
+                            out.push((format!("{path}{name} value"), at - value_at));
+                        }
+                        1 => {
+                            out.push((format!("{path}{name} value"), 8));
+                            at += 8;
+                        }
+                        5 => {
+                            out.push((format!("{path}{name} value"), 4));
+                            at += 4;
+                        }
+                        2 => {
+                            let len_at = at;
+                            let len = varint(body, &mut at) as usize;
+                            out.push((format!("{path}{name} length"), at - len_at));
+                            match nested {
+                                Some(inner) => {
+                                    let before = out.len();
+                                    attribute(
+                                        &body[at..at + len],
+                                        inner,
+                                        &format!("{path}{name}."),
+                                        out,
+                                    );
+                                    let named: usize = out[before..].iter().map(|term| term.1).sum();
+                                    assert_eq!(
+                                        named, len,
+                                        "the walk of {path}{name} named {named} B of its own {len} B"
+                                    );
+                                }
+                                None => out.push((format!("{path}{name} value"), len)),
+                            }
+                            at += len;
+                        }
+                        other => {
+                            panic!("wire type {other} is not one this walk reads, at {path}{name}")
+                        }
+                    }
+                }
+                assert_eq!(at, body.len(), "the walk of {path} overran its message");
+            }
+
+            /// Bytes the binary frame's own length varint occupies over a payload of this size.
+            fn frame_varint_len(payload_len: usize) -> usize {
+                match payload_len {
+                    0..=127 => 1,
+                    128..=16_383 => 2,
+                    _ => 3,
+                }
+            }
+
+            /// Every byte of one framed record, named. The sum is asserted equal to the frame.
+            fn terms_of(record: &WriteAheadLogRecord) -> (Vec<(String, usize)>, usize) {
+                let (payload, framed) = encoded(record);
+                assert_eq!(
+                    payload.first().copied(),
+                    Some(crate::wal_proto::RAW_PAYLOAD_MARKER),
+                    "this walk names protobuf fields, so it is only meaningful on the \
+                     uncompressed branch; this payload went through the compressor"
+                );
+                let mut terms = vec![("payload marker".to_string(), 1usize)];
+                attribute(&payload[1..], Schema::Record, "record.", &mut terms);
+                let named: usize = terms.iter().map(|term| term.1).sum();
+                assert_eq!(
+                    named,
+                    payload.len(),
+                    "the walk named {named} B of a {} B payload, so some of the payload is \
+                     unaccounted for",
+                    payload.len()
+                );
+
+                // The binary frame around it, which is three terms and not one.
+                let varint_len = frame_varint_len(payload.len());
+                assert_eq!(
+                    framed - payload.len(),
+                    1 + varint_len + 4,
+                    "the binary frame costs {} B over a {}-byte payload, not the marker, \
+                     {varint_len}-byte varint and four CRC bytes this names",
+                    framed - payload.len(),
+                    payload.len()
+                );
+                terms.push(("frame marker".to_string(), 1));
+                terms.push(("frame length varint".to_string(), varint_len));
+                terms.push(("frame crc32c".to_string(), 4));
+
+                let total: usize = terms.iter().map(|term| term.1).sum();
+                assert_eq!(
+                    total, framed,
+                    "the named terms sum to {total} B against a {framed} B framed record. There \
+                     is deliberately no remainder term for the difference to live in"
+                );
+                (terms, framed)
+            }
+
+            /// A record carrying ONE OUTCOME and no operation -- the shape this log writes by
+            /// default. The batch append path builds exactly this: no command, because the items
+            /// say what the batch did.
+            ///
+            /// # THE OBJECT ID IS THE DERIVED ONE, AND THAT IS NOT A DETAIL
+            ///
+            /// `item_object_id_to_write` writes the id ONLY when it differs from
+            /// `stable_block_object_id(shard, kind, key)`, so a record whose id is the derived one
+            /// omits nine bytes -- a `fixed64` and its tag. An invented id is therefore not a
+            /// smaller version of a real one, it is a DIFFERENT SHAPE: the first draft of this
+            /// fixture used `1_000` and reported an outcome envelope 9 B larger than the one this
+            /// log actually writes, which would have made the default shape look like the
+            /// expensive one. The id is derived here for that reason, and
+            /// `the_fixture_writes_the_object_id_the_store_would_derive` asserts the omission
+            /// rather than trusting this comment.
+            fn outcome_record_of(value: Vec<u8>) -> WriteAheadLogRecord {
+                WriteAheadLogRecord {
+                    shard_id: 1,
+                    sequence: 1,
+                    command: None,
+                    metadata: Some(WriteAheadLogRecordMetadata {
+                        version: WRITE_AHEAD_LOG_FORMAT_VERSION,
+                        timestamp_ms: 1_787_270_070_192,
+                        items: Vec::new(),
+                        batch_id: None,
+                        batch_size: None,
+                        batch_index: None,
+                    }),
+                    staged_blocks: Vec::new(),
+                    outcomes: vec![WalOutcomeItem {
+                        kind: "string".to_string(),
+                        object_key: KEY.to_string(),
+                        component: None,
+                        object_id: crate::engine::hashing::stable_block_object_id(
+                            1, "string", KEY,
+                        ),
+                        routing_bucket: 7,
+                        address: None,
+                        value: Some(value),
+                        ttl: None,
+                        deleted: false,
+                        meta: false,
+                    }],
+                }
+            }
+
+            /// THE FIXTURE'S OWN PRECONDITION: the outcome item names the object the way the store
+            /// does, so the record under measurement is the shape the store writes.
+            ///
+            /// Without this the sweep would still produce a line, a residual and a ceiling -- all
+            /// of them about a record no append produces. A fixture that is wrong in a way the
+            /// encoder has an omission rule for does not look wrong; it looks expensive.
+            #[test]
+            fn the_fixture_writes_the_object_id_the_store_would_derive() {
+                let (terms, _) = terms_of(&outcome_record_of(incompressible_seeded(32, 32)));
+                let named: usize = terms
+                    .iter()
+                    .filter(|(name, _)| name.starts_with("record.item.object_id"))
+                    .map(|(_, bytes)| bytes)
+                    .sum();
+                assert_eq!(
+                    0, named,
+                    "this fixture's outcome item spends {named} B stating its object id, so the \
+                     id it carries is not `stable_block_object_id(1, \"string\", {KEY:?})` and \
+                     every outcome figure here is about a record this store does not write"
+                );
+                // AND THE CONTROL, so a zero above cannot mean the walk stopped finding the
+                // field: an item whose id is NOT the derived one does spend those bytes.
+                let mut invented = outcome_record_of(incompressible_seeded(32, 32));
+                invented.outcomes[0].object_id = invented.outcomes[0].object_id.wrapping_add(1);
+                let (control, _) = terms_of(&invented);
+                let control_named: usize = control
+                    .iter()
+                    .filter(|(name, _)| name.starts_with("record.item.object_id"))
+                    .map(|(_, bytes)| bytes)
+                    .sum();
+                assert_eq!(
+                    9, control_named,
+                    "an item whose object id is NOT the derived one spent {control_named} B on \
+                     it, not a tag and a fixed64, so the zero above is not evidence of an \
+                     omission"
+                );
+            }
+
+            fn report(label: &str, terms: &[(String, usize)], framed: usize, user: usize) {
+                let mut rows: Vec<(String, usize)> = terms.to_vec();
+                rows.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+                println!();
+                println!("  {label}: {framed} B framed, {user} B of it the caller's own");
+                for (name, bytes) in &rows {
+                    println!("    {bytes:>7} B   {name}");
+                }
+                println!(
+                    "    {:>7} B   = ENVELOPE (framed minus the caller's own)",
+                    framed - user
+                );
+            }
+
+            /// Bytes the caller's key and value occupy, found by name rather than by subtraction.
+            fn callers_own(terms: &[(String, usize)], size: usize) -> usize {
+                let key = terms
+                    .iter()
+                    .find(|(name, _)| {
+                        name == "record.command.string_set.key value"
+                            || name == "record.item.object_key value"
+                    })
+                    .expect("no term holds the caller's key");
+                assert_eq!(
+                    key.1,
+                    KEY.len(),
+                    "the key term {:?} is {} B for a {}-character key",
+                    key.0,
+                    key.1,
+                    KEY.len()
+                );
+                if size == 0 {
+                    return key.1;
+                }
+                let value = terms
+                    .iter()
+                    .find(|(name, _)| {
+                        name == "record.command.string_set.value value"
+                            || name == "record.item.value value"
+                    })
+                    .expect("no term holds the caller's value");
+                assert_eq!(
+                    value.1, size,
+                    "the value term {:?} is {} B for a {size}-byte value",
+                    value.0, value.1
+                );
+                key.1 + value.1
+            }
+
+            /// THE DECOMPOSITION, with every term named, every term non-zero, and no remainder.
+            ///
+            /// Run at 512 bytes deliberately: the terms are all populated there, so "every term
+            /// non-zero" is a statement about the encoding rather than about a fixture that
+            /// happened to leave a field empty.
+            #[test]
+            fn every_byte_of_one_record_has_a_name() {
+                const SIZE: usize = 512;
+                let value = incompressible_seeded(SIZE, SIZE as u64);
+
+                for (label, record) in [
+                    ("a record carrying an OPERATION", record_of(value.clone())),
+                    (
+                        "a record carrying an OUTCOME (the shape this log writes by default)",
+                        outcome_record_of(value.clone()),
+                    ),
+                ] {
+                    let (terms, framed) = terms_of(&record);
+                    let user = callers_own(&terms, SIZE);
+                    report(label, &terms, framed, user);
+
+                    // EACH TERM IS A TERM. A zero-byte term is a field written with no content,
+                    // which is a finding rather than a rounding.
+                    for (name, bytes) in &terms {
+                        assert!(
+                            *bytes > 0,
+                            "{label}: the term {name:?} is 0 B, so this walk is naming a field \
+                             that carries nothing"
+                        );
+                    }
+
+                    // THE TERMS EVERY RECORD OF THIS LOG OWES, asserted by name and non-zero.
+                    // Without this the walk could name a record correctly and say nothing about
+                    // whether the fields that make it a log record are there at all.
+                    for owed in [
+                        "payload marker",
+                        "frame marker",
+                        "frame length varint",
+                        "frame crc32c",
+                        "record.shard_id value",
+                        "record.sequence value",
+                    ] {
+                        let bytes: usize = terms
+                            .iter()
+                            .filter(|(name, _)| name == owed)
+                            .map(|(_, bytes)| bytes)
+                            .sum();
+                        assert!(
+                            bytes > 0,
+                            "{label}: the term {owed:?} is absent or 0 B. Every record of this \
+                             log carries a frame, a payload marker, a shard and a sequence"
+                        );
+                    }
+                }
+            }
+
+            /// WHAT THE LEADER CLOCK STAMP COSTS, AND WHICH SHAPE READS IT.
+            ///
+            /// See `wal_proto::leader_stamp_has_a_reader` for the whole argument. BOTH ARMS are
+            /// asserted here, because dropping the stamp from the shape that reads it would lose
+            /// a deadline and dropping it from neither would save nothing.
+            #[test]
+            fn only_the_shape_that_re_executes_carries_the_leader_stamp() {
+                const SIZE: usize = 512;
+                let value = incompressible_seeded(SIZE, SIZE as u64);
+
+                let (operation_terms, operation_framed) = terms_of(&record_of(value.clone()));
+                let (outcome_terms, outcome_framed) = terms_of(&outcome_record_of(value));
+
+                let stamp = |terms: &[(String, usize)]| -> usize {
+                    terms
+                        .iter()
+                        .filter(|(name, _)| name.starts_with("record.metadata.timestamp_ms"))
+                        .map(|(_, bytes)| bytes)
+                        .sum()
+                };
+
+                let on_operation = stamp(&operation_terms);
+                let on_outcome = stamp(&outcome_terms);
+                println!();
+                println!(
+                    "  record.metadata.timestamp_ms: {on_operation} B on a record carrying an \
+                     operation ({operation_framed} B framed), {on_outcome} B on one carrying an \
+                     outcome ({outcome_framed} B framed)"
+                );
+
+                assert!(
+                    on_operation >= 7,
+                    "a record that will be RE-EXECUTED on replay carries {on_operation} B of \
+                     leader stamp. Replay resolves its relative TTL deadlines against that \
+                     stamp, and without one every deadline in it is extended to the restart \
+                     clock -- see `wal_replay_reads_an_unstamped_record_against_the_live_clock`"
+                );
+                assert_eq!(
+                    0, on_outcome,
+                    "a record carrying outcomes spends {on_outcome} B on a leader stamp the \
+                     replay loop never reads: it installs the recorded items and continues above \
+                     `set_replay_clock_ms`. If replay has started reading the stamp on that \
+                     branch then `wal_proto::leader_stamp_has_a_reader` is the thing to change, \
+                     not this assertion"
+                );
+            }
+
+            /// THE ENVELOPE AS A LINE, for both record shapes, over a payload sweep.
+            ///
+            /// A per-record figure quoted at one payload size is mostly the envelope divided by
+            /// that size, so the size is swept and `framed = rate * payload + envelope` fitted,
+            /// with the worst residual printed beside it.
+            #[test]
+            fn the_envelope_is_a_line_on_both_record_shapes() {
+                println!();
+                println!(
+                    "    payload   user B   operation framed   outcome framed   operation env   outcome env"
+                );
+                let mut operation: Vec<(f64, f64)> = Vec::new();
+                let mut outcome: Vec<(f64, f64)> = Vec::new();
+                for size in SWEEP {
+                    let value = incompressible_seeded(size, size as u64);
+                    let (operation_terms, operation_framed) = terms_of(&record_of(value.clone()));
+                    let (outcome_terms, outcome_framed) = terms_of(&outcome_record_of(value));
+                    let operation_user = callers_own(&operation_terms, size);
+                    let outcome_user = callers_own(&outcome_terms, size);
+                    assert_eq!(
+                        operation_user, outcome_user,
+                        "the two shapes carry different amounts of the caller's own bytes at \
+                         {size}, so their envelopes are not comparable"
+                    );
+                    println!(
+                        "    {size:>7}   {operation_user:>6}   {operation_framed:>16}   {outcome_framed:>14}   {:>13}   {:>11}",
+                        operation_framed - operation_user,
+                        outcome_framed - outcome_user,
+                    );
+                    operation.push((size as f64, operation_framed as f64));
+                    outcome.push((size as f64, outcome_framed as f64));
+                }
+
+                let (operation_rate, operation_env, operation_resid) = fit(&operation);
+                let (outcome_rate, outcome_env, outcome_resid) = fit(&outcome);
+                println!();
+                println!("  carrying an operation = {operation_rate:.4} * payload + {operation_env:.1}      worst residual {operation_resid:.1} B");
+                println!("  carrying an outcome   = {outcome_rate:.4} * payload + {outcome_env:.1}      worst residual {outcome_resid:.1} B");
+                println!(
+                    "  outcome shape: at {:>5} B payload the envelope alone is {:>6.2}x of the caller's bytes",
+                    SWEEP[1],
+                    outcome_env / (KEY.len() + SWEEP[1]) as f64
+                );
+                println!(
+                    "  outcome shape: at {:>5} B payload the envelope alone is {:>6.2}x of the caller's bytes",
+                    SWEEP[SWEEP.len() - 1],
+                    outcome_env / (KEY.len() + SWEEP[SWEEP.len() - 1]) as f64
+                );
+
+                // THE FITS HAVE TO BE FITS, the same rule every other line on this surface is
+                // held to: a line quoted over points that do not lie on one summarises nothing.
+                for (label, rate, env, resid) in [
+                    ("operation", operation_rate, operation_env, operation_resid),
+                    ("outcome", outcome_rate, outcome_env, outcome_resid),
+                ] {
+                    assert!(
+                        resid < env.abs().max(1.0),
+                        "the {label} fit leaves a residual of {resid:.1} B against an envelope of \
+                         {env:.1} B, so `rate * payload + envelope` is not the shape of this cost"
+                    );
+                    assert!(
+                        rate >= 1.0,
+                        "the {label} marginal rate is {rate:.4}, under 1.0 -- an uncompressed \
+                         record cannot store less than it was given"
+                    );
+                }
+
+                // THE CEILING FOLLOWS THE ENVELOPE DOWN. A bound left where it was after the
+                // envelope dropped would admit the whole of the saving being handed back.
+                //
+                // Both shapes get one, and they are different numbers because they are different
+                // records: the operation shape pays a leader stamp and two levels of command
+                // nesting, the outcome shape pays a kind code, a routing bucket and the item's
+                // own tag and length. Quoting either as "the" per-record envelope is the
+                // confusion these two bounds exist to make impossible.
+                assert!(
+                    operation_env < 38.0,
+                    "the per-record envelope of a record carrying an OPERATION is \
+                     {operation_env:.1} B, over the 38 B ceiling. Every byte of it is named by \
+                     `every_byte_of_one_record_has_a_name` -- re-price it term by term before \
+                     raising this"
+                );
+                assert!(
+                    outcome_env < 34.0,
+                    "the per-record envelope of a record carrying an OUTCOME is \
+                     {outcome_env:.1} B, over the 34 B ceiling. Every byte of it is named by \
+                     `every_byte_of_one_record_has_a_name`. The leader stamp came off this shape \
+                     for seven of those bytes -- re-price it term by term before raising this"
+                );
+                // AND THE DEFAULT SHAPE MUST BE THE CHEAPER ONE. It was not: with the stamp on
+                // it, the shape this log writes by default cost MORE per record than the
+                // command-carrying shape the published figure was measured on.
+                assert!(
+                    outcome_env < operation_env,
+                    "the outcome shape's envelope is {outcome_env:.1} B against the operation \
+                     shape's {operation_env:.1} B. The outcome shape carries no command and no \
+                     leader stamp, so it cannot be the more expensive of the two"
+                );
+            }
+
+            /// THE IDLE CONTROL for a surface with no store in it: the same record encoded twice
+            /// is the same bytes.
+            ///
+            /// Without it no byte figure above is attributable. A wall clock, a counter or an
+            /// address that leaked into the encoding would move the total between two encodings
+            /// of an identical record, and every term in the table would be a measurement of
+            /// when it was taken rather than of what the record holds.
+            #[test]
+            fn the_same_record_encodes_to_the_same_bytes_twice() {
+                let value = incompressible_seeded(512, 512);
+                for record in [record_of(value.clone()), outcome_record_of(value)] {
+                    let (first, first_framed) = encoded(&record);
+                    let (second, second_framed) = encoded(&record);
+                    assert_eq!(
+                        first, second,
+                        "one record encoded twice produced different payloads, so something \
+                         outside the record is reaching the bytes"
+                    );
+                    assert_eq!(
+                        first_framed, second_framed,
+                        "the frame length moved between two encodings of one record"
+                    );
+                }
+            }
+
+            /// ONE OUTCOME RECORD OF THE SHAPE THIS BUILD NO LONGER WRITES, AS BYTES.
+            ///
+            /// A payload: the raw-payload marker, then an `EngineWalRecord` carrying one outcome
+            /// item AND the leader stamp beside it. `the_payload_an_older_writer_produced` builds
+            /// the same thing from the generated encoder and this literal is asserted equal to
+            /// it, so the literal is a record rather than a string someone typed.
+            /// ```text
+            ///   b8                             the raw-payload marker
+            ///   08 01                          shard_id 1
+            ///   10 09                          sequence 9
+            ///   22 07  10 b0ffe38c8234         metadata { timestamp_ms 1787270070192 }
+            ///   2a 12                          one item, 18 bytes of it:
+            ///          1a 07 616d702d6b6579      object_key "amp-key"
+            ///          6a 02 7676                value "vv"
+            ///          78 07                     routing_bucket 7
+            ///          980101                    kind_code 1
+            /// ```
+            ///
+            /// No `object_id`: it is the one the shard derives, so the writer omitted it then and
+            /// omits it now. The stamp inside `metadata` is the field this build no longer states
+            /// on this shape, and it is the whole of the difference.
+            const AN_OUTCOME_RECORD_THAT_STATES_ITS_LEADER_STAMP: &str =
+                "b808011009220710b0ffe38c82342a121a07616d702d6b65796a0276767807980101";
+
+            /// The bytes a writer produced before this build stopped stating the stamp on this
+            /// shape, built with the GENERATED encoder rather than the hand-written one under
+            /// change -- so the two halves of this test cannot be wrong together.
+            fn the_payload_an_older_writer_produced() -> Vec<u8> {
+                use prost::Message as _;
+                let record = stamped_outcome_record();
+                let message = crate::sdk::v1::EngineWalRecord {
+                    shard_id: record.shard_id,
+                    sequence: record.sequence,
+                    command: None,
+                    metadata: Some(crate::sdk::v1::EngineWalMetadata {
+                        // Absent means current, which is what the writer wrote then and now.
+                        version: 0,
+                        timestamp_ms: record
+                            .metadata
+                            .as_ref()
+                            .expect("the fixture carries metadata")
+                            .timestamp_ms,
+                        items: Vec::new(),
+                        batch_id: None,
+                        batch_size: None,
+                        batch_index: None,
+                    }),
+                    items: record
+                        .outcomes
+                        .iter()
+                        .map(|item| {
+                            crate::wal_proto::item_to_proto(item, record.shard_id, None, None)
+                        })
+                        .collect(),
+                    staged_blocks: Vec::new(),
+                };
+                let mut out = vec![crate::wal_proto::RAW_PAYLOAD_MARKER];
+                message.encode(&mut out).expect("the message encodes");
+                out
+            }
+
+            /// The record the literal above is: one outcome, a short value, and a leader stamp.
+            fn stamped_outcome_record() -> WriteAheadLogRecord {
+                let mut record = outcome_record_of(b"vv".to_vec());
+                record.sequence = 9;
+                record
+            }
+
+            /// A RECORD WRITTEN BEFORE THIS CHANGE STILL HANDS BACK ITS LEADER STAMP.
+            ///
+            /// # WHY A COMMITTED LITERAL AND NOT A ROUND TRIP
+            ///
+            /// A round trip writes and reads with the same build, so both halves can be wrong
+            /// together and agree. These bytes are committed in this file: they do not come from
+            /// the encoder this change touched, and if the decoder's reading of them moves, this
+            /// fails whether or not the encoder moved with it.
+            ///
+            /// Three things are asserted, and the third is the one that makes the first two mean
+            /// something: the literal IS a record an older writer produced, the production
+            /// decoder reads the stamp out of it, and this build does NOT produce those bytes --
+            /// a literal that matched the current encoder would prove nothing about an old shape.
+            #[test]
+            fn an_old_outcome_record_still_hands_back_its_leader_stamp() {
+                let built = the_payload_an_older_writer_produced();
+                let printed = hex::encode(&built);
+                println!();
+                println!("  the old shape, as this build would have written it: {printed}");
+                assert_eq!(
+                    AN_OUTCOME_RECORD_THAT_STATES_ITS_LEADER_STAMP, printed,
+                    "the literal committed in this file is not the payload an older writer \
+                     produced for this record. Either the message definition moved -- in which \
+                     case a record already on disk is being read by a changed decoder and that is \
+                     the thing to check -- or the literal needs replacing with the line printed \
+                     above"
+                );
+
+                let bytes = hex::decode(AN_OUTCOME_RECORD_THAT_STATES_ITS_LEADER_STAMP)
+                    .expect("the committed literal is hex");
+                let old = crate::wal_proto::decode(&bytes).expect("the old shape still decodes");
+                assert_eq!(1, old.shard_id);
+                assert_eq!(9, old.sequence);
+                assert_eq!(
+                    1,
+                    old.outcomes.len(),
+                    "the old record's outcome did not come back, so this is not reading the \
+                     record it claims to"
+                );
+                assert_eq!("amp-key", old.outcomes[0].object_key);
+                assert_eq!(
+                    Some(1_787_270_070_192),
+                    old.metadata.as_ref().map(|metadata| metadata.timestamp_ms),
+                    "a record written before this build stopped stating the stamp must still hand \
+                     it back: replay resolves that record's deadlines against it"
+                );
+
+                // AND THIS BUILD WRITES SOMETHING ELSE FOR THE SAME RECORD, with the stamp the
+                // only difference. Asserted field by field rather than by a length, so a second
+                // change that happened to cost seven bytes could not hide in it.
+                let now = crate::wal_proto::encode(&stamped_outcome_record())
+                    .expect("the record encodes");
+                assert_ne!(
+                    now, bytes,
+                    "this build produces exactly the old bytes for this record, so the literal \
+                     above is not an older shape and this test is checking nothing"
+                );
+                let current = crate::wal_proto::decode(&now).expect("what this build wrote decodes");
+                assert_eq!(
+                    0,
+                    current
+                        .metadata
+                        .as_ref()
+                        .map(|metadata| metadata.timestamp_ms)
+                        .expect("the metadata survives"),
+                    "this build still states a leader stamp on a record carrying outcomes"
+                );
+                assert_eq!(old.shard_id, current.shard_id);
+                assert_eq!(old.sequence, current.sequence);
+                assert_eq!(old.command, current.command);
+                assert_eq!(old.staged_blocks, current.staged_blocks);
+                assert_eq!(
+                    old.outcomes, current.outcomes,
+                    "the outcome items differ between the two shapes, so more than the stamp \
+                     changed"
+                );
+            }
+        }
+    }
+
+    /// A record that ENDS inside a block's footer slot, in a log written without footers.
+    ///
+    /// Reading is documented to tolerate such a log -- "records occupying what would be the
+    /// footer slots" -- and the two transition tests above cover a record that STARTS in a slot.
+    /// Neither covers one that ends there, and that is the case the tail walk got wrong: it
+    /// skipped to the next block on POSITION alone, without checking whether the slot held a
+    /// footer at all, discarding up to 128 bytes of record and resuming mid-record. On a real
+    /// store that skipped 92 bytes holding the start of a record and resumed on `"key":...`,
+    /// which the decoder reported as `invalid type: string "key" ... at line 1 column 5` --
+    /// refusing to open a store whose bytes were entirely intact.
+    #[test]
+    fn a_record_that_ends_inside_a_footer_slot_is_not_skipped() {
+        // Rolling off: these assertions are about blocks within one piece.
+        set_wal_segment_bytes_for_test(Some(0));
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_ahead_log_path(dir.path(), 1);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        // Frames of a fixed size, laid end to end with nothing reserved -- a log as a writer
+        // that predates footers left it. 250 divides into the first block so that record 524
+        // ends at 131_000, which is inside the slot that starts at 130_944.
+        const FRAME: usize = 250;
+        let framed = |sequence: u64| -> Vec<u8> {
+            let mut pad = 8usize;
+            loop {
+                let payload = format!(
+                    "{{\"shard_id\":1,\"sequence\":{sequence},\"command\":{{\"kind\":\"string_set\",\"key\":\"{}\",\"value\":[118]}}}}",
+                    "k".repeat(pad)
+                );
+                let line = crate::log_framing::encode_line(payload.as_bytes());
+                match line.len().cmp(&FRAME) {
+                    std::cmp::Ordering::Equal => return line,
+                    std::cmp::Ordering::Less => pad += FRAME - line.len(),
+                    std::cmp::Ordering::Greater => {
+                        pad = pad
+                            .checked_sub(line.len() - FRAME)
+                            .expect("a frame of this size must be reachable by padding the key");
+                    }
+                }
+            }
+        };
+
+        let records = (WAL_BLOCK_BYTES as usize / FRAME) + 40;
+        let mut bytes = Vec::with_capacity(records * FRAME);
+        for sequence in 1..=records as u64 {
+            bytes.extend_from_slice(&framed(sequence));
+        }
+        std::fs::write(&path, &bytes).unwrap();
+
+        // The precondition this test exists for: some record must END inside a footer slot.
+        // Without it the test would pass on any reader and prove nothing.
+        let slot_start = block_data_end(0);
+        let ends_in_slot = (1..=records as u64)
+            .map(|n| n * FRAME as u64)
+            .filter(|end| *end >= slot_start && *end < WAL_BLOCK_BYTES)
+            .count();
+        assert!(
+            ends_in_slot > 0,
+            "no record ends inside the footer slot, so this test would not exercise the skip"
+        );
+
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        let scanned = store.scan(1, 0, u64::MAX, u64::MAX).unwrap();
+        assert_eq!(
+            scanned.len(),
+            records,
+            "every record must survive the block boundary in a log written without footers"
+        );
+        for (_, line) in &scanned {
+            decode_wal_line(line).expect("every record must still decode");
+        }
+        let (last, _) = last_wal_sequence_in(&path).unwrap();
+        assert_eq!(
+            last, records as u64,
+            "the tail walk must reach the last record rather than stopping at a slot"
+        );
+    }
+
+    /// What the footer actually buys, on equivalent logs. Ignored: a measurement, not a gate.
+    ///
+    // The footer-on / footer-off benchmark that lived here cannot run any more: there is no way
+    // to build the footer-off arm now that the footer is unconditional. Its numbers are preserved
+    // in the doc comment on the footer itself, which is where they justify the design.
+
+
+    /// With blocks on, a scan has to walk past the footers between them. It did not: the first
+    /// footer looked like the end of the log, so every record after the first block vanished
+    /// from every reader that scans -- replay included.
+    #[test]
+    fn a_scan_returns_records_from_every_block_not_just_the_first() {
+        // rolling is off for this test. The segment threshold is a THREAD-LOCAL override and
+        // these tests share a thread, so whatever the previous test left is inherited -- and a
+        // log that rolls mid-test splits across files the assertions never look at.
+        //
+        // `Some(0)`, not `None`: None clears the override and takes the DEFAULT, and the default
+        // rolls now. These assertions are about blocks within one piece, so they say "off"
+        // explicitly instead of relying on what the default happens to be.
+        set_wal_segment_bytes_for_test(Some(0));
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        let records = 2_000usize;
+        for index in 0..records {
+            store
+                .append_with_sync(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:05}"),
+                        value: incompressible(1024),
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        let path = write_ahead_log_path(dir.path(), 1);
+        let (_, record_end) = last_wal_sequence_in(&path).unwrap();
+        assert!(
+            record_end > 2 * WAL_BLOCK_BYTES,
+            "the workload must span several blocks or this proves nothing: {record_end}"
+        );
+        let scanned = store.scan(1, 0, u64::MAX, u64::MAX).unwrap();
+        assert_eq!(
+            scanned.len(),
+            records,
+            "a scan must return every record, not only the first block's"
+        );
+        // And each one still decodes: the offsets the scan reports have to name whole records.
+        let sequences: Vec<u64> = scanned
+            .iter()
+            .map(|(_, line)| decode_wal_line(line).unwrap().sequence)
+            .collect();
+        assert_eq!(sequences.first().copied(), Some(1));
+        assert_eq!(sequences.last().copied(), Some(records as u64));
+    }
+
+    /// A reclaim copies the retained bytes VERBATIM, so any block footer inside them is copied
+    /// too -- and the rewritten file's block grid is recomputed from its own header, which puts
+    /// the copied footer at an offset that is no longer a block boundary. The walk then meets it
+    /// where a record should be, and stops.
+    #[test]
+    fn a_reclaim_that_crosses_a_block_boundary_keeps_every_record_it_retained() {
+        // rolling is off for this test: these assertions are about blocks within one piece.
+        set_wal_segment_bytes_for_test(Some(0));
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        let records = 300usize;
+        for index in 0..records {
+            store
+                .append_with_sync(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:05}"),
+                        value: incompressible(1024),
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        let path = write_ahead_log_path(dir.path(), 1);
+        let (last_before, record_end) = last_wal_sequence_in(&path).unwrap();
+        // Denominator. Without a CLOSED block in the retained range this proves nothing: the
+        // footer has to be inside the bytes the reclaim copies.
+        assert_eq!(last_before, records as u64, "every record must be readable first");
+        assert!(
+            record_end > WAL_BLOCK_BYTES,
+            "the workload must close at least one block: {record_end} <= {WAL_BLOCK_BYTES}"
+        );
+
+        // Retain from sequence 10, whose record sits in block 0 -- so the retained suffix spans
+        // block 0's footer.
+        let retain_from = 10u64;
+        let report = store.gc_before_sequence_unchecked(1, retain_from).unwrap();
+        // The denominator for the assertions below: the pass had a footer in the range it would
+        // have kept. Without that this test is exercising the ordinary reclaim and proves nothing.
+        assert!(
+            report.retained_bytes_carry_a_block_footer,
+            "this workload must reach the footer case: {report:?}"
+        );
+
+        // Whatever the pass decided, every record at or above the floor has to still be there.
+        // The tail sequence is the sharp half: the next append seeds from it, so a walk that
+        // stops short hands out sequences that are already in use.
+        let (last_after, _) = last_wal_sequence_in(&path).unwrap();
+        assert_eq!(
+            last_after, records as u64,
+            "the tail walk must still reach the highest retained sequence"
+        );
+        let scanned = store.scan(1, 0, u64::MAX, u64::MAX).unwrap();
+        let sequences: std::collections::BTreeSet<u64> = scanned
+            .iter()
+            .map(|(_, line)| decode_wal_line(line).unwrap().sequence)
+            .collect();
+        let missing: Vec<u64> = (retain_from..=records as u64)
+            .filter(|sequence| !sequences.contains(sequence))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "every record at or above the floor must still read: {} of {} missing, first {:?}",
+            missing.len(),
+            records as u64 - retain_from + 1,
+            missing.first()
+        );
+    }
+
+    /// The displaced-footer search may only ever say YES on the MAGIC.
+    ///
+    /// `displaced_block_footer_end` exists because a reclaim copies a block footer to an offset
+    /// the new file's grid has no boundary at, so the walk has to find it off-grid. It looks for
+    /// the first NON-ZERO byte within one block, on the reasoning that the writer leaves the
+    /// space between the last record and the footer slot unwritten. But "non-zero" is not
+    /// evidence of a footer: record bytes, or a torn write, read exactly the same from here.
+    /// Believing one would resume the walk at an offset chosen by arbitrary data and hand the
+    /// next read whatever followed it.
+    ///
+    /// The reclaim fixture above cannot reach this. Every run the search meets THERE is a real
+    /// displaced footer, so a search that believed any non-zero run passes it unchanged --
+    /// measured: dropping the `decode_block_footer` check entirely leaves that test green.
+    ///
+    /// Both directions in one test, and the POSITIVE half first, because a search that had
+    /// stopped finding anything at all would pass the negative half on its own.
+    #[test]
+    fn the_displaced_footer_search_believes_a_footer_only_on_its_magic() {
+        use std::io::Cursor;
+
+        // Off the grid on purpose: this offset is not a block boundary, which is the whole
+        // situation the function exists for.
+        const AT: u64 = 4096;
+        // The unwritten run between the last record and the copied footer.
+        const PAD: usize = 100;
+        const TAIL: usize = WAL_BLOCK_BYTES as usize / 2;
+
+        // POSITIVE CONTROL. A real footer, displaced, must still be found -- and the walk must
+        // resume AFTER it, not at it. Without this half the negative assertion below is passed
+        // by a function that answers None to everything.
+        let footer = encode_block_footer(0, 1234, 64, 7, 0);
+        assert_eq!(
+            footer.len(),
+            WAL_BLOCK_FOOTER_BYTES as usize,
+            "the fixture must write a full-slot footer"
+        );
+        let mut found = vec![0u8; AT as usize + PAD];
+        found.extend_from_slice(&footer);
+        found.resize(AT as usize + TAIL, 0);
+        let len = found.len() as u64;
+        assert_eq!(
+            displaced_block_footer_end(&mut Cursor::new(found), AT, len).unwrap(),
+            Some(AT + PAD as u64 + WAL_BLOCK_FOOTER_BYTES),
+            "a displaced footer must be found, and the walk must resume after it"
+        );
+
+        // THE PROPERTY. The same shape, but the non-zero run carries no magic -- it is record
+        // bytes. The search must find nothing, and the caller must stop exactly as it did
+        // before this path existed.
+        let mut garbage = vec![0u8; AT as usize + PAD];
+        garbage.extend(std::iter::repeat(b'A').take(4 * WAL_BLOCK_FOOTER_BYTES as usize));
+        garbage.resize(AT as usize + TAIL, 0);
+        let len = garbage.len() as u64;
+        assert_eq!(
+            displaced_block_footer_end(&mut Cursor::new(garbage), AT, len).unwrap(),
+            None,
+            "record bytes carry no footer magic, so the search must not name them a footer and \
+             send the walk into the middle of them"
+        );
+
+        // And a run that is nearly a footer: the slot's own length prefix is right, the magic is
+        // not. This is the case a length-only check would wave through.
+        let mut wrong_magic = encode_block_footer(0, 1234, 64, 7, 0);
+        let magic_at = wrong_magic
+            .windows(8)
+            .position(|window| window == WAL_BLOCK_FOOTER_MAGIC.to_le_bytes())
+            .expect("the encoded footer must carry its magic little-endian");
+        wrong_magic[magic_at..magic_at + 8].copy_from_slice(&0xDEAD_BEEF_DEAD_BEEFu64.to_le_bytes());
+        let mut spoiled = vec![0u8; AT as usize + PAD];
+        spoiled.extend_from_slice(&wrong_magic);
+        spoiled.resize(AT as usize + TAIL, 0);
+        let len = spoiled.len() as u64;
+        assert_eq!(
+            displaced_block_footer_end(&mut Cursor::new(spoiled), AT, len).unwrap(),
+            None,
+            "a well-formed slot whose magic is wrong is not a footer"
+        );
+    }
+
+    /// Not an assertion about behaviour -- a look at what the writer actually did, because the
+    /// agreement test only says the footer is absent, not why.
+    #[test]
+    fn what_the_footer_writer_actually_did() {
+        // rolling is off for this test. The segment threshold is a THREAD-LOCAL override and
+        // these tests share a thread, so whatever the previous test left is inherited -- and a
+        // log that rolls mid-test splits across files the assertions never look at.
+        //
+        // `Some(0)`, not `None`: None clears the override and takes the DEFAULT, and the default
+        // rolls now. These assertions are about blocks within one piece, so they say "off"
+        // explicitly instead of relying on what the default happens to be.
+        set_wal_segment_bytes_for_test(Some(0));
+        // ~327 B a record here, so a few hundred fill ONE block. Cross several on purpose.
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        for index in 0..2000 {
+            store
+                .append_with_sync(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:05}"),
+                        value: incompressible(1024),
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        let path = write_ahead_log_path(dir.path(), 1);
+        let bytes = std::fs::read(&path).unwrap();
+        let (_, header_len) = read_wal_base(&path).unwrap();
+        let (_, record_end) = last_wal_sequence_in(&path).unwrap();
+        let slot_at = (header_len + block_footer_at(0)) as usize;
+        let slot_written = bytes
+            .get(slot_at..slot_at + WAL_BLOCK_FOOTER_BYTES as usize)
+            .map(|slot| !slot.iter().all(|byte| *byte == 0))
+            .unwrap_or(false);
+        println!(
+            "  file {} bytes, header {header_len}, records end at {record_end}\n  \
+             block 0 footer slot at {slot_at}: {}\n  \
+             blocks the records span: {}",
+            bytes.len(),
+            if slot_written { "WRITTEN" } else { "still zeros" },
+            record_end / WAL_BLOCK_BYTES
+        );
+        assert!(
+            record_end > WAL_BLOCK_BYTES,
+            "the workload must cross a block boundary or this proves nothing: ended at \
+             {record_end}, block is {WAL_BLOCK_BYTES}"
+        );
+        assert!(
+            slot_written,
+            "records crossed a block boundary, so block 0's footer must have been written"
+        );
+    }
+
+    /// A footer is only worth having if it says what walking the log would have said. This
+    /// writes enough records to close several blocks, then compares the two answers on the very
+    /// same file: the fast path is otherwise just a faster way to be wrong.
+    #[test]
+    fn the_footer_and_the_walk_agree_about_where_the_log_ends() {
+        // rolling is off for this test. The segment threshold is a THREAD-LOCAL override and
+        // these tests share a thread, so whatever the previous test left is inherited -- and a
+        // log that rolls mid-test splits across files the assertions never look at.
+        //
+        // `Some(0)`, not `None`: None clears the override and takes the DEFAULT, and the default
+        // rolls now. These assertions are about blocks within one piece, so they say "off"
+        // explicitly instead of relying on what the default happens to be.
+        set_wal_segment_bytes_for_test(Some(0));
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        // 128KiB blocks; a ~1KiB value closes several of them.
+        for index in 0..400 {
+            store
+                .append_with_sync(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:05}"),
+                        value: incompressible(1024),
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        let path = write_ahead_log_path(dir.path(), 1);
+
+        let hint = footer_tail_hint(&path).unwrap();
+        assert!(
+            hint.is_some(),
+            "several blocks were filled, so at least one footer must have been written"
+        );
+        let (footer_sequence, from) = hint.unwrap();
+
+        let with_footer = last_wal_sequence_in(&path).unwrap();
+        let without_footer = last_wal_sequence_forward(&path).unwrap();
+
+        assert_eq!(
+            with_footer, without_footer,
+            "the footer path and the full walk must agree: footer said {with_footer:?}, \
+             walking said {without_footer:?} (hint was sequence {footer_sequence} from {from})"
+        );
+        assert!(
+            from > 0,
+            "the walk should start after a closed block, not at the top"
+        );
+    }
+
+    /// The point of the footer is that finding the tail stops costing the file. Reading it must
+    /// therefore touch a bounded amount regardless of how much log precedes it.
+    #[test]
+    fn finding_the_tail_reads_a_block_not_the_log() {
+        // rolling is off for this test. The segment threshold is a THREAD-LOCAL override and
+        // these tests share a thread, so whatever the previous test left is inherited -- and a
+        // log that rolls mid-test splits across files the assertions never look at.
+        //
+        // `Some(0)`, not `None`: None clears the override and takes the DEFAULT, and the default
+        // rolls now. These assertions are about blocks within one piece, so they say "off"
+        // explicitly instead of relying on what the default happens to be.
+        set_wal_segment_bytes_for_test(Some(0));
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        for index in 0..800 {
+            store
+                .append_with_sync(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:05}"),
+                        value: incompressible(1024),
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        let path = write_ahead_log_path(dir.path(), 1);
+        let (_, from) = footer_tail_hint(&path).unwrap().expect("a closed block");
+        // Measure to where the RECORDS end, not to the file's length: preallocation leaves
+        // megabytes of reservation past the last record and the walk stops at the records. An
+        // earlier version compared against the file and was measuring the reservation.
+        let (_, record_end) = last_wal_sequence_in(&path).unwrap();
+        let walked = record_end.saturating_sub(from);
+        assert!(
+            walked <= WAL_BLOCK_BYTES,
+            "the walk after the footer must be bounded by one block: {walked} bytes, from \
+             {from} to {record_end}"
+        );
+    }
+
+    /// A crash leaves the open block without its footer. Recovery must fall back to the last
+    /// footer that WAS written and walk from there -- never trust a slot that holds zeros.
+    #[test]
+    fn a_block_that_never_closed_falls_back_to_the_one_that_did() {
+        // rolling is off for this test. The segment threshold is a THREAD-LOCAL override and
+        // these tests share a thread, so whatever the previous test left is inherited -- and a
+        // log that rolls mid-test splits across files the assertions never look at.
+        //
+        // `Some(0)`, not `None`: None clears the override and takes the DEFAULT, and the default
+        // rolls now. These assertions are about blocks within one piece, so they say "off"
+        // explicitly instead of relying on what the default happens to be.
+        set_wal_segment_bytes_for_test(Some(0));
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        for index in 0..400 {
+            store
+                .append_with_sync(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:05}"),
+                        value: vec![b'v'; 1024],
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        drop(store);
+        let path = write_ahead_log_path(dir.path(), 1);
+        let expected = last_wal_sequence_forward(&path).unwrap();
+        let reopened = LocalWriteAheadLogStore::new(dir.path());
+        let seen = reopened.stats(1).last_sequence;
+        assert_eq!(
+            seen, expected.0,
+            "reopening must see every record the walk sees, footer or no footer"
+        );
+    }
+
+    /// Rolling must not cost extra durability barriers per write.
+    ///
+    /// A roll creates a new file, and its directory entry has to reach disk before any record in
+    /// that piece is acked -- so rolling COULD add an fsync every piece. The append path defers
+    /// that debt to the next barrier that was going to run anyway, and this checks the deferral
+    /// actually holds.
+    ///
+    /// Counted, not timed. The count is the thing: a barrier either happened or it did not, and a
+    /// duration on a shared machine mostly measures what else was running.
+    #[test]
+    fn rolling_adds_no_durability_barriers() {
+        fn syncs_for(roll: u64) -> (u64, u64, usize) {
+            set_wal_segment_bytes_for_test(Some(roll));
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalWriteAheadLogStore::new(dir.path());
+            for index in 0..3_000u64 {
+                store
+                    .append_with_sync(
+                        1,
+                        Command::StringSet {
+                            key: format!("k{index:06}"),
+                            value: incompressible(256),
+                        },
+                        // Sync ON: with it off nothing syncs, the counters read zero on both
+                        // sides, and the comparison below passes on having measured nothing.
+                        true,
+                    )
+                    .unwrap();
+            }
+            let stats = store.stats(1);
+            let pieces = wal_segment_paths(dir.path(), 1).len();
+            set_wal_segment_bytes_for_test(None);
+            (stats.syncs, stats.flushes, pieces)
+        }
+
+        let (never_syncs, never_flushes, never_pieces) = syncs_for(0);
+        let (rolled_syncs, rolled_flushes, rolled_pieces) = syncs_for(DEFAULT_WAL_SEGMENT_BYTES);
+        println!(
+            "  never rolling: {never_syncs} syncs, {never_flushes} flushes, {never_pieces} piece(s)
+               at the default: {rolled_syncs} syncs, {rolled_flushes} flushes, {rolled_pieces} piece(s)"
+        );
+
+        // A bound passes most easily when nothing was measured -- and this one already did once,
+        // reading 0 syncs against 0 syncs because the appends were not asking for durability.
+        assert!(never_syncs > 0, "the probe must observe syncs: {never_syncs}");
+        assert!(rolled_syncs > 0, "the probe must observe syncs: {rolled_syncs}");
+        assert!(never_pieces == 1, "zero must still mean one piece");
+        assert!(rolled_pieces > 1, "the default must actually roll this workload");
+
+        // The deferral is the claim: rolling adds pieces without adding a barrier per piece.
+        // Allow one per piece as slack; anything beyond that means the debt is NOT being deferred.
+        let extra = rolled_syncs.saturating_sub(never_syncs);
+        assert!(
+            extra <= rolled_pieces as u64,
+            "rolling added {extra} syncs over {} pieces -- the roll debt is not being deferred",
+            rolled_pieces
+        );
+    }
+
+    /// Which part of an append allocates. Encoding, framing, and everything else.
+    ///
+    /// A whole-append figure says a write costs 34 allocations and about nine kilobytes for a
+    /// 64-byte value, but not which step to look at. This prices the steps that are callable on
+    /// their own, and infers the rest by subtraction rather than by reading the code and guessing.
+    #[test]
+    #[cfg(feature = "alloc-probe")]
+    #[ignore]
+    fn where_an_appends_allocations_go() {
+        for value_len in [64usize, 4096] {
+            let record = WriteAheadLogRecord {
+                shard_id: 1,
+                sequence: 7,
+                metadata: Some(WriteAheadLogRecordMetadata {
+                    version: WRITE_AHEAD_LOG_FORMAT_VERSION,
+                    timestamp_ms: 1_787_270_070_192,
+                    items: Vec::new(),
+                    batch_id: None,
+                    batch_size: None,
+                    batch_index: None,
+                }),
+                command: Some(Command::StringSet {
+                    key: "tenant/7/object/000000123".to_string(),
+                    value: vec![118u8; value_len],
+                }),
+                staged_blocks: Vec::new(),
+                outcomes: Vec::new(),
+            };
+
+            let runs = 200usize;
+
+            let probe = crate::alloc_probe::Probe::start();
+            for _ in 0..runs {
+                let payload = encode_wal_payload(&record).expect("encode");
+                std::hint::black_box(&payload);
+            }
+            let encode = probe.stop();
+
+            let probe = crate::alloc_probe::Probe::start();
+            for _ in 0..runs {
+                let payload = encode_wal_payload(&record).expect("encode");
+                let framed = crate::log_framing::encode_record(&payload);
+                std::hint::black_box(&framed);
+            }
+            let encode_and_frame = probe.stop();
+
+            println!(
+                "  STEP value {value_len:>5}B | encode {:>5.1} allocs {:>7.0} B |                  +frame {:>5.1} allocs {:>7.0} B (frame alone {:>5.1} / {:>7.0} B)",
+                encode.allocs as f64 / runs as f64,
+                encode.alloc_bytes as f64 / runs as f64,
+                encode_and_frame.allocs as f64 / runs as f64,
+                encode_and_frame.alloc_bytes as f64 / runs as f64,
+                (encode_and_frame.allocs as f64 - encode.allocs as f64) / runs as f64,
+                (encode_and_frame.alloc_bytes as f64 - encode.alloc_bytes as f64) / runs as f64,
+            );
+
+            // A bound passes most easily when nothing was measured.
+            assert!(encode.allocs > 0, "the probe must observe the encode");
+        }
+    }
+
+    /// A lock file that was removed gets opened again, rather than locked as a ghost.
+    ///
+    /// The append lock handle is kept open per shard now, instead of being opened and closed on
+    /// every append. That is safe only while the handle still names a file: a descriptor outlives
+    /// the unlinking of its file, and `flock` on an unlinked inode SUCCEEDS -- so a stale handle
+    /// would hand out a lock that another process, opening the path afresh, could hold at the same
+    /// time. Two writers, both certain they held the append lock.
+    ///
+    /// Removing the file is the observable form of that: if the handle were reused blindly, the
+    /// file would never come back.
+    #[test]
+    fn a_removed_lock_file_is_opened_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        let write = |index: usize| {
+            store
+                .append(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index}"),
+                        value: b"v".to_vec(),
+                    },
+                )
+                .unwrap()
+        };
+
+        write(0);
+        let lock_path = dir.path().join("shard-1.wal.lock");
+        assert!(lock_path.exists(), "the first append must create the lock file");
+
+        // Someone removes it out from under the running store.
+        std::fs::remove_file(&lock_path).expect("remove the lock file");
+        assert!(!lock_path.exists(), "the probe must actually remove it");
+
+        let record = write(1);
+        assert_eq!(record.sequence, 2, "the append must still succeed");
+        assert!(
+            lock_path.exists(),
+            "the lock file must be opened again, not locked as an unlinked ghost"
+        );
+
+        // And the log itself is intact across it.
+        let scanned = store.scan(1, 0, u64::MAX, u64::MAX).unwrap();
+        assert_eq!(scanned.len(), 2, "both records must be readable: {scanned:?}");
+    }
+
+    /// Every `Command` variant's payload, sized by the compiler rather than by eye.
+    ///
+    /// `large_enum_variant` stays silent when the top variants are all wide -- it compares the
+    /// largest against the SECOND largest, so a family of equally fat variants reads as no problem.
+    /// That is a different question from "would boxing a few of them collapse the enum", which is
+    /// what this answers.
+    #[test]
+    #[ignore]
+    fn every_command_variant_payload_size() {
+        // Glob so every field type resolves without guessing which need qualifying.
+        #[allow(unused_imports)]
+        use crate::types::*;
+        let mut rows: Vec<(&str, usize)> = vec![
+        ("CommonDelete", std::mem::size_of::<(String)>()),
+        ("CommonExpire", std::mem::size_of::<(String, u64)>()),
+        ("CommonTtl", std::mem::size_of::<(String)>()),
+        ("CommonPersist", std::mem::size_of::<(String)>()),
+        ("CommonExists", std::mem::size_of::<(String)>()),
+        ("StringSet", std::mem::size_of::<(String, Vec<u8>)>()),
+        ("StringSetEx", std::mem::size_of::<(String, Vec<u8>, u64)>()),
+        ("StringSetConditional", std::mem::size_of::<(String, Vec<u8>, Option<u64>, StringSetCondition, bool, bool)>()),
+        ("StringGet", std::mem::size_of::<(String)>()),
+        ("StringDelete", std::mem::size_of::<(String)>()),
+        ("HashSet", std::mem::size_of::<(String, String, Vec<u8>)>()),
+        ("HashGet", std::mem::size_of::<(String, String)>()),
+        ("HashMultiGet", std::mem::size_of::<(String, Vec<String>)>()),
+        ("HashMultiSet", std::mem::size_of::<(String, Vec<(String, Vec<u8>)>)>()),
+        ("HashIncrBy", std::mem::size_of::<(String, String, i64)>()),
+        ("HashGetAll", std::mem::size_of::<(String)>()),
+        ("HashLen", std::mem::size_of::<(String)>()),
+        ("HashDelete", std::mem::size_of::<(String, String)>()),
+        ("SetAdd", std::mem::size_of::<(String, Vec<u8>)>()),
+        ("ZSetAdd", std::mem::size_of::<(String, Vec<u8>, f64)>()),
+        ("ZSetScore", std::mem::size_of::<(String, Vec<u8>)>()),
+        ("ZSetRemove", std::mem::size_of::<(String, Vec<u8>)>()),
+        ("ZSetCard", std::mem::size_of::<(String)>()),
+        ("ZSetRange", std::mem::size_of::<(String, i64, i64, bool)>()),
+        ("ZSetRangeByScore", std::mem::size_of::<(String, f64, f64, bool, bool, bool)>()),
+        ("SeenCheck", std::mem::size_of::<(String, Vec<u8>, u64)>()),
+        ("SeenCard", std::mem::size_of::<(String)>()),
+        ("BucketTake", std::mem::size_of::<(String, f64, f64, f64)>()),
+        ("BucketPeek", std::mem::size_of::<(String, f64, f64, f64)>()),
+        ("ZSetIncrBy", std::mem::size_of::<(String, Vec<u8>, f64)>()),
+        ("ZSetPop", std::mem::size_of::<(String, bool, u64)>()),
+        ("ZSetRank", std::mem::size_of::<(String, Vec<u8>, bool)>()),
+        ("ListPush", std::mem::size_of::<(String, Vec<u8>, bool)>()),
+        ("ListPop", std::mem::size_of::<(String, bool)>()),
+        ("ListRange", std::mem::size_of::<(String, i64, i64)>()),
+        ("ListLen", std::mem::size_of::<(String)>()),
+        ("SetMembers", std::mem::size_of::<(String)>()),
+        ("SetRemove", std::mem::size_of::<(String, Vec<u8>)>()),
+        ("FeatureAppend", std::mem::size_of::<(String, Vec<FeaturePoint>)>()),
+        ("FeatureAppendWithPolicy", std::mem::size_of::<(String, Vec<FeaturePoint>, FeatureWritePolicy)>()),
+        ("FeatureQuery", std::mem::size_of::<(String, u64, u64, Option<usize>)>()),
+        ("FeatureQueryFiltered", std::mem::size_of::<(String, u64, u64, Option<usize>, Vec<FeatureFilter>)>()),
+        ("FeatureReplace", std::mem::size_of::<(String, u64, u64, Vec<FeaturePoint>)>()),
+        ("FeatureDelete", std::mem::size_of::<(String)>()),
+        ("FeatureAggQuery", std::mem::size_of::<(String, u64, u64, String, Option<usize>)>()),
+        ("SequenceAdd", std::mem::size_of::<(String, Vec<SequenceFeatureRow>)>()),
+        ("SequenceQuery", std::mem::size_of::<(String, u64, u64, usize, Vec<FeatureFilter>)>()),
+        ("SequenceBatchQuery", std::mem::size_of::<(Vec<SequenceQuerySpec>)>()),
+        ("ControlStateIncrement", std::mem::size_of::<(String, u64, i64)>()),
+        ("ControlStateIncrementWithOptions", std::mem::size_of::<(String, u64, i64, Option<u64>, Option<u64>)>()),
+        ("ControlStateChangeAdd", std::mem::size_of::<(String, u64, Vec<u8>, Option<u64>, Option<u64>)>()),
+        ("ControlStateCount", std::mem::size_of::<(String, u64, u64)>()),
+        ("ControlStateQuery", std::mem::size_of::<(String, u64, u64, String)>()),
+        ("ControlStateDetail", std::mem::size_of::<(String, u64, u64, Option<usize>)>()),
+        ("ControlStateSet", std::mem::size_of::<(ControlStateFamily, String, u64, i64)>()),
+        ("ControlStateSetAndGet", std::mem::size_of::<(ControlStateFamily, String, u64, i64, u64, u64, String)>()),
+        ("ControlStateSetAndGetWithOptions", std::mem::size_of::<(ControlStateFamily, String, u64, i64, u64, u64, String, Option<u64>, Option<u64>, Option<String>)>()),
+        ("ControlStateFamilyQuery", std::mem::size_of::<(ControlStateFamily, String, u64, u64, String)>()),
+        ("ControlStateSelectionSet", std::mem::size_of::<(String, Vec<u8>, u64, u64, ControlStateSelectionType)>()),
+        ("ControlStateSelectionQuery", std::mem::size_of::<(String)>()),
+        ("ControlStateManager", std::mem::size_of::<(String, Option<String>, Vec<(String, String)>, String, String, bool)>()),
+        ("ControlStateDebug", std::mem::size_of::<(String, u64, u64)>()),
+        ("ContextQueryNodeEmbeddings", std::mem::size_of::<(u64, Vec<u64>)>()),
+        ("ContextResourceBlobBegin", std::mem::size_of::<(u64)>()),
+        ("ContextResourceBlobAppend", std::mem::size_of::<(u64, String, String)>()),
+        ("ContextResourceBlobCommit", std::mem::size_of::<(u64, String)>()),
+        ("ContextResourceBlobPut", std::mem::size_of::<(u64, String)>()),
+        ("ContextResourceBlobFetch", std::mem::size_of::<(String, u64, u64)>()),
+        ("ContextResourceBlobSweep", std::mem::size_of::<(u64, Vec<u64>, u64)>()),
+        ("ContextSetNodeEmbedding", std::mem::size_of::<(u64, u64, u64, Vec<f32>, u64)>()),
+        ("ContextUpsertNode", std::mem::size_of::<(u64, Box<ContextNode>)>()),
+        ("ContextGetNode", std::mem::size_of::<(u64, u64)>()),
+        ("ContextGetNodes", std::mem::size_of::<(u64, Vec<u64>)>()),
+        ("ContextWriteEvent", std::mem::size_of::<(u64, u64, Box<ContextEvent>, bool, bool)>()),
+        ("ContextWriteExtractedEvent", std::mem::size_of::<(u64, u64, Box<ContextEvent>, ContextExtractedEventIndexes, bool, bool)>()),
+        ("ContextQueryEvents", std::mem::size_of::<(u64, u64, u64, u64, Option<usize>, Option<usize>, bool, u64, Vec<u32>, Vec<u32>, f32, f32)>()),
+        ("ContextWriteIndexRef", std::mem::size_of::<(u64, String, u64, u64, u64, ContextIndexRef)>()),
+        ("ContextQueryIndex", std::mem::size_of::<(u64, String, u64, u64, u64, u64, Option<usize>)>()),
+        ("ContextQueryIndexIntersection", std::mem::size_of::<(u64, Vec<ContextIndexLookup>, Option<usize>)>()),
+        ("ContextWritePackAudit", std::mem::size_of::<(u64, ContextPackAudit)>()),
+        ("ContextQueryPackAudit", std::mem::size_of::<(u64, u64, u64, u64, Option<usize>)>()),
+        ("ContextMarkSummaryDirty", std::mem::size_of::<(u64, u64, u64, u32, u32)>()),
+        ("ContextQuerySummaryDirty", std::mem::size_of::<(u64, u64, u64, u64, Option<usize>)>()),
+        ("ContextMarkEmbeddingDirty", std::mem::size_of::<(u64, u64, u64, u32, u32, bool)>()),
+        ("ContextQueryEmbeddingDirty", std::mem::size_of::<(u64, u64, u64, u64, Option<usize>)>()),
+        ("ContextUpsertEntity", std::mem::size_of::<(u64, ContextEntity)>()),
+        ("ContextGetEntity", std::mem::size_of::<(u64, u64, u64)>()),
+        ("ContextQueryEntities", std::mem::size_of::<(u64, u64, Vec<u64>, Option<usize>)>()),
+        ("ContextUpsertChildRef", std::mem::size_of::<(u64, ContextChildRef)>()),
+        ("ContextQueryChildren", std::mem::size_of::<(u64, u64, Option<usize>)>()),
+        ("ContextTraverseTree", std::mem::size_of::<(u64, u64, Vec<f32>, Option<u32>, Option<usize>, Option<usize>, Option<usize>, bool)>()),
+        ("ContextUpsertSummary", std::mem::size_of::<(u64, ContextSummary)>()),
+        ("ContextQuerySummaries", std::mem::size_of::<(u64, u64, u32, u64, Option<usize>)>()),
+        ("ContextQuerySummaryVectors", std::mem::size_of::<(u64, Vec<u64>, u32, u64)>()),
+        ("ContextWriteCompressionEvent", std::mem::size_of::<(u64, ContextCompressionEvent)>()),
+        ("ContextQueryCompressionEvents", std::mem::size_of::<(u64, Vec<u64>, u64, u64, Option<usize>)>()),
+        ("ContextCompressEvents", std::mem::size_of::<(u64, u64, u64, u64, u64, Option<usize>, f32, f32)>()),
+        ("ContextQueryNodeContext", std::mem::size_of::<(u64, u64, Option<u32>, u64, u64, u64, Option<usize>)>()),
+        ];
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        let whole = std::mem::size_of::<Command>();
+        println!("  Command is {whole} B");
+        println!("  FIELD ContextEvent                    {:>4} B", std::mem::size_of::<ContextEvent>());
+        println!("  FIELD ContextExtractedEventIndexes    {:>4} B", std::mem::size_of::<ContextExtractedEventIndexes>());
+        println!("  FIELD Box<ContextEvent>               {:>4} B", std::mem::size_of::<Box<ContextEvent>>());
+        let mut cumulative = 0usize;
+        for (index, (name, size)) in rows.iter().enumerate().take(12) {
+            cumulative += size;
+            println!("    VARIANT {:>2}. {:<36} {:>4} B", index + 1, name, size);
+        }
+        let _ = cumulative;
+        println!("  boxing the top N drops the enum to the (N+1)th plus a discriminant");
+        assert!(whole > 0);
+    }
+
+    /// What their item SHAPE costs us, since we already have the type.
+    ///
+    /// `WalItem` mirrors their operation-log item field for field -- the field numbers match
+    /// one-for-one and a test pins that. It is one flat message with optional fields, where
+    /// `Command` is a 99-variant sum type as wide as its widest arm. That difference, not any
+    /// individual field, is why our record is bigger than theirs.
+    ///
+    /// If the record carried the flat item the way theirs does, this is what it would occupy.
+    #[test]
+    #[ignore]
+    fn what_their_item_shape_would_cost() {
+        use std::mem::size_of;
+        let wal_item = size_of::<crate::wal_record::WalItem>();
+        let command = size_of::<Option<Command>>();
+        let record = size_of::<WriteAheadLogRecord>();
+        println!("  SHAPE WalItem (their item, our type)  {wal_item:>4} B");
+        println!("  SHAPE Option<Command> (a sum type)    {command:>4} B");
+        println!("  SHAPE record as it stands             {record:>4} B");
+        println!(
+            "  SHAPE record with the flat item instead {:>4} B  (record - command + item)",
+            record - command + wal_item
+        );
+        println!("  their item is ~20 B of scalars plus the message, held by value");
+        assert!(wal_item > 0);
+    }
+
+    /// The cached active path still names the live piece after a roll.
+    ///
+    /// The append path keeps the active piece's path per shard instead of rebuilding it six times
+    /// a write. That is only safe because a roll SEALS the old piece under a numbered name and
+    /// recreates the active one under the same name -- the cached path keeps pointing at the live
+    /// file. If a roll ever renamed the active piece instead, the cache would address the sealed
+    /// file and every later append would land in the wrong place.
+    #[test]
+    fn the_cached_active_path_survives_a_roll() {
+        set_wal_segment_bytes_for_test(Some(4 * 1024));
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        let value = incompressible(512);
+
+        for index in 0..40usize {
+            store
+                .append(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:04}"),
+                        value: value.clone(),
+                    },
+                )
+                .unwrap();
+        }
+        let pieces = wal_segment_paths(dir.path(), 1).len();
+        set_wal_segment_bytes_for_test(None);
+        assert!(pieces > 1, "the workload must roll or this proves nothing: {pieces}");
+
+        // Every record is still readable, in order, across the roll.
+        let scanned = store.scan(1, 0, u64::MAX, u64::MAX).unwrap();
+        assert_eq!(scanned.len(), 40, "every record must survive the roll: {}", scanned.len());
+
+        // And the next append lands in the live piece, not a sealed one.
+        let after = store
+            .append(
+                1,
+                Command::StringSet {
+                    key: "after-roll".to_string(),
+                    value: b"v".to_vec(),
+                },
+            )
+            .unwrap();
+        assert_eq!(after.sequence, 41, "the append after a roll must continue the sequence");
+        let reread = store.scan(1, 0, u64::MAX, u64::MAX).unwrap();
+        assert_eq!(reread.len(), 41, "the post-roll record must be readable too");
+    }
+
+    /// The physical length the append records matches what the file actually is.
+    ///
+    /// The append used to stat the file a second time to learn its length after possibly growing
+    /// it. That length is now carried: either the one just read, or the one just set. If those ever
+    /// disagreed, the cached figure would put the next record at the wrong offset -- so this checks
+    /// the carried number against the filesystem across both branches, the append that grows the
+    /// file and the many that do not.
+    #[test]
+    fn the_carried_physical_length_matches_the_file() {
+        // `Some(0)`, not `None`: rolling is on by default, and a roll seals the active piece and
+        // starts a new one -- so the active file drops back to a header while the carried figure
+        // keeps counting. This checks the ACTIVE file's bookkeeping, so it needs one file.
+        set_wal_segment_bytes_for_test(Some(0));
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        let path = write_ahead_log_path(dir.path(), 1);
+
+        let mut grew = 0usize;
+        let mut last = 0u64;
+        for index in 0..600usize {
+            store
+                .append(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:05}"),
+                        value: incompressible(512),
+                    },
+                )
+                .unwrap();
+            let on_disk = std::fs::metadata(&path).unwrap().len();
+            let carried = store.stats(1).persistent_bytes;
+            assert!(
+                carried <= on_disk,
+                "record {index}: carried {carried} exceeds the file's {on_disk}"
+            );
+            if on_disk != last {
+                grew += 1;
+                last = on_disk;
+            }
+        }
+
+        // A bound passes most easily when nothing was measured: the run must actually have grown
+        // the file more than once, or it never exercised the branch that sets the length.
+        assert!(grew > 1, "the workload must grow the file repeatedly: {grew}");
+
+        // And every record still reads back, which is what a wrong offset would break.
+        let scanned = store.scan(1, 0, u64::MAX, u64::MAX).unwrap();
+        set_wal_segment_bytes_for_test(None);
+        assert_eq!(scanned.len(), 600, "every record must be readable: {}", scanned.len());
+    }
+
+    /// An append allocates no buffer of its own beyond the record it is writing.
+    ///
+    /// This bounds the number rather than printing it, because the thing it guards against is
+    /// invisible in a passing suite: the roll check used to call `read_wal_base` on EVERY append,
+    /// which opens the piece and reads its header through a `BufReader` -- and that reader's
+    /// buffer is eight kilobytes. A write of a 256-byte value allocated 8,987 bytes, almost all of
+    /// it that one buffer, to answer "is this piece full" from a number the shard already had.
+    ///
+    /// Anything that re-introduces a per-append reader, or any other fixed buffer, fails here.
+    #[test]
+    #[cfg(feature = "alloc-probe")]
+    fn an_append_allocates_no_hidden_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        let value = vec![118u8; 256];
+
+        // Warm past the first write, which pays for the file and the header.
+        store
+            .append(1, Command::StringSet { key: "warm".to_string(), value: value.clone() })
+            .unwrap();
+
+        let runs = 100usize;
+        let commands = (0..runs)
+            .map(|index| Command::StringSet {
+                key: format!("k{index:06}"),
+                value: value.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        let probe = crate::alloc_probe::Probe::start();
+        for command in commands {
+            store.append(1, command).unwrap();
+        }
+        let counts = probe.stop();
+        let per_write = counts.alloc_bytes as f64 / runs as f64;
+        println!("  a 256-byte write allocates {per_write:.0} B");
+
+        // A bound passes most easily when nothing was measured.
+        assert!(counts.allocs > 0, "the probe must observe the appends");
+
+        // Eight kilobytes is the size of the reader that used to be here. Two is comfortably
+        // above what the record itself needs and far below anything with a hidden buffer in it.
+        assert!(
+            per_write < 2_000.0,
+            "a 256-byte write allocated {per_write:.0} B: something is allocating a buffer per              append again"
+        );
+    }
+
+    /// What one append allocates, and how much of it is the value it carries.
+    ///
+    /// Allocation count is latency and allocation bytes are memory; both are deterministic, unlike
+    /// a timing on a shared machine. Reported per append across value sizes, so a cost that scales
+    /// with the payload can be told apart from a fixed one -- a fixed cost is the one worth
+    /// attacking, since it is paid by every write however small.
+    /// How many times one append asks for the active log path, and what each ask costs.
+    ///
+    /// The path is cached as an `Arc`, but every caller gets a COPY of it: the cache removed the
+    /// cost of BUILDING the name and left the cost of copying it. Whether that is worth chasing
+    /// is a question of how often an append asks, which is cheaper to count than to find out by
+    /// rewriting every call site.
+    ///
+    /// No `alloc-probe` feature here -- it counts calls, not allocations. An earlier version of
+    /// this probe inherited that cfg from the test it was pasted above and vanished from the
+    /// build entirely.
+    /// A batch that outgrows its reservation several times still reads back whole.
+    ///
+    /// 512 records of 4 KiB is ~2 MiB against a 256 KiB chunk, so the reservation is grown
+    /// roughly eight times inside one batch -- the case a single-chunk batch never reaches.
+    ///
+    /// What the carried physical length can and cannot break, since the distinction decides what
+    /// this test is worth: the carried number gates GROWTH only. The write offset comes from
+    /// `verified_len_by_shard`, not from the file's physical length, so a stale carried value
+    /// causes a redundant `set_len` and never a misplaced record. Checked by control -- refusing
+    /// to update it after a growth leaves this test passing and only the syscall count moving.
+    ///
+    /// So this is an end-to-end check that a multi-growth batch survives, not the discriminating
+    /// test for the carried length: `a_batch_opens_the_piece_once_not_once_per_record` is that.
+    #[test]
+    fn a_batch_that_outgrows_its_reservation_reads_back_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        let commands: Vec<Command> = (0..512)
+            .map(|index| Command::StringSet {
+                key: format!("grown-{index:05}"),
+                value: vec![(index % 251) as u8; 4096],
+            })
+            .collect();
+
+        let written = store
+            .append_batch_atomic(1, commands, true)
+            .expect("the batch appends");
+        assert_eq!(written.len(), 512);
+
+        let read = store
+            .scan(1, 0, u64::MAX, u64::MAX)
+            .expect("the log scans back");
+        assert_eq!(
+            read.len(),
+            512,
+            "the batch wrote 512 records and the log reads back {}; a carried physical length              that missed a growth puts records at the wrong offset",
+            read.len()
+        );
+
+        // Sequences are contiguous and in order -- a record landing at a wrong offset shows up
+        // here before it shows up anywhere a user would look.
+        let sequences: Vec<u64> = written.iter().map(|record| record.sequence).collect();
+        let mut expected = sequences.clone();
+        expected.sort_unstable();
+        expected.dedup();
+        assert_eq!(
+            sequences, expected,
+            "the batch produced out-of-order or duplicate sequences"
+        );
+    }
+
+    /// A batch opens the active piece ONCE, not once per record.
+    ///
+    /// A batch is one crash-atomic group under one durability barrier, and that barrier is the
+    /// thing it exists to amortise. Each record used to open, write, stat and close the piece for
+    /// itself, so a batch of N paid 4N syscalls against that one barrier.
+    ///
+    /// Counted rather than timed: the syscalls ARE the cost being removed, and this machine cannot
+    /// resolve the difference in wall clock under load. The single-append arm is the control --
+    /// without it, a counter that had simply stopped incrementing would read as a perfect result.
+    #[test]
+    fn a_batch_opens_the_piece_once_not_once_per_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        // Warm: the first append creates the piece and its header, which is not per-record work.
+        store
+            .append(1, Command::StringSet { key: "warm".to_string(), value: vec![1] })
+            .unwrap();
+
+        let commands: Vec<Command> = (0..64)
+            .map(|index| Command::StringSet {
+                key: format!("batched-{index:04}"),
+                value: vec![7; 32],
+            })
+            .collect();
+
+        let reset = || {
+            super::WAL_FILE_OPENS.with(|opens| opens.set(0));
+            super::WAL_FILE_STATS.with(|stats| stats.set(0));
+        };
+        let opens = || super::WAL_FILE_OPENS.with(|opens| opens.get());
+        let stats = || super::WAL_FILE_STATS.with(|stats| stats.get());
+
+        reset();
+        store.append_batch_atomic(1, commands.clone(), true).unwrap();
+        let batched = opens();
+        let batched_stats = stats();
+
+        reset();
+        for command in commands {
+            store.append_with_sync(1, command, true).unwrap();
+        }
+        let one_at_a_time = opens();
+        let one_at_a_time_stats = stats();
+
+        assert!(
+            one_at_a_time >= 64,
+            "the control opened {one_at_a_time} times for 64 single appends, so the counter is              not counting opens and the batch figure below means nothing"
+        );
+        assert_eq!(
+            batched, 1,
+            "a batch of 64 records opened the piece {batched} times; it holds the append lock and              the inner lock across the whole loop and rolls only afterwards, so one open covers it"
+        );
+
+        // The same argument covers the physical length. Under preallocation each record asked the
+        // filesystem whether the reservation still had room; nothing else can change that length
+        // while both locks are held, so the batch reads it once and carries it, growing its own
+        // copy when it grows the file.
+        assert!(
+            one_at_a_time_stats >= 1,
+            "the control never asked for the physical length ({one_at_a_time_stats}), so the              batch figure below is not measuring anything"
+        );
+        assert_eq!(
+            batched_stats, 1,
+            "a batch of 64 records asked for the piece's physical length {batched_stats} times"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn how_often_an_append_asks_for_the_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        store
+            .append(1, Command::StringSet { key: "warm".to_string(), value: vec![1] })
+            .unwrap();
+
+        super::ACTIVE_PATH_CALLS.with(|calls| calls.set(0));
+        let runs = 50usize;
+        for index in 0..runs {
+            store
+                .append(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{index:06}"),
+                        value: incompressible(256),
+                    },
+                )
+                .unwrap();
+        }
+        let calls = super::ACTIVE_PATH_CALLS.with(|calls| calls.get());
+        let path_len = write_ahead_log_path(dir.path(), 1).as_os_str().len();
+        println!(
+            "  PATHCALLS {:.2} per append | the name is {path_len} B, so the copies cost about {:.0} B/append",
+            calls as f64 / runs as f64,
+            calls as f64 / runs as f64 * path_len as f64,
+        );
+        assert!(calls > 0, "the counter must observe the appends");
+    }
+
+    /// How much of a record's envelope could a batch actually share?
+    ///
+    /// Their logger pays its record header once per COMMIT and ours once per RECORD, so the
+    /// amortisation prize looks like the whole envelope. It is not: part of what sits outside the
+    /// value travels WITH each item and cannot be shared -- the key above all. Only the part that
+    /// is per-record can amortise.
+    ///
+    /// This separates the two by writing the same value under keys of two lengths. What moves
+    /// with the key is per-item; what stays is the fixed, shareable remainder.
+    #[test]
+    #[ignore]
+    fn how_much_of_the_envelope_can_amortise() {
+        let value_len = 64usize;
+        let measure = |key_len: usize| -> f64 {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalWriteAheadLogStore::new(dir.path());
+            let path = write_ahead_log_path(dir.path(), 1);
+            let value = incompressible(value_len);
+            let append = |index: usize| {
+                let key = format!("{:0width$}", index, width = key_len);
+                store
+                    .append(1, Command::StringSet { key, value: value.clone() })
+                    .unwrap();
+            };
+            append(0);
+            let (_, before) = last_wal_sequence_in(&path).unwrap();
+            let runs = 16usize;
+            for index in 1..=runs {
+                append(index);
+            }
+            let (_, after) = last_wal_sequence_in(&path).unwrap();
+            (after - before) as f64 / runs as f64
+        };
+
+        let short = measure(8);
+        let long = measure(40);
+        // Each extra key byte costs one byte on the wire, so the difference IS the key span.
+        let per_key_byte = (long - short) / 32.0;
+        let key_part = 8.0 * per_key_byte;
+        let fixed = short - value_len as f64 - key_part;
+
+        println!(
+            "  AMORTISE 8-char key {short:.1} B/record, 40-char {long:.1} B/record | value {value_len} B | key ~{key_part:.1} B | FIXED (shareable) {fixed:.1} B"
+        );
+        for items in [8usize, 64] {
+            let n_records = short * items as f64;
+            let one_record = fixed + (short - fixed) * items as f64;
+            println!(
+                "    at {items:>3} items: {n_records:.0} B as records vs {one_record:.0} B sharing the fixed part = {:.1}% ",
+                100.0 * (n_records - one_record) / n_records
+            );
+        }
+
+        assert!(short > 0.0 && long > short, "the probe must observe a key-length difference");
+        assert!(fixed > 0.0, "the fixed part cannot be negative: {fixed}");
+    }
+
+    #[test]
+    #[cfg(feature = "alloc-probe")]
+    #[ignore]
+    fn what_one_append_allocates() {
+        for value_len in [64usize, 256, 1024, 4096] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalWriteAheadLogStore::new(dir.path());
+            let value = vec![118u8; value_len];
+
+            // Warm: the first append pays for the file, the header and any lazy setup.
+            store
+                .append(
+                    1,
+                    Command::StringSet {
+                        key: "warm".to_string(),
+                        value: value.clone(),
+                    },
+                )
+                .unwrap();
+
+            // Built BEFORE the probe starts. Constructing the command is the caller's cost, not
+            // the append's, and a `format!` plus a `clone` inside the window put two allocations a
+            // write on the append's account that it never paid.
+            let runs = 200usize;
+            let commands = (0..runs)
+                .map(|index| Command::StringSet {
+                    key: format!("k{index:06}"),
+                    value: value.clone(),
+                })
+                .collect::<Vec<_>>();
+
+            let probe = crate::alloc_probe::Probe::start();
+            for command in commands {
+                store.append(1, command).unwrap();
+            }
+            let counts = probe.stop();
+
+            println!(
+                "  APPEND value {value_len:>5}B -> {:>6.1} allocs, {:>8.0} B allocated                  ({:>5.2}x the value)",
+                counts.allocs as f64 / runs as f64,
+                counts.alloc_bytes as f64 / runs as f64,
+                counts.alloc_bytes as f64 / runs as f64 / value_len as f64,
+            );
+
+            // A bound passes most easily when nothing was measured.
+            assert!(counts.allocs > 0, "the probe must observe the appends");
+        }
+    }
+
+    /// Sweep: what each rolling threshold costs and saves. Ignored -- a measurement, not a bound.
+    ///
+    ///   cargo test -p temporalstore-rust --lib sweep_segment_sizes -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn sweep_segment_sizes() {
+        // Preallocation is ON by default and grows a file 256 KiB at a time, so a piece smaller
+        // than that still costs a full chunk on disk. That sets the floor for the candidates.
+        for (label, roll) in [
+            ("off (today)", None),
+            ("256 KiB", Some(256u64 * 1024)),
+            ("512 KiB", Some(512 * 1024)),
+            ("1 MiB", Some(1024 * 1024)),
+            ("4 MiB", Some(4 * 1024 * 1024)),
+        ] {
+            for (shape, keep_fraction) in [("trim oldest 10%", 0.10f64), ("dump-driven, keep 10%", 0.90)] {
+                set_wal_segment_bytes_for_test(roll);
+                let dir = tempfile::tempdir().unwrap();
+                let store = LocalWriteAheadLogStore::new(dir.path());
+                let records = 4000u64;
+                for index in 0..records {
+                    store
+                        .append(
+                            1,
+                            Command::StringSet {
+                                key: format!("k{index:06}"),
+                                value: vec![118u8; 256],
+                            },
+                        )
+                        .unwrap();
+                }
+                let files_before = wal_segment_paths(dir.path(), 1).len();
+                let on_disk_before: u64 = wal_segment_paths(dir.path(), 1)
+                    .iter()
+                    .filter_map(|p| p.metadata().ok().map(|m| m.len()))
+                    .sum();
+
+                // `bytes_copied` misses the read side: an unrolled reclaim reads the whole file to
+                // find survivors, a rolled one skips the pieces it unlinks. `stats().bytes_read`
+                // does NOT cover the reclaim path -- it reported a flat zero here, which is the
+                // instrument not observing rather than reads being free -- so this times the call.
+                // A timing number, reported and never asserted on.
+                let retain_from = (records as f64 * keep_fraction) as u64;
+                let started = std::time::Instant::now();
+                let report = store.gc_before_sequence_unchecked(1, retain_from).unwrap();
+                let elapsed_us = started.elapsed().as_micros();
+
+                let on_disk_after: u64 = wal_segment_paths(dir.path(), 1)
+                    .iter()
+                    .filter_map(|p| p.metadata().ok().map(|m| m.len()))
+                    .sum();
+                set_wal_segment_bytes_for_test(None);
+
+                println!(
+                    "  SWEEP {label:>11} | {shape:>21} | files {files_before:>3} |                      on-disk {on_disk_before:>8} -> {on_disk_after:>8} | copied {:>8} |                      {elapsed_us:>7} us | unlinked {:>2} / {:>8} B",
+                    report.bytes_copied, report.dropped_segments, report.dropped_segment_bytes
+                );
+            }
+        }
+    }
+
+    /// The shipped default ROLLS, and rolling is what lets reclaim unlink instead of rewrite.
+    ///
+    /// The previous version of this test claimed it would fail if rolling ever became the
+    /// default. It would not have: it wrote 2,000 records of 64 bytes, a log of about 226 KB,
+    /// which never reaches a 256 KiB threshold -- so it passed either way and proved nothing about
+    /// the default it was named for. The log here is deliberately several times the threshold.
+    ///
+    /// Counted in bytes and pieces rather than timed. The scan saving that rolling also buys is
+    /// real and larger in the drop-most shape, but it is a wall-clock number and belongs in
+    /// `sweep_segment_sizes`, not in an assertion.
+    ///
+    /// **What these numbers are NOT.** They are per pass. Reclaim copies what it KEEPS, so a
+    /// bigger log means a bigger copy for the same fraction freed -- but that does not compound
+    /// over the log's life, because two things bound how big the log gets between passes:
+    /// `DEFAULT_INDEX_DUMP_WAL_GAP_BYTES` is a megabyte, so the index dumps once the log runs that
+    /// far ahead, and the storage-manager cycle that drives reclaim is wired (`bin/server.rs`
+    /// submits it). The steady-state cost is bounded write amplification. The quadratic shape
+    /// needs something to BLOCK reclaim so the log grows, and that case clamps to the floor rather
+    /// than refusing at it.
+    ///
+    /// This paragraph is here because it was written once already, as a correction to a claim that
+    /// the copy "grows with the log while the amount freed does not" -- a lifetime cost asserted
+    /// from a per-pass measurement. Rewriting this test for the new default dropped the correction
+    /// along with the test it was attached to. A cost per pass says nothing about total cost until
+    /// you know what bounds the passes.
+    #[test]
+    fn the_shipped_default_rolls_the_log() {
+        fn run(roll: Option<u64>, keep_fraction: f64) -> (u64, usize, u64, usize) {
+            set_wal_segment_bytes_for_test(roll);
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalWriteAheadLogStore::new(dir.path());
+            let records = 4000u64;
+            for index in 0..records {
+                store
+                    .append(
+                        1,
+                        Command::StringSet {
+                            key: format!("k{index:06}"),
+                            value: incompressible(256),
+                        },
+                    )
+                    .unwrap();
+            }
+            let files = wal_segment_paths(dir.path(), 1).len();
+            let report = store
+                .gc_before_sequence_unchecked(1, (records as f64 * keep_fraction) as u64)
+                .unwrap();
+            set_wal_segment_bytes_for_test(None);
+            (
+                report.bytes_copied,
+                report.dropped_segments,
+                report.dropped_segment_bytes,
+                files,
+            )
+        }
+
+        // `Some(0)` is the old behaviour, still reachable: zero means never roll.
+        let (never_copied, never_pieces, _, never_files) = run(Some(0), 0.90);
+        let (default_copied, default_pieces, default_bytes, default_files) = run(None, 0.90);
+
+        println!(
+            "  never rolling: {never_files} file(s), copied {never_copied} B, unlinked {never_pieces}
+               at the default: {default_files} file(s), copied {default_copied} B, unlinked              {default_pieces} piece(s) holding {default_bytes} B"
+        );
+
+        // A bound passes most easily when nothing was measured.
+        assert!(never_copied > 0, "the probe must observe a reclaim");
+        assert_eq!(never_files, 1, "zero must still mean one file");
+
+        // The default rolls: the log is several pieces and reclaim drops whole ones.
+        assert!(
+            default_files > 1,
+            "at a {}-byte threshold this log should be several pieces, got {default_files} file(s)",
+            DEFAULT_WAL_SEGMENT_BYTES
+        );
+        assert!(
+            default_pieces > 0,
+            "reclaim should unlink whole pieces at the default, not rewrite: {default_pieces}"
+        );
+        assert!(
+            default_bytes > 0,
+            "the pieces it dropped should have held something: {default_bytes}"
+        );
+
+        // Where rolling reduces the COPY: keeping most of the log confines the rewrite to the
+        // boundary piece. Dropping most of it copies the same either way -- the survivors are
+        // small however the log is laid out -- so this shape is the one worth asserting on.
+        let (never_keep_most, _, _, _) = run(Some(0), 0.10);
+        let (default_keep_most, _, _, _) = run(None, 0.10);
+        println!(
+            "  keeping most: never rolling copied {never_keep_most} B, at the default              {default_keep_most} B"
+        );
+        assert!(
+            default_keep_most * 4 < never_keep_most,
+            "rolling should confine the rewrite to the boundary piece: {default_keep_most} vs              {never_keep_most}"
+        );
+    }
+
+    /// What a batch costs on disk each way, as the batch grows.
+    ///
+    /// The comparison tree pays its record envelope once per COMMIT: its logger accumulates items
+    /// and serialises all of them into a single stream append, so at N items per commit the
+    /// envelope is amortised N ways. Written as N records ours is paid N times, and the three
+    /// batch fields are added to every record on top.
+    ///
+    /// Two different savings live in this number, and they are worth keeping apart.
+    ///
+    /// Batching amortises the ENVELOPE: one shard id, one sequence and one frame instead of N.
+    /// With compression off, so that is all that is left, this is 16.9% at eight items and 19.0%
+    /// at sixty-four. That figure bounds what a record-format change could win on its own.
+    ///
+    /// With compression on -- how it ships -- a batch also lets the compressor work ACROSS the
+    /// records' keys and structure, which are near-identical from one to the next, and the saving
+    /// is 32.1% and 38.5%. Both are real; they answer different questions.
+    ///
+    /// Getting there took two corrections, and both are the same mistake in different clothes.
+    /// A payload of one byte repeated made this read 86.6% and 94.8% -- the compressor eating the
+    /// value. Giving every item the SAME incompressible payload made it read 80.0% and 93.8%,
+    /// because sixteen identical payloads in ONE record compress just as well: measured, sixteen
+    /// 256-byte payloads accounted for 4,160 bytes of an uncompressed record and 279 of a
+    /// compressed one, which is not a ratio any real payload reaches. Each payload has to be its
+    /// own, which is what `incompressible_seeded` is for.
+    /// This measures both, so the amortisation is a number rather than an argument.
+    #[test]
+    #[ignore]
+    fn what_a_batch_costs_each_way() {
+        for items in [1usize, 8, 64] {
+            let value_len = 64usize;
+
+            let atomic_bytes = {
+                let dir = tempfile::tempdir().unwrap();
+                let store = LocalWriteAheadLogStore::new(dir.path());
+                let path = write_ahead_log_path(dir.path(), 1);
+                let commands = (0..items)
+                    .map(|index| Command::StringSet {
+                        key: format!("batch-key-{index:09}"),
+                        value: incompressible_seeded(value_len, index as u64),
+                    })
+                    .collect::<Vec<_>>();
+                let (_, before) = last_wal_sequence_in(&path).unwrap_or((0, 0));
+                store.append_batch_atomic(1, commands, false).unwrap();
+                let (_, after) = last_wal_sequence_in(&path).unwrap();
+                after - before
+            };
+
+            let one_record_bytes = {
+                let dir = tempfile::tempdir().unwrap();
+                let store = LocalWriteAheadLogStore::new(dir.path());
+                let path = write_ahead_log_path(dir.path(), 1);
+                let outcomes = (0..items)
+                    .map(|index| WalOutcomeItem {
+                        kind: "string".to_string(),
+                        object_key: format!("batch-key-{index:09}"),
+                        component: None,
+                        object_id: index as u64,
+                        routing_bucket: index as u32,
+                        address: None,
+                        value: Some(incompressible_seeded(value_len, index as u64)),
+                        ttl: None,
+                        deleted: false,
+                        meta: false,
+                    })
+                    .collect::<Vec<_>>();
+                let (_, before) = last_wal_sequence_in(&path).unwrap_or((0, 0));
+                store
+                    .append_batch_as_one_record(1, outcomes, Vec::new(), false)
+                    .unwrap();
+                let (_, after) = last_wal_sequence_in(&path).unwrap();
+                after - before
+            };
+
+            let payload = (items * value_len) as f64;
+            println!(
+                "  BATCH {items:>3} items | N records {atomic_bytes:>7} B ({:>5.2}x) | one record {one_record_bytes:>7} B ({:>5.2}x) | saved {:>5.1}%",
+                atomic_bytes as f64 / payload,
+                one_record_bytes as f64 / payload,
+                100.0 * (atomic_bytes as f64 - one_record_bytes as f64) / atomic_bytes as f64,
+            );
+
+            // Both figures read as a saving if either side measured nothing.
+            assert!(atomic_bytes > 0, "the N-record form wrote nothing at {items}");
+            assert!(
+                one_record_bytes > 0,
+                "the one-record form wrote nothing at {items}"
+            );
+        }
+    }
+
+    /// What the scan's read-time check costs, against the check that catches corruption.
+    ///
+    /// `scan_bounded` calls `decode_wal_line` on every record and throws the record away; the
+    /// caller then decodes the same bytes again. `decode_wal_line` starts by calling
+    /// `log_framing::decode_line`, which verifies the declared length and the checksum -- so
+    /// corruption, meaning bytes that changed on disk, is already caught there. What the rest of
+    /// the decode adds is a payload that checksums correctly and still will not parse.
+    ///
+    /// This prices the difference, because it is paid once per record on every recovery.
+    #[test]
+    #[ignore]
+    fn what_the_scan_time_check_costs() {
+        let record = WriteAheadLogRecord {
+            shard_id: 1,
+            sequence: 7,
+            command: Some(Command::StringSet {
+                key: "tenant/7/object/000000123".to_string(),
+                value: (0..4096u32).map(|index| (index % 7) as u8).collect(),
+            }),
+            metadata: None,
+            staged_blocks: Vec::new(),
+            outcomes: Vec::new(),
+        };
+        let line = encode_wal_line_for_test(&record).expect("record frames");
+
+        let rounds = 200usize;
+        let mut full_best = f64::MAX;
+        let mut framed_best = f64::MAX;
+        for _ in 0..7 {
+            let start = std::time::Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(decode_wal_line(std::hint::black_box(&line)).unwrap());
+            }
+            full_best = full_best.min(start.elapsed().as_secs_f64());
+
+            let start = std::time::Instant::now();
+            for _ in 0..rounds {
+                std::hint::black_box(
+                    crate::log_framing::decode_line(std::hint::black_box(&line)).unwrap(),
+                );
+            }
+            framed_best = framed_best.min(start.elapsed().as_secs_f64());
+        }
+
+        let us = |t: f64| t / rounds as f64 * 1e6;
+        println!(
+            "  SCANCHECK line {} B | full decode {:>7.3} us | length+checksum only {:>7.3} us | {:>5.1}x",
+            line.len(),
+            us(full_best),
+            us(framed_best),
+            full_best / framed_best,
+        );
+    }
+
+    #[test]
+    fn what_a_record_actually_costs_on_disk() {
+        for value_len in [64usize, 1024, 4096] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalWriteAheadLogStore::new(dir.path());
+            let value = incompressible(value_len);
+            let path = write_ahead_log_path(dir.path(), 1);
+
+            let append = |index: usize| {
+                store
+                    .append(
+                        1,
+                        Command::StringSet {
+                            key: format!("scale-key-{index:09}"),
+                            value: value.clone(),
+                        },
+                    )
+                    .unwrap();
+            };
+
+            // Warm past any once-only header, then measure a run of appends.
+            append(0);
+            let (_, before) = last_wal_sequence_in(&path).unwrap();
+            let runs = 16usize;
+            for index in 1..=runs {
+                append(index);
+            }
+            let (_, after) = last_wal_sequence_in(&path).unwrap();
+
+            let per_record = (after - before) as f64 / runs as f64;
+            println!(
+                "  ONDISK value {value_len:>5}B -> {per_record:>7.1} B/record ({:>5.2}x)",
+                per_record / value_len as f64
+            );
+
+            // A bound passes most easily when nothing was measured.
+            assert!(
+                after > before,
+                "the probe must observe the appends at {value_len}B"
+            );
+            assert!(
+                per_record > value_len as f64,
+                "a record cannot be smaller than the value it carries: {per_record}"
+            );
+
+            // The envelope must stay in binary territory. The text fallback carries a ~122-byte
+            // envelope and base64s the value at a flat third on top, so this bound fails wide if
+            // either default ever flips back -- which is the drift that left the neighbouring
+            // analysis describing a saving that had already been taken.
+            let envelope = per_record - value_len as f64;
+            assert!(
+                envelope < 80.0,
+                "envelope is {envelope:.0} B at {value_len}B: that is the text fallback's shape,                  not the binary one -- has a default flipped?"
+            );
+        }
+    }
+
+    /// What each frame costs in TIME, not just bytes. Ignored by default: it is a measurement,
+    /// and a timing assertion in the suite would be a flake generator.
+    ///
+    ///   cargo test -p temporalstore-rust --lib what_each_frame_costs_in_time -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn what_each_frame_costs_in_time() {
+        fn run(binary: bool, records: usize) -> (std::time::Duration, u64) {
+            let previous = std::env::var("TS_WAL_BINARY_FRAME").ok();
+            std::env::set_var("TS_WAL_BINARY_FRAME", if binary { "1" } else { "0" });
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalWriteAheadLogStore::new(dir.path());
+            // A payload with the byte a delimited reader splits on, because escaping is what
+            // the length frame stops paying for and it is charged per occurrence.
+            let value: Vec<u8> = (0..512u32)
+                .map(|i| if i % 16 == 0 { b'\n' } else { b'v' })
+                .collect();
+            let started = std::time::Instant::now();
+            for index in 0..records {
+                store
+                    .append_with_sync(
+                        1,
+                        Command::StringSet {
+                            key: format!("tenant/7/object/{index:06}"),
+                            value: value.clone(),
+                        },
+                        false,
+                    )
+                    .unwrap();
+            }
+            let elapsed = started.elapsed();
+            let path = write_ahead_log_path(dir.path(), 1);
+            let (_, bytes) = last_wal_sequence_in(&path).unwrap();
+            match previous {
+                Some(value) => std::env::set_var("TS_WAL_BINARY_FRAME", value),
+                None => std::env::remove_var("TS_WAL_BINARY_FRAME"),
+            }
+            (elapsed, bytes)
+        }
+
+        let records = 4_000usize;
+        // Alternate the order so a cold page cache or a warming disk cannot be read as a win.
+        let (text_a, text_bytes) = run(false, records);
+        let (binary_a, binary_bytes) = run(true, records);
+        let (binary_b, _) = run(true, records);
+        let (text_b, _) = run(false, records);
+        let text = (text_a + text_b) / 2;
+        let binary = (binary_a + binary_b) / 2;
+
+        let text_us = text.as_secs_f64() * 1e6 / records as f64;
+        let binary_us = binary.as_secs_f64() * 1e6 / records as f64;
+        println!(
+            "  records {records}\n  \
+             delimited  {text_us:.2} us/append, {} B/record\n  \
+             length     {binary_us:.2} us/append, {} B/record\n  \
+             time  {:+.1}%   bytes {:+.1}%",
+            text_bytes / records as u64,
+            binary_bytes / records as u64,
+            100.0 * (binary_us - text_us) / text_us,
+            100.0 * (binary_bytes as f64 - text_bytes as f64) / text_bytes as f64,
+        );
+    }
+    use super::*;
+
+    /// What the two frames actually cost, measured on the file rather than argued from the
+    /// header sizes: same records, same store, one flag apart.
+    #[test]
+    fn what_each_frame_costs_on_disk() {
+        fn write_and_measure(binary: bool, dir: &std::path::Path) -> (u64, usize) {
+            let previous = std::env::var("TS_WAL_BINARY_FRAME").ok();
+            std::env::set_var("TS_WAL_BINARY_FRAME", if binary { "1" } else { "0" });
+            let store = LocalWriteAheadLogStore::new(dir);
+            let records = 200usize;
+            for index in 0..records {
+                store
+                    .append(
+                        1,
+                        Command::StringSet {
+                            // A realistic key and a value with the byte a line reader splits on,
+                            // because that byte is exactly what escaping charges for.
+                            key: format!("tenant/9/object/{index:06}/field"),
+                            value: format!("value-{index}\nsecond line\nthird").into_bytes(),
+                        },
+                    )
+                    .unwrap();
+            }
+            let path = write_ahead_log_path(dir, 1);
+            // Preallocated room is reservation, not records: measure what the records occupy.
+            let (_, record_end) = last_wal_sequence_in(&path).unwrap();
+            match previous {
+                Some(value) => std::env::set_var("TS_WAL_BINARY_FRAME", value),
+                None => std::env::remove_var("TS_WAL_BINARY_FRAME"),
+            }
+            (record_end, records)
+        }
+
+        let text_dir = tempfile::tempdir().unwrap();
+        let binary_dir = tempfile::tempdir().unwrap();
+        let (text_bytes, count) = write_and_measure(false, text_dir.path());
+        let (binary_bytes, _) = write_and_measure(true, binary_dir.path());
+
+        let text_per = text_bytes as f64 / count as f64;
+        let binary_per = binary_bytes as f64 / count as f64;
+        let saved = 100.0 * (text_per - binary_per) / text_per;
+        println!(
+            "  text   {text_bytes} bytes over {count} records = {text_per:.1} B/record\n  \
+             binary {binary_bytes} bytes over {count} records = {binary_per:.1} B/record\n  \
+             saved  {saved:.1}%"
+        );
+        assert!(
+            binary_bytes < text_bytes,
+            "the binary frame must not cost more: {binary_bytes} vs {text_bytes}"
+        );
+    }
+    use crate::types::Command;
+
+    #[test]
+    fn default_store_scratch_dir_dies_with_the_last_clone() {
+        let store = LocalWriteAheadLogStore::default();
+        let root = store.inner.lock().unwrap().root.clone();
+        assert!(root.exists(), "Default must create its scratch dir");
+        let clone = store.clone();
+        drop(store);
+        assert!(root.exists(), "a live clone must keep the scratch dir");
+        drop(clone);
+        assert!(!root.exists(), "the last clone's drop must remove the scratch dir");
+    }
+
+    #[test]
+    fn wal_interleaved_processes_refresh_sequence_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = LocalWriteAheadLogStore::new(dir.path());
+        let second = LocalWriteAheadLogStore::new(dir.path());
+
+        let one = first
+            .append(
+                1,
+                Command::StringSet {
+                    key: "first".to_string(),
+                    value: b"v".to_vec(),
+                },
+            )
+            .unwrap();
+        let two = second
+            .append(
+                1,
+                Command::StringSet {
+                    key: "second".to_string(),
+                    value: b"v".to_vec(),
+                },
+            )
+            .unwrap();
+        let three = first
+            .append(
+                1,
+                Command::StringSet {
+                    key: "third".to_string(),
+                    value: b"v".to_vec(),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(one.sequence, 1);
+        assert_eq!(two.sequence, 2);
+        assert_eq!(three.sequence, 3);
+        assert_eq!(last_wal_sequence_at(dir.path(), 1).unwrap().0, 3);
+    }
+
+    #[test]
+    fn wal_full_reclaim_retains_tail_so_sequence_does_not_regress_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        for i in 0..5 {
+            store
+                .append(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{i}"),
+                        value: b"v".to_vec(),
+                    },
+                )
+                .unwrap();
+        }
+        assert_eq!(store.stats(1).last_sequence, 5);
+        // Full reclaim: retain floor past the max sequence would empty the file.
+        store.gc_before_sequence_unchecked(1, 6).unwrap();
+        drop(store);
+        // Restart: the sequence generator is seeded from the file. The tail record must have
+        // survived so the next sequence is 6, not a regressed 1 (which would reuse a sequence
+        // <= the durable anchor and be dropped by replay).
+        let restarted = LocalWriteAheadLogStore::new(dir.path());
+        let next = restarted
+            .append(
+                1,
+                Command::StringSet {
+                    key: "after".to_string(),
+                    value: b"v".to_vec(),
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            next.sequence, 6,
+            "sequence must continue at 6 after a full reclaim + restart, not regress"
+        );
+    }
+
+    #[test]
+    fn wal_interior_corruption_is_fatal_not_silent_truncation() {
+        // Pins the TEXT encoding: the corruption this injects is a line that fails to parse
+        // as a document, which is a text-shaped fault by construction.
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        for i in 0..4 {
+            store
+                .append(
+                    1,
+                    Command::StringSet {
+                        key: format!("k{i}"),
+                        value: b"v".to_vec(),
+                    },
+                )
+                .unwrap();
+        }
+        drop(store);
+        // Corrupt the 2nd record IN PLACE, keeping it newline-terminated and leaving records
+        // 3 & 4 intact after it. A newline-terminated line that fails to parse is committed
+        // corruption, not a torn tail.
+        let path = write_ahead_log_path(dir.path(), 1);
+        // Read bytes and walk frames: a record is not a line once the frame declares its own
+        // length, and `read_to_string` fails outright on a payload that is not valid UTF-8.
+        let contents = std::fs::read(&path).unwrap();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut at = data_start(&contents);
+        while at < contents.len() {
+            // Preallocated room trails the records and is not one of them.
+            if contents[at] == 0 {
+                break;
+            }
+            match crate::log_framing::next_frame(&contents[at..]) {
+                Ok(Some((consumed, _))) if consumed > 0 => {
+                    spans.push((at, at + consumed));
+                    at += consumed;
+                }
+                _ => break,
+            }
+        }
+        assert_eq!(spans.len(), 4);
+        // The damage this injects is a COMPLETE record that will not parse -- framed correctly,
+        // checksum intact, contents not a record. That is committed corruption, distinct from a
+        // torn tail, and the whole point of the test is that the two are handled differently.
+        let mut corrupted = Vec::new();
+        corrupted.extend_from_slice(&contents[..spans[0].1]);
+        corrupted.extend_from_slice(&crate::log_framing::encode_record(b"corrupt-not-json"));
+        corrupted.extend_from_slice(&contents[spans[2].0..spans[2].1]);
+        corrupted.extend_from_slice(&contents[spans[3].0..spans[3].1]);
+        std::fs::write(&path, &corrupted).unwrap();
+        // scan drives last_wal_sequence_at, which must surface the interior corruption as an
+        // error rather than silently truncating away records 3 & 4 (which would defeat the
+        // strict replay-continuity DataLoss guard).
+        let restarted = LocalWriteAheadLogStore::new(dir.path());
+        assert!(
+            restarted.scan(1, 0, u64::MAX, u64::MAX).is_err(),
+            "interior WAL corruption must be fatal, not silently truncated to the last good record"
+        );
+    
+        // Unpin it: this variable is process-global, and leaving it set makes every
+        // test that runs after this one inherit an encoding it never asked for.
+    }
+
+    #[test]
+    fn framed_wal_bitflip_that_still_parses_json_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        store
+            .append(
+                1,
+                Command::StringSet {
+                    key: "alpha".to_string(),
+                    value: b"one".to_vec(),
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                1,
+                Command::StringSet {
+                    key: "target".to_string(),
+                    value: b"two".to_vec(),
+                },
+            )
+            .unwrap();
+        drop(store);
+        // Flip one byte inside the second record's key ("target" -> "tbrget"): the framed line
+        // stays VALID JSON but no longer matches its per-record SHA-256 digest. Without framing
+        // this would replay as truth; with it, the committed corruption is fatal.
+        let path = write_ahead_log_path(dir.path(), 1);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let position = bytes
+            .windows(6)
+            .position(|window| window == b"target")
+            .expect("second record contains the target key");
+        bytes[position + 1] = b'b';
+        std::fs::write(&path, &bytes).unwrap();
+        let reopened = LocalWriteAheadLogStore::new(dir.path());
+        let scanned = reopened.scan(1, 0, u64::MAX, u64::MAX);
+        match scanned {
+            Err(WriteAheadLogError::Corruption(_)) => {}
+            other => panic!("expected a Corruption error from a value-preserving bit-flip, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn legacy_unframed_wal_still_loads_after_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        // Simulate a pre-upgrade on-disk WAL: raw single-line JSON records, no framing.
+        let path = write_ahead_log_path(dir.path(), 3);
+        let make = |sequence: u64, key: &str| WriteAheadLogRecord {
+            shard_id: 3,
+            sequence,
+            command: Some(Command::StringSet {
+                key: key.to_string(),
+                value: b"v".to_vec(),
+            }),
+            metadata: None,
+            staged_blocks: Vec::new(),
+            outcomes: Vec::new(),
+        };
+        let mut raw = serde_json::to_vec(&make(1, "k1")).unwrap();
+        raw.push(b'\n');
+        raw.extend_from_slice(&serde_json::to_vec(&make(2, "k2")).unwrap());
+        raw.push(b'\n');
+        std::fs::write(&path, &raw).unwrap();
+
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        // The legacy (unframed) records still load: sequence tail + scan see both.
+        assert_eq!(store.stats(3).last_sequence, 2);
+        let rows = store.scan(3, 0, u64::MAX, u64::MAX).unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(decode_wal_line(&rows[0].1).unwrap().sequence, 1);
+        assert_eq!(decode_wal_line(&rows[1].1).unwrap().sequence, 2);
+        // A new append is framed and continues the sequence; the mixed file still loads.
+        let appended = store
+            .append(
+                3,
+                Command::StringSet {
+                    key: "k3".to_string(),
+                    value: b"v".to_vec(),
+                },
+            )
+            .unwrap();
+        assert_eq!(appended.sequence, 3);
+        let reopened = LocalWriteAheadLogStore::new(dir.path());
+        assert_eq!(reopened.scan(3, 0, u64::MAX, u64::MAX).unwrap().len(), 3);
+        assert_eq!(reopened.stats(3).last_sequence, 3);
+    }
+
+    // rust-internal: verifies Rust WAL alias exports remain wired to the local mutation log API.
+    #[test]
+    fn wal_aliases_cover_local_mutation_log_api() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWalStore::new(dir.path());
+        let record: WalRecord = store
+            .append(
+                5,
+                Command::StringSet {
+                    key: "wal-key".to_string(),
+                    value: b"wal-value".to_vec(),
+                },
+            )
+            .unwrap();
+        assert_eq!(record.sequence, 1);
+        let stats: WalStats = store.stats(5);
+        assert_eq!(stats.last_sequence, 1);
+        let gc: WalGcReport = store.gc_before_sequence_unchecked(5, 1).unwrap();
+        assert_eq!(gc.records_removed, 0);
+    }
+
+    #[test]
+    fn gc_before_sequence_rewrites_wal_with_retained_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        for key in ["a", "b", "c"] {
+            store
+                .append(
+                    7,
+                    Command::StringSet {
+                        key: key.to_string(),
+                        value: key.as_bytes().to_vec(),
+                    },
+                )
+                .unwrap();
+        }
+
+        let report = store.gc_before_sequence_unchecked(7, 3).unwrap();
+        assert_eq!(report.records_before, 3);
+        assert_eq!(report.records_after, 1);
+        assert_eq!(report.records_removed, 2);
+        assert_eq!(store.stats(7).last_sequence, 3);
+        let reopened = LocalWriteAheadLogStore::new(dir.path());
+        assert_eq!(reopened.stats(7).last_sequence, 3);
+        assert_eq!(reopened.scan(7, 0, u64::MAX, u64::MAX).unwrap().len(), 1);
+        store
+            .append(
+                7,
+                Command::StringSet {
+                    key: "d".to_string(),
+                    value: b"d".to_vec(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.stats(7).last_sequence, 4);
+    }
+
+    #[test]
+    fn corrupt_tail_is_truncated_and_append_resumes_after_last_valid_wal_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        store
+            .append(
+                7,
+                Command::StringSet {
+                    key: "a".to_string(),
+                    value: b"a".to_vec(),
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                7,
+                Command::StringSet {
+                    key: "b".to_string(),
+                    value: b"b".to_vec(),
+                },
+            )
+            .unwrap();
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(write_ahead_log_path(dir.path(), 7))
+                .unwrap();
+            file.write_all(b"{\"shard_id\":7,\"sequence\":3").unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let reopened = LocalWriteAheadLogStore::new(dir.path());
+        assert_eq!(reopened.stats(7).last_sequence, 2);
+        assert_eq!(reopened.scan(7, 0, u64::MAX, u64::MAX).unwrap().len(), 2);
+        let record = reopened
+            .append(
+                7,
+                Command::StringSet {
+                    key: "c".to_string(),
+                    value: b"c".to_vec(),
+                },
+            )
+            .unwrap();
+        assert_eq!(record.sequence, 3);
+        assert_eq!(reopened.scan(7, 0, u64::MAX, u64::MAX).unwrap().len(), 3);
+    }
+
+    // shared-corpus: storage_wal_structure_api_flush_parity
+    #[test]
+    fn wal_record_metadata_tracks_style_log_item_shape() {
+        // The derivation is the contract: anything that wants the per-item description can
+        // rebuild it from the command, which is why the record no longer stores it.
+        let command = Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        };
+        let item = WriteAheadLogItemMetadata::from_command(&command);
+        assert_eq!(item.item_kind, WriteAheadLogItemKind::Kv);
+        assert_eq!(item.model, WriteAheadLogModel::String);
+        assert_eq!(item.object_key.as_deref(), Some("k"));
+        assert!(!item.deleted);
+        assert!(!item.meta_log);
+        assert!(!item.block_log);
+
+        // The record does not carry it -- 147 fsynced bytes per write saying what the record
+        // already says.
+        let lean = WriteAheadLogRecordMetadata::single_command(&command);
+        assert!(
+            lean.items.is_empty(),
+            "the derived description should not be written by default"
+        );
+        let encoded = serde_json::to_string(&lean).unwrap();
+        assert!(
+            !encoded.contains("items"),
+            "an empty description must be skipped entirely, got {encoded}"
+        );
+
+        // The other constructor restores it for a consumer reading records directly. It is
+        // named rather than selected, so no environment can point the live path at it.
+        let full = WriteAheadLogRecordMetadata::single_command_with_items(&command);
+        assert_eq!(full.items.len(), 1);
+        assert_eq!(full.items[0].object_key.as_deref(), Some("k"));
+    }
+
+    // shared-corpus: storage_wal_structure_api_flush_parity
+    #[test]
+    fn append_replayed_record_is_idempotent_and_flushes_like_stream_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        let command = Command::HashSet {
+            key: "h".to_string(),
+            field: "f".to_string(),
+            value: b"v".to_vec(),
+        };
+        let replayed = WriteAheadLogRecord {
+            shard_id: 3,
+            sequence: 8,
+            metadata: Some(WriteAheadLogRecordMetadata::single_command(&command)),
+            command: Some(command),
+            staged_blocks: Vec::new(),
+            outcomes: Vec::new(),
+        };
+
+        let first = store.append_replayed_record(replayed.clone()).unwrap();
+        assert!(first.appended);
+        assert_eq!(first.current_sequence, 8);
+        assert!(first.size > 0);
+        assert!(first.persistent_bytes >= first.size);
+        // The per-shard figure, not just the report this call returns. A replayed append syncs
+        // inside the append primitive and nowhere else, so the primitive's own record of how far
+        // the shard is durable has no second writer to correct it -- and every other assertion
+        // on this path reads the report, which carries its own copy. Without this the primitive
+        // could record nothing at all and the suite would not notice.
+        assert_eq!(
+            store.info(3).unwrap().persistent_length_bytes,
+            first.persistent_bytes,
+            "the replayed append's barrier is not recorded against the shard"
+        );
+        let duplicate = store.append_replayed_record(replayed).unwrap();
+        assert!(!duplicate.appended);
+        assert_eq!(duplicate.current_sequence, 8);
+        // A duplicate appends nothing, and says so with the RECORDS' end -- where the next
+        // record would go, and how far a barrier has reached. It used to answer the file's
+        // length for both, which under preallocation is the reservation: an offset pointing
+        // into the zeros past the records, and a durability figure above what the log holds.
+        let (_, record_end) =
+            last_wal_sequence_in(&write_ahead_log_path(dir.path(), 3)).unwrap();
+        assert_eq!(duplicate.offset, record_end);
+        assert_eq!(duplicate.persistent_bytes, record_end);
+        assert_eq!(first.persistent_bytes, record_end);
+        if wal_preallocate_enabled() {
+            let physical = write_ahead_log_path(dir.path(), 3).metadata().unwrap().len();
+            assert!(
+                record_end < physical,
+                "no reservation ({record_end} records in a {physical}-byte file), so the two \
+                 answers coincide and these assertions do not tell them apart"
+            );
+        }
+        assert_eq!(store.scan(3, 0, u64::MAX, u64::MAX).unwrap().len(), 1);
+        let stats = store.stats(3);
+        assert_eq!(stats.last_sequence, 8);
+        assert_eq!(stats.last_flushed_sequence, 8);
+        assert!(stats.flushes >= 1);
+        assert!(stats.syncs >= 1);
+    }
+
+    // shared-corpus: storage_wal_structure_api_flush_parity
+    #[test]
+    fn flush_and_info_report_persistent_wal_boundaries() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        store
+            .append(
+                4,
+                Command::SetAdd {
+                    key: "s".to_string(),
+                    member: b"m1".to_vec(),
+                },
+            )
+            .unwrap();
+        store
+            .append(
+                4,
+                Command::SetAdd {
+                    key: "s".to_string(),
+                    member: b"m2".to_vec(),
+                },
+            )
+            .unwrap();
+
+        let flush = store.flush(4).unwrap();
+        assert!(flush.synced);
+        assert_eq!(flush.last_sequence, 2);
+        assert!(flush.persistent_bytes > 0);
+        let info = store.info(4).unwrap();
+        assert_eq!(info.start_sequence, 1);
+        assert_eq!(info.current_sequence, 2);
+        assert_eq!(info.records, 2);
+        assert_eq!(info.persistent_length_bytes, flush.persistent_bytes);
+        assert_eq!(info.format_version, WRITE_AHEAD_LOG_FORMAT_VERSION);
+    }
+
+    // ---- block-retention floor -------------------------------------------------------------
+
+    /// Byte offset at which records begin: past the reclaim-base header if the file has one.
+    ///
+    /// Raw-file helpers have to step over the header for the same reason the readers do --
+    /// decoding it as a record fails.
+    fn data_start(bytes: &[u8]) -> usize {
+        if bytes.starts_with(crate::log_framing::BASE_HEADER_MAGIC) {
+            bytes
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map(|index| index + 1)
+                .unwrap_or(bytes.len())
+        } else {
+            0
+        }
+    }
+
+    /// The file bytes with any trailing preallocated-zeros reservation stripped:
+    /// exactly the records (a record line always ends in a newline, never a NUL).
+    fn strip_reservation(mut bytes: Vec<u8>) -> Vec<u8> {
+        while bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        bytes
+    }
+
+    /// Decode the shard's WAL the way GC does, by frames, so a test can assert on what
+    /// survived. Splitting on newlines answers correctly only while every record ends with one:
+    /// a record that declares its own length carries 0x0A inside its payload, and the split
+    /// then reports fragments that were never records. Asking each frame how far it runs works
+    /// for a file holding either kind, which is what an upgrade or a reclaim rewrite leaves.
+    fn sequences_on_disk(root: &std::path::Path, shard: ShardId) -> Vec<u64> {
+        let bytes = std::fs::read(write_ahead_log_path(root, shard)).unwrap();
+        let mut sequences = Vec::new();
+        let mut at = data_start(&bytes);
+        while at < bytes.len() {
+            // A zero where a record should start is preallocated room, not a record.
+            if bytes[at] == 0 {
+                break;
+            }
+            match crate::log_framing::next_frame(&bytes[at..]) {
+                Ok(Some((consumed, _))) if consumed > 0 => {
+                    let raw = &bytes[at..at + consumed];
+                    if !raw.iter().all(|byte| byte.is_ascii_whitespace()) {
+                        sequences.push(decode_wal_line(raw).unwrap().sequence);
+                    }
+                    at += consumed;
+                }
+                _ => break,
+            }
+        }
+        sequences
+    }
+
+    /// Byte offset at which each record starts, in order, past any base header.
+    /// Where each record starts. Walk the frames, do not hunt for newlines: a record ends where
+    /// its frame says it does, and a length-framed payload carries 0x0A of its own, so counting
+    /// newlines reports boundaries that were never boundaries. Works for either frame, which is
+    /// what a log written across a format change actually contains.
+    fn record_offsets_on_disk(root: &std::path::Path, shard: ShardId) -> Vec<usize> {
+        let bytes = std::fs::read(write_ahead_log_path(root, shard)).unwrap();
+        let start = data_start(&bytes);
+        let mut offsets = Vec::new();
+        let mut at = start;
+        while at < bytes.len() {
+            // Preallocated room ends the records: nothing starts inside the zeros.
+            if bytes[at] == 0 {
+                break;
+            }
+            match crate::log_framing::next_frame(&bytes[at..]) {
+                Ok(Some((consumed, _))) if consumed > 0 => {
+                    offsets.push(at);
+                    at += consumed;
+                }
+                _ => break,
+            }
+        }
+        if offsets.is_empty() {
+            offsets.push(start);
+        }
+        offsets
+    }
+
+    /// Bytes of the record starting at `offset`, including its newline.
+    fn record_bytes_at(root: &std::path::Path, shard: ShardId, offset: usize) -> Vec<u8> {
+        let bytes = std::fs::read(write_ahead_log_path(root, shard)).unwrap();
+        // The frame says how far the record runs; a newline only marks the end of one kind.
+        let end = match crate::log_framing::next_frame(&bytes[offset..]) {
+            Ok(Some((consumed, _))) if consumed > 0 => offset + consumed,
+            _ => bytes.len(),
+        };
+        bytes[offset..end].to_vec()
+    }
+
+    fn append_n(store: &LocalWriteAheadLogStore, shard: ShardId, count: usize) {
+        for index in 0..count {
+            store
+                .append(
+                    shard,
+                    Command::StringSet {
+                        key: format!("k{index}"),
+                        value: b"v".to_vec(),
+                    },
+                )
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn an_unsynced_append_is_not_reported_as_durable() {
+        // The whole point of a persistent-length figure is "what survives a crash". An append
+        // puts its record in the file whether or not a barrier followed, so reading the file's
+        // length back as `persistent_length_bytes` answers a different question than the one
+        // asked -- and answers it in the dangerous direction.
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        store
+            .append_with_sync(
+                1,
+                Command::StringSet {
+                    key: "k".to_string(),
+                    value: b"v".to_vec(),
+                },
+                false,
+            )
+            .unwrap();
+
+        let info = store.info(1).unwrap();
+        assert!(info.length_bytes > 0, "the record was written");
+        assert_eq!(
+            info.persistent_length_bytes, 0,
+            "nothing has been synced, so nothing is durable"
+        );
+        assert_eq!(
+            info.last_flushed_sequence, 0,
+            "no barrier has covered any sequence yet"
+        );
+        assert!(info.current_sequence > info.last_flushed_sequence);
+
+        // After a barrier the RECORDS are durable -- and it is the records that are reported.
+        // This used to assert the durable figure equals the file's LENGTH, which passed for the
+        // wrong reason: under preallocation both sides were the reservation. The file is grown
+        // to a chunk boundary past the last record, and those zeros are room, not durable log.
+        store.flush(1).unwrap();
+        let synced = store.info(1).unwrap();
+        let (_, record_end) = last_wal_sequence_in(&write_ahead_log_path(dir.path(), 1)).unwrap();
+        assert_eq!(
+            synced.persistent_length_bytes, record_end,
+            "a barrier makes the records durable, so the records are what is reported"
+        );
+        if wal_preallocate_enabled() {
+            assert!(
+                synced.persistent_length_bytes < synced.length_bytes,
+                "the file's length is the reservation ({}) and the records stop at {}; equal \
+                 means the reservation is being reported as durable",
+                synced.length_bytes,
+                synced.persistent_length_bytes
+            );
+        }
+        assert_eq!(synced.last_flushed_sequence, synced.current_sequence);
+    }
+
+
+    /// The durable byte figure reports the RECORDS a barrier covered, not the reservation the
+    /// file was grown to -- at two log sizes, with the ratio.
+    ///
+    /// Preallocation (`TS_WAL_PREALLOCATE`, default ON) grows the active piece with `set_len` to
+    /// a 256 KiB chunk boundary past the last record. The barrier paths used to report
+    /// `path.metadata().len()`, which is that boundary: zeros no record occupies. Measured on
+    /// this tree before the fix, a 100-record log reported 262,144 durable bytes against 10,100
+    /// of records -- 25.9x -- and a one-record log reported 262,144 against 30, 8,738x.
+    ///
+    /// The assertion is EQUALITY, not "reasonable". Overstating and understating this figure
+    /// fail differently and a bound that admits both catches neither: `info()` says which way it
+    /// must never err -- understating is survivable, overstating says unsynced records are on
+    /// disk to survive a crash -- so the test pins the exact byte count and, separately, pins
+    /// that the figure is STRICTLY BELOW the file's length, which is the observable that was
+    /// false before the fix and is what tells the two apart.
+    #[test]
+    fn a_barrier_reports_the_records_it_covered_and_not_the_reservation() {
+        // The fixture has to be in the regime being measured, or it measures nothing.
+        assert!(
+            wal_preallocate_enabled(),
+            "this is a statement about the preallocation regime and preallocation is off"
+        );
+
+        for records in [100usize, 1_000usize] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalWriteAheadLogStore::new(dir.path());
+            // One piece, so the whole figure is the active piece's and a roll cannot mask it.
+            set_wal_segment_bytes_for_test(Some(0));
+            for index in 0..records {
+                store
+                    .append_with_sync(
+                        1,
+                        Command::StringSet {
+                            key: format!("k{index:08}"),
+                            value: vec![b'v'; 64],
+                        },
+                        true,
+                    )
+                    .unwrap();
+            }
+            let info = store.info(1).unwrap();
+            let pieces = wal_segment_paths(dir.path(), 1);
+            let active = write_ahead_log_path(dir.path(), 1);
+            let (_, record_end) = last_wal_sequence_in(&active).unwrap();
+            set_wal_segment_bytes_for_test(None);
+
+            // Regime, asserted rather than assumed: one piece, no roll, and a reservation that
+            // really is longer than the records -- without that last part there is no gap
