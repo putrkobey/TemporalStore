@@ -55,22 +55,3 @@ ok("an unrelated warning is not called shed",
 ok("a missing answer does not throw", sandbox.wasShed(null) === false);
 
 const shed = sandbox.emptyPackMessage(SHED);
-ok("a shed search says the deployment did not run it",
-   /did not run the search/.test(shed), shed);
-ok("and clears the reader of blame for their setup",
-   /Nothing is wrong with the query, the store or the embedding model/.test(shed), shed);
-/* The whole point: it must NOT send them to the provider they have configured correctly. */
-ok("and does not blame the embedding provider",
-   !/deterministic/.test(shed), shed);
-
-const encoder = sandbox.emptyPackMessage({ groups: [], embedding_conflicts: { encoder_change: 4 } });
-ok("an encoder change still says so", /different embedding model/.test(encoder), encoder);
-ok("and is not called shedding", !/did not run the search/.test(encoder), encoder);
-
-const plain = sandbox.emptyPackMessage({ groups: [] });
-ok("a plain empty result keeps the deterministic-provider hint",
-   /deterministic/.test(plain), plain);
-ok("and is not called shedding", !/did not run the search/.test(plain), plain);
-
-/* Shedding wins when both are true: nothing was searched, so what the encoder did is beside the
-   point and mentioning it is the misdirection this exists to remove. */
