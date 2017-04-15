@@ -2098,3 +2098,2104 @@ pub fn block_ref_key_parts(key: &str) -> Result<BlockRefKeyParts<'_>, BlockRefKe
                 cut = found;
             }
             None => {
+                return Err(refuse(
+                    "it holds fewer than seven separators, so it cannot be the eight-slot \
+                     composite the page index is keyed by",
+                ))
+            }
+        }
+    }
+    let head = &key[..at[5]];
+    let (kind, object_key) = head.split_once(':').ok_or_else(|| {
+        refuse(
+            "its head holds no separator, so there is no slot in it for a kind and an object key \
+             both",
+        )
+    })?;
+    let numeric = |text: &str, which: &'static str| {
+        canonical_decimal(text).ok_or(BlockRefKeyUnparsable { key: key.to_string(), because: which })
+    };
+    Ok(BlockRefKeyParts {
+        kind,
+        object_key,
+        component: &key[at[5] + 1..at[4]],
+        block_slab_id: numeric(
+            &key[at[4] + 1..at[3]],
+            "its slab id slot is not a decimal in the spelling the renderer writes",
+        )?,
+        offset: numeric(
+            &key[at[3] + 1..at[2]],
+            "its offset slot is not a decimal in the spelling the renderer writes",
+        )?,
+        length: numeric(
+            &key[at[2] + 1..at[1]],
+            "its length slot is not a decimal in the spelling the renderer writes",
+        )?,
+        block_id: numeric(
+            &key[at[1] + 1..at[0]],
+            "its block id slot is not a decimal in the spelling the renderer writes",
+        )?,
+        generation: numeric(
+            &key[at[0] + 1..],
+            "its generation slot is not a decimal in the spelling the renderer writes",
+        )?,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// WHAT THIS STORE READS OFF DISK, COUNTED WHERE THE READING HAPPENS.
+//
+// `IndexLogStats::bytes_read` counts what a read HANDS BACK -- the records inside the window a
+// caller asked for. That is a useful number and it is not this one. The load-path fold reads
+// whole PIECES and hands back RECORDS, and it fed neither counter at all: #1936 measured a
+// 200,000-record restore reading 8,119,256 bytes off this store's pieces in 1,069 reads while
+// `index_log_store().stats()` answered `bytes_read: 0`. Measured again here at 2,000 and 8,000
+// records, the fold read 163,236 and 655,236 bytes -- the whole log, both times -- against a
+// store that reported zero.
+//
+// A READER WITH NO COUNTER CONTRIBUTES ZERO TO EVERY REPORT, WHICH IS INDISTINGUISHABLE FROM A
+// READER DOING NO WORK. That is how 965,415,651 bytes -- 95% of a restore -- survived every
+// previous measurement of that path.
+//
+// Process-wide rather than per-store, and deliberately: pieces are read from free functions that
+// hold no store (`last_sequence_at`, `index_log_segment_span_of`), so charging a store would mean
+// threading one through the whole read side to buy a number that is already obtainable. The
+// thread-local beside it is what a single restore wants, because a restore runs on one thread
+// while the suite does not.
+// ---------------------------------------------------------------------------------------------
+
+static INDEX_LOG_PIECE_BYTES_READ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static INDEX_LOG_PIECE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static INDEX_LOG_PIECE_BYTES_READ_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static INDEX_LOG_PIECE_READS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Bytes and read calls this PROCESS has made against index-log pieces since it started.
+pub fn index_log_piece_read_counts() -> (u64, u64) {
+    (
+        INDEX_LOG_PIECE_BYTES_READ.load(std::sync::atomic::Ordering::Relaxed),
+        INDEX_LOG_PIECE_READS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Bytes and read calls THIS THREAD has made against index-log pieces since it started.
+///
+/// A restore runs on one thread; the suite runs many at once. Measuring a restore against the
+/// process counter reads another test's reads as this one's.
+pub fn index_log_piece_read_counts_on_this_thread() -> (u64, u64) {
+    (
+        INDEX_LOG_PIECE_BYTES_READ_HERE.with(|bytes| bytes.get()),
+        INDEX_LOG_PIECE_READS_HERE.with(|reads| reads.get()),
+    )
+}
+
+/// What one span of reading against index-log pieces cost, published when it goes out of scope.
+///
+/// Held mutably by the [`CountedIndexLogFile`] it is passed to, so the handle cannot outlive it
+/// and A NEW READ OF A PIECE CANNOT BE WRITTEN WITHOUT A TALLY TO HAND OVER.
+pub(crate) struct IndexLogReadTally {
+    bytes: u64,
+    reads: u64,
+}
+
+impl IndexLogReadTally {
+    fn start() -> Self {
+        Self { bytes: 0, reads: 0 }
+    }
+}
+
+impl Drop for IndexLogReadTally {
+    fn drop(&mut self) {
+        if self.reads == 0 {
+            return;
+        }
+        INDEX_LOG_PIECE_BYTES_READ
+            .fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        INDEX_LOG_PIECE_READS.fetch_add(self.reads, std::sync::atomic::Ordering::Relaxed);
+        INDEX_LOG_PIECE_BYTES_READ_HERE.with(|bytes| bytes.set(bytes.get() + self.bytes));
+        INDEX_LOG_PIECE_READS_HERE.with(|reads| reads.set(reads.get() + self.reads));
+    }
+}
+
+/// A readable handle on one piece of an index log, which charges every byte the kernel hands it.
+///
+/// This is the only thing [`open_index_log_read`] and [`open_index_log_repair`] return, and they
+/// are the only way this module opens a piece to read it -- so the counting is not a call site
+/// anyone has to remember. `std::fs::File` is deliberately NOT imported into this module any
+/// more: a new read written the old way does not compile.
+pub(crate) struct CountedIndexLogFile<'a> {
+    file: std::fs::File,
+    tally: &'a mut IndexLogReadTally,
+}
+
+impl CountedIndexLogFile<'_> {
+    fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.file.set_len(len)
+    }
+
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
+impl Read for CountedIndexLogFile<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file.read(buf)?;
+        self.tally.bytes += read as u64;
+        self.tally.reads += 1;
+        Ok(read)
+    }
+}
+
+impl Seek for CountedIndexLogFile<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
+/// Open a piece of an index log for reading, and count what comes off it.
+///
+/// Every read-side open in this module goes through here or [`open_index_log_repair`], which is
+/// what makes a total takeable at all: the handle this returns is the only readable one, and a
+/// new read of a piece cannot be written without a tally to pass.
+fn open_index_log_read<'a>(
+    path: &Path,
+    tally: &'a mut IndexLogReadTally,
+) -> std::io::Result<CountedIndexLogFile<'a>> {
+    Ok(CountedIndexLogFile {
+        file: std::fs::File::open(path)?,
+        tally,
+    })
+}
+
+/// Open the piece being written, for the tail trim that reads it and then truncates it.
+///
+/// Read-WRITE, and still one of the read side's opens: the bytes it reads are charged like any
+/// other, or the counter would stop seeing this branch the moment a torn tail appeared.
+fn open_index_log_repair<'a>(
+    path: &Path,
+    tally: &'a mut IndexLogReadTally,
+) -> std::io::Result<CountedIndexLogFile<'a>> {
+    Ok(CountedIndexLogFile {
+        file: OpenOptions::new().read(true).write(true).open(path)?,
+        tally,
+    })
+}
+
+/// Exactly `len` bytes from `at` in a piece, through the one handle the read side uses.
+///
+/// The planted-marker control for the piece counter needs a read whose byte count IT decided, and
+/// the counted handle is private to this module.
+#[cfg(test)]
+pub(crate) fn read_index_log_piece_for_test(
+    path: &Path,
+    at: u64,
+    len: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut tally = IndexLogReadTally::start();
+    let mut file = open_index_log_read(path, &mut tally)?;
+    file.seek(SeekFrom::Start(at))?;
+    let mut bytes = vec![0u8; len];
+    let mut filled = 0usize;
+    while filled < len {
+        match file.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexLogStats {
+    pub writes: u64,
+    pub reads: u64,
+    pub scans: u64,
+    pub bytes_written: u64,
+    /// Bytes of RECORDS this store has handed back, which is not what it read off disk.
+    ///
+    /// The two came apart badly enough to hide a restore: see
+    /// [`index_log_piece_read_counts`], which is charged inside the read itself and is the
+    /// number to use for what a path COSTS. This one stays what it has always been, because a
+    /// caller reporting how much record data it received is asking a real question -- it is
+    /// simply a different one.
+    pub bytes_read: u64,
+    /// Records this store has read back and handed to a decoder.
+    ///
+    /// Beside `bytes_read`, which is the same work measured the other way. Both are what makes a
+    /// claim about what a round COSTS checkable without a clock: a guard that asserts a bound on
+    /// milliseconds asserts something about the machine, and this box cannot hold one still.
+    #[serde(default)]
+    pub records_read: u64,
+    pub last_sequence: u64,
+}
+
+/// What the index-GC gate needs, and what answering it cost.
+///
+/// The gate decides on a REMOVABLE-RECORD RATIO, which is two counts. Getting them by scanning
+/// and decoding the whole log made the maintenance round O(log size) even after reclaim itself
+/// stopped being -- the cost moved from the collector to the thing that decides whether to
+/// collect. Every one of these numbers except the last two is arithmetic on piece NAMES plus the
+/// one piece being written.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexLogGateSummary {
+    pub shard_id: ShardId,
+    /// The retain floor the counts below were taken against.
+    pub retain_from_sequence: u64,
+    /// On-disk bytes of the whole log: one `stat` per piece, nothing opened.
+    pub bytes: u64,
+    /// How many records the log holds.
+    pub records: usize,
+    /// How many of them sit below the floor.
+    pub removable_records: usize,
+    /// Files the log is in, the one being written included. This is what the gate now costs.
+    pub pieces: usize,
+    /// How many of those were answered from the NAME alone -- every sealed one.
+    pub pieces_named: usize,
+    /// Bytes read and decoded: the piece being written, and nothing else. Bounded by the rolling
+    /// threshold, not by the log.
+    pub bytes_decoded: u64,
+    /// Records read and decoded, bounded the same way.
+    pub records_decoded: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexLogGcReport {
+    pub shard_id: ShardId,
+    pub retain_from_sequence: u64,
+    #[serde(default)]
+    pub max_entries_per_round: usize,
+    pub records_before: usize,
+    pub records_after: usize,
+    pub records_removed: usize,
+    #[serde(default)]
+    pub removable_records_before_budget: usize,
+    #[serde(default)]
+    pub budget_exhausted: bool,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// On-disk bytes the sweep found reclaimable, whether or not it rewrote the log for them.
+    #[serde(default)]
+    pub reclaimable_bytes: u64,
+    /// The sweep read the log, decided what was reclaimable, and did NOT rewrite it -- because
+    /// nothing was reclaimable, or too little was to be worth the barrier. Distinguishes a log
+    /// that had nothing to give from one that was rewritten and gave nothing, which otherwise
+    /// look identical: both report zero records removed and the same bytes before and after.
+    #[serde(default)]
+    pub rewrite_skipped: bool,
+    /// Bytes the round COPIED: what it wrote into the replacement for the piece being written.
+    ///
+    /// This is what a round costs. The collector used to rewrite every record it retained, so
+    /// this number was the size of everything it KEPT, and a round that removed less copied
+    /// more. Earlier pieces are now unlinked instead, and nothing in them is read or copied, so
+    /// this is bounded by the piece being written however deep the log is.
+    #[serde(default)]
+    pub bytes_copied: u64,
+    /// Whole pieces of the log this round unlinked.
+    #[serde(default)]
+    pub dropped_segments: usize,
+    /// What those pieces held on disk.
+    #[serde(default)]
+    pub dropped_segment_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalIndexLogStore {
+    inner: Arc<Mutex<IndexLogInner>>,
+    /// One barrier gate per shard log, so appends that arrive while an fsync is in flight ride it
+    /// instead of queueing to take an identical one.
+    flush_gates: Arc<crate::flush_gate::FlushRegistry>,
+}
+
+#[derive(Debug)]
+struct IndexLogInner {
+    root: PathBuf,
+    stats: IndexLogStats,
+    last_sequence_by_shard: HashMap<ShardId, u64>,
+    /// MANIFEST-CONFORMANCE FOLD: the index-log byte length recorded at the last catalog dump, per
+    /// shard. `undumped_len_since_dump` subtracts this from the current on-disk length to get the
+    /// undumped gap that drives the threshold-dump cadence. Reset to 0
+    /// on process restart, so the first post-restart cycle may dump once -- harmless (a dump only
+    /// materializes durable state that is already recoverable).
+    last_dumped_len_by_shard: HashMap<ShardId, u64>,
+    /// When the last catalog dump of a shard completed. Read by `ms_since_catalog_dump` to hold
+    /// the next dump off until the minimum interval has passed.
+    ///
+    /// An `Instant`, not a wall clock, because the question is "how long since", and a wall
+    /// clock that steps backwards would hold a dump off for as long as the step, while one that
+    /// steps forward would release it early. A shard never dumped in this process has no entry,
+    /// and no entry means no floor: the first dump after a restart is never delayed.
+    last_dumped_at_by_shard: HashMap<ShardId, std::time::Instant>,
+    // Set only by Default: the store owns its minted scratch directory, and the last
+    // clone's drop removes it. Never set for a caller-supplied root.
+    scratch: Option<std::sync::Arc<crate::scratch::ScratchDirGuard>>,
+    /// Whether the log directory is known to exist, so an append need not ask again.
+    ///
+    /// `new` creates it. This records whether that SUCCEEDED, so the one case the per-append
+    /// `create_dir_all` genuinely covered -- a root `new` could not make, whose creation the
+    /// constructor discards because it cannot return an error -- is still retried, once, by the
+    /// first append instead of by every append.
+    ///
+    /// It is never set back to false, and that is deliberate. An append whose directory has
+    /// gone must FAIL, not re-create it: re-creating it turns "someone removed the log
+    /// directory" into "the log quietly began again, empty", which is lost durable state
+    /// wearing the costume of resilience. `an_append_fails_loudly_when_the_log_directory_is_
+    /// removed_underneath_it` is that behaviour, asserted.
+    root_created: bool,
+    /// The buffer a delta append encodes its payload into, kept between appends.
+    ///
+    /// The encode used to start from an empty vector every time and grow it by doubling to the
+    /// size of the record. Reusing one buffer leaves a steady stream of appends allocating
+    /// nothing here after the first few, which is the arrangement the write-ahead log's
+    /// `encode_scratch` already had. Held on `inner` rather than in a thread-local because the
+    /// append holds this lock across the encode anyway, so there is no contention to avoid and
+    /// no second place for it to live.
+    encode_scratch: Vec<u8>,
+    /// The buffer that payload is FRAMED into, kept for the same reason.
+    ///
+    /// Separate from the one above because the frame is built from the payload, so the two are
+    /// alive at the same moment.
+    frame_scratch: Vec<u8>,
+}
+
+/// The largest scratch buffer worth keeping between appends.
+///
+/// The buffers grow to the largest record this store has encoded and would otherwise hold that
+/// capacity for the life of the process. Past this they are dropped instead. Same ceiling, and
+/// the same reason, as `MAX_ENCODE_SCRATCH_BYTES` in the write-ahead encoder.
+const MAX_INDEX_ENCODE_SCRATCH_BYTES: usize = 1024 * 1024;
+
+impl IndexLogInner {
+    /// Make the log directory if `new` could not, and then never ask again.
+    ///
+    /// `new` already created it, and NOTHING IN THIS TREE REMOVES IT UNDER A LIVE STORE: the
+    /// scratch guard's drop runs when the last clone is gone, the scratch sweep keeps every
+    /// directory whose owning process is still alive (its own included), and the crash
+    /// harness removes the directory from a SEPARATE process, after the writer has aborted and
+    /// before the next one constructs its store. So the `create_dir_all` this replaces asked
+    /// the kernel, on every single append, a question whose answer it already had -- 10,001
+    /// `EEXIST` mkdirs in 10,002 at the measured size.
+    ///
+    /// If the directory IS gone, this no longer puts it back: the append's own `open` fails
+    /// with the directory named in the error. That is the intended direction. See the note on
+    /// `root_created`.
+    fn ensure_root(&mut self) -> Result<(), IndexLogError> {
+        if self.root_created {
+            return Ok(());
+        }
+        #[cfg(test)]
+        probe::APPEND_ROOT_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        fs::create_dir_all(&self.root)?;
+        self.root_created = true;
+        Ok(())
+    }
+}
+
+fn indexlog_enabled() -> bool {
+    // The index-log is the delta served-index's durable per-write delta stream: the
+    // load-time fold reconstructs the served index (at the original page addresses) from
+    // these records, so it must be written in ALL builds, not just tests. It is kept
+    // bounded by GC-at-compaction, which truncates every delta already folded into the
+    // durably-rewritten base snapshot (retain-from-anchor). Always on.
+    true
+}
+
+fn bulk_ingest_mode() -> bool {
+    crate::engine::bulk_ingest_mode()
+}
+
+/// Defer the ack-path index-log fsync (WAL replay is the durable recovery source). This is the
+/// single-barrier default; restored to a synchronous fsync only under the TS_WAL_LEGACY_RECOVERY
+/// escape hatch (whose delta-fold recovery trusts the durable delta).
+fn indexlog_wal_only_sync() -> bool {
+    // See `block_store::block_wal_single_barrier`: one reader, in `engine`, so the three barriers
+    // this hatch controls cannot end up disagreeing about whether it is set.
+    !crate::engine::wal_legacy_recovery()
+}
+
+/// MANIFEST-CONFORMANCE FOLD, always on: the slab catalog is folded into the index-log
+/// anchor at a threshold dump, and the per-write slab-manifest file is no longer the catalog's
+/// source of truth (it is reconstructed on load from the durable pages plus the folded anchor).
+/// `TS_INDEX_CATALOG_FOLD` used to be able to skip all of it. It shipped dark (the flip once
+/// broke proxy tests), then defaulted on once the upsert-delta and single-barrier work landed,
+/// and nothing ever selected the off position again -- the five tests that exercise the fold
+/// pinned it ON rather than off. The threshold dump is also what lets the embedded (proxy)
+/// engine reclaim its index-log and WAL at all, so the off side disabled reclaim entirely.
+///
+/// The off side's compatibility claim still holds and is not conditional on anything: an anchor
+/// whose `slabs` is empty serializes with no `zones` key, byte-identical to a pre-fold MetaItem.
+/// `meta_item_without_zones_serializes_byte_identically_to_pre_fold` asserts exactly that.
+///
+/// How many bytes a threshold dump may WRITE for each byte it RELEASES.
+///
+/// A dump's cost is the whole served index; its release is the index log accrued since the
+/// previous dump. Against a constant accrual threshold those two quantities have nothing to do
+/// with each other, so bytes written per byte released is linear in the store: measured at 9.89
+/// on a 20,000-record store and 84.23 on a 200,000-record one, for the same 4,000 records of work
+/// in both. Requiring the accrual to reach `base_index / INDEX_DUMP_BASE_FRACTION_DIVISOR` before
+/// a threshold dump fires bounds that figure at the divisor, whatever the store holds.
+///
+/// It is bought with index-log footprint. Between dumps the log may now stand at
+/// `base_index / divisor` rather than at the configured floor -- 12.5% of the base index on top
+/// of it at 8 -- and it still returns to its floor at every dump. That is the trade: the store's
+/// steady-state disk grows by an eighth, and the bytes it writes to hold that bound stop growing
+/// with it.
+///
+/// A constant rather than a deployment knob. It is a dimensionless ratio, it is the same at every
+/// size by construction, and the deployment already sets the FLOOR through
+/// `TS_INDEX_DUMP_WAL_GAP_BYTES`.
+///
+/// # WHY 8, AND WHY THE EXPRESSION STAYS A DIVISION OF THE BASE INDEX
+///
+/// Chosen on measurement rather than inherited. `index_write_amplification` drives this divisor
+/// across a sweep and prices the WRITE side; `index_recovery_cost` recovers the same five stores
+/// at the budget's high-water mark -- the worst moment a crash can pick -- and prices the READ
+/// side. At 4,000 objects on the shipped routing range `0..1023`, physical bytes throughout:
+///
+/// ```text
+///   divisor      b        a    index log    base read    WAL read    NAMED read    wall
+///         2  1.3563    3.810      143,669      286,242     763,392     1,193,303  1671 ms
+///         4  1.2125    5.715       61,768      243,537     566,784       872,089   405 ms
+///         8  1.1159    9.658       28,807      223,389     493,056       745,252   252 ms
+///        16  1.0609   17.511       14,409      213,124     468,480       696,013   249 ms
+///        32  1.0347   30.083        7,245      208,503     443,904       659,652   228 ms
+/// ```
+///
+/// The two sides are RECIPROCAL in `b - 1`. `a = b/(b-1)` is about `divisor + 1`, and the index
+/// log a recovery reads is `(b - 1)` times the base index -- read WHOLE, because the default load
+/// path's `latest_slab_catalog` walks every record to find the last one carrying a catalog, and
+/// the piece-name decline buys nothing in a post-sweep state (measured: the sweep has already
+/// dropped every piece the base reflects, so there is no piece left to decline). A looser budget
+/// also dumps less often, which leaves a longer unreflected write-ahead tail, so the replay term
+/// moves with the same threshold -- and that is the one term in a restore that is superlinear in
+/// its own size (`restore_large_scale`: 89% of what a 200,000-record restart reads, 6.70x per
+/// stored record for a 10x store).
+///
+/// So neither direction is free and the sweep identifies no interior optimum on its own -- the two
+/// costs are in different units, one paid continuously and one per restart, and no measurement
+/// fixes the exchange rate between them. What the measurement DOES decide is both ends:
+///
+/// - TIGHTER IS A BAD TRADE. 8 -> 16 costs 81% more bytes written per byte logged (9.658 ->
+///   17.511) and takes 6.6% off what a recovery reads (745,252 -> 696,013 B). The first is paid on
+///   every write for as long as the store is up; the second once per restart.
+/// - LOOSER PAST `b = 2` CANNOT BE EXPRESSED HERE, AND SHOULD NOT BE. `b = 1 + 1/divisor` for
+///   integer `divisor >= 1` confines `b` to `(1, 2]`, so `a >= 2` structurally; reaching
+///   `a <= 1.25` needs `b = 5`, a threshold FOUR TIMES the base index. At the measured 0.1255
+///   share that is a 32-fold increase in both the whole-log read and the unreflected tail -- a
+///   recovery that reads several times the store it is recovering. A multiplier, a rational or a
+///   configured byte value would each reach it; none of them should.
+/// - LOOSER WITHIN REACH IS ARGUABLE AND NOT FORCED. 8 -> 4 buys 41% off `a` for 17% more recovery
+///   read. It is the only move this measurement leaves open, and it would spend the budget on a
+///   read that is currently UNBOUNDED rather than on one that is minimal: the catalog walk needs
+///   one record and reads the whole log for it. Bounding that read is the prerequisite for
+///   revisiting this constant, not a reason to move it first.
+///
+/// AND THAT IS WHY THE FORM STAYS A DIVISION. Every budget the evidence supports lies in
+/// `(1, 2]`, which a division of the base index expresses exactly; a multiplier or a rational
+/// would only widen the reachable range into the region the recovery measurement refuses. A
+/// configured byte value would give up the property every figure above depends on -- the threshold
+/// is a FRACTION of the base index, so `b`, `a` and the recovery's index-log term are the same at
+/// every store size, measured at 0.1290 and 0.1255 of the base index across a 5.2x corpus.
+pub const INDEX_DUMP_BASE_FRACTION_DIVISOR: u64 = 8;
+
+/// The accrual a threshold dump must have to show for itself: the configured floor, raised so a
+/// dump never writes more than `divisor` bytes of base index per byte of index log it releases.
+///
+/// `configured_threshold_bytes` is a FLOOR and never a ceiling. A store whose base index is
+/// smaller than `divisor * configured_threshold_bytes` keeps exactly the cadence it has today --
+/// the relative term can only ever make a dump wait for MORE to release, never fire earlier -- so
+/// nothing below the crossover changes behaviour at all.
+///
+/// A zero configured floor DISABLES threshold dumping: `should_dump_index_catalog` refuses every
+/// undumped length against it, `u64::MAX` included, which is how an operator pins dumps to
+/// compaction and unload only. The relative term is a `max` against a quantity that grows without
+/// bound, so it would silently switch threshold dumping back ON for exactly the largest stores --
+/// the ones an operator who set a zero was most likely protecting. A zero in either position
+/// therefore returns the configured value unchanged and leaves the caller the decision it had.
+pub fn effective_index_dump_threshold_bytes(
+    configured_threshold_bytes: u64,
+    base_index_bytes: u64,
+    divisor: u64,
+) -> u64 {
+    if configured_threshold_bytes == 0 || divisor == 0 {
+        return configured_threshold_bytes;
+    }
+    configured_threshold_bytes.max(base_index_bytes / divisor)
+}
+
+/// Threshold decision for the background catalog/index dump, mirroring this design
+/// index-meta dump gate (the dump-delay check compares the undumped
+/// WAL length against the 1 MiB gap). `undumped_bytes` is the served-index-log growth since
+/// the last dumped watermark; when it crosses `gap_bytes` the dump fires. A zero gap disables
+/// the cadence (never dump on threshold) so an operator can pin dumps to compaction/unload only.
+pub fn should_dump_index_catalog(undumped_bytes: u64, gap_bytes: u64) -> bool {
+    gap_bytes > 0 && undumped_bytes >= gap_bytes
+}
+
+/// The threshold decision above, with a floor on how often it may say yes.
+///
+/// `ms_since_dump` is `None` for a shard this process has never dumped, which is not a dump
+/// "0 ms ago" -- it is no dump at all, and nothing to wait behind. Getting that backwards would
+/// silence the first dump after every restart for the length of the interval, on exactly the
+/// engine that has the most to reclaim.
+///
+/// A zero interval is no floor at all, so the byte gap alone decides. That is what a test which
+/// is not exercising the timer passes, and it says so by passing it.
+pub fn should_dump_index_catalog_now(
+    undumped_bytes: u64,
+    gap_bytes: u64,
+    ms_since_dump: Option<u64>,
+    min_interval_ms: u64,
+) -> bool {
+    if !should_dump_index_catalog(undumped_bytes, gap_bytes) {
+        return false;
+    }
+    match ms_since_dump {
+        Some(elapsed) => elapsed >= min_interval_ms,
+        None => true,
+    }
+}
+
+impl LocalIndexLogStore {
+    /// On-disk byte length of a shard's index-log file (0 if absent). Used as the "undumped
+    /// length" signal for the threshold-dump cadence: the growth of this file since the last
+    /// dumped watermark is the undumped-length signal.
+    pub fn log_len_bytes(&self, shard_id: ShardId) -> u64 {
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        // Every piece, not just the one being written. After a roll the active piece is the
+        // NEWEST and smallest part of the log, so reporting its length as the log's length makes
+        // a log SHRINK as it grows -- and the dump cadence that reads this would stop firing
+        // exactly when there is most to dump.
+        index_log_total_bytes(&inner.root, shard_id)
+    }
+
+    /// Undumped index-log length for a shard: the on-disk byte growth since the last catalog
+    /// dump (`mark_catalog_dumped`). This is the native analog of this design
+    /// the undumped WAL length, and is the signal compared against `index_dump_wal_gap_bytes`
+    /// to decide a threshold dump. A shard never dumped this process (or freshly restarted)
+    /// reports the whole current length.
+    /// Milliseconds since this shard's last catalog dump, or `None` if it has not dumped in
+    /// this process. Feeds `should_dump_index_catalog_now`'s interval check.
+    pub fn ms_since_catalog_dump(&self, shard_id: ShardId) -> Option<u64> {
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        inner
+            .last_dumped_at_by_shard
+            .get(&shard_id)
+            .map(|at| at.elapsed().as_millis() as u64)
+    }
+
+    pub fn undumped_len_since_dump(&self, shard_id: ShardId) -> u64 {
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        let current = index_log_total_bytes(&inner.root, shard_id);
+        let dumped = inner
+            .last_dumped_len_by_shard
+            .get(&shard_id)
+            .copied()
+            .unwrap_or(0);
+        current.saturating_sub(dumped)
+    }
+
+    /// Record that a catalog dump captured the shard's index-log up to its current on-disk
+    /// length, resetting the undumped gap to 0. Called by the engine ONLY after the dump's base
+    /// index + folded anchor are durably written, so the watermark never advances past
+    /// non-durable state (restart-during-dump re-dumps rather than skipping).
+    pub fn mark_catalog_dumped(&self, shard_id: ShardId) {
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        let current = index_log_total_bytes(&inner.root, shard_id);
+        inner.last_dumped_len_by_shard.insert(shard_id, current);
+        // Stamped in the same call as the length, so the two halves of the cadence -- how much
+        // has accumulated, and how long ago -- can never disagree about which dump they describe.
+        inner
+            .last_dumped_at_by_shard
+            .insert(shard_id, std::time::Instant::now());
+    }
+
+    /// The most recent `MetaItem` anchor carrying a folded slab catalog, or `None` if no
+    /// anchor with a non-empty `slabs` list has been written. Used on load (gate on) to seed the
+    /// block-store slab catalog from the folded anchor when the slab-manifest file is absent.
+    pub fn latest_slab_catalog(&self, shard_id: ShardId) -> Result<Option<MetaItem>, IndexLogError> {
+        // The LAST matching record wins, so this cannot stop early -- but it never needed to
+        // hold the records it walks past. It kept every record in the log, with every item each
+        // one carries, to take one field out of one of them.
+        let mut latest = None;
+        self.for_each_delta_record(shard_id, 0, |record| {
+            if let Some(meta) = record.meta {
+                if !meta.slabs.is_empty() {
+                    latest = Some(meta);
+                }
+            }
+        })?;
+        Ok(latest)
+    }
+
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        // The RESULT, not `let _`. This is the store's one directory creation; every append
+        // then trusts it rather than repeating it. Keeping the answer is what lets an append
+        // skip the `mkdir` + `statx` pair while still retrying the one case that mattered.
+        let root_created = fs::create_dir_all(&root).is_ok();
+        Self {
+            inner: Arc::new(Mutex::new(IndexLogInner {
+                root,
+                stats: IndexLogStats::default(),
+                last_sequence_by_shard: HashMap::new(),
+                last_dumped_len_by_shard: HashMap::new(),
+                last_dumped_at_by_shard: HashMap::new(),
+                scratch: None,
+                root_created,
+                encode_scratch: Vec::new(),
+                frame_scratch: Vec::new(),
+            })),
+            flush_gates: Arc::new(crate::flush_gate::FlushRegistry::default()),
+        }
+    }
+
+    /// Append an index record, PARSING the bytes into a value first.
+    ///
+    /// Prefer [`append_index_bytes`](Self::append_index_bytes), which splices the already
+    /// serialized bytes into the record instead. This one parses the whole index into a
+    /// `serde_json::Value` and then re-encodes it, so a multi-megabyte index is walked twice
+    /// more per append -- measured at 2.31 MB for a 2,000-key shard. It remains for callers
+    /// that genuinely need the parsed record back; every engine caller writes an index it has
+    /// just serialized and discards the result, so they all take the splicing path.
+    pub fn append_json(
+        &self,
+        shard_id: ShardId,
+        index_bytes: &[u8],
+    ) -> Result<IndexLogRecord, IndexLogError> {
+        // Bulk backfill: skip the replay-log append entirely (deferred to a
+        // single flush of the served index). Removes the per-record fsync bomb.
+        if bulk_ingest_mode() || !indexlog_enabled() {
+            return Ok(IndexLogRecord {
+                shard_id,
+                sequence: 0,
+                index: serde_json::Value::Null,
+            });
+        }
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        inner.ensure_root()?;
+        let last_sequence = match inner.last_sequence_by_shard.get(&shard_id).copied() {
+            Some(sequence) => sequence,
+            None => {
+                let sequence = last_sequence_at(&inner.root, shard_id)?;
+                inner.last_sequence_by_shard.insert(shard_id, sequence);
+                sequence
+            }
+        };
+        // Seal the piece being written if this record would take it past the rolling threshold,
+        // so reclaim has whole pieces to unlink instead of a file to rewrite. The check is a
+        // stat; the piece is walked once per ROLL, never once per append -- re-reading the file
+        // to answer "is this piece full" on every write is the cost the write-ahead log had to
+        // take back out.
+        //
+        // AFTER the sequence probe above, not before it. That probe is what trims a tail a crash
+        // left half-written, and only the piece being written is ever trimmed -- so rolling first
+        // would seal the torn bytes into a piece nothing trims again, and the piece's recorded
+        // end would be taken from the last record before them.
+        // ONE probe, for both questions. This resolves which file the shard's log is being
+        // written to and how long it is; the roll needs the length, the open needs the name,
+        // and asking separately is what made the append probe the same path twice per record.
+        let (mut active, active_len) = active_index_log(&inner.root, shard_id);
+        if roll_index_log_segment_at(&inner.root, shard_id, &active, active_len)? {
+            // Re-resolve ONLY here. The seal RENAMES the piece away, and that rename is the one
+            // event that can change which name the next record belongs under -- so the answer is
+            // taken again exactly when it has been invalidated, and never cached past it. A roll
+            // is 1 append in 1,000 at the rolling default, so this costs nothing per record.
+            active = active_index_log(&inner.root, shard_id).0;
+        }
+        let next_sequence = last_sequence.saturating_add(1);
+        let record = IndexLogRecord {
+            shard_id,
+            sequence: next_sequence,
+            index: serde_json::from_slice(index_bytes)?,
+        };
+        // Frame the record with a length + SHA-256 digest (crate::log_framing) so a later
+        // value-preserving bit-flip in this committed line is detected on read.
+        let bytes =
+            crate::log_framing::encode_record(&encode_index_payload(&record, INDEX_LOG_SHAPE_WHOLE)?);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&active)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        // Ack-path index-log append. Under the single-barrier default defer this fsync (bytes
+        // still written): the WAL is the durable recovery source and replay rebuilds the
+        // served index, so the replay-log checkpoint need not be crash-durable per write.
+        if !indexlog_wal_only_sync() {
+            file.sync_data()?;
+        }
+        inner.stats.writes += 1;
+        #[cfg(test)]
+        probe::APPENDS_COMPLETED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        inner.stats.bytes_written += bytes.len() as u64;
+        inner.stats.last_sequence = next_sequence;
+        inner.last_sequence_by_shard.insert(shard_id, next_sequence);
+        Ok(record)
+    }
+
+    pub fn append_index_bytes(
+        &self,
+        shard_id: ShardId,
+        index_bytes: &[u8],
+    ) -> Result<u64, IndexLogError> {
+        if bulk_ingest_mode() || !indexlog_enabled() {
+            return Ok(0);
+        }
+        // This once asserted the bytes parse as JSON, from when this appender spliced the whole
+        // index into the record. It no longer does -- it writes a digest and a length, and never
+        // looks inside -- so the JSON demand was a precondition that outlived its reason, and it
+        // fires the moment the index is written in its binary container. Assert what this code
+        // actually needs: that it was handed an index at all, in either format a reader accepts.
+        debug_assert!(
+            crate::engine::bytes_look_like_served_index(index_bytes),
+            "index-log anchor was handed {} bytes that are not a served index in any known format",
+            index_bytes.len()
+        );
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        inner.ensure_root()?;
+        let last_sequence = match inner.last_sequence_by_shard.get(&shard_id).copied() {
+            Some(sequence) => sequence,
+            None => {
+                let sequence = last_sequence_at(&inner.root, shard_id)?;
+                inner.last_sequence_by_shard.insert(shard_id, sequence);
+                sequence
+            }
+        };
+        // Seal the piece being written if this record would take it past the rolling threshold,
+        // so reclaim has whole pieces to unlink instead of a file to rewrite. The check is a
+        // stat; the piece is walked once per ROLL, never once per append -- re-reading the file
+        // to answer "is this piece full" on every write is the cost the write-ahead log had to
+        // take back out.
+        //
+        // AFTER the sequence probe above, not before it. That probe is what trims a tail a crash
+        // left half-written, and only the piece being written is ever trimmed -- so rolling first
+        // would seal the torn bytes into a piece nothing trims again, and the piece's recorded
+        // end would be taken from the last record before them.
+        // ONE probe, for both questions. This resolves which file the shard's log is being
+        // written to and how long it is; the roll needs the length, the open needs the name,
+        // and asking separately is what made the append probe the same path twice per record.
+        let (mut active, active_len) = active_index_log(&inner.root, shard_id);
+        if roll_index_log_segment_at(&inner.root, shard_id, &active, active_len)? {
+            // Re-resolve ONLY here. The seal RENAMES the piece away, and that rename is the one
+            // event that can change which name the next record belongs under -- so the answer is
+            // taken again exactly when it has been invalidated, and never cached past it. A roll
+            // is 1 append in 1,000 at the rolling default, so this costs nothing per record.
+            active = active_index_log(&inner.root, shard_id).0;
+        }
+        let next_sequence = last_sequence.saturating_add(1);
+        // Record WHICH index this checkpoint anchors, not a second copy of it.
+        //
+        // This used to splice the whole served index into the record -- 2.31 MB for a 2,000-key
+        // shard, written again here after it had just been written to the index file. Nothing
+        // ever read it back: every path that reconstructs a shard decodes the index FILE or a
+        // dump manifest, and the log's own readers take only `sequence` (the tail scan and the
+        // GC anchor probe) or raw bytes (the debug stream). Removing the payload and running
+        // the reload, recovery-sweep, storage-lifecycle, dump, index-format, load-index and
+        // anchor suites changed nothing -- 77 tests, all still green.
+        //
+        // The digest keeps what the copy was actually good for: an anchor can still be checked
+        // against the index file it claims to describe. `append_json` still embeds the whole
+        // index for any caller that wants the record to carry it.
+        let digest = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(index_bytes);
+            hasher.finalize().to_vec()
+        };
+        let index_len = index_bytes.len();
+        let anchor = IndexAnchorRecord {
+            shard_id,
+            sequence: next_sequence,
+            index_sha256: digest,
+            index_len: index_len as u64,
+        };
+        let bytes = crate::log_framing::encode_record(&encode_index_payload(
+            &anchor,
+            INDEX_LOG_SHAPE_ANCHOR,
+        )?);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&active)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        // Ack-path index-log append. Under the single-barrier default defer this fsync (bytes
+        // still written): the WAL is the durable recovery source and replay rebuilds the
+        // served index, so the replay-log checkpoint need not be crash-durable per write.
+        if !indexlog_wal_only_sync() {
+            file.sync_data()?;
+        }
+        inner.stats.writes += 1;
+        #[cfg(test)]
+        probe::APPENDS_COMPLETED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        inner.stats.bytes_written += bytes.len() as u64;
+        inner.stats.last_sequence = next_sequence;
+        inner.last_sequence_by_shard.insert(shard_id, next_sequence);
+        Ok(next_sequence)
+    }
+
+    /// Append one O(delta) served-index record: the page/object items a single write
+    /// touched, optionally carrying a compaction anchor. Unlike `append_json`, this never
+    /// serializes the whole index -- the appended bytes are proportional to the change,
+    /// which is what turns the per-write served-index persist cost from O(store) into
+    /// O(delta). Returns the assigned monotonic sequence.
+    ///
+    /// `durable` controls the fsync, and WHAT IT IS AT THE SHIPPED DEFAULT IS PER CALL SITE.
+    /// There are exactly FOUR in the library, and they do not agree:
+    ///
+    /// | call site | expression | at the shipped default |
+    /// |---|---|---|
+    /// | `engine.rs` single-command ack | `!raft_applying() && !wal_single_barrier()` | **false** |
+    /// | `engine/recovery_sweep_compact.rs` expiry flush | `!raft_applying() && !wal_single_barrier()` | **false** |
+    /// | `engine/stream_batch_methods.rs` batch ack | `!raft_applying()` | **true** |
+    /// | `engine/engine_persistence.rs` threshold catalog dump | `true` | **true** |
+    ///
+    /// `wal_single_barrier()` is `!wal_legacy_recovery()`, which reads `TS_WAL_LEGACY_RECOVERY`,
+    /// off by default -- so the two expressions carrying that term evaluate false, and the raft
+    /// term is what defers them on the apply path instead. The single-command ack therefore
+    /// defers, because the WAL barrier has already committed before this is reached. The BATCH
+    /// ack does not: its expression never had the `wal_single_barrier()` term, so on every
+    /// single-node batch write it takes the barrier. And the dump passes a literal `true`, which
+    /// is the point of a dump -- step 4 of `dump_index_catalog` advances the dumped watermark on
+    /// the strength of this record being durable.
+    ///
+    /// # THIS DOC HAS NOW BEEN WRONG TWICE, IN OPPOSITE DIRECTIONS
+    ///
+    /// It first claimed the normal path fsync'd and only raft deferred. That was corrected to
+    /// "under the shipped default no production caller passes `true`", over "both callers", and
+    /// THAT IS ALSO WRONG -- the correction is mine and it is the worse of the two, because a
+    /// reader who checks it finds a literal `true` at the second call site down.
+    ///
+    /// Two separate errors produced it. "Both callers" was a count taken from a grep: there are
+    /// four, and only two compute the expression quoted. And "no caller passes `true`" read the
+    /// term `!wal_single_barrier()` as though every call site carried it.
+    ///
+    /// The caller count here is the COMPILER's, not a grep's. `append_delta`'s `durable`
+    /// parameter was removed and `cargo check --lib` run: four arity errors, the four rows above.
+    /// A grep over the same tree reports 89 call sites and 28 that look like production -- the
+    /// rest are inside `#[cfg(test)]` functions of the measurement modules, which a grep cannot
+    /// see and the compiler does not compile.
+    ///
+    /// Either way the record is WRITTEN and flushed to the OS at every one of the four, so the
+    /// served-index stream is the same shape regardless, and a tail lost from a deferred one is
+    /// rebuilt by replay.
+    ///
+    /// The consumer-aware GC never truncates such a tail: its retain floor is
+    /// `min(durable frontier, slowest cursor) + 1`, which
+    /// `the_index_log_retain_floor_never_passes_the_durable_frontier` asserts rather than leaving
+    /// to this sentence.
+    pub fn append_delta(
+        &self,
+        shard_id: ShardId,
+        items: Vec<IndexItem>,
+        key_states: Vec<serde_json::Value>,
+        applied_wal_sequence: Option<u64>,
+        meta: Option<MetaItem>,
+        upsert: bool,
+        durable: bool,
+    ) -> Result<u64, IndexLogError> {
+        // The single and the batch write paths are two live callers of this, which is exactly the
+        // pair a charge at one call site would have split: an exploratory scope placed at the
+        // single-command site read ZERO on a batch ingest. Here both are counted, and the
+        // disabled-log return below is inside the class so a store with the log off reports a
+        // measured zero rather than an absent one.
+        crate::alloc_probe::in_class(crate::alloc_probe::AllocClass::IndexLogDelta, || {
+            self.append_delta_inner(
+                shard_id,
+                items,
+                key_states,
+                applied_wal_sequence,
+                meta,
+                upsert,
+                durable,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_delta_inner(
+        &self,
+        shard_id: ShardId,
+        items: Vec<IndexItem>,
+        key_states: Vec<serde_json::Value>,
+        applied_wal_sequence: Option<u64>,
+        meta: Option<MetaItem>,
+        upsert: bool,
+        durable: bool,
+    ) -> Result<u64, IndexLogError> {
+        if bulk_ingest_mode() || !indexlog_enabled() {
+            return Ok(0);
+        }
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        inner.ensure_root()?;
+        let last_sequence = match inner.last_sequence_by_shard.get(&shard_id).copied() {
+            Some(sequence) => sequence,
+            None => {
+                let sequence = last_sequence_at(&inner.root, shard_id)?;
+                inner.last_sequence_by_shard.insert(shard_id, sequence);
+                sequence
+            }
+        };
+        // Seal the piece being written if this record would take it past the rolling threshold,
+        // so reclaim has whole pieces to unlink instead of a file to rewrite. The check is a
+        // stat; the piece is walked once per ROLL, never once per append -- re-reading the file
+        // to answer "is this piece full" on every write is the cost the write-ahead log had to
+        // take back out.
+        //
+        // AFTER the sequence probe above, not before it. That probe is what trims a tail a crash
+        // left half-written, and only the piece being written is ever trimmed -- so rolling first
+        // would seal the torn bytes into a piece nothing trims again, and the piece's recorded
+        // end would be taken from the last record before them.
+        // ONE probe, for both questions. This resolves which file the shard's log is being
+        // written to and how long it is; the roll needs the length, the open needs the name,
+        // and asking separately is what made the append probe the same path twice per record.
+        let (mut active, active_len) = active_index_log(&inner.root, shard_id);
+        if roll_index_log_segment_at(&inner.root, shard_id, &active, active_len)? {
+            // Re-resolve ONLY here. The seal RENAMES the piece away, and that rename is the one
+            // event that can change which name the next record belongs under -- so the answer is
+            // taken again exactly when it has been invalidated, and never cached past it. A roll
+            // is 1 append in 1,000 at the rolling default, so this costs nothing per record.
+            active = active_index_log(&inner.root, shard_id).0;
+        }
+        let next_sequence = last_sequence.saturating_add(1);
+        // Do not write what the item already says. Each item carries `object_id` and
+        // `routing_bucket`, and the address it points at repeats both -- 18 bytes of a 142-byte
+        // item. `restore_address_repeats` at the decode site puts them back.
+        let mut items = items;
+        for item in items.iter_mut() {
+            item.strip_block_ref_key_repeat();
+            item.strip_size_repeat();
+            // The address first, because it is stripped against the item's id, and the item's
+            // id is what goes next.
+            item.strip_address_repeats();
+            item.strip_object_id_repeat(shard_id);
+        }
+        // Hoist the object key when every item names the same one, and blank the copies.
+        //
+        // LAST, after the strips above. `strip_block_ref_key_repeat` DERIVES the page handle from
+        // the item's own fields and `object_key` is one of them, so blanking the key first would
+        // derive a different handle and the strip would decline -- costing more than this saves.
+        let shared_object_key = match items.split_first() {
+            Some((first, rest)) if rest.iter().all(|item| item.object_key == first.object_key) => {
+                Some(first.object_key.to_string())
+            }
+            _ => None,
+        };
+        if shared_object_key.is_some() {
+            let blank = empty_object_key();
+            for item in items.iter_mut() {
+                item.object_key = blank.clone();
+            }
+        }
+        let record = IndexDeltaRecord {
+            shard_id,
+            sequence: next_sequence,
+            items,
+            meta,
+            applied_wal_sequence,
+            key_states,
+            upsert,
+            shared_object_key,
+        };
+        // Frame the delta record with a length + SHA-256 digest (crate::log_framing) so a
+        // value-preserving bit-flip (e.g. a flipped `deleted` flag or page address) in this
+        // committed line is detected on read rather than replayed as truth on recovery.
+        // Both buffers are taken off `inner` and put back below, because the framing borrows one
+        // while the other is still being read and `inner` is needed either side.
+        //
+        // A failed append puts them back holding WHATEVER THEY HELD -- a partial encode, or the
+        // previous record's frame -- and that is safe because both writers CLEAR before they
+        // write, so no byte of a failed or an earlier record can reach the next one. What must
+        // not happen is LOSING them, which would leave the next append allocating from nothing.
+        let mut payload = std::mem::take(&mut inner.encode_scratch);
+        let mut bytes = std::mem::take(&mut inner.frame_scratch);
+        // Encode, frame and write inside one closure so that EVERY way out of it -- including the
+        // three I/O failures -- passes through the restore below. A `?` here would drop the two
+        // buffers on the floor and leave `inner` holding empty ones, so the next append would
+        // allocate from nothing: not a correctness bug, but exactly the cost this removes,
+        // reappearing after the first transient write error and never going away.
+        let written = (|payload: &mut Vec<u8>, bytes: &mut Vec<u8>| -> Result<std::fs::File, IndexLogError> {
+            encode_index_payload_into(&record, INDEX_LOG_SHAPE_DELTA, payload)?;
+            crate::log_framing::encode_record_into(payload, bytes);
+            let mut file = OpenOptions::new().create(true).append(true).open(&active)?;
+            file.write_all(bytes)?;
+            file.flush()?;
+            Ok(file)
+        })(&mut payload, &mut bytes);
+        let written_len = bytes.len() as u64;
+        // A buffer that grew to hold one enormous record does not keep that capacity for the life
+        // of the process; past the ceiling it is dropped and the next append starts again.
+        if payload.capacity() > MAX_INDEX_ENCODE_SCRATCH_BYTES {
+            payload = Vec::new();
+        }
+        if bytes.capacity() > MAX_INDEX_ENCODE_SCRATCH_BYTES {
+            bytes = Vec::new();
+        }
+        inner.encode_scratch = payload;
+        inner.frame_scratch = bytes;
+        let mut file = written?;
+        inner.stats.writes += 1;
+        #[cfg(test)]
+        probe::APPENDS_COMPLETED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        inner.stats.bytes_written += written_len;
+        inner.stats.last_sequence = next_sequence;
+        inner.last_sequence_by_shard.insert(shard_id, next_sequence);
+        // The bytes are in the file and the bookkeeping is done, so claim a barrier and then let
+        // the lock go before taking it. Holding the lock across the fsync meant writers could
+        // never reach the barrier together, so each paid for one that would have covered all of
+        // them.
+        let barrier = durable.then(|| {
+            let gate = self.flush_gates.gate((shard_id as u64, 0));
+            let ticket = gate.register_write();
+            (gate, ticket)
+        });
+        drop(inner);
+        if let Some((gate, ticket)) = barrier {
+            gate.await_durable(ticket, || {
+                crate::durability_metrics::record_barrier("engine_index_log_append");
+                file.sync_data()
+            })?;
+        }
+        Ok(next_sequence)
+    }
+
+    /// Read every delta record for a shard in log order. Records at or before
+    /// `retain_after_sequence` (the base snapshot's anchor) are skipped, so replay applies
+    /// only the suffix the base does not already reflect. Legacy whole-index
+    /// (`IndexLogRecord`) lines are ignored here -- they are not delta records.
+    pub fn read_delta_records(
+        &self,
+        shard_id: ShardId,
+        retain_after_sequence: u64,
+    ) -> Result<Vec<IndexDeltaRecord>, IndexLogError> {
+        let mut records = Vec::new();
+        self.for_each_delta_record(shard_id, retain_after_sequence, |record| {
+            records.push(record);
+        })?;
+        Ok(records)
+    }
+
+    /// The same walk, handing each record over instead of collecting them.
+    ///
+    /// The file was already read a frame at a time, so what a caller held was never the FILE --
+    /// it was every record the file DECODES to, which is the larger of the two and lives until
+    /// the caller drops the vector. A caller that folds the records into one answer has no use
+    /// for that, and the folding caller here runs on the load path, which is when a store can
+    /// least afford to hold the log twice over.
+    ///
+    /// `read_delta_records` keeps its shape on top of this, so a caller that genuinely wants all
+    /// of them -- the tests that assert what a log holds -- is unchanged.
+    pub fn for_each_delta_record(
+        &self,
+        shard_id: ShardId,
+        retain_after_sequence: u64,
+        take: impl FnMut(IndexDeltaRecord),
+    ) -> Result<(), IndexLogError> {
+        // Anchor 0 declines nothing, so this opens every piece exactly as it always has. Every
+        // caller but the load-path fold asks about the LOG ITSELF -- what it holds, what its
+        // newest catalog is -- and no base anchor makes any part of that answer redundant.
+        self.for_each_delta_record_above_anchor(shard_id, retain_after_sequence, 0, take)
+    }
+
+    /// The same walk, declining WHOLE PIECES the dumped base already reflects, from their names.
+    ///
+    /// The load-path fold in `fold_index_log_deltas` hands every record it is given to the same
+    /// test: a record whose `applied_wal_sequence` is at or below the base's anchor is already
+    /// in the base, so folding it again would change nothing. That test was applied AFTER the
+    /// frame had been read off the disk, the payload decoded and every stripped repeat put back
+    /// -- so a restore whose base reflects the entire log still paid for the entire log.
+    ///
+    /// A sealed piece's name already carries the one number that test reads: `max_applied_wal`,
+    /// the highest anchor any record in it carries. When that is at or below `base_anchor`,
+    /// EVERY record in the piece fails the same test, so the piece can be passed over unopened.
+    ///
+    /// WHAT THE NAME PINS, AND WHY THAT IS ENOUGH HERE.
+    ///
+    /// - `max_applied_wal` is a max over the records' own anchors, taken at SEAL time by
+    ///   [`index_log_segment_span_of`], after a complete append. A record carrying NO anchor
+    ///   does not take part in that max at all: one carrying something the fold would apply
+    ///   makes the whole name [`INDEX_SEGMENT_UNREFLECTED`], and one carrying nothing leaves
+    ///   the max where it was. The load-path test is [`delta_record_is_reflected_by`], which
+    ///   asks those same two questions of the same record, so the two agree about it. That
+    ///   agreement is what makes the piece-level test equivalent to the per-record one.
+    ///
+    ///   THIS BULLET OUTLIVED WHAT IT DESCRIBED, AND IS KEPT AS THE RECORD OF HOW. It used to
+    ///   read "A record carrying NO anchor contributes 0 to that max -- and the load-path test
+    ///   reads a missing anchor as 0 in exactly the same way (`applied_wal_sequence
+    ///   .unwrap_or(0)`), so the two agree about it." Both halves stopped being true, one at a
+    ///   time. #1842 stopped the SEAL from reading a missing anchor as 0, because a piece of
+    ///   nothing but anchor-less deltas named 0 and the post-dump sweep unlinked it unread. The
+    ///   fold went on reading it as 0 for longer -- so a piece held open by #1842 precisely to
+    ///   save an anchor-less record handed that record to a fold that dropped it one line
+    ///   later, and the sentence above still said the two agreed. The agreement is a property
+    ///   of the predicate both sides now call, not of this paragraph.
+    /// - [`INDEX_SEGMENT_UNREFLECTED`] is excluded EXPLICITLY rather than left to the `<=`. It
+    ///   is `u64::MAX`, so the comparison would already decline to fire for any real anchor --
+    ///   but "already" is a property of the anchors a deployment happens to reach, not of this
+    ///   code, and the one value that means "no base reflects this" must not be reachable by
+    ///   arithmetic on the boundary.
+    /// - Nothing renames, copies or appends to a sealed piece. The only writer of a sealed name
+    ///   is the `fs::rename` in [`roll_index_log_segment_at`], which renames the piece being
+    ///   WRITTEN to a name computed from a fresh walk of it; the two index-GC rewrites both
+    ///   target [`index_log_path`], the active piece, which has no numbers in its name and is
+    ///   never declined here. So a piece's name and its contents are fixed together.
+    /// - The piece being written is never declined: it has no sealed name, so
+    ///   [`sealed_index_log_span`] answers `None` for it and the walk reads it whole. The tail
+    ///   of the log -- the part no dump can have reflected -- is therefore always read.
+    ///
+    /// WHICH WAY A WRONG ANSWER FAILS. Declining a piece that still holds a record the fold
+    /// would have applied is SILENT DATA LOSS: an eviction or removal recorded only in that
+    /// delta is recovered from neither the delta nor the write-ahead log, and the load reports
+    /// success. Reading a piece that could have been declined is merely slow. Only one of those
+    /// two is observable, so the tests attack that one: they assert the RECORDS THE FOLD HANDS
+    /// BACK are identical with the decline and without it, and take the saving as a separate
+    /// half.
+    ///
+    /// WHAT IS GIVEN UP. A declined piece is not checked for sequence continuity, because it is
+    /// not read. The watermark is still carried across it from its name, so a hole ON a piece
+    /// boundary is still refused; a hole INSIDE a declined piece is not. That is a strictly
+    /// smaller concession than the one this project has already made: the post-dump sweep
+    /// UNLINKS a piece on the same predicate ([`drop_reflected_index_segments`]), so a piece
+    /// this fold declines to read is a piece reclaim would delete unread.
+    pub fn for_each_delta_record_above_anchor(
+        &self,
+        shard_id: ShardId,
+        retain_after_sequence: u64,
+        base_anchor: u64,
+        mut take: impl FnMut(IndexDeltaRecord),
+    ) -> Result<(), IndexLogError> {
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        // Every piece of the log, oldest first. A log that has never rolled is one file, and this
+        // is then the single path this fold has always read.
+        //
+        // `last_sequence` is carried ACROSS the pieces, not reset per piece: the continuity check
+        // below is what refuses a holed delta stream, and per-piece it would stop seeing a hole
+        // that falls on a boundary -- which is the only new place a hole can appear.
+        let mut last_sequence = 0_u64;
+        // ONE tally for the whole fold, borrowed by each piece's handle in turn and published
+        // when the fold returns. This is the reader #1936 named and did not fix.
+        let mut tally = IndexLogReadTally::start();
+        for path in index_log_segment_paths(&inner.root, shard_id) {
+            // From the NAME, before the `exists` probe and before the open, so a declined piece
+            // costs neither. `sealed_index_log_span` parses the path string and touches no
+            // filesystem, and the enumeration handed the path over already.
+            if let Some(span) = sealed_index_log_span(&path, shard_id) {
+                if piece_is_reflected_by(span, base_anchor) {
+                    #[cfg(test)]
+                    probe::FOLD_PIECES_DECLINED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Carry the continuity watermark ACROSS the declined piece, from its name.
+                    // Leaving it behind would put the next piece's first record up against a
+                    // watermark from before this one, which is a WEAKER check than the walk has
+                    // today -- it would pass a record that repeats a sequence inside the piece
+                    // just declined. `end` is one past the last sequence the piece held when it
+                    // was sealed. `max` rather than assignment, and no new refusal: a name that
+                    // somehow ran backwards must not turn a load that succeeds today into one
+                    // that fails.
+                    last_sequence = last_sequence.max(span.end.saturating_sub(1));
+                    continue;
+                }
+            }
+            if !path.exists() {
+                continue;
+            }
+            let mut reader = BufReader::new(open_index_log_read(&path, &mut tally)?);
+            // Read by FRAME, not by line. A record's payload may be binary, and a binary payload
+            // may contain 0x0A -- a reader splitting on newlines would cut such a record in half
+            // and, being `lines()`, would also demand it be valid UTF-8. `read_frame` takes the
+            // length the frame declares instead, and reads text-framed and legacy unframed
+            // records unchanged, so one loop reads every shape the log has ever held. Streaming
+            // rather than reading the file whole keeps memory bounded by the largest record.
+            while let Some((_, payload)) = crate::log_framing::read_frame(&mut reader)? {
+                // Before the `continue` below, not after it: a frame this walk passes over is
+                // still a frame this walk read off the disk, and that is what the probe counts.
+                #[cfg(test)]
+                probe::FOLD_FRAMES_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    continue;
+                }
+                let payload = payload.as_slice();
+                // PROPAGATE decode/parse failures instead of silently skipping the line. Silently
+                // dropping an unparseable interior delta record and continuing the fold advances
+                // the reconstructed anchor past it, so an eviction/removal recorded ONLY in that
+                // delta (not the WAL) is recovered from neither source = silent loss / dangling
+                // ref. `decode_line` also verifies the per-record integrity envelope, so a
+                // value-preserving bit-flip surfaces here as `Corruption`.
+                // Skip only a payload that SAYS it is the other shape. Anything else -- an
+                // unrecognised shape, a truncated container -- goes to the decoder and is
+                // reported, because a sweep that quietly skips what it cannot read is how
+                // committed corruption becomes silent data loss.
+                if index_payload_shape(payload) == Some(INDEX_LOG_SHAPE_WHOLE) {
+                    continue;
+                }
+                let mut record: IndexDeltaRecord = decode_index_payload(payload)?;
+                // Put back what the writer left out because the item already stated it. A record
+                // written before that stripping carries both already, and this leaves those
+                // alone. The hoisted key FIRST: everything below derives from the item's own
+                // fields and `object_key` is one of them.
+                if let Some(shared) = record.shared_object_key.as_deref() {
+                    // Converted ONCE for the record, not once per item: every item in a
+                    // hoisted record carries the same key, so they share one allocation.
+                    let shared: std::sync::Arc<str> = std::sync::Arc::from(shared);
+                    for item in record.items.iter_mut() {
+                        item.object_key = shared.clone();
+                    }
+                }
+                for item in record.items.iter_mut() {
+                    // The item's id first: the address is restored FROM it.
+                    item.restore_object_id_repeat(record.shard_id);
+                    item.restore_address_repeats();
+                    item.restore_block_ref_key_repeat();
+                    item.restore_size_repeat();
+                }
+                // Enforce delta sequence-continuity: sequences are assigned strictly
+                // monotonically across ALL appended records (whole-index and delta share one
+                // counter), reclaim only ever removes a leading prefix, and pieces are read in
+                // log order -- so each record's sequence must be strictly greater than the
+                // previous one, boundaries included. A drop below or a duplicate means a lost /
+                // reordered / corrupted record, or pieces read out of order; refuse rather than
+                // fold a holed delta stream.
+                if record.sequence <= last_sequence {
+                    return Err(IndexLogError::Corruption(format!(
+                        "index-log delta sequence continuity violation: record sequence {} is not greater than previous {}",
+                        record.sequence, last_sequence
+                    )));
+                }
+                last_sequence = record.sequence;
+                // A whole-index IndexLogRecord also deserializes into IndexDeltaRecord (its
+                // `index` field is ignored, leaving the delta fields empty). Only keep records
+                // that carry a delta payload OR a WAL anchor (an anchor-only record still
+                // advances the reconstructed watermark on load).
+                if record.items.is_empty()
+                    && record.meta.is_none()
+                    && record.key_states.is_empty()
+                    && record.applied_wal_sequence.is_none()
+                {
+                    continue;
+                }
+                if record.sequence > retain_after_sequence {
+                    take(record);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Raw bytes of the log at `offset`.
+    ///
+    /// `offset` is a position in the LOG, not in whichever piece holds it: the pieces are read
+    /// back to back, so a window that starts in one continues into the next rather than stopping
+    /// at a boundary the caller cannot see.
+    pub fn read_range(
+        &self,
+        shard_id: ShardId,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, IndexLogError> {
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut at = 0_u64;
+        let mut tally = IndexLogReadTally::start();
+        for path in index_log_segment_paths(&inner.root, shard_id) {
+            if bytes.len() as u64 >= size {
+                break;
+            }
+            let length = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            if length == 0 {
+                continue;
+            }
+            // A piece that ends before the window starts holds nothing the caller asked for, and
+            // skipping it costs a stat rather than a read.
+            if at.saturating_add(length) <= offset {
+                at = at.saturating_add(length);
+                continue;
+            }
+            let start_in_piece = offset.saturating_sub(at);
+            let want = size.saturating_sub(bytes.len() as u64);
+            let mut file = open_index_log_read(&path, &mut tally)?;
+            file.seek(SeekFrom::Start(start_in_piece))?;
+            file.take(want).read_to_end(&mut bytes)?;
+            at = at.saturating_add(length);
+        }
+        inner.stats.reads += 1;
+        inner.stats.bytes_read += bytes.len() as u64;
+        Ok(bytes)
+    }
+
+    /// The records in the window. Says nothing about whether the window was exhausted, which
+    /// is why anything reporting completeness to a caller wants `scan_bounded` instead.
+    pub fn scan(
+        &self,
+        shard_id: ShardId,
+        start_offset: u64,
+        end_offset: u64,
+        max_bytes: u64,
+    ) -> Result<Vec<(u64, Vec<u8>)>, IndexLogError> {
+        self.scan_bounded(shard_id, start_offset, end_offset, max_bytes)
+            .map(|(records, _)| records)
+    }
+
+    /// The records in the window, and whether `max_bytes` cut the scan short.
+    ///
+    /// The walk below stops for two unrelated reasons: the window ended, or the byte budget ran
+    /// out. Returning only the records conflates them, and a caller that cannot tell them apart
+    /// reports a truncated read as a complete one.
+    pub fn scan_bounded(
+        &self,
+        shard_id: ShardId,
+        start_offset: u64,
+        end_offset: u64,
+        max_bytes: u64,
+    ) -> Result<(Vec<(u64, Vec<u8>)>, bool), IndexLogError> {
+        self.scan_collect(shard_id, start_offset, end_offset, max_bytes, |offset, raw| {
+            (offset, raw)
+        })
+    }
+
+    /// How many records the log holds, without building them.
+    ///
+    /// The caller that wanted this asked `scan(.., u64::MAX, u64::MAX)` and took `.len()` of the
+    /// result, so it read the whole log into a vector to learn how many records were in it --
+    /// on the plan path of every maintenance round.
+    ///
+    /// The same walk, projecting to `()`. A zero-sized element costs nothing per record, so peak
+    /// memory is one record rather than all of them, and the count cannot drift from what a scan
+    /// would have returned because it IS the scan. The write-ahead log store has the twin of
+    /// this, for the same caller.
+    pub fn record_count(&self, shard_id: ShardId) -> Result<usize, IndexLogError> {
+        self.scan_collect(shard_id, 0, u64::MAX, u64::MAX, |_offset, _raw| ())
+            .map(|(records, _truncated)| records.len())
+    }
+
+    /// The one walk every scan of this log shares, so they cannot drift about what a window
+    /// contains. Mirrors `scan_collect` on the write-ahead log store.
+    fn scan_collect<T>(
+        &self,
+        shard_id: ShardId,
+        start_offset: u64,
+        end_offset: u64,
+        max_bytes: u64,
+        mut take: impl FnMut(u64, Vec<u8>) -> T,
+    ) -> Result<(Vec<T>, bool), IndexLogError> {
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        let segments = index_log_segment_paths(&inner.root, shard_id)
+            .into_iter()
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        if segments.is_empty() {
+            inner.stats.scans += 1;
+            return Ok((Vec::new(), false));
+        }
+        let _ = last_sequence_at(&inner.root, shard_id)?;
+        // A record's position is where it sits in the LOG, counted across the pieces in order --
+        // not an offset into whichever file holds it, which would mean nothing to a caller once
+        // there is more than one.
+        let mut offset = 0_u64;
+        let mut total = 0;
+        let mut truncated = false;
+        let mut records = Vec::new();
+        let mut tally = IndexLogReadTally::start();
+
+        'segments: for path in segments {
+            let length = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            if offset.saturating_add(length) <= start_offset {
+                offset = offset.saturating_add(length);
+                continue;
+            }
+            let mut file = open_index_log_read(&path, &mut tally)?;
+            let skip = start_offset.saturating_sub(offset);
+            file.seek(SeekFrom::Start(skip))?;
+            offset = offset.saturating_add(skip);
+            let mut reader = BufReader::new(file);
+
+            // Walk by RECORD, not by newline. What this returns is each record's raw framed
+            // bytes -- the caller ships them onward untouched -- so the walk has to agree with
+            // the writer about where a record ends. A newline scan decides that from a delimiter
+            // a binary payload may itself contain, and would hand the caller half a record that
+            // still looks like a whole one. The write-ahead log walks its own records with this
+            // same reader, for this same reason.
+            while let Some(raw) = crate::log_framing::read_raw_record(&mut reader)? {
+                let read = raw.len() as u64;
+                let next_offset = offset.saturating_add(read);
+                if next_offset > end_offset {
+                    break 'segments;
+                }
+                if total + read > max_bytes {
+                    // Out of budget with the window not yet walked: there is more to read.
+                    truncated = true;
+                    break 'segments;
+                }
+                records.push(take(offset, raw));
+                offset = next_offset;
+                total += read;
+            }
+        }
+        inner.stats.scans += 1;
+        inner.stats.bytes_read += total;
+        inner.stats.records_read += records.len() as u64;
+        Ok((records, truncated))
+    }
+
+    /// Answer the index-GC gate from the piece NAMES plus the piece being written.
+    ///
+    /// The gate wants three numbers -- the log's size, how many records it holds, and how many of
+    /// them sit below a retain floor -- and used to get the last two by scanning the whole log and
+    /// decoding every record. That is the cost `drop_covered_index_segments` stopped paying: a
+    /// sealed piece's name already carries `start`, `end` and its highest WAL anchor, so
+    ///
+    /// - the piece holds `end - start` records, because sequences are assigned `last + 1` with no
+    ///   holes -- the same arithmetic a round already reports its removals with, so the gate and the
+    ///   collector cannot disagree about a piece;
+    /// - the records in it below a floor are `min(end, floor) - start`, saturating, for exactly the
+    ///   same reason: contiguity makes a count out of a subtraction, and a floor at or under
+    ///   `start` leaves none.
+    ///
+    /// Only the piece being WRITTEN has no numbers in its name, so only that one is opened. It is
+    /// at most the rolling threshold (64 KiB shipped), whatever the log has grown to, which is
+    /// what makes this cost the number of PIECES rather than the number of records.
+    ///
+    /// THE ONE SHAPE THIS DOES NOT BOUND, said plainly rather than left to be discovered: a log
+    /// that has never rolled is ONE piece and that piece is the whole log, so this decodes all of
+    /// it -- exactly what the old gate did, no better and no worse. `TS_INDEX_LOG_SEGMENT_BYTES=0`
+    /// and any store written before pieces are that shape. The bound is on the ROLLED log, and a
+    /// guard asserting it has to say how many pieces its fixture actually had.
+    ///
+    /// Infallible on purpose. This is a GC-pressure metric, not the recovery path: a corrupt frame
+    /// in the piece being written stops the walk and leaves the sealed pieces counted, where
+    /// returning an error would have the caller read the whole log as EMPTY -- which reads as a
+    /// log with nothing to collect rather than as a log that could not be measured. Replay is
+    /// where a corrupt record is surfaced, and it still surfaces it.
+    pub fn gate_summary(
+        &self,
+        shard_id: ShardId,
+        retain_from_sequence: u64,
+    ) -> IndexLogGateSummary {
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        let root = inner.root.clone();
+        let active = index_log_path(&root, shard_id);
+        let mut summary = IndexLogGateSummary {
+            shard_id,
+            retain_from_sequence,
+            ..IndexLogGateSummary::default()
+        };
+        let mut tally = IndexLogReadTally::start();
+        for path in index_log_segment_paths(&root, shard_id) {
+            // A `stat`, and for a sealed piece that is the whole of it. A piece that has just been
+            // unlinked out from under this walk is simply not counted, the same way
+            // `index_log_total_bytes` does not count it.
+            let Ok(metadata) = path.metadata() else {
+                continue;
+            };
+            summary.pieces += 1;
+            summary.bytes = summary.bytes.saturating_add(metadata.len());
+            if path != active {
+                let Some(span) = sealed_index_log_span(&path, shard_id) else {
+                    continue;
+                };
+                summary.pieces_named += 1;
+                let held = span.end.saturating_sub(span.start);
+                let removable = span.end.min(retain_from_sequence).saturating_sub(span.start);
+                summary.records = summary.records.saturating_add(held as usize);
+                summary.removable_records = summary
+                    .removable_records
+                    .saturating_add(removable as usize);
+                continue;
+            }
+            let Ok(file) = open_index_log_read(&path, &mut tally) else {
+                continue;
+            };
+            let mut reader = BufReader::new(file);
+            // By FRAME, not by newline, for the reason every other walk of this log gives: a
+            // binary payload may contain the delimiter a newline scan would stop at.
+            while let Ok(Some((frame_bytes, payload))) = crate::log_framing::read_frame(&mut reader)
+            {
+                summary.bytes_decoded = summary.bytes_decoded.saturating_add(frame_bytes as u64);
+                if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    continue;
+                }
+                summary.records_decoded += 1;
+                summary.records += 1;
+                // Through the index log's own decoder, and only the HEAD of the record: two shapes
+                // share this log and both carry a sequence. A record that will not decode is
+                // COUNTED but not called removable, which is what the scan this replaces did -- it
+                // makes the ratio smaller, so it can only ever decline a round, never fire one.
+                if let Ok(head) = decode_index_payload::<IndexRecordHead>(&payload) {
+                    if head.sequence < retain_from_sequence {
+                        summary.removable_records += 1;
+                    }
+                }
+            }
+        }
+        inner.stats.scans += 1;
+        inner.stats.bytes_read += summary.bytes_decoded;
+        inner.stats.records_read += summary.records_decoded as u64;
+        summary
+    }
+
+    /// How many files this shard's log is in, the one being written included.
+    pub fn piece_count(&self, shard_id: ShardId) -> usize {
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        index_log_segment_paths(&inner.root, shard_id)
+            .into_iter()
+            .filter(|path| path.exists())
+            .count()
+    }
+
+    pub fn gc_before_sequence(
+        &self,
+        shard_id: ShardId,
+        retain_from_sequence: u64,
+    ) -> Result<IndexLogGcReport, IndexLogError> {
+        self.gc_before_sequence_limited(shard_id, retain_from_sequence, 0)
+    }
+
+    pub fn gc_before_sequence_limited(
+        &self,
+        shard_id: ShardId,
+        retain_from_sequence: u64,
+        // The bound applies to the REWRITE of the piece being written, which is the only part of
+        // a round that copies anything. Whole earlier pieces are unlinked, and that is not work a
+        // round needs protecting from: a stat and an unlink each, whatever they hold.
+        //
+        // It used to bound the whole round, and bounding the whole round cost MORE: the round
+        // rewrote what it retained, so removing fewer records meant copying more of them --
+        // 40,000 records were 357 ms in one unlimited round against 492 ms limited to 200. That
+        // inversion is what the pieces remove; see
+        // `reclaim_costs_what_it_removes_not_what_it_keeps`.
+        max_entries_per_round: usize,
+    ) -> Result<IndexLogGcReport, IndexLogError> {
+        #[cfg(test)]
+        probe::SWEEP_ENTRIES_BUDGETED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Taken here and held to the end of the function -- past the walk, past the rewrite,
+        // past the barrier and the rename. It is the same lock `append_json` takes, so for as
+        // long as a sweep runs the shard's index log accepts no record. What bounds that hold is
+        // therefore what bounds the sweep, and `max_entries_per_round` is not it: see the note
+        // on the parameter above.
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        // AFTER the guard, so it drops BEFORE it: the release reading is taken while the lock is
+        // still held. `a_sweep_holds_the_lock_every_append_needs` reads the two.
+        #[cfg(test)]
+        let _lock_span = probe::SweepLockSpan::new();
+        fs::create_dir_all(&inner.root)?;
+        let root = inner.root.clone();
+        let path = index_log_path(&root, shard_id);
+        if !index_log_segment_paths(&root, shard_id)
+            .iter()
+            .any(|piece| piece.exists())
+        {
+            return Ok(IndexLogGcReport {
+                shard_id,
+                retain_from_sequence,
+                max_entries_per_round,
+                ..IndexLogGcReport::default()
+            });
+        }
+
+        let bytes_before = index_log_total_bytes(&root, shard_id);
+        // Whole earlier pieces first. A piece whose sequences all sit below the floor is unlinked
+        // without being opened, so what it HELD costs nothing -- which is the point: this round
+        // used to pay for every record it kept.
+        let (dropped_segments, dropped_segment_bytes, dropped_records) =
+            drop_covered_index_segments(&root, shard_id, retain_from_sequence)?;
+
+        let _ = last_sequence_at(&root, shard_id)?;
+        let mut records_before = 0usize;
+        let mut removed_this_round = 0usize;
+        let mut removable_records_before_budget = 0usize;
+        let mut retained = Vec::new();
+        let mut reclaimable_bytes = 0u64;
+        if path.exists() {
+            let mut tally = IndexLogReadTally::start();
+            // By frame, not by line: see the fold path above.
+            let mut reader = BufReader::new(open_index_log_read(&path, &mut tally)?);
+            while let Some((frame_bytes, payload)) = crate::log_framing::read_frame(&mut reader)? {
+                if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    continue;
+                }
+                records_before += 1;
+                #[cfg(test)]
+                probe::SWEEP_FRAMES_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Preserve the exact on-disk payload for retained records so a delta record is
+                // not silently re-encoded as a whole-index record (which would drop its
+                // items/meta). Decode verifies the integrity envelope; the retained raw payload
+                // is re-framed on write-out below.
+                let record: IndexRecordHead = decode_index_payload(&payload)?;
+                if record.sequence < retain_from_sequence {
+                    removable_records_before_budget =
+                        removable_records_before_budget.saturating_add(1);
+                }
+                if record.sequence >= retain_from_sequence
+                    || (max_entries_per_round > 0 && removed_this_round >= max_entries_per_round)
+                {
+                    retained.push(payload);
+                } else {
+                    removed_this_round = removed_this_round.saturating_add(1);
+                    reclaimable_bytes = reclaimable_bytes.saturating_add(frame_bytes as u64);
+                    #[cfg(test)]
+                    probe::note_sweep_removed(shard_id, record.sequence);
+                }
+            }
+        }
+
+        // Nothing in the piece being written is reclaimable, which is the ordinary case once the
+        // log rolls: the removable prefix lives in the pieces that were just unlinked. Rewriting
+        // the piece would write it back byte for byte and take a barrier to do it.
+        let mut bytes_copied = 0u64;
+        let rewrite_skipped = removed_this_round == 0;
+        if !rewrite_skipped {
+            let temp_path = path.with_extension("gc.tmp");
+            {
+                // A WRITE, not a read: spelled in full because `File` is no longer in this
+                // module's namespace, which is what stops a read being written uncounted.
+                let mut temp = std::fs::File::create(&temp_path)?;
+                for payload in &retained {
+                    let framed = crate::log_framing::encode_record(payload);
+                    bytes_copied = bytes_copied.saturating_add(framed.len() as u64);
+                    #[cfg(test)]
+                    probe::SWEEP_FRAMES_COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    temp.write_all(&framed)?;
+                }
+                temp.flush()?;
+                crate::durability_metrics::record_barrier("engine_index_log_gc");
+                temp.sync_all()?;
+            }
+            fs::rename(&temp_path, &path)?;
+            sync_parent_dir(&path)?;
+        }
+        let bytes_after = index_log_total_bytes(&root, shard_id);
+        let removed_from_active = records_before.saturating_sub(retained.len());
+        Ok(IndexLogGcReport {
+            shard_id,
+            retain_from_sequence,
+            max_entries_per_round,
+            records_before: dropped_records.saturating_add(records_before),
+            records_after: retained.len(),
+            records_removed: dropped_records.saturating_add(removed_from_active),
+            removable_records_before_budget: dropped_records
+                .saturating_add(removable_records_before_budget),
+            budget_exhausted: max_entries_per_round > 0
+                && removable_records_before_budget > max_entries_per_round,
+            bytes_before,
+            bytes_after,
+            reclaimable_bytes: dropped_segment_bytes.saturating_add(reclaimable_bytes),
+            rewrite_skipped,
+            bytes_copied,
+            dropped_segments,
+            dropped_segment_bytes,
+        })
+    }
+
+    /// Remove every record a completed catalog dump has made redundant, deciding retention per
+    /// record on CONTENT rather than on log position alone.
+    ///
+    /// A dump durably materializes the base served index at WAL anchor `wal_anchor` and then
+    /// appends its folded catalog anchor, which lands at index-log sequence `meta_sequence`.
+    /// Everything the base reflects -- records whose own WAL anchor is at or below `wal_anchor`
+    /// -- is redundant on load (the fold skips them), so it goes. Two kinds of record sit below
+    /// `meta_sequence` yet must SURVIVE:
+    ///
+    /// - a delta a concurrent writer appended between the dump's serialization and its anchor
+    ///   append: its WAL anchor is above `wal_anchor`, so the base does not reflect it, and
+    ///   removing it would lose an eviction/removal that lives only in the delta stream;
+    /// - a record carrying NO anchor that still holds items, a meta item or key-states. The
+    ///   fold applies those whatever the anchor says, so nothing shows the base reflects them.
+    ///   A legacy whole-index line also carries no anchor, but holds nothing the fold applies
+    ///   and is read by no load path, so it IS treated as reflected and removed. Reading a
+    ///   missing anchor as 0 made the two indistinguishable, and 0 is at or below every
+    ///   anchor -- so every anchor-less record was removed, the content-bearing ones included.
+    ///
+    /// The folded catalog anchor itself is at `meta_sequence`, above the removal window, so the
+    /// load-time catalog seed always survives. Position (`sequence < meta_sequence`) still
+    /// bounds the sweep so a record appended AFTER the dump with a stale-looking anchor is never
+    /// touched.
+    /// `min_reclaimable_bytes` is the least the sweep must be able to reclaim before it will
+    /// rewrite the log. Below it -- and always when nothing at all is reclaimable -- the log is
+    /// left exactly as it is and the report says so.
+    ///
+    /// NO PER-ROUND ENTRY BUDGET, DELIBERATELY, and it is the sweep a background thread drives
+    /// once a second while its budgeted sibling runs when an operator asks. Both halves of that
+    /// are measured; [`POST_DUMP_SWEEP_ENTRY_BUDGET`] is the long form, and the short one is that
+    /// a budget would bound neither the walk nor the lock this holds, and would make the rewrite
+    /// copy more. What bounds this round is the rolling threshold: pieces below the floor are
+    /// unlinked by name and never opened, so only the piece being written is walked.
+    pub fn gc_reflected_before_anchor(
+        &self,
+        shard_id: ShardId,
+        wal_anchor: u64,
+        meta_sequence: u64,
+        min_reclaimable_bytes: u64,
+    ) -> Result<IndexLogGcReport, IndexLogError> {
+        #[cfg(test)]
+        probe::SWEEP_ENTRIES_POST_DUMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Held to the end of the function, exactly as the budgeted sweep holds it, and for the
+        // same reason: this is the lock `append_json` takes.
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        #[cfg(test)]
+        let _lock_span = probe::SweepLockSpan::new();
+        fs::create_dir_all(&inner.root)?;
+        let root = inner.root.clone();
+        let path = index_log_path(&root, shard_id);
+        if !index_log_segment_paths(&root, shard_id)
+            .iter()
+            .any(|piece| piece.exists())
+        {
+            return Ok(IndexLogGcReport {
+                shard_id,
+                retain_from_sequence: meta_sequence,
+                ..IndexLogGcReport::default()
+            });
+        }
+
+        let bytes_before = index_log_total_bytes(&root, shard_id);
+        // Whole earlier pieces first, and unconditionally: the threshold below exists to decline
+        // a REWRITE that copies almost everything to reclaim almost nothing, and an unlink copies
+        // nothing at all. A piece only goes when its name says every record in it is both below
+        // the position bound and reflected by the base the dump wrote.
+        let (dropped_segments, dropped_segment_bytes, dropped_records) =
+            drop_reflected_index_segments(&root, shard_id, wal_anchor, meta_sequence)?;
+
+        let _ = last_sequence_at(&root, shard_id)?;
+        let mut records_before = 0usize;
+        let mut retained = Vec::new();
+        // `read_frame` hands back how many bytes the record OCCUPIED, which this loop used to
+        // discard. It is the exact on-disk size of what a rewrite would drop, so the threshold
+        // below is measured in the same bytes the file is measured in rather than in payloads.
+        let mut reclaimable_bytes = 0u64;
+        if path.exists() {
+            let mut tally = IndexLogReadTally::start();
+            // By frame, not by line: see the fold path above.
+            let mut reader = BufReader::new(open_index_log_read(&path, &mut tally)?);
+            while let Some((frame_bytes, payload)) = crate::log_framing::read_frame(&mut reader)? {
+                if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    continue;
+                }
+                records_before += 1;
+                #[cfg(test)]
+                probe::SWEEP_FRAMES_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Decode verifies the integrity envelope; the retained raw payload is re-framed
+                // on write-out below, so a retained delta record keeps its exact on-disk bytes.
+                let probe: IndexRecordHead = decode_index_payload(&payload)?;
+                // THREE clauses, not two: below the position bound, AND the base PROVABLY
+                // reflects it. `unwrap_or(0)` was not a proof -- it read a missing anchor as
+                // anchor 0, which is at or below every anchor, so every anchor-less record was
+                // classified reflected and removed. That is right for the legacy whole-index
+                // lines named above and wrong for a DELTA that carries no anchor:
+                // `for_each_delta_record` still folds its items and key-states, so removing it
+                // loses exactly the eviction the fold would have applied. The expiry sweep
+                // writes such a record whenever it reaches its checkpoint while
+                // `shard.applied_wal_sequence` is still `None` -- no items, and every tombstone
+                // of the round in its key-states.
+                //
+                // The missing clause is the FOLD'S OWN predicate, asked of the same record, so
+                // the sweep and the walk cannot drift about which records matter. It costs a
+                // second decode only for an anchor-less record, which is the rare one.
+                let reflected = match probe.applied_wal_sequence {
+                    Some(anchor) => anchor <= wal_anchor,
+                    None => !delta_record_carries_content(&payload)?,
+                };
+                if probe.sequence >= meta_sequence || !reflected {
+                    retained.push(payload);
+                } else {
+                    reclaimable_bytes = reclaimable_bytes.saturating_add(frame_bytes as u64);
+                    #[cfg(test)]
+                    crate::index_log::probe::note_sweep_removed(shard_id, probe.sequence);
+                }
+            }
+        }
+
+        // Rewriting while retaining every record writes the file back byte for byte, so the
+        // barrier and the rename buy nothing at all -- that half is arithmetic, not policy. The
+        // threshold is the policy: a rewrite that reclaims a handful of bytes still costs a full
+        // read, a full write and an fsync, and the post-dump sweep runs on every dump.
+        let removable = records_before.saturating_sub(retained.len());
+        if removable == 0 || reclaimable_bytes < min_reclaimable_bytes {
+            let bytes_after = index_log_total_bytes(&root, shard_id);
+            return Ok(IndexLogGcReport {
+                shard_id,
+                retain_from_sequence: meta_sequence,
+                records_before: dropped_records.saturating_add(records_before),
+                records_after: records_before,
+                records_removed: dropped_records,
+                removable_records_before_budget: dropped_records.saturating_add(removable),
+                bytes_before,
+                bytes_after,
+                reclaimable_bytes: dropped_segment_bytes.saturating_add(reclaimable_bytes),
+                rewrite_skipped: true,
+                bytes_copied: 0,
+                dropped_segments,
+                dropped_segment_bytes,
+                ..IndexLogGcReport::default()
+            });
+        }
+
+        let temp_path = path.with_extension("gc.tmp");
+        let mut bytes_copied = 0u64;
+        {
+            // A WRITE, not a read. See the note on the other rewrite.
+            let mut temp = std::fs::File::create(&temp_path)?;
+            for payload in &retained {
+                let framed = crate::log_framing::encode_record(payload);
+                bytes_copied = bytes_copied.saturating_add(framed.len() as u64);
+                #[cfg(test)]
+                crate::index_log::probe::SWEEP_FRAMES_COPIED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                temp.write_all(&framed)?;
+            }
+            temp.flush()?;
+            crate::durability_metrics::record_barrier("engine_index_log_gc");
+            temp.sync_all()?;
+        }
+        fs::rename(&temp_path, &path)?;
+        sync_parent_dir(&path)?;
+        let bytes_after = index_log_total_bytes(&root, shard_id);
+        Ok(IndexLogGcReport {
+            shard_id,
+            retain_from_sequence: meta_sequence,
+            // NOT a bare zero. See the constant: an entry budget bounds neither this round's read
+            // nor its lock hold, and setting one here would only make the rewrite copy more.
+            max_entries_per_round: POST_DUMP_SWEEP_ENTRY_BUDGET,
+            records_before: dropped_records.saturating_add(records_before),
+            records_after: retained.len(),
+            records_removed: dropped_records.saturating_add(removable),
+            removable_records_before_budget: dropped_records.saturating_add(removable),
+            budget_exhausted: false,
+            bytes_before,
+            bytes_after,
+            reclaimable_bytes: dropped_segment_bytes.saturating_add(reclaimable_bytes),
+            rewrite_skipped: false,
+            bytes_copied,
+            dropped_segments,
+            dropped_segment_bytes,
+        })
+    }
+
+    pub fn stats(&self, shard_id: ShardId) -> IndexLogStats {
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        IndexLogStats {
+            last_sequence: last_sequence_at(&inner.root, shard_id).unwrap_or_default(),
+            ..inner.stats
+        }
+    }
+}
+
+impl Default for LocalIndexLogStore {
+    fn default() -> Self {
+        let scratch = crate::scratch::owned_scratch_dir("index-logs");
+        let store = Self::new(scratch.path());
+        store
+            .inner
+            .lock()
+            .expect("index log lock poisoned")
+            .scratch = Some(scratch);
+        store
+    }
+}
+
+/// The suffix an index log is written with.
+///
+/// Its records are binary -- the same framing the write-ahead log uses, a frame magic then a
+/// payload -- and have been since the log stopped encoding JSON. A store written before this
+/// carries the older name, which claimed a format it no longer held.
+const INDEX_LOG_SUFFIX: &str = "bin";
+
+/// What the same file used to be called. Still read, never written.
+///
+/// Dropping it rather than keeping it would find no index log where one exists, which reads as an
+/// empty log rather than an error -- and an empty index log is a silently emptier shard.
+const LEGACY_INDEX_LOG_SUFFIX: &str = "jsonl";
+
+fn index_log_path(root: &Path, shard_id: ShardId) -> PathBuf {
+    // Counted here as well as in `active_index_log`, and BEFORE the branches, so the probe is
+    // "how many times was the active piece resolved, by any route" rather than "by the new
+    // route". A change that put the append back on this function would otherwise read as free.
+    #[cfg(test)]
+    probe::APPEND_PATH_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let renamed = root.join(format!("shard-{shard_id}.indexlog.{INDEX_LOG_SUFFIX}"));
+    if renamed.exists() {
+        return renamed;
+    }
+    // An existing store keeps the name it already has, so one shard's log is never split across
+    // two names. A store with neither is new, and starts under the current one.
+    let legacy = root.join(format!("shard-{shard_id}.indexlog.{LEGACY_INDEX_LOG_SUFFIX}"));
+    if legacy.exists() {
+        return legacy;
+    }
+    renamed
+}
+
+/// The file the shard's log is being written to, AND how many bytes are in it, in ONE probe.
+///
+/// [`index_log_path`] answers the first question with `exists()`, and the roll then asked
+/// `metadata()` for the second -- of the same path, a syscall later. `Path::exists()` IS
+/// `metadata().is_ok()`, so the existence answer was already inside the length answer and the
+/// append was buying it twice. This asks once and returns both.
+///
+/// The three-way answer is [`index_log_path`]'s, unchanged: the current name when it is there,
+/// the legacy name when only that is, and the current name when neither is -- so one shard's
+/// log is still never split across two names.
+///
+/// A length of 0 means an empty file OR no file, and both are "nothing to seal", which is the
+/// only thing the caller asks the length for.
+fn active_index_log(root: &Path, shard_id: ShardId) -> (PathBuf, u64) {
+    #[cfg(test)]
+    probe::APPEND_PATH_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let renamed = root.join(format!("shard-{shard_id}.indexlog.{INDEX_LOG_SUFFIX}"));
+    if let Ok(metadata) = fs::metadata(&renamed) {
+        return (renamed, metadata.len());
+    }
+    let legacy = root.join(format!("shard-{shard_id}.indexlog.{LEGACY_INDEX_LOG_SUFFIX}"));
+    if let Ok(metadata) = fs::metadata(&legacy) {
+        return (legacy, metadata.len());
+    }
+    (renamed, 0)
+}
+
+fn last_sequence_at(root: &Path, shard_id: ShardId) -> Result<u64, IndexLogError> {
+    // A sealed piece SAYS what its last sequence is, in its name. It was sealed after a complete
+    // append, so the number is authoritative -- and reading the piece back to learn it would make
+    // every sequence probe cost the log's whole history again, which is the cost the pieces exist
+    // to remove.
+    let mut last = 0_u64;
+    for piece in index_log_segment_paths(root, shard_id) {
+        if let Some(span) = sealed_index_log_span(&piece, shard_id) {
+            last = last.max(span.end.saturating_sub(1));
+        }
+    }
+    let path = index_log_path(root, shard_id);
+    if !path.exists() {
+        return Ok(last);
+    }
+    // Only the piece being written can have a torn tail: a sealed piece was made durable and
+    // renamed after a whole record landed, and nothing appends to it afterwards. So this trims
+    // the active piece, exactly as it trimmed the single file before there were pieces.
+    let mut tally = IndexLogReadTally::start();
+    let mut reader = BufReader::new(open_index_log_repair(&path, &mut tally)?);
+    let mut good_offset = 0_u64;
+    loop {
+        // By FRAME, not by newline. This function truncates: it trims the file back to the
+        // last whole record. A newline scan decides where records end by looking for a
+        // delimiter, which a binary payload may legitimately contain -- so it would find an
+        // end that is not one, call the remainder torn, and set_len durable records away.
+        // `read_frame` takes the length the record declares, and still reads text-framed and
+        // legacy unframed records, so what counts as "whole" no longer depends on the payload
+        // encoding. Mirrors wal.rs::last_wal_sequence_at.
+        match crate::log_framing::read_frame(&mut reader) {
+            // A complete record. Whitespace-only filler advances the good offset without
+            // being parsed, exactly as the newline scan did.
+            Ok(Some((consumed, payload))) => {
+                good_offset = good_offset.saturating_add(consumed as u64);
+                if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    continue;
+                }
+                // A COMPLETE record that fails to parse is committed corruption, not a torn
+                // tail. Treating it as end-of-log would set_len the file down to the last
+                // parseable record -- silently dropping durable index-log records after the
+                // corrupt one AND rewinding the sequence counter (the next append reuses a
+                // sequence that durable dump manifests already cite). Surface it as an error;
+                // index-log replay returns DataLoss on a hole or digest mismatch, never trims.
+                let record = decode_index_payload::<IndexRecordHead>(&payload)?;
+                last = last.max(record.sequence);
+            }
+            // Nothing further, or fewer bytes than the record declares: a crash mid-append.
+            // That tail is what `good_offset` trims below.
+            Ok(None) => break,
+            // A whole record whose digest does not match its payload: committed damage.
+            Err(err) => return Err(IndexLogError::Corruption(err.0)),
+        }
+    }
+    // Back out of the reader to truncate through the same handle: the bytes it read are
+    // already charged, and taking a second descriptor to do this is what made the write-ahead
+    // log's tail repair count one open where two happened.
+    let file = reader.into_inner();
+    if good_offset < file.metadata()?.len() {
+        file.set_len(good_offset)?;
+        crate::durability_metrics::record_barrier("engine_index_log_seq_probe");
+        file.sync_all()?;
+        sync_parent_dir(&path)?;
+    }
+    Ok(last)
+}
+
+/// TS_INDEX_LOG_SEGMENT_BYTES: roll the index log into a new piece once the one being written
+/// passes this many bytes.
+///
+/// Zero never rolls, which is one file -- the shape every store written before this has, and the
+/// shape this code still reads.
+///
+/// Rolling is what makes reclaim cost what it REMOVES. One file per shard has to be reclaimed by
+/// reading it and rewriting every record it keeps, so a round that removes little copies almost
+/// everything: 40,000 records took 357 ms in one unlimited round against 492 ms limited to 200 --
+/// bounding the round made it DEARER, because the bound is on what it removes and the cost is on
+/// what it retains. In pieces the removal is an unlink: a stat and a `remove_file`, whatever the
+/// piece holds, and nothing is read or copied.
+///
+/// **Default 64 KiB**, chosen against the gate that lets this log grow rather than by feel. Index
+/// GC fires at `DEFAULT_INDEX_GC_INDEX_LOG_BYTES_THRESHOLD`, 768 KiB, and only when at least 40%
+/// of the records are removable -- so the log a round actually meets is about 768 KiB with a
+/// removable prefix of about 300 KiB. A round can only unlink pieces that lie WHOLLY inside that
+/// prefix, so the piece size is the granularity of reclaim:
+///
+/// | piece | pieces in 768 KiB | unlinked from a 40% prefix |
+/// |---|---|---|
+/// | 256 KiB (the write-ahead log's) | 3 | 1 -- a third of the log |
+/// | 64 KiB | 12 | 4 -- 87% of what is removable |
+/// | 8 KiB | 96 | 38 -- 99%, and 96 names per shard |
+///
+/// 64 KiB is where the granularity stops being the limit and the file count has not yet started
+/// to be one. The write-ahead log's 256 KiB is larger because it is pinned to its preallocation
+/// chunk, which this log does not have.
+fn index_log_segment_bytes() -> u64 {
+    if let Some(threshold) = INDEX_SEGMENT_BYTES_OVERRIDE.with(|value| value.get()) {
+        return threshold;
+    }
+    std::env::var("TS_INDEX_LOG_SEGMENT_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_INDEX_LOG_SEGMENT_BYTES)
+}
+
+/// Rolling threshold when nothing sets one. See [`index_log_segment_bytes`].
+pub const DEFAULT_INDEX_LOG_SEGMENT_BYTES: u64 = 64 * 1024;
+
+/// The per-round entry budget the post-dump sweep applies: NONE, deliberately.
+///
+/// [`LocalIndexLogStore::gc_reflected_before_anchor`] takes no `max_entries_per_round` parameter
+/// and has no budget test in its record loop. This is the value its report carries, so a reader
+/// of an `IndexLogGcReport` off that path sees the absence stated rather than inferred -- and so
+/// a third sweep cannot pick up a bare literal without meeting the reason for it.
+///
+/// WHAT `0` MEANS, READ FROM THE CONSUMER. The only code that consumes this quantity is
+/// [`LocalIndexLogStore::gc_before_sequence_limited`], which guards it as
+/// `max_entries_per_round > 0 && removed_this_round >= max_entries_per_round`, and the
+/// `budget_exhausted` term, guarded the same way. `0` is therefore "no budget" and not "use the
+/// default" -- `the_default_entry_budget_belongs_to_the_path_that_runs_when_asked` drives the
+/// consumer at this value and asserts it removes everything it can.
+///
+/// WHY THIS PATH HAS NONE, AND WHY MATCHING THE OTHER PATH'S 256 WOULD BE A PESSIMISATION.
+/// An entry budget is not a bound on the work of either sweep. When the budget is reached the
+/// record is pushed onto `retained` and the loop CONTINUES, so the budget:
+///
+/// - does not bound what the round READS -- both loops read the piece being written to its end;
+/// - does not bound how long the round holds `inner`, which is the lock `append_json` takes;
+/// - bounds what the round REMOVES, and so makes the rewrite copy MORE, not less.
+///
+/// Measured in counts in `index_log_sweep_bound::an_entry_budget_copies_more_and_reads_exactly_as_much`:
+/// the same log, budgeted at 256, reads the identical number of frames, removes fewer records
+/// and copies strictly more bytes than the same round with no budget at all. The note on
+/// `gc_before_sequence_limited`'s parameter records the same inversion in milliseconds at 40,000
+/// records, from the shape that preceded piece unlinking.
+///
+/// WHAT DOES BOUND THIS SWEEP is [`DEFAULT_INDEX_LOG_SEGMENT_BYTES`]. Sealed pieces below the
+/// floor are unlinked by NAME without being opened, so the walk and the rewrite see only the
+/// piece being written -- at most the rolling threshold, whatever the store holds. That is a

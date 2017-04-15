@@ -88,33 +88,3 @@ pub(super) fn unload_shard_with_inner(
 ) -> UnloadShardResponse {
     let load_version = inner
         .engine
-        .get_info(request.shard_id)
-        .info
-        .map(|info| info.load_version)
-        .unwrap_or_default();
-    if reject_when_busy && shard_has_queued_or_running_work(inner, request.shard_id) {
-        let status = Status::error(
-            "shard_busy",
-            format!(
-                "cannot unload shard {} while data node work is queued or running",
-                request.shard_id
-            ),
-        );
-        record_lifecycle_state_inner(
-            inner,
-            request.shard_id,
-            "failed",
-            "unload",
-            load_version,
-            Some(status.clone()),
-        );
-        return UnloadShardResponse { status };
-    }
-    if let Err(status) =
-        validate_lifecycle_token_inner(inner, request.shard_id, "unload", load_version)
-    {
-        record_lifecycle_state_inner(
-            inner,
-            request.shard_id,
-            "failed",
-            "unload",
