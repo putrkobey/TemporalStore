@@ -67,3 +67,73 @@ fn what_the_durable_byte_encodings_cost() {
     struct AsArray<'a>(&'a [u8]);
     impl serde::Serialize for AsArray<'_> {
         fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.collect_seq(self.0.iter())
+        }
+    }
+    struct AsBin<'a>(&'a [u8]);
+    impl serde::Serialize for AsBin<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            serializer.serialize_bytes(self.0)
+        }
+    }
+    struct AsBase64<'a>(&'a [u8]);
+    impl serde::Serialize for AsBase64<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            crate::bytes_serde::serialize(self.0, serializer)
+        }
+    }
+
+    let as_array = rmp_serde::to_vec(&AsArray(&bytes)).expect("array packs");
+    let as_bin = rmp_serde::to_vec(&AsBin(&bytes)).expect("bin packs");
+    let as_base64 = rmp_serde::to_vec(&AsBase64(&bytes)).expect("base64 packs");
+
+    println!();
+    println!("  A {DIGEST}-BYTE DIGEST THROUGH ONE MSGPACK SERIALIZER, THREE SHAPES");
+    println!();
+    println!("    bytes at or above 0x80: {above} of {DIGEST}");
+    println!();
+    println!("    {:<34} {:>8} {:>10}", "shape", "bytes", "per byte");
+    for (label, packed) in [
+        ("array of integers (unannotated)", &as_array),
+        ("base64 string (bytes_serde, JSON)", &as_base64),
+        ("bin string (serialize_bytes)", &as_bin),
+    ] {
+        println!(
+            "    {:<34} {:>8} {:>9.3}x",
+            label,
+            packed.len(),
+            packed.len() as f64 / DIGEST as f64
+        );
+    }
+    println!();
+    println!(
+        "    the anchor record uses the MIDDLE one on a msgpack path -- {} bytes against {} for",
+        as_base64.len(),
+        as_bin.len()
+    );
+    println!(
+        "    `bin`, a toll of {} per anchor. Its doc says it carries the digest as 32 raw bytes.",
+        as_base64.len() - as_bin.len()
+    );
+    println!();
+
+    // ---- THE FIXTURE IS THE RIGHT SHAPE. A run of one low byte would make the array encoding look
+    // ---- free, which is how a byte-distribution toll hides.
+    assert!(
+        above > DIGEST / 4,
+        "only {above} of {DIGEST} fixture bytes are at or above 0x80, so the array encoding has \
+         almost nothing to charge for and the comparison below understates it"
+    );
+
+    // ---- `bin` IS THE CHEAPEST, which is the whole claim.
+    assert!(
+        as_bin.len() < as_base64.len() && as_bin.len() < as_array.len(),
+        "bin packs {} bytes against base64 {} and array {}. A byte string carries a length prefix \
+         and the bytes; the other two carry an expansion of them, so bin must be smallest",
+        as_bin.len(),
+        as_base64.len(),
+        as_array.len()
+    );
+
+    // ---- AND BASE64 IS A REAL TOLL ON THIS PATH, not a rounding difference. Four characters per
+    // ---- three bytes is a flat third, whatever the bytes are.
