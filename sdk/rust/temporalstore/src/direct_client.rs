@@ -23,15 +23,3 @@ impl Client {
             value
         };
         strings.apply(&mut c_options, &options);
-
-        let mut raw: *mut TemporalStoreClientOpaque = ptr::null_mut();
-        let mut error: *mut c_char = ptr::null_mut();
-        let code = unsafe { temporalstore_connect(&c_options, &mut raw, &mut error) };
-        check(code, error)?;
-        Ok(Self { raw })
-    }
-
-    pub fn close(&mut self) -> Result<()> {
-        if self.raw.is_null() {
-            return Ok(());
-        }

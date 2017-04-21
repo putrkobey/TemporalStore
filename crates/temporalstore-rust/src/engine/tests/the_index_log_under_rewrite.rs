@@ -98,3 +98,103 @@ fn the_index_log_under_rewrite() {
     );
     engine.load_shard(1);
     let index_dir = dir.path().join("indexes");
+
+    let snapshot = |label: String| -> (String, u64, u64, u64, u64) {
+        let log = engine.index_log_store.stats(1);
+        let image = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            crate::engine::encode_index_bytes(shard).len() as u64
+        };
+        let (index_bytes, wal_bytes) = index_and_wal_bytes(&index_dir);
+        (label, log.bytes_written, image, index_bytes, wal_bytes)
+    };
+
+    let mut rows = Vec::new();
+    for round in 0..ROUNDS {
+        for index in 0..KEYS {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("ilog-{index:06}"),
+                    value: noisy_value(index, round, VALUE),
+                },
+            });
+            assert!(response.status.ok, "round {round} write {index}: {:?}", response.status);
+        }
+        rows.push(snapshot(format!("after {} pass(es)", round + 1)));
+    }
+
+    println!();
+    println!(
+        "  THE INDEX UNDER REWRITE -- {KEYS} keys x {VALUE} B, {ROUNDS} passes, incompressible"
+    );
+    println!("  the log reclaim gate: {} B and at least 40% reclaimable",
+        DEFAULT_INDEX_GC_INDEX_LOG_BYTES_THRESHOLD);
+    println!();
+    println!(
+        "    {:<20} {:>11} {:>10} {:>12} {:>10} {:>8} {:>8}",
+        "", "log written", "image", "index disk", "wal disk", "wr ratio", "sp ratio"
+    );
+    for (label, log_written, image, index_bytes, wal_bytes) in &rows {
+        println!(
+            "    {:<20} {:>11} {:>10} {:>12} {:>10} {:>7.3}x {:>7.3}x",
+            label,
+            log_written,
+            image,
+            index_bytes,
+            wal_bytes,
+            as_x(ppm(*log_written, *image)),
+            as_x(ppm(*index_bytes, *image)),
+        );
+    }
+
+    let (_, log_before, image_before, disk_before, _) = rows[rows.len() - 1].clone();
+    let crossed = log_before >= DEFAULT_INDEX_GC_INDEX_LOG_BYTES_THRESHOLD;
+    println!();
+    println!(
+        "    log written {log_before} B vs the {} B threshold: {}",
+        DEFAULT_INDEX_GC_INDEX_LOG_BYTES_THRESHOLD,
+        if crossed { "CROSSED" } else { "NOT crossed" }
+    );
+
+    // ---- THE CYCLE, with the index-gc stage on and the production threshold in effect.
+    let buckets: Vec<u32> = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        shard.bucket_index.bucket_map.keys().copied().collect()
+    };
+    let report = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        enable_prepare: true,
+        enable_wal_reclaim: true,
+        enable_expire: true,
+        enable_evict: false,
+        enable_block_reclaim: true,
+        enable_block_compaction: true,
+        enable_index_gc: true,
+        selected_dump_buckets: buckets.clone(),
+        max_dump_buckets_per_round: buckets.len(),
+        min_undumped_wal_records: 1,
+        min_undumped_wal_bytes: 1,
+        max_expire_hot_buckets_per_round:
+            crate::engine::reports::DEFAULT_MAX_EXPIRE_HOT_BUCKETS_PER_ROUND,
+        max_expire_cold_buckets_per_round:
+            crate::engine::reports::DEFAULT_MAX_EXPIRE_COLD_BUCKETS_PER_ROUND,
+        index_gc_max_entries_per_round:
+            crate::engine::reports::DEFAULT_INDEX_GC_MAX_ENTRIES_PER_ROUND,
+        index_gc_index_log_bytes_threshold: DEFAULT_INDEX_GC_INDEX_LOG_BYTES_THRESHOLD,
+        ..StorageManagerCycleRequest::default()
+    });
+    let removed: Vec<String> = report
+        .stages
+        .iter()
+        .filter(|stage| stage.index_log_records_removed > 0)
+        .map(|stage| format!("{}={}", stage.stage, stage.index_log_records_removed))
+        .collect();
+    let (_, log_after, image_after, disk_after, wal_after) = snapshot("after the cycle".into());
+
+    println!();
+    println!("  AFTER A CYCLE WITH INDEX GC ON");
+    println!(
+        "    log written {log_before} -> {log_after} B,  index on disk {disk_before} -> \

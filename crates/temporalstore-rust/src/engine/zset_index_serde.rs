@@ -21,3 +21,14 @@ where
                 key,
                 members
                     .iter()
+                    .map(|(member, entry)| (member, entry))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    encoded.serialize(serializer)
+}
+
+pub fn deserialize<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<super::state::ModelKey, BTreeMap<Vec<u8>, (u64, ElementEntry)>>, D::Error>
