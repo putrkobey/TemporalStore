@@ -48,3 +48,53 @@ fn engine_with_a_durable_frontier(dir: &std::path::Path) -> Arc<TemporalEngine> 
             shard_id: SHARD,
             command: Command::StringSet {
                 key: format!("floor-{i}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "seed must ack at {i}: {response:?}");
+    }
+    engine
+}
+
+#[test]
+fn the_index_log_retain_floor_never_passes_the_durable_frontier() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_with_a_durable_frontier(dir.path());
+
+    // A dump is what makes a bucket generation durable, which is what `safe_to_reclaim` needs.
+    let _ = engine.apply_storage_lifecycle(crate::StorageLifecycleRequest {
+        shard_id: SHARD,
+        ..Default::default()
+    });
+
+    // THEN WRITE MORE, and this is the whole fixture rather than a flourish.
+    //
+    // After the dump alone the durable frontier and the log's current sequence are the SAME number,
+    // and a floor derived from the current sequence instead of the frontier would be identical — so
+    // the assertions below would hold against exactly the derivation they exist to refuse. These
+    // writes put delta records AFTER the durable frontier, which is the unsynced tail the invariant
+    // protects, and the regime assertion below requires that separation to exist.
+    for i in 48..72usize {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringSet {
+                key: format!("floor-{i}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "tail write must ack at {i}: {response:?}");
+    }
+
+    let plan = engine.storage_wal_reclaim_plan(SHARD, Vec::new(), Vec::new());
+    println!(
+        "safe_to_reclaim={} frontier={} retain_from={} current={}",
+        plan.safe_to_reclaim,
+        plan.durable_bucket_generation_frontier_index_log_sequence,
+        plan.retain_from_index_log_sequence,
+        plan.current_index_log_sequence,
+    );
+
+    // THE ORDERING, which is the invariant itself.
+    assert!(
+        plan.retain_from_index_log_sequence
+            <= plan
