@@ -173,3 +173,179 @@ impl SingleNodeMeta {
         ListNamespacesResponse {
             status: Status::ok(),
             namespaces,
+        }
+    }
+
+    pub fn list_tables(&self) -> ListTablesResponse {
+        let state = self.inner.read().expect("meta lock poisoned");
+        ListTablesResponse {
+            status: Status::ok(),
+            tables: state
+                .tables
+                .values()
+                .map(|table| table.info.clone())
+                .collect(),
+        }
+    }
+
+    /// List shard placement, ordered by shard id and returned a page at a time.
+    ///
+    /// Servers, proxies, proxy groups, namespaces and tables could all be
+    /// listed; shards -- the thing the metaserver exists to place -- could only
+    /// be fetched one id at a time, so answering "what is on this node?" or
+    /// "which shards has nothing claimed?" meant knowing every id up front.
+    pub fn list_shards(&self, request: ListShardsRequest) -> ListShardsResponse {
+        let state = self.inner.read().expect("meta lock poisoned");
+        let limit = if request.limit == 0 {
+            LIST_SHARDS_DEFAULT_LIMIT
+        } else {
+            request.limit.min(LIST_SHARDS_DEFAULT_LIMIT)
+        };
+
+        // Which shards this answer will carry, decided before anything is
+        // looked up for them. Naming the table that owns a shard used to be
+        // done by building that map for every shard in the cluster -- walking
+        // every table, over every shard it declares, cloning its namespace and
+        // its name for each -- and then using at most one page of it.
+        //
+        // The map is kept in shard order, so this walks from the cursor rather
+        // than over everything above it: a page costs the page. It used to cost
+        // the cluster, which made paging through one quadratic.
+        let mut block = Vec::new();
+        let mut next_after_shard_id = None;
+        for (shard_id, location) in state
+            .shards
+            .range((
+                std::ops::Bound::Excluded(request.after_shard_id),
+                std::ops::Bound::Unbounded,
+            ))
+        {
+            let shard_id = *shard_id;
+            if !request.server_addr.is_empty() && location.server_addr != request.server_addr {
+                continue;
+            }
+            if block.len() == limit {
+                // A full page and at least one more match: hand back where to
+                // resume rather than silently truncating.
+                next_after_shard_id = block.last().map(|(shard_id, _): &(ShardId, &ShardLocation)| *shard_id);
+                break;
+            }
+            block.push((shard_id, location));
+        }
+
+        // The page is sorted and a table's shards are a contiguous range, so
+        // the entries of the page that belong to a table are a slice of it.
+        let block_ids = block.iter().map(|(shard_id, _)| *shard_id).collect::<Vec<_>>();
+        let mut shard_tables: BTreeMap<ShardId, (String, String)> = BTreeMap::new();
+        for table in state.tables.values() {
+            let first = table.info.first_shard_id;
+            let end = first.saturating_add(table.info.shard_count);
+            let from = block_ids.partition_point(|shard_id| *shard_id < first);
+            let until = block_ids.partition_point(|shard_id| *shard_id < end);
+            for shard_id in &block_ids[from..until] {
+                // First table in map order wins a contested shard, which is how
+                // the map built shard by shard resolved two tables whose ranges
+                // overlap.
+                shard_tables.entry(*shard_id).or_insert_with(|| {
+                    (
+                        table.info.namespace.clone(),
+                        table.info.table_name.clone(),
+                    )
+                });
+            }
+        }
+
+        let mut shards = Vec::new();
+        for (shard_id, location) in block {
+            let (namespace, table_name) = shard_tables.get(&shard_id).cloned().unwrap_or_default();
+            // What the owner says about this shard, when it says anything at
+            // all. A server that has never reported its shard states cannot be
+            // read as reporting an empty set.
+            let owner_reports_loaded = state
+                .servers
+                .get(&location.server_addr)
+                .filter(|server| server.reports_shard_states)
+                .map(|server| {
+                    server
+                        .shard_states
+                        .iter()
+                        .any(|reported| reported.shard_id == shard_id && reported.loaded)
+                });
+            shards.push(ShardListEntry {
+                shard_id,
+                server_addr: location.server_addr.clone(),
+                namespace,
+                table_name,
+                latest_snapshot: location.latest_snapshot.clone(),
+                state: location.state,
+                owner_reports_loaded,
+                preferred_location: location.preferred_location.clone(),
+                registered_at_ms: location.registered_at_ms,
+            });
+        }
+
+        ListShardsResponse {
+            status: Status::ok(),
+            shards,
+            next_after_shard_id,
+        }
+    }
+
+    pub fn list_servers(&self) -> ListServersResponse {
+        let state = self.inner.read().expect("meta lock poisoned");
+        ListServersResponse {
+            status: Status::ok(),
+            servers: state.servers.values().cloned().collect(),
+        }
+    }
+
+    pub fn freeze_stale_servers(&self, stale_after_ms: u64) -> StaleServerReport {
+        let report = self.freeze_stale_resources(stale_after_ms);
+        StaleServerReport {
+            status: report.status,
+            frozen_servers: report.frozen_servers,
+        }
+    }
+
+    pub fn freeze_stale_resources(&self, stale_after_ms: u64) -> StaleResourceReport {
+        self.freeze_stale_resources_with_policy(
+            stale_after_ms,
+            SafeModePolicy {
+                server_freeze_cooldown_ms: 0,
+                proxy_freeze_cooldown_ms: 0,
+            },
+        )
+    }
+
+    pub fn freeze_stale_resources_with_policy(
+        &self,
+        stale_after_ms: u64,
+        policy: SafeModePolicy,
+    ) -> StaleResourceReport {
+        let now = now_ms();
+        let stale_servers = {
+            let state = self.inner.read().expect("meta lock poisoned");
+            state
+                .servers
+                .values()
+                .filter(|server| {
+                    server.state == MetaEntityState::Normal
+                        && now.saturating_sub(server.last_heartbeat_ms) > stale_after_ms
+                })
+                .map(|server| server.server_addr.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut frozen_servers = Vec::new();
+        for endpoint in stale_servers {
+            let response = self.freeze_server(StateChangeRequest {
+                endpoint: endpoint.clone(),
+                freeze_cooldown_ms: policy.server_freeze_cooldown_ms,
+                // The metaserver decided this, not an operator.
+                reason: FreezeReason::Unresponsive,
+            });
+            if !response.status.ok {
+                return StaleResourceReport {
+                    status: response.status,
+                    frozen_servers,
+                    frozen_proxies: Vec::new(),

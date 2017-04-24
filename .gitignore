@@ -34,3 +34,21 @@ terraform-output*.json
 dependencies/
 thirdparty/
 local_build/
+objectstorelab-master/
+matrixdb2_images/
+objectstore_images/
+
+# Terraform/runtime state
+.terraform/
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Language build outputs and caches
+__pycache__/
+*.pyc
+node_modules/
+dist/
+out/
+crates/*/shard-*.index.json
+
