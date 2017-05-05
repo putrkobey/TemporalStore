@@ -7,3 +7,7 @@
 # wins, because systemd applies them before ExecStart runs.
 [Unit]
 Description=MatrixArk /v1 HTTP gateway
+After=network-online.target matrixark-proxy.service
+Wants=network-online.target
+
+[Service]
