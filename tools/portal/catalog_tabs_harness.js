@@ -33,3 +33,74 @@ function attr(tag, name) {
   const m = tag.match(new RegExp(name + '="([^"]*)"'));
   return m ? m[1] : null;
 }
+
+/* Tabs and panes come from the STATIC markup, so they are parsed from the page once. */
+const tabCells = [...page.matchAll(/<button[^>]*role="tab"[\s\S]*?<\/button>/g)].map((m) => {
+  const tag = m[0];
+  const el = {
+    id: attr(tag, "id"), dataset: { pane: attr(tag, "data-pane") },
+    tabIndex: 0, focused: false, _listeners: {},
+    _attrs: { "aria-selected": attr(tag, "aria-selected") || "false" },
+    addEventListener(t, fn) { (this._listeners[t] = this._listeners[t] || []).push(fn); },
+    dispatch(t, ev) { (this._listeners[t] || []).forEach((fn) => fn(ev || {})); },
+    setAttribute(k, v) { this._attrs[k] = String(v); },
+    getAttribute(k) { return k in this._attrs ? this._attrs[k] : null; },
+    focus() { this.focused = true; }, click() { this.dispatch("click"); }
+  };
+  return el;
+});
+const panes = [...page.matchAll(/<section[^>]*class="pane"[^>]*>/g)].map((m) => ({
+  id: attr(m[0], "id"), hidden: /\shidden[\s>]/.test(m[0])
+}));
+
+function makeEl(id) {
+  return {
+    id: id || "", hidden: false, innerHTML: "", textContent: "", value: "", className: "",
+    style: {}, dataset: {}, children: [],
+    addEventListener(type, fn) { listeners[(id || "") + ":" + type] = fn; },
+    removeEventListener() {}, appendChild() {}, removeChild() {},
+    setAttribute() {}, getAttribute() { return null; }, closest() { return null; },
+    querySelector() { return null; }, querySelectorAll() { return []; },
+    scrollIntoView() {}, focus() {}, click() {},
+    classList: { add() {}, remove() {}, toggle() {} }
+  };
+}
+function el(id) {
+  const fromMarkup = tabCells.filter((t) => t.id === id)[0];
+  if (fromMarkup) { return fromMarkup; }
+  if (!els.has(id)) { els.set(id, makeEl(id)); }
+  return els.get(id);
+}
+
+function json(body) {
+  return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body),
+                           text: () => Promise.resolve("{}") });
+}
+
+const win = {
+  document: {
+    getElementById: (id) => el(id),
+    querySelector: () => makeEl(),
+    querySelectorAll: (sel) => (sel === ".tabs button" ? tabCells
+                                : (sel === ".pane" ? panes : [])),
+    createElement: () => makeEl(), addEventListener() {}, body: makeEl(), hidden: false
+  },
+  addEventListener() {},
+  location: { origin: "http://localhost", href: "http://localhost", reload() {} },
+  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  navigator: {},
+  setTimeout: () => 0, setInterval: () => 0, clearInterval() {},
+  Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
+  TextDecoder: function () { this.decode = () => ""; },
+  AbortController: function () { this.abort = () => {}; this.signal = {}; },
+  FileReader: function () {}, Blob: function () {},
+  URL: { createObjectURL: () => "", revokeObjectURL() {} },
+  fetch: (url) => {
+    const u = String(url);
+    if (u.indexOf("/v1/skills") >= 0) { return json(SKILLS); }
+    if (u.indexOf("/v1/resources") >= 0) { return json(RESOURCES); }
+    if (u.indexOf("/v1/admin/events") >= 0) {
+      return Promise.resolve({ ok: true, status: 200,
+                               body: { getReader: () => ({ read: () => new Promise(() => {}) }) },

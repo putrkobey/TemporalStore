@@ -1268,3 +1268,1274 @@ fn an_empty_zset_member_is_a_whole_component_and_survives_the_fold_shape() {
             "zset",
             addresses,
             |address| engine.block_store.read(address).ok(),
+        );
+        assert!(
+            derived.is_complete(),
+            "the derivation from the pages is incomplete ({} failure(s): {} read, {} undecodable, \
+             {} unframed, {} unrenderable), so a missing empty member below could be any of those \
+             rather than a length boundary",
+            derived.failures(),
+            derived.read_failures,
+            derived.undecodable,
+            derived.unframed,
+            derived.unrenderable_items
+        );
+        assert!(
+            derived.live.contains_key(""),
+            "the pages do not derive the empty member as a zero-length component: {:?}. A reader \
+             that treats a short component as an absent one has come back -- which is the defect \
+             this arm exists for, now one layer down",
+            derived.live.keys().collect::<Vec<_>>()
+        );
+        println!(
+            "[empty-member] the pages derive {} live element(s) and the empty member is among them \
+             as a zero-length component",
+            derived.live.len()
+        );
+    }
+
+    // The shape this fixture builds by hand: the durable map loses one element.
+    {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard is loaded");
+        let removed = shard
+            .zsets
+            .elements_mut_for_test("mt-zset")
+            .expect("the zset is present")
+            .remove(empty.as_slice());
+        assert!(
+            removed.is_some(),
+            "the durable map did not hold the empty member, so this fixture cannot build the state \
+             it is about"
+        );
+        println!("[empty-member] dropped the empty member from the durable map only");
+    }
+
+    engine.unload_shard(1);
+    load_on(&engine, OPERATOR_END);
+
+    let score_of = |member: &[u8]| -> Option<f64> {
+        match read(
+            &engine,
+            Command::ZSetScore {
+                key: "mt-zset".to_string(),
+                member: member.to_vec(),
+            },
+        ) {
+            crate::types::CommandResponse::Bytes { value: Some(bytes) } => {
+                String::from_utf8_lossy(&bytes).parse::<f64>().ok()
+            }
+            _ => None,
+        }
+    };
+
+    let control_score = score_of(&control);
+    let empty_score = score_of(&empty);
+    println!("[empty-member] after the reload: control={control_score:?} empty={empty_score:?}");
+
+    // THE CONTROL, at the score it was written with and untouched by the fixture.
+    assert_eq!(
+        control_score,
+        Some(1.0),
+        "the non-empty member did not come back either, so this fixture lost the whole key and says \
+         nothing about the element it dropped"
+    );
+
+    // THE INVERSION. Nothing can name an element the durable map lost.
+    assert_eq!(
+        None, empty_score,
+        "the empty member came back as {empty_score:?} after being dropped from the durable map. \
+         An entry carries no element name and the derived view is empty by construction, so there \
+         is nothing left to recover an identity from -- a value here means that has changed"
+    );
+}
+
+/// THE DELTA RECORD CARRIES THE MEMBER BYTES ITS COMPONENT MERELY SPELLS.
+///
+/// `apply_key_states` folded thirteen maps and `sets`, `zsets`, `lists` and `hashes` were not among
+/// them, while `fold_delta_block_items` DID restore the page items -- so after a fold the bucket
+/// index held pages for elements whose durable-map entry was never written, and the component its
+/// page was filed under was the only copy of the member on that path. It is a DECODABLE copy on this
+/// revision, so nothing was lost by it; #1996 had to rewrite a component into an ordinal shape
+/// deliberately to lose one. This is the prerequisite that stops identity depending on that.
+///
+/// ASSERTED ON THE RECORD ON DISK, not on the function that builds it, because the question is what
+/// a reload will find. The log is read back through the store's own reader and the carried bytes are
+/// compared with the member the caller sent.
+///
+/// rust-internal: reads the engine's own index log, no external surface
+#[test]
+fn a_delta_record_carries_the_container_element_a_write_touched() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_on(dir.path());
+    load_on(&engine, OPERATOR_END);
+
+    let set_member = b"carried-set-member".to_vec();
+    let zset_member = b"carried-zset-member".to_vec();
+    write(
+        &engine,
+        Command::SetAdd {
+            key: "carry-set".to_string(),
+            member: set_member.clone(),
+        },
+    );
+    write(
+        &engine,
+        Command::ZSetAdd {
+            key: "carry-zset".to_string(),
+            member: zset_member.clone(),
+            score: 4.5,
+        },
+    );
+
+    let records = engine
+        .index_log_store
+        .read_delta_records(1, 0)
+        .expect("the delta log reads back");
+    assert!(
+        records.len() >= 2,
+        "DENOMINATOR: the log holds {} delta record(s); with fewer than two the assertions below \
+         are scoring an empty read",
+        records.len()
+    );
+
+    // Gather every carried element across the log, keyed by the blob field that carried it.
+    let mut carried_set: Vec<Vec<u8>> = Vec::new();
+    let mut carried_zset: Vec<(Vec<u8>, u64)> = Vec::new();
+    let mut blobs_seen = 0usize;
+    for record in &records {
+        for blob in &record.key_states {
+            blobs_seen += 1;
+            if let Some(elements) = blob.get("set_elements").and_then(|v| v.as_array()) {
+                for element in elements {
+                    if let Some(member) = element.get(0) {
+                        if let Ok(bytes) = serde_json::from_value::<Vec<u8>>(member.clone()) {
+                            carried_set.push(bytes);
+                        }
+                    }
+                }
+            }
+            if let Some(elements) = blob.get("zset_elements").and_then(|v| v.as_array()) {
+                for element in elements {
+                    let member = element
+                        .get(0)
+                        .and_then(|m| serde_json::from_value::<Vec<u8>>(m.clone()).ok());
+                    let score = element.get(1).and_then(|s| s.get(0)).and_then(|s| s.as_u64());
+                    if let (Some(member), Some(score)) = (member, score) {
+                        carried_zset.push((member, score));
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "[carry] {} record(s), {blobs_seen} key-state blob(s), {} carried set element(s), {} \
+         carried zset element(s)",
+        records.len(),
+        carried_set.len(),
+        carried_zset.len()
+    );
+
+    assert!(
+        carried_set.contains(&set_member),
+        "no record carried the set member the caller sent. Carried: {carried_set:?}"
+    );
+    let expected_score = crate::engine::execute_on_shard::zset_score_bits(4.5);
+    assert!(
+        carried_zset.contains(&(zset_member.clone(), expected_score)),
+        "no record carried the zset member with the score the durable map holds. Carried: \
+         {carried_zset:?}, wanted {:?} at {expected_score}",
+        String::from_utf8_lossy(&zset_member)
+    );
+    println!(
+        "[carry] the record carries the member BYTES and the score the durable map holds, so a fold \
+         does not have to decode the component to know either"
+    );
+}
+
+/// A RECORD THAT CARRIES NO ELEMENTS CHANGES NOTHING, WHICH IS WHAT AN OLD LOG IS.
+///
+/// The carry rides in the delta record's existing opaque per-key state channel and is matched BY
+/// NAME, so a record written before these fields existed simply does not have them. That is the
+/// whole compatibility story and it is asserted rather than argued: nothing positional moves, no
+/// reader has to be upgraded first, and `SHARD_INDEX_FORMAT_VERSION` does not change -- so an old
+/// log is not refused, it folds exactly as it always did.
+///
+/// TWO ARMS, and the second is the one that could have been a silent disaster. Every one of the
+/// thirteen maps `apply_key_states` folds is restored through `apply_key_state_field`, which treats
+/// an ABSENT field as "this key had none" and REMOVES the entry. Had the container maps been folded
+/// that way, an old record -- or any record for a key whose container this write did not touch --
+/// would have DELETED the whole collection. `merge_container_elements` inserts and never removes,
+/// and this asserts that at 0.00%: a blob naming only its key leaves all four maps exactly as they
+/// were.
+///
+/// rust-internal: calls the engine's own fold directly, no external surface
+#[test]
+fn a_key_state_blob_that_carries_no_elements_leaves_the_container_maps_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_on(dir.path());
+    load_on(&engine, OPERATOR_END);
+
+    // A member in each of the four container maps, written normally.
+    write(
+        &engine,
+        Command::SetAdd {
+            key: "old-log".to_string(),
+            member: b"set-member".to_vec(),
+        },
+    );
+    write(
+        &engine,
+        Command::ZSetAdd {
+            key: "old-log".to_string(),
+            member: b"zset-member".to_vec(),
+            score: 2.5,
+        },
+    );
+    write(
+        &engine,
+        Command::ListPush {
+            key: "old-log".to_string(),
+            member: b"list-element".to_vec(),
+            left: false,
+        },
+    );
+    write(
+        &engine,
+        Command::HashSet {
+            key: "old-log".to_string(),
+            field: "hash-field".to_string(),
+            value: b"hash-value".to_vec(),
+        },
+    );
+
+    let mut shards = engine.shards.write().expect("engine lock poisoned");
+    let shard = shards.get_mut(&1).expect("shard is loaded");
+    let before = (
+        shard.sets.clone(),
+        shard.zsets.clone(),
+        shard.lists.clone(),
+        shard.hashes.clone(),
+    );
+    let populated: usize = before.0.len() + before.1.len() + before.2.len() + before.3.len();
+    assert_eq!(
+        populated, 4,
+        "DENOMINATOR: {populated} of the four container maps hold this key; with fewer than four \
+         an unchanged comparison below would be comparing empty maps"
+    );
+
+    // EXACTLY WHAT AN OLD RECORD'S BLOB IS: a key, and none of the fields that did not exist yet.
+    // Through BOTH halves of the fold, because an old log meets both.
+    let old_shape = vec![serde_json::json!({ "key": "old-log" })];
+    super::apply_key_states(shard, &old_shape);
+    super::fold_carried_container_elements(shard, &old_shape);
+
+    let after = (
+        shard.sets.clone(),
+        shard.zsets.clone(),
+        shard.lists.clone(),
+        shard.hashes.clone(),
+    );
+    assert_eq!(
+        before.0, after.0,
+        "folding a blob with no carried elements changed `sets`"
+    );
+    assert_eq!(
+        before.1, after.1,
+        "folding a blob with no carried elements changed `zsets`"
+    );
+    assert_eq!(
+        before.2, after.2,
+        "folding a blob with no carried elements changed `lists`"
+    );
+    assert_eq!(
+        before.3, after.3,
+        "folding a blob with no carried elements changed `hashes`. An absent field must be a NO-OP \
+         here and not a removal -- `apply_key_state_field`, which the other thirteen maps use, would \
+         have deleted the whole collection."
+    );
+    println!(
+        "[old-log] all four container maps unchanged at 0.00% across a blob that names only its key"
+    );
+}
+
+/// THE FOLD RESTORES AN ELEMENT WHOSE COMPONENT COULD NOT NAME IT.
+///
+/// This is the finding, driven at the seam. A blob carrying one zset element and one set element is
+/// folded onto a shard that holds neither, and there is NO component anywhere in the input -- so the
+/// identity that arrives cannot have been decoded from one. That is the property the two blocked
+/// changes need: a 2-byte element ordinal replacing `component: Option<Arc<str>>`, and batched pages
+/// where element identity lives only in the page payload.
+///
+/// THE MUTANT THIS KILLS is the removal of the four `merge_container_elements` calls from
+/// `apply_key_states`, which is the whole change on the apply side. Without them the maps stay empty
+/// here, because nothing else in this test writes them.
+///
+/// AND A CONTROL WHERE THE CHANGE PREDICTS NOTHING: the same blob carries a `features` field, which
+/// is one of the thirteen maps the fold already handled and which this change does not touch. It
+/// must arrive exactly as it always did, so an `apply_key_states` that had stopped working
+/// altogether cannot pass as this finding.
+///
+/// rust-internal: calls the engine's own fold directly, no external surface
+#[test]
+fn the_fold_restores_a_container_element_from_carried_identity_and_not_from_a_component() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_on(dir.path());
+    load_on(&engine, OPERATOR_END);
+
+    // A real address to carry, taken from a page this store actually wrote.
+    write(
+        &engine,
+        Command::SetAdd {
+            key: "seed".to_string(),
+            member: b"seed-member".to_vec(),
+        },
+    );
+    let mut shards = engine.shards.write().expect("engine lock poisoned");
+    let shard = shards.get_mut(&1).expect("shard is loaded");
+    let address = shard
+        .sets
+        .get("seed")
+        .and_then(|members| members.get(b"seed-member".as_slice()))
+        .cloned()
+        .expect("the seed member has an address");
+
+    // Bytes no component on this revision would spell: a component is hex, and these are not.
+    let member = b"identity-not-in-a-name".to_vec();
+    let score_bits = crate::engine::execute_on_shard::zset_score_bits(9.25);
+    let blob = vec![serde_json::json!({
+        "key": "folded",
+        "set_elements": [[ &member, &address ]],
+        "zset_elements": [[ &member, [score_bits, &address] ]],
+    }),
+    // THE CONTROL: one of the thirteen maps the fold already restored, through the unchanged path.
+    //
+    // A SEPARATE BLOB, because that is what a record actually carries. `capture_key_states` and
+    // `capture_container_element_states` each produce their own blobs and the two are never merged,
+    // and `apply_key_states` relies on exactly that: it SKIPS a blob carrying container fields,
+    // because reading a container carry as a per-key capture would clear the key's deadline and
+    // every series it holds (see `a_container_carry_does_not_clear_the_key_state_it_does_not_name`).
+    // This fixture put both in one object, which no writer emits, and so was testing a shape that
+    // cannot occur.
+    serde_json::json!({
+        "key": "folded",
+        "features": { "7": &address },
+    })];
+
+    assert!(
+        shard.sets.get("folded").is_none() && shard.zsets.get("folded").is_none(),
+        "DENOMINATOR: the shard already holds this key, so an element found after the fold would \
+         not have come from the fold"
+    );
+
+    // BOTH HALVES, because they do different jobs now: `apply_key_states` restores the thirteen
+    // per-key maps (the `features` control below), and `fold_carried_container_elements` restores
+    // the container elements -- the latter only where the page each one names is still there, which
+    // for this seeded address it is.
+    super::apply_key_states(shard, &blob);
+    super::fold_carried_container_elements(shard, &blob);
+
+    let folded_set = shard
+        .sets
+        .get("folded")
+        .and_then(|members| members.get(member.as_slice()))
+        .cloned();
+    let folded_zset = shard
+        .zsets
+        .get("folded")
+        .and_then(|members| members.get(member.as_slice()))
+        .cloned();
+    println!(
+        "[carried] set={} zset={} for a member of {} bytes that no component in the input spells",
+        folded_set.is_some(),
+        folded_zset.is_some(),
+        member.len()
+    );
+
+    assert!(
+        folded_set.is_some(),
+        "the fold did not restore the set element. There is no component in this input, so if this \
+         is red the carry is not being applied and a folded element is once again known only by the \
+         name its page was filed under."
+    );
+    let (folded_score, _) = folded_zset.expect(
+        "the fold did not restore the zset element from its carried identity, so `shard.zsets` is \
+         still a map the fold cannot write",
+    );
+    assert_eq!(
+        folded_score, score_bits,
+        "the zset element came back at score bits {folded_score}, not the {score_bits} the record \
+         carried -- the score must come from the carried entry, not be re-derived"
+    );
+
+    // THE CONTROL, at the value it was given, through the path this change does not touch.
+    let control = shard
+        .features()
+        .get("folded")
+        .and_then(|series| series.get(7u64))
+        .cloned();
+    assert!(
+        control.is_some(),
+        "the `features` control did not arrive, so `apply_key_states` is not working at all and the \
+         assertions above say nothing about the carry specifically"
+    );
+    println!(
+        "[carried] and the `features` control arrived through the unchanged per-key path, so the \
+         fold as a whole is working and the two results above are about the carry"
+    );
+}
+
+/// A CARRIED ELEMENT WHOSE PAGE THE FOLD DID NOT LEAVE BEHIND IS NOT RESTORED.
+///
+/// This is the test that made the carry's shape what it is, and the first shape of it was wrong.
+/// A fold replays a SUFFIX of the delta log, so ONE fold can both add an element and take it away
+/// again -- add, then remove, between two base-index writes is entirely ordinary. Applying a
+/// record's carried elements as that record was folded put the element into the durable map, and
+/// `fill_absent_elements` -- which keeps every durable element the derived view could not produce,
+/// #1989's rule -- then handed it back after the later record had removed its page. **The element
+/// would be served after being deleted.** Nothing did that before the carry existed, because the
+/// fold never wrote these four maps at all, so this would have been a regression introduced by the
+/// fix.
+///
+/// THE MERGE ASKS THAT QUESTION OF ITS PERSISTED INPUT TOO NOW, which is a later change and not a
+/// reason to relax this one. `resident_map_readers` carries the argument: the carry and the persisted
+/// map are two inputs to one merge, the carry was applied in the wrong ORDER and the persisted map is
+/// simply OLDER than the page index, and both now answer `live_block_key` against the finished index.
+/// So this test's subject would be stripped downstream if it survived here. It must not survive
+/// here: correctness at this stage is not the same as being cleaned up at the next one.
+///
+/// AND MATCHING THE RECORD'S TOMBSTONES DOES NOT SUBSTITUTE, which is why the obvious symmetric
+/// half was removed rather than kept. `mark_bucket_index_block_deleted_with` -- which `SetRemove`,
+/// `ZSetRemove`, `ListPop` and `HashDelete` all reach -- is named for a mark it does not make: its
+/// body is a `retain` that DROPS the page. So by the time the delta record is built there is no
+/// page left to describe and no `deleted` item is emitted; the removal is spelled as the ABSENCE of
+/// a page under a covered key. A removal half reading tombstones is dead code on every typed
+/// container removal.
+///
+/// (`collect_command_index_items_for`'s own doc still claims a typed removal "marks its page
+/// deleted in the bucket index rather than dropping it, so the item this emits carries
+/// `deleted: true`". That claim does not hold on this revision. Recorded here rather than acted on:
+/// correcting it is not this change's business, but a removal half built on believing it would have
+/// been.)
+///
+/// # THE EXPERIMENT
+///
+/// Two carried elements against the same live shard. One names the address of a page that IS in the
+/// bucket index; the other names an address no page holds, which is exactly what a carry left over
+/// from a record whose page a later record removed looks like.
+///
+///   * The live-page element is restored. THE CONTROL: a filter that rejected everything would
+///     otherwise pass as this finding.
+///   * The absent-page element is NOT restored.
+///
+/// rust-internal: calls the engine's own fold directly, no external surface
+#[test]
+fn a_carried_element_whose_block_the_fold_did_not_keep_is_not_restored() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_on(dir.path());
+    load_on(&engine, OPERATOR_END);
+
+    write(
+        &engine,
+        Command::SetAdd {
+            key: "res-seed".to_string(),
+            member: b"res-seed-member".to_vec(),
+        },
+    );
+
+    let mut shards = engine.shards.write().expect("engine lock poisoned");
+    let shard = shards.get_mut(&1).expect("shard is loaded");
+    let live_address = shard
+        .sets
+        .get("res-seed")
+        .and_then(|members| members.get(b"res-seed-member".as_slice()))
+        .cloned()
+        .expect("the seed member has an address");
+
+    // An address no live page holds. Built by changing the length, which is part of what names a
+    // page in the live set, so it is a well-formed address that simply is not in the index -- which
+    // is what a removed page leaves behind in a carry.
+    let mut absent_address = live_address.clone();
+    absent_address.set_length(live_address.length() + 4_096);
+
+    // THE DENOMINATOR: the two addresses must actually differ, or both arms measure the same thing.
+    assert_ne!(
+        live_address.length(),
+        absent_address.length(),
+        "the two addresses are identical, so this fixture cannot tell a live page from an absent one"
+    );
+    let live_blocks: usize = shard
+        .bucket_index
+        .bucket_map
+        .values()
+        .map(|bucket| bucket.block_index.values().filter(|block| !block.deleted).count())
+        .sum();
+    assert!(
+        live_blocks >= 1,
+        "DENOMINATOR: {live_blocks} live pages; with none, every carried element is skipped for the \
+         wrong reason and the finding below is vacuous"
+    );
+
+    let kept = b"kept-by-a-live-page".to_vec();
+    let gone = b"removed-page-leftover".to_vec();
+    let blob = vec![serde_json::json!({
+        "key": "res",
+        "set_elements": [
+            [ &kept, &live_address ],
+            [ &gone, &absent_address ],
+        ],
+    })];
+
+    super::fold_carried_container_elements(shard, &blob);
+
+    let restored: Vec<Vec<u8>> = shard
+        .sets
+        .get("res")
+        .map(|members| members.keys().cloned().collect())
+        .unwrap_or_default();
+    println!(
+        "[resurrect] {live_blocks} live page(s); restored {} of 2 carried element(s)",
+        restored.len()
+    );
+
+    // THE CONTROL.
+    assert!(
+        restored.contains(&kept),
+        "the element whose page IS live was not restored either, so the filter rejects everything \
+         and says nothing about the absent one"
+    );
+
+    // THE FINDING.
+    assert!(
+        !restored.contains(&gone),
+        "an element naming a page the fold did not leave behind was restored anyway. That is how a \
+         removed element comes back: `fill_absent_elements` keeps every durable element the derived \
+         view could not produce, and the derived view cannot produce this one because its page is \
+         gone. It would then be served after being deleted. (That merge now asks this same \
+         live-page question of its persisted input, so it would strip this element afterwards -- \
+         but the fold must not hand it a known-dead one to strip.)"
+    );
+    println!(
+        "[resurrect] so the carry is applied against the FINISHED page index, and a removal needs \
+         no tombstone to be honoured -- taking the page away is the whole answer"
+    );
+}
+
+/// A CONTAINER CARRY MUST NOT BE READ AS A PER-KEY STATE CAPTURE.
+///
+/// This is a bug the carry introduced and this test is what it is for. Both kinds of blob ride in
+/// the delta record's one `key_states` channel, and `apply_key_states` applies THIRTEEN maps from
+/// every blob it meets through `apply_key_state_field` -- which treats an ABSENT field as "this key
+/// had none" and REMOVES the entry. That is deliberate and load-bearing for a real capture: a blob
+/// naming only its key means "this key is in none of the thirteen", and the removal is the point.
+///
+/// A container carry names only its key and its elements. Read as a capture it therefore says this
+/// key has no deadline and no series at all -- so a plain `SetAdd` against a key that holds a TTL
+/// would DROP THAT TTL on the next fold, turning an expiring key into a permanent one, with nothing
+/// reporting it. The carry is now skipped by that loop.
+///
+/// # TWO ARMS, AND THE SECOND IS THE ONE THAT KEEPS THE FIRST HONEST
+///
+///   * A container-only blob leaves `expires_at_ms` and `features` alone.
+///   * A GENUINE capture blob for the same key, with those fields absent, still REMOVES them. This
+///     is the control: skipping too much -- or `apply_key_states` quietly doing nothing at all --
+///     would pass the first arm and break the mechanism the thirteen maps depend on, and only this
+///     arm can tell the two apart.
+///
+/// rust-internal: calls the engine's own fold directly, no external surface
+#[test]
+fn a_container_carry_does_not_clear_the_key_state_it_does_not_name() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_on(dir.path());
+    load_on(&engine, OPERATOR_END);
+
+    write(
+        &engine,
+        Command::SetAdd {
+            key: "carry-ttl".to_string(),
+            member: b"ttl-member".to_vec(),
+        },
+    );
+
+    let mut shards = engine.shards.write().expect("engine lock poisoned");
+    let shard = shards.get_mut(&1).expect("shard is loaded");
+    let address = shard
+        .sets
+        .get("carry-ttl")
+        .and_then(|members| members.get(b"ttl-member".as_slice()))
+        .cloned()
+        .expect("the member has an address");
+
+    // State this key holds that a container carry says nothing about.
+    shard
+        .expires_at_ms_mut()
+        .insert(std::sync::Arc::from("carry-ttl"), 1_800_000_000_000u64);
+    shard
+        .features_mut()
+        .entry("carry-ttl".into())
+        .or_default()
+        .set(11u64, address.clone());
+
+    // THE DENOMINATOR: both must actually be there, or "unchanged" below is comparing absences.
+    assert!(
+        shard.expires_at_ms().contains_key("carry-ttl")
+            && shard.features().get("carry-ttl").is_some_and(|s| !s.is_empty()),
+        "the fixture did not establish a deadline and a series, so neither arm below means anything"
+    );
+
+    // ARM ONE: a container-only carry, exactly what a `SetAdd` now writes.
+    let carry = vec![serde_json::json!({
+        "key": "carry-ttl",
+        "set_elements": [[ b"another-member".to_vec(), &address ]],
+    })];
+    super::apply_key_states(shard, &carry);
+    super::fold_carried_container_elements(shard, &carry);
+
+    let deadline_after_carry = shard.expires_at_ms().get("carry-ttl").copied();
+    let series_after_carry = shard.features().get("carry-ttl").map(|s| s.len()).unwrap_or(0);
+    println!(
+        "[carry-ttl] after a container-only carry: deadline={deadline_after_carry:?} \
+         series_len={series_after_carry}"
+    );
+    assert_eq!(
+        deadline_after_carry,
+        Some(1_800_000_000_000u64),
+        "a container carry cleared this key's deadline. Read as a per-key capture it says the key \
+         has no deadline, so a plain SetAdd against a key with a TTL would drop the TTL on the next \
+         fold."
+    );
+    assert_eq!(
+        series_after_carry, 1,
+        "a container carry cleared this key's feature series for the same reason"
+    );
+    // And it did do its own job.
+    assert!(
+        shard
+            .sets
+            .get("carry-ttl")
+            .is_some_and(|members| members.contains_key(b"another-member".as_slice())),
+        "the carry did not restore its own element, so arm one may be passing because nothing ran"
+    );
+
+    // ARM TWO, THE CONTROL: a genuine capture blob with those fields absent still removes them.
+    let capture = vec![serde_json::json!({ "key": "carry-ttl" })];
+    super::apply_key_states(shard, &capture);
+    let deadline_after_capture = shard.expires_at_ms().get("carry-ttl").copied();
+    let series_after_capture = shard.features().get("carry-ttl").map(|s| s.len()).unwrap_or(0);
+    println!(
+        "[carry-ttl] after a genuine capture that omits them: deadline={deadline_after_capture:?} \
+         series_len={series_after_capture}"
+    );
+    assert_eq!(
+        deadline_after_capture, None,
+        "a real capture blob no longer removes an absent deadline. The skip is too broad -- it must \
+         match only a container carry, or the thirteen maps stop being able to record a removal and \
+         reconstruction resurrects what a write evicted."
+    );
+    assert_eq!(
+        series_after_capture, 0,
+        "a real capture blob no longer removes an absent series, for the same reason"
+    );
+    println!(
+        "[carry-ttl] so the two blob kinds are told apart: a carry adds and never removes, a \
+         capture still removes what it does not name"
+    );
+}
+
+/// WHAT A STAGED HASH PAGE SAYS ABOUT ITS OWN ELEMENT, AND WHAT REPLAY COSTS TO ASK IT.
+///
+/// A MEASUREMENT ARM. Three things have to be true before the recorded outcome's element name can
+/// be resolved from the page instead of carried, and each of them is a question this prints an
+/// answer to rather than assuming:
+///
+///   1. IS THE NAME PARSEABLE, or merely PRESENT? An earlier probe searched the payload bytes for
+///      the field name as a SUBSTRING and found it in 3 of 3 pages. That is not the same claim: a
+///      substring says the information is there, not that there is a defined way to recover it.
+///      This decodes the page through `container_blocks::decode_container_block` and renders the
+///      component back through `component_from_element_key`, which is the only recovery that
+///      counts.
+///   2. HOW MANY ELEMENTS DOES ONE STAGED PAGE HOLD? If one, the page names the outcome's element
+///      unambiguously. If many, the payload says which elements the PAGE holds and not which one
+///      the OUTCOME is about, and the two are different questions.
+///   3. AND DOES REPLAY ALREADY HAVE THE BYTES? If the page travels inside the record, resolving
+///      from the payload is a parse. If it does not, it is a BLOCK READ PER RECORD -- and recovery
+///      time is a product property, so that cost decides whether any of this is worth doing.
+#[test]
+fn what_a_staged_hash_block_says_about_its_own_element_and_what_asking_costs() {
+    use crate::engine::container_blocks::{
+        component_from_element_key, decode_container_block, ContainerBlockDecode, ElementKeySpelling,
+    };
+
+    const KEY: &str = "pay-hash";
+    const FIELDS: usize = 64;
+
+    let source = tempfile::tempdir().unwrap();
+    let engine = engine_on(source.path());
+    load_on(&engine, OPERATOR_END);
+    for index in 0..FIELDS {
+        write(
+            &engine,
+            Command::HashSet {
+                key: KEY.to_string(),
+                field: format!("field-{index:04}"),
+                value: format!("value-{index}").into_bytes(),
+            },
+        );
+    }
+
+    let lines = engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .expect("the log scans");
+    let records: Vec<crate::wal::WriteAheadLogRecord> = lines
+        .iter()
+        .map(|(sequence, line)| {
+            crate::wal::decode_wal_line(line)
+                .unwrap_or_else(|error| panic!("record {sequence} does not decode: {error}"))
+        })
+        .collect();
+
+    // (3a) DOES THE PAGE TRAVEL IN THE RECORD? Counted against its denominator.
+    let outcomes: usize = records.iter().map(|record| record.outcomes.len()).sum();
+    let staged: usize = records.iter().map(|record| record.staged_blocks.len()).sum();
+    println!(
+        "[pay] {} records, {outcomes} outcomes, {staged} staged pages",
+        records.len()
+    );
+
+    // (1) AND (2): decode every staged page and ask it for its elements.
+    let mut framed = 0usize;
+    let mut not_framed = 0usize;
+    let mut corrupt = 0usize;
+    let mut items_per_block: Vec<usize> = Vec::new();
+    let mut recovered: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut spellings: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for record in &records {
+        for block in &record.staged_blocks {
+            match decode_container_block(&block.bytes) {
+                ContainerBlockDecode::Framed { spelling, items, .. } => {
+                    framed += 1;
+                    spellings.insert(format!("{spelling:?}"));
+                    items_per_block.push(items.len());
+                    for item in &items {
+                        if let Some(component) = component_from_element_key(spelling, &item.key) {
+                            recovered.insert(component);
+                        }
+                    }
+                    assert_eq!(
+                        ElementKeySpelling::Utf8, spelling,
+                        "a hash page spells its key as {spelling:?}, not as the field name"
+                    );
+                }
+                ContainerBlockDecode::NotFramed => not_framed += 1,
+                ContainerBlockDecode::Corrupt(why) => {
+                    corrupt += 1;
+                    println!("[pay] a staged page is CORRUPT: {why}");
+                }
+            }
+        }
+    }
+    let expected: std::collections::BTreeSet<String> =
+        (0..FIELDS).map(|index| format!("field-{index:04}")).collect();
+    println!(
+        "[pay] staged pages: {framed} framed, {not_framed} not framed, {corrupt} corrupt; \
+         spellings={spellings:?}"
+    );
+    println!(
+        "[pay] items per staged page: min={:?} max={:?}; {} distinct components recovered of {} \
+         fields written",
+        items_per_block.iter().min(),
+        items_per_block.iter().max(),
+        recovered.len(),
+        expected.len()
+    );
+    assert_eq!(
+        expected, recovered,
+        "the field names recovered from the staged pages are not the ones written"
+    );
+
+    // (3b) WHAT A COLD REPLAY READS TODAY. The baseline for the whole trade: if this is already
+    // nonzero per record, resolving from the payload is free; if it is zero, resolving from the
+    // payload is a new read per record unless the carried page covers it.
+    //
+    // THE COUNTER IS PROVED TO MOVE FIRST, because a zero from an instrument that cannot rise is
+    // not a measurement -- this tree has a recorded finding that every in-engine counter reported a
+    // restore as flat.
+    let replayed = engine_on(source.path());
+    let control_before = replayed.block_store().stats().reads;
+    let started = std::time::Instant::now();
+    load_on(&replayed, OPERATOR_END);
+    let elapsed = started.elapsed();
+    let after_load = replayed.block_store().stats().reads;
+    let served = read(
+        &replayed,
+        Command::HashGetAll {
+            key: KEY.to_string(),
+        },
+    );
+    let after_read = replayed.block_store().stats().reads;
+    let fields_served = match &served {
+        crate::types::CommandResponse::HashEntries { entries } => entries.len(),
+        other => panic!("HashGetAll answered {other:?}"),
+    };
+    println!(
+        "[pay] cold replay of {} records: {} block reads, {:?} wall clock; a HashGetAll then took \
+         {} more reads and served {fields_served} field(s)",
+        records.len(),
+        after_load - control_before,
+        elapsed,
+        after_read - after_load
+    );
+    assert_eq!(
+        expected.len(),
+        fields_served,
+        "the cold replay did not serve the fields that were written, so its read count is a count \
+         of the wrong thing"
+    );
+    assert!(
+        after_read > after_load,
+        "THE READ COUNTER DOES NOT MOVE even for a read that must touch pages, so the load figure \
+         above is an instrument reading zero rather than a measurement of zero"
+    );
+    println!(
+        "[pay] BASELINE: {} block reads per replayed record",
+        (after_load - control_before) as f64 / records.len().max(1) as f64
+    );
+}
+
+/// WHAT RESOLVING THE ELEMENT FROM THE PAGE COSTS A REPLAY, AND WHAT IT SAVES A RECORD.
+///
+/// # WHY THIS ARM DECIDES THE CHANGE RATHER THAN DESCRIBING IT
+///
+/// Reading the field name off the page means replay has to GET the page. If replay does not already
+/// have it, that is one block read per replayed record -- and recovery time is a product property,
+/// so the trade would be bytes on disk against seconds of recovery. This arm is the number that
+/// trade is made on, and it is the read COUNT rather than the wall clock that carries it: a count
+/// is exact, and a wall clock on this box moves with whatever else is running on it.
+///
+/// # THE THREE NUMBERS
+///
+///   1. THE PRODUCTION PATH COSTS NOTHING, asserted and not merely printed. `block_in_wal::stage`
+///      is UNCONDITIONAL -- its own doc records that the flag which gated it is gone -- so every
+///      page a write produces travels inside its record and replay has already deserialized it.
+///      The baseline measured on the base before this change was 0 block reads for a cold replay;
+///      the assertion here is that it is STILL 0, which is the whole of the cost argument.
+///   2. THE FALLBACK IS PRICED ANYWAY, because it is reachable: a record carrying several pages of
+///      ONE key cannot say which page an outcome is about (`StagedBlock` is keyed by object id,
+///      which is per key and not per element), so those resolve by ADDRESS and pay a read each.
+///      Driven through `install_shared_outcomes_with_blocks` with no carried pages, which is
+///      exactly that arm.
+///   3. AND WHAT IS SAVED, PER RECORD, WITH BOTH ARMS NAMED. A hash field's component is the
+///      field name as text; a set member's is HEX, two characters a byte. So the two kinds save
+///      different amounts and quoting one as the figure would be a mean for a distribution.
+///      Measured by encoding the real record through the real framer twice, once with the name and
+///      once without.
+///
+/// rust-internal: measurement, no product behaviour
+#[test]
+fn what_resolving_the_element_from_the_block_costs_a_replay() {
+    const KEY: &str = "cost-hash";
+    const FIELDS: usize = 256;
+
+    let source = tempfile::tempdir().unwrap();
+    let engine = engine_on(source.path());
+    load_on(&engine, OPERATOR_END);
+    for index in 0..FIELDS {
+        write(
+            &engine,
+            Command::HashSet {
+                key: KEY.to_string(),
+                field: format!("field-{index:04}"),
+                value: format!("value-{index}").into_bytes(),
+            },
+        );
+    }
+    // A SET MEMBER TOO, so the saving can be priced on the kind whose component is hex rather than
+    // quoted from the kind whose component is the caller's own text.
+    let member = vec![0xA7u8; 20];
+    write(
+        &engine,
+        Command::SetAdd {
+            key: "cost-set".to_string(),
+            member: member.clone(),
+        },
+    );
+
+    let lines = engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .expect("the log scans");
+    let records: Vec<crate::wal::WriteAheadLogRecord> = lines
+        .iter()
+        .map(|(sequence, line)| {
+            crate::wal::decode_wal_line(line)
+                .unwrap_or_else(|error| panic!("record {sequence} does not decode: {error}"))
+        })
+        .collect();
+    assert!(
+        records.len() > FIELDS,
+        "the log holds {} records for {} writes",
+        records.len(),
+        FIELDS + 1
+    );
+
+    // --- (1) THE PRODUCTION PATH: a real cold load, with the records carrying their pages. ---
+    let replayed = engine_on(source.path());
+    let before = replayed.block_store().stats().reads;
+    let started = std::time::Instant::now();
+    load_on(&replayed, OPERATOR_END);
+    let elapsed = started.elapsed();
+    let replay_reads = replayed.block_store().stats().reads - before;
+    let served = match read(
+        &replayed,
+        Command::HashGetAll {
+            key: KEY.to_string(),
+        },
+    ) {
+        crate::types::CommandResponse::HashEntries { entries } => entries.len(),
+        other => panic!("HashGetAll answered {other:?}"),
+    };
+    let after_read = replayed.block_store().stats().reads;
+    println!(
+        "[cost] PRODUCTION cold replay of {} records: {replay_reads} block reads, {elapsed:?}; it \
+         serves {served} of {FIELDS} fields",
+        records.len()
+    );
+    assert_eq!(
+        FIELDS, served,
+        "the cold replay served {served} of {FIELDS} fields, so its read count is a count of the \
+         wrong thing"
+    );
+    // THE INSTRUMENT IS PROVED TO MOVE, because a zero from a counter that cannot rise is not a
+    // measurement of zero. This tree has a recorded finding that every in-engine counter reported a
+    // restore as flat.
+    assert!(
+        after_read > replay_reads + before,
+        "the read counter did not move even for a HashGetAll that must touch pages, so the replay \
+         figure above is an instrument reading zero rather than a measurement"
+    );
+    assert_eq!(
+        0, replay_reads,
+        "A COLD REPLAY NOW PERFORMS {replay_reads} BLOCK READS WHERE THE BASE PERFORMED 0. That is \
+         the cost this change was not allowed to pay: resolving the element from the page is only \
+         free while the page travels inside its record, and if this is non-zero the carried-page \
+         arm has stopped firing and every replayed record is paying an I/O"
+    );
+
+    // --- (2) THE FALLBACK, PRICED. Same outcomes, no carried pages, so every one resolves by
+    //         reading the address. This is what a multi-page record costs. ---
+    let outcomes: Vec<crate::wal::WalOutcomeItem> = records
+        .iter()
+        .flat_map(|record| record.outcomes.iter().cloned())
+        .filter(|item| item.kind == "hash" && !item.deleted)
+        .collect();
+    assert_eq!(
+        FIELDS,
+        outcomes.len(),
+        "the fixture produced {} live hash outcomes for {FIELDS} writes",
+        outcomes.len()
+    );
+    let by_address = engine_on(source.path());
+    load_on(&by_address, OPERATOR_END);
+    let before_fallback = by_address.block_store().stats().reads;
+    let started = std::time::Instant::now();
+    let installed = by_address.install_shared_outcomes_with_blocks(1, &outcomes, &[]);
+    let fallback_elapsed = started.elapsed();
+    let fallback_reads = by_address.block_store().stats().reads - before_fallback;
+    println!(
+        "[cost] FALLBACK (no carried page): installed={installed}, {fallback_reads} block reads \
+         for {} outcomes, {fallback_elapsed:?}",
+        outcomes.len()
+    );
+    assert!(
+        installed,
+        "resolving by address refused, so the price above is the price of a failure"
+    );
+    assert!(
+        fallback_reads >= outcomes.len() as u64,
+        "the fallback performed {fallback_reads} reads for {} outcomes; fewer than one each means \
+         it is not reading the page it claims to be reading",
+        outcomes.len()
+    );
+    println!(
+        "[cost] so the element name costs 0 reads where the page is carried and 1 read where it is \
+         not; the production replay path carries it unconditionally"
+    );
+
+    // --- (3) WHAT IS SAVED PER RECORD, BOTH KINDS NAMED. ---
+    let price = |record: &crate::wal::WriteAheadLogRecord| -> (usize, usize) {
+        let with = crate::wal::encode_wal_line_for_test(record)
+            .expect("the record frames")
+            .len();
+        let mut stripped = record.clone();
+        for item in stripped.outcomes.iter_mut() {
+            item.component = None;
+        }
+        for block in stripped.staged_blocks.iter_mut() {
+            block.component = None;
+        }
+        let without = crate::wal::encode_wal_line_for_test(&stripped)
+            .expect("the stripped record frames")
+            .len();
+        (with, without)
+    };
+    let hash_record = records
+        .iter()
+        .find(|record| record.outcomes.iter().any(|item| item.kind == "hash"))
+        .expect("a hash record");
+    let set_record = records
+        .iter()
+        .find(|record| record.outcomes.iter().any(|item| item.kind == "set"))
+        .expect("a set record");
+    let (hash_with, hash_without) = price(hash_record);
+    let (set_with, set_without) = price(set_record);
+    println!(
+        "[cost] per record on disk: hash {hash_with} B -> {hash_without} B (saves {}), set with a \
+         20-byte member {set_with} B -> {set_without} B (saves {})",
+        hash_with - hash_without,
+        set_with - set_without
+    );
+    println!(
+        "[cost] and in memory, per outcome and per carried page: Option<String> is {} B and \
+         Option<Arc<str>> is {} B of struct, plus the heap the name itself takes -- 10 B for \
+         `field-0000` and 40 B for a 20-byte member rendered as hex",
+        std::mem::size_of::<Option<String>>(),
+        std::mem::size_of::<Option<std::sync::Arc<str>>>()
+    );
+    assert!(
+        hash_with > hash_without && set_with > set_without,
+        "stripping the element name did not make either record smaller, so there is nothing to \
+         save and the whole trade is off"
+    );
+    assert!(
+        set_with - set_without > hash_with - hash_without,
+        "a hex-rendered 20-byte member saved no more than a ten-character field name, so the two \
+         arms are not the two arms this is pricing"
+    );
+}
+
+/// THE RECORDED OUTCOME NO LONGER HAS TO CARRY THE ELEMENT NAME, BECAUSE THE PAGE DOES.
+///
+/// # WHAT THIS ARM SAYS, AND WHAT IT SAID BEFORE
+///
+/// It was introduced asserting the OPPOSITE, and that assertion was right about the code it was
+/// written against: `apply_outcome_item`'s hash arm asked the OUTCOME for the field name, so
+/// clearing it refused the load -- `wal_replay_outcome_refused`, "component missing". The same arm
+/// recorded the fact that made this change possible: every carried page payload DOES name its
+/// elements, so the field was dead weight behind a replay path that did not ask the page.
+///
+/// THE REPLAY PATH NOW ASKS THE PAGE, so the arm keeps its fixture and inverts its claim.
+///
+/// # IT IS DRIVEN THROUGH THE REAL REPLAY LOOP, AND THAT IS NOT INCIDENTAL
+///
+/// The first version of this arm drove `install_shared_outcomes_with_blocks`, and it FAILED -- for
+/// a reason that turned out to be a defect in that path rather than in this change, which
+/// `the_shared_install_pairs_carried_blocks_by_object_and_component`
+/// below records in full. The short form: that path pairs a carried page to an outcome by
+/// `object_id`, which is per (kind, key) and NOT per element, so for a record carrying several
+/// pages of one key it attaches the FIRST page's bytes to every outcome. While the outcome carried
+/// the field name that produced the right names over the wrong bytes; reading the name off the page
+/// turns the same defect into the wrong names. So the arm moved to `load_shard`, which is the path
+/// a restart takes and which does not localise anything.
+///
+/// # THE CONTROLS, AND WHAT EACH ONE RULES OUT
+///
+///   * ZERO RECORDS CARRY AN OPERATION, asserted. A load that restored the fields by RE-EXECUTING
+///     `Command::HashSet` would satisfy the subject while proving nothing about the page, and this
+///     tree has a recorded finding of exactly that shape.
+///   * THE UNTOUCHED LOAD IS THE POSITIVE CONTROL. A load that refused everything would satisfy
+///     the broken-frame arm below and say nothing.
+///   * AND THE FRAME IS BROKEN IN A THIRD ARM, which is what makes the page the SOURCE rather than
+///     a coincidence. If clearing the name leaves the fields coming back AND destroying the page's
+///     frame also leaves them coming back, something else is supplying them.
+#[test]
+fn a_recorded_outcome_without_its_element_name_replays_no_hash_field_at_all() {
+    const KEY: &str = "wo-hash";
+    let fields: [(&str, &[u8]); 3] = [("alpha", b"1"), ("beta", b"22"), ("gamma", b"333")];
+    let expected: std::collections::BTreeSet<String> =
+        fields.iter().map(|(field, _)| (*field).to_string()).collect();
+
+    let source = tempfile::tempdir().unwrap();
+    let engine = engine_on(source.path());
+    load_on(&engine, OPERATOR_END);
+    for (field, value) in fields {
+        write(
+            &engine,
+            Command::HashSet {
+                key: KEY.to_string(),
+                field: field.to_string(),
+                value: value.to_vec(),
+            },
+        );
+    }
+
+    let lines = engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .expect("the log scans");
+    let records: Vec<crate::wal::WriteAheadLogRecord> = lines
+        .iter()
+        .map(|(sequence, line)| {
+            crate::wal::decode_wal_line(line)
+                .unwrap_or_else(|error| panic!("record {sequence} does not decode: {error}"))
+        })
+        .collect();
+
+    // THE CONTROL AGAINST RE-EXECUTION: there is no operation in these records to re-run, so a
+    // field that comes back came back from what the write RECORDED.
+    let carrying_a_command = records.iter().filter(|record| record.command.is_some()).count();
+    println!(
+        "[outcome-name] {} records, {carrying_a_command} carrying an operation",
+        records.len()
+    );
+    assert_eq!(
+        0, carrying_a_command,
+        "{carrying_a_command} of {} records carry their operation, so a field that comes back \
+         below may have been re-derived by re-running the command rather than read off the page",
+        records.len()
+    );
+
+    // THE REAL REPLAY LOOP. The records are re-appended through the append path into the SAME store
+    // -- same block store, so the addresses the outcomes name resolve exactly as they do after a
+    // restart -- and then a fresh engine over those directories is loaded.
+    let replay = |strip: bool, break_the_frame: bool| -> (bool, String, std::collections::BTreeSet<String>) {
+        let into = tempfile::tempdir().unwrap();
+        // The pages are copied so the addresses resolve; the log is rebuilt from the records.
+        let copy = std::process::Command::new("cp")
+            .arg("-a")
+            .arg(source.path().join("blocks"))
+            .arg(into.path().join("blocks"))
+            .status()
+            .expect("the page directory copies");
+        assert!(copy.success(), "copying the pages failed, so the fixture has no store");
+        let fresh = engine_on(into.path());
+        let log = fresh.write_ahead_log_store();
+        for record in &records {
+            let mut record = record.clone();
+            if strip {
+                for item in record.outcomes.iter_mut() {
+                    item.component = None;
+                }
+                for block in record.staged_blocks.iter_mut() {
+                    block.component = None;
+                }
+            }
+            if break_the_frame {
+                for block in record.staged_blocks.iter_mut() {
+                    if !block.bytes.is_empty() {
+                        block.bytes[0] ^= 0xFF;
+                    }
+                }
+            }
+            log.append_replayed_record(record).expect("the replayed record appends");
+        }
+        let response = fresh.load_shard_with(crate::control::LoadShardRequest {
+            shard_id: 1,
+            table_name: "durable-outranks".to_string(),
+            shard_uri: "local://durable-outranks/1".to_string(),
+            start_routing_bucket: 0,
+            end_routing_bucket: OPERATOR_END,
+            readonly: false,
+            load_version: 1,
+            local_node_id: Some(1),
+        });
+        let held = if response.status.ok {
+            let shards = fresh.shards.read().expect("engine lock poisoned");
+            shards
+                .get(&1)
+                .and_then(|shard| shard.hashes.get(KEY))
+                .map(|held| held.keys().map(|name| name.to_string()).collect())
+                .unwrap_or_default()
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        (response.status.ok, format!("{:?}", response.status), held)
+    };
+
+    // THE POSITIVE CONTROL: untouched records load and serve every field.
+    let (control_ok, control_status, control_fields) = replay(false, false);
+    println!("[outcome-name] CONTROL   ok={control_ok} fields={control_fields:?}");
+    assert!(
+        control_ok,
+        "a log of UNTOUCHED records did not load: {control_status}. Then nothing below is about \
+         the element name"
+    );
+    assert_eq!(
+        expected, control_fields,
+        "the untouched replay restored {control_fields:?} and the write touched {expected:?}"
+    );
+
+    // THE SUBJECT: the element name cleared from every outcome AND every carried page.
+    let (stripped_ok, stripped_status, stripped_fields) = replay(true, false);
+    println!("[outcome-name] NO NAME   ok={stripped_ok} fields={stripped_fields:?}");
+    assert!(
+        stripped_ok,
+        "a replay whose outcomes name no element was REFUSED: {stripped_status}. The page each \
+         outcome points at names its own field, so a refusal means the replay path has gone back \
+         to asking the outcome -- which is the dead weight this change removed"
+    );
+    assert_eq!(
+        expected, stripped_fields,
+        "a replay with no element name anywhere restored {stripped_fields:?} and the write \
+         touched {expected:?}. Anything short means the page is not being read for every element"
+    );
+
+    // AND THE PAGE IS THE SOURCE: break every carried frame and the fields must STOP coming back.
+    let (broken_ok, broken_status, broken_fields) = replay(true, true);
+    println!(
+        "[outcome-name] NO FRAME  ok={broken_ok} fields={broken_fields:?} status={broken_status}"
+    );
+    assert!(
+        !broken_ok,
+        "a replay with no element name AND no readable frame still loaded, holding \
+         {broken_fields:?}. Then the field names are coming from somewhere other than the page, \
+         and the arm above is passing for the wrong reason"
+    );
+    assert!(
+        broken_status.contains("wal_replay_outcome_refused"),
+        "the load failed, but not as a refused replay outcome: {broken_status}"
+    );
+
+    println!(
+        "[outcome-name] VERDICT: the page is the authority. Untouched {} of {}; with the element \
+         name CLEARED everywhere {} of {}; with the page's frame destroyed the load is REFUSED",
+        control_fields.len(),
+        expected.len(),
+        stripped_fields.len(),
+        expected.len()
+    );
+}
+
+/// A DEFECT THIS CHANGE EXPOSED AND DID NOT CAUSE: THE SHARED INSTALL PAIRS A PAGE TO AN OUTCOME BY
+/// AN ID THAT CANNOT DISCRIMINATE.
+///
+/// # WHAT IT IS
+///
+/// `install_shared_outcomes_with_blocks` localises an entry whose addresses belong to another
+/// store: for each outcome whose address does not resolve locally it finds a carried page and
+/// appends it here. The find is
+///
+/// ```text
+///     carried.iter().find(|page| page.object_id == item.object_id)
+/// ```
+///
+/// and an object id is derived from (kind, key) -- it is NOT per element. `StagedBlock::component`'s
+/// own doc says what that costs, in a measurement predating this arm: "two pages of one key sharing
+/// an id serve 1 of 2 correctly, and the page that loses is handed the FIRST page's BYTES rather
+/// than answering missing." The pairing has never used the outcome's element name, so this is not
+/// something the element name was protecting.
+///
+/// # WHY IT IS RECORDED HERE RATHER THAN FIXED HERE
+///
+/// Because the fix is a change to a different path with a different shape, and this arm is what
+/// makes it findable. While the outcome carried the field name, the defect produced the RIGHT NAMES
+/// over the WRONG BYTES -- three fields installed, each pointing at the first field's page -- which
+/// is why no existing arm caught it. Reading the name off the page makes the same defect produce
+/// the wrong NAMES, which is louder but no more wrong. Both are corruption and the pairing is the
+/// cause.
+///
+/// THE FIX IS NOT "PAIR BY THE COMPONENT", which is the obvious move and is the wrong one: it
+/// re-introduces the per-page element name as an addressing key on the very path this campaign is
+/// taking it off. The shape that works is to iterate the CARRIED PAGES rather than the outcomes --
+/// each page names its own elements and, once localised, has its own address -- so no per-page key
+/// is needed on either side. That is a separate change and it is not attempted here.
