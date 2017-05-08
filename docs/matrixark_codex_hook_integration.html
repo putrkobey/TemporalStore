@@ -83,3 +83,45 @@ retrieval, summaries, entities, segments, indexes, embeddings, and ContextPack
 audits all go through the MatrixArk direct adapter backed by the live
 TemporalStore SDK.
 
+Validation report:
+
+- [matrixark_codex_hook_e2e.md](matrixark_codex_hook_e2e.md)
+- [matrixark_codex_hook_e2e.html](matrixark_codex_hook_e2e.html)
+- [matrixark_codex_hook_e2e.json](matrixark_codex_hook_e2e.json)
+
+## Local JSONL E2E Test
+
+This mode remains useful for unit tests and debugging, but it is not the
+preferred MatrixArk-on-Codex path.
+
+From the TemporalStore repo:
+
+```bash
+python3 tools/matrixark_codex_hook.py \
+  --event UserPromptSubmit \
+  --event-log /tmp/matrixark-codex-hook.jsonl \
+  --account-id acct_codex \
+  --tenant-id tenant_codex \
+  --user-id local_user &lt;&lt;&#x27;JSON&#x27;
+{&quot;prompt&quot;:&quot;Remember that Alice approved the GPU purchase for Project Orion.&quot;}
+JSON
+
+python3 tools/matrixark_codex_hook.py \
+  --event UserPromptSubmit \
+  --event-log /tmp/matrixark-codex-hook.jsonl \
+  --account-id acct_codex \
+  --tenant-id tenant_codex \
+  --user-id local_user &lt;&lt;&#x27;JSON&#x27;
+{&quot;prompt&quot;:&quot;What was approved for Project Orion?&quot;,&quot;thread_id&quot;:&quot;codex-thread-1&quot;}
+JSON
+```
+
+Inspect records:
+
+```bash
+tail -n 20 /tmp/matrixark-codex-hook.jsonl
+```
+
+Run the automated test:
+
+```bash
