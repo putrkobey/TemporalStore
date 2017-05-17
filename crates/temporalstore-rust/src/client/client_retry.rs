@@ -66,3 +66,37 @@ pub(super) fn status_is_retryable(status: &Status) -> bool {
         code.as_str(),
         "deadlineexceeded"
             | "deadline_exceeded"
+            | "unavailable"
+            | "internal"
+            | "retrylater"
+            | "retry_later"
+            | "partitionloading"
+            | "partition_loading"
+            | "metachanged"
+            | "meta_changed"
+            | "topomerror"
+            | "topom_error"
+            | "notserving"
+            | "not_serving"
+            | "staleloadversion"
+            | "stale_load_version"
+            // A request that lands on a node that no longer owns the shard (post-
+            // migration) must re-resolve the route -- the not-owner topology error
+            // forces a topology re-sync.
+            | "shardnotloaded"
+            | "shard_not_loaded"
+            | "shardnotfound"
+            | "shard_not_found"
+            | "loadversionmismatch"
+            | "load_version_mismatch"
+            // A foreground write refused while its shard is loading, reloading or unloading.
+            // Every one of those states ends on its own, and the data node refuses the write
+            // BEFORE executing it, so asking again cannot duplicate anything. Not topology
+            // retryable: the shard has not moved, so re-resolving the route names the same
+            // node. Without this a rebalance, a restart or a dump/load cycle reached the
+            // caller as failed writes, while the two conditions directly above -- which say
+            // the same thing about the same shard -- were retried.
+            | "lifecyclewriteblocked"
+            | "lifecycle_write_blocked"
+    )
+}
