@@ -196,3 +196,202 @@ fn measure_warm_reads(engine: &TemporalEngine, records: usize) -> WarmArm {
         }));
     }
     let counted = span.close().expect("the counting allocator must be installed");
+    let after = engine.cache().stats();
+
+    WarmArm {
+        counted,
+        memory_hits: after.memory_hits.saturating_sub(before.memory_hits),
+        disk_hits: after.disk_hits.saturating_sub(before.disk_hits),
+        misses: after.misses.saturating_sub(before.misses),
+    }
+}
+
+/// EVERY ARM MUST REACH A WARM MEMORY HIT AND NOTHING ELSE.
+///
+/// A read path that quietly misses is not a measurement of a warm hit: it is a measurement of
+/// the 29.13-allocation absent case wearing the warm case's label, and every number taken from
+/// it is wrong by a factor of three. Floored on the case it must reach and pinned to zero on the
+/// two it must not, so no single value can satisfy the assertion and the failure at once.
+/// The warm-hit floor as a PREDICATE, so a control can fire it on a shape no arm here produces.
+///
+/// Split out because the floor had nothing to discriminate while it was only ever applied to arms
+/// that warm: weakening `>= READS` to `>= 0` changed no verdict in this module, and a floor that
+/// cannot change a verdict is not a floor. The control below plants the one shape it exists to
+/// catch -- an arm that served SOME answers from memory but fewer than it measured reads.
+#[cfg(feature = "alloc-probe")]
+fn warm_hit_floor_holds(memory_hits: u64, disk_hits: u64, misses: u64) -> bool {
+    memory_hits >= READS as u64 && disk_hits == 0 && misses == 0
+}
+
+#[cfg(feature = "alloc-probe")]
+fn assert_reached_a_warm_hit_and_only_that(label: &str, arm: &WarmArm) {
+    // THE VERDICT COMES FROM THE PREDICATE, not from a second copy of the same three clauses
+    // written out here. Two spellings of one rule is how one of them keeps a bug the other
+    // fixed -- and mutation found exactly that: weakening the inline copy changed every arm's
+    // verdict while the control over the predicate stayed green.
+    assert!(
+        warm_hit_floor_holds(arm.memory_hits, arm.disk_hits, arm.misses),
+        "{label}: {READS} warm reads produced memory_hits {}, disk_hits {}, misses {}. A warm arm \
+         serves every read it measures from memory and touches neither the SSD tier nor a miss; \
+         an arm that does not is measuring one of the other two cases under this one's label",
+        arm.memory_hits,
+        arm.disk_hits,
+        arm.misses,
+    );
+}
+
+#[cfg(feature = "alloc-probe")]
+fn report(label: &str, arm: &WarmArm) {
+    println!(
+        "  {label:<34} | {:>6.2} allocs {:>8.0} B per warm read | cache_read {:>5.2} \
+         | recency_stamp {:>5.2} | residual {:>6} allocs | memory_hits {:>5} disk_hits {:>4} \
+         misses {:>4}",
+        arm.allocs_per_read(),
+        arm.bytes_per_read(),
+        arm.per_read(crate::alloc_probe::AllocClass::CacheRead),
+        arm.per_read(crate::alloc_probe::AllocClass::RecencyStamp),
+        arm.counted.residual_allocs(),
+        arm.memory_hits,
+        arm.disk_hits,
+        arm.misses,
+    );
+}
+
+/// WHAT A WARM SERVING READ COSTS NOW, ON BOTH FIXTURES, AT BOTH CORPUS SIZES.
+///
+/// The four arms differ in the corpus (512 against 4,096) and in whether the shard carries the
+/// two names a metaserver gives it. Nothing else moves: same capacity, same key width, same
+/// store path length, asserted equal at the end rather than trusted.
+///
+/// MEASURED, this change in:
+///
+/// ```text
+///   fixture                 512 records        4,096 records     ratio
+///   load_shard (unnamed)     8.00 allocs        8.00 allocs      1.00x
+///   named shard             10.00 allocs       10.00 allocs      1.00x
+/// ```
+///
+/// Against 10.00 and 12.00 before it. The 2.00 that comes off is the recency stamp, and the
+/// 2.00 that separates the two fixtures is the `ShardInfo` clone, which stands.
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn where_a_warm_serving_reads_allocations_go() {
+    let mut path_lengths = Vec::new();
+    let mut unnamed = Vec::new();
+    let mut named = Vec::new();
+
+    for &records in &[SMALL, LARGE] {
+        println!("\nCORPUS {records} records, value {VALUE_BYTES} B, {READS} warm reads per arm");
+
+        let plain_dir = tempfile::tempdir().unwrap();
+        let (engine, len) = engine_at(plain_dir.path());
+        path_lengths.push(len);
+        let plain = measure_warm_reads(&engine, records);
+        report("load_shard, two empty names", &plain);
+        assert_reached_a_warm_hit_and_only_that("load_shard", &plain);
+        drop(engine);
+
+        let named_dir = tempfile::tempdir().unwrap();
+        let (engine, len) = engine_at_named(named_dir.path());
+        path_lengths.push(len);
+        let with_names = measure_warm_reads(&engine, records);
+        report("named shard, as a metaserver loads", &with_names);
+        assert_reached_a_warm_hit_and_only_that("named shard", &with_names);
+        drop(engine);
+
+        // The named shard must cost MORE, and the difference is the clone of two names this
+        // engine makes on every command to read four fields. An arm that did not show it would
+        // mean the clone had stopped happening -- which is the change this file declines to make
+        // and therefore the thing most worth noticing if someone else makes it.
+        //
+        // AN EQUALITY, NOT AN INEQUALITY. `ShardInfo` carries TWO names and the clone allocates
+        // once for each, so the difference is exactly 2.00. Asserting only that it costs
+        // MORE would stay true with one of the two names emptied -- the fixture would quietly
+        // stop being the production shape it claims to be, and the headline figure would drift
+        // from 12.00 to 11.00 without anything failing.
+        let names_cost = with_names.allocs_per_read() - plain.allocs_per_read();
+        assert_eq!(
+            names_cost, SHARD_INFO_CLONE_ALLOCS,
+            "the named shard cost {:.2} against the unnamed {:.2}, a difference of {names_cost:.2} \
+             and not {SHARD_INFO_CLONE_ALLOCS:.2}. That difference IS the per-command ShardInfo \
+             clone of a table name and a shard URI, and it is the whole of correction 2",
+            with_names.allocs_per_read(),
+            plain.allocs_per_read()
+        );
+        unnamed.push(plain.allocs_per_read());
+        named.push(with_names.allocs_per_read());
+
+        // THE RESIDUAL IS THE CHECK THAT THE ROWS ARE AN ATTRIBUTION OF THIS TOTAL rather than a
+        // separate quantity that happens to look like it. It is never negative -- that is double
+        // counting -- and the classes never claim more than the span made.
+        assert!(
+            plain.counted.residual_allocs() >= 0,
+            "the classes claim {} allocations of a span that made {}",
+            plain.counted.classes.summed().allocs,
+            plain.counted.total.allocs
+        );
+    }
+
+    // FLAT PER RECORD. Eight times the corpus, the same per-read cost, on both fixtures.
+    assert_eq!(
+        unnamed[0], unnamed[1],
+        "the unnamed arm cost {:.2} at {SMALL} records and {:.2} at {LARGE}; a warm read that \
+         moved with the corpus is not the flat cost this module reports",
+        unnamed[0], unnamed[1]
+    );
+    assert_eq!(
+        named[0], named[1],
+        "the named arm cost {:.2} at {SMALL} records and {:.2} at {LARGE}",
+        named[0], named[1]
+    );
+
+    // A BAND THAT EXCLUDES THE VALUE IT GUARDS AGAINST. 10.00 is what #1952 measured before the
+    // recency stamp stopped collecting; the assertion is strictly below it, so the pre-change
+    // figure cannot satisfy this and a silent revert cannot pass.
+    for cost in &unnamed {
+        assert!(
+            *cost < ALLOCS_BEFORE,
+            "a warm serving read costs {cost:.2} allocations against {ALLOCS_BEFORE:.2} before \
+             the recency stamp stopped collecting a Vec<String> to walk once and drop"
+        );
+        assert!(
+            *cost > 1.0,
+            "a warm serving read costs {cost:.2} allocations, which is at or below the single \
+             allocation the cache's own lookup makes; a fixture that stopped reading would \
+             report exactly this"
+        );
+    }
+
+    let first = path_lengths[0];
+    for (index, length) in path_lengths.iter().enumerate() {
+        assert_eq!(
+            *length, first,
+            "arm {index} ran against a store path of {length} characters, not {first}; \
+             allocation bytes move with that length at about six bytes a character"
+        );
+    }
+    println!(
+        "\n  store path held at {first} characters across all {} arms; \
+         unnamed {:.2}, named {:.2}, the difference is the per-command ShardInfo clone",
+        path_lengths.len(),
+        unnamed[0],
+        named[0],
+    );
+}
+
+/// THE RECENCY STAMP'S ROW, WITH THE CONTROL THAT PROVES IT IS BEING CHARGED.
+///
+/// A row that reads zero is exactly the shape of a class nobody enters, so zero on its own says
+/// nothing. The control is the WRITE arm: the same scope, the same production site, on a command
+/// whose keys `command_object_keys` SYNTHESISES and therefore has to build. It must be non-zero
+/// there and zero on the read, on one run of one binary, or the zero is an instrument failure
+/// rather than a saving.
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn the_recency_stamp_allocates_on_a_write_and_not_on_a_read() {
+    use crate::alloc_probe::AllocClass;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (engine, _) = engine_at(dir.path());
