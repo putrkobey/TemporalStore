@@ -1336,3 +1336,449 @@ fn a_released_bucket_reloads_every_name_element_by_element() {
             let mut shards = engine.shards.write().expect("engine lock poisoned");
             let shard = shards.get_mut(&1).expect("shard is loaded");
             crate::engine::storage_bucket_internals::reload_released_bucket(
+                shard,
+                1,
+                *routing_bucket,
+            )
+        };
+        assert!(reloaded, "bucket {routing_bucket} was released and refused to reload");
+    }
+
+    let after = block_triples(&engine);
+
+    // ELEMENT BY ELEMENT, and the count is asserted too -- but only as well as, never instead of.
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "the reload brought back {} pages against {} released",
+        after.len(),
+        before.len()
+    );
+    let mut compared = 0usize;
+    for (index, (left, right)) in before.iter().zip(after.iter()).enumerate() {
+        assert_eq!(
+            left, right,
+            "page {index} came back with different names: before {left:?}, after {right:?}. A \
+             count would have passed this"
+        );
+        compared += 1;
+    }
+    assert_eq!(
+        before.len(), compared,
+        "the element-by-element comparison ran over {compared} of {} pages",
+        before.len()
+    );
+    println!("  {compared} pages compared element by element, all three names identical");
+}
+
+/// Every page's three names and its address identity, sorted, so two walks are comparable.
+fn block_triples(engine: &TemporalEngine) -> Vec<(String, String, Option<String>, u64, u64)> {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    let mut triples: Vec<(String, String, Option<String>, u64, u64)> =
+        super::blocks_with_identity(&shard.bucket_index)
+            .into_iter()
+            .map(|(_, _, object_key, block)| {
+            (
+                block.model_id.as_str().to_string(),
+                object_key.to_string(),
+                None::<String>,
+                block.address.block_slab_id(),
+                block.address.offset(),
+            )
+        })
+        .collect();
+    triples.sort();
+    triples
+}
+
+// =================================================================================================
+// LOUD OR SILENT. What a spelling the registry cannot place actually does.
+// =================================================================================================
+
+/// A STORED SPELLING THE REGISTRY CANNOT PLACE IS REFUSED, AND THE REFUSAL NAMES IT.
+///
+/// THE MUTANT THIS PLANTS is the dangerous one for a narrowed field: a stored index carrying a
+/// spelling the engine does not know. Mapped onto some default variant it would file the page
+/// under a kind it does not have, and a page filed under the wrong kind is still on its slab while
+/// nothing looks for it -- silent corruption, not a red test.
+///
+/// The wire did NOT move for this change: the spelling is still written and read as a string. So
+/// the failure mode a migration would have had -- hex parsed as a length, a handle parsed as a
+/// string -- does not exist here, and what remains is exactly this one: a name with no row.
+#[test]
+fn a_stored_spelling_with_no_row_is_refused_by_name_at_the_decode() {
+    // THE REFUSAL IS ASSERTED ON THE ERROR, NOT THROUGH `should_panic`, AND THAT IS THE FIX.
+    //
+    // This was `should_panic` over an `.expect()`. `expect` renders its error with `Debug`,
+    // which ESCAPES the quotes the message puts around the model id, so the expectation
+    // carried a bare quote where the panic carried a backslashed one. The substring could
+    // never match, however right the refusal was, and this test was red on main for that
+    // reason alone -- while its twin below, which calls `stored_model_kind` directly and so
+    // reaches the expectation unescaped, passed the whole time. Reading the error here
+    // removes the question: the assertion is against the `Display` text a caller sees.
+    // PLANTED ON A REAL ENTRY AND A REAL KEY, AND THE PLANT MOVED ONTO THE KEY.
+    //
+    // It used to overwrite the entry's own `model_id`. The entry has no such field: the spelling
+    // is the composite key's LEFTMOST SLOT and the decode reads it back out of there, so a stored
+    // spelling with no row now arrives in the key -- and a plant on a field that no longer exists
+    // is not a weaker control, it is none. The key is rendered by the production renderer and only
+    // its kind slot is replaced, so this plants exactly the defect and nothing else.
+    let block = sample_entry();
+    let real_key = crate::engine::state::block_index_written_key(SAMPLE_ENTRY_OBJECT_KEY, &block);
+    let planted = real_key.replacen(block.model_id.as_str(), "not_a_model_kind", 1);
+    assert_ne!(
+        real_key, planted,
+        "the plant matched nothing in {real_key:?}, so the refusal below would be about the real \
+         spelling"
+    );
+    let stored = serde_json::from_value::<crate::engine::state::StoredBlockEntry>(
+        serde_json::to_value(&crate::engine::state::BlockEntryAt { block: &block }).expect("encode"),
+    )
+    .expect("a real entry decodes");
+    let error = stored
+        .into_parts_from_key(&planted)
+        .err()
+        .expect("a spelling with no row must be refused, not decoded")
+        .to_string();
+    assert!(
+        error.contains("no stored model kind for model id"),
+        "the decode refused with {error:?} rather than by naming the unplaceable spelling"
+    );
+    assert!(
+        error.contains("not_a_model_kind"),
+        "the refusal named no spelling: {error:?}. The message has to carry the name, or an
+         operator cannot tell which stored kind their store and this binary disagree about"
+    );
+}
+
+/// THE OBJECT [`sample_entry`] BELONGS TO, named once rather than at each encode.
+///
+/// The stored key is composed from the identity held BESIDE the page, so an arm that encodes one
+/// has to state which object it means. Same characters `sample_entry` puts on the entry.
+const SAMPLE_ENTRY_OBJECT_KEY: &str = "k";
+
+/// One page entry, for the tests that mutate a single field of a real encoding.
+fn sample_entry() -> BlockIndex {
+    BlockIndex {
+        model_id: StoredModelKind::String,
+        address: crate::block_store::ElementEntry::from_parts(1, 2, 4, Some(5), Some(6)),
+        dirty: true,
+        deleted: false,
+    }
+}
+
+/// AND THE SAME REFUSAL AT THE WRITE, which is the other direction a spelling arrives from.
+#[test]
+#[should_panic(expected = "no stored model kind for model id \"not_a_model_kind\"")]
+fn a_written_spelling_with_no_row_is_refused_by_name() {
+    crate::engine::storage_bucket_internals::stored_model_kind("not_a_model_kind");
+}
+
+/// THE TWO DERIVATIONS OF THE REPORT BYTE MUST AGREE, and they are independent.
+///
+/// `model_report_code` reads `StoredModelKind::report_code`; the registry's own guards derive their
+/// expectations from `ModelKind::report_code`. Those are two match arms generated from the same
+/// declaration, which is what makes the guards' comparison meaningful rather than a function
+/// checked against itself -- and what makes DRIFT between them possible. This pins the agreement
+/// over every live kind, and pins the retired half against the declared table.
+///
+/// It exists because a mutation run found the new accessor had no production caller at all: a
+/// second derivation nothing reached, so mutating it killed nothing. Routing the report through it
+/// fixed the reachability; this stops the two derivations diverging afterwards.
+#[test]
+fn the_two_derivations_of_the_report_byte_agree() {
+    use crate::engine::storage_bucket_internals::{
+        ModelKind, StoredModelKind as SMK, RETIRED_MODEL_REPORT_CODES,
+    };
+    let mut live = 0usize;
+    for kind in ModelKind::ALL {
+        let stored = SMK::from(*kind);
+        assert_eq!(
+            kind.report_code(),
+            stored.report_code(),
+            "the two derivations disagree for {:?}: ModelKind says {}, StoredModelKind says {}",
+            kind,
+            kind.report_code(),
+            stored.report_code()
+        );
+        assert_eq!(kind.as_str(), stored.as_str(), "and their spellings disagree for {kind:?}");
+        live += 1;
+    }
+    assert!(live >= 15, "only {live} live kinds were compared; the registry declares at least 15");
+
+    let mut retired = 0usize;
+    for (name, code) in RETIRED_MODEL_REPORT_CODES {
+        let stored = SMK::from_stored_name(name)
+            .unwrap_or_else(|| panic!("the entry's type cannot place the retired spelling {name:?}"));
+        assert!(stored.is_retired(), "{name:?} is declared retired and the entry's type says live");
+        assert_eq!(
+            *code,
+            stored.report_code(),
+            "the retired spelling {name:?} is declared as {code} and reads as {}",
+            stored.report_code()
+        );
+        retired += 1;
+    }
+    assert!(retired >= 2, "only {retired} retired spellings compared; the registry declares 2");
+
+    // AND NO TWO OF THE SEVENTEEN COLLIDE, read through the ACCESSOR rather than off the
+    // declaration. The declaration already has a const assert on its literals; that one cannot see
+    // a `report_code` whose arms stopped returning them, which is exactly the mutant that survived.
+    let mut seen: BTreeSet<u8> = BTreeSet::new();
+    for kind in SMK::ALL {
+        let code = kind.report_code();
+        assert_ne!(0, code, "{kind:?} packs as 0, the byte an empty bucket writes");
+        assert!(seen.insert(code), "two of the seventeen spellings pack as {code}");
+    }
+    assert_eq!(
+        SMK::ALL.len(),
+        seen.len(),
+        "{} spellings produced {} distinct bytes",
+        SMK::ALL.len(),
+        seen.len()
+    );
+    println!(
+        "\n=== the report byte ===\n  {live} live and {retired} retired spellings, {} distinct \
+         bytes over {} spellings, both derivations agreeing",
+        seen.len(),
+        SMK::ALL.len()
+    );
+}
+
+/// A RETIRED SPELLING STILL LOADS, which is why the entry's type covers BOTH halves of the
+/// registry rather than only the live walk's kinds.
+///
+/// `ModelKind` is the live walk's set and has no variant for a spelling no arm emits. An entry
+/// typed as that would refuse a store this engine opens TODAY: `storage_reporting` matches
+/// `"sequence"` on a live entry, and `model_report_code` has carried both retired spellings since
+/// #1970. So the entry's type is the seventeen-element set, and this drives both retired rows
+/// through a decode to prove it.
+#[test]
+fn a_retired_spelling_still_decodes_into_a_block_entry() {
+    let mut seen = 0usize;
+    for spelling in ["sequence", "context_embedding"] {
+        // THE SPELLING IS NAMED IN THE KEY, which is where a stored index carries it now. The
+        // entry has no `model_id` field, so a retired row arriving on an entry is not a state a
+        // store can be in; a retired row arriving in a page's KEY is.
+        let sample = sample_entry();
+        let real_key =
+            crate::engine::state::block_index_written_key(SAMPLE_ENTRY_OBJECT_KEY, &sample);
+        let key = real_key.replacen(sample.model_id.as_str(), spelling, 1);
+        assert_ne!(
+            real_key, key,
+            "the retired spelling was not planted into {real_key:?}, so this arm is about the \
+             live kind instead"
+        );
+        let stored = serde_json::from_value::<crate::engine::state::StoredBlockEntry>(
+            serde_json::to_value(&crate::engine::state::BlockEntryAt { block: &sample })
+                .expect("encode"),
+        )
+        .expect("a real entry decodes");
+        let (object_key, block) = stored
+            .into_parts_from_key(&key)
+            .unwrap_or_else(|err| panic!("a store carrying {spelling:?} must still load: {err}"));
+        assert_eq!(
+            SAMPLE_ENTRY_OBJECT_KEY,
+            &*object_key,
+            "the object key came back as something else beside the retired kind"
+        );
+        assert_eq!(
+            spelling,
+            block.model_id.as_str(),
+            "the spelling came back as something else"
+        );
+        assert!(
+            block.model_id.is_retired(),
+            "{spelling:?} is declared under `retired` and the entry does not say so"
+        );
+        seen += 1;
+    }
+    assert_eq!(2, seen, "both retired rows are supposed to be driven, not {seen}");
+    // The floor that ties the entry's set to the registry's two halves.
+    assert_eq!(
+        StoredModelKind::ALL.len(),
+        crate::engine::storage_bucket_internals::ModelKind::ALL.len()
+            + crate::engine::storage_bucket_internals::RETIRED_MODEL_REPORT_CODES.len(),
+        "the entry's spelling set is supposed to be exactly the registry's two halves: {} against \
+         {} live plus {} retired",
+        StoredModelKind::ALL.len(),
+        crate::engine::storage_bucket_internals::ModelKind::ALL.len(),
+        crate::engine::storage_bucket_internals::RETIRED_MODEL_REPORT_CODES.len(),
+    );
+}
+
+// =================================================================================================
+// THE CONTROL ON THE EXPLANATION. Where the mechanism predicts the effect is ABSENT.
+// =================================================================================================
+
+/// THE CONTROL: THE WIRE DID NOT MOVE, SO THE STORED BYTES MUST NOT HAVE.
+///
+/// Every claim above is about the IN-MEMORY width of a page entry. The mechanism -- a fat pointer
+/// to a string from a closed set becomes a discriminant, and the string is written as the string
+/// it always was -- predicts that the STORED encoding is byte-for-byte what it was. That is a
+/// place the effect must be ABSENT, and 0.00% is the answer that distinguishes this change from
+/// one that quietly moved the format.
+///
+/// Driven rather than asserted: an entry is encoded through the same serializers the index uses
+/// -- the NAMED one and the POSITIONAL one, because #1969 found the index log packs positionally
+/// and a field that changed shape would shift every field after it -- and the bytes are compared
+/// against the spelling recorded when the field was an `Arc<str>`.
+#[test]
+fn the_model_spelling_did_not_move_on_the_wire_and_the_entry_lost_three_steps_in_memory() {
+    // What the entry encoded to when `model_id` was an `Arc<str>`, captured at b8b12d30 by
+    // `block_entry_names::capture_the_stored_spelling_of_a_block_entry`'s shape and re-derived here
+    // from an equal-valued map so the golden is the VALUE, not this type's own impl.
+    let block = sample_entry();
+
+    // THROUGH THE WRAPPER IN ALL THREE ENCODINGS, and the msgpack pair is why the wrapper counts
+    // its fields rather than hard-coding one: `to_vec` writes the entry POSITIONALLY, so a field
+    // count or an order that moved would move these bytes and not just the named form's.
+    let at = crate::engine::state::BlockEntryAt { block: &block };
+    let named = rmp_serde::to_vec_named(&at).expect("named encode");
+    let positional = rmp_serde::to_vec(&at).expect("positional encode");
+    let json = serde_json::to_value(&at).expect("json encode");
+
+    println!(
+        "\n=== the stored spelling ===\n  named {} B, positional {} B\n  json {}",
+        named.len(),
+        positional.len(),
+        json
+    );
+
+    // THE MODEL SPELLING IS STILL A STRING ON THE WIRE -- AND IT HAS MOVED OFF THE ENTRY ONTO THE
+    // KEY, WHICH IS A CHANGE TO THIS CONTROL'S SUBJECT AND IS WRITTEN UP RATHER THAN RELAXED.
+    //
+    // The claim was "the spelling is written as the string it always was, on the entry". Half of
+    // that is unchanged: it is still a STRING and not a number, so the migration hazard this
+    // control exists for -- hex parsed as a length, a handle parsed as a string -- still does not
+    // exist. What moved is WHERE: it is the composite key's leftmost slot now, and the entry
+    // writes no copy. Asserting the old location would be asserting the change away.
+    assert!(
+        json.get("model_id").is_none(),
+        "the entry still writes its own copy of the model spelling, which the composite key \
+         already spells: {json}"
+    );
+    assert!(
+        json.get("object_key").is_none(),
+        "the entry still writes its own copy of the object key, which the composite key already \
+         spells: {json}"
+    );
+    let stored_key = crate::engine::state::block_index_written_key(SAMPLE_ENTRY_OBJECT_KEY, &block);
+    assert!(
+        stored_key.starts_with("string:"),
+        "the model spelling is supposed to be written as the string it always was, in the key's \
+         leftmost slot; the key reads {stored_key:?}"
+    );
+
+    // And it round-trips through both encoders, positionally included -- which is the encoder a
+    // shifted field would break.
+    // DECODED INTO THE STORED SHAPE, which is what the wire holds: the entry itself has no
+    // `Deserialize`, and the positional encode is exactly why that matters -- a field count or an
+    // order that moved between the two wrappers would land here and nowhere else.
+    //
+    // AND THE IDENTITY COMES FROM THE KEY, NOT FROM THE ROW. That is what makes the POSITIONAL arm
+    // worth keeping: the row is three slots now, and a field count or an order that moved would
+    // land here and nowhere else, while the object key and the kind are supplied from the one
+    // place that still has them.
+    let (named_key, from_named) =
+        rmp_serde::from_slice::<crate::engine::state::StoredBlockEntry>(&named)
+            .expect("named decode")
+            .into_parts_from_key(&stored_key)
+            .expect("the key the production renderer wrote must invert");
+    let (positional_key, from_positional) =
+        rmp_serde::from_slice::<crate::engine::state::StoredBlockEntry>(&positional)
+            .expect("positional decode")
+            .into_parts_from_key(&stored_key)
+            .expect("the key the production renderer wrote must invert");
+    for (label, key, decoded) in [
+        ("named", &named_key, &from_named),
+        ("positional", &positional_key, &from_positional),
+    ] {
+        assert_eq!(
+            block.model_id, decoded.model_id,
+            "{label}: the spelling did not survive the round trip"
+        );
+        // THE IDENTITY IS COMPARED AGAINST WHAT THE FIXTURE NAMED, not against a copy on the
+        // decoded entry. It arrives BESIDE the entry now, which is the whole of the move: the key
+        // the encoder was handed is the key the decoder hands back.
+        assert_eq!(
+            SAMPLE_ENTRY_OBJECT_KEY,
+            &**key,
+            "{label}: object_key moved across the round trip"
+        );
+        // No component on the entry, so there is no such field to survive a round trip.
+        assert_eq!(block.dirty, decoded.dirty, "{label}: dirty moved");
+        assert_eq!(block.deleted, decoded.deleted, "{label}: deleted moved");
+        // NOT a stored field any more, and this is the ONLY address property this loop checks --
+        // there is no `address` comparison beside it -- so the accessor comparison still has
+        // content: it asserts the block id's PRESENCE survives both encoders.
+        assert_eq!(
+            block.log_backed(),
+            decoded.log_backed(),
+            "{label}: the address stopped agreeing about log-residency across the round trip"
+        );
+    }
+
+    // THE ABSENT EFFECT, as THREE numbers now, because three changes have taken bytes off this entry
+    // and a single subtraction would let any of them absorb another's.
+    //
+    // The model spelling took it 88 -> 72, which is the sixteen this test was written for. The address
+    // inside it then took it 72 -> 64 by shedding its routing bucket and narrowing its block id. Then
+    // `object_id` left that address and took it 64 -> 56 -- a WHOLE eight-byte field out of the
+    // eight-aligned group, which is why it paid alone where neither narrowing did. All three are
+    // asserted separately, so none can be credited with another's bytes.
+    //
+    // AND THE WIRE IS NO LONGER UNTOUCHED, WHICH IS WHY THIS TEST IS RENAMED. It held that the stored
+    // bytes did not move AT ALL. The MODEL SPELLING still has not moved -- asserted above, written as
+    // the string it always was -- but the address inside this entry now writes its `oi` slot empty,
+    // which IS a stored move and is what the format stamp pays for -- 6, not the 4 this text first
+    // named: 4 was reserved while main held 3, main is 5 now, and a stamp may only increase. The slot is
+    // still present, because the index log packs positionally. See
+    // `per_item_byte_budget::the_stored_form_moved_in_one_slot_and_the_version_stamp_pays_for_it`,
+    // which is the tripwire for that and fired on this change.
+    // A FOURTH STEP JOINS THE CHAIN, so the last link is not asked to carry two of them.
+    //
+    // The chain was 88 -> 72 -> 64 -> `size_of`, with the final link asserted at EIGHT: the
+    // address shedding its object id. The entry then stopped naming its element, which is another
+    // sixteen, and the final link measured 24 -- so the assertion failed naming the right
+    // mechanism for the wrong arithmetic. The milestone the object id left it at is written down
+    // (56) and the new step gets its own link and its own assertion, which is what keeps each
+    // claim attributable to one change.
+    let in_memory_before = 88usize;
+    let after_the_spelling = 72usize;
+    let after_the_address_narrowing = 64usize;
+    let after_shedding_the_object_id = 56usize;
+    let after_shedding_the_element_name = 40usize;
+    let in_memory_after = std::mem::size_of::<BlockIndex>();
+    let spelling_wire_delta = 0i64;
+    println!(
+        "  in memory {in_memory_before} -> {after_the_spelling} -> {after_the_address_narrowing} \
+         -> {after_shedding_the_object_id} -> {after_shedding_the_element_name} -> \
+         {in_memory_after} B ({:.2}% in total), model spelling on the wire \
+         {spelling_wire_delta} B (0.00%)",
+        100.0 * (in_memory_before - in_memory_after) as f64 / in_memory_before as f64
+    );
+    assert_eq!(
+        16,
+        in_memory_before - after_the_spelling,
+        "the model spelling's in-memory effect is supposed to be sixteen bytes"
+    );
+    assert_eq!(
+        8,
+        after_the_spelling - after_the_address_narrowing,
+        "the address narrowing's in-memory effect is supposed to be eight bytes, and it is eight \
+         because SIX bytes of address payload left in two narrowings of which neither crosses a \
+         multiple of eight alone"
+    );
+    assert_eq!(
+        8,
+        after_the_address_narrowing - after_shedding_the_object_id,
+        "shedding the address's object id is supposed to be eight bytes, and unlike the two \
+         narrowings above it pays ALONE: it is a whole eight-byte field leaving the eight-aligned \
+         group, not a field getting smaller inside it"
+    );
+    assert_eq!(
+        16,
+        after_shedding_the_object_id - after_shedding_the_element_name,
+        "the entry giving up its element NAME is supposed to be sixteen bytes -- a fat optional \
