@@ -175,3 +175,91 @@ impl TemporalStoreTable {
             .response
         {
             CommandResponse::ContextObjectKey { object_key } => Ok(object_key),
+            response => Err(ClientError::UnexpectedResponse {
+                operation: "context_write_pack_audit",
+                response,
+            }),
+        }
+    }
+
+    pub fn context_query_pack_audit(
+        &self,
+        tenant_hash: u64,
+        session_hash: u64,
+        start_time_ms: u64,
+        end_time_ms: u64,
+        limit: Option<usize>,
+    ) -> Result<Vec<ContextPackAudit>, ClientError> {
+        match self
+            .execute(Command::ContextQueryPackAudit {
+                tenant_hash,
+                session_hash,
+                start_time_ms,
+                end_time_ms,
+                limit,
+            })?
+            .response
+        {
+            CommandResponse::ContextPackAudits { audits, .. } => Ok(audits),
+            response => Err(ClientError::UnexpectedResponse {
+                operation: "context_query_pack_audit",
+                response,
+            }),
+        }
+    }
+
+    pub fn context_mark_summary_dirty(
+        &self,
+        tenant_hash: u64,
+        node_hash: u64,
+        event_time_ms: u64,
+        reason: u32,
+        propagate_depth: u32,
+    ) -> Result<String, ClientError> {
+        match self
+            .execute(Command::ContextMarkSummaryDirty {
+                tenant_hash,
+                node_hash,
+                event_time_ms,
+                reason,
+                propagate_depth,
+            })?
+            .response
+        {
+            CommandResponse::ContextObjectKey { object_key } => Ok(object_key),
+            response => Err(ClientError::UnexpectedResponse {
+                operation: "context_mark_summary_dirty",
+                response,
+            }),
+        }
+    }
+
+    pub fn context_query_summary_dirty(
+        &self,
+        tenant_hash: u64,
+        node_hash: u64,
+        start_time_ms: u64,
+        end_time_ms: u64,
+        limit: Option<usize>,
+    ) -> Result<Vec<ContextDirtyNode>, ClientError> {
+        match self
+            .execute(Command::ContextQuerySummaryDirty {
+                tenant_hash,
+                node_hash,
+                start_time_ms,
+                end_time_ms,
+                limit,
+            })?
+            .response
+        {
+            CommandResponse::ContextSummaryDirtyNodes { nodes, .. } => Ok(nodes),
+            response => Err(ClientError::UnexpectedResponse {
+                operation: "context_query_summary_dirty",
+                response,
+            }),
+        }
+    }
+
+    /// Mark a context node embedding-dirty (its semantic embedding is deferred or
+    /// failed). Independent of the summary-dirty marker.
+    pub fn context_mark_embedding_dirty(
