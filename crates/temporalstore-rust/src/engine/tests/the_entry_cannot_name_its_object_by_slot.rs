@@ -1,0 +1,595 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright 2026 MatrixArkAI
+
+//! CAN A PAGE ENTRY NAME ITS OBJECT BY ITS SLOT IN THE BUCKET'S OBJECT LIST? NO, AND THE TWO
+//! GROUNDS ARE INDEPENDENT.
+//!
+//! THE PROPOSAL, AND IT IS THE BEST-SHAPED ONE THIS ROUTE HAS HAD. `BlockIndex::object_key` is an
+//! `Arc<str>` at sixteen bytes on an entry that is FORTY with no slack. Swapping it for a
+//! four-byte ordinal takes the field sum to twenty-eight and the width to thirty-two, MEASURED
+//! BELOW. Every previous attempt at that paid for the ordinal with a stored object-ordinal table,
+//! and a second stored structure is the one thing this leg may not add. So the question asked here
+//! is narrower: IS THE ORDINAL DERIVABLE FROM SOMETHING THE INDEX ALREADY HOLDS?
+//!
+//! FORTY, NOT FIFTY-SIX, AND THE SECOND TARGET IS NOW THE FIRST. This module arrived from main
+//! written against an entry of 56, where the ordinal step reached 44 of field in 48 and a further
+//! 28-in-32 waited behind "another lane's change" to the element name. That lane has LANDED on
+//! this branch: the entry is 40, so the ordinal step reaches 28 in 32 in ONE move and the two
+//! targets this module measured have become one. The 44/48 mirror is kept as the figure against
+//! the entry it was measured on, and the tie between the two probes is what shows the element
+//! name's removal was exactly the difference between them.
+//!
+//! AND THE ANSWER TO THAT NARROW QUESTION IS YES, ON THE WIRE -- WHICH IS WHY THE REFUSAL HAD TO
+//! BE DRIVEN RATHER THAN ASSUMED. `bucket.object_index` is a slot array whose positions #2057 and
+//! the stored form that followed it made durable: `Serialize` writes slot order with `null`
+//! placeholders, `Deserialize` reads back `Vec<Option<u64>>` by position, and
+//! `ObjectSlots::from_stored_slots` files them where they were written rather than through
+//! `insert`. A slot is therefore a WRITTEN position and costs no new structure. The one objection
+//! recorded against a bucket-relative number -- that the three deciding sites take a bare
+//! `&BlockIndex` with no bucket in scope -- is also gone, because `routing_bucket` is a FIELD on
+//! the entry now, so `(routing_bucket, slot)` is readable from the entry alone. Both halves of the
+//! lead check out at the wire.
+//!
+//! IT STILL FAILS, ON TWO GROUNDS THAT DO NOT DEPEND ON EACH OTHER.
+//!
+//! # GROUND 1 -- THE WIRE KEEPS THE POSITIONS AND THE LOAD THROWS THEM AWAY
+//!
+//! MEASURED, END TO END. Two objects are stored at slots 0 and 1 -- read off the object list's own
+//! `Serialize`, so the positions are known to have been written. After a dump and a restart on the
+//! same directories, the surviving LIVE object is at slot 0. `persistence.rs:487` runs
+//! `update_bucket_layout` over every bucket once the index-log delta has folded, and that scan is
+//! confirmed to have run; which of its arms moved the id is deliberately NOT asserted, for the
+//! reason below.
+//!
+//! SO NO ENTRY'S SLOT SURVIVES A RESTART -- live or tombstoned -- and an ordinal stored on an entry
+//! names a different object or none after the first one.
+//!
+//! THREE DRAFTS OF THIS TEST WERE WRONG AND ALL THREE FAILURES ARE KEPT IN IT, because each was
+//! caught by a different part of the apparatus and that is the only reason the claim above is the
+//! size it is.
+//!
+//!   * DRAFT ONE asserted that a `SetRemove` frees the tombstoned object's slot. It does not: the
+//!     remove path at `storage_bucket_internals.rs:4086` drops an id only when NO ENTRY names it
+//!     -- `block_index.values().any(|page| page.object_id(shard_id) == removed_object_id)`, with
+//!     no `!page.deleted` filter -- so a tombstone holds its slot, which is exactly the invariant
+//!     a durable ordinal needs. `reconcile_object_index_with_live_blocks`'s own doc comment had
+//!     said in advance that the load is "the fatal one for anything that stored a slot, and it is
+//!     also the quietest, which is why a test driving a write and finding nothing proves nothing
+//!     here". A write is what draft one drove.
+//!   * DRAFT TWO asserted that the load frees the TOMBSTONE'S slot and leaves the live object's
+//!     alone, since `update_bucket_layout` filters `!page.deleted`. THE CONTROL caught it: the
+//!     live witness moved too. The ground is wider than a tombstone.
+//!   * DRAFT THREE named a RECONSTRUCT as the branch that renumbered it. THE COUNTER caught it:
+//!     `rebuilds +5, reconstructs +0, list_held_an_object_no_block_names +1` -- the load
+//!     RECONCILED, and the live id moved anyway. The same reading is why no branch is asserted
+//!     now: one load scanned five buckets and these counters are SHARD-WIDE, so a delta of +1 is
+//!     not attributable to the bucket under test.
+//!
+//! WHY THE EXISTING STABILITY PROOF DOES NOT COVER THIS. `a_slot_into_the_object_list_survives_
+//! the_three_mutations_that_invalidated_an_ordinal` watches a live object across three in-memory
+//! mutations, and the tests in `the_slot_survives_a_reload` round-trip `ObjectIndex` through its
+//! own serde impls. Both are true and neither drives an ENGINE reload, which is where the
+//! reconstruct is. The rule they establish is the documented one -- "slot `i` names the same
+//! object for as long as that object is in the bucket" -- and the rule a durable ordinal needs is
+//! that a slot names one object for as long as any ENTRY names the slot.
+//!
+//! THE CONTROL IS THE STORED FORM, read off the object list's own `Serialize` before the dump, so
+//! "the positions were written and then discarded" is measured at both ends. Without it, a
+//! renumbering reload would be indistinguishable from positions that were never durable.
+//!
+//! # GROUND 2 -- THE ENTRY IS THE ONLY DURABLE HOME OF THE KEY'S CHARACTERS
+//!
+//! A slot resolves to a `u64` that is `hashing::stable_block_object_id(shard, kind, key)`, an
+//! FNV-1a hash. It is an IDENTITY and it is not invertible, so no ordinal can hand a reader the
+//! characters. Of the fifty-nine production sites the compiler names (below), the ones that want
+//! characters have exactly one place to get them, and it is the field being removed:
+//!
+//!   * `BUCKET_NODE_FIELDS` is thirteen names. `object_index` and `deleted_object_index` are bare
+//!     ids. `block_index` is the `BlockIndex` rows. Nothing else on a node carries text.
+//!   * The block store does not keep a key with a page; `object_key` appears in `block_store.rs`
+//!     only in prose about routing.
+//!   * The index-log row DOES carry `object_key` as text -- and it is not a fallback, for two
+//!     reasons that compose. It is WRITTEN FROM THE ENTRY (`collect_command_index_items_for` sets
+//!     `object_key: page.object_key.clone()` at `engine.rs:3328`), so it is downstream of the
+//!     field rather than independent of it, and the compiler census is the proof of that
+//!     dependency; and `dump_and_reclaim_index_logs_with_min_reclaimable` gives the log back once
+//!     a dump has made the base index authoritative, so it is not durable past a dump either.
+//!
+//! `the_block_entry_is_the_only_durable_home_of_an_object_keys_characters` drives that, with both
+//! controls: a key that IS in the store must be found (or the scan is vacuous) and a key of the
+//! same shape that is NOT must be found nowhere (or the matcher matches anything). MEASURED: of
+//! the twelve members a stored `BucketNode` writes, the key's characters are in `block_index` and
+//! in no other, and `object_index`'s 106 bytes are ids and placeholders only.
+//!
+//! AND IT IS MEASURED ON THE SERIALIZED NODE, NOT ON THE FILE, because of a detector failure worth
+//! recording. A first draft scanned the raw bytes of every file under the engine's three
+//! directories for the key's characters and found them in NONE of fourteen files, which reads as
+//! "the characters are not durable at all" and would have OPENED this leg. The stored index is
+//! COMPRESSED -- `shard-1.index.json` begins with `TSIDX` -- so that scan could not have found a
+//! key in it at any width. The test's own positive control is what caught it: a key the store
+//! certainly holds was found nowhere, which is a statement about the scan and not about the store.
+//! The measurement is taken on `BucketNode`'s own `Serialize` output instead, which is what the
+//! compressor is handed.
+//!
+//! A SECOND DETECTOR FAILED THE SAME WAY AND IS ALSO RECORDED. The index-log arm first bounded the
+//! log's BYTES against the characters written; its control refused, because the log reads 0 bytes
+//! before the dump as well as after -- this fixture's rows are not on disk until the dump writes
+//! them, so the bound could not tell the two states apart. That arm now asserts CONTENT, with the
+//! matcher controlled on both sides over the same byte search.
+//!
+//! THE PRECEDENT THAT DOES NOT TRANSFER, and it is worth naming because it is the obvious hope. A
+//! tombstone page already stores its own element key, so "ask what already holds the fact" is the
+//! right question here. The answer is that nothing does: a tombstone stores a COMPONENT, which is
+//! a different field, and it stores it per page rather than per object.
+//!
+//! # THE READER CENSUS, BY COMPILER AND NOT BY GREP
+//!
+//! Measured at `2ae24a03d` by replacing the field with `pub(super) object_ordinal: u32` and
+//! running `cargo check --lib`: 59 production field sites, 52 reads (E0609) and 7 constructions
+//! (E0560). A grep for the field name over-counts, and E0560 SUPPRESSES E0063 on the same literal,
+//! so the construction arm is a FLOOR until the first pass is fixed. `--lib` is also not all code:
+//! it does not compile examples, the test targets, or `#[cfg(feature)]` regions.
+//!
+//! Split by what each site actually wants, and the split is what decides the leg:
+//!
+//!   * 28 sites use the text only AS AN IDENTITY and an ordinal serves them. 14 are
+//!     `&*page.object_key == key` against a caller's `&str`; 6 compare the entry against another
+//!     in-tree row that could carry the ordinal too; 2 are `contains` over a caller's key set;
+//!     1 is `block_index_handle`, which hashes the key to a handle and would hash
+//!     `(routing_bucket, ordinal)` instead -- both terms on the entry; and 5 reach
+//!     `ObjectBlockLookup`, which could be re-keyed by `(routing_bucket, slot)`.
+//!   * 22 sites WANT THE CHARACTERS and have no other source: `block_index_written_key`, the
+//!     `IndexItem` row, `LiveBlockEntry`, `runtime_report`'s public `object_keys`,
+//!     `StoragePhysicalBlockIndex` (2), `filing_by_object_key`, `released_block_identity`, the
+//!     `dropped` triples in the release path, the delete-marker sample, the `dirty_objects` probes
+//!     (4), `expires_at_ms` (1), the lifecycle dump, and `bucket_object_count`'s distinct-object
+//!     tuples (2).
+//!   * 1 site CANNOT BE SERVED AT ALL, and it is `storage_bucket_internals.rs:2247`:
+//!     `block_routing_bucket(&block.object_key, start, end) != routing_bucket`. The bucket is
+//!     FNV-1a over the key BYTES, so no ordinal produces it -- and the `routing_bucket` field is
+//!     not a substitute, because the check exists precisely to compare the bucket a block's KEY
+//!     routes to against the bucket HOLDING it. Its own comment says it "compares two INDEPENDENT
+//!     things rather than a block's copy of its bucket against the bucket holding it". Feeding it
+//!     the field turns a check that can fail into one that cannot.
+//!
+//! WHAT WOULD REOPEN THIS. Ground 1 is a fixable defect, and the fix is not the one that looks
+//! obvious: the load path would have to preserve positions THROUGH the reconcile -- a live set
+//! taken over every entry rather than every live page, no collapse that can move a surviving id,
+//! and no give-back of trailing positions -- at the cost of an array no longer bounded by the
+//! bucket's live high water mark. Ground 2 is not fixable without a durable ordinal-to-characters
+//! map, which is the second index this leg exists to avoid. So the leg is refused on Ground 2, and
+//! Ground 1 is the reason a partial fix would not rescue it.
+//!
+//! AND GROUND 2 HAS SINCE BEEN ANSWERED FOR THIRTEEN OF THE FIFTEEN LIVE KINDS, WHICH IS WHY THIS
+//! PARAGRAPH IS NO LONGER THE LAST WORD ON IT. The sentence above asks for a durable
+//! ordinal-to-characters map and calls it a second index. What
+//! [`super::where_the_characters_are_durable_per_kind`] measures is that no such map has to be
+//! ADDED: the characters are already held durably, per kind, by the model map that kind's objects
+//! live in, recoverable from a decode with no page read. Twelve kinds hand the key back from their
+//! own map, `context_entity` by composing two durable terms, `context_event` only from the time
+//! index -- with a constructed hole where even that fails -- and `context_index` not at all.
+//!
+//! SO THIS MODULE'S GROUND 2 SURVIVES FOR ONE KIND AND NOT FOR THIRTEEN, and the leg's remaining
+//! cost moved to the OTHER direction: an assigned id needs `characters -> id`, which the per-kind
+//! maps do not carry. [`super::what_an_assigned_id_costs_the_object_lookup`] prices the three
+//! places that direction can live and finds exactly one that pays for itself. Nothing measured in
+//! this module is retracted -- the ordinal is still refused on Ground 1, and the slot positions
+//! still do not survive a reload.
+//!
+//! AND ONE THING THE WIDTH WORK SETTLED ON THE WAY, found by a mutation and not by argument: the
+//! ORDINAL'S WIDTH DOES NOT MOVE THE ENTRY. u8, u16, u32 and u64 all land it at 48, because the
+//! tail carries four bytes of padding and the address is eight-aligned. A fail-first mutation that
+//! widened the field to `u64` left every assertion GREEN, which exposed both that and a real
+//! defect in this module: the field sums were hand-written literals standing beside the structs
+//! rather than reconstructions of them. They are taken off a real instance's fields with
+//! `size_of_val` now, so a field whose type moves moves the sum.
+//!
+//! WHAT THE 48 IS WORTH, so the refusal is priced rather than merely stated. Eight bytes an entry
+//! of resident width, and nothing on disk -- the stored row's `object_key` would become a number,
+//! which is smaller, but the characters would then have to be written somewhere else. Against that:
+//! a load path that must retain positions, 28 call sites to re-point, 22 readers that need a new
+//! source for the characters, and one -- `block_routing_bucket` over the key BYTES -- that has
+//! none.
+//!
+//! NO STORED SHAPE MOVES HERE, SO NO `SHARD_INDEX_FORMAT_VERSION` IS OWED. This module adds
+//! measurements and changes no production code.
+//!
+//! EVERY ASSERTION HERE WAS SHOWN TO FAIL ON CODE THAT DOES NOT HOLD IT, and three of the six
+//! demonstrations were accidents rather than planned mutations:
+//!
+//!   * the three drafts above -- a removal that keeps the slot, a control that caught the live
+//!     witness moving, and a counter that refused the named branch;
+//!   * widening the mirror's ordinal to `u64`, which FIRST PASSED and exposed the parallel-literal
+//!     field sums, and reddens the sum now;
+//!   * planting a field in either mirror, which reddens that mirror's width and its tie;
+//!   * comparing the stored array against itself instead of against the reloaded one;
+//!   * watching the slot the witness actually lands in rather than its stored one;
+//!   * pointing the member matcher at the never-written key, which fires the positive control.
+//!
+//! rust-internal: drives this crate's own engine, index log and layout scan, no external surface
+
+#![allow(clippy::all)]
+
+use super::*;
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
+use crate::block_store::ElementEntry;
+use crate::engine::state::BlockIndex;
+use crate::engine::storage_bucket_internals::StoredModelKind;
+
+// =================================================================================================
+// THE WIDTH
+// =================================================================================================
+
+/// THE FIELD SET A FOUR-BYTE ORDINAL WOULD LEAVE, with every type taken from the entry it was
+/// measured against.
+///
+/// IT KEEPS ITS ELEMENT-NAME TERM ON PURPOSE, AND THAT MAKES IT A HISTORICAL FIGURE NOW. 44 of
+/// field in 48 is the ordinal step applied to the entry as it stood at `2ae24a03d`, which still
+/// carried `component`. This branch removed that field, so the ordinal step applied to the LIVE
+/// entry is `BothGoneEntry` below -- 28 in 32 -- and that is the figure a reader should take from
+/// this module.
+///
+/// THIS ONE IS KEPT RATHER THAN RETIRED FOR TWO REASONS, both of which the assertions use: it is
+/// the measured rustc transcript recorded in the paragraph below, and the tie between the two
+/// probes is what shows the element name's removal is EXACTLY the difference between the two
+/// targets. That tie now reads as a step that has been taken rather than one still owed.
+///
+/// A MIRROR AND NOT A RESTATEMENT. Nothing here is a literal: each field is spelled with the type
+/// the real `BlockIndex` spells it with, so a field whose own width moves elsewhere moves this
+/// structure too and fails here rather than passing against a stale number. `#[repr]`-free, so the
+/// compiler lays it out exactly as it lays out the real entry.
+///
+/// MEASURED, NOT PROPOSED. `size_of::<BlockIndex>()` with `object_key: Arc<str>` replaced by
+/// `object_ordinal: u32` in the real struct was read off rustc at `2ae24a03d` as **48**, and the
+/// field sum as **44**, by making the compiler print them: a
+/// `const _: [(); 0] = [(); std::mem::size_of::<BlockIndex>()];` reports "expected an array with a
+/// size of 0, found one with a size of 48". This mirror reproduces both, which is what makes it
+/// usable as a stand-in for a struct this module does not change.
+struct OrdinalEntry {
+    _kind: crate::index_log::IndexItemKind,
+    _routing_bucket: u32,
+    _object_ordinal: u32,
+    _model_id: StoredModelKind,
+    _component: Option<Arc<str>>,
+    _address: ElementEntry,
+    _dirty: bool,
+    _deleted: bool,
+}
+
+/// THE FIELD SET ONCE `component` HAS GONE TOO -- the 28/32 this leg of the campaign is aiming at.
+///
+/// AND IT IS THE LIVE TARGET NOW, NOT THE ONE AFTER NEXT. This read "`component` is another lane's
+/// change and nothing here touches it." That lane has LANDED: `BlockIndex` has no element-name
+/// field, so this structure is the live entry with its object key swapped for an ordinal, and
+/// reaching 32 is ONE step rather than two. The probe is unchanged -- it was already written
+/// without the element name, which is why it compiled through the merge while
+/// `live_entry_field_sum` did not.
+///
+/// This structure exists so the target is pinned to the LIVE types rather than carried as a number
+/// in prose, and so it cannot drift: the assertions below tie it to `BlockIndex` through the width
+/// of the one field that would have to leave.
+struct BothGoneEntry {
+    _kind: crate::index_log::IndexItemKind,
+    _routing_bucket: u32,
+    _object_ordinal: u32,
+    _model_id: StoredModelKind,
+    _address: ElementEntry,
+    _dirty: bool,
+    _deleted: bool,
+}
+
+fn an_address() -> ElementEntry {
+    ElementEntry::from_parts(1, 64, 32, Some(9), Some(11))
+}
+
+/// THE SUMS ARE TAKEN OFF AN INSTANCE'S FIELDS, NOT WRITTEN OUT BESIDE THEM -- and a mutation is
+/// the reason.
+///
+/// These were hand-written sums spelling each term as `size_of::<u32>()` and so on. That reads as a
+/// reconstruction and is not one: widening `OrdinalEntry::_object_ordinal` from `u32` to `u64`
+/// left all three tests GREEN, because the sum went on saying `size_of::<u32>()` while the struct
+/// said `u64`. Two parallel statements of one fact, and the assertion was on the one that had not
+/// moved.
+///
+/// `size_of_val` over the fields of a real instance cannot drift that way: the term IS the field.
+fn ordinal_entry_field_sum() -> usize {
+    let probe = OrdinalEntry {
+        _kind: crate::index_log::IndexItemKind::Block,
+        _routing_bucket: 0,
+        _object_ordinal: 0,
+        _model_id: StoredModelKind::String,
+        _component: None,
+        _address: an_address(),
+        _dirty: false,
+        _deleted: false,
+    };
+    std::mem::size_of_val(&probe._kind)
+        + std::mem::size_of_val(&probe._routing_bucket)
+        + std::mem::size_of_val(&probe._object_ordinal)
+        + std::mem::size_of_val(&probe._model_id)
+        + std::mem::size_of_val(&probe._component)
+        + std::mem::size_of_val(&probe._address)
+        + std::mem::size_of_val(&probe._dirty)
+        + std::mem::size_of_val(&probe._deleted)
+}
+
+fn both_gone_field_sum() -> usize {
+    let probe = BothGoneEntry {
+        _kind: crate::index_log::IndexItemKind::Block,
+        _routing_bucket: 0,
+        _object_ordinal: 0,
+        _model_id: StoredModelKind::String,
+        _address: an_address(),
+        _dirty: false,
+        _deleted: false,
+    };
+    std::mem::size_of_val(&probe._kind)
+        + std::mem::size_of_val(&probe._routing_bucket)
+        + std::mem::size_of_val(&probe._object_ordinal)
+        + std::mem::size_of_val(&probe._model_id)
+        + std::mem::size_of_val(&probe._address)
+        + std::mem::size_of_val(&probe._dirty)
+        + std::mem::size_of_val(&probe._deleted)
+}
+
+/// THE LIVE ENTRY'S SUM, OFF A REAL `BlockIndex`. Every other figure in this module is anchored on
+/// this one, so it is the term that most needs not to be a literal.
+///
+/// AND IT EARNED THAT: this is the function that refused to compile when the element-name field
+/// left the declaration (E0560), because it builds a real entry rather than listing widths beside
+/// one. A parallel literal would have gone on summing a field that was no longer there.
+fn live_entry_field_sum() -> usize {
+    let probe = BlockIndex {
+        model_id: StoredModelKind::String,
+        address: an_address(),
+        dirty: false,
+        deleted: false,
+    };
+    // FOUR TERMS NOW. The `object_key` term went with the field, and this function is the one
+    // that EARNED its shape twice: it builds a real `BlockIndex` and reads `size_of_val` off each
+    // field, so a field leaving the declaration stops it compiling. A parallel list of widths
+    // would have gone on summing a term that was no longer there, which is what happened to four
+    // mirrors elsewhere in this tree.
+    std::mem::size_of_val(&probe.model_id)
+        + std::mem::size_of_val(&probe.address)
+        + std::mem::size_of_val(&probe.dirty)
+        + std::mem::size_of_val(&probe.deleted)
+}
+
+/// rust-internal: arithmetic over this crate's own types, no external surface
+#[test]
+fn the_width_an_object_ordinal_would_reach_against_the_live_entrys_own() {
+    println!("\n=== THE WIDTH, AT THIS COMMIT ===");
+    println!(
+        "  live BlockIndex      field_sum {:>3}  size_of {:>3}",
+        live_entry_field_sum(),
+        std::mem::size_of::<BlockIndex>()
+    );
+    println!(
+        "  with a u32 ordinal   field_sum {:>3}  size_of {:>3}",
+        ordinal_entry_field_sum(),
+        std::mem::size_of::<OrdinalEntry>()
+    );
+    println!(
+        "  and component gone   field_sum {:>3}  size_of {:>3}",
+        both_gone_field_sum(),
+        std::mem::size_of::<BothGoneEntry>()
+    );
+
+    // THE LIVE ENTRY, WHICH IS WHAT EVERYTHING ELSE IS ANCHORED ON.
+    //
+    // FORTY, NOT FIFTY-SIX, AND THESE TWO ASSERTIONS ARE WHY THAT WAS NOT MISSED. They arrived
+    // from main pinning 56 and the field sum beside it. `BlockIndex` has no element-name field on
+    // this branch -- `component: Option<Arc<str>>`, sixteen bytes -- so the entry is seven fields
+    // and 40. `live_entry_field_sum` built a real `BlockIndex` and refused to compile at all
+    // (E0560, "has no field named `component`"), which is the strongest form of this guard: the
+    // sum is taken off a real instance rather than a parallel literal, so a field that leaves the
+    // declaration cannot leave the sum silently.
+    assert_eq!(
+        24,
+        std::mem::size_of::<BlockIndex>(),
+        "the live entry is {} bytes, not 24, so every figure below is anchored on a width that \
+         has moved",
+        std::mem::size_of::<BlockIndex>()
+    );
+    assert_eq!(
+        19,
+        live_entry_field_sum(),
+        "the live entry's fields add up to {} rather than 19; the identity has left the entry on \
+         top of the two LOG-ONLY fields that went before it, so the ZERO SLACK this leg was \
+         priced against has been gone for two legs",
+        live_entry_field_sum()
+    );
+
+    // WHAT THE ORDINAL PRODUCES: 44 of field in 48. MEASURED on the real struct and reproduced
+    // here; see `OrdinalEntry`'s own doc comment for the rustc transcript.
+    assert_eq!(
+        44,
+        ordinal_entry_field_sum(),
+        "the ordinal field set adds up to {} bytes, not 44 -- the width this module is about is \
+         the four-byte one, and the sum is taken off the mirror's own fields, so a field whose \
+         type moved is what this is reporting",
+        ordinal_entry_field_sum()
+    );
+    assert_eq!(
+        48,
+        std::mem::size_of::<OrdinalEntry>(),
+        "the ordinal field set lands at {} bytes, not the 48 rustc measured on the real struct",
+        std::mem::size_of::<OrdinalEntry>()
+    );
+
+    // THE 32 PROBE: 28 of field in 32.
+    assert_eq!(
+        28,
+        both_gone_field_sum(),
+        "the post-removal field set adds up to {}, not 28",
+        both_gone_field_sum()
+    );
+    assert_eq!(
+        32,
+        std::mem::size_of::<BothGoneEntry>(),
+        "the post-removal field set lands at {} bytes, not 32",
+        std::mem::size_of::<BothGoneEntry>()
+    );
+
+    // NO SLACK BEYOND THE ROUNDING, asserted as the claim rather than read off a spare byte. Both
+    // mirrors are exactly their field sum rounded up to a word, and the remainder is PRINTED
+    // rather than called nothing: 44 in 48 and 28 in 32 each carry four bytes of tail, so the
+    // next field added to either costs NOTHING, where the next field added to the live
+    // fifty-six-in-fifty-six costs EIGHT. That difference is the thing a reader needs, and the
+    // phrase "zero slack" applied to these two would hide it.
+    for (what, field_sum, width) in [
+        (
+            "with a u32 ordinal",
+            ordinal_entry_field_sum(),
+            std::mem::size_of::<OrdinalEntry>(),
+        ),
+        (
+            "and component gone",
+            both_gone_field_sum(),
+            std::mem::size_of::<BothGoneEntry>(),
+        ),
+        (
+            "live BlockIndex",
+            live_entry_field_sum(),
+            std::mem::size_of::<BlockIndex>(),
+        ),
+    ] {
+        assert_eq!(
+            (field_sum + 7) / 8 * 8,
+            width,
+            "{what} is {width} bytes wide for {field_sum} bytes of field, which is not that sum \
+             rounded up to a word -- so something in it is padded internally and the arithmetic \
+             above is not a reconstruction of it"
+        );
+        println!("  {what:<20} tail {} bytes", width - field_sum);
+    }
+
+    // AND THE SECOND TIE RE-ANCHORS FOR THE THIRD TIME, WHICH IS ITSELF THE FINDING.
+    //
+    // It began as `live_entry_field_sum() == ordinal_entry_field_sum() - u32 + Arc<str>` -- the
+    // live entry is the ordinal mirror with one field swapped back. Every leg since has taken a
+    // field off the live entry and left the mirror alone, so the left side has grown a term per
+    // leg: the element name, then `kind` and `routing_bucket`, and now the object key itself. The
+    // mirror models an entry that is four fields away from the live one.
+    //
+    // IT IS RE-ANCHORED RATHER THAN RETIRED BECAUSE THE TIE IS STILL THE ONLY THING HOLDING THE
+    // MIRROR TO A REAL STRUCTURE: without it the ordinal's 44 is a number about nothing. But a
+    // tie that needs a growing list of retired terms is a mirror that should be rebuilt against
+    // the live field set, and that is the next thing this module owes -- recorded here rather
+    // than done in a commit about the width, where a rebuilt mirror would move the ordinal
+    // figures this module's verdict rests on.
+    assert_eq!(
+        live_entry_field_sum() + std::mem::size_of::<Option<Arc<str>>>()
+        + std::mem::size_of::<crate::index_log::IndexItemKind>()   // kind, retired
+        + std::mem::size_of::<u32>()                               // routing_bucket, retired
+        + std::mem::size_of::<Arc<str>>()                          // object_key, retired here
+            ,
+        ordinal_entry_field_sum() - std::mem::size_of::<u32>() + std::mem::size_of::<Arc<str>>(),
+        "the ordinal mirror does not reconstruct to the entry it was measured against -- the live \
+         sum plus the element name's {} bytes -- so it is not that entry with one field swapped",
+        std::mem::size_of::<Option<Arc<str>>>()
+    );
+    // AND THE TARGET IS NOW TWO FIELDS FROM THE LIVE ENTRY AGAIN, HAVING BEEN ONE. This read
+    // `both_gone_field_sum() - u32 + Arc<str> + Option<Arc<str>>`, naming both fields that had to
+    // leave; the element name then left `BlockIndex` and the term came out, because putting it
+    // back would have double-counted it. The IDENTITY has now left too, so the key's own sixteen
+    // bytes go back on this side for the same reason -- the mirror still carries a key and the
+    // live entry does not.
+    assert_eq!(
+        live_entry_field_sum()
+        + std::mem::size_of::<crate::index_log::IndexItemKind>()   // kind, retired
+        + std::mem::size_of::<u32>()                               // routing_bucket, retired
+        + std::mem::size_of::<Arc<str>>()                          // object_key, retired here
+            ,
+        both_gone_field_sum() - std::mem::size_of::<u32>() + std::mem::size_of::<Arc<str>>(),
+        "28 does not reconstruct to the live {} by putting the key back, so the 32 probe is not \
+         pinned to this type at all",
+        live_entry_field_sum()
+    );
+
+    // THE ORDINAL'S WIDTH DOES NOT MOVE THE ENTRY AT ALL, u8 THROUGH u64 -- and this paragraph is
+    // here because a mutation found it rather than because it was reasoned to.
+    //
+    // It said only that a `u8` buys nothing. A fail-first mutation widened the field to `u64`
+    // expecting the 48 pin to redden, and ALL THREE TESTS STAYED GREEN. Two things were wrong at
+    // once: the field sum was a parallel literal (fixed above, so the sum now moves to 48 and the
+    // `44` assertion reddens), and `size_of` genuinely does NOT move, because the tail has four
+    // bytes of padding and the address is eight-aligned, so an ordinal of 1, 4 or 8 bytes all land
+    // at 48. The blind spot is now an asserted property instead.
+    //
+    // WHAT THAT MEANS FOR THE DECISION: the entry's width places NO constraint on the ordinal's
+    // width. A 255-object-a-bucket ceiling buys nothing, and neither does a 64-bit ordinal cost
+    // anything. The choice is free and should be made on the semantics.
+    macro_rules! ordinal_of_width {
+        ($name:ident, $width:ty) => {{
+            struct $name {
+                _kind: crate::index_log::IndexItemKind,
+                _routing_bucket: u32,
+                _object_ordinal: $width,
+                _model_id: StoredModelKind,
+                _component: Option<Arc<str>>,
+                _address: ElementEntry,
+                _dirty: bool,
+                _deleted: bool,
+            }
+            std::mem::size_of::<$name>()
+        }};
+    }
+    let by_width = [
+        ("u8", ordinal_of_width!(U8Ordinal, u8)),
+        ("u16", ordinal_of_width!(U16Ordinal, u16)),
+        ("u32", ordinal_of_width!(U32Ordinal, u32)),
+        ("u64", ordinal_of_width!(U64Ordinal, u64)),
+    ];
+    println!("\n=== THE ENTRY'S WIDTH AGAINST THE ORDINAL'S ===");
+    for (spelling, width) in by_width {
+        println!("  {spelling:<4} ordinal -> entry {width} bytes");
+        assert_eq!(
+            48, width,
+            "a {spelling} ordinal lands the entry at {width} rather than 48, so the ordinal's \
+             width DOES move the entry and the paragraph above is wrong -- which would also mean \
+             the 48 in this module is a figure about one choice of width rather than about the \
+             field set"
+        );
+    }
+}
+
+// =================================================================================================
+// HARNESS
+// =================================================================================================
+
+/// EIGHT BUCKETS, so distinct keys collide into one bucket without hunting for a collision.
+const START_BUCKET: u32 = 0;
+const END_BUCKET: u32 = 7;
+const SHARD: crate::types::ShardId = 1;
+
+fn engine_on(dir: &std::path::Path) -> TemporalEngine {
+    TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.join("cache"),
+        dir.join("blocks"),
+        dir.join("indexes"),
+    )
+}
+
+fn load_on(engine: &TemporalEngine, table: &str, load_version: u64) {
+    let response = engine.load_shard_with(crate::control::LoadShardRequest {
+        shard_id: SHARD,
+        table_name: table.to_string(),
+        shard_uri: format!("local://{table}/1"),
+        start_routing_bucket: START_BUCKET,
+        end_routing_bucket: END_BUCKET,
+        readonly: false,
+        load_version,
+        local_node_id: Some(1),
+    });
+    assert!(
+        response.status.ok,
+        "APPARATUS: load failed: {:?}",
+        response.status
+    );
+}
+
