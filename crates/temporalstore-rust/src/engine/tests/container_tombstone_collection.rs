@@ -228,3 +228,234 @@ fn an_older_block_is_not_outranked_by_a_block_that_merely_does_not_mention_the_e
         (silent_at.clone(), silent.clone()),
         (tomb_at.clone(), tomb.clone()),
     ];
+    let read = |set: Vec<(ElementEntry, Vec<u8>)>| {
+        move |address: &ElementEntry| -> Option<Vec<u8>> {
+            set.iter()
+                .find(|(candidate, _)| append_position(candidate) == append_position(address))
+                .map(|(_, block)| block.clone())
+        }
+    };
+
+    // SILENCE DOES NOT REMOVE.
+    let with_silence = derive_membership(
+        "set",
+        vec![older_at.clone(), silent_at.clone()],
+        read(bytes.clone()),
+    );
+    println!(
+        "older + a later page that does not mention it: {} live, {} removed",
+        with_silence.live.len(),
+        with_silence.removed.len()
+    );
+    assert_eq!(2, with_silence.blocks_read, "DENOMINATOR: two pages must be read");
+    assert!(with_silence.is_complete());
+    assert!(
+        with_silence.live.contains_key(&component),
+        "A LATER PAGE THAT DOES NOT MENTION THE ELEMENT REMOVED IT. Silence is not a removal: a fold \
+         writes pages that hold only the elements it batched, so treating an unmentioned element as \
+         gone would empty every container a round did not fully rewrite."
+    );
+    assert!(with_silence.removed.is_empty());
+
+    // A REMOVAL DOES.
+    let with_removal = derive_membership(
+        "set",
+        vec![older_at, silent_at, tomb_at],
+        read(bytes.clone()),
+    );
+    println!(
+        "older + silent + a removal: {} live, {} removed",
+        with_removal.live.len(),
+        with_removal.removed.len()
+    );
+    assert_eq!(3, with_removal.blocks_read, "DENOMINATOR: three pages must be read");
+    assert!(with_removal.is_complete());
+    assert!(
+        with_removal.removed.contains(&component),
+        "a page that states the removal did not remove the element"
+    );
+    assert!(!with_removal.live.contains_key(&component));
+    // The unrelated element is untouched by either -- a control, so that "removed" above is not the
+    // fold simply losing everything.
+    let unrelated_component = hex::encode(&unrelated);
+    assert!(
+        with_removal.live.contains_key(&unrelated_component),
+        "CONTROL: the element nothing removed is gone too, so the fold is losing items rather than \
+         applying a tombstone"
+    );
+}
+
+/// rust-internal: operates on the page codec directly
+#[test]
+fn an_empty_value_and_a_removal_of_the_same_element_are_different_bytes() {
+    let key = b"field-with-no-value".to_vec();
+
+    let empty = encode_container_block_items(
+        ElementKeySpelling::Utf8,
+        &[ContainerBlockWrite::live(&key, b"")],
+    );
+    let removed = encode_container_block_items(
+        ElementKeySpelling::Utf8,
+        &[ContainerBlockWrite::removed(&key)],
+    );
+
+    println!("empty-valued page:  {} bytes {:?}", empty.len(), &empty[7..]);
+    println!("tombstone page:     {} bytes {:?}", removed.len(), &removed[7..]);
+
+    // DENOMINATOR: both must actually be frames, or "they differ" could be two failures.
+    assert!(
+        empty.starts_with(CONTAINER_BLOCK_MAGIC_V2) && removed.starts_with(CONTAINER_BLOCK_MAGIC_V2),
+        "one of the two is not a frame of the second shape at all"
+    );
+    assert_ne!(
+        empty, removed,
+        "AN EMPTY VALUE AND A REMOVAL ENCODE THE SAME. That is the one thing that cannot be true: \
+         the removal codepoint is free only because the encoder never emits an empty INLINE value, \
+         and if it does then every empty-valued hash field in the store decodes as a removal."
+    );
+
+    // And each says what it is, which is the round trip the byte comparison above does not cover.
+    for (bytes, expect_deleted, label) in
+        [(&empty, false, "empty value"), (&removed, true, "removal")]
+    {
+        match decode_container_block(bytes) {
+            ContainerBlockDecode::Framed { items, shape, .. } => {
+                assert_eq!(ContainerBlockShape::WithRemovals, shape, "{label}: wrong shape");
+                assert_eq!(1, items.len(), "{label}: wrong item count");
+                assert_eq!(key, items[0].key, "{label}: wrong key");
+                assert_eq!(
+                    expect_deleted, items[0].deleted,
+                    "{label} decoded with deleted = {}",
+                    items[0].deleted
+                );
+                assert!(
+                    items[0].value.is_empty(),
+                    "{label}: both carry no value bytes, and this one carried {}",
+                    items[0].value.len()
+                );
+            }
+            other => panic!("{label} did not decode: {other:?}"),
+        }
+    }
+}
+
+/// rust-internal: operates on the page codec directly
+#[test]
+fn a_live_suffix_block_is_the_same_bytes_under_either_shape() {
+    // A set member: the element key IS the member and so is the value, which is the suffix case --
+    // and the case that covers the two kinds whose pages dominate the store.
+    let member = b"member-0007".to_vec();
+    let block = encode_container_block_items(
+        ElementKeySpelling::Hex,
+        &[ContainerBlockWrite::live(&member, &member)],
+    );
+    assert!(block.starts_with(CONTAINER_BLOCK_MAGIC_V2));
+
+    // The SAME BYTES with the magic rewritten. If the two shapes disagreed anywhere in the body for
+    // a live suffix item, this would not decode, or would decode to different items.
+    let mut as_first_shape = block.clone();
+    as_first_shape[..CONTAINER_BLOCK_MAGIC.len()].copy_from_slice(CONTAINER_BLOCK_MAGIC);
+    assert_eq!(
+        block.len(),
+        as_first_shape.len(),
+        "rewriting the magic changed the length, which it cannot"
+    );
+
+    let second = decode_container_block(&block);
+    let first = decode_container_block(&as_first_shape);
+    println!("second shape: {second:?}");
+    println!("first shape:  {first:?}");
+
+    match (second, first) {
+        (
+            ContainerBlockDecode::Framed {
+                items: new_items,
+                shape: new_shape,
+                spelling: new_spelling,
+            },
+            ContainerBlockDecode::Framed {
+                items: old_items,
+                shape: old_shape,
+                spelling: old_spelling,
+            },
+        ) => {
+            assert_eq!(ContainerBlockShape::WithRemovals, new_shape);
+            assert_eq!(ContainerBlockShape::LiveOnly, old_shape);
+            assert_eq!(new_spelling, old_spelling, "the spelling byte moved");
+            assert_eq!(
+                new_items, old_items,
+                "a live suffix item does not decode the same under the two shapes, so the second \
+                 shape is not free for the kinds whose values are their keys' tails"
+            );
+            assert_eq!(1, new_items.len());
+            assert!(!new_items[0].deleted);
+        }
+        (second, first) => panic!("one shape did not decode: second={second:?} first={first:?}"),
+    }
+}
+
+/// rust-internal: drives the page-derived membership fold
+#[test]
+fn the_fold_orders_blocks_by_append_position_and_not_by_the_order_it_was_handed_them() {
+    let member = b"m".to_vec();
+    let live = encode_container_block_items(
+        ElementKeySpelling::Hex,
+        &[ContainerBlockWrite::live(&member, &member)],
+    );
+    let tomb = encode_container_block_items(
+        ElementKeySpelling::Hex,
+        &[ContainerBlockWrite::removed(&member)],
+    );
+
+    let earlier = at(1, 100, live.len() as u32);
+    let later = at(1, 200, tomb.len() as u32);
+    // THE ORDER IS A FACT ABOUT THE ADDRESSES, asserted before it is relied on.
+    assert!(
+        append_position(&earlier) < append_position(&later),
+        "the later page does not compare greater, so nothing below is testing ordering"
+    );
+    // AND ACROSS A SLAB ROLL, which is the case a single-slab fixture would not cover and the one a
+    // scalar packing of the pair would get wrong. The offset is the HIGHEST one an address can name,
+    // so the comparison is made at the boundary rather than somewhere comfortably inside it --
+    // `from_parts` panics above it, which is itself the proof that this is the extreme case.
+    assert!(
+        append_position(&at(1, crate::block_store::MAX_ADDRESSABLE_BLOCK_OFFSET, 1))
+            < append_position(&at(2, 0, 1)),
+        "a page in a later slab does not compare greater than one at the highest offset of an \
+         earlier slab, so the pair is not ordering slab before offset"
+    );
+
+    // The reader is keyed by POSITION rather than by a captured address, so it borrows nothing the
+    // two calls below need to own. Built fresh per call for the same reason.
+    let earlier_position = append_position(&earlier);
+    let read = || {
+        let live = live.clone();
+        let tomb = tomb.clone();
+        move |address: &ElementEntry| -> Option<Vec<u8>> {
+            if append_position(address) == earlier_position {
+                Some(live.clone())
+            } else {
+                Some(tomb.clone())
+            }
+        }
+    };
+
+    // HANDED IN THE WRONG ORDER ON PURPOSE. A fold that trusted its input would answer "live".
+    let reversed = derive_membership("set", vec![later.clone(), earlier.clone()], read());
+    let forwards = derive_membership("set", vec![earlier, later], read());
+
+    let component = hex::encode(&member);
+    println!(
+        "reversed input: {} live, {} removed; forwards: {} live, {} removed",
+        reversed.live.len(),
+        reversed.removed.len(),
+        forwards.live.len(),
+        forwards.removed.len()
+    );
+    assert_eq!(2, reversed.blocks_read, "DENOMINATOR: both pages must be read");
+    assert!(reversed.is_complete() && forwards.is_complete());
+    assert!(
+        reversed.removed.contains(&component),
+        "handed the tombstone FIRST, the fold kept the member -- so it applies items in the order it \
+         receives them rather than in append order"
+    );

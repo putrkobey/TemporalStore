@@ -5,18 +5,3 @@
 #
 #   docker build -f docker/Dockerfile.cloud-api -t temporalstore-cloud-api:latest .
 #   docker run --rm -p 8080:8080 \
-#     -e MATRIXARK_API_KEYS='sk_live_demo:acme' \
-#     -e MATRIXARK_DATANODE_BLOB_URL='http://datanode:17102' \
-#     temporalstore-cloud-api:latest
-#
-# The gateway is framework-free stdlib Python; only uvicorn is a runtime dependency. It fronts the
-# same MatrixArk backend as the tools/ management API, so the whole tools/ tree is copied in.
-FROM python:3.11-slim
-
-# uvicorn is the only runtime dep; the gateway itself is stdlib-only.
-RUN pip install --no-cache-dir "uvicorn[standard]>=0.23"
-
-RUN useradd --system --uid 10001 --create-home matrixark
-WORKDIR /app
-
-# Ship the Python control plane (gateway + MCP server + adapters).
