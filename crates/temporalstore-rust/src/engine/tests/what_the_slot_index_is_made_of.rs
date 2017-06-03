@@ -1031,3 +1031,520 @@ fn walk(reading: &Reading) -> Walked {
         for (block_key, entry_value) in blocks.iter() {
             blocks_seen += 1;
             // QUOTES AND NOTHING ELSE. `klen` is the JSON rendering, so this difference is the two
+            // quotes plus any escaping; the fixture's keys hold none, and the assertion is what
+            // keeps the label honest rather than letting an escape hide inside an envelope term.
+            assert_eq!(
+                klen(block_key) - block_key.len(),
+                2,
+                "[CLAUSE map-key-quotes-are-two] the written page key `{block_key}` renders {} B \
+                 wider than its characters, so it carries escaping and this term is not quotes",
+                klen(block_key) - block_key.len()
+            );
+            tally.add("page/map_key_quotes", klen(block_key) - block_key.len(), 0);
+            tally.add("page/map_key_colon", 1, 0);
+            tally.add("page/map_entry_tail", 1, 0);
+
+            let slots = split_written_key(block_key);
+            tally.add("page/map_key/kind", slots.kind.len(), 0);
+            tally.add("page/map_key/object_key", slots.object_key.len(), 0);
+            tally.add("page/map_key/component_slot", slots.component.len(), 0);
+            tally.add("page/map_key/block_slab_id", slots.block_slab_id.len(), 0);
+            tally.add("page/map_key/offset", slots.offset.len(), 0);
+            tally.add("page/map_key/length", slots.length.len(), 0);
+            tally.add("page/map_key/block_id", slots.block_id.len(), 0);
+            tally.add("page/map_key/generation", slots.generation.len(), 0);
+            // SEVEN SEPARATORS, AND ONE OF THEM DELIMITS A SLOT THAT IS ALWAYS EMPTY. Charged
+            // apart from the other six because what it is worth to remove is a different number.
+            tally.add("page/map_key/separators", 6, 0);
+            tally.add("page/map_key/empty_slot_separator", 1, 0);
+
+            let entry = entry_value.as_object().expect("a page entry writes an object");
+            tally.add("entry/open_brace", 1, 0);
+            tally.add("entry/field_tails", entry.len(), 0);
+            for (field, value) in entry.iter() {
+                match field.as_str() {
+                    // NO `object_key` AND NO `model_id` ARMS. They are the key's own second and
+                    // first slots, the decoder reads them back out of it, and the entry writes
+                    // neither -- so an entry carrying one lands in the `no-unclassified` panic
+                    // below, which is the tripwire that says the field came back.
+                    "dirty" => {
+                        tally.add("entry/dirty", klen(field) + 1 + jlen(value), klen(field) + 1)
+                    }
+                    "deleted" => {
+                        tally.add("entry/deleted", klen(field) + 1 + jlen(value), klen(field) + 1)
+                    }
+                    "address" => {
+                        tally.add(
+                            "entry/address/field_name",
+                            klen(field) + 1,
+                            klen(field) + 1,
+                        );
+                        let address =
+                            value.as_object().expect("a stored address writes an object");
+                        tally.add("entry/address/open_brace", 1, 0);
+                        tally.add("entry/address/field_tails", address.len(), 0);
+                        for (slot, slot_value) in address.iter() {
+                            let label = address_field_label(slot);
+                            tally.add(
+                                label,
+                                klen(slot) + 1 + jlen(slot_value),
+                                klen(slot) + 1,
+                            );
+                            if slot == "oi" && slot_value.is_null() {
+                                nil_object_id_slots += 1;
+                            }
+                        }
+                    }
+                    other => panic!(
+                        "[CLAUSE no-unclassified] a page entry writes the key `{other}`, which \
+                         this decomposition does not name"
+                    ),
+                }
+            }
+
+            // ---- THE RECONSTRUCTION, AND HALF OF IT IS CLOSED BECAUSE THE PROPOSAL LANDED ----
+            //
+            // THIS CLAUSE WAS `key-restates-the-entry` AND IT HAS INVERTED. It rebuilt the whole
+            // page key from the entry's own written `object_key`, `model_id` and `address`, and
+            // asserted the result was the key the entry is filed under -- which was the evidence
+            // that the key held nothing the entry did not, so calling it redundancy was fair. The
+            // entry writes neither name now, so that comparison has ONE SOURCE on two of its
+            // terms and would be a renderer compared with itself. It is RETIRED rather than
+            // weakened: a comparison that cannot disagree is worse than no comparison, because its
+            // name goes on claiming the stronger thing.
+            //
+            // WHAT SURVIVES IS THE OTHER DIRECTION, WHICH IS WHERE THE REMAINING DUPLICATION IS.
+            // The entry's `address` still restates five of the key's slots, so the address is
+            // decoded back out of the written value through its production `Deserialize` -- which
+            // is what a load has in hand -- and compared against the five decimals in the key,
+            // read by THIS MODULE'S splitter and not by the production parse.
+            let decoded: crate::ElementEntry = serde_json::from_value(
+                entry
+                    .get("address")
+                    .expect("a page entry writes `address`")
+                    .clone(),
+            )
+            .expect("a written address decodes through its own production impl");
+            assert_eq!(
+                (
+                    slots.block_slab_id.as_str(),
+                    slots.offset.as_str(),
+                    slots.length.as_str(),
+                    slots.block_id.as_str(),
+                    slots.generation.as_str(),
+                ),
+                (
+                    decoded.block_slab_id().to_string().as_str(),
+                    decoded.offset().to_string().as_str(),
+                    decoded.length().to_string().as_str(),
+                    decoded.block_id().unwrap_or_default().to_string().as_str(),
+                    decoded.generation().unwrap_or_default().to_string().as_str(),
+                ),
+                "[CLAUSE address-restates-the-key] the five decimals in the page key {block_key:?} \
+                 are not what the entry's own written address spells, so the address is not a \
+                 restatement of them and classing it redundancy would be wrong"
+            );
+            keys_reconstructed += 1;
+
+            // AND THE OBJECT ID THE NODE FILES THIS PAGE'S OBJECT UNDER, FROM THE KEY'S OWN TWO
+            // NAME SLOTS -- which is where those two terms live now, and the reason this arm still
+            // has content: the ids in `node/object_index` are derived from a kind and an object key
+            // that the entry no longer carries, so the derivation reads the key.
+            //
+            // A LIVE page only: a removal's id goes to `deleted_object_index`, and this fixture
+            // performs none -- which `optional-stays-absent` pins.
+            if !entry
+                .get("deleted")
+                .expect("a page entry writes `deleted`")
+                .as_bool()
+                .expect("`deleted` is written as a boolean")
+            {
+                derived_object_ids.insert(stable_object_id_from_the_written_terms(
+                    SHARD,
+                    &slots.kind,
+                    &slots.object_key,
+                ));
+            }
+        }
+
+        if derived_object_ids == written_object_ids {
+            buckets_whose_object_index_is_derivable += 1;
+        }
+    }
+
+    assert_eq!(
+        blocks_seen, reading.blocks,
+        "[CLAUSE part-sum] the walk saw {blocks_seen} written page(s) against {} resident",
+        reading.blocks
+    );
+
+    Walked {
+        tally,
+        block_subtree_bytes,
+        keys_reconstructed,
+        slots_reconstructed,
+        buckets_whose_object_index_is_derivable,
+        nil_object_id_slots,
+    }
+}
+
+/// Print one tally as a table, and assert every declared term is non-zero (or exactly zero where
+/// it is structurally empty).
+fn report(reading: &Reading, walked: &Walked) {
+    let tally = &walked.tally;
+    let whole = reading.slot_index_entry_bytes();
+    let per = |bytes: usize| bytes as f64 / reading.objects as f64;
+
+    println!();
+    println!(
+        "================ `slot_index` TERM BY TERM, {} OBJECTS IN {} BUCKETS ON 0..{} \
+         ({} KEYS, WIDTH {}) ================",
+        reading.objects,
+        reading.buckets,
+        SHIPPED_END_BUCKET,
+        reading.shape.label(),
+        reading.width
+    );
+    println!(
+        "  {:<38} {:>12} {:>10} {:>11} {:>12} {:>12} {:>8}",
+        "term", "bytes", "instances", "B/object", "% slot_index", "scale", "nature"
+    );
+    let mut ordered: Vec<(&'static str, Row)> =
+        tally.rows.iter().map(|entry| (*entry.0, *entry.1)).collect();
+    ordered.sort_by(|left, right| right.1.bytes.cmp(&left.1.bytes).then(left.0.cmp(right.0)));
+    for (label, row) in ordered.iter() {
+        let (scale, nature, _) = declared(label);
+        println!(
+            "  {:<38} {:>12} {:>10} {:>11.3} {:>11.2}% {:>12} {:>8}",
+            label,
+            row.bytes,
+            row.instances,
+            per(row.bytes),
+            100.0 * row.bytes as f64 / whole as f64,
+            scale.label(),
+            nature.label()
+        );
+    }
+    println!(
+        "  {:<38} {:>12} {:>10} {:>11.3} {:>11.2}%",
+        "TOTAL",
+        tally.total(),
+        "",
+        per(tally.total()),
+        100.0 * tally.total() as f64 / whole as f64
+    );
+
+    println!();
+    println!("  BY SCALE");
+    for scale in [Scale::PerBlock, Scale::PerBucket, Scale::PerShard] {
+        let bytes = tally.at_scale(scale);
+        println!(
+            "    {:<12} {:>12} B  {:>9.3} B/object  {:>6.2}%",
+            scale.label(),
+            bytes,
+            per(bytes),
+            100.0 * bytes as f64 / whole as f64
+        );
+    }
+    println!("  BY NATURE");
+    for nature in [Nature::Payload, Nature::Identity, Nature::Envelope, Nature::Redundancy] {
+        let bytes = tally.of_nature(nature);
+        println!(
+            "    {:<12} {:>12} B  {:>9.3} B/object  {:>6.2}%",
+            nature.label(),
+            bytes,
+            per(bytes),
+            100.0 * bytes as f64 / whole as f64
+        );
+    }
+    let name_tax: usize = tally.rows.values().map(|row| row.name_bytes).sum();
+    println!(
+        "  JSON FIELD NAMES, a cross-cut and not a term: {name_tax} B = {:.3} B/object = {:.2}% \
+         -- what a NAMED encoding spends on keys. The served index is msgpack `with_struct_map` \
+         for a stated reason: the positional form mis-reads a struct that skipped an absent \
+         optional, so this is a priced DECLINE and not a finding.",
+        per(name_tax),
+        100.0 * name_tax as f64 / whole as f64
+    );
+}
+
+// =================================================================================================
+// THE COUNTERFACTUAL SURFACES
+// =================================================================================================
+
+/// The container `TSIDX\x01` codec 1 writes: the magic, the codec id, and a zstd-3 frame over the
+/// struct's JSON.
+///
+/// THIS IS A PRODUCTION CONTAINER ARM OF THIS STORE AND NOT A SURFACE INVENTED HERE.
+/// `engine::wrap_index_json` writes exactly this whenever the codec is not the binary one, and
+/// `decode_index_bytes` sniffs and reads it. It is used for every counterfactual below for one
+/// reason: a doctored stream has to be RE-ENCODED, and the only re-encoding this module can take
+/// that is byte-for-byte what production writes is the JSON one. A msgpack payload rebuilt from a
+/// `serde_json::Value` is NOT that -- measured: it differs from the production payload at byte 4,
+/// because a `Value` writes its keys sorted while the struct writes them in declaration order, and
+/// the reordering alone moves the compressed size by 5%. So the counterfactual is taken on the
+/// container arm it can be taken on exactly, and
+/// [`what_removing_a_redundant_slot_index_term_would_cost_the_shipped_container`] asserts how far
+/// the two container arms are apart before quoting a price from either.
+fn json_container_bytes(value: &serde_json::Value) -> usize {
+    const MAGIC: &[u8] = b"TSIDX\x01";
+    const CODEC_BYTE: usize = 1;
+    const ZSTD_LEVEL: i32 = 3;
+    let json = serde_json::to_vec(value).expect("the doctored index serializes");
+    let payload =
+        zstd::stream::encode_all(json.as_slice(), ZSTD_LEVEL).expect("the payload compresses");
+    MAGIC.len() + CODEC_BYTE + payload.len()
+}
+
+/// The removals this module prices, each one a term the decomposition classified as redundancy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Candidate {
+    /// Nothing is changed. The CONTROL: it must reproduce the undoctored stream byte for byte, or
+    /// every price below is a price of the doctoring machinery rather than of a removal.
+    Control,
+    /// The page index is keyed by the handle the LIVE map already keys it by, rendered as a
+    /// decimal, in place of the composite.
+    BlockKeyBecomesTheHandle,
+    /// The composite loses the slot that is always empty, and the separator that delimits it.
+    BlockKeyDropsTheEmptySlot,
+    /// The entry loses `address`, whose five values its own map key spells.
+    ///
+    /// Priced and BLOCKED, and the reason is not a scope decision. The five VALUES are in the key;
+    /// the two PRESENCE bits beside them are not. `block_index_written_key` renders
+    /// `block_id().unwrap_or_default()`, and `ElementEntry::block_id()` is `None` EXACTLY while a
+    /// block is log-resident -- so a staged page and the first page of an object in a slab render
+    /// ONE key and differ in `log_backed()`, which has production readers.
+    /// `the_key_a_block_is_filed_under_inverts_exactly::the_presence_bits_of_an_address_are_not_in_the_key_it_renders`
+    /// builds both and asserts the keys identical. Trimming the address slot-wise instead is
+    /// blocked independently: `BlockAddressWire` is shared with the index log, which packs it
+    /// POSITIONALLY.
+    EntryDropsAddress,
+    /// The stored address loses its `oi` slot, which the writer fills from a literal `None`.
+    ///
+    /// Priced and DECLINED, with the reason in the source rather than in this comment: the index
+    /// log packs the same struct POSITIONALLY, so a slot skipped here shortens that array and
+    /// shifts every slot after it. Pricing a decline is what makes it a decision.
+    AddressDropsTheAlwaysNilSlot,
+}
+
+impl Candidate {
+    fn label(self) -> &'static str {
+        match self {
+            Candidate::Control => "control: nothing removed",
+            Candidate::BlockKeyBecomesTheHandle => "page key -> the live map's handle",
+            Candidate::BlockKeyDropsTheEmptySlot => "page key -> drop the always-empty slot",
+            Candidate::EntryDropsAddress => "entry -> drop `address` (BLOCKED)",
+            Candidate::AddressDropsTheAlwaysNilSlot => "address -> drop the always-nil `oi` slot",
+        }
+    }
+}
+
+/// `slot_index` as it would be written with one term removed.
+///
+/// A BYTE-WEIGHT COUNTERFACTUAL, AND THAT IS ALL IT CLAIMS TO BE. It says what the artefact would
+/// weigh, not that the result loads -- except for the one candidate whose loadability is MEASURED,
+/// by [`the_page_keys_characters_are_not_read_back_by_the_decoder`], which feeds the doctored bytes
+/// to the production decoder.
+fn doctor(reading: &Reading, candidate: Candidate) -> serde_json::Value {
+    let mut value = reading.value.clone();
+    {
+        let bucket_map = value
+            .get_mut("slot_index")
+            .expect("slot_index")
+            .get_mut("bucket_map")
+            .expect("bucket_map")
+            .as_object_mut()
+            .expect("an object");
+        for node in bucket_map.values_mut() {
+            let block_index = node
+                .get("page_index")
+                .expect("page_index")
+                .as_object()
+                .expect("an object")
+                .clone();
+            let mut replacement = serde_json::Map::with_capacity(block_index.len());
+            for (block_key, entry_value) in block_index.iter() {
+                let mut entry = entry_value.clone();
+                let fields = entry.as_object_mut().expect("a page entry is an object");
+                let new_key = match candidate {
+                    Candidate::Control
+                    | Candidate::EntryDropsAddress
+                    | Candidate::AddressDropsTheAlwaysNilSlot => block_key.clone(),
+                    Candidate::BlockKeyBecomesTheHandle => reading
+                        .handles_by_written_key
+                        .get(block_key)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "[CLAUSE join-total] the written key `{block_key}` has no handle \
+                                 beside it, so this counterfactual cannot be priced"
+                            )
+                        })
+                        .to_string(),
+                    Candidate::BlockKeyDropsTheEmptySlot => {
+                        let slots = split_written_key(block_key);
+                        assert!(
+                            slots.component.is_empty(),
+                            "[CLAUSE empty-slot-is-empty] the component slot of `{block_key}` holds \
+                             `{}`, so dropping it would drop a term rather than a hole",
+                            slots.component
+                        );
+                        format!(
+                            "{}:{}:{}:{}:{}:{}:{}",
+                            slots.kind,
+                            slots.object_key,
+                            slots.block_slab_id,
+                            slots.offset,
+                            slots.length,
+                            slots.block_id,
+                            slots.generation
+                        )
+                    }
+                };
+                match candidate {
+                    Candidate::EntryDropsAddress => {
+                        fields.remove("address").expect("address was written");
+                    }
+                    Candidate::AddressDropsTheAlwaysNilSlot => {
+                        let address = fields
+                            .get_mut("address")
+                            .expect("address was written")
+                            .as_object_mut()
+                            .expect("an object");
+                        let was = address.remove("oi").expect("the `oi` slot was written");
+                        assert!(
+                            was.is_null(),
+                            "[CLAUSE empty-slot-is-empty] the `oi` slot of a page in this fixture \
+                             holds `{was}`, so dropping it would drop a value rather than a hole"
+                        );
+                    }
+                    Candidate::Control
+                    | Candidate::BlockKeyBecomesTheHandle
+                    | Candidate::BlockKeyDropsTheEmptySlot => {}
+                }
+                assert!(
+                    replacement.insert(new_key.clone(), entry).is_none(),
+                    "[CLAUSE doctoring-is-one-to-one] the doctored page index files two entries \
+                     under `{new_key}`, so this candidate loses a page rather than bytes"
+                );
+            }
+            *node.get_mut("page_index").expect("page_index") =
+                serde_json::Value::Object(replacement);
+        }
+    }
+    value
+}
+
+/// The bytes the `slot_index` entry of a (possibly doctored) shard value occupies.
+fn slot_index_entry_bytes_of(value: &serde_json::Value) -> usize {
+    let entry = value
+        .as_object()
+        .expect("a shard value is an object")
+        .get("slot_index")
+        .expect("slot_index");
+    klen("slot_index") + 1 + jlen(entry)
+}
+
+// =================================================================================================
+
+/// THE TERM TABLE IS WELL FORMED BEFORE ANY FIXTURE RUNS.
+///
+/// One conclusion: the vocabulary every byte below is charged against has no duplicate label, and
+/// `Redundancy` is assigned exactly where a reconstructor is named. A class whose membership is a
+/// matter of prose is a class that drifts, and the cost of finding that out is one run.
+#[test]
+fn the_slot_index_term_table_is_well_formed() {
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for (label, ..) in TERMS.iter() {
+        *seen.entry(label).or_default() += 1;
+    }
+    let duplicates: Vec<&&str> = seen
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(label, _)| label)
+        .collect();
+    assert!(
+        duplicates.is_empty(),
+        "[CLAUSE table-unique] these labels are declared more than once: {duplicates:?} -- a \
+         repeated label silently merges two terms and the sum still balances"
+    );
+    for (label, _, nature, reconstructor) in TERMS.iter() {
+        match nature {
+            Nature::Redundancy => assert!(
+                !reconstructor.is_empty(),
+                "[CLAUSE redundancy-names-its-source] `{label}` is classed as redundancy and names \
+                 nothing that reconstructs it, so the class is an opinion"
+            ),
+            _ => assert!(
+                reconstructor.is_empty(),
+                "[CLAUSE redundancy-names-its-source] `{label}` is classed `{}` and names \
+                 `{reconstructor}` as reconstructing it -- a term with a reconstructor belongs in \
+                 the redundancy class or the class is wrong",
+                nature.label()
+            ),
+        }
+    }
+    assert_eq!(
+        declared(STRUCTURALLY_EMPTY).0,
+        Scale::PerBlock,
+        "[CLAUSE table-unique] the structurally empty term must be a per-page one, or the \
+         exemption below exempts the wrong thing"
+    );
+    println!();
+    println!(
+        "  {} term(s) declared, {} of them redundancy with a named reconstructor",
+        TERMS.len(),
+        TERMS
+            .iter()
+            .filter(|(_, _, nature, _)| *nature == Nature::Redundancy)
+            .count()
+    );
+}
+
+// =================================================================================================
+
+/// WHAT `slot_index` IS MADE OF ON THE SHIPPED ROUTING RANGE, TERM BY TERM.
+///
+/// One conclusion: the full partition of the `slot_index` entry at the amortised regime, every term
+/// named, non-zero, classed by a measured scale, and summing to the whole by two independent
+/// identities.
+///
+/// THE ASSERTION ORDER IS LOAD-BEARING. A plant stops at the first failing assertion, so the
+/// fixture-regime clauses come first: a corpus that did not land and a fixture that never reached
+/// the amortised regime are refused BEFORE any byte is read as a finding. Each message carries a
+/// `[CLAUSE <name>]` tag so a plant's verdict comes from the panic text.
+#[test]
+fn what_the_slot_index_is_made_of_on_the_shipped_routing_range() {
+    let reading = reading_on(
+        HEADLINE_KEYS,
+        PUBLISHED_WIDTH,
+        KeyShape::Padded,
+        SHIPPED_END_BUCKET,
+    );
+
+    // ---- FIXTURE REGIME FIRST ----
+    assert!(
+        reading.buckets < reading.objects,
+        "[CLAUSE amortised-regime] the fixture put {} object(s) in {} bucket(s), so no bucket \
+         holds more than one and the per-bucket terms amortise over nothing -- this is the \
+         unbounded regime wearing the shipped range's name",
+        reading.objects,
+        reading.buckets
+    );
+    let occupancy = reading.objects as f64 / reading.buckets as f64;
+    assert!(
+        occupancy > 4.0,
+        "[CLAUSE amortised-regime] {occupancy:.2} object(s) per bucket is not the regime the \
+         published 226.35 B/object was taken in (7.81), so the per-bucket terms below amortise \
+         over the wrong denominator"
+    );
+    assert_eq!(
+        reading.blocks, reading.objects,
+        "[CLAUSE one-page-an-object] the fixture holds {} page(s) for {} object(s), so a per-PAGE \
+         term and a per-OBJECT term are different quantities here and every B/object figure below \
+         would silently be a B/page figure",
+        reading.blocks, reading.objects
+    );
+
+    let walked = walk(&reading);
+    let tally = &walked.tally;
+    let whole = reading.slot_index_entry_bytes();
