@@ -80,3 +80,45 @@ fn the_published_stale_record_accounts_for_itself() {
     // exactly one possible cause and a misattribution cannot hide behind a mixed fixture.
     for round in 0..=ROUNDS {
         for index in 0..KEYS {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("accounted-{index:06}"),
+                    value: noisy_value(index, round, VALUE),
+                },
+            });
+            assert!(response.status.ok, "round {round} write {index}: {:?}", response.status);
+        }
+    }
+
+    let s = engine
+        .shard_stats(1)
+        .expect("a loaded shard reports stats")
+        .storage;
+
+    println!();
+    println!("  THE PUBLISHED STALE RECORD -- {KEYS} keys x {VALUE} B, {ROUNDS} rewrites, overwrite only");
+    println!();
+    println!("    recorded                       {:>12}", s.stale_bytes_recorded);
+    println!("      pending                      {:>12}", s.pending_discard_bytes);
+    println!("      discarded                    {:>12}", s.stale_bytes_discarded);
+    println!("      ---- sum                     {:>12}", s.pending_discard_bytes + s.stale_bytes_discarded);
+    println!();
+    println!("      by overwrite                 {:>12}", s.stale_bytes_by_overwrite);
+    println!("      by removal                   {:>12}", s.stale_bytes_by_removal);
+    println!("      by sweep                     {:>12}", s.stale_bytes_by_sweep);
+    println!(
+        "      ---- sum                     {:>12}",
+        s.stale_bytes_by_overwrite + s.stale_bytes_by_removal + s.stale_bytes_by_sweep
+    );
+    println!();
+    println!("    pending block refs             {:>12}", s.pending_discard_block_refs);
+    println!("    merged ranges                  {:>12}", s.merged_discard_range_count);
+    println!("    compaction candidate ranges    {:>12}", s.compaction_candidate_range_count);
+    println!("    fragmented ranges              {:>12}", s.fragmented_range_count);
+    println!("    DROPPED ranges (placement)     {:>12}", s.dropped_discard_range_count);
+    println!("    slabs tracked / pruned         {:>12} / {}", s.stale_slabs_tracked, s.stale_slabs_pruned);
+    println!("    discard backlog                {:>12} ppm", s.discard_backlog_ppm);
+    println!();
+
+    // ---- NON-VACUITY. Every assertion below holds at zero.
