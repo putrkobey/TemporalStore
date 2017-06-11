@@ -154,3 +154,159 @@ fn in_situ_charge_per_record(records: usize) -> (f64, f64) {
     (
         row.allocs as f64 / records as f64,
         row.alloc_bytes as f64 / records as f64,
+    )
+}
+
+#[cfg(feature = "alloc-probe")]
+#[derive(Clone, Copy)]
+struct Arm {
+    label: &'static str,
+    allocs: u64,
+    bytes: u64,
+}
+
+#[cfg(feature = "alloc-probe")]
+impl Arm {
+    fn per(&self, n: usize) -> f64 {
+        self.allocs as f64 / n as f64
+    }
+    fn bytes_per(&self, n: usize) -> f64 {
+        self.bytes as f64 / n as f64
+    }
+}
+
+#[cfg(feature = "alloc-probe")]
+fn arm(label: &'static str, counts: AllocCounts) -> Arm {
+    Arm {
+        label,
+        allocs: counts.allocs,
+        bytes: counts.alloc_bytes,
+    }
+}
+
+/// Run the whole ladder at one corpus size, under one store path.
+#[cfg(feature = "alloc-probe")]
+fn ladder(n: usize, dir: &std::path::Path) -> Vec<Arm> {
+    let keys = corpus(n);
+
+    // Each arm gets its OWN cache, so an arm never inherits the tier state a previous arm left.
+    let key_cache = engine_cache(&dir.join("c-key"));
+    let peek_cache = engine_cache(&dir.join("c-peek"));
+    let mem_cache = engine_cache(&dir.join("c-mem"));
+    let full_cache = engine_cache(&dir.join("c-full"));
+    let batch_cache = engine_cache(&dir.join("c-batch"));
+    // The SAME cache this engine already builds when a node is configured without a disk cache
+    // tier -- `with_local_dirs_block_store_options_and_disk_cache(.., false)`. Not a hypothetical
+    // shape: a supported deployment, measured here beside the default one.
+    let no_disk_cache = MultiLayerCache::with_tiering_policy(
+        dir.join("c-nodisk"),
+        matrixcache::CacheTieringPolicy {
+            memory_capacity_bytes: MEMORY_CAPACITY,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 0,
+            ..Default::default()
+        },
+        matrixcache::CacheBlockOptions::default(),
+    );
+
+    // The shipped call returns a Result and `invalidate_cache_key` discards it. A cache that was
+    // never started answers `Err(Stopped)` and returns having done NOTHING, which would read as a
+    // very cheap invalidation rather than as an invalidation that did not happen.
+    assert!(
+        full_cache
+            .invalidate(&CacheKey::string(1, "started-probe"))
+            .is_ok(),
+        "the cache under measurement is not started, so `invalidate` returns early and every \
+         figure below is the cost of doing nothing"
+    );
+    let _ = key_cache.peek(&CacheKey::string(1, "started-probe"));
+
+    let key_only = arm(
+        "key_only",
+        measure(|| {
+            for key in &keys {
+                std::hint::black_box(CacheKey::string(1, key));
+            }
+        }),
+    );
+    let peek = arm(
+        "peek",
+        measure(|| {
+            for key in &keys {
+                std::hint::black_box(peek_cache.peek(&CacheKey::string(1, key)));
+            }
+        }),
+    );
+    let memory_only = arm(
+        "invalidate_memory_only",
+        measure(|| {
+            for key in &keys {
+                mem_cache.invalidate_memory_only(&CacheKey::string(1, key));
+            }
+        }),
+    );
+    let full = arm(
+        "invalidate",
+        measure(|| {
+            for key in &keys {
+                let _ = full_cache.invalidate(&CacheKey::string(1, key));
+            }
+        }),
+    );
+
+    // CANDIDATE, PRICED: one call per key replaced by one call per hundred keys. Same key set,
+    // same round; only WHEN each key leaves the cache changes.
+    let batched = arm(
+        "invalidate_batch(100)",
+        measure(|| {
+            for chunk in keys.chunks(100) {
+                let batch = chunk
+                    .iter()
+                    .map(|key| CacheKey::string(1, key))
+                    .collect::<Vec<_>>();
+                let _ = batch_cache.invalidate_batch(&batch);
+            }
+        }),
+    );
+    // CANDIDATE, PRICED: the disk cache tier switched off, which this engine already supports.
+    let no_disk = arm(
+        "invalidate@no-disk-tier",
+        measure(|| {
+            for key in &keys {
+                let _ = no_disk_cache.invalidate(&CacheKey::string(1, key));
+            }
+        }),
+    );
+
+    vec![key_only, peek, memory_only, full, batched, no_disk]
+}
+
+#[cfg(feature = "alloc-probe")]
+fn print_ladder(n: usize, arms: &[Arm]) {
+    println!("\n  {n} keys, cache cold, every key absent");
+    println!(
+        "  {:<24} {:>12} {:>10} {:>14} {:>11}",
+        "arm", "allocs", "per key", "alloc bytes", "B per key"
+    );
+    for entry in arms {
+        println!(
+            "  {:<24} {:>12} {:>10.3} {:>14} {:>11.1}",
+            entry.label,
+            entry.allocs,
+            entry.per(n),
+            entry.bytes,
+            entry.bytes_per(n)
+        );
+    }
+}
+
+/// The instrument's own control: plant a known number of allocations and recover exactly that many.
+///
+/// Without this the ladder cannot tell a correct reading from a counter that is off by a constant
+/// per iteration, and every difference it reports would inherit the error.
+///
+/// THE PROBE IS SPELLED OUT IN FULL BELOW ON PURPOSE. The repo-wide guard
+/// `every_counting_allocator_probe_is_gated_on_the_feature_that_installs_it` finds probe-reading
+/// tests by matching the fully qualified spelling of the counter type and its start call, so a
+/// module that imports those names and uses them bare is INVISIBLE to it. Measured, not assumed:
+/// with every read in this file going through the import, that guard scanned this file, found no

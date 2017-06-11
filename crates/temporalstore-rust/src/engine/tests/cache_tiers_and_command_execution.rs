@@ -1176,3 +1176,1181 @@ fn durable_execute_overrides_async_storage_for_raft_local_file_path() {
 
 #[test]
 fn durable_index_survives_restart_and_points_to_block_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache-a");
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(1024, &cache_dir, &block_dir, &index_dir);
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"persisted".to_vec(),
+        },
+    });
+
+    let restarted =
+        TemporalEngine::with_local_dirs(1024, dir.path().join("cache-b"), &block_dir, &index_dir);
+    restarted.load_shard(1);
+    let response = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        response.response,
+        CommandResponse::Bytes {
+            value: Some(b"persisted".to_vec())
+        }
+    );
+    assert_eq!(restarted.block_store().stats().reads, 1);
+}
+
+#[test]
+fn async_write_survives_restart_via_wal_replay_like_native() {
+    // conformance: an async_storage write records a WAL entry but defers page/
+    // index materialization to the background dump. If the crash beats the dump,
+    // Startup load replays the wal and recovers the write. Rust must replay
+    // its WAL on shard load the same way, or the async write is silently lost.
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"async-durable".to_vec(),
+        },
+    });
+    assert_eq!(engine.block_store().stats().writes, 0);
+    assert_eq!(engine.write_ahead_log_store().stats(1).writes, 1);
+    drop(engine);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+    let response = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        response.response,
+        CommandResponse::Bytes {
+            value: Some(b"async-durable".to_vec())
+        },
+        "async write must be recovered by replaying the WAL on shard load"
+    );
+}
+
+// Readiness race regression: after a restart with WAL entries not yet reflected in the served
+// index, the shard is published but NOT serving until `replay_wal_into_shard` completes
+// (ShardInfo.recovering gates it). A read that arrives inside that window must NOT observe a
+// false null from the half-reconstructed state -- it must be rejected with a retryable
+// `shard_not_loaded`. Once replay completes the same read must return the recovered value.
+// (The fix commit gated this deliberately without a deterministic test; this pins it.)
+#[test]
+fn read_during_wal_replay_recovery_returns_retryable_not_false_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    // async_storage: the write lands in the WAL but page/index materialization is deferred, so
+    // it is absent from the served index until the WAL is replayed on the next load.
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"recovered-value".to_vec(),
+        },
+    });
+    assert_eq!(engine.block_store().stats().writes, 0);
+    assert_eq!(engine.write_ahead_log_store().stats(1).writes, 1);
+    drop(engine);
+
+    // Restart, and park the shard in the recovery window: base index loaded (the async write is
+    // NOT in it yet), recovering=true, WAL not yet replayed.
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    let watermark = restarted.test_publish_recovering_shard(1);
+
+    // A read inside the recovery window must be rejected retryably, NOT return a false null.
+    let during = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert!(
+        !during.status.ok,
+        "read during WAL-replay recovery must be rejected, not served from half-built state"
+    );
+    assert_eq!(during.status.code, "shard_not_loaded");
+    assert_eq!(
+        during.response,
+        CommandResponse::Empty,
+        "recovering read must return a retryable error, never a false null (Bytes {{ None }})"
+    );
+
+    // After replay completes and the gate clears, the same read returns the recovered value.
+    restarted.test_finish_recovery(1, watermark);
+    let after = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert!(after.status.ok, "shard must serve once recovery completes");
+    assert_eq!(
+        after.response,
+        CommandResponse::Bytes {
+            value: Some(b"recovered-value".to_vec())
+        },
+        "the WAL-recovered value must be served after recovery completes"
+    );
+}
+
+// Coalesced control-state persistence skips the per-write whole-series page rewrite
+// (write-amplification) and relies on the index snapshot + WAL replay for durability, the
+// same model control_state_changes/fol already use. This MUST stay crash-safe: increments
+// recorded only in the WAL (no page materialization, no flush) must be recovered on reload.
+#[test]
+fn control_state_coalesced_write_survives_restart_via_wal_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    let mut config = Config {
+        version: 2,
+        async_storage: true,
+        ..Config::default()
+    };
+    config
+        .extend_config
+        .insert("control_coalesce_persist".to_string(), "on".to_string());
+    assert!(engine.set_config(SetConfigRequest { shard_id: 1, config }).ok);
+
+    for (timestamp_ms, amount) in [(10u64, 1i64), (20, 2), (30, 4), (40, 8)] {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ControlStateIncrement {
+                key: "cap".to_string(),
+                timestamp_ms,
+                amount,
+            },
+        });
+    }
+    // Coalesced: the per-write control_state page rewrite is skipped; the WAL carries durability.
+    assert_eq!(
+        engine.block_store().stats().writes,
+        0,
+        "coalesced control-state writes must not materialize a per-write page"
+    );
+    assert!(
+        engine.write_ahead_log_store().stats(1).writes >= 4,
+        "each coalesced increment must still be recorded in the WAL"
+    );
+    drop(engine);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+    let response = restarted
+        .execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ControlStateCount {
+                key: "cap".to_string(),
+                start_ms: 0,
+                end_ms: 100,
+            },
+        })
+        .response;
+    assert_eq!(
+        response,
+        CommandResponse::Integer { value: 15 },
+        "coalesced control-state counter must be recovered by WAL replay on reload"
+    );
+}
+
+#[test]
+fn async_storage_batch_write_records_wal_without_sync_or_index() {
+    // Batch analog of the single-command async conformance: the batch path (used by
+    // ingestion) must also record a WAL entry per async write, unfsynced, with page/
+    // index materialization deferred.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    let batch = engine.batch_execute(BatchExecuteRequest {
+        shard_id: 1,
+        commands: vec![
+            Command::StringSet {
+                key: "a".to_string(),
+                value: b"a".to_vec(),
+            },
+            Command::StringSet {
+                key: "b".to_string(),
+                value: b"b".to_vec(),
+            },
+        ],
+    });
+    assert!(batch.status.ok);
+    assert_eq!(engine.block_store().stats().writes, 0);
+    // logged at all, not logged once per command. Whether a batch of two becomes two records
+    // sharing a batch id or one record carrying both items is a property of the log format, and
+    // this test is about what an ASYNCHRONOUS batch does and does not touch: the log yes, the
+    // barrier no, the block store no, the index no. Pinning the count made it a test of the
+    // format instead, which is how it came to fail on a change that took nothing away from it.
+    assert!(
+        engine.write_ahead_log_store().stats(1).writes >= 1,
+        "the batch must reach the log"
+    );
+    assert_eq!(engine.write_ahead_log_store().stats(1).syncs, 0);
+    assert_eq!(engine.index_log_store().stats(1).writes, 0);
+}
+
+#[test]
+fn eviction_ranks_victims_least_recently_used_first_like_native() {
+    // Eviction victims are ordered least-recently-used first, so a
+    // repeatedly-read hot bucket is evicted last. Rust stamps per-bucket recency on
+    // every read/write and sorts victims oldest-first.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for key in ["cold-a", "cold-b", "cold-c", "cold-d", "hot"] {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: key.to_string(),
+                value: b"value".to_vec(),
+            },
+        });
+    }
+    std::thread::sleep(std::time::Duration::from_millis(3));
+    for _ in 0..3 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: "hot".to_string(),
+            },
+        });
+    }
+    let report = engine.apply_storage_eviction(1, 0, 0, false, false);
+    assert!(
+        report.selected_victims.len() >= 2,
+        "expected multiple victim buckets: {report:?}"
+    );
+    let recencies: Vec<u64> = report
+        .selected_victims
+        .iter()
+        .map(|victim| victim.last_touched_ms)
+        .collect();
+    assert!(
+        recencies.windows(2).all(|pair| pair[0] <= pair[1]),
+        "victims must be ordered least-recently-used first: {report:?}"
+    );
+    assert!(
+        recencies.last() > recencies.first(),
+        "the hot bucket must have the newest recency and sort last: {report:?}"
+    );
+}
+
+#[test]
+fn wal_replay_gap_refuses_load_like_dataloss() {
+    // WAL replay returns DataLoss and aborts load on a hole in the
+    // retained wal. Rust must likewise refuse the load (not-loaded) rather than
+    // silently serve a truncated prefix.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    // Seed the WAL with a sequence hole {1,2,4} (missing 3) before loading the shard;
+    // there is no served index, so recovery replays from watermark 0.
+    let wal = engine.write_ahead_log_store();
+    for seq in [1u64, 2, 4] {
+        wal.append_replayed_record(WriteAheadLogRecord {
+            shard_id: 1,
+            sequence: seq,
+            command: Some(Command::StringSet {
+                key: format!("k{seq}"),
+                value: b"v".to_vec(),
+            }),
+            metadata: None,
+            staged_blocks: Vec::new(),
+            outcomes: Vec::new(),
+        })
+        .unwrap();
+    }
+    let response = engine.load_shard_with(LoadShardRequest {
+        shard_id: 1,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 0,
+        end_routing_bucket: u32::MAX,
+        readonly: false,
+        table_name: String::new(),
+    });
+    assert!(
+        !response.status.ok,
+        "load must refuse on a WAL sequence gap: {response:?}"
+    );
+    assert_eq!(response.status.code, "wal_replay_sequence_gap");
+    // The shard must be left NOT loaded (unwound).
+    let get = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k1".to_string(),
+        },
+    });
+    assert!(
+        !get.status.ok,
+        "a refused load must leave the shard not-loaded: {get:?}"
+    );
+}
+
+#[test]
+fn expiry_sweep_emits_wal_delete_marker_like_native() {
+    // Active expiry is a logged, replicated delete. Rust's sweep must append a
+    // WAL tombstone per expired key so followers / WAL replay observe the deletion,
+    // instead of removing only in-memory + index.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        },
+    });
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::CommonExpire {
+            key: "k".to_string(),
+            ttl_ms: 1,
+        },
+    });
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let wal_before_sweep = engine.write_ahead_log_store().stats(1).writes;
+    let report = engine.sweep_expired_records(1).unwrap();
+    assert_eq!(report.expired_records_removed, 1);
+    let wal_after_sweep = engine.write_ahead_log_store().stats(1).writes;
+    assert_eq!(
+        wal_after_sweep - wal_before_sweep,
+        1,
+        "the expiry sweep must append one WAL delete (tombstone) per expired key"
+    );
+}
+
+
+/// Pins the two clocks these recovery tests depend on: the timestamp stamped onto each WAL
+/// record (which replay reads back as the leader clock) and the clock the engine computes
+/// deadlines with. Both are restored on drop, including on panic, so a pinned clock can
+/// never leak into another test on this thread.
+static PINNED_LEADER_CLOCK_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct PinnedLeaderClock(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+impl PinnedLeaderClock {
+    fn at(leader_now_ms: u64) -> Self {
+        // The record clock is process-wide, so two tests pinning it at once would stamp each
+        // other's records. Held for the few writes that need it, released on drop.
+        let guard = PINNED_LEADER_CLOCK_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        crate::wal::set_test_record_clock_ms(Some(leader_now_ms));
+        crate::engine::set_replay_clock_ms(Some(leader_now_ms));
+        PinnedLeaderClock(guard)
+    }
+
+    fn real_now_ms() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_millis() as u64
+    }
+}
+
+impl Drop for PinnedLeaderClock {
+    fn drop(&mut self) {
+        crate::wal::set_test_record_clock_ms(None);
+        crate::engine::set_replay_clock_ms(None);
+    }
+}
+
+#[test]
+fn wal_replay_uses_leader_timestamp_for_ttl_deadline_like_native() {
+    // resolves a TTL to an ABSOLUTE deadline on the leader before logging it
+    // (deadline = request.ttl_ms + current time at log time); replay uses that
+    // value. Rust must resolve replayed TTLs against the leader's logged timestamp, not
+    // the (later) restart clock -- otherwise crash recovery resurrects a key past its
+    // deadline with a fresh restart-time+ttl lifetime.
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    // async so the SETEX lives only in the WAL, forcing a replay on reload.
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSetEx {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+            ttl_ms: 40,
+        },
+    });
+    // Sleep well past the 40ms TTL so the leader deadline is in the past at reload.
+    std::thread::sleep(std::time::Duration::from_millis(160));
+    drop(engine);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+    let get = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        get.response,
+        CommandResponse::Bytes { value: None },
+        "a key past its leader TTL deadline must not be resurrected with a replay-time deadline"
+    );
+}
+
+/// A WAL record carrying NO leader timestamp must replay against the LIVE clock.
+///
+/// The rule is already written down for the raft-apply path, on `execute_raft_apply_at`: "`None`
+/// (or a zero stamp, from an entry written before the log carried one) keeps the live clock".
+/// `ReplayClockGuard::enter` enforces it with `.filter(|stamp| *stamp > 0)`. The WAL replay loop
+/// sets the same thread-local, but set it straight from `metadata.timestamp_ms` -- so an
+/// unstamped record pinned the replay clock to 0 and every relative deadline resolved during it
+/// landed in 1970. A durably acknowledged write then comes back from recovery already expired,
+/// which is the quietest way a store can lose one.
+///
+/// The zero is reachable rather than hypothetical: protobuf is the only WAL encoder, and its
+/// decoder copies this field verbatim, so an absent `timestamp_ms` decodes as 0 -- while the
+/// field immediately beside it, `version`, IS normalized for precisely this case.
+///
+/// BOTH HALVES ARE ASSERTED SEPARATELY, and they fail the same way for opposite reasons: a
+/// stamped record must still resolve against its stamp (the behaviour this must not break), and
+/// an unstamped one must not resolve against a zero. Asserting only one of them would pass on a
+/// replay that got the other exactly backwards.
+#[test]
+fn wal_replay_reads_an_unstamped_record_against_the_live_clock() {
+    use crate::wal::{WriteAheadLogRecord, WriteAheadLogRecordMetadata};
+
+    const ONE_MINUTE_MS: u64 = 60 * 1000;
+
+    // Records built by hand and written straight into the log, because the stamp is the whole
+    // subject: no writer API will produce a zero on request (`set_test_record_clock_ms` reads
+    // its own zero as "not pinned"), so the only way to state one is to write the record.
+    fn record_at(sequence: u64, key: &str, stamp_ms: u64) -> WriteAheadLogRecord {
+        WriteAheadLogRecord {
+            shard_id: 1,
+            sequence,
+            command: Some(Command::StringSetEx {
+                key: key.to_string(),
+                value: b"v".to_vec(),
+                ttl_ms: ONE_MINUTE_MS,
+            }),
+            metadata: Some(WriteAheadLogRecordMetadata {
+                version: crate::wal::WRITE_AHEAD_LOG_FORMAT_VERSION,
+                timestamp_ms: stamp_ms,
+                items: Vec::new(),
+                batch_id: None,
+                batch_size: None,
+                batch_index: None,
+            }),
+            staged_blocks: Vec::new(),
+            outcomes: Vec::new(),
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let live_now_ms = PinnedLeaderClock::real_now_ms();
+
+    {
+        let writer = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            dir.path().join("cache-a"),
+            &block_dir,
+            &index_dir,
+        );
+        let log = writer.write_ahead_log_store();
+        // Sequence 1: STAMPED an hour ago, one-minute TTL. Its deadline is long past.
+        log.append_replayed_record(record_at(1, "stamped", live_now_ms - 60 * ONE_MINUTE_MS))
+            .unwrap();
+        // Sequence 2: UNSTAMPED, same one-minute TTL. Nothing in the record says when the
+        // leader took it, so the only honest reading of its deadline is "a minute from now".
+        log.append_replayed_record(record_at(2, "unstamped", 0))
+            .unwrap();
+    }
+
+    // No index file was ever written, so the replay watermark is 0 and both records replay.
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+
+    let ttl_of = |key: &str| {
+        match restarted
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::CommonTtl {
+                    key: key.to_string(),
+                },
+            })
+            .response
+        {
+            CommandResponse::Integer { value } => value,
+            other => panic!("TTL for {key} answered {other:?}"),
+        }
+    };
+
+    // HALF A, the control. The stamped record still resolves against its own stamp, so its
+    // deadline sits 59 minutes in the past and the key is gone. -2 is "no such key". This half
+    // passes before the fix as well as after; it is here so a change that repaired half B by
+    // ignoring every stamp could not pass.
+    assert_eq!(
+        ttl_of("stamped"),
+        -2,
+        "a record carrying a real leader stamp must resolve its deadline against that stamp, \
+         not against the restart clock"
+    );
+
+    // HALF B, the finding. Read against a zero clock the unstamped record's deadline is 60000 --
+    // an absolute instant in 1970 -- so it replays already-expired and answers -2, the same
+    // number as half A for the opposite reason.
+    let remaining = ttl_of("unstamped");
+    assert!(
+        remaining > 0 && remaining <= ONE_MINUTE_MS as i64,
+        "an unstamped record must resolve its one-minute TTL against the live clock, leaving \
+         at most {ONE_MINUTE_MS}ms and more than 0; got {remaining} (-2 means the replay clock \
+         was pinned to 1970 and a durable write came back from recovery already expired)"
+    );
+}
+
+#[test]
+fn wal_replay_conditional_write_uses_leader_clock_for_lazy_expiry_like_native() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    // async so both records live only in the WAL, forcing a replay on reload.
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+
+    // An hour of downtime, STATED rather than slept for. Sleeping for it was the defect in
+    // this test: the two writes below have to land while k is still live, so a real deadline
+    // made that a race against whatever else the machine was doing, and any stall longer than
+    // the TTL failed the test on a property it is not about.
+    let leader_now_ms = PinnedLeaderClock::real_now_ms() - 60 * 60 * 1000;
+    {
+        let _clock = PinnedLeaderClock::at(leader_now_ms);
+        // Record 1: create k with a one-minute deadline, an hour before restart.
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSetEx {
+                key: "k".to_string(),
+                value: b"v1".to_vec(),
+                ttl_ms: 60 * 1000,
+            },
+        });
+        // Record 2: a SET XX refreshing k=v2 with a deadline that OUTLASTS the downtime. On
+        // the leader this fires because k is live at leader time, and it now fires
+        // unconditionally, because the deadline and the check read the same pinned clock.
+        let cond = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSetConditional {
+                key: "k".to_string(),
+                value: b"v2".to_vec(),
+                ttl_ms: Some(2 * 60 * 60 * 1000),
+                condition: StringSetCondition::IfExists,
+                return_old: false,
+                keep_ttl: false,
+            },
+        });
+        assert_eq!(
+            cond.response,
+            CommandResponse::Integer { value: 1 },
+            "SET XX must fire on the leader while k is live"
+        );
+    }
+    // These writes are asynchronous: the commit does not block, so a returned write does not
+    // mean the record has reached the file. The engine has no Drop that flushes, so dropping
+    // it is not a barrier either -- the successor below can open the log before the last
+    // record lands in it, and a replay test whose log is missing its last record fails
+    // looking exactly like a recovery defect. Flush, then check there is something to replay.
+    let flushed = engine
+        .write_ahead_log_store()
+        .flush(1)
+        .expect("flush the log before the engine goes away");
+    let _ = flushed;
+    assert!(
+        engine.write_ahead_log_store().stats(1).writes >= 2,
+        "premise: the log must hold the writes this test is about to replay, got {}",
+        engine.write_ahead_log_store().stats(1).writes
+    );
+    drop(engine);
+
+    // Restart on the REAL clock. Record 1's deadline lapsed 59 minutes ago; the deadline the
+    // SET XX installed is still an hour out. Replay installs record 1's outcome (an absolute
+    // leader-time deadline) and re-executes record 2, whose lazy-expiry check picks the
+    // branch: against the leader clock k is live and the write survives; against the restart
+    // clock k reads expired and a durably-committed write is silently lost.
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    // Assert the LOAD, not just what is readable after it. `load_shard` throws its response
+    // away, so a shard that refused to recover looks identical to one that recovered empty --
+    // every assertion below then reports a missing value and blames replay for dropping it,
+    // which is the wrong end of the failure and is exactly how this was read for several
+    // rounds.
+    let loaded = restarted.load_shard_with(LoadShardRequest {
+        shard_id: 1,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 0,
+        end_routing_bucket: u32::MAX,
+        readonly: false,
+        table_name: String::new(),
+    });
+    assert!(
+        loaded.status.ok,
+        "the shard refused the load: {:?}",
+        loaded.status
+    );
+
+    let get = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        get.response,
+        CommandResponse::Bytes {
+            value: Some(b"v2".to_vec())
+        },
+        "replay must reproduce the leader's SET XX branch (k live at leader time), not drop \
+         the committed write because the original deadline lapsed during downtime"
+    );
+}
+
+#[test]
+fn wal_replay_rearmed_expire_does_not_abort_recovery_like_native() {
+    // A committed EXPIRE that re-arms a key's TTL must replay cleanly even if the key's
+    // ORIGINAL (pre-re-arm) deadline has lapsed by restart time. Command preconditions are
+    // a LEADER-time gate; re-running them during replay against the restart clock made a
+    // replayed EXPIRE fail "not_found" and abort the WHOLE shard load (data unavailability
+    // for every key on the shard). ReplayWal re-applies logged effects without
+    // re-checking preconditions. The canary below proves the shard actually recovered.
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    // async so every record lives only in the WAL, forcing a full replay on reload.
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+
+    // An hour of downtime, stated rather than slept for, as in the sibling test. What this
+    // test needs is that k's deadline has LAPSED by restart -- a premise that now holds by
+    // construction. It previously held only if the sleep outlasted the TTL, and widening the
+    // TTL to steady the race quietly inverted it: 250ms of downtime against a 1500ms
+    // deadline left the key live at restart, so the test passed without ever building the
+    // situation it exists to check.
+    let leader_now_ms = PinnedLeaderClock::real_now_ms() - 60 * 60 * 1000;
+    {
+        let _clock = PinnedLeaderClock::at(leader_now_ms);
+        // Durable canary that survives iff replay runs to completion (not aborted mid-way).
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "canary".to_string(),
+                value: b"present".to_vec(),
+            },
+        });
+        // Create k with a one-minute deadline, then re-arm it via EXPIRE. Both logged, both
+        // an hour before restart, so both deadlines are in the past by the time replay runs.
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSetEx {
+                key: "k".to_string(),
+                value: b"v".to_vec(),
+                ttl_ms: 60 * 1000,
+            },
+        });
+        let rearmed = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::CommonExpire {
+                key: "k".to_string(),
+                ttl_ms: 60 * 1000,
+            },
+        });
+        assert!(
+            rearmed.status.ok,
+            "EXPIRE on a live key should succeed on the leader"
+        );
+    }
+    // These writes are asynchronous: the commit does not block, so a returned write does not
+    // mean the record has reached the file. The engine has no Drop that flushes, so dropping
+    // it is not a barrier either -- the successor below can open the log before the last
+    // record lands in it, and a replay test whose log is missing its last record fails
+    // looking exactly like a recovery defect. Flush, then check there is something to replay.
+    let flushed = engine
+        .write_ahead_log_store()
+        .flush(1)
+        .expect("flush the log before the engine goes away");
+    let _ = flushed;
+    assert!(
+        engine.write_ahead_log_store().stats(1).writes >= 3,
+        "premise: the log must hold the writes this test is about to replay, got {}",
+        engine.write_ahead_log_store().stats(1).writes
+    );
+    drop(engine);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    // Assert the LOAD, not just what is readable after it. `load_shard` throws its response
+    // away, so a shard that refused to recover looks identical to one that recovered empty --
+    // every assertion below then reports a missing value and blames replay for dropping it,
+    // which is the wrong end of the failure and is exactly how this was read for several
+    // rounds.
+    let loaded = restarted.load_shard_with(LoadShardRequest {
+        shard_id: 1,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 0,
+        end_routing_bucket: u32::MAX,
+        readonly: false,
+        table_name: String::new(),
+    });
+    assert!(
+        loaded.status.ok,
+        "the shard refused the load: {:?}",
+        loaded.status
+    );
+
+    // THE PREMISE, ASSERTED. This test is only meaningful if k's deadline actually lapsed
+    // while the engine was down; if it did not, the situation it exists to check was never
+    // built and the canary below passes for free. That is not hypothetical -- widening this
+    // test's TTL to steady a race once left 250ms of downtime against a 1500ms deadline, and
+    // it kept passing while checking nothing. So: k must be GONE at restart.
+    let lapsed = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    assert_eq!(
+        lapsed.response,
+        CommandResponse::Bytes { value: None },
+        "premise: k's re-armed deadline must have lapsed during the downtime, or this test \
+         is not exercising a replayed EXPIRE whose deadline is in the past"
+    );
+    let canary = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "canary".to_string(),
+        },
+    });
+    assert_eq!(
+        canary.response,
+        CommandResponse::Bytes {
+            value: Some(b"present".to_vec())
+        },
+        "shard must recover: a replayed re-arming EXPIRE whose original deadline lapsed must \
+         not abort the whole WAL replay"
+    );
+}
+
+#[test]
+fn hdel_last_field_removes_key_like_native() {
+    // hash2::Del removes the whole object once the last field is deleted; Rust left an
+    // empty field map behind, so the key still reported as existing (EXISTS=1, TYPE=hash).
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::HashSet {
+            key: "h".to_string(),
+            field: "f".to_string(),
+            value: b"v".to_vec(),
+        },
+    });
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::HashDelete {
+            key: "h".to_string(),
+            field: "f".to_string(),
+        },
+    });
+    let exists = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::CommonExists {
+            key: "h".to_string(),
+        },
+    });
+    assert_eq!(
+        exists.response,
+        CommandResponse::Integer { value: 0 },
+        "an emptied hash must not leave a phantom key (deletes the object on last HDEL)"
+    );
+}
+
+#[test]
+fn timestamped_models_survive_unload_reload_round_trip() {
+    // Regression net for the membership-authoritative reconcile + serde round-trip: write a
+    // string plus the reconcile page-reading timestamped kinds (feature + sequence), then
+    // unload + reload and assert every value comes back intact (no loss, no resurrection).
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "s".to_string(),
+            value: b"string-value".to_vec(),
+        },
+    });
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::FeatureAppend {
+            key: "f".to_string(),
+            points: vec![
+                FeaturePoint {
+                    timestamp_ms: 10,
+                    value: b"a".to_vec(),
+                },
+                FeaturePoint {
+                    timestamp_ms: 20,
+                    value: b"b".to_vec(),
+                },
+            ],
+        },
+    });
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::SequenceAdd {
+            key: "seq".to_string(),
+            rows: vec![SequenceFeatureRow {
+                timestamp_ms: 5,
+                gid: 1,
+                action_type: 2,
+                duration: 3,
+                author_id: 4,
+            }],
+        },
+    });
+
+    let feature_timestamps = |engine: &TemporalEngine| -> Vec<u64> {
+        match engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureQuery {
+                    key: "f".to_string(),
+                    start_ms: 0,
+                    end_ms: u64::MAX,
+                    count: Some(100),
+                },
+            })
+            .response
+        {
+            CommandResponse::FeaturePoints { points } => {
+                points.iter().map(|p| p.timestamp_ms).collect()
+            }
+            other => panic!("expected FeaturePoints, got {other:?}"),
+        }
+    };
+    let sequence_len = |engine: &TemporalEngine| -> usize {
+        match engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::SequenceQuery {
+                    key: "seq".to_string(),
+                    start_ms: 0,
+                    end_ms: u64::MAX,
+                    count: 100,
+                    filters: Vec::new(),
+                },
+            })
+            .response
+        {
+            CommandResponse::SequenceRows { rows } => rows.len(),
+            other => panic!("expected SequenceRows, got {other:?}"),
+        }
+    };
+    let features_before = feature_timestamps(&engine);
+    assert_eq!(features_before, vec![10, 20]);
+    assert_eq!(sequence_len(&engine), 1);
+
+    engine.unload_shard(1);
+    engine.load_shard(1);
+
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: "s".to_string(),
+                },
+            })
+            .response,
+        CommandResponse::Bytes {
+            value: Some(b"string-value".to_vec()),
+        },
+        "string must survive reload"
+    );
+    assert_eq!(
+        feature_timestamps(&engine),
+        features_before,
+        "feature series must survive reload unchanged"
+    );
+    assert_eq!(
+        sequence_len(&engine),
+        1,
+        "sequence row must survive reload"
+    );
+}
+
+#[test]
+fn reconcile_does_not_resurrect_evicted_feature_points_on_reload() {
+    // A single FeatureAppend packs all timestamps into one page; the feature_max_size trim
+    // drops the oldest from the in-memory series, but the page still physically holds them.
+    // reconcile-from-pages must keep the persisted (trimmed) membership -- the evicted points
+    // must NOT resurrect on reload (writes per-timestamp deleted tombstones for this).
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    feature_max_size: 3,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    // One append of 5 points; the max_size=3 trim keeps the newest 3 in the series.
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::FeatureAppend {
+            key: "f".to_string(),
+            points: (1..=5)
+                .map(|i| FeaturePoint {
+                    timestamp_ms: i * 10,
+                    value: vec![i as u8],
+                })
+                .collect(),
+        },
+    });
+    let live_timestamps = |engine: &TemporalEngine| -> Vec<u64> {
+        match engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureQuery {
+                    key: "f".to_string(),
+                    start_ms: 0,
+                    end_ms: u64::MAX,
+                    count: Some(100),
+                },
+            })
+            .response
+        {
+            CommandResponse::FeaturePoints { points } => {
+                points.iter().map(|point| point.timestamp_ms).collect()
+            }
+            other => panic!("expected FeaturePoints, got {other:?}"),
+        }
+    };
+    let before = live_timestamps(&engine);
+    assert!(
+        before.contains(&50) && !before.contains(&10),
+        "trim should keep the newest points and drop the oldest: {before:?}"
+    );
+    drop(engine);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+    assert_eq!(
+        live_timestamps(&restarted),
+        before,
+        "reload must not resurrect the evicted feature points that still physically live in the page"
+    );
