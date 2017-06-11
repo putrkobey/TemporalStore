@@ -30,35 +30,3 @@ function firstStringEnv(env, keys) {
     }
   }
   return { value: "", source: "" };
-}
-
-export function resolveSessionId(payload = {}, env = process.env) {
-  const direct = firstStringAt(payload, [
-    ["session_id"],
-    ["sessionId"],
-    ["codex_session_id"],
-    ["conversation_id"],
-    ["conversationId"],
-    ["thread_id"],
-    ["threadId"],
-    ["transcript_id"],
-    ["transcriptId"],
-    ["run", "session_id"],
-    ["run", "thread_id"],
-    ["params", "session_id"],
-    ["params", "thread_id"],
-    ["turn", "session_id"],
-    ["turn", "thread_id"],
-    ["metadata", "session_id"],
-    ["metadata", "thread_id"]
-  ]);
-  if (direct.value) {
-    return {
-      sessionId: `${env.TEMPORALSTORE_AGENT_NAME || "codex"}:${direct.value}`,
-      conversationId: direct.value,
-      source: `payload.${direct.source}`
-    };
-  }
-
-  const pathValue = firstStringAt(payload, [
-    ["transcript_path"],
