@@ -26,3 +26,59 @@ function makeEl(id) {
     id: id || "",
     hidden: false, innerHTML: "", textContent: "", value: "", checked: false, className: "",
     style: {}, dataset: {}, files: [], options: [], children: [],
+    addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+    removeEventListener() {},
+    dispatch(type, ev) { (listeners[type] || []).forEach((fn) => fn(ev || {})); },
+    appendChild() {}, removeChild() {},
+    setAttribute(k, v) { attrs[k] = v; }, getAttribute(k) { return k in attrs ? attrs[k] : null; },
+    closest() { return null; },
+    querySelector() { return null; }, querySelectorAll() { return []; },
+    scrollIntoView() {}, focus() {}, click() {},
+    classList: { add() {}, remove() {}, toggle() {} }
+  };
+  return el;
+}
+
+function get(id) {
+  if (!byId.has(id)) { byId.set(id, makeEl(id)); }
+  return byId.get(id);
+}
+
+function respond(body) {
+  return Promise.resolve({
+    ok: true, status: 200,
+    json: () => Promise.resolve(body),
+    text: () => Promise.resolve(JSON.stringify(body))
+  });
+}
+
+const win = {
+  document: {
+    getElementById: get,
+    querySelector: () => makeEl(),
+    querySelectorAll: () => [],
+    createElement: () => makeEl(),
+    addEventListener() {},
+    body: makeEl("body"),
+    hidden: false
+  },
+  addEventListener() {},
+  location: { origin: "http://localhost", href: "http://localhost", host: "gw.example:8080", reload() {} },
+  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  navigator: {},
+  setTimeout: () => 0,
+  setInterval: () => 0,
+  clearInterval() {},
+  Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
+  TextDecoder: function () { this.decode = () => ""; },
+  AbortController: function () { this.abort = () => {}; this.signal = {}; },
+  FileReader: function () {},
+  Blob: function () {},
+  URL: { createObjectURL: () => "", revokeObjectURL() {} },
+  fetch: (url, opts) => {
+    const key = String(url);
+    if (opts && opts.method === "POST") { posted.push({ url: key, body: opts.body }); }
+    if (key.indexOf("/v1/admin/deployment/plan") === 0) { return respond(routes.plan); }
+    if (key.indexOf("/v1/admin/deployment") === 0) { return respond(routes.deployment); }

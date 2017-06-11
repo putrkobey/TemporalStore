@@ -129,3 +129,134 @@ fn n_members_at_distinct_scores_survive_a_cold_reload_in_score_order() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     {
+        let engine = engine_on(dir.path(), "cache-writer");
+        load_on(&engine, "zcd-present-table");
+        for index in 0..N {
+            write(
+                &engine,
+                Command::ZSetAdd {
+                    key: key.to_string(),
+                    member: member_bytes(index),
+                    score: index as f64 * 1.5,
+                },
+            );
+        }
+        for index in 0..N {
+            assert_eq!(
+                score_of(&engine, key, &member_bytes(index)),
+                Some(index as f64 * 1.5),
+                "member {index} did not read back its own score BEFORE the reload"
+            );
+        }
+        engine.unload_shard(1);
+    }
+
+    let engine = engine_on(dir.path(), "cache-reloaded");
+    load_on(&engine, "zcd-present-table");
+
+    for index in 0..N {
+        assert_eq!(
+            score_of(&engine, key, &member_bytes(index)),
+            Some(index as f64 * 1.5),
+            "member {index} did not come back at its own score after a cold reload"
+        );
+    }
+
+    let ranged = match read(
+        &engine,
+        Command::ZSetRangeByScore {
+            key: key.to_string(),
+            min: f64::MIN,
+            max: f64::MAX,
+            min_exclusive: false,
+            max_exclusive: false,
+            rev: false,
+        },
+    ) {
+        crate::types::CommandResponse::Members { members } => members,
+        other => panic!("ZSetRangeByScore answered {other:?}"),
+    };
+    assert_eq!(
+        ranged.len(),
+        2 * N,
+        "ZSetRangeByScore answered {} interleaved entries, not the {} this fixture wrote",
+        ranged.len(),
+        2 * N
+    );
+    let scores: Vec<f64> = ranged
+        .chunks(2)
+        .map(|pair| String::from_utf8_lossy(&pair[1]).parse::<f64>().expect("a score string"))
+        .collect();
+    let mut sorted = scores.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(
+        scores, sorted,
+        "ZSetRangeByScore did not answer in score order after a cold reload: {scores:?}"
+    );
+    println!("[present] {N} members survived a cold reload, in score order");
+}
+
+// =================================================================================================
+// 2. REMOVED STAYS REMOVED
+// =================================================================================================
+
+/// A LOSS GUARD IS NOT A RESURRECTION GUARD -- a separate test, not one more assertion on the
+/// first, which the module doc explains.
+///
+/// rust-internal: drives ZSetAdd and ZSetRemove through a real cold reload, no external surface
+#[test]
+fn a_removed_member_stays_removed_across_a_cold_reload() {
+    const N: usize = 10;
+    let key = "zcd-removed";
+    let removed_index = 4;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let engine = engine_on(dir.path(), "cache-writer");
+        load_on(&engine, "zcd-removed-table");
+        for index in 0..N {
+            write(
+                &engine,
+                Command::ZSetAdd {
+                    key: key.to_string(),
+                    member: member_bytes(index),
+                    score: index as f64,
+                },
+            );
+        }
+        write(
+            &engine,
+            Command::ZSetRemove {
+                key: key.to_string(),
+                member: member_bytes(removed_index),
+            },
+        );
+        assert_eq!(
+            card_of(&engine, key),
+            (N - 1) as i64,
+            "DENOMINATOR: the removal did not take effect before the reload"
+        );
+        engine.unload_shard(1);
+    }
+
+    let engine = engine_on(dir.path(), "cache-reloaded");
+    load_on(&engine, "zcd-removed-table");
+
+    assert_eq!(
+        card_of(&engine, key),
+        (N - 1) as i64,
+        "ZCARD is not N-1 after a cold reload -- either the removed member came back or an \
+         unrelated one went missing"
+    );
+    assert_eq!(
+        score_of(&engine, key, &member_bytes(removed_index)),
+        None,
+        "the removed member came back after a cold reload"
+    );
+    for index in 0..N {
+        if index == removed_index {
+            continue;
+        }
+        assert_eq!(
+            score_of(&engine, key, &member_bytes(index)),
+            Some(index as f64),
