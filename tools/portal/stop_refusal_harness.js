@@ -46,28 +46,3 @@ async function flush() {
   }
 }
 
-function run(status, body, reject) {
-  const said = [];
-  const reloads = [];
-  const env = {
-    $: (id) => ({ id }),
-    say(_el, text, cls) { said.push({ text: String(text), cls }); },
-    auth: () => ({}),
-    loadJobs() { reloads.push(1); },
-    encodeURIComponent: (s) => s,
-    fetch: () => (reject
-      ? Promise.reject(new Error("offline"))
-      : Promise.resolve({
-          ok: status >= 200 && status < 300,
-          status,
-          json: () => (body === undefined ? Promise.reject(new Error("no body"))
-                                          : Promise.resolve(body)),
-        })),
-    window: {
-      __matrixarkWhy(b, fallback) {
-        b = b || {};
-        let text = b.detail || b.error || fallback;
-        if (b.required && b.required.length) { text += " — this needs " + b.required.join(" or "); }
-        return text;
-      },
-      /* The shared map, if this page uses it; the page's own failure() closes over whichever. */
