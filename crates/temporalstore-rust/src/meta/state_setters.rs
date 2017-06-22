@@ -71,39 +71,3 @@ impl SingleNodeMeta {
         }
     }
 
-    pub(super) fn set_proxy_state(&self, request: StateChangeRequest, next: MetaEntityState) -> AckResponse {
-        if let Some(status) = self.meta_change_refusal() {
-            return AckResponse { status };
-        }
-        if !self
-            .inner
-            .read()
-            .expect("meta lock poisoned")
-            .proxies
-            .contains_key(&request.endpoint)
-        {
-            return AckResponse {
-                status: Status::error("not_found", "proxy not found"),
-            };
-        }
-        let at_ms = self.record_mutation(match next {
-            MetaEntityState::Frozen => MetaMutation::FreezeProxy(request.clone()),
-            MetaEntityState::Dropped => MetaMutation::DropProxy(request.clone()),
-            MetaEntityState::Normal => MetaMutation::UnfreezeProxy(request.clone()),
-        });
-        self.apply_set_proxy_state(request, next, at_ms)
-    }
-
-    pub(super) fn apply_set_proxy_state(
-        &self,
-        request: StateChangeRequest,
-        next: MetaEntityState,
-        at_ms: u64,
-    ) -> AckResponse {
-        let mut state = self.inner.write().expect("meta lock poisoned");
-        let Some(proxy) = state.proxies.get_mut(&request.endpoint) else {
-            return AckResponse {
-                status: Status::error("not_found", "proxy not found"),
-            };
-        };
-        let now = at_ms;

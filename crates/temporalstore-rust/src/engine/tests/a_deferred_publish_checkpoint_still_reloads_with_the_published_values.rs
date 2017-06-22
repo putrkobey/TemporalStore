@@ -164,3 +164,169 @@ fn drive_publishes(engine: &TemporalEngine) -> PublishShape {
         published: Vec::new(),
         published_per_publish: Vec::new(),
     };
+    for round in 0..PUBLISHES {
+        // DISTINCT KEYS PER PUBLISH. A published block is no longer log-resident, so naming the
+        // same key twice gives a publish with nothing to do -- which would report a skip that is
+        // really an empty publish and make the count below mean nothing.
+        let selected: Vec<String> = (0..PER_PUBLISH)
+            .map(|offset| key_at(round * PER_PUBLISH + offset))
+            .collect();
+        crate::engine::shard_write_guard::reset_index_encode_counts();
+        let reported = engine
+            .publish_shard_index_snapshot_for_keys(SHARD, selected.clone())
+            .expect("publish must succeed");
+        let counts = crate::engine::shard_write_guard::index_encode_counts();
+        shape.encode_bytes += counts.encode_bytes_total;
+        shape.publishes_with_keys += 1;
+        shape.published_per_publish.push(selected.len() as u64);
+        shape.published.extend(selected);
+        if counts.encodes_total > 0 {
+            shape.materializations += 1;
+            assert!(
+                reported > 0,
+                "round {round} encoded {} bytes and reported {reported}, so the reported figure \
+                 is no longer the bytes the publish wrote",
+                counts.encode_bytes_total
+            );
+        } else {
+            shape.skipped += 1;
+            assert_eq!(
+                0, reported,
+                "round {round} encoded nothing and reported {reported} bytes, so the report is \
+                 describing an index this publish did not write"
+            );
+        }
+    }
+    shape
+}
+
+/// A DEFERRED CHECKPOINT STILL RELOADS WITH EVERY PUBLISHED VALUE.
+#[test]
+fn a_deferred_publish_checkpoint_still_reloads_with_the_published_values() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let (before_reload, published, shape) = {
+        let engine = engine_over(dir.path());
+        seed(&engine, KEYS);
+
+        let seeded = engine
+            .shards
+            .read()
+            .expect("engine lock poisoned")
+            .get(&SHARD)
+            .expect("shard is loaded")
+            .strings()
+            .len();
+        assert_eq!(
+            KEYS, seeded,
+            "the seed must have landed, or nothing below means anything"
+        );
+
+        // THE INTERVAL, READ BACK OUT. A knob the publish consults under a different name than
+        // this arm sets leaves the arm silently not running, and it would then agree with whatever
+        // it was asked. This is the shipped default, deliberately: the deferral this test is about
+        // is the one a deployment gets.
+        let interval = engine.visibility_publish_index_flush_interval();
+        assert!(
+            interval > 1,
+            "the engine's interval is {interval}, so every publish is due and nothing is \
+             deferred -- this test would pass while measuring the behaviour it was written to \
+             replace"
+        );
+
+        let shape = drive_publishes(&engine);
+        let before_reload = served_values(&engine);
+        println!();
+        println!(
+            "  interval={interval} publishes={PUBLISHES} per_publish={PER_PUBLISH} \
+             checkpoints_taken={} checkpoints_skipped={} encode_bytes={}",
+            shape.materializations, shape.skipped, shape.encode_bytes
+        );
+        println!(
+            "  seeded={seeded} published_keys={} served_before_reload={}",
+            shape.published.len(),
+            before_reload.len()
+        );
+        (before_reload, shape.published.clone(), shape)
+        // The engine drops here, so only what reached the disk is left and the reload below has
+        // to rebuild the shard from it.
+    };
+
+    // --- THE REGIME. All of these have to hold before the reload says anything. ---
+    assert!(
+        shape.publishes_with_keys > 1,
+        "only {} publish(es) ran, so there was never more than one checkpoint's worth of keys to \
+         defer",
+        shape.publishes_with_keys
+    );
+    assert!(
+        shape.skipped > 0,
+        "every one of the {} publish(es) also took its checkpoint, so nothing was deferred and a \
+         clean reload below would prove nothing. ({} checkpoint(s) taken.)",
+        shape.publishes_with_keys,
+        shape.materializations
+    );
+    assert!(
+        !published.is_empty(),
+        "no key was published across {PUBLISHES} publishes, so the reload has nothing to \
+         re-derive"
+    );
+    assert_eq!(
+        KEYS,
+        before_reload.len(),
+        "the engine did not serve every seeded key BEFORE the reload, so the comparison below \
+         would be against a store that was already short"
+    );
+
+    // --- THE PROPERTY. ---
+    let reopened = engine_over(dir.path());
+    let after_reload = served_values(&reopened);
+    println!("  served_after_reload={}", after_reload.len());
+    println!();
+
+    // THE PUBLISHED KEYS FIRST, because they are the contested subset: these are the rows whose
+    // relocation the skipped checkpoints never wrote down.
+    let lost_published: Vec<&String> = published
+        .iter()
+        .filter(|key| after_reload.get(*key).map(|bytes| &bytes[..]) != {
+            before_reload.get(*key).map(|bytes| &bytes[..])
+        })
+        .collect();
+    assert!(
+        lost_published.is_empty(),
+        "{} of {} key(s) published by a call whose served-index checkpoint was deferred did not \
+         read back the same bytes after a reload, so the deferral is NOT re-derived by replay and \
+         the interval is unsafe. First few: {:?}",
+        lost_published.len(),
+        published.len(),
+        lost_published.iter().take(8).collect::<Vec<_>>()
+    );
+
+    // AND THE WHOLE STORE, IN BOTH DIRECTIONS, because "every published value came back" is also
+    // what a reload that served the pre-publish copy of everything would report, and "nothing is
+    // missing" is what a reload that invented rows would report too.
+    let missing: Vec<&String> = before_reload
+        .keys()
+        .filter(|key| !after_reload.contains_key(*key))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "{} key(s) the engine served before the reload are gone after it, so the clean result \
+         above is a store that lost rows rather than a deferral that replayed. First few: {:?}",
+        missing.len(),
+        missing.iter().take(8).collect::<Vec<_>>()
+    );
+    let extra: Vec<&String> = after_reload
+        .keys()
+        .filter(|key| !before_reload.contains_key(*key))
+        .collect();
+    assert!(
+        extra.is_empty(),
+        "{} key(s) exist after the reload that the engine did not serve before it: {:?}",
+        extra.len(),
+        extra.iter().take(8).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        before_reload, after_reload,
+        "the values the reopened engine serves are not the ones the publishes left behind"
+    );

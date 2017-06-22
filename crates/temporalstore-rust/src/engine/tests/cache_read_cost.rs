@@ -458,3 +458,156 @@ fn the_residual_recovers_a_planted_marker_exactly() {
 // which a normal `cargo test` does not install, so nothing above would catch a regression on its
 // own. These two do.
 // ---------------------------------------------------------------------------------------------
+
+/// A WARM SERVING READ IS ANSWERED FROM MEMORY AND NEVER REACHES THE SSD TIER.
+///
+/// This is the fact that decides whether the cache crate's read-side savings reach this store,
+/// and it is the reason they largely do not. Those savings are in `ssd_store_key`, which builds
+/// the SSD tier's key for an entry -- so they are paid back only by a read that descends to that
+/// tier. A warm serving read does not descend, and a pin A/B measured the difference it makes as
+/// exactly 0.00 allocations on this arm against exactly 8.00 on the two arms that do descend.
+///
+/// If a change ever made the warm path probe the SSD tier -- writing the command answer with a
+/// tiered `put` instead of `put_memory_only`, say -- this fails, and the reading of every
+/// allocation figure in this module changes with it.
+///
+/// THE BAND EXCLUDES THE VALUE IT GUARDS AGAINST: the failure is `disk_hits > 0`, and the
+/// assertion is `disk_hits == 0`, so no value can satisfy both. `memory_hits` is floored above
+/// zero for the same reason in the other direction -- an arm that served nothing at all would
+/// otherwise pass the first half on a technicality.
+#[test]
+fn a_warm_serving_read_is_answered_from_memory_and_never_reaches_the_ssd_tier() {
+    const KEYS: usize = 64;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        256 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    let names: Vec<String> = (0..KEYS).map(|index| format!("tenant/7/object/{index:09}")).collect();
+    for name in &names {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet { key: name.clone(), value: vec![118u8; 1_024] },
+        });
+    }
+    // Warm: after this every answer is in the command-answer cache.
+    for name in &names {
+        let _ = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet { key: name.clone() },
+        });
+    }
+
+    let before = engine.cache().stats();
+    for name in &names {
+        let answer = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet { key: name.clone() },
+        });
+        // The reads must actually be SERVING something. A shed or empty answer would satisfy
+        // every counter assertion below while measuring nothing at all.
+        match answer.response {
+            CommandResponse::Bytes { value: Some(ref bytes) } => {
+                assert_eq!(bytes.len(), 1_024, "a served answer must carry the stored value");
+            }
+            other => panic!("a warm read of a present key answered {other:?}"),
+        }
+    }
+    let after = engine.cache().stats();
+
+    let memory_hits = after.memory_hits.saturating_sub(before.memory_hits);
+    let disk_hits = after.disk_hits.saturating_sub(before.disk_hits);
+    let misses = after.misses.saturating_sub(before.misses);
+    println!(
+        "  warm serving reads: {KEYS} requests -> memory_hits {memory_hits}, \
+         disk_hits {disk_hits}, misses {misses}"
+    );
+
+    assert!(
+        memory_hits >= KEYS as u64,
+        "{KEYS} warm reads produced {memory_hits} memory hits; the command-answer cache is not \
+         answering and every read figure in this module is measuring a miss"
+    );
+    assert_eq!(
+        disk_hits, 0,
+        "a warm serving read reached the SSD tier {disk_hits} times. The cache crate's read-side \
+         savings live in the SSD tier's key builder, so this is the difference between them \
+         arriving and not arriving, and it has changed"
+    );
+    assert_eq!(
+        misses, 0,
+        "a warm serving read missed {misses} times, so the warm arm is not warm"
+    );
+
+    // ONE SERVING READ IS ONE CACHE READ when the answer is cached, and this is the assertion
+    // that says so. It exists because a mutation found the hole: making `cached_response` throw
+    // its hit away and recompute changes NEITHER the answer -- the source recomputes the same
+    // bytes -- NOR `memory_hits`, because the lookup still happens. Two paths, one answer, and
+    // nothing that compares answers can see the difference. What moves is the COUNT: the
+    // recompute reaches `read_block_bytes` and the page cache, so the store answers one request
+    // with two cache reads instead of one.
+    let cache_reads = memory_hits + disk_hits + misses;
+    assert_eq!(
+        cache_reads, KEYS as u64,
+        "{KEYS} warm requests made {cache_reads} cache reads. One cached answer is one cache \
+         read; more than that means the command-answer cache is being consulted and then not \
+         used, and the page underneath is being read anyway"
+    );
+}
+
+/// EVERY PRODUCTION CACHE READ IS CHARGED TO THE READ CLASS, AND THERE IS NO EXEMPTION LIST.
+///
+/// The compiler cannot refuse an uncounted cache read outright -- `MultiLayerCache` is named in
+/// several hundred signatures in this crate and its read methods are public -- so this enumerates
+/// them instead, in the same shape as the counted-handle guard over the index log.
+///
+/// What it does NOT do is carry a list of sites that are allowed to be uncharged. Compaction's
+/// residency probe was the one site that would have needed an entry, and it was charged instead,
+/// because a list of excused sites is where a site goes to stop being looked at.
+///
+/// The scan joins wrapped method chains before matching. Two of the four sites put the receiver
+/// on one line and the call on the next, and a line-at-a-time matcher reports those as absent --
+/// which is a clean pass over a scan that cannot see half its subject.
+///
+/// `a_new_uncharged_cache_read_would_fail_this_guard` below is the negative control.
+#[test]
+fn every_production_cache_read_is_charged_to_the_read_class() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = 0usize;
+    let mut lines = 0usize;
+    let mut excluded = 0usize;
+    let mut sites: Vec<(String, usize, bool, String)> = Vec::new();
+
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let Ok(display) = path.strip_prefix(&root) else { continue };
+            let display = display.to_string_lossy().replace('\\', "/");
+            // The engine owns the MultiLayerCache; the compiler enumeration found every
+            // production read door inside it. Test modules are taken out and the removals
+            // counted, so an exclusion that started matching everything shows up as a collapsed
+            // denominator rather than as a clean pass.
+            let is_engine = display == "engine.rs" || display.starts_with("engine/");
+            let is_test = display.contains("/tests/") || display.ends_with("tests.rs");
+            if !is_engine {
+                continue;
+            }
+            if is_test {
+                excluded += 1;
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&path) else { continue };
+            files += 1;
