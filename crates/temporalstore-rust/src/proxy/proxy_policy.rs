@@ -98,3 +98,54 @@ mod message_tests {
         let status = proxy_dropped_status();
         assert_eq!(status.code, "proxy_traffic_dropped");
         assert!(
+            !status.message.contains("  "),
+            "the refusal reads with a run of spaces in it: {:?}",
+            status.message
+        );
+    }
+}
+
+pub(super) fn proxy_serving_mode_from_meta(value: &str) -> Option<ProxyServingMode> {
+    match value.to_ascii_lowercase().replace('-', "_").as_str() {
+        "" => None,
+        "serving" => Some(ProxyServingMode::Serving),
+        "readonly" | "read_only" => Some(ProxyServingMode::Readonly),
+        "write_disabled" => Some(ProxyServingMode::WriteDisabled),
+        "degraded" => Some(ProxyServingMode::Degraded),
+        "not_serving" | "disabled" | "frozen" | "dropped" => Some(ProxyServingMode::NotServing),
+        _ => None,
+    }
+}
+
+pub(super) fn proxy_serving_mode_label(mode: ProxyServingMode) -> &'static str {
+    match mode {
+        ProxyServingMode::Serving => "serving",
+        ProxyServingMode::Readonly => "readonly",
+        ProxyServingMode::WriteDisabled => "write_disabled",
+        ProxyServingMode::Degraded => "degraded",
+        ProxyServingMode::NotServing => "not_serving",
+    }
+}
+
+/// Rejects a request whose namespace falls outside the account this proxy is
+/// scoped to. Enforcement with no configured account fails closed: a proxy that
+/// is told to enforce but given nothing to enforce against must not serve
+/// everything.
+pub(super) fn proxy_account_rejection(options: &ProxyOptions, namespace: &str) -> Option<Status> {
+    if !options.enforce_ingestion_account {
+        return None;
+    }
+    if options.ingestion_account.is_empty() {
+        return Some(Status::error(
+            "proxy_account_not_configured",
+            "proxy account enforcement is enabled without an ingestion_account",
+        ));
+    }
+    if namespace != options.ingestion_account {
+        return Some(Status::error(
+            "proxy_account_denied",
+            "namespace is not allowed for this proxy account",
+        ));
+    }
+    None
+}

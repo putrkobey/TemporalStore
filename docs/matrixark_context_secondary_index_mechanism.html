@@ -28,3 +28,33 @@
     <div class="box">
       <h3>Legacy compatibility refs</h3>
       <pre><code>ctxidx:{tenant_hash}:{index_name}:{index_value_hash}:{scope_hash}
+  timestamp_key -&gt; ContextIndexRef</code></pre>
+    </div>
+    <div class="box">
+      <h3>Compact postings</h3>
+      <pre><code>ctxidx2:{tenant_hash}:{scope_hash}:{index_name}:{time_bucket_ms}
+  timestamp_key -&gt; posting payload with refs + index_value_hash</code></pre>
+    </div>
+  </div>
+
+  <h2>Why Counts Do Not Match Item Counts</h2>
+  <p>Secondary-index counts are not expected to equal context item counts. One item can emit several index families, while one compact posting can contain many item refs.</p>
+  <pre><code>ContextEvent 123
+  -&gt; source_type:message
+  -&gt; event_type:approval
+  -&gt; entity_type:approval_state
+  -&gt; keyword_id:gpu
+  -&gt; keyword_id:aurora</code></pre>
+  <p>That is one event but multiple index memberships. The opposite also happens:</p>
+  <pre><code>ctxidx2:tenant:scope:event_type:20260704093000000
+  -&gt; index_value_hash=approval
+  -&gt; ref_hashes=[123, 456, 789, ...]</code></pre>
+  <p>That is many refs in one posting object.</p>
+
+  <h2>Better Metrics</h2>
+  <pre><code>indexed_item_count
+posting_object_count
+posting_ref_count
+avg_refs_per_posting
+max_refs_per_posting
+index_family_count
