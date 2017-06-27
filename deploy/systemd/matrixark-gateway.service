@@ -11,3 +11,8 @@ After=network-online.target matrixark-proxy.service
 Wants=network-online.target
 
 [Service]
+Type=simple
+WorkingDirectory=/opt/temporalstore/gw
+# Explicit env here (or via a drop-in) overrides the config file (env wins):
+# Environment=MATRIXARK_HTTP_PORT=8080
+ExecStart=/opt/temporalstore/scripts/with_config.sh /opt/temporalstore/config/temporalstore.toml /usr/bin/python3 /opt/temporalstore/gw/tools/matrixark_v1_gateway.py
