@@ -14,11 +14,3 @@ terraform {
 }
 
 provider "aws" {
-  region  = var.aws_region
-  profile = var.aws_profile == "" ? null : var.aws_profile
-}
-
-data "aws_eks_cluster" "this" {
-  name = var.eks_cluster_name
-}
-
