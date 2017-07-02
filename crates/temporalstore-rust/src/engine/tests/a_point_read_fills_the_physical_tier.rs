@@ -16,3 +16,57 @@
 //!     cache refills from it *without a block-store read*;
 //!   * and since the logical copy was dropped, the frame is the **only** copy. The same change
 //!     today would leave a string read with no cache at all.
+//!
+//! Those six arms caught it, but each needs a particular fixture — eviction pressure, a cleared
+//! memory tier, a restart — to reach the state it checks. **None of them says in one line what the
+//! invariant is.** So the next person with this idea gets six confusing failures in cache-tier
+//! tests instead of one that names the rule and the reason.
+//!
+//! A declined design is only durable if something FAILS when it is re-attempted, and says why. A
+//! comment does not fail. This does.
+//!
+//! # IT FAILS ON THE CHANGE, NOT ON A CONSEQUENCE
+//!
+//! One write, one read, then `peek_tier` on the key the engine's own accessor builds. No eviction,
+//! no disk tier, no restart — so it breaks on the edit itself rather than three steps downstream.
+//!
+//! rust-internal: reads the engine's own cache keys, no product behaviour
+
+use crate::types::{Command, CommandResponse, ExecuteRequest};
+
+#[test]
+fn a_point_read_fills_the_physical_tier() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    let key = "physical-tier-key";
+    let value = b"the bytes a physical key must name".to_vec();
+    let write = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet { key: key.to_string(), value: value.clone() },
+    });
+    assert!(write.status.ok, "write: {:?}", write.status);
+
+    // THE KEY MUST NOT BE POPULATED BY THE WRITE ALONE, or the read below proves nothing about the
+    // read path. Checked first, because a guard that cannot fail for the right reason is not one.
+    let physical = engine
+        .string_block_cache_key_for_test(1, key)
+        .expect("the write indexed the key, so its block has a physical cache key");
+    let before = engine.cache().peek_tier(&physical).is_some();
+
+    let read = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet { key: key.to_string() },
+    });
+    assert_eq!(
+        read.response,
+        CommandResponse::Bytes { value: Some(value) },
+        "the read did not return what was written, so nothing below is about caching"
+    );
+
