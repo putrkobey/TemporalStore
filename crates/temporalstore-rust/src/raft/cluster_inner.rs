@@ -247,3 +247,252 @@ impl RaftClusterInner {
                 .collect();
             node.commit_index = target_commit_index;
             if node.replica_role.can_serve_data() {
+                apply_committed(node);
+            }
+            replayed_log_entries += node.commit_index.saturating_sub(before);
+        }
+        Ok(replayed_log_entries)
+    }
+
+    pub(super) fn remove_node_safely(&mut self, node_id: RaftNodeId) -> Result<(), RaftError> {
+        if self.voting_node_ids().len() == 1
+            && self
+                .nodes
+                .get(&node_id)
+                .map(|node| node.replica_role.participates_in_quorum())
+                .unwrap_or(false)
+        {
+            return Err(RaftError::CannotRemoveLastNode);
+        }
+        if !self.nodes.contains_key(&node_id) {
+            return Err(RaftError::NodeNotFound(node_id));
+        }
+        let remaining = self
+            .voting_node_ids()
+            .into_iter()
+            .filter(|id| *id != node_id)
+            .collect::<BTreeSet<_>>();
+        let required_after = majority(remaining.len());
+        let live_after = remaining
+            .iter()
+            .filter(|id| self.nodes.get(id).map(|node| node.alive).unwrap_or(false))
+            .count();
+        if live_after < required_after {
+            return Err(RaftError::NoMajority {
+                live: live_after,
+                required: required_after,
+            });
+        }
+
+        if self.leader_id == node_id {
+            let leader_commit_index = self.leader_commit_index();
+            let candidate_id = self.best_live_candidate_in(&remaining)?;
+            let candidate = self
+                .nodes
+                .get(&candidate_id)
+                .ok_or(RaftError::NodeNotFound(candidate_id))?;
+            if candidate.commit_index < leader_commit_index {
+                return Err(RaftError::ReplicaLagging {
+                    replica_id: candidate_id,
+                    replica_commit_index: candidate.commit_index,
+                    leader_commit_index,
+                });
+            }
+            self.nodes.remove(&node_id);
+            self.elect_leader(candidate_id)?;
+        } else {
+            self.nodes.remove(&node_id);
+        }
+        Ok(())
+    }
+
+    pub(super) fn plan_membership_change(
+        &self,
+        new_voters: impl IntoIterator<Item = RaftNodeId>,
+    ) -> Result<RaftMembershipChangePlan, RaftError> {
+        if self.joint_membership.is_some() {
+            return Err(RaftError::JointConsensusInProgress);
+        }
+        if !self
+            .nodes
+            .get(&self.leader_id)
+            .map(|node| node.alive && node.role == RaftRole::Leader)
+            .unwrap_or(false)
+        {
+            return Err(RaftError::LeaderUnavailable);
+        }
+        let old_voters = self.voting_node_ids().into_iter().collect::<BTreeSet<_>>();
+        let new_voters = new_voters.into_iter().collect::<BTreeSet<_>>();
+        if new_voters.is_empty() {
+            return Err(RaftError::CannotRemoveLastNode);
+        }
+        if old_voters == new_voters {
+            return Err(RaftError::InvalidConfig(
+                "membership change must add or remove at least one voter".to_string(),
+            ));
+        }
+
+        let add_voters = new_voters
+            .difference(&old_voters)
+            .copied()
+            .collect::<Vec<_>>();
+        let remove_voters = old_voters
+            .difference(&new_voters)
+            .copied()
+            .collect::<Vec<_>>();
+        let kind = match (add_voters.is_empty(), remove_voters.is_empty()) {
+            (false, true) => RaftMembershipChangeKind::AddVoter,
+            (true, false) => RaftMembershipChangeKind::RemoveVoter,
+            (false, false) => RaftMembershipChangeKind::ReplaceVoter,
+            (true, true) => unreachable!("old_voters != new_voters was checked"),
+        };
+
+        let live_new_voters = new_voters
+            .iter()
+            .filter(|node_id| {
+                self.nodes
+                    .get(node_id)
+                    .map(|node| node.alive)
+                    .unwrap_or(true)
+            })
+            .count();
+        let required_new_majority = majority(new_voters.len());
+        if live_new_voters < required_new_majority {
+            return Err(RaftError::NoMajority {
+                live: live_new_voters,
+                required: required_new_majority,
+            });
+        }
+
+        Ok(RaftMembershipChangePlan {
+            shard_id: self.shard_id,
+            kind,
+            old_voters: old_voters.into_iter().collect(),
+            new_voters: new_voters.into_iter().collect(),
+            add_voters,
+            remove_voters,
+        })
+    }
+
+    pub(super) fn scale_change_report(&self) -> RaftScaleChangeReport {
+        let status = self.status();
+        RaftScaleChangeReport {
+            leader_id: status.leader_id,
+            voters: self.voting_node_ids(),
+            live_voters: status.live_voters,
+            majority: status.majority,
+            caught_up_voters: status
+                .nodes
+                .into_iter()
+                .filter(|node| {
+                    node.alive && node.lag == 0 && node.replica_role.participates_in_quorum()
+                })
+                .map(|node| node.node_id)
+                .collect(),
+        }
+    }
+
+    pub(super) fn failover_report(&self, old_leader_id: RaftNodeId) -> RaftFailoverReport {
+        let status = self.status();
+        let term = status.current_term;
+        RaftFailoverReport {
+            old_leader_id,
+            new_leader_id: status.leader_id,
+            term,
+            commit_index: status.commit_index,
+            caught_up_voters: status
+                .nodes
+                .into_iter()
+                .filter(|node| {
+                    node.alive && node.lag == 0 && node.replica_role.participates_in_quorum()
+                })
+                .map(|node| node.node_id)
+                .collect(),
+        }
+    }
+
+    pub(super) fn pre_vote_would_win(&self, candidate_id: RaftNodeId) -> Result<bool, RaftError> {
+        self.candidate_log_would_win(candidate_id)
+    }
+
+    pub(super) fn candidate_log_would_win(&self, candidate_id: RaftNodeId) -> Result<bool, RaftError> {
+        let candidate = self
+            .nodes
+            .get(&candidate_id)
+            .ok_or(RaftError::NodeNotFound(candidate_id))?;
+        // Snapshot-aware tail: after log compaction the last committed entry lives in the
+        // installed snapshot, not `log`. Comparing raw `log.last()` (which is None -> (0,0)
+        // for a fully-snapshotted node) would let a lagging candidate look "up to date"
+        // against a caught-up replica (safety) and stop the healthiest node from winning
+        // (liveness). Mirrors the meta-raft election path.
+        let candidate_last_index = node_last_log_or_snapshot_index(candidate);
+        let candidate_last_term =
+            node_term_at_log_or_snapshot_index(candidate, candidate_last_index).unwrap_or_default();
+        let votes = self
+            .nodes
+            .values()
+            .filter(|node| node.alive)
+            .filter(|node| node.replica_role.participates_in_quorum())
+            .filter(|node| {
+                let local_last_index = node_last_log_or_snapshot_index(node);
+                let local_last_term =
+                    node_term_at_log_or_snapshot_index(node, local_last_index).unwrap_or_default();
+                (candidate_last_term, candidate_last_index) >= (local_last_term, local_last_index)
+            })
+            .count();
+        if let Some(membership) = &self.joint_membership {
+            let old_votes = self.up_to_date_votes_in(candidate_id, &membership.old_voters)?;
+            let new_votes = self.up_to_date_votes_in(candidate_id, &membership.new_voters)?;
+            return Ok(old_votes >= majority(membership.old_voters.len())
+                && new_votes >= majority(membership.new_voters.len()));
+        }
+        Ok(votes >= majority(self.voting_node_ids().len()))
+    }
+
+    pub(super) fn up_to_date_votes_in(
+        &self,
+        candidate_id: RaftNodeId,
+        voters: &[RaftNodeId],
+    ) -> Result<usize, RaftError> {
+        let candidate = self
+            .nodes
+            .get(&candidate_id)
+            .ok_or(RaftError::NodeNotFound(candidate_id))?;
+        // Snapshot-aware tail: after log compaction the last committed entry lives in the
+        // installed snapshot, not `log`. Comparing raw `log.last()` (which is None -> (0,0)
+        // for a fully-snapshotted node) would let a lagging candidate look "up to date"
+        // against a caught-up replica (safety) and stop the healthiest node from winning
+        // (liveness). Mirrors the meta-raft election path.
+        let candidate_last_index = node_last_log_or_snapshot_index(candidate);
+        let candidate_last_term =
+            node_term_at_log_or_snapshot_index(candidate, candidate_last_index).unwrap_or_default();
+        Ok(voters
+            .iter()
+            .filter_map(|node_id| self.nodes.get(node_id))
+            .filter(|node| node.alive)
+            .filter(|node| node.replica_role.participates_in_quorum())
+            .filter(|node| {
+                let local_last_index = node_last_log_or_snapshot_index(node);
+                let local_last_term =
+                    node_term_at_log_or_snapshot_index(node, local_last_index).unwrap_or_default();
+                (candidate_last_term, candidate_last_index) >= (local_last_term, local_last_index)
+            })
+            .count())
+    }
+
+    /// R5: promote `node_id` only after a DURABLE per-term quorum RequestVote round grants it a
+    /// majority. This mirrors the receiver rules
+    /// already implemented in `receive_vote_request` (single vote per term via `voted_for`,
+    /// leader-completeness log-freshness), but drives them across every voter and gates
+    /// promotion on the collected grant count. A partitioned candidate whose granting voters
+    /// fall short of majority cannot elect, so two disjoint partitions can never each promote a
+    /// leader for the same term.
+    pub(super) fn elect_leader(&mut self, node_id: RaftNodeId) -> Result<(), RaftError> {
+        if self.config.prohibits_election {
+            for node in self.nodes.values_mut() {
+                node.pipeline_state.election_rejections =
+                    node.pipeline_state.election_rejections.saturating_add(1);
+            }
+            return Err(RaftError::ElectionProhibited);
+        }
+        if let Some((live, required)) = self.joint_majority_failure() {
