@@ -21,15 +21,3 @@ where
                     .map(|(member, seen_at)| (member, seen_at))
                     .collect::<Vec<_>>(),
             )
-        })
-        .collect::<BTreeMap<_, _>>();
-    encoded.serialize(serializer)
-}
-
-pub fn deserialize<'de, D>(deserializer: D) -> Result<HashMap<std::sync::Arc<str>, SeenSet>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let encoded = HashMap::<String, Vec<(Vec<u8>, u64)>>::deserialize(deserializer)?;
-    Ok(encoded
-        .into_iter()
