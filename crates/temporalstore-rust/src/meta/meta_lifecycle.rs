@@ -349,3 +349,179 @@ impl SingleNodeMeta {
                     status: response.status,
                     frozen_servers,
                     frozen_proxies: Vec::new(),
+                };
+            }
+            frozen_servers.push(endpoint);
+        }
+
+        let proxy_report = self.freeze_stale_proxies(stale_after_ms, policy);
+        // Recorded per tier, the way the adaptive detector records its own
+        // rounds. `record_conviction` counts both lists, so one call carrying
+        // both would double every freeze; the adaptive path calls it once per
+        // tier with the other list empty, and this matches it.
+        //
+        // Without this the counter is exported unconditionally and sits at zero
+        // while this detector -- the default one, since
+        // TS_META_ADAPTIVE_FAILURE_DETECTOR is off unless asked for -- freezes
+        // servers and proxies. A confident wrong number reads worse than an
+        // absent series: `absent()` catches a missing one, nothing catches a
+        // zero.
+        self.metrics.record_conviction(
+            TIER_SERVER,
+            &simple_conviction_round(frozen_servers.clone(), Vec::new()),
+        );
+        self.metrics.record_conviction(
+            TIER_PROXY,
+            &simple_conviction_round(Vec::new(), proxy_report.frozen_proxies.clone()),
+        );
+        StaleResourceReport {
+            status: proxy_report.status,
+            frozen_servers,
+            frozen_proxies: proxy_report.frozen_proxies,
+        }
+    }
+
+    /// Freeze every proxy whose heartbeat is older than `stale_after_ms`.
+    ///
+    /// Split out of [`Self::freeze_stale_resources_with_policy`] so the adaptive
+    /// server detector ([`Self::convict_stale_servers_adaptive`]) can keep
+    /// sweeping proxies on the fixed threshold: proxies are stateless routers,
+    /// so freezing one is cheap and does not move data, and the correlated
+    /// -failure reasoning that applies to datanodes does not apply to them.
+    pub fn freeze_stale_proxies(
+        &self,
+        stale_after_ms: u64,
+        policy: SafeModePolicy,
+    ) -> StaleResourceReport {
+        let now = now_ms();
+        let stale_proxies = {
+            let state = self.inner.read().expect("meta lock poisoned");
+            state
+                .proxies
+                .values()
+                .filter(|proxy| {
+                    proxy.state == MetaEntityState::Normal
+                        && now.saturating_sub(proxy.last_heartbeat_ms) > stale_after_ms
+                })
+                .map(|proxy| proxy.proxy_addr.clone())
+                .collect::<Vec<_>>()
+        };
+
+        let mut frozen_proxies = Vec::new();
+        for endpoint in stale_proxies {
+            let response = self.freeze_proxy(StateChangeRequest {
+                endpoint: endpoint.clone(),
+                freeze_cooldown_ms: policy.proxy_freeze_cooldown_ms,
+                reason: FreezeReason::Unresponsive,
+            });
+            if !response.status.ok {
+                return StaleResourceReport {
+                    status: response.status,
+                    frozen_servers: Vec::new(),
+                    frozen_proxies,
+                };
+            }
+            frozen_proxies.push(endpoint);
+        }
+
+        StaleResourceReport {
+            status: Status::ok(),
+            frozen_servers: Vec::new(),
+            frozen_proxies,
+        }
+    }
+
+    pub fn safe_mode_report(&self) -> SafeModeReport {
+        let state = self.inner.read().expect("meta lock poisoned");
+        let now = now_ms();
+        let blocked_servers = state
+            .servers
+            .values()
+            .filter(|server| {
+                server.state == MetaEntityState::Frozen && server.freeze_cooldown_until_ms > now
+            })
+            .map(|server| server.server_addr.clone())
+            .collect::<Vec<_>>();
+        let blocked_proxies = state
+            .proxies
+            .values()
+            .filter(|proxy| {
+                proxy.state == MetaEntityState::Frozen && proxy.freeze_cooldown_until_ms > now
+            })
+            .map(|proxy| proxy.proxy_addr.clone())
+            .collect::<Vec<_>>();
+        SafeModeReport {
+            status: Status::ok(),
+            blocked_servers,
+            blocked_proxies,
+            server_count: state.servers.len(),
+            proxy_count: state.proxies.len(),
+        }
+    }
+
+    pub fn start_failure_detector_loop(
+        &self,
+        stale_after_ms: u64,
+        interval_ms: u64,
+    ) -> thread::JoinHandle<()> {
+        let meta = self.clone();
+        let interval = Duration::from_millis(interval_ms.max(1));
+        thread::spawn(move || loop {
+            let _ = meta.freeze_stale_resources(stale_after_ms);
+            thread::sleep(interval);
+        })
+    }
+
+    pub fn list_proxies(&self) -> ListProxiesResponse {
+        let state = self.inner.read().expect("meta lock poisoned");
+        ListProxiesResponse {
+            status: Status::ok(),
+            proxies: state.proxies.values().cloned().collect(),
+        }
+    }
+
+    pub fn freeze_server(&self, request: StateChangeRequest) -> AckResponse {
+        self.set_server_state(request, MetaEntityState::Frozen)
+    }
+
+    /// Return a frozen server to service.
+    ///
+    /// Until now the only way out of a freeze was for the server to re-register,
+    /// which meant an operator had no lever at all and a convicted node cleared
+    /// its own conviction. This is that lever: it is always available, whatever
+    /// the freeze reason, because an operator must be able to overrule the
+    /// metaserver.
+    pub fn unfreeze_server(&self, request: StateChangeRequest) -> AckResponse {
+        self.set_server_state(request, MetaEntityState::Normal)
+    }
+
+    /// Take a server out of service because it announced its own shutdown.
+    ///
+    /// Without this a clean shutdown is indistinguishable from a crash: the node
+    /// simply stops heartbeating, and the metaserver waits out the whole
+    /// detection window before reacting. Every read routed to that node during
+    /// the window fails, and a rolling deploy pays that cost once per node.
+    ///
+    /// Idempotent: a server that is already out of service reports
+    /// `not_modified` rather than failing, so a shutdown hook that retries or
+    /// races the failure detector does not produce spurious errors.
+    pub fn notify_server_stop(&self, request: NotifyStopRequest) -> AckResponse {
+        {
+            let state = self.inner.read().expect("meta lock poisoned");
+            let Some(server) = state.servers.get(&request.endpoint) else {
+                return AckResponse {
+                    status: Status::error("server_not_found", "server not found"),
+                };
+            };
+            if server.state != MetaEntityState::Normal {
+                return AckResponse {
+                    status: Status::error("not_modified", "server is already out of service"),
+                };
+            }
+        }
+        self.freeze_server(StateChangeRequest {
+            endpoint: request.endpoint,
+            freeze_cooldown_ms: 0,
+            // No cooldown and not a conviction: this node is expected back.
+            reason: FreezeReason::Stopping,
+        })

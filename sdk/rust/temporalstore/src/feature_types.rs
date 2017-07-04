@@ -24,3 +24,16 @@ pub enum FeatureWritePolicy {
     Update = 3,
 }
 
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "proxy", derive(serde::Serialize, serde::Deserialize))]
+pub struct FeatureFilter {
+    pub field: String,
+    pub op: FeatureFilterOp,
+    pub value: u64,
+}
+
+#[derive(Clone, Debug)]
+#[cfg_attr(feature = "proxy", derive(serde::Serialize, serde::Deserialize))]
+pub struct FeaturePoint {
+    pub timestamp_ms: u64,
+    pub value: Vec<u8>,
