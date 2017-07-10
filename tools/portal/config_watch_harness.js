@@ -40,3 +40,46 @@ function run() {
   const reloads = [];
   const hidden = { value: false };
   const key = { value: "k-test" };
+  const win = {};
+  const env = {
+    window: win,
+    document: { get hidden() { return hidden.value; } },
+    $: (id) => (id === "key" ? key : { value: "" }),
+    loadConfig(changedElsewhere) { reloads.push(!!changedElsewhere); },
+  };
+  new Function(...Object.keys(env), src)(...Object.values(env));
+  const queue = win.__matrixarkFrameQueue;
+  const callback = queue && queue[0];
+  return { callback, reloads, hidden, key };
+}
+
+const first = run();
+ok("the watcher is on the queue", typeof first.callback === "function");
+if (typeof first.callback !== "function") { console.log("FAILED " + failures); process.exit(1); }
+
+/* ---------- the first frame is not a change ---------- */
+first.callback({ config_changed_at: 100 });
+ok("the first frame does not trigger a re-read", first.reloads.length === 0,
+   "the configuration was read a moment ago on load");
+
+/* ---------- an unchanged frame is not a change ---------- */
+first.callback({ config_changed_at: 100 });
+ok("an unchanged value does not trigger one either", first.reloads.length === 0);
+
+/* ---------- a change is ---------- */
+first.callback({ config_changed_at: 200 });
+ok("a changed value re-reads the configuration", first.reloads.length === 1,
+   String(first.reloads.length));
+ok("and the re-read is marked as caused by a change elsewhere", first.reloads[0] === true,
+   "the header would say 'checked', which is true about when it looked and false about what "
+   + "it is showing");
+
+/* ---------- and only once per change ---------- */
+first.callback({ config_changed_at: 200 });
+ok("the same value again does not re-read", first.reloads.length === 1,
+   String(first.reloads.length));
+
+/* ---------- a frame without the field ---------- */
+first.callback({});
+ok("a frame carrying no configuration stamp is ignored", first.reloads.length === 1);
+
