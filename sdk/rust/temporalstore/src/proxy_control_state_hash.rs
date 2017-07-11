@@ -29,3 +29,18 @@ impl ProxyClient {
         precision: ControlStatePrecision,
     ) -> Result<()> {
         let body = self.proxy_service_body(
+            key,
+            &[
+                ("value", serde_json::json!(value)),
+                ("ttl", serde_json::json!(ttl_seconds)),
+                (
+                    "ttl_ms",
+                    serde_json::json!(ttl_seconds.saturating_mul(1000)),
+                ),
+                ("htype", serde_json::to_value(htype).map_err(json_error)?),
+                ("occur_time", serde_json::json!(occur_time_seconds)),
+                (
+                    "timestamp_ms",
+                    serde_json::json!(proxy_timestamp_ms(occur_time_seconds)),
+                ),
+                (
