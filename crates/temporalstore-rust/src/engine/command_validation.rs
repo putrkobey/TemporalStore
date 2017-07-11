@@ -216,3 +216,222 @@ pub(crate) fn command_object_keys(command: &Command) -> Vec<String> {
             child_ref,
         } => vec![context_child_key(*tenant_hash, child_ref.parent_hash)],
         Command::ContextSetNodeEmbedding {
+            tenant_hash,
+            node_hash,
+            ..
+        } => vec![context_node_key(*tenant_hash, *node_hash)],
+        Command::ContextQueryNodeEmbeddings {
+            tenant_hash,
+            node_hashes,
+        } => node_hashes
+            .iter()
+            .map(|node_hash| context_node_key(*tenant_hash, *node_hash))
+            .collect(),
+        Command::ContextUpsertSummary {
+            tenant_hash,
+            summary,
+        } => vec![context_summary_key(
+            *tenant_hash,
+            summary.node_hash,
+            summary.level,
+        )],
+        Command::ContextWriteCompressionEvent { tenant_hash, event } => {
+            vec![context_compression_key(*tenant_hash, event.node_hash)]
+        }
+        Command::ContextCompressEvents {
+            tenant_hash,
+            node_hash,
+            ..
+        } => vec![context_compression_key(*tenant_hash, *node_hash)],
+        Command::SequenceBatchQuery { .. }
+        | Command::CommonTtl { .. }
+        | Command::CommonExists { .. }
+        | Command::StringGet { .. }
+        | Command::HashGet { .. }
+        | Command::HashMultiGet { .. }
+        | Command::HashGetAll { .. }
+        | Command::HashLen { .. }
+        | Command::SetMembers { .. }
+        | Command::FeatureQuery { .. }
+        | Command::FeatureQueryFiltered { .. }
+        | Command::FeatureAggQuery { .. }
+        | Command::SequenceQuery { .. }
+        | Command::ControlStateCount { .. }
+        | Command::ControlStateQuery { .. }
+        | Command::ControlStateDetail { .. }
+        | Command::ControlStateFamilyQuery { .. }
+        | Command::ControlStateSelectionQuery { .. }
+        | Command::ControlStateManager { .. }
+        | Command::ControlStateDebug { .. }
+        | Command::ContextGetNode { .. }
+        | Command::ContextGetNodes { .. }
+        | Command::ContextQueryEvents { .. }
+        | Command::ContextQueryIndex { .. }
+        | Command::ContextQueryIndexIntersection { .. }
+        | Command::ContextQueryPackAudit { .. }
+        | Command::ContextQuerySummaryDirty { .. }
+        | Command::ContextQueryEmbeddingDirty { .. }
+        | Command::ContextGetEntity { .. }
+        | Command::ContextQueryEntities { .. }
+        | Command::ContextQueryChildren { .. }
+        | Command::ContextTraverseTree { .. }
+        | Command::ContextQuerySummaries { .. }
+        | Command::ContextQuerySummaryVectors { .. }
+        | Command::ContextQueryCompressionEvents { .. }
+        | Command::ContextResourceBlobBegin { .. }
+        | Command::ContextResourceBlobAppend { .. }
+        | Command::ContextResourceBlobCommit { .. }
+        | Command::ContextResourceBlobPut { .. }
+        | Command::ContextResourceBlobFetch { .. }
+        | Command::ContextResourceBlobSweep { .. }
+        | Command::ContextQueryNodeContext { .. } => Vec::new(),
+    }
+}
+
+pub(super) fn command_updates_bucket_index_directly(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::CommonDelete { .. }
+            | Command::StringDelete { .. }
+            | Command::StringSet { .. }
+            | Command::StringSetEx { .. }
+            | Command::StringSetConditional { .. }
+            | Command::HashSet { .. }
+            | Command::HashMultiSet { .. }
+            | Command::HashIncrBy { .. }
+            | Command::HashDelete { .. }
+            | Command::SetAdd { .. }
+            | Command::SetRemove { .. }
+            | Command::ListPush { .. }
+            | Command::ListPop { .. }
+            | Command::ZSetAdd { .. }
+            | Command::ZSetRemove { .. }
+            | Command::ZSetIncrBy { .. }
+            | Command::ZSetPop { .. }
+            | Command::ControlStateIncrement { .. }
+            | Command::ControlStateIncrementWithOptions { .. }
+            | Command::ControlStateSet { .. }
+            | Command::ControlStateSetAndGet { .. }
+            | Command::ControlStateSetAndGetWithOptions { .. }
+            // These file their pages through `sync_bucket_index_object_blocks`, which maintains
+            // exactly what a rebuild would recompute. Without them here the post-command path took
+            // the rebuild branch on EVERY call: measured at twice the shard's page count per call,
+            // so a one-point feature append into a 1,024-key store cost 12,717 allocations, none of
+            // it about the point being appended.
+            | Command::FeatureAppend { .. }
+            | Command::FeatureAppendWithPolicy { .. }
+            | Command::FeatureReplace { .. }
+            | Command::FeatureDelete { .. }
+            | Command::SequenceAdd { .. }
+    )
+}
+
+/// True when a command mutates only state that no page backs.
+///
+/// The seen sets, the control-state change and selection maps, and the token buckets live outside the
+/// page-backed models, and their durability rides the index-log `key_states` blobs rather than a page
+/// entry. So a rebuild of the page index after one of these can only recompute what it already held.
+///
+/// This is deliberately NOT folded into `command_updates_bucket_index_directly`: these commands do
+/// not update that index, and saying they do to skip the rebuild would make the predicate assert
+/// something false. They need their own reason.
+pub(super) fn command_writes_no_block(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::SeenCheck { .. }
+            | Command::ControlStateChangeAdd { .. }
+            | Command::ControlStateSelectionSet { .. }
+            | Command::BucketTake { .. }
+    )
+}
+
+pub(crate) fn is_write_command(command: &Command) -> bool {
+    matches!(
+        command,
+        Command::CommonDelete { .. }
+            | Command::CommonExpire { .. }
+            | Command::CommonPersist { .. }
+            | Command::StringSet { .. }
+            | Command::StringSetEx { .. }
+            | Command::StringSetConditional { .. }
+            | Command::StringDelete { .. }
+            | Command::HashSet { .. }
+            | Command::HashMultiSet { .. }
+            | Command::HashIncrBy { .. }
+            | Command::HashDelete { .. }
+            | Command::SetAdd { .. }
+            | Command::SetRemove { .. }
+            | Command::ListPush { .. }
+            | Command::ListPop { .. }
+            | Command::ZSetAdd { .. }
+            | Command::ZSetRemove { .. }
+            | Command::ZSetIncrBy { .. }
+            | Command::ZSetPop { .. }
+            | Command::BucketTake { .. }
+            | Command::SeenCheck { .. }
+            | Command::FeatureAppend { .. }
+            | Command::FeatureAppendWithPolicy { .. }
+            | Command::FeatureReplace { .. }
+            | Command::FeatureDelete { .. }
+            | Command::SequenceAdd { .. }
+            | Command::ControlStateIncrement { .. }
+            | Command::ControlStateIncrementWithOptions { .. }
+            | Command::ControlStateChangeAdd { .. }
+            | Command::ControlStateSet { .. }
+            | Command::ControlStateSetAndGet { .. }
+            | Command::ControlStateSetAndGetWithOptions { .. }
+            | Command::ControlStateSelectionSet { .. }
+            | Command::ContextResourceBlobBegin { .. }
+            | Command::ContextResourceBlobAppend { .. }
+            | Command::ContextResourceBlobCommit { .. }
+            | Command::ContextResourceBlobPut { .. }
+            | Command::ContextResourceBlobSweep { .. }
+            | Command::ContextUpsertNode { .. }
+            | Command::ContextWriteEvent { .. }
+            | Command::ContextWriteExtractedEvent { .. }
+            | Command::ContextWriteIndexRef { .. }
+            | Command::ContextWritePackAudit { .. }
+            | Command::ContextMarkSummaryDirty { .. }
+            | Command::ContextMarkEmbeddingDirty { .. }
+            | Command::ContextUpsertEntity { .. }
+            | Command::ContextUpsertChildRef { .. }
+            | Command::ContextSetNodeEmbedding { .. }
+            | Command::ContextUpsertSummary { .. }
+            | Command::ContextWriteCompressionEvent { .. }
+            | Command::ContextCompressEvents { .. }
+    )
+}
+
+pub(super) fn admission_limits(
+    shard_id: ShardId,
+    write_command: bool,
+    config: &Config,
+    info: &Option<ShardInfo>,
+) -> Vec<AdmissionLimit> {
+    let mut limits = Vec::new();
+    // A configured qps of 0 means UNLIMITED on EVERY scope below, not deny-all. Zero is what
+    // an unset knob reads as, so treating it as "refuse everything" turns an intended "no limit
+    // here" into a total outage; denying traffic outright has its own controls.
+    //
+    // The filter has to stay uniform across the three scopes. It once guarded the shard knob
+    // alone, so `write_qps: 0` meant no limit while `table_write_qps: 0` a few lines below denied
+    // every write to that table -- two knobs of identical shape with opposite meanings.
+    if let Some(limit) = (if write_command {
+        config.write_qps
+    } else {
+        config.read_qps
+    })
+    .filter(|&limit| limit > 0)
+    {
+        limits.push(AdmissionLimit {
+            scope: AdmissionScope::Shard(shard_id),
+            limit,
+            label: if write_command {
+                "write_qps"
+            } else {
+                "read_qps"
+            },
+        });
+    }
+    if let Some(table_name) = info
+        .as_ref()

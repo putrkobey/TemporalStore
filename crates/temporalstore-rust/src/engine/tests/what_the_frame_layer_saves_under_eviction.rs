@@ -108,3 +108,58 @@ fn what_the_frame_layer_saves_under_eviction() {
         dir.path().join("indexes"),
     );
     engine.load_shard(1);
+
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("evict-{index:06}"),
+                value: noisy_value(index, VALUE),
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    // THE POPULATING PASS. Every key read once, so whatever layers exist are filled.
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet { key: format!("evict-{index:06}") },
+        });
+        assert!(response.status.ok, "populating read {index}: {:?}", response.status);
+    }
+    let after_populate = engine.block_store.stats().reads;
+    let populate_stats = engine.cache().stats();
+
+    // THE WARM PASS, in the same order. Under a cache this small the early keys have been evicted
+    // by the late ones, so this is the eviction regime rather than a second hit on hot entries.
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet { key: format!("evict-{index:06}") },
+        });
+        assert!(response.status.ok, "warm read {index}: {:?}", response.status);
+    }
+    let warm_reads = engine.block_store.stats().reads - after_populate;
+    let warm_stats = engine.cache().stats();
+    // DELTAS OVER THE WARM PASS, because the cache counters are cumulative and the populating pass
+    // already moved them. Reading the cumulative figure as the warm pass's own is how the first
+    // version of this arm came to print `memory hits 0` for a pass that had served 1,000 reads.
+    let warm_memory_hits = warm_stats.memory_hits.saturating_sub(populate_stats.memory_hits);
+    let warm_disk_hits = warm_stats.disk_hits.saturating_sub(populate_stats.disk_hits);
+    let warm_misses = warm_stats.misses.saturating_sub(populate_stats.misses);
+    let accounted = warm_memory_hits + warm_disk_hits + warm_reads;
+
+    println!();
+    println!(
+        "  WARM READS UNDER CACHE PRESSURE -- {KEYS} keys x {VALUE} B behind a {CACHE_BYTES} B cache"
+    );
+    println!();
+    println!("    corpus offered            {:>12} B", KEYS * VALUE);
+    println!("    cache ceiling             {:>12} B", CACHE_BYTES);
+    println!("    cache memory held         {:>12} B", warm_stats.memory_bytes);
+    println!();
+    println!("    after the populating pass:");
+    println!("      puts                    {:>12}", populate_stats.puts);
+    println!("      evictions               {:>12}", populate_stats.memory_evictions);
+    println!();
