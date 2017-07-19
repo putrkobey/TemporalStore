@@ -70,3 +70,27 @@ fn raft_apply_batch_coalesces_to_one_fsync_while_off_is_one_per_entry() {
     let off_dir = tempfile::tempdir().unwrap();
     let off = new_engine(off_dir.path());
     off.apply_raft_batch_per_entry_for_test();
+    let before = off.write_ahead_log_store().stats(1).syncs;
+    let off_responses = off.execute_raft_apply_batch(batch_requests());
+    let off_fsyncs = off.write_ahead_log_store().stats(1).syncs - before;
+    assert!(off_responses.iter().all(|r| r.status.ok), "per-entry: all apply ok");
+    assert_all_present(&off);
+    assert_eq!(
+        off_fsyncs, BATCH as u64,
+        "per-entry: each committed entry takes its own fsync ({BATCH} entries, {off_fsyncs} fsyncs)"
+    );
+
+    // --- What ships: one coalesced barrier for the whole batch. ---
+    let on_dir = tempfile::tempdir().unwrap();
+    let on = new_engine(on_dir.path());
+    let before = on.write_ahead_log_store().stats(1).syncs;
+    let on_responses = on.execute_raft_apply_batch(batch_requests());
+    let on_fsyncs = on.write_ahead_log_store().stats(1).syncs - before;
+    eprintln!(
+        "[raft_apply_coalesce] batch={BATCH} off_fsyncs={off_fsyncs} on_fsyncs={on_fsyncs}"
+    );
+    assert!(on_responses.iter().all(|r| r.status.ok), "gate ON: all apply ok");
+    assert_all_present(&on);
+    // The whole point: the entire committed batch shares a single durable barrier.
+    assert_eq!(
+        on_fsyncs, 1,

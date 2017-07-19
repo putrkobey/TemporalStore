@@ -148,3 +148,78 @@ fn the_published_set_against_its_envelope() {
     // The store above writes incompressible bytes and its codec ratio is ABOVE the floor:
     // framing slightly exceeds the payload. A store of compressible values is BELOW it. Neither
     // number alone says anything about the ratio -- together they say the floor is decided by the
+    // workload, so it cannot be a gate.
+    let flat_dir = tempfile::tempdir().expect("tempdir");
+    let flat = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        flat_dir.path().join("cache"),
+        flat_dir.path().join("blocks"),
+        flat_dir.path().join("indexes"),
+    );
+    flat.load_shard(1);
+    for index in 0..KEYS {
+        let response = flat.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("env-{index:06}"),
+                value: vec![b'v'; VALUE_LEN],
+            },
+        });
+        assert!(response.status.ok, "compressible write {index}: {:?}", response.status);
+    }
+    let flat_stats = flat.shard_stats(1).expect("stats").storage.clone();
+    println!();
+    println!("  THE 1.0x FLOOR IS DECIDED BY THE WORKLOAD, NOT THE STORE");
+    println!(
+        "    codec ratio {:.3}x on incompressible values, {:.3}x on compressible ones",
+        once.storage_write_amplification_ppm as f64 / 1_000_000.0,
+        flat_stats.storage_write_amplification_ppm as f64 / 1_000_000.0
+    );
+    println!();
+    assert!(
+        flat_stats.storage_write_amplification_ppm < NOMINAL_FLOOR_PPM,
+        "on compressible values the codec ratio must fall BELOW the 1.0x floor and read {} ppm. If it does not, the compression path stopped working, which is a bigger finding than the bound.",
+        flat_stats.storage_write_amplification_ppm
+    );
+    assert!(
+        once.storage_write_amplification_ppm > flat_stats.storage_write_amplification_ppm,
+        "the codec ratio read {} ppm on incompressible values and {} on compressible ones. The incompressible store must read HIGHER, or these two fixtures do not differ in the way this straddle rests on.",
+        once.storage_write_amplification_ppm,
+        flat_stats.storage_write_amplification_ppm
+    );
+
+    // ---------- 2. REWRITTEN. The write ratios climb; the space ratios follow the garbage.
+    for round in 1..3 {
+        write_round(&engine, round);
+    }
+    let rewritten = engine.shard_stats(1).expect("stats").storage.clone();
+    report("rewritten three times", &rewritten);
+
+    assert_eq!(
+        3 * NOMINAL_FLOOR_PPM, rewritten.user_write_amplification_ppm,
+        "three passes over the same keys must read exactly 3.0x in user bytes and read {} ppm",
+        rewritten.user_write_amplification_ppm
+    );
+    // AT THE TRIGGER, NOT PAST IT -- which is what a trigger is for: this is the state that should
+    // cause a consolidation, and the next phase performs one.
+    assert!(
+        rewritten.write_amplification_since_compaction_ppm >= WRITE_TRIGGER_PPM,
+        "after three rewrites with no compaction the windowed write ratio should have reached the \
+         {WRITE_TRIGGER_PPM} ppm trigger and read {} ppm -- if it has not, the trigger would never \
+         fire on this workload and the bound is unreachable rather than satisfied",
+        rewritten.write_amplification_since_compaction_ppm
+    );
+    // AND THE SPACE RATIO THAT CAN SEE GARBAGE IS INSIDE ITS CEILING.
+    assert!(
+        rewritten.block_space_amplification_ppm <= SPACE_CEILING_PPM,
+        "the block-granular space ratio read {} ppm, outside the {SPACE_CEILING_PPM} ppm ceiling, \
+         after only three rewrites",
+        rewritten.block_space_amplification_ppm
+    );
+
+    // ---------- 3. CONSOLIDATED. The windowed ratio comes back inside the trigger; the lifetime
+    // ---------- one does not, because nothing resets it.
+    let plan = engine.storage_lifecycle_plan(crate::StorageLifecycleRequest {
+        shard_id: 1,
+        ..crate::StorageLifecycleRequest::default()
+    });
