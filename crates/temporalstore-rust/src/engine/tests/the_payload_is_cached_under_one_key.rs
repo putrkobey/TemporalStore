@@ -55,3 +55,31 @@ fn the_payload_is_cached_under_one_key() {
     assert!(write.status.ok, "write: {:?}", write.status);
 
     let read = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet { key: key.to_string() },
+    });
+    assert_eq!(
+        read.response,
+        CommandResponse::Bytes { value: Some(value.clone()) },
+        "the read did not return what was written, so nothing below is about caching"
+    );
+
+    let logical = matrixcache::CacheKey::string(1, key);
+    let physical = engine
+        .string_block_cache_key_for_test(1, key)
+        .expect("the key is indexed, so its block has a physical cache key");
+
+    let logical_held = engine.cache().peek_tier(&logical).is_some();
+    let physical_held = engine.cache().peek_tier(&physical).is_some();
+
+    println!();
+    println!("  WHERE THE PAYLOAD IS RESIDENT AFTER ONE READ");
+    println!();
+    println!("    logical  CacheKey::string(shard, key)     {}", if logical_held { "HELD" } else { "empty" });
+    println!("    physical CacheKey::page_with_slot(...)    {}", if physical_held { "HELD" } else { "empty" });
+    println!();
+
+    // ---- EXACTLY ONE. Stated as the count, so both failure directions report the same way.
+    let copies = usize::from(logical_held) + usize::from(physical_held);
+    assert_eq!(
+        copies, 1,

@@ -26,3 +26,32 @@ use super::*;
 const SHARD: ShardId = 1;
 
 /// The index-log file for `SHARD`, whichever of the two names this store uses. The log lives
+/// under `index_dir/indexlogs`, not `index_dir` itself.
+fn index_log_file(index_dir: &std::path::Path) -> std::path::PathBuf {
+    let root = index_dir.join("indexlogs");
+    let framed = root.join(format!("shard-{SHARD}.indexlog.bin"));
+    if framed.exists() {
+        return framed;
+    }
+    root.join(format!("shard-{SHARD}.indexlog.jsonl"))
+}
+
+/// A durable index holding two keys, a manifest that predates the second, and a corrupt delta.
+///
+/// The manifest is created BEFORE the second key so that installing it would visibly roll the
+/// durable index backwards -- if the two were byte-identical, an install that happened anyway
+/// would leave no trace and this test would pass without measuring anything.
+#[test]
+fn a_refused_install_on_load_leaves_the_durable_index_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(SHARD);
+    engine.execute(ExecuteRequest {
+        shard_id: SHARD,
+        command: Command::StringSet {
+            key: "before-manifest".to_string(),

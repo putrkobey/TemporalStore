@@ -54,3 +54,60 @@ Request shape:
     {&quot;ref&quot;: &quot;tool-output:test&quot;, &quot;text&quot;: &quot;relevant test output summary&quot;}
   ],
   &quot;local_context_tokens&quot;: 700,
+  &quot;max_context_tokens&quot;: 2048,
+  &quot;ranking&quot;: {
+    &quot;weights&quot;: {&quot;time&quot;: 0.2, &quot;business&quot;: 0.1}
+  }
+}
+```
+
+Send only visible local context: open files, selected text, tool outputs,
+terminal summaries, current page refs, and explicit local summaries. Do not send
+hidden/internal prompt context. MatrixArk dedupes local refs and fills only the
+remaining budget with remote context.
+
+## After Answering
+
+Call `matrixark_ingest` or `matrixark_feedback` when the turn produced durable
+information.
+
+Store:
+
+```text
+final answer summaries
+accepted refs
+rejected refs
+corrections
+confirmations
+decisions
+tool outcomes
+new facts
+new resource or skill refs
+```
+
+Post-answer ingest shape:
+
+```json
+{
+  &quot;messages&quot;: [
+    {&quot;role&quot;: &quot;user&quot;, &quot;content&quot;: &quot;What did we decide about the GPU budget?&quot;},
+    {&quot;role&quot;: &quot;assistant&quot;, &quot;content&quot;: &quot;The GPU request is approved under capex.&quot;}
+  ],
+  &quot;metadata&quot;: {
+    &quot;source&quot;: &quot;agent_post_answer&quot;,
+    &quot;reply_to_context_pack_id&quot;: &quot;pack_123&quot;,
+    &quot;local_context_refs&quot;: [&quot;open-buffer:src/billing.py&quot;, &quot;tool-output:test&quot;]
+  },
+  &quot;scope&quot;: {
+    &quot;account_id&quot;: &quot;acct_acme&quot;,
+    &quot;tenant_id&quot;: &quot;tenant_prod&quot;,
+    &quot;user_id&quot;: &quot;user_123&quot;,
+    &quot;session_id&quot;: &quot;cursor_thread_456&quot;
+  }
+}
+```
+
+Feedback shape:
+
+```json
+{
