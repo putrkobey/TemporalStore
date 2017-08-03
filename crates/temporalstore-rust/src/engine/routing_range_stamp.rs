@@ -47,3 +47,152 @@
 //!    guess, and one that carries its own check:
 //!
 //!    ```text
+//!      bucket = start + FNV-1a-64(object_key) % width
+//!      => width divides (FNV-1a-64(object_key) - bucket) for EVERY stored address
+//!      => take the gcd of those differences, keep its divisors above the largest bucket seen,
+//!         and accept a candidate only if it reproduces EVERY recorded bucket.
+//!    ```
+//!
+//!    A wrong candidate fails that last step on very nearly every address, so unlike the spread
+//!    inference above this cannot be quietly wrong: it either reproduces the buckets or it does
+//!    not. Carried out on a 13 GB pre-stamp store: the gcd over 12,125 addresses is 4,294,967,295,
+//!    exactly one of its divisors exceeds the largest recorded bucket (4,294,914,071), and that
+//!    width reproduces 12,125 of 12,125. `width = (end - start).saturating_add(1)`, so a width of
+//!    `u32::MAX` means `0..u32::MAX` -- the pre-stamp fallback -- while `0..u32::MAX - 1` computes
+//!    the same buckets: the solve fixes the WIDTH, and those two ends are the same modulus.
+//!
+//!    THE ENGINE DOES NOT DO THIS, deliberately. Those addresses are in the SERVED INDEX, and an
+//!    index old enough to carry no stamp is old enough that `decode_index_bytes` refuses its
+//!    format version before a byte of it is read. Solving the width belongs to a tool that reads
+//!    the old index. What belongs here is not telling an operator the answer is unrecoverable
+//!    while it is sitting in their store.
+//!
+//!    THIS ARM USED TO ADOPT THE WHOLE KEYSPACE rather than refuse, reasoning that it "was the
+//!    ONLY default a store could have been built on". That is true of the DEFAULT and false of the
+//!    CONFIGURATION: `TS_SHARD_END_ROUTING_BUCKET` is documented, and `docs/runtime_tuning.md`
+//!    told operators to set it before the first ingest. So a store built narrow before this file
+//!    existed was adopted onto the whole keyspace and quietly mis-ranged -- measured at 600 of 600
+//!    blocks in `a_pre_stamp_store_built_narrow_is_adopted_onto_a_range_that_cannot_compute_its_buckets`.
+//!    The adoption existed to keep existing deployments starting; before the first milestone there
+//!    are none to keep, so the honest answer replaces the convenient one.
+//!
+//! A store with NO stamp and NO on-disk state is new: it is stamped with the requested range, which
+//! is what lets the shipped default move for new stores without touching existing ones.
+//!
+//! # THE STAMP IS NOT PART OF THE INDEX
+//!
+//! It is its own small file beside `shard-{id}.index.json`, for two reasons. The serialized index
+//! shape does not move, so an older build reads a newer store's index unchanged; and the check runs
+//! BEFORE the decode, which is where a mismatch has to be caught -- after the decode the pages are
+//! already in the wrong buckets in memory.
+
+use super::*;
+// Spelled out rather than taken from `super::*`: the engine's glob does not re-export the derive
+// macros, and `#[derive(Serialize)]` fails with "cannot find derive macro" rather than with
+// anything that points at the glob.
+use serde::{Deserialize, Serialize};
+
+/// A load refused because the stamp names a range the request does not: the range is KNOWN and
+/// the configuration disagrees with it.
+pub(super) const ROUTING_RANGE_MISMATCH: &str = "routing_range_mismatch";
+
+/// A load refused because the store has state and no stamp: the range is NOT RECOVERABLE.
+///
+/// A DIFFERENT CODE FROM THE MISMATCH, deliberately. The remedy differs -- there is no range to
+/// correct the configuration to -- and the arm this replaces was not a refusal at all, so a caller
+/// that used to see a successful load needs to be able to recognise exactly what changed.
+pub(super) const ROUTING_RANGE_UNSTAMPED: &str = "routing_range_unstamped";
+
+/// The range a store was built under.
+/// `pub(crate)`, not `pub(super)`, because a REPLICATION PAYLOAD carries one. A snapshot image and
+/// a shared-store checkpoint both name the range the index they carry was built on, and those live
+/// outside `engine`, so the type they name has to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct RoutingRangeStamp {
+    pub(crate) start_routing_bucket: u32,
+    pub(crate) end_routing_bucket: u32,
+}
+
+/// Where the stamp lives: beside the base index, named for the shard, so a store copied as a
+/// directory carries it.
+pub(crate) fn routing_range_stamp_path(index_dir: &std::path::Path, shard_id: ShardId) -> PathBuf {
+    index_dir.join(format!("shard-{shard_id}.routing-range.json"))
+}
+
+pub(crate) fn read_routing_range_stamp(
+    index_dir: &std::path::Path,
+    shard_id: ShardId,
+) -> Option<RoutingRangeStamp> {
+    let bytes = fs::read(routing_range_stamp_path(index_dir, shard_id)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+pub(crate) fn write_routing_range_stamp(
+    index_dir: &std::path::Path,
+    shard_id: ShardId,
+    stamp: RoutingRangeStamp,
+) -> Result<(), std::io::Error> {
+    fs::create_dir_all(index_dir)?;
+    let bytes = serde_json::to_vec(&stamp)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+    fs::write(routing_range_stamp_path(index_dir, shard_id), bytes)
+}
+
+/// Whether this shard already has state on disk -- the question that separates a NEW store from one
+/// built before the stamp existed.
+///
+/// TWO PLACES, NOT ONE. The base index file is the obvious one, but a shard whose base has never
+/// been materialized can still have durable bucket dump manifests, and a load recovers from those.
+/// Asking only about the base index would call such a store new and stamp it with the requested
+/// range, which is exactly the silent re-ranging this whole file exists to prevent.
+pub(super) fn store_has_on_disk_state(index_dir: &std::path::Path, shard_id: ShardId) -> bool {
+    if index_dir
+        .join(format!("shard-{shard_id}.index.json"))
+        .exists()
+    {
+        return true;
+    }
+    let manifest_dir = crate::engine::bucket_dump_io::bucket_dump_manifest_dir(index_dir, shard_id);
+    fs::read_dir(manifest_dir)
+        .map(|mut entries| entries.any(|entry| entry.is_ok()))
+        .unwrap_or(false)
+}
+
+/// What a load should do about the range it was asked for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RoutingRangeDecision {
+    /// Load on this range. `write_stamp` says whether the stamp still has to be written.
+    ///
+    /// There is no "adopted" arm any more. A load either runs on the range it asked for or is
+    /// refused, so the requested range is never overridden and there is nothing for the caller to
+    /// report about a range it did not choose.
+    Load {
+        start_routing_bucket: u32,
+        end_routing_bucket: u32,
+        write_stamp: bool,
+    },
+    /// Refuse the load. The message names the file that decides and what to do about it.
+    ///
+    /// TWO CODES, because the two refusals have DIFFERENT REMEDIES and a caller scripting against
+    /// this has to tell them apart. A disagreeing stamp means the range is known and the
+    /// configuration is wrong -- set it and load again. An absent stamp means the range is not
+    /// recoverable at all -- record it if it is known elsewhere, or ingest into a new store. One
+    /// code for both would make the second look like a configuration slip.
+    Refuse { code: &'static str, message: String },
+}
+
+/// THE DECISION, taken before any decode.
+pub(super) fn decide_routing_range(
+    index_dir: &std::path::Path,
+    shard_id: ShardId,
+    requested_start_routing_bucket: u32,
+    requested_end_routing_bucket: u32,
+) -> RoutingRangeDecision {
+    match read_routing_range_stamp(index_dir, shard_id) {
+        Some(stamp)
+            if stamp.start_routing_bucket == requested_start_routing_bucket
+                && stamp.end_routing_bucket == requested_end_routing_bucket =>
+        {
+            RoutingRangeDecision::Load {
+                start_routing_bucket: requested_start_routing_bucket,
+                end_routing_bucket: requested_end_routing_bucket,
