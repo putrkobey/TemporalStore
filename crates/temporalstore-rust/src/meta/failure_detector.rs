@@ -370,3 +370,375 @@ fn apply_orphan_guard(
         for holder in holders {
             pull_back.insert(holder.to_string());
         }
+    }
+    orphaned.sort();
+    orphaned.dedup();
+    plan.orphaned_shards = orphaned;
+
+    if !policy.forbid_orphaning_shards || pull_back.is_empty() {
+        return;
+    }
+    plan.convict.retain(|addr| !pull_back.contains(addr));
+    plan.held_by_orphan_guard = pull_back.into_iter().collect();
+    plan.held_by_orphan_guard.sort();
+}
+
+/// Damage severity for one location. Ratios are compared without integer
+/// division so a small location is not rounded straight into safe mode, and the
+/// `min_abnormal_for_safe_mode` floor keeps an isolated failure convictable.
+fn assess_severity(total: usize, abnormal: usize, policy: ConvictionPolicy) -> DamageSeverity {
+    if total == 0 || abnormal < policy.min_abnormal_for_safe_mode.max(1) {
+        return DamageSeverity::Normal;
+    }
+    let abnormal_scaled = abnormal as u128 * 100;
+    let total = total as u128;
+    if abnormal_scaled > total * policy.critical_ratio_percent as u128 {
+        DamageSeverity::Critical
+    } else if abnormal_scaled > total * policy.warning_ratio_percent as u128 {
+        DamageSeverity::Warning
+    } else {
+        DamageSeverity::Normal
+    }
+}
+
+/// Sliding window of one server's recent heartbeat intervals.
+#[derive(Debug, Clone)]
+struct ArrivalWindow {
+    intervals: VecDeque<u64>,
+    sum: u64,
+    last_arrival_ms: u64,
+}
+
+impl ArrivalWindow {
+    fn new(first_arrival_ms: u64, options: &FailureDetectorOptions) -> Self {
+        let mut window = Self {
+            intervals: VecDeque::with_capacity(options.sample_capacity.max(1)),
+            sum: 0,
+            last_arrival_ms: first_arrival_ms,
+        };
+        // Seed with the conservative initial interval so the mean is defined
+        // from the first observation and starts out biased against conviction.
+        window.push(options.initial_interval_ms.max(1), options);
+        window
+    }
+
+    fn push(&mut self, interval_ms: u64, options: &FailureDetectorOptions) {
+        let capacity = options.sample_capacity.max(1);
+        while self.intervals.len() >= capacity {
+            if let Some(evicted) = self.intervals.pop_front() {
+                self.sum -= evicted;
+            }
+        }
+        self.intervals.push_back(interval_ms);
+        self.sum += interval_ms;
+    }
+
+    fn observe(&mut self, arrival_ms: u64, options: &FailureDetectorOptions) {
+        if arrival_ms <= self.last_arrival_ms {
+            // Not a new heartbeat (or the clock went backwards): nothing to learn.
+            return;
+        }
+        let interval = arrival_ms - self.last_arrival_ms;
+        self.last_arrival_ms = arrival_ms;
+        if interval <= options.max_interval_ms {
+            self.push(interval, options);
+        }
+    }
+
+    fn mean_ms(&self) -> f64 {
+        if self.intervals.is_empty() {
+            return 0.0;
+        }
+        self.sum as f64 / self.intervals.len() as f64
+    }
+
+    /// Suspicion that this server is gone, given how long it has been silent
+    /// relative to its own learned cadence.
+    fn phi(&self, now_ms: u64) -> f64 {
+        let mean = self.mean_ms();
+        if mean <= 0.0 || now_ms <= self.last_arrival_ms {
+            return 0.0;
+        }
+        LOG10_E * (now_ms - self.last_arrival_ms) as f64 / mean
+    }
+}
+
+/// Per-server phi-accrual heartbeat failure detector with a stall guard.
+///
+/// Feed it one round at a time: [`MetaFailureDetector::begin_round`], then
+/// [`MetaFailureDetector::observe`] for every server's latest heartbeat
+/// timestamp, then [`MetaFailureDetector::diagnose`] for each. Or call
+/// [`MetaFailureDetector::plan_round`], which does all of that and applies the
+/// correlated-failure gate.
+#[derive(Debug, Clone)]
+pub struct MetaFailureDetector {
+    options: FailureDetectorOptions,
+    windows: BTreeMap<String, ArrivalWindow>,
+    last_round_ms: u64,
+    /// Suspicion stays suppressed until this timestamp after a detector stall.
+    paused_until_ms: u64,
+}
+
+impl Default for MetaFailureDetector {
+    fn default() -> Self {
+        Self::new(FailureDetectorOptions::default())
+    }
+}
+
+/// A server as the conviction planner sees it.
+///
+/// The planner judges whether a node has gone quiet: it reads the address, the
+/// state, the location it sits in, when it last heartbeated, whether it has
+/// been seen restarting, and which shards it is serving.
+///
+/// The serving shards are reduced to a set of ids here, which is all the
+/// planner ever wanted -- it used to be handed every shard serving state, each
+/// carrying its serving state, table name and uri as strings, and reduce them
+/// itself. On 32 nodes holding 1000 shards each, copying those out first cost
+/// 5.6ms a tick.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObservedLiveness {
+    pub server_addr: String,
+    pub state: MetaEntityState,
+    pub location: String,
+    pub last_heartbeat_ms: u64,
+    pub reboot_detected: bool,
+    pub serving_shards: BTreeSet<ShardId>,
+}
+
+impl ObservedLiveness {
+    pub fn of(server: &ServerMetaInfo) -> Self {
+        Self {
+            server_addr: server.server_addr.clone(),
+            state: server.state,
+            location: server.location.clone(),
+            last_heartbeat_ms: server.last_heartbeat_ms,
+            reboot_detected: server.reboot_detected,
+            serving_shards: super::shard_check::serving_shards(server),
+        }
+    }
+}
+
+impl MetaFailureDetector {
+    pub fn new(options: FailureDetectorOptions) -> Self {
+        Self {
+            options,
+            windows: BTreeMap::new(),
+            last_round_ms: 0,
+            paused_until_ms: 0,
+        }
+    }
+
+    pub fn options(&self) -> FailureDetectorOptions {
+        self.options
+    }
+
+    /// Number of servers with a learned interval distribution.
+    pub fn tracked_servers(&self) -> usize {
+        self.windows.len()
+    }
+
+    /// Open a detection round. Returns `false` when suspicion is not trustworthy
+    /// this round: either the detector just started, or it did not run for
+    /// longer than [`FailureDetectorOptions::max_round_pause_ms`], in which case
+    /// every server looks silent through no fault of its own. A stall re-arms
+    /// the grace window, so conviction stays suppressed until the fleet has had
+    /// a full pause window to be heard from again.
+    pub fn begin_round(&mut self, now_ms: u64) -> bool {
+        let previous = self.last_round_ms;
+        self.last_round_ms = now_ms;
+        if previous == 0 {
+            // First round ever: nothing was being watched before it, so silence
+            // carries no information yet.
+            self.paused_until_ms = now_ms.saturating_add(self.options.max_round_pause_ms);
+            return false;
+        }
+        if now_ms.saturating_sub(previous) > self.options.max_round_pause_ms {
+            self.paused_until_ms = now_ms.saturating_add(self.options.max_round_pause_ms);
+            return false;
+        }
+        now_ms >= self.paused_until_ms
+    }
+
+    /// True when the current round's suspicion is trustworthy.
+    pub fn is_active(&self, now_ms: u64) -> bool {
+        self.last_round_ms != 0 && now_ms >= self.paused_until_ms
+    }
+
+    /// Record that `server_addr`'s newest heartbeat arrived at
+    /// `last_heartbeat_ms`. Repeated calls with an unchanged timestamp are
+    /// no-ops, so this is safe to call every round for every server.
+    pub fn observe(&mut self, server_addr: &str, last_heartbeat_ms: u64) {
+        if last_heartbeat_ms == 0 {
+            return;
+        }
+        match self.windows.get_mut(server_addr) {
+            Some(window) => window.observe(last_heartbeat_ms, &self.options),
+            None => {
+                self.windows.insert(
+                    server_addr.to_string(),
+                    ArrivalWindow::new(last_heartbeat_ms, &self.options),
+                );
+            }
+        }
+    }
+
+    /// Stop tracking a server (it left the cluster).
+    pub fn forget(&mut self, server_addr: &str) {
+        self.windows.remove(server_addr);
+    }
+
+    /// Drop every server that is no longer present, so a long-lived detector
+    /// does not accumulate windows for departed nodes.
+    pub fn retain_only(&mut self, present: &BTreeSet<String>) {
+        self.windows.retain(|addr, _| present.contains(addr));
+    }
+
+    /// Current suspicion for one server, or `None` if it was never observed.
+    pub fn phi(&self, server_addr: &str, now_ms: u64) -> Option<f64> {
+        self.windows.get(server_addr).map(|window| window.phi(now_ms))
+    }
+
+    /// The server's learned mean heartbeat interval, or `None` if unobserved.
+    pub fn mean_interval_ms(&self, server_addr: &str) -> Option<f64> {
+        self.windows.get(server_addr).map(|window| window.mean_ms())
+    }
+
+    /// Diagnose one server. Returns [`Diagnosis::Unknown`] whenever the detector
+    /// is paused, so a stalled metaserver can never convict anybody.
+    pub fn diagnose(&self, server_addr: &str, now_ms: u64) -> Diagnosis {
+        if !self.is_active(now_ms) {
+            return Diagnosis::Unknown;
+        }
+        let Some(window) = self.windows.get(server_addr) else {
+            return Diagnosis::NotObserved;
+        };
+        if window.phi(now_ms) > self.options.phi_failure_threshold {
+            Diagnosis::Failed
+        } else {
+            Diagnosis::Healthy
+        }
+    }
+
+    /// Run one full detection round over the current server list: learn from
+    /// every heartbeat, diagnose every serving server, then apply the
+    /// correlated-failure gate. The returned plan names exactly the servers the
+    /// metaserver should freeze.
+    pub fn plan_round(
+        &mut self,
+        servers: &[ObservedLiveness],
+        now_ms: u64,
+        policy: ConvictionPolicy,
+    ) -> ConvictionPlan {
+        let subjects = servers
+            .iter()
+            .map(|server| ConvictionSubject {
+                addr: server.server_addr.as_str(),
+                location: server.location.as_str(),
+                state: server.state,
+                last_heartbeat_ms: server.last_heartbeat_ms,
+                // Already reduced to ids when the view was taken.
+                serving_shards: server.serving_shards.iter().copied().collect(),
+                // Not gated on the detector being active: a changed boot time is
+                // direct evidence the process restarted, not an inference drawn
+                // from silence, so the stall guard does not apply to it.
+                rebooted: server.reboot_detected,
+            })
+            .collect::<Vec<_>>();
+        self.plan_subject_round(&subjects, now_ms, policy)
+    }
+
+    /// Run one detection round over the proxies, with the same phi detection and
+    /// the same correlated-failure gate the datanodes get.
+    ///
+    /// A proxy carries no boot-time anchor, so it is never convicted for a
+    /// restart -- only for silence.
+    /// Plan a proxy round from records the caller owns.
+    ///
+    /// Kept for callers that already hold owned records; it borrows from them
+    /// rather than copying them again. The metaserver uses
+    /// [`Self::plan_proxy_round_borrowed`], which never makes the copies.
+    pub fn plan_proxy_round(
+        &mut self,
+        proxies: &[ProxyMetaInfo],
+        now_ms: u64,
+        policy: ConvictionPolicy,
+    ) -> ConvictionPlan {
+        self.plan_proxy_round_borrowed(&proxies.iter().collect::<Vec<_>>(), now_ms, policy)
+    }
+
+    /// Plan a proxy round without owning the proxies.
+    ///
+    /// A subject under judgement already borrows -- it holds `&str` into the
+    /// record rather than a copy of it -- so lifting the whole proxy set out of
+    /// the metadata first bought nothing.
+    pub fn plan_proxy_round_borrowed(
+        &mut self,
+        proxies: &[&ProxyMetaInfo],
+        now_ms: u64,
+        policy: ConvictionPolicy,
+    ) -> ConvictionPlan {
+        if !policy.convict_proxies {
+            // Still assess damage so the severity is reportable; just never name
+            // anybody to freeze.
+            let policy = ConvictionPolicy {
+                convict_enabled: false,
+                ..policy
+            };
+            let subjects = proxy_subjects(proxies.iter().copied());
+            return self.plan_subject_round(&subjects, now_ms, policy);
+        }
+        let subjects = proxy_subjects(proxies.iter().copied());
+        self.plan_subject_round(&subjects, now_ms, policy)
+    }
+
+    /// The shared body of a detection round: learn from every heartbeat,
+    /// diagnose everything still serving, then apply the correlated-failure
+    /// gate.
+    fn plan_subject_round(
+        &mut self,
+        subjects: &[ConvictionSubject<'_>],
+        now_ms: u64,
+        policy: ConvictionPolicy,
+    ) -> ConvictionPlan {
+        let active = self.begin_round(now_ms);
+        let mut present = BTreeSet::new();
+        for subject in subjects {
+            present.insert(subject.addr.to_string());
+            self.observe(subject.addr, subject.last_heartbeat_ms);
+        }
+        self.retain_only(&present);
+
+        let candidates = subjects
+            .iter()
+            // A dropped resource has left the cluster: it is neither damage nor
+            // a conviction candidate.
+            .filter(|subject| subject.state != MetaEntityState::Dropped)
+            .map(|subject| {
+                let serving = subject.state == MetaEntityState::Normal;
+                ConvictionCandidate {
+                    server_addr: subject.addr.to_string(),
+                    location: subject.location.to_string(),
+                    abnormal: !serving,
+                    failed: active
+                        && serving
+                        && self.diagnose(subject.addr, now_ms) == Diagnosis::Failed,
+                    rebooted: serving && subject.rebooted,
+                    serving_shards: subject.serving_shards.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
+        plan_conviction(&candidates, policy)
+    }
+}
+
+/// One resource under judgement, shared by the datanode and proxy rounds so both
+/// tiers run identical detection rather than drifting apart.
+struct ConvictionSubject<'a> {
+    addr: &'a str,
+    location: &'a str,
+    state: MetaEntityState,
+    last_heartbeat_ms: u64,
+    rebooted: bool,
+    /// Shards this subject is serving. Always empty for proxies.
+    serving_shards: Vec<ShardId>,
