@@ -94,3 +94,51 @@
       color: var(--code);
       background: #eef2f7;
       padding: 1px 4px;
+      border-radius: 4px;
+    }
+    pre code { color: inherit; background: transparent; padding: 0; }
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 10px;
+      margin: 18px 0;
+    }
+    .step {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fff;
+      position: relative;
+      min-height: 74px;
+    }
+    .step strong { display: block; color: var(--accent); margin-bottom: 4px; }
+    .callout {
+      border-left: 4px solid var(--accent2);
+      background: #fff7ed;
+      padding: 14px 16px;
+      margin: 18px 0;
+    }
+  </style>
+</head>
+<body>
+<main>
+  <span class="tag">MatrixArk Benchmark Doc</span>
+  <h1>LOCOMO Benchmark Workflow: TemporalStore vs Python Memory</h1>
+  <p class="lede">This walkthrough shows how LOCOMO conversations become MatrixArk context records, how retrieval builds a ContextPack, and what differs when the same pipeline uses Python memory versus TemporalStore as the storage boundary.</p>
+
+  <h2>What LOCOMO Tests</h2>
+  <div class="grid">
+    <div class="card"><strong>Single-hop</strong><br>One turn contains the answer.</div>
+    <div class="card"><strong>Multi-hop</strong><br>The answer requires combining multiple turns or sessions.</div>
+    <div class="card"><strong>Temporal</strong><br>Questions depend on dates, before/after, or current/latest state.</div>
+    <div class="card"><strong>Updates</strong><br>Newer facts supersede older facts while old evidence remains replayable.</div>
+  </div>
+
+  <h2>End-To-End Workflow</h2>
+  <div class="flow">
+    <div class="step"><strong>1. Load</strong>LOCOMO JSON sessions and QA.</div>
+    <div class="step"><strong>2. Batch</strong>Session turns become message batches.</div>
+    <div class="step"><strong>3. Extract</strong>One pass emits events, entities, summaries, indexes, segments.</div>
+    <div class="step"><strong>4. Store</strong>Python memory or TemporalStore record log.</div>
+    <div class="step"><strong>5. Retrieve</strong>Dense, sparse, keyword, time-decay recall.</div>
+    <div class="step"><strong>6. Pack</strong>Question-type token-budgeted ContextPack.</div>

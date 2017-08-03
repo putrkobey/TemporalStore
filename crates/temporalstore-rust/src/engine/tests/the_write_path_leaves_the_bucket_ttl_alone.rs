@@ -100,37 +100,3 @@ fn a_shard_with_expiring_blocks(buckets: u32) -> ShardState {
         crate::engine::set_expiry(&mut shard, object_key, FAR_FUTURE_MS);
     }
     assert!(
-        !shard.expires_at_ms().is_empty(),
-        "the fixture must have expiries, or the computation under test short-circuits and both \
-         halves of every pair below would agree for the wrong reason"
-    );
-    shard
-}
-
-fn ttl_of(shard: &ShardState, routing_bucket: u32) -> Option<u64> {
-    shard
-        .bucket_index
-        .bucket_map
-        .get(&routing_bucket)
-        .expect("the fixture bucket must exist")
-        .ttl_ms
-        .ms()
-}
-
-#[test]
-fn the_write_path_leaves_the_bucket_ttl_alone_where_it_takes_the_sweep() {
-    // ONE bucket pending of one, so `pending * 2 >= bucket_count` and the pending refresh hands its
-    // work to the full sweep. This is the arm production takes, and it is the one that would have
-    // been missed by gating on the traversal instead of on the parameter.
-    let mut shard = a_shard_with_expiring_blocks(1);
-    note_bucket_flags_stale(&mut shard, 0);
-    refresh_pending_bucket_runtime_flags(&mut shard);
-    assert_eq!(
-        ttl_of(&shard, 0),
-        None,
-        "a write-path refresh must leave the TTL as it stands, even when it delegates to the sweep"
-    );
-
-    // THE CONTROL. The same shard, swept: the value must now be computed. Without this, deleting
-    // the computation entirely would satisfy the assertion above.
-    refresh_bucket_runtime_flags(&mut shard);
