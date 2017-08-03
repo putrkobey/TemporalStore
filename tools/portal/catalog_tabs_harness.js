@@ -104,3 +104,38 @@ const win = {
     if (u.indexOf("/v1/admin/events") >= 0) {
       return Promise.resolve({ ok: true, status: 200,
                                body: { getReader: () => ({ read: () => new Promise(() => {}) }) },
+                               json: () => Promise.resolve({}), text: () => Promise.resolve("") });
+    }
+    return json({});
+  }
+};
+win.window = win;
+
+const names = Object.keys(win);
+const values = names.map((k) => win[k]);
+scripts.forEach((body, index) => {
+  try { new Function(...names, body)(...values); }
+  catch (e) { console.log("FAIL script " + index + " threw: " + e.message); failures += 1; }
+});
+
+function visible() { return panes.filter((p) => !p.hidden).map((p) => p.id); }
+function counts() {
+  return [el("skillsCount").textContent.trim(), el("resourcesCount").textContent.trim()];
+}
+function search(text) {
+  el("filter").value = text;
+  const fn = listeners["filter:input"];
+  if (fn) { fn({}); }
+}
+
+function settle() { return new Promise((r) => setImmediate(() => setImmediate(r))); }
+
+(async function () {
+  for (let i = 0; i < 40; i += 1) { await settle(); }
+
+  ok("both tabs exist", tabCells.length === 2, tabCells.map((t) => t.id).join(", "));
+  ok("exactly one pane is visible", visible().length === 1, visible().join(", "));
+  ok("the tabs carry counts", counts()[0] === "2" && counts()[1] === "1", counts().join(" / "));
+
+  /* Clicking has to work, which means the page called the switcher. Without this check, removing
+     that call leaves every other assertion passing -- the counts and the notice are computed in

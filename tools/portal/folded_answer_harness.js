@@ -59,34 +59,3 @@ if (!src) { console.log("FAIL the page carries no reveal helper"); process.exit(
 
 /* `nest` puts the named element INSIDE the fold rather than being it -- the walk has to climb, and
    a helper that only ever looked at the element itself would pass every test that does not. */
-function build(hash, nest) {
-  const fold = makeEl({ tagName: "DETAILS", id: nest ? null : named[0].id });
-  const wrapper = makeEl({ tagName: "DIV", parentNode: fold });
-  const inner = makeEl({ tagName: "P", id: nest ? named[0].id : null, parentNode: wrapper });
-  const loose = makeEl({ tagName: "P", id: "not-folded-at-all" });
-
-  const byId = new Map();
-  [fold, inner, loose].forEach((el) => { if (el.id) { byId.set(el.id, el); } });
-
-  const listeners = {};
-  const win = {
-    location: { hash: hash || "" },
-    addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
-  };
-  const doc = { getElementById: (id) => byId.get(id) || null };
-  new Function("window", "document", src)(win, doc);
-
-  return {
-    fold,
-    target: nest ? inner : fold,
-    listens: (type) => (listeners[type] || []).length > 0,
-    go(next) {
-      win.location.hash = next;
-      (listeners.hashchange || []).forEach((fn) => fn({}));
-    },
-  };
-}
-
-const anchor = "#" + named[0].id;
-
-/* ---------- the link works ---------- */

@@ -100,3 +100,37 @@ impl SnapshotMetrics {
             last_success_log_index.clone(),
         );
 
+        Self {
+            create_total,
+            upload_total,
+            download_total,
+            restore_total,
+            snapshot_bytes,
+            upload_seconds,
+            download_seconds,
+            last_success_log_index,
+        }
+    }
+
+    pub fn observe_create(&self, shard_id: u64, status: SnapshotStatus) {
+        self.create_total
+            .get_or_create(&status_labels(shard_id, status))
+            .inc();
+    }
+
+    pub fn observe_upload(&self, shard_id: u64, status: SnapshotStatus, bytes: u64, seconds: u64) {
+        self.upload_total
+            .get_or_create(&status_labels(shard_id, status))
+            .inc();
+        let labels = shard_labels(shard_id);
+        self.snapshot_bytes
+            .get_or_create(&labels)
+            .set(to_i64(bytes));
+        self.upload_seconds
+            .get_or_create(&labels)
+            .set(to_i64(seconds));
+    }
+
+    pub fn observe_download(&self, shard_id: u64, status: SnapshotStatus, seconds: u64) {
+        self.download_total
+            .get_or_create(&status_labels(shard_id, status))
