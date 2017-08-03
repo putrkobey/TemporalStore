@@ -517,3 +517,176 @@ fn no_page_named_identity_type_field_or_size_constant_exists_in_this_crate() {
             None => code,
         }
     }
+
+    // --- NON-VACUITY: each matcher still matches, in both directions. ---
+    assert!(
+        declares_a_page_named_type("pub struct PageAddress {"),
+        "the type matcher no longer reports a page-named type declaration"
+    );
+    assert!(
+        declares_a_page_named_type("    type PageIndex = BlockIndexMap;"),
+        "the type matcher misses a type alias"
+    );
+    assert!(
+        !declares_a_page_named_type("pub struct StoragePageAddressSample {"),
+        "the type matcher reports a report projection, which is allowed and must stay"
+    );
+    assert!(
+        !declares_a_page_named_type("//!   * [`crate::engine::state::PageIndexNamedBy`] is a type"),
+        "the type matcher reports a doc line, so it would fail on this very file"
+    );
+    assert!(
+        declares_a_page_named_identity_field("    pub page_id: u64,"),
+        "the field matcher no longer reports a page-named identity field"
+    );
+    assert!(
+        declares_a_page_named_identity_field("    page_ordinal: Option<u64>,"),
+        "the field matcher misses a private field"
+    );
+    assert!(
+        !declares_a_page_named_identity_field("        \"page_id\": 4,"),
+        "the field matcher reports a JSON key in a fixture string, which is stored data and must \
+         keep its spelling"
+    );
+    assert!(
+        !declares_a_page_named_identity_field("    #[serde(default, alias = \"page_id\")]"),
+        "the field matcher reports a serde alias, which is how older stored data still decodes"
+    );
+    assert!(
+        declares_a_page_size_constant("const PAGE_SIZE: usize = 1 << 20;"),
+        "the constant matcher no longer reports a page size constant"
+    );
+    assert!(
+        !declares_a_page_size_constant("//!   * There is no page SIZE tier: no PAGE_SIZE exists"),
+        "the constant matcher reports a doc line"
+    );
+    assert!(
+        !declares_a_page_size_constant("    let page_size = record.page_size;"),
+        "the constant matcher reports a local binding"
+    );
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("read_dir {} failed: {err}", dir.display()));
+        for entry in entries {
+            let entry = entry.expect("dir entry readable");
+            let path = entry.path();
+            let kind = entry.file_type().expect("file type readable");
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+
+    // --- NON-VACUITY: the walk ran and recursed. ---
+    assert!(
+        files.len() >= MIN_FILES,
+        "the walk found {} files under {}, floor is {MIN_FILES} -- that is a broken walk, not a \
+         clean tree",
+        files.len(),
+        root.display()
+    );
+    assert!(
+        files
+            .iter()
+            .filter(|path| path.parent() != Some(root.as_path()))
+            .count()
+            > 0,
+        "the walk did not recurse, so most of this crate was not scanned"
+    );
+
+    // --- NON-VACUITY: the walk can still SEE a block-named declaration of each shape, so a
+    // clean page-named result is a fact about the spelling and not about the scan. ---
+    let mut block_named_types = 0usize;
+    let mut block_named_id_fields = 0usize;
+    let mut findings: Vec<String> = Vec::new();
+    for path in &files {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("read {} failed: {err}", path.display()));
+        for (number, line) in text.lines().enumerate() {
+            let code = strip_leading_visibility(line);
+            if ["struct ", "enum ", "type ", "trait "].iter().any(|keyword| {
+                code.strip_prefix(keyword)
+                    .is_some_and(|rest| rest.starts_with("Block"))
+            }) {
+                block_named_types += 1;
+            }
+            if code
+                .strip_prefix("block_id")
+                .is_some_and(|rest| rest.trim_start().starts_with(':'))
+            {
+                block_named_id_fields += 1;
+            }
+            let what = if declares_a_page_named_type(line) {
+                Some("a page-named type")
+            } else if declares_a_page_named_identity_field(line) {
+                Some("a page-named identity field")
+            } else if declares_a_page_size_constant(line) {
+                Some("a page SIZE constant")
+            } else {
+                None
+            };
+            if let Some(what) = what {
+                findings.push(format!(
+                    "{}:{} declares {what}: {}",
+                    path.display(),
+                    number + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        block_named_types > 0,
+        "the walk found no Block-named type declaration either, so the matcher is looking at \
+         nothing rather than at a crate with one spelling"
+    );
+    assert!(
+        block_named_id_fields > 0,
+        "the walk found no `block_id` field declaration, so the field matcher is looking at \
+         nothing"
+    );
+    println!(
+        "scanned {} files; {block_named_types} Block-named type declarations and \
+         {block_named_id_fields} `block_id` fields are the spelling that is used",
+        files.len()
+    );
+
+    assert!(
+        findings.is_empty(),
+        "every identity on this tier is spelled `block`, and there is no page SIZE tier; the \
+         module header rests on that. These declarations contradict it:\n{}",
+        findings.join("\n")
+    );
+}
+
+/// The page-spelled keys the STORED OBJECT RECORD emits, named as a set.
+///
+/// `BlockLayout` is spelled `blocks` in Rust and emits `pages`, so the identifier says nothing
+/// about the contract and a scan over identifiers cannot see this key at all.
+///
+/// # WHY THIS IS NOT A `DURABLE_NAMES` ENTRY
+///
+/// `DURABLE_NAMES` in `block_store.rs` checks one direction: every listed name must still be
+/// spelled by SOME site outside the list. For this key that check can never go red. The string
+/// `"pages"` has 747 other sites in this crate -- it is also the on-disk directory the block
+/// store lives in (`<data>/pages`, set by `docker/single-node-entrypoint.sh`,
+/// `docker/docker-compose.cloud-api.yml` and `tools/deploy_profile_common.sh`) -- so the
+/// substring survives the serde rename being deleted outright. A registry entry for `pages`
+/// would be a guard that cannot fail, which is worse than no entry: it reads as covered.
+///
+/// So this key is pinned where it is EMITTED instead, on both halves of the round trip.
+///
+/// THE WRITER HAS SINCE MOVED, so the emitted key is `blocks` and `pages` is the alias a store
+/// written by an earlier build is read through. The decode clause below drives BOTH spellings and
+/// asserts they land on the same layout, which is the guarantee that replaced the old clause
+/// asserting the block spelling was refused.
+const BLOCK_SPELLED_RECORD_KEYS: &[&str] = &["blocks"];
+
+/// The stored layout emits the page spelling, and still reads one back.
