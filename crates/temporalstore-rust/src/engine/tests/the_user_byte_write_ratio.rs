@@ -113,3 +113,119 @@ fn the_user_byte_write_ratio() {
         "    {:<42} {:>14} {:>14}",
         "", "compressible", "incompressible"
     );
+    for (label, a, b) in [
+        ("logical (user) bytes written", flat_stats.logical_bytes_written, sharp_stats.logical_bytes_written),
+        ("live_user_bytes", flat_stats.live_user_bytes, sharp_stats.live_user_bytes),
+        ("live_objects_with_logical_size", flat_stats.live_objects_with_logical_size, sharp_stats.live_objects_with_logical_size),
+        ("live_block_bytes (stored)", flat_stats.live_block_bytes, sharp_stats.live_block_bytes),
+    ] {
+        println!("    {:<42} {:>14} {:>14}", label, a, b);
+    }
+    println!(
+        "    {:<42} {:>13.3}x {:>13.3}x",
+        "storage_write_amplification (the CODEC)",
+        flat_stats.storage_write_amplification_ppm as f64 / 1_000_000.0,
+        sharp_stats.storage_write_amplification_ppm as f64 / 1_000_000.0
+    );
+    println!(
+        "    {:<42} {:>13.3}x {:>13.3}x",
+        "user_write_amplification (the REWRITE)",
+        flat_stats.user_write_amplification_ppm as f64 / 1_000_000.0,
+        sharp_stats.user_write_amplification_ppm as f64 / 1_000_000.0
+    );
+    println!();
+
+    // --- THE TWO STORES REALLY DID COMPRESS DIFFERENTLY, or the invariance below is vacuous.
+    assert!(
+        sharp_stats.storage_write_amplification_ppm
+            > flat_stats.storage_write_amplification_ppm * 2,
+        "the two stores reported storage-write figures of {} and {} ppm. They must differ \
+         materially, or this pair cannot show that compression cancels out of the user ratio.",
+        flat_stats.storage_write_amplification_ppm,
+        sharp_stats.storage_write_amplification_ppm
+    );
+
+    // --- AND THE USER RATIO IS THE SAME ON BOTH. This is the property; everything else here
+    // --- supports it.
+    assert_eq!(
+        flat_stats.user_write_amplification_ppm, sharp_stats.user_write_amplification_ppm,
+        "the user-byte write ratio read {} ppm on the compressible store and {} on the \
+         incompressible one. Both wrote the same user bytes over the same live set, so compression \
+         must cancel -- if it does not, one of the halves is in stored units.",
+        flat_stats.user_write_amplification_ppm, sharp_stats.user_write_amplification_ppm
+    );
+
+    // --- IT READS THE NUMBER OF ROUNDS, because each round rewrote every key once.
+    assert_eq!(
+        (ROUNDS as u64) * 1_000_000,
+        sharp_stats.user_write_amplification_ppm,
+        "{ROUNDS} passes over the same keys must read {ROUNDS}.000x and {} ppm was published",
+        sharp_stats.user_write_amplification_ppm
+    );
+
+    // --- COVERAGE IS COMPLETE on a corpus written entirely through the string path, and the
+    // --- denominator is the user bytes rather than the stored ones.
+    assert_eq!(
+        KEYS as u64, sharp_stats.live_objects_with_logical_size,
+        "{KEYS} keys were written through the string path, so every live object should carry a \
+         size class and {} do",
+        sharp_stats.live_objects_with_logical_size
+    );
+    assert_eq!(
+        live_user_bytes_expected, sharp_stats.live_user_bytes,
+        "the live user bytes should be {KEYS} x {VALUE_LEN} = {live_user_bytes_expected} and \
+         {} was published. {VALUE_LEN} is exactly representable as a size class, so this is an \
+         equality rather than a tolerance.",
+        sharp_stats.live_user_bytes
+    );
+
+    // --- RE-DERIVABLE FROM ITS OWN PUBLISHED TERMS.
+    assert_eq!(
+        ppm(sharp_stats.logical_bytes_written, sharp_stats.live_user_bytes),
+        sharp_stats.user_write_amplification_ppm,
+        "the published ratio is not its own published terms: {} over {} should be {} ppm",
+        sharp_stats.logical_bytes_written,
+        sharp_stats.live_user_bytes,
+        ppm(sharp_stats.logical_bytes_written, sharp_stats.live_user_bytes)
+    );
+
+    // --- A DELETE TAKES ITS BYTES AND ITS COVERAGE WITH IT. Without this the denominator would
+    // --- only ever rise and a deleted object would keep contributing to a figure that claims to
+    // --- describe what is live.
+    let response = sharp.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringDelete { key: format!("uw-{:06}", 0) },
+    });
+    assert!(response.status.ok, "delete: {:?}", response.status);
+    let after = sharp.shard_stats(1).expect("stats").storage.clone();
+    println!(
+        "  after deleting one key: live_user_bytes {} -> {}, covered {} -> {}",
+        sharp_stats.live_user_bytes,
+        after.live_user_bytes,
+        sharp_stats.live_objects_with_logical_size,
+        after.live_objects_with_logical_size
+    );
+    println!();
+    assert_eq!(
+        sharp_stats.live_user_bytes - VALUE_LEN as u64,
+        after.live_user_bytes,
+        "deleting one {VALUE_LEN}-byte object should drop the live user bytes by exactly that, \
+         {} -> {}",
+        sharp_stats.live_user_bytes,
+        after.live_user_bytes
+    );
+    assert_eq!(
+        sharp_stats.live_objects_with_logical_size - 1,
+        after.live_objects_with_logical_size,
+        "deleting one object should drop the coverage count by one, {} -> {}",
+        sharp_stats.live_objects_with_logical_size,
+        after.live_objects_with_logical_size
+    );
+}
+
+/// NO STRING ROW IS REMOVED OUTSIDE ITS DOOR.
+///
+/// `remove_string_row` maintains `live_user_bytes` and `live_objects_with_logical_size`. A caller
+/// that reaches `strings_mut().remove(..)` instead removes the row and leaves both totals claiming
+/// an object that is gone -- which makes `user_write_amplification_ppm` read LOW, and nothing in
+/// the published value says so. That is how this started: the totals were hooked on
