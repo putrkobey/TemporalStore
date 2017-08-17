@@ -27,3 +27,32 @@ function makeEl(id) {
        reports on a strip that never ran. */
     id: id || "", hidden: true, innerHTML: "", textContent: "", className: "",
     value: id === "key" ? "k-admin" : "", checked: false,
+    style: {}, dataset: {}, href: "", files: [], options: [], children: [],
+    addEventListener() {}, removeEventListener() {}, appendChild() {}, removeChild() {},
+    setAttribute() {}, getAttribute() { return null; }, closest() { return null; },
+    querySelector() { return null; }, querySelectorAll() { return []; },
+    scrollIntoView() {}, focus() {}, click() {},
+    classList: { add() {}, remove() {}, toggle() {} }
+  };
+}
+function el(id) {
+  if (!els.has(id)) { els.set(id, makeEl(id)); }
+  return els.get(id);
+}
+
+const win = {
+  document: {
+    getElementById: (id) => el(id),
+    querySelector: () => makeEl(), querySelectorAll: () => [],
+    createElement: () => makeEl(), addEventListener() {}, body: makeEl(), hidden: false
+  },
+  addEventListener() {},
+  location: { origin: "http://localhost", href: "http://localhost", reload() {} },
+  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  navigator: {},
+  setTimeout: () => 0, setInterval: () => 0, clearInterval() {},
+  Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
+  TextDecoder: function () { this.decode = () => ""; },
+  AbortController: function () { this.abort = () => {}; this.signal = {}; },
