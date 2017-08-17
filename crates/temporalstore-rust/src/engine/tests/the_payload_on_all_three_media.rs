@@ -39,3 +39,45 @@
 //! and is the key of the persistent block cache, while the response copy was memory-only with a
 //! single reader — so the response copy was the one to drop, and it was the larger of the two by the
 //! msgpack envelope. `what_the_frame_layer_saves_under_eviction` holds the before-and-after.
+//!
+//! rust-internal: measures this crate's own counters, no product behaviour
+//!
+//!   cargo test -p temporalstore-rust --lib the_payload_on_all_three_media -- --ignored --nocapture
+
+use crate::types::{Command, ExecuteRequest};
+
+const KEYS: usize = 2_000;
+const VALUE: usize = 256;
+
+fn noisy_value(index: usize, len: usize) -> Vec<u8> {
+    let mut state = (index as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(0x1234_5678_9ABC_DEF0)
+        | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        })
+        .collect()
+}
+
+/// (label, logical, on disk, in memory)
+fn weigh(compressible: bool) -> (&'static str, u64, u64, u64) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("media-{index:06}"),
+                value: if compressible {
+                    vec![b'v'; VALUE]
