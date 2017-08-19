@@ -80,3 +80,85 @@ fn verify_engine_dump_load_recovery(case: &StorageMigrationCase) {
     let index_dir = dir.path().join("indexes");
     let mut engine = new_engine(dir.path(), &block_dir, &index_dir, case.shard_id);
 
+    execute_steps(&engine, case.shard_id, &case.operations, &case.name);
+
+    let summaries = engine.bucket_storage_summaries(case.shard_id);
+    assert!(
+        !summaries.is_empty(),
+        "case={} should create slot ownership summaries",
+        case.name
+    );
+    assert!(
+        summaries
+            .iter()
+            .any(|summary| summary.dirty_generation > 0 && summary.block_ref_count > 0),
+        "case={} should track dirty slot generations and page refs",
+        case.name
+    );
+    let dirty_buckets = summaries
+        .iter()
+        .filter(|summary| summary.dirty_generation > 0)
+        .map(|summary| summary.routing_bucket)
+        .collect::<Vec<_>>();
+    assert!(!dirty_buckets.is_empty());
+    let installable_manifest = engine
+        .create_bucket_dump_manifest(case.shard_id, Vec::new())
+        .expect("explicit slot dump manifest should be created");
+    assert!(
+        !installable_manifest.index_bytes.is_empty(),
+        "explicit slot dump manifest must include index bytes"
+    );
+
+    let lifecycle = engine.apply_storage_lifecycle(StorageLifecycleRequest {
+        shard_id: case.shard_id,
+        selected_dump_buckets: dirty_buckets,
+        max_dump_buckets_per_round: 64,
+        // Both thresholds at zero: this corpus drives the dump itself and must not be told to
+        // wait for pressure to build, or the buckets it just dirtied stay undumped and every
+        // assertion below is about the wrong state.
+        min_undumped_wal_records: 0,
+        min_undumped_wal_bytes: 0,
+        purge_delayed_destroy: true,
+        // `None` is "every quarantined slab old enough", which is what this corpus asserted
+        // before the field existed. The scheduled cycle fills it from the dependency plan; a
+        // corpus that drives the round itself has no plan to narrow it with.
+        purge_delayed_destroy_slab_ids: None,
+        prune_bucket_dump_manifests: true,
+        roll_forward_bucket_dump_installs: true,
+        follower_replay_cursors: vec![BucketDumpFollowerReplayCursor {
+            follower_id: "lagging-storage-corpus-follower".to_string(),
+            shard_id: case.shard_id,
+            wal_sequence: 0,
+            index_log_sequence: 0,
+        }],
+        block_gc_shared_store_cursors: Vec::new(),
+        block_gc_raft_snapshot_refs: Vec::new(),
+        block_gc_checkpoint_floor_slab_id: None,
+        block_gc_raft_install_floor_slab_id: None,
+        block_gc_delayed_destroy_grace_ms: 0,
+        invalidate_cache: true,
+        warm_cache: true,
+    });
+    let report_manifest = lifecycle
+        .dump_manifest
+        .as_ref()
+        .expect("storage lifecycle should write a slot dump manifest");
+    assert!(!report_manifest.checksum.is_empty());
+    assert!(!report_manifest.bucket_summaries.is_empty());
+    assert!(
+        lifecycle.cache_warmup.considered_block_refs > 0,
+        "case={} cache warmup should inspect page refs",
+        case.name
+    );
+    assert_eq!(
+        lifecycle.cache_warmup.failed_block_refs, 0,
+        "case={} cache warmup should not fail page reads",
+        case.name
+    );
+
+    assert_clean_recovery(&engine, case.shard_id, &case.name);
+
+    drop(engine);
+    engine = new_engine(dir.path(), &block_dir, &index_dir, case.shard_id);
+    engine
+        .install_bucket_dump_manifest(&installable_manifest)
