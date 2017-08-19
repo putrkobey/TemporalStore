@@ -136,3 +136,72 @@ pub struct MetaOwnedDataRaftMembershipReport {
     pub blockers: Vec<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataRaftTopologyMembershipPlan {
+    pub shard_id: ShardId,
+    pub target_voters: Vec<RaftNodeId>,
+    pub target_servers: Vec<String>,
+    pub no_change: bool,
+    pub membership_change: Option<RaftMembershipChangePlan>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DataRaftTopologyApplyReport {
+    pub plan: DataRaftTopologyMembershipPlan,
+    pub applied: bool,
+    pub membership_report: Option<RaftMembershipChangeReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RaftFailoverReport {
+    pub old_leader_id: RaftNodeId,
+    pub new_leader_id: RaftNodeId,
+    pub term: u64,
+    pub commit_index: u64,
+    pub caught_up_voters: Vec<RaftNodeId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ReadIndexResponse {
+    pub leader_id: RaftNodeId,
+    pub node_id: RaftNodeId,
+    pub term: u64,
+    pub read_index: u64,
+}
+
+pub fn plan_data_raft_membership_from_topology(
+    cluster: &RaftCluster,
+    topology: &TableTopologyResponse,
+    servers: &[ServerMetaInfo],
+    shard_id: ShardId,
+) -> Result<DataRaftTopologyMembershipPlan, RaftError> {
+    let partition = topology
+        .shards
+        .iter()
+        .find(|partition| partition.shard_id == shard_id)
+        .ok_or_else(|| {
+            RaftError::InvalidConfig(format!("topology does not contain shard {shard_id}"))
+        })?;
+    let servers_by_addr = servers
+        .iter()
+        .map(|server| (server.server_addr.as_str(), server))
+        .collect::<BTreeMap<_, _>>();
+    let mut target_servers = Vec::new();
+    let mut seen_servers = BTreeSet::new();
+    if let Some(primary) = &partition.primary {
+        if seen_servers.insert(primary.clone()) {
+            target_servers.push(primary.clone());
+        }
+    }
+    for replica in &partition.replicas {
+        if seen_servers.insert(replica.clone()) {
+            target_servers.push(replica.clone());
+        }
+    }
+    if target_servers.is_empty() {
+        return Err(RaftError::InvalidConfig(format!(
+            "topology shard {shard_id} has no primary or replicas"
+        )));
+    }
+
+    let mut target_voters = Vec::new();
