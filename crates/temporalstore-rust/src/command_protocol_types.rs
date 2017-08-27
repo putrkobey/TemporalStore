@@ -1901,3 +1901,954 @@ pub enum Command {
     ContextUpsertEntity {
         tenant_hash: u64,
         entity: ContextEntity,
+    },
+    ContextGetEntity {
+        tenant_hash: u64,
+        node_hash: u64,
+        entity_hash: u64,
+    },
+    ContextQueryEntities {
+        tenant_hash: u64,
+        node_hash: u64,
+        entity_hashes: Vec<u64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    ContextUpsertChildRef {
+        tenant_hash: u64,
+        child_ref: ContextChildRef,
+    },
+    ContextQueryChildren {
+        tenant_hash: u64,
+        parent_hash: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    ContextTraverseTree {
+        tenant_hash: u64,
+        start_node_hash: u64,
+        query_vector: Vec<f32>,
+        #[serde(default)]
+        max_depth: Option<u32>,
+        #[serde(default)]
+        top_k_per_depth: Option<usize>,
+        #[serde(default)]
+        max_children_scored_per_parent: Option<usize>,
+        #[serde(default)]
+        max_candidate_nodes: Option<usize>,
+        #[serde(default)]
+        leaf_only: bool,
+    },
+    ContextUpsertSummary {
+        tenant_hash: u64,
+        summary: ContextSummary,
+    },
+    ContextQuerySummaries {
+        tenant_hash: u64,
+        node_hash: u64,
+        level: u32,
+        as_of_ms: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// The newest summary VECTOR at `level` for each node, in one command.
+    ///
+    /// Retrieval scores every candidate node's summaries; per-node ContextQuerySummaries would
+    /// turn that into a command per candidate, and the whole summary payload when only the
+    /// vector is wanted. This returns exactly the scoring input, batched like ContextGetNodes.
+    ContextQuerySummaryVectors {
+        tenant_hash: u64,
+        node_hashes: Vec<u64>,
+        level: u32,
+        as_of_ms: u64,
+    },
+    ContextWriteCompressionEvent {
+        tenant_hash: u64,
+        event: ContextCompressionEvent,
+    },
+    ContextQueryCompressionEvents {
+        tenant_hash: u64,
+        node_hashes: Vec<u64>,
+        start_time_ms: u64,
+        end_time_ms: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    ContextCompressEvents {
+        tenant_hash: u64,
+        node_hash: u64,
+        source_start_ms: u64,
+        source_end_ms: u64,
+        compressed_time_ms: u64,
+        #[serde(default)]
+        max_source_events: Option<usize>,
+        #[serde(default)]
+        min_confidence: f32,
+        #[serde(default)]
+        min_importance: f32,
+    },
+    ContextQueryNodeContext {
+        tenant_hash: u64,
+        node_hash: u64,
+        #[serde(default)]
+        summary_level: Option<u32>,
+        as_of_ms: u64,
+        #[serde(default)]
+        cold_start_time_ms: u64,
+        #[serde(default)]
+        cold_end_time_ms: u64,
+        #[serde(default)]
+        compression_limit: Option<usize>,
+    },
+}
+
+/// Field number carrying the inline embedding vector on ContextEvent/Entity/Summary.
+///
+/// These three types have HAND-WRITTEN protobuf codecs; a serde field alone is invisible to
+/// them and is silently dropped on persist -- the struct is populated in memory and the value
+/// is gone by the time it reaches a page, with no error anywhere. 20 is clear of every field
+/// number the three messages already use.
+/// A node's vector, without decoding the node.
+///
+/// The traversal scores candidates on this one field. Decoding the whole record to read it
+/// allocates every string and the summary vector as well, for a candidate that usually loses.
+///
+/// Scanning continues past a match on purpose: the full decoder assigns to `vector` on each
+/// vector field it meets, so the last encoding present is the one that wins. Stopping at the
+/// first would disagree with it on any record carrying more than one.
+pub(crate) fn decode_context_node_vector(bytes: &[u8]) -> Option<Vec<f32>> {
+    let mut cursor = 0;
+    let mut found: Option<Vec<f32>> = None;
+    while cursor < bytes.len() {
+        let tag = decode_varint(bytes, &mut cursor)?;
+        match (tag >> 3, tag & 0x7) {
+            (CONTEXT_VECTOR_FIELD, 2) => {
+                found = Some(unpack_f32_vector(decode_bytes_ref(bytes, &mut cursor)?));
+            }
+            (CONTEXT_VECTOR_INT8_FIELD, 2) => {
+                found = Some(unpack_i8_vector(decode_bytes_ref(bytes, &mut cursor)?));
+            }
+            (CONTEXT_VECTOR_SCALED_FIELD, 2) => {
+                found = Some(unpack_scaled_vector(decode_bytes_ref(bytes, &mut cursor)?));
+            }
+            (_, wire_type) => skip_proto_field(bytes, &mut cursor, wire_type)?,
+        }
+    }
+    found
+}
+
+const CONTEXT_VECTOR_FIELD: u64 = 20;
+// Which model produced the inline vector, and when. Both travelled with the separate
+// embedding record; an owner carrying a vector without them cannot say whether the vector
+// is still from the model in use. Numbered above the per-record fields so they stay clear
+// of the low tags each record type assigns for itself.
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+const CONTEXT_EMBEDDING_MODEL_FIELD: u64 = 21;
+const CONTEXT_EMBEDDING_UPDATED_FIELD: u64 = 22;
+/// Uniformly-scaled integer vectors. Their own field, like the int8 form, so a decoder knows
+/// which representation it holds from the tag and a store containing several reads end to end.
+const CONTEXT_VECTOR_SCALED_FIELD: u64 = 24;
+/// Multiplier for the scaled form. Every element of every vector is scaled by the SAME constant,
+/// which is what makes the encoding rank-preserving: cosine is invariant under a uniform scale,
+/// so no two stored vectors can change places against a query. 1e4 keeps four decimal places,
+/// which on unit vectors (elements around 0.04) is ~0.1% of an element.
+const VECTOR_SCALE: f32 = 1.0e4;
+
+/// Quantized vector, self-contained: `[f32 LE scale][one i8 per dimension]`.
+///
+/// The scale rides inside the same length-delimited field rather than beside it, so each decoder
+/// needs one arm and no cross-field state -- protobuf does not order fields, and a "wait for the
+/// other half" dance in four separate loops is four chances to leave a vector empty.
+///
+/// A record carries EITHER this or `CONTEXT_VECTOR_FIELD`, never both.
+const CONTEXT_VECTOR_INT8_FIELD: u64 = 23;
+
+/// The node's copy of its L1 summary vector, in the same three representations the record's own
+/// vector has. Its own field numbers rather than a second use of 20/23/24, because a node now
+/// carries TWO vectors and protobuf tells one value from another only by its tag -- reusing the
+/// tag would make the second write overwrite the first on decode, with no error and no length
+/// mismatch to notice.
+const CONTEXT_SUMMARY_VECTOR_FIELD: u64 = 25;
+const CONTEXT_SUMMARY_VECTOR_INT8_FIELD: u64 = 26;
+const CONTEXT_SUMMARY_VECTOR_SCALED_FIELD: u64 = 27;
+/// `valid_from_ms` of the summary the copy came from, without which the copy cannot be used at
+/// all: it says which point in time the vector is the newest summary FOR.
+const CONTEXT_SUMMARY_VECTOR_VALID_FROM_FIELD: u64 = 28;
+/// Written in place of 25/26/27 when the copy is byte-equal to the record's own vector, which is
+/// what the current ingest produces: it embeds ONE text and gives the result to both the node and
+/// its L1 summary. Storing the duplicate would add a whole vector -- 4 KB at 1024 f32 dimensions,
+/// on every node -- to say something a single varint says.
+///
+/// Resolved after the decode loop, not inside it: protobuf does not order fields, so the marker
+/// can arrive before the vector it points at.
+const CONTEXT_SUMMARY_VECTOR_SAME_FIELD: u64 = 29;
+/// Which encoder produced the copy. Travels with it or the copy is the one scored vector nothing
+/// checks the encoder of.
+const CONTEXT_SUMMARY_VECTOR_MODEL_FIELD: u64 = 30;
+
+/// The three tags one vector may be written under, so a record carrying two vectors can encode
+/// and decode both through one implementation instead of two that drift apart.
+struct VectorFieldSet {
+    plain: u64,
+    int8: u64,
+    scaled: u64,
+}
+
+const OWN_VECTOR_FIELDS: VectorFieldSet = VectorFieldSet {
+    plain: CONTEXT_VECTOR_FIELD,
+    int8: CONTEXT_VECTOR_INT8_FIELD,
+    scaled: CONTEXT_VECTOR_SCALED_FIELD,
+};
+
+const NODE_SUMMARY_VECTOR_FIELDS: VectorFieldSet = VectorFieldSet {
+    plain: CONTEXT_SUMMARY_VECTOR_FIELD,
+    int8: CONTEXT_SUMMARY_VECTOR_INT8_FIELD,
+    scaled: CONTEXT_SUMMARY_VECTOR_SCALED_FIELD,
+};
+
+/// f32 vector -> packed little-endian bytes. Explicit LE, not native, so a page written on one
+/// architecture decodes on another.
+fn pack_f32_vector(vector: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vector.len() * 4);
+    for value in vector {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+/// Whether new writes store the quantized form. Default OFF; reading understands both regardless,
+/// so this can be turned on and off without stranding anything already written.
+fn vector_int8_enabled() -> bool {
+    matches!(
+        std::env::var("TS_VECTOR_INT8")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// A vector as it will read back once it has been through a page.
+///
+/// Both stored forms round -- the int8 one to a per-vector scale, the uniformly-scaled one to four
+/// decimal places -- so a vector just computed is never equal to the same vector read back. Any
+/// "has this changed?" test written against the raw value answers YES every time, and any "are
+/// these two the same vector?" test answers NO, which here would mean a second node page written
+/// on every ingest and the equal-copy marker never firing.
+///
+/// Idempotent: rounding an already-rounded value changes nothing, so this can be applied to a
+/// value of either origin.
+pub(crate) fn context_vector_as_stored(vector: &[f32]) -> Vec<f32> {
+    if vector.is_empty() {
+        return Vec::new();
+    }
+    if vector_int8_enabled() {
+        return unpack_i8_vector(&pack_i8_vector(vector));
+    }
+    if vector_scaled_enabled() {
+        return unpack_scaled_vector(&pack_scaled_vector(vector));
+    }
+    vector.to_vec()
+}
+
+/// Whether a node record carries a copy of its L1 summary's vector.
+///
+/// Default ON, and only writes consult it: a node either carries a copy or it does not, and one
+/// that does not is looked up from the summary records exactly as before. So turning this off
+/// strands nothing already written, and turning it back on needs no backfill -- the copy reappears
+/// as each node's summary is next written.
+pub(crate) fn context_node_summary_vector_enabled() -> bool {
+    !matches!(
+        std::env::var("TS_NODE_SUMMARY_VECTOR")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// Symmetric per-vector int8, scale first: `scale = max|v| / 127`, then `round(v / scale)`.
+///
+/// Measured on real BGE-M3 vectors at 1024 dims: reconstruction cosine min 0.999868 and recall@1
+/// drop 0.0000 against the same f32 vectors, at 3.98x smaller.
+fn pack_i8_vector(vector: &[f32]) -> Vec<u8> {
+    let peak = vector.iter().fold(0.0_f32, |acc, value| acc.max(value.abs()));
+    let scale = if peak == 0.0 { 0.0 } else { peak / 127.0 };
+    let mut out = Vec::with_capacity(4 + vector.len());
+    out.extend_from_slice(&scale.to_le_bytes());
+    if scale == 0.0 {
+        out.extend(std::iter::repeat(0_u8).take(vector.len()));
+        return out;
+    }
+    for value in vector {
+        let q = (value / scale).round().clamp(-127.0, 127.0) as i8;
+        out.push(q as u8);
+    }
+    out
+}
+
+/// Dequantize and RENORMALIZE.
+///
+/// A dequantized unit vector is no longer unit, and the retrieve path compares raw cosines, so
+/// returning it unnormalized would bias every affected score downward.
+fn unpack_i8_vector(bytes: &[u8]) -> Vec<f32> {
+    if bytes.len() < 4 {
+        return Vec::new();
+    }
+    let scale = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let mut out: Vec<f32> = bytes[4..]
+        .iter()
+        .map(|byte| (*byte as i8) as f32 * scale)
+        .collect();
+    let norm = out.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in out.iter_mut() {
+            *value /= norm;
+        }
+    }
+    out
+}
+
+fn unpack_f32_vector(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+/// Whether new writes store the uniformly-scaled form. Default ON: it halves the bytes of a
+/// vector while leaving the ranking IDENTICAL, which the per-vector int8 form does not.
+///
+/// Measured over 713 chunks of real documentation, e5-large at 512 dims, 8 bilingual queries,
+/// scored through the normalized cosine and compared against the float ordering:
+///
+///   encoding              bytes   top-1   exact top-10 order
+///   float32               2048     8/8          8/8
+///   int8 (per-vector)      516     7/8          3/8
+///   scale=1e4 (uniform)   1024     8/8          8/8
+///
+/// Reading never consults this -- a vector is decoded by the field carrying it -- so turning it
+/// off again strands nothing. `TS_VECTOR_SCALED` opts OUT.
+fn vector_scaled_enabled() -> bool {
+    !matches!(
+        std::env::var("TS_VECTOR_SCALED")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// f32 vector -> zigzag varints of `round(v * VECTOR_SCALE)`.
+///
+/// A UNIFORM multiplier, unlike the int8 form's per-vector peak. That difference is the whole
+/// point: scaling every vector by the same constant cannot reorder two of them against a query,
+/// because cosine divides the scale back out. Dividing each vector by its own peak can, and
+/// measurably does.
+fn pack_scaled_vector(vector: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vector.len() * 2);
+    for value in vector {
+        let scaled = (value * VECTOR_SCALE).round() as i64;
+        // zigzag so small negatives stay one or two bytes
+        encode_varint(&mut out, ((scaled << 1) ^ (scaled >> 63)) as u64);
+    }
+    out
+}
+
+/// How many values the encoding holds, without decoding them.
+///
+/// The varints are variable-width, so the count cannot be had from `bytes.len()`. Walking them
+/// allocates nothing, and it is what lets the vector be sized exactly rather than grown.
+fn count_scaled_vector_values(bytes: &[u8]) -> usize {
+    let mut count = 0;
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if decode_varint(bytes, &mut cursor).is_none() {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+fn unpack_scaled_vector(bytes: &[u8]) -> Vec<f32> {
+    // Sized before filling. Growing from empty costs a reallocation every time the capacity
+    // doubles -- eight of them at 384 dimensions, each copying everything written so far, and this
+    // is the default storage form, so it is what a decode actually does. Counting first is a scan
+    // and no allocation.
+    //
+    // Exactly, not generously: these vectors live on records the store keeps resident, so slack
+    // capacity would be paid in memory for as long as the node is cached, not just during the
+    // decode.
+    let mut out = Vec::with_capacity(count_scaled_vector_values(bytes));
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let Some(raw) = decode_varint(bytes, &mut cursor) else {
+            break;
+        };
+        let value = ((raw >> 1) as i64) ^ -((raw & 1) as i64);
+        out.push(value as f32 / VECTOR_SCALE);
+    }
+    out
+}
+
+fn encode_vector_field_as(out: &mut Vec<u8>, fields: &VectorFieldSet, vector: &[f32]) {
+    if vector.is_empty() {
+        return;
+    }
+    if vector_int8_enabled() {
+        encode_bytes_field(out, fields.int8, &pack_i8_vector(vector));
+        return;
+    }
+    if vector_scaled_enabled() {
+        encode_bytes_field(out, fields.scaled, &pack_scaled_vector(vector));
+        return;
+    }
+    encode_bytes_field(out, fields.plain, &pack_f32_vector(vector));
+}
+
+fn encode_vector_field(out: &mut Vec<u8>, vector: &[f32]) {
+    encode_vector_field_as(out, &OWN_VECTOR_FIELDS, vector);
+}
+
+fn encode_varint_field(out: &mut Vec<u8>, field_number: u64, value: u64) {
+    encode_varint(out, field_number << 3);
+    encode_varint(out, value);
+}
+
+fn encode_fixed32_field(out: &mut Vec<u8>, field_number: u64, value: u32) {
+    encode_varint(out, (field_number << 3) | 5);
+    out.extend(value.to_le_bytes());
+}
+
+fn encode_bytes_field(out: &mut Vec<u8>, field_number: u64, value: &[u8]) {
+    if value.is_empty() {
+        return;
+    }
+    encode_varint(out, (field_number << 3) | 2);
+    encode_varint(out, value.len() as u64);
+    out.extend(value);
+}
+
+fn encode_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn decode_varint(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
+    let mut value = 0_u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes.get(*cursor)?;
+        *cursor += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn decode_fixed32(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+    let end = cursor.checked_add(4)?;
+    let slice = bytes.get(*cursor..end)?;
+    *cursor = end;
+    Some(u32::from_le_bytes(slice.try_into().ok()?))
+}
+
+/// The field's bytes, borrowed from the page rather than copied out of it.
+///
+/// A caller that reads the bytes and builds something else from them -- every `unpack_*` vector
+/// call -- has no use for an owned copy, and copying costs an allocation that is dropped at the end
+/// of the statement. Decoding is the larger half of a node fetch, and a fetch happens once per
+/// retrieval candidate, so a copy per vector field is a copy per candidate.
+fn decode_bytes_ref<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    let len = usize::try_from(decode_varint(bytes, cursor)?).ok()?;
+    let end = cursor.checked_add(len)?;
+    let slice = bytes.get(*cursor..end)?;
+    *cursor = end;
+    Some(slice)
+}
+
+/// The field's bytes, owned. For callers that keep them -- `decode_string` hands the Vec straight
+/// to `String::from_utf8`, which takes ownership, so that path is already a single allocation.
+fn decode_bytes(bytes: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
+    Some(decode_bytes_ref(bytes, cursor)?.to_vec())
+}
+
+fn decode_string(bytes: &[u8], cursor: &mut usize) -> Option<String> {
+    String::from_utf8(decode_bytes(bytes, cursor)?).ok()
+}
+
+fn skip_proto_field(bytes: &[u8], cursor: &mut usize, wire_type: u64) -> Option<()> {
+    match wire_type {
+        0 => {
+            let _ = decode_varint(bytes, cursor)?;
+        }
+        1 => *cursor = cursor.checked_add(8)?,
+        2 => {
+            let len = usize::try_from(decode_varint(bytes, cursor)?).ok()?;
+            *cursor = cursor.checked_add(len)?;
+        }
+        5 => *cursor = cursor.checked_add(4)?,
+        _ => return None,
+    }
+    (*cursor <= bytes.len()).then_some(())
+}
+
+/// Serialize an optional payload as a msgpack byte string, and read back either spelling.
+///
+/// WHY NOT `serde_bytes`: it is not in the lock, and this is a dozen lines that keeps both halves
+/// of the encode/decode pairing inside this repo -- `CachedBytes` in `command_validation` mirrors
+/// the same field and has to carry the same annotation, which is easier to keep true when the
+/// codec is visible here.
+///
+/// THE DESERIALIZER ACCEPTS THE OLD INTEGER ARRAY as well as a byte string. The entries this
+/// encodes live only in the cache's memory tier and do not survive a restart, so a mixed-encoding
+/// cache cannot actually arise -- but accepting both costs one visitor method and turns the
+/// compatibility direction into something a test can assert rather than something to reason about.
+pub(crate) mod cached_payload_bytes {
+    pub fn serialize<S>(value: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        struct AsBytes<'a>(&'a [u8]);
+        impl serde::Serialize for AsBytes<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+        match value {
+            Some(bytes) => serializer.serialize_some(&AsBytes(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Payload;
+        impl<'de> serde::de::Visitor<'de> for Payload {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a byte string, or a sequence of byte-valued integers")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<Vec<u8>, E> {
+                Ok(value.to_vec())
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, value: Vec<u8>) -> Result<Vec<u8>, E> {
+                Ok(value)
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Vec<u8>, E> {
+                Ok(value.as_bytes().to_vec())
+            }
+            // THE OLD SPELLING. An array of integers is what the derive wrote before this module,
+            // and what any other msgpack producer of this shape would write.
+            fn visit_seq<A>(self, mut seq: A) -> Result<Vec<u8>, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or_default());
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    out.push(byte);
+                }
+                Ok(out)
+            }
+        }
+
+        struct MaybePayload;
+        impl<'de> serde::de::Visitor<'de> for MaybePayload {
+            type Value = Option<Vec<u8>>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an optional payload")
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Option<Vec<u8>>, E> {
+                Ok(None)
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Option<Vec<u8>>, E> {
+                Ok(None)
+            }
+            fn visit_some<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Option<Vec<u8>>, D::Error> {
+                // `deserialize_any`, because msgpack is self-describing and the point is to accept
+                // whichever of the two spellings is present.
+                deserializer.deserialize_any(Payload).map(Some)
+            }
+        }
+        deserializer.deserialize_option(MaybePayload)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandResponse {
+    Empty,
+    Bytes {
+        /// Encoded as a msgpack BYTE STRING, not an array of integers.
+        ///
+        /// Left to the derive, `rmp_serde` writes a `Vec<u8>` element by element: a byte below
+        /// 0x80 is a positive fixint and costs one byte, a byte at or above it takes a uint8
+        /// marker and costs TWO. The inflation therefore depends on the payload's byte
+        /// distribution -- 1.0x for ASCII, ~1.5x for uniform random bytes, 2.0x worst case -- and
+        /// the cached response is what pays it. Measured at 2,000 keys x 1 KiB: 4,138,000 B for a
+        /// run of `b'v'` (0x76) against 5,161,820 B for incompressible noise.
+        ///
+        /// `b'v'` is below the line, where the toll is exactly zero, which is why every fixture in
+        /// this area had seen 1.0x and the toll went unpriced.
+        ///
+        /// SISTER VARIANTS STILL PAY IT. `Members` and `Values` carry bulk payloads through
+        /// `Vec<Vec<u8>>` and `Vec<Option<Vec<u8>>>`; a field-level annotation does not reach
+        /// inside a container, so they need their own wrapper and are deliberately unchanged.
+        #[serde(with = "cached_payload_bytes")]
+        value: Option<Vec<u8>>,
+    },
+    Integer {
+        value: i64,
+    },
+    Members {
+        members: Vec<Vec<u8>>,
+    },
+    Values {
+        values: Vec<Option<Vec<u8>>>,
+    },
+    HashEntries {
+        entries: Vec<(String, Vec<u8>)>,
+    },
+    FeaturePoints {
+        points: Vec<FeaturePoint>,
+    },
+    FeaturePointGroups {
+        groups: Vec<(String, Vec<FeaturePoint>)>,
+    },
+    Aggregate {
+        value: i64,
+    },
+    SequenceRows {
+        rows: Vec<SequenceFeatureRow>,
+    },
+    SequenceRowGroups {
+        groups: Vec<(String, Vec<SequenceFeatureRow>)>,
+    },
+    ContextNode {
+        object_key: String,
+        node: Option<ContextNode>,
+    },
+    ContextNodes {
+        nodes: Vec<ContextNode>,
+    },
+    ContextObjectKey {
+        object_key: String,
+    },
+    ContextExtractedEventWrite {
+        event_object_key: String,
+        index_object_keys: Vec<String>,
+        written_index_count: usize,
+    },
+    ContextEvents {
+        object_key: String,
+        events: Vec<ContextEvent>,
+    },
+    ContextIndexRefs {
+        object_key: String,
+        refs: Vec<ContextIndexRef>,
+    },
+    ContextIndexIntersection {
+        refs: Vec<ContextIndexRef>,
+        matched_index_count: usize,
+        scanned_ref_count: usize,
+        deduped_ref_count: usize,
+    },
+    ContextPackAudits {
+        object_key: String,
+        audits: Vec<ContextPackAudit>,
+    },
+    ContextSummaryDirtyNodes {
+        object_key: String,
+        nodes: Vec<ContextDirtyNode>,
+    },
+    // Response for ContextQueryEmbeddingDirty. Mirrors ContextSummaryDirtyNodes
+    // but adds a `tenant_hashes` vector parallel to `markers`: the all-pending scan
+    // (node_hash == 0) spans every tenant on the shard, so the drainer needs each
+    // marker's tenant to compute its embedding ref-hash and read its events. In the
+    // single-node per-node query `tenant_hashes` may be empty (the caller already
+    // knows the tenant it asked for).
+    ContextEmbeddingDirtyNodes {
+        object_key: String,
+        nodes: Vec<ContextDirtyNode>,
+        #[serde(default)]
+        tenant_hashes: Vec<u64>,
+    },
+    ContextEntity {
+        object_key: String,
+        entity: Option<ContextEntity>,
+    },
+    ContextEntities {
+        object_key: String,
+        entities: Vec<ContextEntity>,
+    },
+    ContextChildRefs {
+        object_key: String,
+        refs: Vec<ContextChildRef>,
+        #[serde(default)]
+        created: Option<bool>,
+    },
+    /// (node_hash, vector) pairs -- nodes with no vector of their own are omitted, so a caller
+    /// can tell "not embedded yet" from "embedded to the zero vector".
+    ContextNodeEmbeddings {
+        embeddings: Vec<(u64, Vec<f32>)>,
+    },
+    ContextTraversedNodes {
+        nodes: Vec<ContextTraversedNode>,
+        /// Children skipped by the per-parent cap before any scoring. Non-zero
+        /// means this result is bounded by the cap and not by relevance, which a
+        /// caller cannot otherwise tell from a genuinely thin tree.
+        #[serde(default)]
+        children_dropped_before_scoring: usize,
+    },
+    ContextSummaries {
+        object_key: String,
+        summaries: Vec<ContextSummary>,
+    },
+    ContextSummaryVectors {
+        vectors: Vec<ContextSummaryVector>,
+    },
+    ContextCompressionEvents {
+        object_key: String,
+        events: Vec<ContextCompressionEvent>,
+        #[serde(default)]
+        source_event_count: Option<u32>,
+        #[serde(default)]
+        truncated_source_events: Option<bool>,
+    },
+    ContextResourceBlobUpload {
+        upload_token: String,
+        bytes_total: u64,
+    },
+    ContextResourceBlobCommitted {
+        uri: String,
+        size_bytes: u64,
+        content_hash: u64,
+    },
+    ContextResourceBlobChunk {
+        payload_base64: String,
+        total_size: u64,
+        eof: bool,
+    },
+    ContextResourceBlobSwept {
+        scanned: u64,
+        deleted: u64,
+    },
+    ContextNodeContext {
+        node_exists: bool,
+        node: Option<ContextNode>,
+        overall_summary_exists: bool,
+        overall_summary: Option<ContextSummary>,
+        cold_window_summaries: Vec<ContextCompressionEvent>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecuteRequest {
+    pub shard_id: ShardId,
+    pub command: Command,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecuteResponse {
+    pub status: Status,
+    pub response: CommandResponse,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EventReplicationMode {
+    #[default]
+    Inherit,
+    AsyncStorage,
+    SyncStorage,
+    Raft,
+}
+
+impl EventReplicationMode {
+    pub fn requires_restart(self) -> bool {
+        false
+    }
+
+    pub fn is_explicit(self) -> bool {
+        self != Self::Inherit
+    }
+}
+
+impl ExecuteRequest {
+    pub fn with_replication_mode(
+        self,
+        replication_mode: EventReplicationMode,
+    ) -> ReplicatedExecuteRequest {
+        ReplicatedExecuteRequest {
+            shard_id: self.shard_id,
+            command: self.command,
+            replication_mode,
+        }
+    }
+
+    pub fn with_async_storage(self) -> ReplicatedExecuteRequest {
+        self.with_replication_mode(EventReplicationMode::AsyncStorage)
+    }
+
+    pub fn with_sync_storage(self) -> ReplicatedExecuteRequest {
+        self.with_replication_mode(EventReplicationMode::SyncStorage)
+    }
+
+    pub fn with_raft(self) -> ReplicatedExecuteRequest {
+        self.with_replication_mode(EventReplicationMode::Raft)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EventReplicationSelectionReport {
+    pub requested_mode: EventReplicationMode,
+    pub effective_mode: EventReplicationMode,
+    pub write_command: bool,
+    pub accepted: bool,
+    pub restart_required: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplicatedExecuteRequest {
+    pub shard_id: ShardId,
+    pub command: Command,
+    #[serde(default)]
+    pub replication_mode: EventReplicationMode,
+}
+
+impl ReplicatedExecuteRequest {
+    pub fn new(
+        shard_id: ShardId,
+        command: Command,
+        replication_mode: EventReplicationMode,
+    ) -> Self {
+        Self {
+            shard_id,
+            command,
+            replication_mode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplicatedCommand {
+    pub command: Command,
+    #[serde(default)]
+    pub replication_mode: EventReplicationMode,
+}
+
+impl ReplicatedCommand {
+    pub fn new(command: Command, replication_mode: EventReplicationMode) -> Self {
+        Self {
+            command,
+            replication_mode,
+        }
+    }
+
+    pub fn async_storage(command: Command) -> Self {
+        Self::new(command, EventReplicationMode::AsyncStorage)
+    }
+
+    pub fn sync_storage(command: Command) -> Self {
+        Self::new(command, EventReplicationMode::SyncStorage)
+    }
+
+    pub fn raft(command: Command) -> Self {
+        Self::new(command, EventReplicationMode::Raft)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplicatedBatchExecuteRequest {
+    pub shard_id: ShardId,
+    pub commands: Vec<ReplicatedCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplicatedBatchExecuteResponse {
+    pub status: Status,
+    pub responses: Vec<ExecuteResponse>,
+    pub replication: Vec<EventReplicationSelectionReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BatchExecuteRequest {
+    pub shard_id: ShardId,
+    pub commands: Vec<Command>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BatchExecuteResponse {
+    pub status: Status,
+    pub responses: Vec<ExecuteResponse>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+
+    /// Sets TS_VECTOR_INT8 and restores it ON DROP, so a failing assertion cannot leave it set for
+    /// every test that runs after it in the same process.
+    struct Int8Flag(Option<String>);
+
+    impl Int8Flag {
+        fn on() -> Self {
+            let previous = std::env::var("TS_VECTOR_INT8").ok();
+            std::env::set_var("TS_VECTOR_INT8", "1");
+            Int8Flag(previous)
+        }
+    }
+
+    impl Drop for Int8Flag {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("TS_VECTOR_INT8", value),
+                None => std::env::remove_var("TS_VECTOR_INT8"),
+            }
+        }
+    }
+
+    /// Reading only the vector must give what reading everything gives.
+    ///
+    /// Checked across the encodings a record can actually carry, because the partial decoder
+    /// skips fields by wire type and a mistake there returns a plausible-looking vector rather
+    /// than an error. Compared against the full decoder on the same bytes -- the thing it is
+    /// standing in for -- rather than against the input vector, which would not catch a decoder
+    /// that agreed with itself.
+    #[test]
+    fn vector_only_decode_agrees_with_the_full_decode() {
+        let vector: Vec<f32> = (0..48).map(|i| (i as f32 / 48.0) - 0.5).collect();
+
+        for (label, var, value) in [
+            ("f32", "TS_VECTOR_SCALED", "0"),
+            ("scaled", "TS_VECTOR_SCALED", "1"),
+            ("int8", "TS_VECTOR_INT8", "1"),
+        ] {
+            // SAFETY: single-threaded test process.
+            unsafe { std::env::set_var(var, value) };
+            let node = int8_node(7, vector.clone());
+            let bytes = node.encode_context_proto_value();
+            unsafe { std::env::remove_var(var) };
+
+            let full = ContextNode::decode_context_proto_value(&bytes)
+                .unwrap_or_else(|| panic!("{label}: the full decode must succeed"));
+            let partial = decode_context_node_vector(&bytes)
+                .unwrap_or_else(|| panic!("{label}: the vector-only decode must find a vector"));

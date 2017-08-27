@@ -85,3 +85,91 @@ impl MatrixObjectObjectStore {
             .map_err(map_matrixobject_error)?;
         Ok(Self {
             bucket,
+            content_type: "application/octet-stream".to_string(),
+            inner: Arc::new(Mutex::new(inner)),
+        })
+    }
+
+    pub fn snapshot_bytes(&self) -> Result<Vec<u8>, ObjectStoreError> {
+        let inner = self.inner.lock().expect("matrixobject lock poisoned");
+        // `export_snapshot` RETURNS A RESULT NOW, and this read as though it returned the
+        // snapshot itself -- so the crate's own error was never reachable here and the file did
+        // not compile against the published crate at all.
+        inner
+            .export_snapshot()
+            .map_err(map_matrixobject_error)?
+            .to_bytes()
+            .map_err(map_matrixobject_error)
+    }
+
+    pub fn inner(&self) -> Arc<Mutex<MatrixObjectStore>> {
+        Arc::clone(&self.inner)
+    }
+
+    /// Synchronous read of one object, for the lazy slab read-through: the store is a mutex
+    /// over in-process state, so nothing here would actually await.
+    pub fn get_blocking(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+        let inner = self.inner.lock().expect("matrixobject lock poisoned");
+        let object = inner
+            .get_object(&self.bucket, key)
+            .map_err(map_matrixobject_error)?;
+        Ok(Bytes::from(object.data))
+    }
+
+    /// Force the durable snapshot to disk after a mutation.
+    ///
+    /// This is a no-op when the store has no `persistent_snapshot_path` (the
+    /// in-memory default), so it is safe to call unconditionally. It exists
+    /// because matrixobjectstore-rs only auto-flushes `flush_on_commit` for
+    /// `append_object`/`create_bucket` — a plain `put_object` (which the
+    /// shared-store WAL, index and page-slab writes all use) mutates in memory
+    /// but never rewrites the snapshot. Without this explicit flush a datanode
+    /// would appear durable yet lose every put on restart.
+    fn flush_snapshot(inner: &MatrixObjectStore) -> Result<(), ObjectStoreError> {
+        inner
+            .flush_persistent_snapshot()
+            .map_err(map_matrixobject_error)
+    }
+}
+
+#[async_trait]
+impl ObjectStore for MatrixObjectObjectStore {
+    async fn put(&self, key: &str, bytes: Bytes) -> Result<(), ObjectStoreError> {
+        let mut inner = self.inner.lock().expect("matrixobject lock poisoned");
+        inner
+            .put_object(&self.bucket, key, bytes.to_vec(), self.content_type.clone())
+            .map_err(map_matrixobject_error)?;
+        Self::flush_snapshot(&inner)?;
+        Ok(())
+    }
+
+    async fn append_blob(
+        &self,
+        key: &str,
+        bytes: Bytes,
+    ) -> Result<AppendBlobReceipt, ObjectStoreError> {
+        let bytes_written = bytes.len() as u64;
+        let mut inner = self.inner.lock().expect("matrixobject lock poisoned");
+        let metadata = inner
+            .append_object(&self.bucket, key, bytes.to_vec(), self.content_type.clone())
+            .map_err(map_matrixobject_error)?;
+        let end_offset = metadata.length;
+        let start_offset = end_offset.saturating_sub(bytes_written);
+        // append_object already honors flush_on_commit, but flush again so
+        // durability does not depend on how the store was configured.
+        Self::flush_snapshot(&inner)?;
+        Ok(AppendBlobReceipt {
+            key: key.to_string(),
+            start_offset,
+            end_offset,
+            bytes_written,
+            object_length: metadata.length,
+            physical_slab_count: metadata.extents.len(),
+            first_physical_offset: metadata.extents.first().map(|extent| extent.offset()),
+        })
+    }
+
+    /// Durable compare-and-set, built on the store's own put preconditions.
+    ///
+    /// The trait's default refuses, so that a backend with no atomic conditional put cannot
+    /// silently degrade a single-writer fence into an unfenced read-modify-write. This overrides it

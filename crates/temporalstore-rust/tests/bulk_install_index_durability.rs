@@ -20,26 +20,3 @@ use std::path::PathBuf;
 
 use temporalstore_rust::{Command, ExecuteRequest, TemporalEngine};
 
-const SHARD_ID: u64 = 1;
-
-fn root() -> PathBuf {
-    let mut root = std::env::temp_dir();
-    root.push(format!("ts-bulk-install-durability-{}", std::process::id()));
-    root
-}
-
-#[test]
-fn manifest_install_materializes_index_under_bulk_mode() {
-    let root = root();
-    let _ = std::fs::remove_dir_all(&root);
-    let index_dir = root.join("indexes");
-    for sub in ["cache", "pages", "indexes"] {
-        std::fs::create_dir_all(root.join(sub)).expect("create engine dir");
-    }
-    let engine = TemporalEngine::with_local_dirs(
-        4096,
-        root.join("cache"),
-        root.join("blocks"),
-        &index_dir,
-    );
-    engine.load_shard(SHARD_ID);
