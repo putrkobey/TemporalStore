@@ -215,3 +215,112 @@ pub(crate) struct QuotaTable {
 impl QuotaTable {
     /// Replace a shard's limits. Rebuilding the bucket resets its credit, which is the honest
     /// behaviour for a new limit: credit accumulated under the old rate means nothing under the
+    /// new one.
+    pub(crate) fn set(&mut self, shard_id: ShardId, config: ShardQuotaConfig) {
+        self.configured.insert(shard_id, config);
+        // The bucket is rebuilt, but the counters are carried across: they record what this shard
+        // has done, not what this bucket has done, and resetting them on every reconfiguration
+        // would erase the history right when someone is watching it to decide the new number.
+        let carried = self
+            .by_shard
+            .get(&shard_id)
+            .map(|quota| quota.counters())
+            .unwrap_or_default();
+        let mut quota = ShardQuota::new(config);
+        quota.counters = carried;
+        self.by_shard.insert(shard_id, quota);
+    }
+
+    pub(crate) fn config_of(&self, shard_id: ShardId) -> Option<ShardQuotaConfig> {
+        self.configured.get(&shard_id).copied()
+    }
+
+    /// Take one token for `kind` on `shard_id`, falling back to the environment default the first
+    /// time a shard is seen.
+    pub(crate) fn try_consume(
+        &mut self,
+        shard_id: ShardId,
+        kind: QuotaKind,
+        default: ShardQuotaConfig,
+    ) -> bool {
+        if !self.by_shard.contains_key(&shard_id) {
+            if default.is_unlimited() {
+                return true;
+            }
+            self.by_shard.insert(shard_id, ShardQuota::new(default));
+            self.configured.entry(shard_id).or_insert(default);
+        }
+        self.by_shard
+            .get_mut(&shard_id)
+            .map(|quota| quota.try_consume(kind))
+            .unwrap_or(true)
+    }
+
+    /// Whether this shard has any limit at all. Answered under a read lock, so an unlimited
+    /// shard never blocks another thread.
+    pub(crate) fn limits(&self, shard_id: ShardId) -> bool {
+        self.by_shard.contains_key(&shard_id)
+    }
+
+    /// What this shard's limit has allowed and refused, if it has one.
+    pub(crate) fn counters_of(&self, shard_id: ShardId) -> Option<QuotaCounters> {
+        self.by_shard.get(&shard_id).map(|quota| quota.counters())
+    }
+
+    /// Every shard that carries a limit, for reporting.
+    pub(crate) fn limited_shards(&self) -> Vec<ShardId> {
+        let mut shards: Vec<ShardId> = self.by_shard.keys().copied().collect();
+        shards.sort_unstable();
+        shards
+    }
+
+    pub(crate) fn limit_of(&self, shard_id: ShardId, kind: QuotaKind) -> Option<(u64, u64)> {
+        self.by_shard
+            .get(&shard_id)
+            .and_then(|quota| quota.limit_of(kind))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn what_the_limit_allowed_and_refused_is_counted() {
+        let mut quota = ShardQuota::new(ShardQuotaConfig {
+            write_qps: 10,
+            write_burst: 3,
+            ..Default::default()
+        });
+        let mut allowed = 0;
+        for _ in 0..20 {
+            if quota.try_consume(QuotaKind::Write) {
+                allowed += 1;
+            }
+        }
+        let counters = quota.counters();
+        assert_eq!(counters.write_allowed, allowed);
+        assert_eq!(counters.write_refused, 20 - allowed);
+        assert!(counters.write_refused > 0, "the limit should have refused some");
+        assert_eq!(counters.read_allowed, 0, "reads were never asked for");
+    }
+
+    #[test]
+    fn an_unlimited_direction_still_counts_what_it_allowed() {
+        // The denominator matters: without it a refusal count says nothing about how close the
+        // limit is.
+        let mut quota = ShardQuota::new(ShardQuotaConfig {
+            write_qps: 1,
+            write_burst: 1,
+            ..Default::default()
+        });
+        for _ in 0..5 {
+            quota.try_consume(QuotaKind::Read);
+        }
+        assert_eq!(quota.counters().read_allowed, 5);
+        assert_eq!(quota.counters().read_refused, 0);
+    }
+
+    #[test]
+    fn changing_a_limit_keeps_what_the_shard_has_already_done() {
+        let mut table = QuotaTable::default();
