@@ -767,3 +767,387 @@ fn the_resident_map_readers_asked_in_the_over_complete_state() {
                 .count();
         println!(
             "  reader visit_model_live_blocks   emitted {emitted_set_entries} live set entr(ies) \
+             for `ghost`"
+        );
+
+        // -----------------------------------------------------------------------------------------
+        // READER 3: collect_live_block_slab_ids -- walks the model maps directly.
+        // -----------------------------------------------------------------------------------------
+        crate::snapshot_probe::reset();
+        let _ = crate::engine::collect_live_block_slab_ids(shard);
+        let map_walk_addresses = crate::snapshot_probe::counts().live_slab_scan_addresses;
+        println!(
+            "  reader collect_live_block_slab_ids visited {map_walk_addresses} model-map \
+             address(es) over {live_blocks} live page(s)"
+        );
+
+        // -----------------------------------------------------------------------------------------
+        // READER 4: compact_shard_blocks_relocating -- it relocates WHAT THE MODEL MAPS NAME.
+        //
+        // Its relocation loop is `for (key, members) in shard.sets.iter_mut()` (and one arm per
+        // other model), handing each address to `compact_block_addresses` to be read off the old
+        // slab, appended to the fresh one and rewritten IN PLACE. The preamble's
+        // `collect_live_block_entries` reports are a different walk and do not bound it. So the map
+        // IS compaction's work list, and a member whose page is gone is a page compaction reads,
+        // copies onto every new slab it rolls, and keeps alive for good.
+        //
+        // THE PROPERTY THAT MAKES THAT SAFE IS THE ONE ASSERTED BELOW: every address the resident
+        // maps name is a live page in the index. It holds even though the merge resurrects, because
+        // what the merge keeps is precisely the elements whose PAGES are still live -- so the
+        // resurrection costs a wrong answer only to a reader that trusts the map for MEMBERSHIP,
+        // never a relocation of a page that is not there. Checked over all five element-bearing
+        // models, not just the set arm, because the relocation loop has an arm for each.
+        // -----------------------------------------------------------------------------------------
+        let live_addresses: BTreeSet<(u64, u64, u64)> = shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .flat_map(|bucket| bucket.block_index.values())
+            .filter(|block| !block.deleted)
+            .map(|block| {
+                (
+                    block.address.block_slab_id(),
+                    block.address.offset(),
+                    block.address.length(),
+                )
+            })
+            .collect();
+        let mut named_by_map = 0usize;
+        let mut named_but_not_live: Vec<String> = Vec::new();
+        {
+            let mut check = |model: &str, key: &str, address: &ElementEntry| {
+                named_by_map += 1;
+                let identity = (
+                    address.block_slab_id(),
+                    address.offset(),
+                    address.length(),
+                );
+                if !live_addresses.contains(&identity) {
+                    named_but_not_live.push(format!("{model}/{key}"));
+                }
+            };
+            for (key, slot) in shard.strings() {
+                check("string", key, &slot.address());
+            }
+            for (key, fields) in &shard.hashes {
+                for address in fields.values() {
+                    check("hash", key, address);
+                }
+            }
+            for (key, members) in &shard.sets {
+                for address in members.values() {
+                    check("set", key, address);
+                }
+            }
+            for (key, elements) in &shard.lists {
+                for address in elements.values() {
+                    check("list", key, address);
+                }
+            }
+            for (key, members) in &shard.zsets {
+                for (_, address) in members.values() {
+                    check("zset", key, address);
+                }
+            }
+        }
+        println!(
+            "  reader compact_shard_blocks_relocating relocates from the model maps: \
+             {named_by_map} address(es) named, {} naming no live page",
+            named_but_not_live.len()
+        );
+        // DENOMINATOR, RE-ATTRIBUTED TO THE FIXTURE THAT OWNS IT. This read 6 on the arithmetic "8
+        // written, 2 removed"; the merge restores the 2 now, so the maps name all 8. It is written
+        // as the two populations the fixture built rather than as a literal, because a floor below
+        // it would let a fixture that wrote nothing pass and a literal goes stale with the fixture.
+        let written_population = ghost.members.len() + control.members.len();
+        assert_eq!(
+            written_population, named_by_map,
+            "DENOMINATOR: the resident maps name {named_by_map} address(es), not the \
+             {written_population} this fixture wrote. The merge keeps every persisted element whose \
+             page is still live, and one entry a page keeps all of them live, so nothing is dropped"
+        );
+        assert!(
+            named_but_not_live.is_empty(),
+            "the resident maps name {} address(es) that are not live pages in the index ({:?}). \
+             `compact_shard_blocks_relocating` iterates those maps to build its relocation work \
+             list, so each of these is a page compaction reads off the old slab, copies onto the \
+             fresh one and keeps alive for good",
+            named_but_not_live.len(),
+            named_but_not_live
+        );
+
+        // -----------------------------------------------------------------------------------------
+        // READER 5: collect_upsert_index_items -- would resolve a ghost, and nothing asks it to.
+        // -----------------------------------------------------------------------------------------
+        // Nothing asks: every arm of `command_upsert_components` is an ADD/SET. A removal's
+        // component goes down `collect_command_index_items_for` instead.
+        for removal in [
+            Command::SetRemove {
+                key: "ghost".to_string(),
+                member: ghost.removed[0].clone(),
+            },
+            Command::ZSetRemove {
+                key: "ghost-z".to_string(),
+                member: b"m".to_vec(),
+            },
+            Command::ListPop {
+                key: "ghost-l".to_string(),
+                left: true,
+            },
+            Command::HashDelete {
+                key: "ghost-h".to_string(),
+                field: "f".to_string(),
+            },
+        ] {
+            assert!(
+                crate::engine::command_upsert_components(&removal, shard).is_none(),
+                "`command_upsert_components` now names a component for a REMOVAL. \
+                 `collect_upsert_index_items` resolves that component's address out of the resident \
+                 map, so a removal reaching it would build a WAL index item pinning a page the \
+                 removal dropped -- and a replay would re-install it"
+            );
+        }
+        // Asked outright, it does resolve one: the mechanism is live, only unreached. Driven with
+        // the ADD command's own component spelling, so this is the item a reachable caller would get.
+        let ghost_component = hex::encode(&ghost.removed[0]);
+        let items_for_a_ghost = crate::engine::collect_upsert_index_items(
+            shard,
+            1,
+            &[("set", "ghost".to_string(), Some(ghost_component.clone()))],
+            0,
+            1023,
+        );
+        println!(
+            "  reader collect_upsert_index_items LATENT: no removal reaches it (4 removal commands \
+             answer None from `command_upsert_components`); asked outright with the ghost's \
+             component it builds {} item(s)",
+            items_for_a_ghost.len()
+        );
+
+        (rows, emitted_set_entries)
+    };
+
+    // ---------------------------------------------------------------------------------------------
+    // THE TWO POPULATIONS, PER KEY, with the lock released so the serving path can answer.
+    // ---------------------------------------------------------------------------------------------
+    println!("\n=== resident map vs what the store serves, after a reconcile against a stale snapshot ===");
+    println!("  key      map members  served  over-reported by");
+    let mut served_by_label: Vec<(&str, usize, usize)> = Vec::new();
+    for (label, in_map) in &rows {
+        let served = served_members(&engine, label);
+        println!(
+            "  {label:<8} {:>12} {:>7} {:>17}",
+            in_map.len(),
+            served.len(),
+            in_map.len().saturating_sub(served.len())
+        );
+        let divergence = if *label == "ghost" { &ghost } else { &control };
+        // EVERY ROW'S CONTROL: the members that were never removed are on BOTH sides, or the merge
+        // dropped everything and nothing here measures what it claims.
+        for member in divergence
+            .members
+            .iter()
+            .filter(|member| !divergence.removed.iter().any(|removed| removed == *member))
+        {
+            assert!(
+                in_map.contains(member),
+                "{label}: a member that was never removed is absent from the resident map"
+            );
+            assert!(
+                served.contains(member),
+                "{label}: a member that was never removed is not served, so this row's served \
+                 population says nothing"
+            );
+        }
+        // THE REMOVALS LANDED where the store answers from -- otherwise there is no divergence.
+        for member in &divergence.removed {
+            assert!(
+                !served.contains(member),
+                "{label}: the store SERVES a member it was told to forget, so the removal did not \
+                 reach the serving path and the divergence below is not the one this arm is about"
+            );
+        }
+        served_by_label.push((label, in_map.len(), served.len()));
+    }
+
+    // THE CONTROL KEY: its snapshot is exact, so the merge has nothing to resurrect and the two
+    // populations must agree. If this diverges, nothing below is about the STALE snapshot.
+    let control_row = served_by_label
+        .iter()
+        .find(|(label, _, _)| *label == "control")
+        .expect("the control row is in the table");
+    assert_eq!(
+        control_row.1, control_row.2,
+        "THE CONTROL DIVERGED: the control key, whose snapshot is exact, holds {} member(s) in the \
+         map against {} served. Nothing below is about the stale snapshot then",
+        control_row.1, control_row.2
+    );
+    assert!(
+        control_row.2 >= 4,
+        "CONTROL FLOOR: the control key serves {} member(s), so a control at 0 over-reported \
+         members means nothing was exercised",
+        control_row.2
+    );
+
+    // THE FINDING. The ghost key's map over-reports, and the mechanism is named so that a fix goes
+    // red here rather than quietly making this arm vacuous.
+    let ghost_row = served_by_label
+        .iter()
+        .find(|(label, _, _)| *label == "ghost")
+        .expect("the ghost row is in the table");
+    assert!(
+        ghost_row.1 > ghost_row.2,
+        "the resident map holds {} member(s) for `ghost` against {} served, so \
+         `fill_absent_elements` is no longer keeping elements whose page is live but whose element \
+         is dead. That was #2017's state, re-reached because the fix tests the ADDRESS and one \
+         index entry a page keeps a page alive through the removal of one of its elements. If this \
+         has been fixed at the ELEMENT, turn the assertion over and name the mechanism",
+        ghost_row.1,
+        ghost_row.2
+    );
+    assert_eq!(
+        ghost.removed.len(),
+        ghost_row.1 - ghost_row.2,
+        "the ghost key over-reports by {} member(s), not the {} the fixture removed -- the merge is \
+         keeping or dropping elements this fixture did not ask it to",
+        ghost_row.1 - ghost_row.2,
+        ghost.removed.len()
+    );
+    // AND THE READER THAT WALKS THE MAP IS BOUNDED BY THE MAP, which is what makes the
+    // over-reporting a membership error and not a relocation one. Reader 4 already asserted that
+    // every address the maps name is live; this says reader 2 emits no more than the map holds.
+    //
+    // THE ASSERTION THIS REPLACES IS DELETED WITH ITS REASON. It read `ghost_index_members ==
+    // emitted_set_entries` and said a mismatch meant the reader was "re-rendering a component for a
+    // member whose page was removed". Both sides of it are gone: the left was the component-decoded
+    // population, which is now always 0, and the hazard is unreachable rather than absent, because
+    // the pages the resurrected members name are live. Reader 4's `named_but_not_live.is_empty()`
+    // asserts that property directly, over all five models instead of one.
+    assert!(
+        emitted_set_entries >= 1 && emitted_set_entries <= ghost_row.1,
+        "`visit_model_live_blocks` emitted {emitted_set_entries} live set entr(ies) for `ghost` \
+         against {} in the resident map it walks. It re-renders out of that map, so it can emit \
+         neither more than the map holds nor nothing at all",
+        ghost_row.1
+    );
+    println!(
+        "  => the merge resurrects {} ghost member(s): the map over-reports and the store does \
+         not, because the listing is not served from the map",
+        ghost_row.1 - ghost_row.2
+    );
+}
+
+// =================================================================================================
+// 3. THE TWO INPUTS TO ONE MERGE, AND WHY #2005's FIX DID NOT COVER BOTH
+// =================================================================================================
+
+/// BOTH INPUTS TO THE MERGE NOW ANSWER THE SAME LIVE-PAGE QUESTION.
+///
+/// #2005 fixed a resurrection on `fill_absent_elements` from the CARRY side: the delta fold's
+/// carried elements are applied once, after the page index settles, and only where a page is still
+/// at the carried address. #2017 reached the same over-complete state through the other input --
+/// the PERSISTED map read off disk, older than the page index it merges with -- which that fix
+/// never looked at. Different mechanism, and the reason the second one survived the first fix.
+///
+/// THE TWO SIDE BY SIDE, one key each, all three merged kinds. Each subject's element has a
+/// FABRICATED address that names no page -- which is what a stale snapshot's entry is, once its page
+/// is gone -- and each control's element has its real live address. A subject dropped and a control
+/// kept is the only outcome that distinguishes the filter from either "keep everything" or "keep
+/// nothing".
+///
+/// rust-internal: calls the engine's own reconcile directly
+#[test]
+fn both_inputs_to_the_merge_now_answer_the_same_live_block_question() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    run(
+        &engine,
+        Command::SetAdd {
+            key: "s".to_string(),
+            member: b"set-control".to_vec(),
+        },
+    );
+    run(
+        &engine,
+        Command::ZSetAdd {
+            key: "z".to_string(),
+            member: b"zset-control".to_vec(),
+            score: 2.5,
+        },
+    );
+    run(
+        &engine,
+        Command::ListPush {
+            key: "l".to_string(),
+            member: b"list-control".to_vec(),
+            left: false,
+        },
+    );
+
+    let mut shards = engine.shards.write().expect("engine lock poisoned");
+    let shard = shards.get_mut(&1).expect("shard 1 is loaded");
+
+    // A page address that is in NO bucket: an offset far past anything this fixture wrote, on a
+    // slab id nothing uses. This is the shape of a persisted entry whose page has been removed.
+    let live_control_address = shard
+        .sets
+        .get("s")
+        .and_then(|members| members.values().next())
+        .cloned()
+        .expect("the control set member is in the resident map");
+    // A page address in NO bucket, built off a real one so every field is in range by construction
+    // (`try_from_parts` refuses an out-of-range slab or offset, and a refusal here would read as a
+    // test bug rather than as the state being modelled). Only the slab id moves, far past anything
+    // this fixture rolled: this is the shape of a persisted entry whose page has been removed.
+    let dead_address = ElementEntry::try_from_parts(
+        live_control_address.block_slab_id().saturating_add(4_096),
+        live_control_address.offset(),
+        live_control_address.length(),
+        None,
+        None,
+    )
+    .expect("the fabricated address is in range");
+    assert!(
+        !shard.bucket_index.bucket_map.values().any(|bucket| bucket
+            .block_index
+            .values()
+            .any(|block| !block.deleted
+                && block.address.block_slab_id() == dead_address.block_slab_id()
+                && block.address.offset() == dead_address.offset())),
+        "the fabricated address matches a live page, so the subjects below would be kept for the \
+         honest reason"
+    );
+
+    // The stale-snapshot entries: one subject per merged kind, beside each kind's real element.
+    shard
+        .sets
+        .elements_mut_for_test("s")
+        .expect("set key")
+        .insert(b"set-subject".to_vec(), dead_address.clone());
+    shard
+        .zsets
+        .elements_mut_for_test("z")
+        .expect("zset key")
+        .insert(b"zset-subject".to_vec(), (9, dead_address.clone()));
+    shard
+        .lists
+        .elements_mut_for_test("l")
+        .expect("list key")
+        .insert(i64::MAX - 3, dead_address.clone());
+
+    crate::engine::storage_bucket_internals::reconcile_secondary_views_from_bucket_index(
+        &engine.block_store,
+        shard,
+        None,
+    );
+
+    let set_members: BTreeSet<Vec<u8>> = shard
+        .sets
+        .get("s")
+        .map(|members| members.keys().cloned().collect())
+        .unwrap_or_default();
+    let zset_members: BTreeSet<Vec<u8>> = shard
+        .zsets
+        .get("z")
