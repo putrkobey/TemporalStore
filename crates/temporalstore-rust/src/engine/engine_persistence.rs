@@ -538,3 +538,544 @@ impl TemporalEngine {
             let index = &mut shard.bucket_index;
             let keys =
                 crate::engine::state::BlockKeysByPosition::from_lookup(&index.object_block_lookup);
+            for bucket in index.bucket_map.values_mut() {
+                update_bucket_layout(shard_id, bucket, &keys);
+            }
+            // AFTER the page index has settled, because this asks of every carried element whether
+            // the fold left a page at its address -- a question only the finished index can answer.
+            fold_carried_container_elements(shard, &carried_container_elements);
+            shard.applied_wal_sequence = Some(max_anchor);
+        }
+        Ok(())
+    }
+
+    /// Persist the in-memory shard index to disk once (used by bulk backfill
+    /// after driving many extract_context calls under MATRIXARK_BULK_INGEST=1,
+    /// which skips per-record persistence). Also refreshes the index-log tail.
+    pub fn flush_shard_index(&self, shard_id: ShardId) {
+        // Make the chunk's deferred bulk writes durable before publishing the
+        // served index: fsync page slabs + slab manifest, then the WAL. If the
+        // barrier FAILS, bail without pinning applied_wal_sequence or writing the index:
+        // advancing the durable anchor past pages that never reached disk would suppress
+        // their replay on reload -> silent data loss. advances the watermark only after
+        // the commit succeeds; the next flush retries.
+        if self.block_store.sync_durable().is_err() || self.wal_store.flush(shard_id).is_err() {
+            return;
+        }
+        // Read OUTSIDE the shards write lock. `shard_routing_range` takes `infos.read()`, copies
+        // the two numbers out and drops the guard before it returns, so no path ever HOLDS one of
+        // these locks while acquiring the other.
+        let (start_routing_bucket, end_routing_bucket) = self.shard_routing_range(shard_id);
+        let index_bytes = {
+            // Reconstruct everything the per-command bulk path deferred: promote
+            // model-map pages into bucket_index, rebuild the secondary views, refresh
+            // runtime flags, then serialize once. Needs a write lock.
+            let mut shards = self.shards.write().expect("engine lock poisoned");
+            match shards.get_mut(&shard_id) {
+                Some(shard) => {
+                    if promote_model_maps_to_bucket_index_authority(
+                        shard_id,
+                        shard,
+                        start_routing_bucket,
+                        end_routing_bucket,
+                    ) {
+                        reconcile_secondary_views_from_bucket_index(&self.block_store, shard, None);
+                    }
+                    rebuild_bucket_first_index(
+                        shard_id,
+                        shard,
+                        start_routing_bucket,
+                        end_routing_bucket,
+                    );
+                    refresh_bucket_runtime_flags(shard);
+                    // Anchor the flushed index to the WAL sequence it reflects so a
+                    // later load replays only records written after this flush. A
+                    // local-context backfill can run beside live hook/proxy writers;
+                    // in that mode the batch process may not have applied records
+                    // written by the live process, so it pins the anchor to the WAL
+                    // sequence observed before the batch began and lets restart
+                    // replay the interleaved tail.
+                    let default_anchor = self.wal_store.stats(shard_id).last_sequence;
+                    let anchor = std::env::var("MATRIXARK_BULK_INGEST_REPLAY_FROM_SEQUENCE")
+                        .ok()
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                        .map(|start_sequence| {
+                            let expected_tail =
+                                std::env::var("MATRIXARK_BULK_INGEST_EXPECTED_WAL_COMMANDS")
+                                    .ok()
+                                    .and_then(|value| value.trim().parse::<u64>().ok())
+                                    .and_then(|written| start_sequence.checked_add(written));
+                            if expected_tail == Some(default_anchor) {
+                                default_anchor
+                            } else {
+                                start_sequence.min(default_anchor)
+                            }
+                        })
+                        .unwrap_or(default_anchor);
+                    shard.applied_wal_sequence = Some(anchor);
+                    serialize_index(shard)
+                }
+                None => return,
+            }
+        };
+        // Write the served shard index directly, bypassing the bulk-mode gate.
+        let _ = fs::create_dir_all(&self.index_dir);
+        let _ = atomic_write_bytes(&self.index_path(shard_id), &index_bytes);
+    }
+
+    /// MANIFEST-CONFORMANCE FOLD threshold check: dump the index catalog when the undumped index-log
+    /// gap has crossed `index_dump_wal_gap_bytes` (the index-meta dump gap
+    /// cadence) AND `index_dump_min_interval_ms` has passed since this shard last dumped.
+    /// Returns whether a dump fired.
+    ///
+    /// This caller has no cadence of its own -- it checks on every background round it runs --
+    /// so without the interval, a burst that keeps crossing the gap gets a whole-index
+    /// serialize every time it does.
+    pub fn maybe_dump_index_catalog(&self, shard_id: ShardId) -> bool {
+        let gap = self.index_dump_threshold_bytes(shard_id);
+        let undumped = self.index_log_store.undumped_len_since_dump(shard_id);
+        if !crate::index_log::should_dump_index_catalog_now(
+            undumped,
+            gap,
+            self.index_log_store.ms_since_catalog_dump(shard_id),
+            crate::storage_config::index_dump_min_interval_ms(),
+        ) {
+            return false;
+        }
+        self.dump_index_catalog(shard_id)
+    }
+
+    /// Test-only variant of `maybe_dump_index_catalog` taking an explicit gap, so a test can drive
+    /// both the below-threshold (no dump) and above-threshold (dump) branches deterministically
+    /// without mutating the process-wide gap env mid-test.
+    #[cfg(test)]
+    pub fn maybe_dump_index_catalog_with_gap_for_test(
+        &self,
+        shard_id: ShardId,
+        gap_bytes: u64,
+        min_interval_ms: u64,
+    ) -> bool {
+        let undumped = self.index_log_store.undumped_len_since_dump(shard_id);
+        if !crate::index_log::should_dump_index_catalog_now(
+            undumped,
+            gap_bytes,
+            self.index_log_store.ms_since_catalog_dump(shard_id),
+            min_interval_ms,
+        ) {
+            return false;
+        }
+        self.dump_index_catalog(shard_id)
+    }
+
+    /// MANIFEST-CONFORMANCE FOLD dump: materialize the durable base index, fold the slab catalog
+    /// into an index-log anchor (the durable slab catalog, conformance), and
+    /// advance the dumped watermark -- the batched, threshold-driven replacement for the per-write
+    /// slab-manifest persist. No-op with the gate off. Ordering is single-barrier safe: pages +
+    /// WAL are fsynced, then the base index is written durably, then the folded anchor is fsync'd,
+    /// and only THEN is the dumped watermark advanced. A crash at any earlier point leaves the
+    /// watermark unadvanced, so the next cycle re-dumps rather than trusting a partial dump -- the
+    /// catalog is never lost, only (harmlessly) re-materialized. Returns whether a dump completed.
+    pub fn dump_index_catalog(&self, shard_id: ShardId) -> bool {
+        self.dump_index_catalog_anchored(shard_id).is_some()
+    }
+
+    /// [`dump_index_catalog`] returning the dump's coordinates on success: the WAL anchor the
+    /// durable base index reflects, and the index-log sequence its folded catalog anchor landed
+    /// at. Post-dump log reclaim needs both: everything the base reflects (WAL records at or
+    /// below the anchor, index-log records whose own anchor is at or below it) is redundant,
+    /// while the folded anchor record itself must survive.
+    pub(super) fn dump_index_catalog_anchored(&self, shard_id: ShardId) -> Option<(u64, u64)> {
+        // A dump for a shard this engine does not serve is a no-op; check BEFORE the durability
+        // barrier so a background caller polling an unloaded shard does not pay (or issue) an
+        // fsync for nothing.
+        if !self
+            .shards
+            .read()
+            .expect("engine lock poisoned")
+            .contains_key(&shard_id)
+        {
+            return None;
+        }
+        // 1. Make deferred data pages + the slab manifest + the WAL durable BEFORE materializing
+        //    the dump, so nothing the anchor references is un-fsynced. Bail (without advancing the
+        //    watermark) if the barrier fails; the next cycle retries.
+        if self.block_store.sync_durable().is_err() || self.wal_store.flush(shard_id).is_err() {
+            return None;
+        }
+        // 2. Serialize + durably write the base served index (collapses the legacy per-write
+        //    whole-index rewrite into this threshold dump). Also read the WAL anchor the index
+        //    reflects for the folded MetaItem.
+        let (index_bytes, anchor) = {
+            let shards = self.shards.read().expect("engine lock poisoned");
+            match shards.get(&shard_id) {
+                Some(shard) => (
+                    serialize_index(shard),
+                    shard.applied_wal_sequence.unwrap_or(0),
+                ),
+                None => return None,
+            }
+        };
+        if self
+            .persist_index_bytes_durable(shard_id, &index_bytes)
+            .is_err()
+        {
+            return None;
+        }
+        // 3. Fold the slab catalog into a MetaItem anchor and append it durably to the
+        //    index-log. This is this design's "dump the slab catalog into the index log" step:
+        //    after it, the slab catalog is recoverable from the durable log, so the per-write
+        //    slab-manifest file stops being the source of truth.
+        let slab_version = anchor;
+        let slabs = self.block_store.slab_catalog(slab_version);
+        let meta = crate::index_log::MetaItem {
+            version: 1,
+            start_wal_sequence: anchor,
+            timestamp_ms: now_ms(),
+            slab_version,
+            slabs,
+        };
+        let meta_sequence = match self.index_log_store.append_delta(
+            shard_id,
+            Vec::new(),
+            Vec::new(),
+            Some(anchor),
+            Some(meta),
+            false,
+            true,
+        ) {
+            Ok(sequence) => sequence,
+            Err(_) => return None,
+        };
+        // 4. The base + folded anchor are durable; advance the dumped watermark so the undumped
+        //    gap resets and the next threshold is measured from here.
+        self.index_log_store.mark_catalog_dumped(shard_id);
+        Some((anchor, meta_sequence))
+    }
+
+    /// Embedded-path log maintenance: when the undumped index-log gap has crossed
+    /// `index_dump_wal_gap_bytes`, dump the catalog and then RECLAIM what the dump made
+    /// redundant. This is what keeps an engine with no background storage-manager cycle (the
+    /// gateway proxy embeds the engine directly; only the server/data-node run cycles) from
+    /// growing its WAL and index-log without bound: the dump durably captures everything at or
+    /// below its anchor, so the logs below it can go. No-op (returning `None`) with the fold
+    /// gate off, below the threshold, or when the dump could not complete.
+    pub fn maybe_dump_and_reclaim_index_logs(
+        &self,
+        shard_id: ShardId,
+    ) -> Option<super::reports::CatalogDumpReclaimReport> {
+        let gap = self.index_dump_threshold_bytes(shard_id);
+        let undumped = self.index_log_store.undumped_len_since_dump(shard_id);
+        if !crate::index_log::should_dump_index_catalog_now(
+            undumped,
+            gap,
+            self.index_log_store.ms_since_catalog_dump(shard_id),
+            crate::storage_config::index_dump_min_interval_ms(),
+        ) {
+            return None;
+        }
+        self.dump_and_reclaim_index_logs(shard_id)
+    }
+
+    /// Unconditional (past the threshold check) dump + reclaim. See
+    /// [`maybe_dump_and_reclaim_index_logs`](Self::maybe_dump_and_reclaim_index_logs).
+    pub fn dump_and_reclaim_index_logs(
+        &self,
+        shard_id: ShardId,
+    ) -> Option<super::reports::CatalogDumpReclaimReport> {
+        self.dump_and_reclaim_index_logs_with_min_reclaimable(
+            shard_id,
+            crate::storage_config::index_gc_min_reclaimable_bytes(),
+        )
+    }
+
+    /// [`dump_and_reclaim_index_logs`](Self::dump_and_reclaim_index_logs) with the index-log
+    /// sweep's threshold given rather than read from configuration.
+    ///
+    /// A threshold that only ever comes from the environment cannot be varied by a test without
+    /// writing to the environment of the whole process, which is shared with every other test in
+    /// the binary. Passing it makes "this test is not exercising the threshold" something the
+    /// test says rather than something it assumes.
+    pub(crate) fn dump_and_reclaim_index_logs_with_min_reclaimable(
+        &self,
+        shard_id: ShardId,
+        min_reclaimable_bytes: u64,
+    ) -> Option<super::reports::CatalogDumpReclaimReport> {
+        let (wal_anchor, meta_sequence) = self.dump_index_catalog_anchored(shard_id)?;
+        // Index-log first: drop every record the durable base already reflects (per-record WAL
+        // anchor at or below the dump's), keeping the folded catalog anchor and any delta a
+        // concurrent writer landed after the dump serialized.
+        let index_gc = self
+            .index_log_store
+            .gc_reflected_before_anchor(shard_id, wal_anchor, meta_sequence, min_reclaimable_bytes)
+            .ok();
+        // The sweep rewrote (shrank) the log file; re-mark the dumped watermark so the next
+        // threshold measures growth from the POST-reclaim length. Without this the gap signal
+        // would read `current - pre_reclaim_length`, saturating to zero until the file regrew
+        // past its old size -- silently suspending the cadence right after its first success.
+        self.index_log_store.mark_catalog_dumped(shard_id);
+        // Pages at or below the anchor are in the durable base now, so a log id is no longer
+        // the only way to find their bytes. Dropping those entries is what keeps this from
+        // growing with the log -- they cost index bytes, and a dumped page will never need one.
+        if let Ok(mut shards) = self.shards.write() {
+            if let Some(shard) = shards.get_mut(&shard_id) {
+                shard
+                    .wal_resident_blocks
+                    .retain(|_, placement| placement.sequence > wal_anchor);
+            }
+        }
+        // Pin the WAL floor to the lowest sequence a live block-in-WAL registration still
+        // depends on: such a record holds the ONLY copy of a page the served index points at
+        // (the write was acked off a synthetic address), so truncating it turns an acked write
+        // into a MISSING read while the process is still serving.
+        let wal_retention_floor =
+            super::block_in_wal::min_registered_sequence(&self.block_store, shard_id, &self.wal_store);
+        match wal_retention_floor {
+            Some(sequence) => self.wal_store.set_block_retention_floor(shard_id, sequence),
+            None => self.wal_store.clear_block_retention_floor(shard_id),
+        }
+        // WAL prefix below the anchor: the durable base reflects those records, replay-on-load
+        // starts above the anchor, and gc itself additionally retains the highest-sequence
+        // record (sequence continuity) and everything at or above the floor just set.
+        // The dump above wrote the base served index durably and fsynced the folded catalog
+        // anchor on top of it, so the durable index reflects everything at or below
+        // `wal_anchor`. That completed work IS the proof this reclaim needs.
+        let durable_index =
+            crate::wal::DurableIndexAnchor::proven_durable_through(shard_id, wal_anchor);
+        let wal_gc = self
+            .wal_store
+            .gc_before_sequence(shard_id, wal_anchor.saturating_add(1), &durable_index)
+            .ok();
+        Some(super::reports::CatalogDumpReclaimReport {
+            shard_id,
+            wal_anchor,
+            index_log_records_removed: index_gc
+                .as_ref()
+                .map(|report| report.records_removed)
+                .unwrap_or_default(),
+            index_log_bytes_before: index_gc
+                .as_ref()
+                .map(|report| report.bytes_before)
+                .unwrap_or_default(),
+            index_log_bytes_after: index_gc
+                .as_ref()
+                .map(|report| report.bytes_after)
+                .unwrap_or_default(),
+            index_log_rewrite_skipped: index_gc
+                .as_ref()
+                .map(|report| report.rewrite_skipped)
+                .unwrap_or_default(),
+            index_log_sweep_failed: index_gc.is_none(),
+            wal_records_removed: wal_gc
+                .as_ref()
+                .map(|report| report.records_removed)
+                .unwrap_or_default(),
+            wal_bytes_before: wal_gc
+                .as_ref()
+                .map(|report| report.bytes_before)
+                .unwrap_or_default(),
+            wal_bytes_after: wal_gc
+                .as_ref()
+                .map(|report| report.bytes_after)
+                .unwrap_or_default(),
+            // The `.ok()` above is kept -- a failed sweep must not fail the dump, which has
+            // already completed and is what bounds the index log. What changes is that the
+            // failure is now SAID rather than rendered as three zeros indistinguishable from an
+            // empty log.
+            wal_sweep_failed: wal_gc.is_none(),
+            wal_retention_floor,
+        })
+    }
+
+    /// Test-only variant of `maybe_dump_and_reclaim_index_logs` taking an explicit gap, so a
+    /// test can drive the below-threshold (no-op) and above-threshold (dump + reclaim) branches
+    /// deterministically without mutating the process-wide gap env mid-test.
+    ///
+    /// The value it takes is used as given, with the relative term disabled -- which is what
+    /// "an explicit threshold" has always meant here and what every existing caller relies on. A
+    /// test that wants the shipped cadence, floor and relative term together, says so by calling
+    /// [`maybe_dump_and_reclaim_with_threshold_and_divisor_for_test`] with a divisor.
+    #[cfg(test)]
+    pub fn maybe_dump_and_reclaim_with_gap_for_test(
+        &self,
+        shard_id: ShardId,
+        gap_bytes: u64,
+        min_interval_ms: u64,
+        min_reclaimable_bytes: u64,
+    ) -> Option<super::reports::CatalogDumpReclaimReport> {
+        self.maybe_dump_and_reclaim_with_threshold_and_divisor_for_test(
+            shard_id,
+            gap_bytes,
+            min_interval_ms,
+            min_reclaimable_bytes,
+            0,
+        )
+    }
+
+    /// [`maybe_dump_and_reclaim_with_gap_for_test`] with the relative term's divisor given too,
+    /// so ONE test can drive the fixed cadence (divisor 0) and the shipped relative one against
+    /// the same fixture and say by its argument which of the two it is measuring.
+    #[cfg(test)]
+    pub fn maybe_dump_and_reclaim_with_threshold_and_divisor_for_test(
+        &self,
+        shard_id: ShardId,
+        threshold_bytes: u64,
+        min_interval_ms: u64,
+        min_reclaimable_bytes: u64,
+        base_fraction_divisor: u64,
+    ) -> Option<super::reports::CatalogDumpReclaimReport> {
+        let threshold = crate::index_log::effective_index_dump_threshold_bytes(
+            threshold_bytes,
+            self.base_index_bytes_on_disk(shard_id),
+            base_fraction_divisor,
+        );
+        let undumped = self.index_log_store.undumped_len_since_dump(shard_id);
+        if !crate::index_log::should_dump_index_catalog_now(
+            undumped,
+            threshold,
+            self.index_log_store.ms_since_catalog_dump(shard_id),
+            min_interval_ms,
+        ) {
+            return None;
+        }
+        self.dump_and_reclaim_index_logs_with_min_reclaimable(shard_id, min_reclaimable_bytes)
+    }
+
+    pub(super) fn persist_index_bytes(
+        &self,
+        shard_id: ShardId,
+        bytes: &[u8],
+    ) -> Result<(), std::io::Error> {
+        // Bulk backfill defers the served-index rewrite to flush_shard_index()
+        // (turns O(n^2) per-record persistence into one write per batch).
+        if bulk_ingest_mode() {
+            return Ok(());
+        }
+        fs::create_dir_all(&self.index_dir)?;
+        // Ack-path served-index checkpoint. Under the single-barrier default the durable barrier
+        // is deferred (content + rename still issued): the WAL is durably synced before ack
+        // and replay-on-load rebuilds the served index from it, so a stale-on-crash index
+        // only costs a longer WAL replay, never an acked write. This is the served-index
+        // fsync removed from the write critical path.
+        atomic_write_bytes_synced(&self.index_path(shard_id), bytes, !wal_only_sync())
+    }
+
+    /// Unconditional (bulk-gate-bypassing) index write for recovery-critical paths such as
+    /// manifest install-on-load. `persist_index_bytes` is deliberately a no-op under bulk
+    /// mode to avoid O(n^2) per-record writes, but install is a one-shot recovery step: if
+    /// it skips the write, `load_index()` reads the stale pre-manifest index while the
+    /// returned watermark advances past the records the manifest embeds -- and replay only
+    /// applies records beyond the watermark, so those records (already WAL-GC'd, living only
+    /// in the manifest) are permanently lost. Always materialize the restored index here.
+    pub(super) fn persist_index_bytes_durable(
+        &self,
+        shard_id: ShardId,
+        bytes: &[u8],
+    ) -> Result<(), std::io::Error> {
+        fs::create_dir_all(&self.index_dir)?;
+        atomic_write_bytes(&self.index_path(shard_id), bytes)
+    }
+
+    pub(super) fn validate_load_version(
+        &self,
+        shard_id: ShardId,
+        load_version: u64,
+    ) -> Result<(), Status> {
+        let infos = self.infos.read().expect("info lock poisoned");
+        let Some(info) = infos.get(&shard_id) else {
+            return Err(Status::error(
+                "shard_not_loaded",
+                "shard is not loaded on this server",
+            ));
+        };
+        if !info.loaded {
+            return Err(Status::error(
+                "shard_not_loaded",
+                "shard is not loaded on this server",
+            ));
+        }
+        if info.load_version != load_version {
+            return Err(Status::error(
+                "load_version_mismatch",
+                format!(
+                    "request load_version {} does not match loaded version {}",
+                    load_version, info.load_version
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// A ratio in PARTS PER MILLION, or 0 when the denominator is 0.
+    ///
+    /// # WHY PPM AND WHY ZERO
+    ///
+    /// Parts per million keeps a ratio in an integer field: 1.0x is 1_000_000, and a report carries
+    /// no float. Zero for a zero denominator is the convention already in this tree -- the slab
+    /// descriptor's utilisation is documented as "or 0 when the slab has no logical bytes" -- and it
+    /// is the honest answer for a fresh store, where 1_000_000 would read as "no amplification
+    /// measured" when nothing has been measured at all.
+    ///
+    /// SATURATING, because `numerator * 1_000_000` overflows `u64` above about 18 TB and a report
+    /// that wraps is worse than one that caps.
+    fn ppm_ratio(numerator: u64, denominator: u64) -> u64 {
+        if denominator == 0 {
+            return 0;
+        }
+        numerator.saturating_mul(1_000_000) / denominator
+    }
+
+    pub(super) fn shard_stats(&self, shard_id: ShardId) -> Option<ShardStats> {
+        let shards = self.shards.read().expect("engine lock poisoned");
+        let info = self
+            .infos
+            .read()
+            .expect("info lock poisoned")
+            .get(&shard_id)
+            .cloned();
+        shards.get(&shard_id).map(|state| {
+            let block_store = self.block_store.stats();
+            let block_store_slabs = self.block_store.slab_summary();
+            let string_records = state.strings().len();
+            let hash_records = state.hashes.len();
+            let set_records = state.sets.len();
+            let list_records = state.lists.len();
+            let _ = list_records;
+            let zset_records = state.zsets.len();
+            let _ = zset_records;
+            let feature_records = state.features().len();
+            // ZERO BY CONSTRUCTION, AND THAT IS WHAT IT ALWAYS MEASURED. This read the length
+            // of `ShardState::sequences`, a map no production path ever wrote: Sequence rows
+            // live in `features` and are counted by `feature_records` above. The map is gone;
+            // the PUBLISHED field stays, because `control.rs` exposes it and
+            // `prometheus_metrics.rs` scrapes it as `temporalstore_shard_records{kind="sequence"}`
+            // -- deleting it would compile cleanly and silently drop a metric. A shard that
+            // served a non-zero here never existed.
+            let sequence_records = 0usize;
+            let control_state_records =
+                state.control_state().len() + state.control_state_changes.len();
+            let loaded = info.as_ref().map(|info| info.loaded).unwrap_or(true);
+            let readonly = info.as_ref().map(|info| info.readonly).unwrap_or(false);
+            let load_version = info
+                .as_ref()
+                .map(|info| info.load_version)
+                .unwrap_or_default();
+            let table_name = info
+                .as_ref()
+                .map(|info| info.table_name.clone())
+                .unwrap_or_default();
+            let shard_uri = info
+                .as_ref()
+                .map(|info| info.shard_uri.clone())
+                .unwrap_or_default();
+            let start_routing_bucket = info
+                .as_ref()
+                .map(|info| info.start_routing_bucket)
+                .unwrap_or_default();
+            let end_routing_bucket = info
+                .as_ref()
+                .map(|info| info.end_routing_bucket)
+                .unwrap_or(u32::MAX);
+            let object_manager =
+                object_manager_stats(state, start_routing_bucket, end_routing_bucket);
+            let secondary_view_total_records = string_records
+                + hash_records
