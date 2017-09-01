@@ -382,3 +382,387 @@ fn restore(dir: &std::path::Path, corpus: Corpus) -> RestoreMeasurement {
     let response = engine.load_shard_with(LoadShardRequest {
         shard_id: 1,
         load_version: 1,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 0,
+        end_routing_bucket: u32::MAX,
+        readonly: false,
+        table_name: "t".to_string(),
+    });
+    // Read BEFORE `finish()`, which allocates a report the restore did not.
+    let span_after = crate::alloc_probe::counted_now();
+    let cost = restore_phase_probe::finish();
+    let wall_ms = started.elapsed().as_millis() as u64;
+    assert!(
+        response.status.ok,
+        "the restore under measurement must succeed, or every number below describes a failure: \
+         {:?}",
+        response.status
+    );
+    let manifest_counts = crate::engine::bucket_dump_manifest_io_counts();
+    let wal = engine.write_ahead_log_store().raw_stats(1);
+    // The restore is only worth counting if it brought the records back. The probe reads are
+    // spread across the WHOLE key space, so a restore that recovered only the dumped half -- the
+    // #1637 shape -- fails here instead of being reported as a cheap recovery.
+    let mut readable = 0usize;
+    let mut probe = 0usize;
+    while probe < PROBE_READS {
+        let index = probe * corpus.records / PROBE_READS;
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: format!("k-{index:08}"),
+            },
+        });
+        let recovered = matches!(
+            &response.response,
+            CommandResponse::Bytes { value }
+                if value.as_ref().map(|bytes| bytes.len()) == Some(corpus.value_bytes)
+        );
+        if response.status.ok && recovered {
+            readable += 1;
+        }
+        probe += 1;
+    }
+    RestoreMeasurement {
+        corpus,
+        cost,
+        wal_window_walks: wal.scans,
+        wal_bytes_read: wal.bytes_read,
+        manifest_listings: manifest_counts.dir_listings,
+        manifest_file_reads: manifest_counts.file_reads,
+        manifest_bytes_read: manifest_counts.bytes_read,
+        manifest_checksum_serializes: manifest_counts.checksum_serializes,
+        manifest_checksum_bytes: manifest_counts.checksum_bytes,
+        replayed_from: crate::engine::lifecycle::LAST_REPLAY_WATERMARK
+            .load(std::sync::atomic::Ordering::SeqCst),
+        readable_after: readable,
+        wall_ms,
+        span_allocs: span_before
+            .zip(span_after)
+            .map(|(before, after)| after.0 - before.0),
+    }
+}
+
+fn measure(records: usize, value_bytes: usize) -> RestoreMeasurement {
+    measure_with(records, value_bytes, 1, records / 2)
+}
+
+fn measure_with(
+    records: usize,
+    value_bytes: usize,
+    dumps: usize,
+    dumped: usize,
+) -> RestoreMeasurement {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let corpus = build_corpus(dir.path(), records, value_bytes, dumps, dumped);
+    restore(dir.path(), corpus)
+}
+
+fn report(label: &str, measurement: &RestoreMeasurement) {
+    let corpus = &measurement.corpus;
+    println!(
+        "\n{label}\n  corpus: {} records of {} B ({} dumped, {} left as a WAL tail) -- WAL {} B \
+         in {} piece(s), {} manifest file(s) {} B, index-log {} B",
+        corpus.records,
+        corpus.value_bytes,
+        corpus.dumped,
+        corpus.tail,
+        corpus.wal_bytes,
+        corpus.wal_pieces,
+        corpus.manifest_files,
+        corpus.manifest_bytes,
+        corpus.index_log_bytes
+    );
+    println!(
+        "  replayed from wal_sequence {} (last manifest anchor {}), {} of {} probed keys \
+         readable, wall {} ms",
+        measurement.replayed_from,
+        corpus.manifest_wal_sequence,
+        measurement.readable_after,
+        PROBE_READS,
+        measurement.wall_ms
+    );
+    println!("  phase                       allocs     alloc_bytes        ms");
+    for phase in &measurement.cost.phases {
+        println!(
+            "  {:<24} {:>10} {:>15} {:>9.1}",
+            phase.phase,
+            phase.allocs,
+            phase.alloc_bytes,
+            phase.nanos as f64 / 1e6
+        );
+    }
+    println!(
+        "  {:<24} {:>10} {:>15} {:>9.1}   <- every phase, summed",
+        "ALL PHASES",
+        measurement.cost.allocs(),
+        measurement.cost.alloc_bytes(),
+        measurement.cost.nanos() as f64 / 1e6
+    );
+    match measurement.residual_allocs() {
+        Some(residual) => println!(
+            "  {:<24} {:>10}                           <- the span, minus every row above",
+            "residual", residual
+        ),
+        None => println!("  (the two allocation columns read zero: built without `alloc-probe`)"),
+    }
+    println!(
+        "  WAL      window walks {} bytes_read {}",
+        measurement.wal_window_walks, measurement.wal_bytes_read
+    );
+    println!(
+        "  MANIFEST listings {} file_reads {} bytes_read {} checksum_serializes {} \
+         checksum_bytes {}",
+        measurement.manifest_listings,
+        measurement.manifest_file_reads,
+        measurement.manifest_bytes_read,
+        measurement.manifest_checksum_serializes,
+        measurement.manifest_checksum_bytes
+    );
+    println!(
+        "  ENGINE LOCK over the index fold: {} write syscall(s) under it, {} after releasing it",
+        measurement.cost.writes_under_engine_lock, measurement.cost.writes_after_engine_lock
+    );
+    println!(
+        "  WALK     decoded {} records, {} of them ({:.0}%) already covered by the checkpoint and \
+         dropped",
+        measurement.cost.records_decoded,
+        measurement.cost.records_behind_checkpoint,
+        100.0 * measurement.cost.records_behind_checkpoint as f64
+            / measurement.cost.records_decoded.max(1) as f64,
+    );
+}
+
+/// THE WHOLE RESTORE, AT TWO CORPUS SIZES, BROKEN INTO ITS PHASES.
+///
+/// The phases sum to the whole by construction, so this reports a complete bill rather than a
+/// selection from one. What it asserts is the two things that decide where an operator should
+/// look: that the fold at the end is the biggest single phase at BOTH sizes, and that the whole
+/// thing is flat per record rather than degrading as the shard grows.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn what_bringing_a_shard_back_costs_at_two_corpus_sizes() {
+    let small = measure(SMALL, NARROW);
+    // BEFORE ANY NUMBER IS READ: the counting allocator is installed. Without it every
+    // allocation column is a placeholder, and every ratio below would be zero against
+    // zero -- which passes a `contains` band as readily as a real measurement does.
+    assert!(
+        small.cost.allocations_were_counted,
+        "the counting allocator must be installed for this test to measure anything"
+    );
+    report("SMALL  (2,000 records)", &small);
+    let large = measure(LARGE, NARROW);
+    report("LARGE  (20,000 records)", &large);
+
+    let ratio = large.cost.allocs() as f64 / small.cost.allocs().max(1) as f64;
+    println!(
+        "\n  10.00x the records: allocations {:.2}x, allocated bytes {:.2}x, log bytes read \
+         {:.2}x, manifest bytes read {:.2}x",
+        ratio,
+        large.cost.alloc_bytes() as f64 / small.cost.alloc_bytes().max(1) as f64,
+        large.wal_bytes_read as f64 / small.wal_bytes_read.max(1) as f64,
+        large.manifest_bytes_read as f64 / small.manifest_bytes_read.max(1) as f64,
+    );
+    println!(
+        "  per record recovered: {:.1} -> {:.1} allocations, {:.0} -> {:.0} allocated bytes, for \
+         a {} B value",
+        small.cost.allocs() as f64 / SMALL as f64,
+        large.cost.allocs() as f64 / LARGE as f64,
+        small.cost.alloc_bytes() as f64 / SMALL as f64,
+        large.cost.alloc_bytes() as f64 / LARGE as f64,
+        NARROW,
+    );
+
+    // NON-VACUOUS FIRST. A restore that recovered nothing, or that never entered the recovery
+    // arm, would make every number above a description of an empty loop.
+    assert!(
+        small.replayed_from > 0 && small.replayed_from == small.corpus.manifest_wal_sequence,
+        "the restore must have started from the dump manifest's anchor ({}), not from {}",
+        small.corpus.manifest_wal_sequence,
+        small.replayed_from
+    );
+    assert_eq!(
+        (small.readable_after, large.readable_after),
+        (PROBE_READS, PROBE_READS),
+        "every probed key, spread across the whole key space, must read back after the restore"
+    );
+
+    // The phase rows account for the whole restore: a phase added later without a boundary shows
+    // up here as a difference rather than vanishing from the bill.
+    assert_eq!(
+        small.cost.phases.len(),
+        5,
+        "a restore is five phases; found {:?}",
+        small
+            .cost
+            .phases
+            .iter()
+            .map(|phase| phase.phase.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        small.cost.phases.iter().map(|phase| phase.allocs).sum::<u64>(),
+        small.cost.allocs(),
+        "the phase rows must sum to the whole restore"
+    );
+    // THE RESIDUAL, measured rather than assumed: the counter either side of the whole
+    // `load_shard_with` call, minus the rows. The assertion above cannot find a phase boundary
+    // that drifted, because it compares the rows against their own sum. This can.
+    let (small_residual, large_residual) = (
+        small.residual_allocs().expect("counted"),
+        large.residual_allocs().expect("counted"),
+    );
+    assert_eq!(
+        small_residual, large_residual,
+        "the part of a restore that no phase row accounts for must be a FIXED edge cost: it is \
+         {small_residual} at {SMALL} records and {large_residual} at {LARGE}, and a residual that \
+         grows with the store is a phase boundary sitting past work nobody wrote a row for"
+    );
+    assert!(
+        (0..=16).contains(&small_residual),
+        "the residual is {small_residual} allocations; it has been 5, and a number big enough to \
+         hide a phase in makes the table above a selection rather than a bill"
+    );
+
+    // HALF ONE: the fold at the end is the largest phase, at BOTH sizes. It is also the phase
+    // with almost no syscalls in it -- 30 and 31 -- so a restore that feels slow is not waiting
+    // on the disk, it is rebuilding and re-serialising the whole shard.
+    let biggest = |measurement: &RestoreMeasurement| {
+        measurement
+            .cost
+            .phases
+            .iter()
+            .max_by_key(|phase| phase.allocs)
+            .map(|phase| phase.phase.clone())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        (biggest(&small).as_str(), biggest(&large).as_str()),
+        ("index_fold", "index_fold"),
+        "the post-replay fold must be the largest phase of a restore at both corpus sizes"
+    );
+
+    // HALF TWO, and independent of the first: ten times the shard costs about ten times the
+    // restore. Restore is flat per record -- it does not degrade as a store grows.
+    assert!(
+        (7.5..=12.5).contains(&ratio),
+        "10.00x the records must cost about 10x the restore, not more and not less; it cost \
+         {ratio:.2}x ({} -> {} allocations)",
+        small.cost.allocs(),
+        large.cost.allocs()
+    );
+
+    // HALF THREE: and what the fold costs, per record the SHARD holds, is the same number at
+    // both sizes. That is the claim the two rows above turn into a rate, and it is the one a
+    // change to any of the four whole-range passes inside the fold has to move.
+    let fold_rate = |measurement: &RestoreMeasurement, records: usize| {
+        measurement.phase_allocs("index_fold") as f64 / records as f64
+    };
+    println!(
+        "  the fold costs {:.1} and {:.1} allocations per record the shard holds",
+        fold_rate(&small, SMALL),
+        fold_rate(&large, LARGE),
+    );
+    assert!(
+        (12.5..=16.5).contains(&fold_rate(&small, SMALL))
+            && (12.5..=16.5).contains(&fold_rate(&large, LARGE)),
+        "the fold must cost the same per stored record at both sizes: {:.1} at {SMALL} records \
+         and {:.1} at {LARGE}",
+        fold_rate(&small, SMALL),
+        fold_rate(&large, LARGE),
+    );
+}
+
+/// WHICH QUANTITY EACH PHASE TRACKS, by holding one fixed and moving the other.
+///
+/// Three arms. BASE, then the same record count at ten times the value width -- which moves the
+/// log and nothing else -- then ten times the records at about the same log. A phase that tracks
+/// bytes moves in the second and not the third; a phase that tracks records does the opposite.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn which_quantity_each_restore_phase_tracks() {
+    let base = measure(SMALL, NARROW);
+    // BEFORE ANY NUMBER IS READ: the counting allocator is installed. Without it every
+    // allocation column is a placeholder, and every ratio below would be zero against
+    // zero -- which passes a `contains` band as readily as a real measurement does.
+    assert!(
+        base.cost.allocations_were_counted,
+        "the counting allocator must be installed for this test to measure anything"
+    );
+    report("BASE   2,000 x 128 B", &base);
+    let wider = measure(SMALL, WIDE);
+    report("WIDER  2,000 x 1,280 B -- more log bytes, the SAME records", &wider);
+    let more = measure(LARGE, NARROW);
+    report("MORE   20,000 x 128 B -- 10x the records, about the SAME log", &more);
+
+    println!(
+        "\n  quantity                    BASE         WIDER          MORE   WIDER/BASE  MORE/WIDER"
+    );
+    let row = |name: &str, a: u64, b: u64, c: u64| {
+        println!(
+            "  {:<22} {:>12} {:>13} {:>13} {:>12.2} {:>11.2}",
+            name,
+            a,
+            b,
+            c,
+            b as f64 / a.max(1) as f64,
+            c as f64 / b.max(1) as f64
+        );
+    };
+    row("log bytes on disk", base.corpus.wal_bytes, wider.corpus.wal_bytes, more.corpus.wal_bytes);
+    row("log bytes read", base.wal_bytes_read, wider.wal_bytes_read, more.wal_bytes_read);
+    row("log window walks", base.wal_window_walks, wider.wal_window_walks, more.wal_window_walks);
+    row(
+        "manifest bytes read",
+        base.manifest_bytes_read,
+        wider.manifest_bytes_read,
+        more.manifest_bytes_read,
+    );
+    row(
+        "phase1 allocs",
+        base.phase_allocs("manifest_and_base_index"),
+        wider.phase_allocs("manifest_and_base_index"),
+        more.phase_allocs("manifest_and_base_index"),
+    );
+    row(
+        "phase2 allocs",
+        base.phase_allocs("publish_and_seed"),
+        wider.phase_allocs("publish_and_seed"),
+        more.phase_allocs("publish_and_seed"),
+    );
+    row(
+        "phase3 allocs",
+        base.phase_allocs("wal_replay"),
+        wider.phase_allocs("wal_replay"),
+        more.phase_allocs("wal_replay"),
+    );
+    row(
+        "phase4 allocs",
+        base.phase_allocs("index_fold"),
+        wider.phase_allocs("index_fold"),
+        more.phase_allocs("index_fold"),
+    );
+    row(
+        "phase3 alloc BYTES",
+        base.cost.phase("wal_replay").alloc_bytes,
+        wider.cost.phase("wal_replay").alloc_bytes,
+        more.cost.phase("wal_replay").alloc_bytes,
+    );
+
+    // The control has to have controlled something. Both of these are what makes the two ratio
+    // columns mean opposite things, and a fixture where the WIDER arm failed to widen would make
+    // the whole test agree with itself for no reason.
+    assert_eq!(
+        (base.corpus.records, wider.corpus.records),
+        (SMALL, SMALL),
+        "the WIDER arm holds the record count fixed"
+    );
+    assert!(
+        wider.corpus.wal_bytes >= base.corpus.wal_bytes * 3,
+        "the WIDER arm must actually carry far more log bytes at the same record count: {} B \
+         against {} B",
+        wider.corpus.wal_bytes,
+        base.corpus.wal_bytes
+    );
+
