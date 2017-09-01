@@ -136,3 +136,141 @@ impl MetaRaftClusterInner {
             self.elect_leader(candidate_id)?;
         } else {
             self.nodes.remove(&node_id);
+        }
+        Ok(())
+    }
+
+    pub(super) fn plan_membership_change(
+        &self,
+        new_voters: impl IntoIterator<Item = RaftNodeId>,
+    ) -> Result<RaftMembershipChangePlan, RaftError> {
+        if !self
+            .nodes
+            .get(&self.leader_id)
+            .map(|node| node.alive && node.role == RaftRole::Leader)
+            .unwrap_or(false)
+        {
+            return Err(RaftError::LeaderUnavailable);
+        }
+        let old_voters = self.nodes.keys().copied().collect::<BTreeSet<_>>();
+        let new_voters = new_voters.into_iter().collect::<BTreeSet<_>>();
+        if new_voters.is_empty() {
+            return Err(RaftError::CannotRemoveLastNode);
+        }
+        if old_voters == new_voters {
+            return Err(RaftError::InvalidConfig(
+                "membership change must add or remove at least one voter".to_string(),
+            ));
+        }
+
+        let add_voters = new_voters
+            .difference(&old_voters)
+            .copied()
+            .collect::<Vec<_>>();
+        let remove_voters = old_voters
+            .difference(&new_voters)
+            .copied()
+            .collect::<Vec<_>>();
+        let kind = match (add_voters.is_empty(), remove_voters.is_empty()) {
+            (false, true) => RaftMembershipChangeKind::AddVoter,
+            (true, false) => RaftMembershipChangeKind::RemoveVoter,
+            (false, false) => RaftMembershipChangeKind::ReplaceVoter,
+            (true, true) => unreachable!("old_voters != new_voters was checked"),
+        };
+
+        let live_new_voters = new_voters
+            .iter()
+            .filter(|node_id| {
+                self.nodes
+                    .get(node_id)
+                    .map(|node| node.alive)
+                    .unwrap_or(true)
+            })
+            .count();
+        let required_new_majority = majority(new_voters.len());
+        if live_new_voters < required_new_majority {
+            return Err(RaftError::NoMajority {
+                live: live_new_voters,
+                required: required_new_majority,
+            });
+        }
+
+        Ok(RaftMembershipChangePlan {
+            shard_id: 0,
+            kind,
+            old_voters: old_voters.into_iter().collect(),
+            new_voters: new_voters.into_iter().collect(),
+            add_voters,
+            remove_voters,
+        })
+    }
+
+    pub(super) fn scale_change_report(&self) -> RaftScaleChangeReport {
+        let status = self.status();
+        RaftScaleChangeReport {
+            leader_id: status.leader_id,
+            voters: self.nodes.keys().copied().collect(),
+            live_voters: status.live_voters,
+            majority: status.majority,
+            caught_up_voters: status
+                .nodes
+                .into_iter()
+                .filter(|node| node.alive && node.lag == 0)
+                .map(|node| node.node_id)
+                .collect(),
+        }
+    }
+
+    pub(super) fn failover_report(&self, old_leader_id: RaftNodeId) -> RaftFailoverReport {
+        let status = self.status();
+        RaftFailoverReport {
+            old_leader_id,
+            new_leader_id: status.leader_id,
+            term: status.current_term,
+            commit_index: status.commit_index,
+            caught_up_voters: status
+                .nodes
+                .into_iter()
+                .filter(|node| node.alive && node.lag == 0)
+                .map(|node| node.node_id)
+                .collect(),
+        }
+    }
+
+    pub(super) fn elect_leader(&mut self, node_id: RaftNodeId) -> Result<(), RaftError> {
+        if self.config.prohibits_election {
+            return Err(RaftError::ElectionProhibited);
+        }
+        let required = majority(self.nodes.len());
+        let live = self.nodes.values().filter(|node| node.alive).count();
+        if live < required {
+            return Err(RaftError::NoMajority { live, required });
+        }
+        if !self
+            .nodes
+            .get(&node_id)
+            .map(|node| node.alive)
+            .unwrap_or(false)
+        {
+            return Err(RaftError::NodeNotFound(node_id));
+        }
+        if !self.candidate_log_would_win(node_id)? {
+            let candidate_commit_index = self
+                .nodes
+                .get(&node_id)
+                .map(|node| node.commit_index)
+                .unwrap_or_default();
+            return Err(RaftError::ReplicaLagging {
+                replica_id: node_id,
+                replica_commit_index: candidate_commit_index,
+                leader_commit_index: self.leader_commit_index(),
+            });
+        }
+        self.leader_id = node_id;
+        let next_term = self
+            .nodes
+            .values()
+            .map(|node| node.current_term)
+            .max()
+            .unwrap_or_default()
+            + 1;

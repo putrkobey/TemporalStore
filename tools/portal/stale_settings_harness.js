@@ -28,3 +28,65 @@ function makeEl(id) {
     addEventListener() {}, removeEventListener() {}, appendChild() {}, removeChild() {},
     setAttribute() {}, getAttribute() { return null; }, closest() { return null; },
     querySelector() { return null; }, querySelectorAll() { return []; },
+    scrollIntoView() {}, focus() {}, click() {},
+    classList: { add() {}, remove() {}, toggle() {} }
+  };
+}
+function el(id) {
+  if (!els.has(id)) { els.set(id, makeEl(id)); }
+  return els.get(id);
+}
+
+const STALE = none ? [] : ["embedding.old_name", "extraction.retired_knob"];
+
+function snapshot() {
+  return {
+    status: "ok",
+    /* A real warning alongside, so an addition that swallowed the existing ones would show. */
+    warnings: ["extraction is falling back to rules"],
+    extraction: { provider: "deterministic" }, embedding: { provider: "deterministic" },
+    settings: {
+      status: "ok",
+      groups: { Extraction: [
+        { key: "extraction.model", kind: "str", label: "Model", help: "", value: "m",
+          env: "MATRIXARK_EXTRACTION_MODEL", applies: "live", source: "config", essential: false,
+          default: "", overridable_by: [], boot_pinned: false, pending_restart: false }
+      ] },
+      group_meta: {}, presets: [], history: [], inventory: {}, essential_keys: [],
+      config_file: "/etc/matrixark/runtime_config.json",
+      pending_restart: [], unknown_stored: STALE
+    }
+  };
+}
+
+const win = {
+  document: {
+    getElementById: (id) => el(id),
+    querySelector: () => makeEl(), querySelectorAll: () => [],
+    createElement: () => makeEl(), addEventListener() {}, body: makeEl(), hidden: false
+  },
+  addEventListener() {},
+  location: { origin: "http://localhost", href: "http://localhost", reload() {} },
+  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  navigator: {},
+  setTimeout: (fn) => { if (typeof fn === "function") { fn(); } return 0; },
+  setInterval: () => 0, clearInterval() {},
+  Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
+  TextDecoder: function () { this.decode = () => ""; },
+  AbortController: function () { this.abort = () => {}; this.signal = {}; },
+  FileReader: function () {}, Blob: function () {},
+  URL: { createObjectURL: () => "", revokeObjectURL() {} },
+  fetch: (url) => {
+    if (String(url).indexOf("/v1/admin/config") >= 0) {
+      return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(snapshot()),
+                               text: () => Promise.resolve("{}") });
+    }
+    return new Promise(() => {});
+  }
+};
+win.window = win;
+
+const names = Object.keys(win);
+const values = names.map((k) => win[k]);
