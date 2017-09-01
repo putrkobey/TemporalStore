@@ -845,3 +845,1697 @@ fn control_state_change_matches_distinct_field_semantics() {
         let response = engine.execute(ExecuteRequest {
             shard_id: 1,
             command: Command::ControlStateChangeAdd {
+                key: control_state_family_key(ControlStateFamily::Counter, "control_state-change"),
+                timestamp_ms,
+                value: value.as_bytes().to_vec(),
+                precision_ms: None,
+                ttl_ms: None,
+            },
+        });
+        assert!(response.status.ok, "{response:?}");
+    }
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ControlStateFamilyQuery {
+                    family: ControlStateFamily::Counter,
+                    key: "control_state-change".to_string(),
+                    start_ms: 0,
+                    end_ms: 40,
+                    aggregator: "change".to_string(),
+                },
+            })
+            .response,
+        CommandResponse::Integer { value: 2 }
+    );
+}
+
+#[test]
+fn control_state_query_supports_first_last_and_detail_list() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    for (timestamp_ms, amount) in [(10, 5), (20, -2), (30, 7)] {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ControlStateIncrement {
+                key: "control_state".to_string(),
+                timestamp_ms,
+                amount,
+            },
+        });
+    }
+    for (aggregator, expected) in [("first", 5), ("last", 7)] {
+        assert_eq!(
+            engine
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::ControlStateQuery {
+                        key: "control_state".to_string(),
+                        start_ms: 0,
+                        end_ms: 40,
+                        aggregator: aggregator.to_string(),
+                    },
+                })
+                .response,
+            CommandResponse::Integer { value: expected }
+        );
+    }
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ControlStateDetail {
+                    key: "control_state".to_string(),
+                    start_ms: 15,
+                    end_ms: 40,
+                    count: Some(2),
+                },
+            })
+            .response,
+        CommandResponse::FeaturePoints {
+            points: vec![
+                FeaturePoint {
+                    timestamp_ms: 20,
+                    value: b"-2".to_vec(),
+                },
+                FeaturePoint {
+                    timestamp_ms: 30,
+                    value: b"7".to_vec(),
+                },
+            ]
+        }
+    );
+}
+
+#[test]
+fn control_state_selection_matches_first_last_string_semantics() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+
+    for (occur_time_ms, value) in [(20, "middle"), (10, "first"), (30, "last")] {
+        assert!(
+            engine
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::ControlStateSelectionSet {
+                        key: "control_state-fol-first".to_string(),
+                        value: value.as_bytes().to_vec(),
+                        occur_time_ms,
+                        ttl_ms: 60_000,
+                        selection_type: ControlStateSelectionType::First,
+                    },
+                })
+                .status
+                .ok
+        );
+        assert!(
+            engine
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::ControlStateSelectionSet {
+                        key: "control_state-fol-last".to_string(),
+                        value: value.as_bytes().to_vec(),
+                        occur_time_ms,
+                        ttl_ms: 60_000,
+                        selection_type: ControlStateSelectionType::Last,
+                    },
+                })
+                .status
+                .ok
+        );
+    }
+
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ControlStateSelectionQuery {
+                    key: "control_state-fol-first".to_string(),
+                },
+            })
+            .response,
+        CommandResponse::Bytes {
+            value: Some(b"first".to_vec()),
+        }
+    );
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ControlStateSelectionQuery {
+                    key: "control_state-fol-last".to_string(),
+                },
+            })
+            .response,
+        CommandResponse::Bytes {
+            value: Some(b"last".to_vec()),
+        }
+    );
+}
+
+#[test]
+fn control_state_selection_omitted_occur_time_resolves_to_now_like_native() {
+    // FirstOrLastSet substitutes occur_time==0 with the current time before the FIRST/LAST
+    // comparison; an omitted-occur-time FIRST set must NOT beat an earlier explicit record.
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    assert!(engine
+        .execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ControlStateSelectionSet {
+                key: "k".to_string(),
+                value: b"early".to_vec(),
+                occur_time_ms: 5000,
+                ttl_ms: 0,
+                selection_type: ControlStateSelectionType::First,
+            },
+        })
+        .status
+        .ok);
+    // occur_time 0 resolves to now (>> 5000), so this FIRST set must not overwrite.
+    assert!(engine
+        .execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ControlStateSelectionSet {
+                key: "k".to_string(),
+                value: b"late".to_vec(),
+                occur_time_ms: 0,
+                ttl_ms: 0,
+                selection_type: ControlStateSelectionType::First,
+            },
+        })
+        .status
+        .ok);
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ControlStateSelectionQuery {
+                    key: "k".to_string(),
+                },
+            })
+            .response,
+        CommandResponse::Bytes {
+            value: Some(b"early".to_vec()),
+        },
+        "an omitted occur_time (0 -> now) FIRST set must not beat an earlier explicit record"
+    );
+}
+
+#[test]
+fn live_block_slab_ids_includes_control_state_blocks() {
+    // control_state_pages is page-backed; omitting it from the GC live set let a slab holding
+    // only a control-state page be reclaimed while still index-referenced -> DataLoss on read.
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let resp = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::ControlStateSet {
+            family: ControlStateFamily::Counter,
+            key: "cs".to_string(),
+            timestamp_ms: 1000,
+            amount: 1,
+        },
+    });
+    assert!(resp.status.ok, "{:?}", resp.status);
+    assert!(
+        !engine.live_block_slab_ids(1).is_empty(),
+        "the control-state page's slab must be in the GC live set, else GC can reclaim a slab \
+         still referenced by control_state_pages"
+    );
+}
+
+#[test]
+fn control_state_values_survive_unload_reload() {
+    // Locks in the control_state reconcile merge (persisted-authoritative) together with the
+    // control_state_pages GC live-set fix: control-state values must round-trip through a
+    // reload unchanged.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for (timestamp_ms, amount) in [(10, 5), (20, -2), (30, 7)] {
+        assert!(engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ControlStateIncrement {
+                    key: "cs".to_string(),
+                    timestamp_ms,
+                    amount,
+                },
+            })
+            .status
+            .ok);
+    }
+    let query = |engine: &TemporalEngine, aggregator: &str| -> i64 {
+        match engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ControlStateQuery {
+                    key: "cs".to_string(),
+                    start_ms: 0,
+                    end_ms: 40,
+                    aggregator: aggregator.to_string(),
+                },
+            })
+            .response
+        {
+            CommandResponse::Integer { value } => value,
+            other => panic!("expected Integer, got {other:?}"),
+        }
+    };
+    let before = ["sum", "first", "last", "count"].map(|agg| query(&engine, agg));
+    assert_eq!(query(&engine, "sum"), 10, "5 - 2 + 7 = 10");
+
+    engine.unload_shard(1);
+    engine.load_shard(1);
+
+    let after = ["sum", "first", "last", "count"].map(|agg| query(&engine, agg));
+    assert_eq!(
+        after, before,
+        "control-state aggregates must survive reload unchanged"
+    );
+}
+
+#[test]
+fn sequence_rows_fold_into_shared_feature_storage_and_survive_reload() {
+    // Thin-layer Sequence fold: Sequence is backed by the Feature timestamped-KV storage
+    // (a single `features` map, no separate `sequences` map). Rows written via SequenceAdd
+    // must be (a) readable through the typed SequenceQuery API, (b) physically present in
+    // the shared feature storage (a Feature read over the same key sees the same
+    // timestamps), and (c) preserved across an unload/reload cycle.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let rows = vec![
+        SequenceFeatureRow {
+            timestamp_ms: 100,
+            gid: 7,
+            action_type: 1,
+            duration: 10,
+            author_id: 900,
+        },
+        SequenceFeatureRow {
+            timestamp_ms: 200,
+            gid: 8,
+            action_type: 2,
+            duration: 20,
+            author_id: 901,
+        },
+    ];
+    assert!(engine
+        .execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::SequenceAdd {
+                key: "seq-fold".to_string(),
+                rows: rows.clone(),
+            },
+        })
+        .status
+        .ok);
+
+    let query_rows = |engine: &TemporalEngine| -> Vec<SequenceFeatureRow> {
+        match engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::SequenceQuery {
+                    key: "seq-fold".to_string(),
+                    start_ms: 0,
+                    end_ms: 1_000,
+                    count: 10,
+                    filters: Vec::new(),
+                },
+            })
+            .response
+        {
+            CommandResponse::SequenceRows { rows } => rows,
+            other => panic!("expected SequenceRows, got {other:?}"),
+        }
+    };
+    assert_eq!(query_rows(&engine), rows, "SequenceQuery returns the rows");
+
+    // Shared storage: the same key is visible through the Feature read path at the same
+    // timestamps, proving the rows live in the `features` map rather than a separate
+    // sequences map.
+    let feature_ts: Vec<u64> = match engine
+        .execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::FeatureQuery {
+                key: "seq-fold".to_string(),
+                start_ms: 0,
+                end_ms: 1_000,
+                count: None,
+            },
+        })
+        .response
+    {
+        CommandResponse::FeaturePoints { points } => {
+            points.iter().map(|point| point.timestamp_ms).collect()
+        }
+        other => panic!("expected FeaturePoints, got {other:?}"),
+    };
+    assert_eq!(
+        feature_ts,
+        vec![100, 200],
+        "sequence rows are stored in the shared feature storage"
+    );
+
+    // Reload fidelity through the merged storage.
+    engine.unload_shard(1);
+    engine.load_shard(1);
+    assert_eq!(
+        query_rows(&engine),
+        rows,
+        "sequence rows survive an unload/reload cycle via feature storage"
+    );
+}
+
+#[test]
+fn insert_if_absent_keeps_the_first_in_batch_duplicate_timestamp() {
+    // feature ADD FIRST policy walks the point list in
+    // request order and skips a timestamp already present, so for an in-batch duplicate the FIRST
+    // value wins. Rust previously pre-collapsed the batch by timestamp (last-wins) before the
+    // policy loop, silently keeping the LAST duplicate. Same batch, same timestamp, InsertIfAbsent
+    // on a not-yet-present key must land the first value ("A"), not the last ("B").
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::FeatureAppendWithPolicy {
+            key: "first-wins".to_string(),
+            points: vec![
+                FeaturePoint {
+                    timestamp_ms: 5,
+                    value: b"A".to_vec(),
+                },
+                FeaturePoint {
+                    timestamp_ms: 5,
+                    value: b"B".to_vec(),
+                },
+            ],
+            policy: FeatureWritePolicy::InsertIfAbsent,
+        },
+    });
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureQuery {
+                    key: "first-wins".to_string(),
+                    start_ms: 0,
+                    end_ms: 10,
+                    count: None,
+                },
+            })
+            .response,
+        CommandResponse::FeaturePoints {
+            points: vec![FeaturePoint {
+                timestamp_ms: 5,
+                value: b"A".to_vec(),
+            }]
+        },
+        "InsertIfAbsent must keep the FIRST in-batch duplicate value (FIRST policy), not the last"
+    );
+}
+
+#[test]
+fn feature_write_policy_sequence_batch_dimensions_and_control_state_precision_work() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::FeatureAppend {
+            key: "feature-policy".to_string(),
+            points: vec![FeaturePoint {
+                timestamp_ms: 10,
+                value: b"old".to_vec(),
+            }],
+        },
+    });
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureAppendWithPolicy {
+                    key: "feature-policy".to_string(),
+                    points: vec![FeaturePoint {
+                        timestamp_ms: 10,
+                        value: b"ignored".to_vec(),
+                    }],
+                    policy: FeatureWritePolicy::InsertIfAbsent,
+                },
+            })
+            .response,
+        CommandResponse::Integer { value: 0 }
+    );
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureAppendWithPolicy {
+                    key: "feature-policy".to_string(),
+                    points: vec![FeaturePoint {
+                        timestamp_ms: 10,
+                        value: b"new".to_vec(),
+                    }],
+                    policy: FeatureWritePolicy::ReplaceExisting,
+                },
+            })
+            .response,
+        CommandResponse::Integer { value: 1 }
+    );
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureQuery {
+                    key: "feature-policy".to_string(),
+                    start_ms: 0,
+                    end_ms: 20,
+                    count: None,
+                },
+            })
+            .response,
+        CommandResponse::FeaturePoints {
+            points: vec![FeaturePoint {
+                timestamp_ms: 10,
+                value: b"new".to_vec(),
+            }]
+        }
+    );
+
+    for (key, gid, action_type) in [("seq-a", 1, 7), ("seq-b", 2, 8)] {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::SequenceAdd {
+                key: key.to_string(),
+                rows: vec![SequenceFeatureRow {
+                    timestamp_ms: 100,
+                    gid,
+                    action_type,
+                    duration: 5,
+                    author_id: 9,
+                }],
+            },
+        });
+    }
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::SequenceBatchQuery {
+                    queries: vec![
+                        SequenceQuerySpec {
+                            key: "seq-a".to_string(),
+                            start_ms: 0,
+                            end_ms: 200,
+                            count: 10,
+                            filters: vec![FeatureFilter {
+                                field: "action_type".to_string(),
+                                op: FeatureFilterOp::Equal,
+                                value: 7,
+                            }],
+                        },
+                        SequenceQuerySpec {
+                            key: "seq-b".to_string(),
+                            start_ms: 0,
+                            end_ms: 200,
+                            count: 10,
+                            filters: Vec::new(),
+                        },
+                    ],
+                },
+            })
+            .response,
+        CommandResponse::SequenceRowGroups {
+            groups: vec![
+                (
+                    "seq-a".to_string(),
+                    vec![SequenceFeatureRow {
+                        timestamp_ms: 100,
+                        gid: 1,
+                        action_type: 7,
+                        duration: 5,
+                        author_id: 9,
+                    }],
+                ),
+                (
+                    "seq-b".to_string(),
+                    vec![SequenceFeatureRow {
+                        timestamp_ms: 100,
+                        gid: 2,
+                        action_type: 8,
+                        duration: 5,
+                        author_id: 9,
+                    }],
+                ),
+            ],
+        }
+    );
+
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::ControlStateIncrementWithOptions {
+            key: "control_state-bucket".to_string(),
+            timestamp_ms: 1_234,
+            amount: 3,
+            precision_ms: Some(1_000),
+            ttl_ms: Some(60_000),
+        },
+    });
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::ControlStateIncrementWithOptions {
+            key: "control_state-bucket".to_string(),
+            timestamp_ms: 1_999,
+            amount: 4,
+            precision_ms: Some(1_000),
+            ttl_ms: None,
+        },
+    });
+    assert_eq!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ControlStateDetail {
+                    key: "control_state-bucket".to_string(),
+                    start_ms: 0,
+                    end_ms: 2_000,
+                    count: None,
+                },
+            })
+            .response,
+        CommandResponse::FeaturePoints {
+            points: vec![FeaturePoint {
+                timestamp_ms: 1_000,
+                value: b"7".to_vec(),
+            }]
+        }
+    );
+    assert!(matches!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::CommonTtl {
+                    key: "control_state-bucket".to_string(),
+                },
+            })
+            .response,
+        CommandResponse::Integer { value } if value > 0
+    ));
+}
+
+#[test]
+fn maxmemory_config_rejects_writes_when_storage_budget_is_exhausted() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    engine.set_config(SetConfigRequest {
+        shard_id: 1,
+        config: Config {
+            version: 2,
+            maxmemory_bytes: Some(0),
+            ..Config::default()
+        },
+    });
+
+    let rejected = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "first".to_string(),
+            value: b"y".to_vec(),
+        },
+    });
+    assert_eq!(rejected.status.code, "storage_quota_exceeded");
+}
+
+#[test]
+fn write_qps_config_rejects_writes_after_admission_limit() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    engine.set_config(SetConfigRequest {
+        shard_id: 1,
+        config: Config {
+            version: 2,
+            write_qps: Some(1),
+            ..Config::default()
+        },
+    });
+    wait_for_fresh_admission_second();
+
+    assert!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "first".to_string(),
+                    value: b"x".to_vec(),
+                },
+            })
+            .status
+            .ok
+    );
+    let rejected = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "second".to_string(),
+            value: b"y".to_vec(),
+        },
+    });
+    assert_eq!(rejected.status.code, "admission_rejected");
+    assert_eq!(rejected.status.message, "write_qps limit exceeded");
+}
+
+#[test]
+fn write_qps_zero_means_unlimited_not_deny_all_like_native() {
+    // A configured qps of 0 is UNLIMITED, not deny-all. The live admission path must not push
+    // a limit==0, which the downstream gate rejects as "is zero". Regression for the case where
+    // the >0 filter existed only in an orphaned, never-compiled module.
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    engine.set_config(SetConfigRequest {
+        shard_id: 1,
+        config: Config {
+            version: 2,
+            write_qps: Some(0),
+            read_qps: Some(0),
+            ..Config::default()
+        },
+    });
+    wait_for_fresh_admission_second();
+    for i in 0..5 {
+        let resp = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("k{i}"),
+                value: b"v".to_vec(),
+            },
+        });
+        assert!(
+            resp.status.ok,
+            "write_qps=0 must be unlimited, not deny-all (got {:?})",
+            resp.status
+        );
+    }
+    // read_qps=0 likewise unlimited.
+    for i in 0..5 {
+        let resp = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: format!("k{i}"),
+            },
+        });
+        assert!(resp.status.ok, "read_qps=0 must be unlimited (got {:?})", resp.status);
+    }
+}
+
+#[test]
+fn table_and_tenant_qps_zero_mean_unlimited_like_the_shard_knob() {
+    // The shard knob above pins 0 = unlimited. The table and tenant knobs have identical shape
+    // and must mean the same thing. A 0 that denied every request here, while `write_qps: 0`
+    // eight lines away meant no limit, is a trap an operator falls into by reading one knob and
+    // assuming the next: setting `table_write_qps: 0` to mean "no table limit" took the table
+    // completely offline instead.
+    let engine = TemporalEngine::default();
+    assert!(
+        engine
+            .load_shard_with(LoadShardRequest {
+                shard_id: 1,
+                load_version: 1,
+                local_node_id: Some(1),
+                shard_uri: "local://feature_table/1".to_string(),
+                start_routing_bucket: 0,
+                end_routing_bucket: u32::MAX,
+                readonly: false,
+                table_name: "feature_table".to_string(),
+            })
+            .status
+            .ok
+    );
+    engine.set_config(SetConfigRequest {
+        shard_id: 1,
+        config: Config {
+            version: 2,
+            table_write_qps: Some(0),
+            table_read_qps: Some(0),
+            tenant_write_qps: Some(0),
+            tenant_read_qps: Some(0),
+            tenant_name: Some("a_tenant".to_string()),
+            ..Config::default()
+        },
+    });
+    wait_for_fresh_admission_second();
+    for i in 0..5 {
+        let wrote = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("k{i}"),
+                value: b"v".to_vec(),
+            },
+        });
+        assert!(
+            wrote.status.ok,
+            "a table/tenant write qps of 0 must be unlimited (got {:?})",
+            wrote.status
+        );
+        let read = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: format!("k{i}"),
+            },
+        });
+        assert!(
+            read.status.ok,
+            "a table/tenant read qps of 0 must be unlimited (got {:?})",
+            read.status
+        );
+    }
+}
+
+#[test]
+fn read_qps_config_rejects_reads_after_admission_limit() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    assert!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "first".to_string(),
+                    value: b"x".to_vec(),
+                },
+            })
+            .status
+            .ok
+    );
+    engine.set_config(SetConfigRequest {
+        shard_id: 1,
+        config: Config {
+            version: 2,
+            read_qps: Some(1),
+            ..Config::default()
+        },
+    });
+    wait_for_fresh_admission_second();
+
+    assert!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: "first".to_string(),
+                },
+            })
+            .status
+            .ok
+    );
+    let rejected = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "first".to_string(),
+        },
+    });
+    assert_eq!(rejected.status.code, "admission_rejected");
+    assert_eq!(rejected.status.message, "read_qps limit exceeded");
+}
+
+#[test]
+fn table_write_qps_config_is_shared_across_loaded_table_shards() {
+    let engine = TemporalEngine::default();
+    for shard_id in [1, 2] {
+        assert!(
+            engine
+                .load_shard_with(LoadShardRequest {
+                    shard_id,
+                    load_version: 1,
+                    local_node_id: Some(1),
+                    shard_uri: format!("local://feature_table/{shard_id}"),
+                    start_routing_bucket: 0,
+                    end_routing_bucket: u32::MAX,
+                    readonly: false,
+                    table_name: "feature_table".to_string(),
+                })
+                .status
+                .ok
+        );
+        engine.set_config(SetConfigRequest {
+            shard_id,
+            config: Config {
+                version: 2,
+                table_write_qps: Some(1),
+                ..Config::default()
+            },
+        });
+    }
+    wait_for_fresh_admission_second();
+
+    assert!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "first".to_string(),
+                    value: b"x".to_vec(),
+                },
+            })
+            .status
+            .ok
+    );
+    let rejected = engine.execute(ExecuteRequest {
+        shard_id: 2,
+        command: Command::StringSet {
+            key: "second".to_string(),
+            value: b"y".to_vec(),
+        },
+    });
+    assert_eq!(rejected.status.code, "admission_rejected");
+    assert_eq!(rejected.status.message, "table_write_qps limit exceeded");
+}
+
+#[test]
+fn tenant_read_qps_config_is_shared_across_tables() {
+    let engine = TemporalEngine::default();
+    for (shard_id, table_name, key) in [(1, "feature_table", "k1"), (2, "control_state_table", "k2")] {
+        assert!(
+            engine
+                .load_shard_with(LoadShardRequest {
+                    shard_id,
+                    load_version: 1,
+                    local_node_id: Some(1),
+                    shard_uri: format!("local://{table_name}/{shard_id}"),
+                    start_routing_bucket: 0,
+                    end_routing_bucket: u32::MAX,
+                    readonly: false,
+                    table_name: table_name.to_string(),
+                })
+                .status
+                .ok
+        );
+        assert!(
+            engine
+                .execute(ExecuteRequest {
+                    shard_id,
+                    command: Command::StringSet {
+                        key: key.to_string(),
+                        value: b"value".to_vec(),
+                    },
+                })
+                .status
+                .ok
+        );
+        engine.set_config(SetConfigRequest {
+            shard_id,
+            config: Config {
+                version: 2,
+                tenant_name: Some("tenant-a".to_string()),
+                tenant_read_qps: Some(1),
+                ..Config::default()
+            },
+        });
+    }
+    wait_for_fresh_admission_second();
+
+    assert!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: "k1".to_string(),
+                },
+            })
+            .status
+            .ok
+    );
+    let rejected = engine.execute(ExecuteRequest {
+        shard_id: 2,
+        command: Command::StringGet {
+            key: "k2".to_string(),
+        },
+    });
+    assert_eq!(rejected.status.code, "admission_rejected");
+    assert_eq!(rejected.status.message, "tenant_read_qps limit exceeded");
+}
+
+#[test]
+fn stats_include_style_partition_and_object_manager_accounting() {
+    let engine = TemporalEngine::default();
+    assert!(
+        engine
+            .load_shard_with(LoadShardRequest {
+                shard_id: 9,
+                load_version: 77,
+                local_node_id: Some(3),
+                shard_uri: "local://table/shard-9".to_string(),
+                start_routing_bucket: 10,
+                end_routing_bucket: 20,
+                readonly: false,
+                table_name: "feature_table".to_string(),
+            })
+            .status
+            .ok
+    );
+    for command in [
+        Command::StringSet {
+            key: "string-key".to_string(),
+            value: b"v".to_vec(),
+        },
+        Command::HashSet {
+            key: "hash-key".to_string(),
+            field: "a".to_string(),
+            value: b"1".to_vec(),
+        },
+        Command::HashSet {
+            key: "hash-key".to_string(),
+            field: "b".to_string(),
+            value: b"2".to_vec(),
+        },
+        Command::SetAdd {
+            key: "set-key".to_string(),
+            member: b"m1".to_vec(),
+        },
+        Command::SetAdd {
+            key: "set-key".to_string(),
+            member: b"m2".to_vec(),
+        },
+        Command::FeatureAppend {
+            key: "feature-key".to_string(),
+            points: vec![
+                FeaturePoint {
+                    timestamp_ms: 1,
+                    value: b"f1".to_vec(),
+                },
+                FeaturePoint {
+                    timestamp_ms: 2,
+                    value: b"f2".to_vec(),
+                },
+            ],
+        },
+        Command::SequenceAdd {
+            key: "sequence-key".to_string(),
+            rows: vec![
+                SequenceFeatureRow {
+                    timestamp_ms: 10,
+                    gid: 1,
+                    action_type: 2,
+                    duration: 3,
+                    author_id: 4,
+                },
+                SequenceFeatureRow {
+                    timestamp_ms: 20,
+                    gid: 5,
+                    action_type: 6,
+                    duration: 7,
+                    author_id: 8,
+                },
+            ],
+        },
+        Command::ControlStateSet {
+            family: ControlStateFamily::Distinct,
+            key: "control_state-key".to_string(),
+            timestamp_ms: 40,
+            amount: 5,
+        },
+    ] {
+        assert!(
+            engine
+                .execute(ExecuteRequest {
+                    shard_id: 9,
+                    command,
+                })
+                .status
+                .ok
+        );
+    }
+
+    let stats = engine.get_stats(9).stats.unwrap();
+    assert_eq!(stats.total_records, 6);
+    assert_eq!(stats.object_manager.object_count, 6);
+    assert_eq!(stats.object_manager.block_ref_count, 9);
+    assert_eq!(stats.object_manager.dirty_object_count, 6);
+    assert!(stats.object_manager.dirty_bucket_count > 0);
+    assert!(stats.object_manager.dirty_bucket_count <= 6);
+    assert_eq!(stats.object_manager.routing_bucket_count, 11);
+    assert_eq!(stats.shard_stat_info.table_name, "feature_table");
+    assert_eq!(stats.shard_stat_info.shard_uri, "local://table/shard-9");
+    assert_eq!(stats.shard_stat_info.start_routing_bucket, 10);
+    assert_eq!(stats.shard_stat_info.end_routing_bucket, 20);
+    assert_eq!(stats.shard_stat_info.object_manager, stats.object_manager);
+    assert!(stats.block_store_slabs.active_slabs >= 1);
+    assert!(stats.block_store_slabs.active_physical_bytes > 0);
+    assert_eq!(
+        stats.block_store_slabs.live_physical_bytes,
+        stats.block_store_slabs.active_physical_bytes
+            + stats.block_store_slabs.sealed_physical_bytes
+    );
+}
+
+#[test]
+fn prometheus_metrics_include_records_cache_block_and_wal() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        },
+    });
+    let _ = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    engine.block_store().roll_slab().unwrap();
+
+    let metrics = engine.prometheus_metrics();
+    assert!(metrics.contains("temporalstore_shard_records{shard_id=\"1\",kind=\"string\"} 1"));
+    assert!(metrics.contains("temporalstore_cache_operations_total"));
+    assert!(metrics.contains(
+        "temporalstore_cache_operations_total{shard_id=\"1\",kind=\"memory_evictions\"}"
+    ));
+    assert!(metrics.contains("temporalstore_block_store_operations_total"));
+    assert!(metrics
+        .contains("temporalstore_block_store_slab_count{shard_id=\"1\",state=\"sealed\"} 1"));
+    assert!(
+        metrics.contains("temporalstore_block_store_slab_bytes{shard_id=\"1\",kind=\"live\"}")
+    );
+    assert!(metrics
+        .contains("temporalstore_block_store_slab_bytes{shard_id=\"1\",kind=\"total_known\"}"));
+    assert!(metrics.contains(
+        "temporalstore_block_store_slab_oldest_unix_ms{shard_id=\"1\",scope=\"known\"}"
+    ));
+    assert!(metrics.contains(
+        "temporalstore_block_store_slab_oldest_unix_ms{shard_id=\"1\",scope=\"live\"}"
+    ));
+    assert!(metrics.contains(
+        "temporalstore_block_store_slab_oldest_age_ms{shard_id=\"1\",scope=\"known\"}"
+    ));
+    assert!(metrics
+        .contains("temporalstore_block_store_slab_oldest_age_ms{shard_id=\"1\",scope=\"live\"}"));
+    assert!(metrics.contains("temporalstore_wal_records_total{shard_id=\"1\"} 1"));
+    assert!(metrics.contains("temporalstore_wal_records_total{shard_id=\"1\"} 1"));
+    assert!(metrics.contains("temporalstore_object_manager_objects{shard_id=\"1\"} 1"));
+    assert!(metrics.contains("temporalstore_object_manager_block_refs{shard_id=\"1\"} 1"));
+    assert!(metrics.contains("temporalstore_object_manager_dirty_objects{shard_id=\"1\"} 1"));
+    assert!(metrics.contains("temporalstore_storage_bucket_block_refs{shard_id=\"1\""));
+    assert!(metrics.contains("temporalstore_storage_bucket_bytes{shard_id=\"1\""));
+    assert!(metrics.contains("temporalstore_storage_bucket_dirty_objects{shard_id=\"1\""));
+    assert!(metrics.contains("temporalstore_partition_routing_buckets{shard_id=\"1\"} 4294967295"));
+}
+
+/// The exported label beside a `..._bucket_...` metric must be spelled `bucket`.
+///
+/// It was spelled `slot` while all four metric names already said bucket, so a query written from
+/// the metric name -- `temporalstore_storage_bucket_bytes{bucket="3"}` -- returned nothing, and had
+/// to be written `{slot="3"}`, which nothing in the name suggested.
+///
+/// Pinned here because NOTHING pinned it before, which is how it drifted: the gateway reads only
+/// the `kind` label, the shipped dashboard selects by metric name with no label filter, and the
+/// assertions in the test above match on `shard_id`, which is the FIRST label. So neither the
+/// original drift nor its correction could fail a test.
+#[test]
+fn the_bucket_metrics_emit_a_bucket_label_and_never_a_slot_one() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        },
+    });
+    let _ = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "k".to_string(),
+        },
+    });
+    engine.block_store().roll_slab().unwrap();
+    let metrics = engine.prometheus_metrics();
+
+    // Every series whose NAME says bucket carries a label KEY that says bucket.
+    for name in [
+        "temporalstore_storage_bucket_block_refs",
+        "temporalstore_storage_bucket_bytes",
+        "temporalstore_storage_bucket_dirty_objects",
+    ] {
+        let needle = format!("{name}{{shard_id=\"1\",bucket=\"");
+        assert!(
+            metrics.contains(&needle),
+            "{name} must spell its routing-bucket label `bucket`; emitted:\n{}",
+            metrics
+                .lines()
+                .filter(|line| line.starts_with(name))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    // The control, and it is what makes the three assertions above mean anything: `bucket` being
+    // present would not prove `slot` had gone, because both could be emitted. Deliberately global
+    // rather than per-series -- no exported metric may spell a routing bucket `slot`.
+    assert!(
+        !metrics.contains("slot=\""),
+        "the exported surface still spells a label `slot`:\n{}",
+        metrics
+            .lines()
+            .filter(|line| line.contains("slot=\""))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // And the value is still read from the routing bucket rather than from whatever was nearest:
+    // a rename that kept the key and changed the source would satisfy everything above.
+    let line = metrics
+        .lines()
+        .find(|line| line.starts_with("temporalstore_storage_bucket_block_refs"))
+        .expect("the block-refs series is emitted");
+    let value = line
+        .split("bucket=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the bucket label carries a value");
+    assert!(
+        value.parse::<u32>().is_ok(),
+        "the bucket label must carry a routing bucket number, got {value:?} in {line:?}"
+    );
+}
+
+#[test]
+fn bucket_storage_summaries_track_live_refs_dirty_buckets_and_manifest_sequence() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard_with(LoadShardRequest {
+        shard_id: 1,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 10,
+        end_routing_bucket: 12,
+        readonly: false,
+        table_name: String::new(),
+    });
+    for key in ["alpha", "beta", "gamma"] {
+        assert!(
+            engine
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: key.to_string(),
+                        value: key.as_bytes().to_vec(),
+                    },
+                })
+                .status
+                .ok
+        );
+    }
+
+    let summaries = engine.bucket_storage_summaries(1);
+    assert!(!summaries.is_empty());
+    assert_eq!(
+        summaries
+            .iter()
+            .map(|summary| summary.block_ref_count)
+            .sum::<u64>(),
+        3
+    );
+    assert_eq!(
+        summaries
+            .iter()
+            .map(|summary| summary.dirty_object_count)
+            .sum::<u64>(),
+        3
+    );
+    let dirty_bucket = summaries
+        .iter()
+        .find(|summary| summary.dirty_object_count > 0)
+        .unwrap()
+        .routing_bucket;
+    let manifest = engine
+        .create_bucket_dump_manifest(1, [dirty_bucket])
+        .expect("slot dump manifest should persist");
+    engine.validate_bucket_dump_manifest(&manifest).unwrap();
+    let summaries = engine.bucket_storage_summaries(1);
+    assert!(summaries
+        .iter()
+        .filter(|summary| summary.routing_bucket == dirty_bucket)
+        .all(|summary| summary.last_dump_sequence == manifest.index_log_sequence));
+}
+
+#[test]
+fn rebuild_bucket_block_ownership_preserves_dirty_watermarks() {
+    // rebuild clears + rebuilds bucket_map from the model maps; it must carry over the durable
+    // per-bucket dirty_generation. Rebuilding it from BucketNode::default() (as manifest-install
+    // / promote do) zeroed the watermark, making a restored shard mismatch its own dump-manifest
+    // generation and forcing unnecessary re-dumps.
+    //
+    // ONE watermark, where this checked two. `last_dump_sequence` no longer exists on the node --
+    // it was read into two reports and nothing else, and the report takes it from the newest dump
+    // manifest. There is nothing left for the rebuild to carry over, and
+    // `the_summary_last_dump_sequence_comes_from_the_manifest_not_from_the_node` is what holds
+    // that the surviving figure is the manifest's.
+    // THE BUCKET IS DERIVED FROM THE KEY, not chosen. This fixture used to file the page under
+    // bucket 3 by writing `Some(3)` into the ADDRESS and letting the rebuild read it back; the rebuild
+    // derives from the object key over the range it is handed now, so a hand-picked bucket id names a
+    // bucket the rebuild will not produce. Deriving here asserts the same property -- a watermark
+    // survives the rebuild -- against the filing the rebuild actually performs.
+    let mut shard = ShardState::default();
+    let derived_bucket = crate::engine::hashing::bucket_for_object("k", 0, u32::MAX);
+    shard.set_string_address(
+        "k".into(), &ElementEntry::from_parts(1, 0, 4, Some(1), Some(30)),
+    );
+    shard.bucket_index.bucket_map.insert(
+        derived_bucket,
+        BucketNode {
+            routing_bucket: derived_bucket,
+            flags: BucketFlags::default().with(BucketFlags::META_LOADED, true),
+            dirty_generation: 7,
+            ..BucketNode::default()
+        },
+    );
+    rebuild_bucket_block_ownership(1, &mut shard, 0, u32::MAX);
+    let bucket = shard
+        .bucket_index
+        .bucket_map
+        .get(&derived_bucket)
+        .expect("the bucket the key routes to should be rebuilt from the string page");
+    assert!(!bucket.block_index.is_empty(), "the page should be re-indexed");
+    assert_eq!(
+        bucket.dirty_generation, 7,
+        "dirty_generation must survive the rebuild"
+    );
+}
+
+// shared-corpus: storage_dump_load_recovery
+#[test]
+fn bucket_block_ownership_is_first_class_and_survives_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard_with(LoadShardRequest {
+        shard_id: 1,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 10,
+        end_routing_bucket: 12,
+        readonly: false,
+        table_name: String::new(),
+    });
+    for field in ["field-a", "field-b"] {
+        assert!(
+            engine
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::HashSet {
+                        key: "hash-key".to_string(),
+                        field: field.to_string(),
+                        value: field.as_bytes().to_vec(),
+                    },
+                })
+                .status
+                .ok
+        );
+    }
+
+    let physical_before_reload = engine.storage_physical_index_report(1);
+    assert!(physical_before_reload.bucket_index_authority);
+    assert_eq!(physical_before_reload.block_index_count, 2);
+    assert_eq!(physical_before_reload.dirty_bucket_count, 1);
+    assert_eq!(physical_before_reload.missing_object_id_count, 0);
+    assert_eq!(physical_before_reload.missing_routing_bucket_count, 0);
+    assert!(physical_before_reload.bucket_nodes.iter().any(|bucket| {
+        bucket.block_ref_count == 2
+            // ONE OBJECT, TWO PAGES. This pinned `object_count == 2` -- two hash fields of one
+            // key were two OBJECTS, because the id folded the component in. They are two
+            // ELEMENTS of one object now, so `object_index` holds one row and the pair
+            // (2 pages, 1 object) is what `classify_bucket_layout` calls `MultiBlockObject`.
+            // The page count beside it is left at 2 deliberately: it is what says the
+            // collapse is of the IDENTITY and not of the pages.
+            && bucket.object_count == 1
+            && bucket.dirty_generation >= 2
+            && bucket.block_indexes.iter().all(|block| {
+                block.model_id == "hash" && block.dirty && !block.deleted && !block.log_backed
+            })
+    }));
+    assert_eq!(
+        engine
+            .bucket_storage_summaries(1)
+            .iter()
+            .map(|summary| summary.object_count)
+            .sum::<u64>(),
+        // ONE, not two: `object_count` is `bucket.object_index.len()` and the two hash
+        // fields of this key are two ELEMENTS of one object since the component left
+        // the identity.
+        1
+    );
+    let ownership = engine.bucket_object_block_ownership_report(1);
+    assert!(ownership.first_class_index_present);
+    assert!(!ownership.derived_from_model_maps);
+    assert_eq!(ownership.block_ref_count, 2);
+    assert_eq!(ownership.missing_owner_block_ref_count, 0);
+    assert_eq!(ownership.owner_mismatch_block_ref_count, 0);
+    let physical = engine.storage_physical_index_report(1);
+    assert!(physical.bucket_index_authority);
+    assert_eq!(physical.block_index_count, 2);
+    assert_eq!(physical.dirty_bucket_count, 1);
+
+    engine.unload_shard(1);
+    engine.load_shard_with(LoadShardRequest {
+        shard_id: 1,
+        load_version: 1,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 10,
+        end_routing_bucket: 12,
+        readonly: false,
+        table_name: String::new(),
+    });
+    let physical_after_reload = engine.storage_physical_index_report(1);
+    assert!(physical_after_reload.bucket_index_authority);
+    assert_eq!(physical_after_reload.block_index_count, 2);
+    assert_eq!(physical_after_reload.dirty_bucket_count, 0);
+    assert!(physical_after_reload
+    // AND THE COLLAPSED IDENTITY SURVIVES THE RELOAD: still two pages, still one object.
+        .bucket_nodes
+        .iter()
+        .any(|bucket| bucket.block_ref_count == 2 && bucket.object_count == 1));
+    let reloaded_ownership = engine.bucket_object_block_ownership_report(1);
+    assert!(reloaded_ownership.first_class_index_present);
+    assert!(!reloaded_ownership.derived_from_model_maps);
+    assert_eq!(reloaded_ownership.block_ref_count, 2);
+    assert_eq!(reloaded_ownership.missing_owner_block_ref_count, 0);
+    assert_eq!(reloaded_ownership.owner_mismatch_block_ref_count, 0);
+    let reloaded_physical = engine.storage_physical_index_report(1);
+    assert!(reloaded_physical.bucket_index_authority);
+    assert_eq!(reloaded_physical.block_index_count, 2);
+}
+
+// shared-corpus: storage_dump_load_recovery
+#[test]
+fn bucket_index_is_authoritative_when_secondary_views_are_missing() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "slot-authority".to_string(),
+                    value: b"slot-value".to_vec(),
+                },
+            })
+            .status
+            .ok
+    );
+
+    {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard loaded");
+        assert!(!shard.bucket_index.bucket_map.is_empty());
+        shard.strings_mut().clear();
+        shard.hashes.clear_for_test();
+        shard.sets.clear_for_test();
+    }
+
+    let exists = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::CommonExists {
+            key: "slot-authority".to_string(),
+        },
+    });
+    assert!(exists.status.ok);
+    assert_eq!(exists.response, CommandResponse::Integer { value: 1 });
+
+    let get = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "slot-authority".to_string(),
+        },
+    });
+    assert!(get.status.ok);
+    assert_eq!(
+        get.response,
+        CommandResponse::Bytes {
+            value: Some(b"slot-value".to_vec())
+        }
+    );
+}
+
+// shared-corpus: storage_recovery_reconciles_bucket_index_to_model_views
+#[test]
+fn storage_recovery_uses_bucket_index_not_stale_secondary_model_maps() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "slot-authority".to_string(),
+                    value: b"authoritative".to_vec(),
+                },
+            })
+            .status
+            .ok
+    );
+
+    {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard loaded");
+        assert!(!shard.bucket_index.bucket_map.is_empty());
+        let stale = shard
+            .strings_mut()
+            .get_mut("slot-authority")
+            .expect("secondary string view");
+        // The object id used to be planted here too. An address holds none, so what makes this
+        // address STALE is the slab coordinates below -- which is the whole of what a reader reads
+        // off it.
+        // The routing bucket used to be planted here too. An address does not hold one, so what
+        // made this address STALE is now the object id and the slab coordinates below -- which is
+        // the whole of what a reader reads off it.
+        // The slab id is half of one packed word now, so it is planted by rebuilding the address
+        // through the checked constructor rather than by assigning a field. Every other part is
+        // carried across unchanged, which is what makes this a STALE address and not a new one.
+        // THROUGH THE SETTER, because the row is a slot: `set_address` rewrites the page words
+        // and leaves the deadline, the model id and the dirty bit alone, which is what makes this
+        // a stale ADDRESS rather than a replaced row.
+        let planted = ElementEntry::from_parts(
+            stale.block_slab_id().wrapping_add(999),
+            stale.offset(),
+            stale.length(),
+            stale.block_id(),
+            None,
+        );
+        stale.set_address(&planted);
+    }
+
+    let recovery = engine.storage_recovery_report(1);
+    assert_eq!(recovery.total_block_refs, 1);
+    assert_eq!(recovery.readable_block_refs, 1);
+    assert!(recovery.all_live_blocks_readable);
+    assert!(recovery.owner_mismatch_block_refs.is_empty());
+    assert_eq!(recovery.missing_owner_block_refs, 0);
+    assert_eq!(recovery.object_lifecycle.owner_mismatch_block_refs, 0);
+    assert_eq!(recovery.slab_integrity.owner_mismatch_block_ref_count, 0);
+    assert!(recovery.slab_integrity.integrity_ok);
+}
+
+// shared-corpus: storage_dump_load_recovery
+#[test]
+fn legacy_model_maps_are_promoted_to_bucket_index_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "legacy-map".to_string(),
+                    value: b"promoted".to_vec(),
+                },
+            })
+            .status
+            .ok
+    );
+
+    {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard loaded");
+        assert!(!shard.strings().is_empty());
+        shard.bucket_index.bucket_map.clear();
+    }
+
+    let get = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "legacy-map".to_string(),
+        },
+    });
+    assert!(get.status.ok);
+    assert_eq!(
+        get.response,
+        CommandResponse::Bytes {
+            value: Some(b"promoted".to_vec())
+        }
+    );
+    let physical = engine.storage_physical_index_report(1);
+    assert!(physical.bucket_index_authority);
+    assert_eq!(physical.block_index_count, 1);
+    assert_eq!(physical.missing_object_id_count, 0);
+    assert_eq!(physical.missing_routing_bucket_count, 0);
+}
+
+// shared-corpus: storage_cold_read_page_address_fallback
+#[test]
+fn cold_read_uses_bucket_block_address_after_cache_and_model_maps_are_cleared() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .execute_durable(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "cold-slot-read".to_string(),
+                    value: b"from-disk".to_vec(),
+                },
+            })
+            .status
+            .ok
+    );
+
+    {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard loaded");
+        assert!(!shard.bucket_index.bucket_map.is_empty());
+        shard.strings_mut().clear();
+    }
+    let _ = engine
+        .cache()
+        .invalidate(&CacheKey::string(1, "cold-slot-read"));
+    engine.cache().clear_memory_for_test();
+    let block_reads_before = engine.block_store().stats().reads;
+
+    let get = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "cold-slot-read".to_string(),
+        },
+    });
+    assert!(get.status.ok);
+    assert_eq!(
+        get.response,
+        CommandResponse::Bytes {
+            value: Some(b"from-disk".to_vec())
+        }
+    );
+    assert!(engine.block_store().stats().reads > block_reads_before);
+}
+
+// shared-corpus: storage_recovery_reconciles_bucket_index_to_model_views
+#[test]
+fn recovery_reconciles_model_views_from_bucket_index_authority() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(1024, &cache_dir, &block_dir, &index_dir);
+    engine.load_shard(1);
+    assert!(
+        engine
+            .execute_durable(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "recover-slot-view".to_string(),
+                    value: b"view".to_vec(),
+                },
+            })
+            .status
+            .ok
+    );
+    engine.unload_shard(1);
+
+    // Empty the string map and put it back through the same encoder that wrote it. Injecting the
+    // fault as JSON text quietly required the index to BE JSON, which is not what this test is
+    // about -- it is about recovery rebuilding the strings from the bucket index.
+    let index_path = index_dir.join("shard-1.index.json");
+    let mut damaged =
+        crate::engine::decode_index_bytes(&std::fs::read(&index_path).expect("index file"))
+            .expect("served index decodes");
+    damaged.strings_mut().clear();
+    std::fs::write(&index_path, crate::engine::encode_index_bytes(&damaged)).unwrap();
+
+    let recovered = TemporalEngine::with_local_dirs(1024, &cache_dir, &block_dir, &index_dir);
+    recovered.load_shard(1);
+    {
+        let shards = recovered.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("recovered shard");
+        assert!(shard.strings().contains_key("recover-slot-view"));
+    }
+    let get = recovered.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "recover-slot-view".to_string(),
+        },
+    });
+    assert_eq!(
+        get.response,
+        CommandResponse::Bytes {
+            value: Some(b"view".to_vec())
+        }
+    );
+}
+
+// shared-corpus: storage_dump_load_recovery
+#[test]
+fn core_index_loads_legacy_bucket_page_field_names() {
+    let legacy_json = r#"{
+        "slots": {
+            "7": {
+                "routing_slot": 7,
+                "layout": "SingleBlockObject",
+                "dirty": false,

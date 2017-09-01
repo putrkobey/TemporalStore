@@ -22,3 +22,27 @@ const clockStart = page.indexOf("var liveServerMs = 0;");
 const clockBlock = page.slice(clockStart, page.indexOf("function liveStream(options)"));
 
 const parts = [
+  clockBlock,
+  slice("function liveStream(options)"),
+  "var CLOCK_SKEW_NOTICE_MS = " +
+    /var CLOCK_SKEW_NOTICE_MS = (\d+);/.exec(page)[1] + ";",
+  slice("function clockNoteHtml()"),
+  slice("  function agoText(at)"),
+  slice("  function renderFailures(list)"),
+];
+
+// A browser whose clock is `input.browserOffsetMs` away from real time.
+const REAL_NOW = 1_760_000_000_000;
+const browserNow = () => REAL_NOW + (input.browserOffsetMs || 0);
+
+const frames = input.frames || [];
+const sse = frames.map((f) => "event: status\ndata: " + JSON.stringify(f) + "\n\n").join("");
+
+const nodes = {};
+const scope = {
+  Date: { now: browserNow },
+  fetch: () => Promise.resolve({
+    ok: true,
+    body: {
+      getReader: () => {
+        let sent = false;
