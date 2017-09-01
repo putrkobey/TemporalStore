@@ -498,3 +498,253 @@ async fn main() {
 
     // ---- TEETH FOR THE ONE CLAIM THAT CHECKS THIS REPORT'S OWN READER.
     // ----
+    // ---- Every field in the summary above is REPORTED, and a reported `false` still exits zero.
+    // ---- For most of them that is a choice about what this program is for. For this one it is a
+    // ---- hole: `direct_offset_slices_decode_expected_frames` is the result of decoding the log
+    // ---- frame with THIS FILE's own copy of the frame message, so it goes false precisely when
+    // ---- that copy has fallen behind the frame -- the one condition under which every other
+    // ---- offset claim in this report is being checked against a frame nobody parsed.
+    // ----
+    // ---- It has already happened once. When the frame's digest moved from tag 5 to tag 9 this
+    // ---- reader matched 0 of 8 frames, printed `false`, and the program exited successfully.
+    // ---- An assertion is the difference between that and a failure.
+    // ----
+    // ---- Deliberately only this field. The rest are pre-existing claims, and turning them all
+    // ---- into assertions in the same change would mix a guard with the question of what they
+    // ---- currently say -- which is its own investigation, not a side effect of this one.
+    assert!(
+        summary.direct_offset_slices_decode_expected_frames,
+        "this report's own reader decoded {} of {} log frames. It is a SECOND implementation of \
+         the frame reader, kept in step by hand, so the first thing to check is \
+         `ReportWalFrameProto` against `SharedStoreWalFrameProto` -- a field the frame has moved \
+         to and this reader does not know makes every frame read as unmatched. Fix the reader \
+         before trusting any other offset figure in this report",
+        direct_publish.offset_frame_validation.matched_frames,
+        direct_publish.offset_frame_validation.checked_frames,
+    );
+
+    let report = Report {
+        schema: "temporalstore_shared_store_append_blob_conformance_report_v1",
+        backend: "rust",
+        matrixobject_mode: "rust_matrixobject_incremental_journal_protobuf_append_blob",
+        entry_count,
+        value_bytes,
+        direct_publish,
+        sync_writer,
+        async_writer,
+        journal_reopen,
+        summary,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).expect("json report")
+    );
+}
+
+fn replay_report_uses_offset_index(report: &ReplayReport, entry_count: u64) -> bool {
+    report.applied == entry_count as usize
+        && report.offset_index_reads == entry_count as usize
+        && report.range_bytes_read > 0
+}
+
+fn matrixobject_options(persistent_journal_path: Option<&std::path::Path>) -> StoreOptions {
+    StoreOptions {
+        // `segment_size` became `slab_size` and is now `page_size`, following the store
+        // dropping its slab tier -- see the note at the matching site in
+        // `shared_store.rs`; the external name survives in the object-store crate's own bench.
+        // page_size must be < chunk_size -- see the note in the smoke example; the figures
+        // were a slab/chunk pair and had to be re-ordered rather than renamed.
+        page_size: 1024,
+        max_extent_bytes: 1024,
+        chunk_size: 4096,
+        persistent_journal_path: persistent_journal_path
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default(),
+        ..StoreOptions::default()
+    }
+}
+
+async fn run_direct_publish(
+    root: &std::path::Path,
+    store: Arc<MatrixObjectObjectStore>,
+    replicator: &SharedStoreReplicator<MatrixObjectObjectStore>,
+    shard_id: u64,
+    entry_count: u64,
+    value_bytes: usize,
+) -> PublishPhaseReport {
+    let mut append_receipts = Vec::new();
+    let mut publish_latencies_us = Vec::new();
+    for index in 1..=entry_count {
+        let start = Instant::now();
+        let receipt = replicator
+            .publish_wal_entry(entry(shard_id, index, "direct", value_bytes))
+            .await
+            .expect("direct publish");
+        publish_latencies_us.push(start.elapsed().as_micros());
+        append_receipts.push(receipt.expect("protobuf append receipt"));
+    }
+    let blob_key = blob_key(shard_id);
+    let metadata = matrixobject_metadata(&store, &blob_key);
+    let offset_frame_validation =
+        validate_offset_frames(&store, &blob_key, &append_receipts, shard_id);
+    let offset_metadata = replicator
+        .load_wal_offset_metadata(shard_id)
+        .await
+        .expect("offset metadata");
+    let offset_index_validation =
+        validate_offset_index(&blob_key, &append_receipts, &offset_metadata);
+    let offset_metadata_mappings = build_offset_metadata_mappings(
+        &offset_metadata,
+        Some(&expected_offsets_from_receipts(&append_receipts)),
+    );
+    let authoritative_offset_lookup = validate_authoritative_offset_lookup(
+        replicator,
+        shard_id,
+        entry_count,
+        "direct",
+        value_bytes,
+    )
+    .await;
+    PublishPhaseReport {
+        shard_id,
+        blob_key,
+        publish_latencies_us,
+        append_receipts,
+        offset_metadata_mappings,
+        blob_object_length: metadata.length,
+        blob_physical_slab_count: metadata.extents.len(),
+        offset_frame_validation,
+        offset_index_validation,
+        authoritative_offset_lookup,
+        replay: replay_and_retrieve(root, replicator, shard_id, entry_count, "direct").await,
+    }
+}
+
+async fn run_sync_writer(
+    root: &std::path::Path,
+    store: Arc<MatrixObjectObjectStore>,
+    replicator: &SharedStoreReplicator<MatrixObjectObjectStore>,
+    shard_id: u64,
+    entry_count: u64,
+    value_bytes: usize,
+) -> WriterPhaseReport {
+    let writer = replicator.storage_writer(SharedStoreStorageMode::Sync, 1);
+    let mut write_reports = Vec::new();
+    let mut write_latencies_us = Vec::new();
+    for index in 1..=entry_count {
+        let start = Instant::now();
+        let report = writer
+            .write(shard_id, command(shard_id, index, "sync", value_bytes))
+            .await
+            .expect("sync write");
+        write_latencies_us.push(start.elapsed().as_micros());
+        write_reports.push(report);
+    }
+    let blob_key = blob_key(shard_id);
+    let metadata = matrixobject_metadata(&store, &blob_key);
+    let offset_metadata = replicator
+        .load_wal_offset_metadata(shard_id)
+        .await
+        .expect("sync writer offset metadata");
+    let offset_metadata_mappings = build_offset_metadata_mappings(
+        &offset_metadata,
+        Some(&expected_offsets_from_write_reports(&write_reports)),
+    );
+    let authoritative_offset_lookup = validate_authoritative_offset_lookup(
+        replicator,
+        shard_id,
+        entry_count,
+        "sync",
+        value_bytes,
+    )
+    .await;
+    WriterPhaseReport {
+        shard_id,
+        write_latencies_us,
+        write_reports,
+        offset_metadata_mappings,
+        blob_object_length: metadata.length,
+        blob_physical_slab_count: metadata.extents.len(),
+        authoritative_offset_lookup,
+        replay: replay_and_retrieve(root, replicator, shard_id, entry_count, "sync").await,
+    }
+}
+
+async fn run_async_writer(
+    root: &std::path::Path,
+    store: Arc<MatrixObjectObjectStore>,
+    replicator: &SharedStoreReplicator<MatrixObjectObjectStore>,
+    shard_id: u64,
+    entry_count: u64,
+    value_bytes: usize,
+) -> AsyncWriterPhaseReport {
+    let writer = replicator.storage_writer(SharedStoreStorageMode::Async, 1);
+    let mut write_reports = Vec::new();
+    let mut enqueue_latencies_us = Vec::new();
+    for index in 1..=entry_count {
+        let start = Instant::now();
+        let report = writer
+            .write(shard_id, command(shard_id, index, "async", value_bytes))
+            .await
+            .expect("async enqueue");
+        enqueue_latencies_us.push(start.elapsed().as_micros());
+        write_reports.push(report);
+    }
+    let flush_start = Instant::now();
+    let flush_report = writer
+        .flush_pending(entry_count as usize)
+        .await
+        .expect("async flush");
+    let flush_latency_us = flush_start.elapsed().as_micros();
+    let blob_key = blob_key(shard_id);
+    let metadata = matrixobject_metadata(&store, &blob_key);
+    let offset_metadata = replicator
+        .load_wal_offset_metadata(shard_id)
+        .await
+        .expect("async writer offset metadata");
+    let offset_metadata_mappings = build_offset_metadata_mappings(&offset_metadata, None);
+    let authoritative_offset_lookup = validate_authoritative_offset_lookup(
+        replicator,
+        shard_id,
+        entry_count,
+        "async",
+        value_bytes,
+    )
+    .await;
+    AsyncWriterPhaseReport {
+        shard_id,
+        enqueue_latencies_us,
+        write_reports,
+        flush_latency_us,
+        flush_report,
+        offset_metadata_mappings,
+        blob_object_length: metadata.length,
+        blob_physical_slab_count: metadata.extents.len(),
+        authoritative_offset_lookup,
+        replay: replay_and_retrieve(root, replicator, shard_id, entry_count, "async").await,
+    }
+}
+
+async fn replay_and_retrieve(
+    root: &std::path::Path,
+    replicator: &SharedStoreReplicator<MatrixObjectObjectStore>,
+    shard_id: u64,
+    entry_count: u64,
+    phase: &str,
+) -> ReplayPhaseReport {
+    let follower = test_engine(root, &format!("follower-{phase}-{shard_id}"));
+    follower.load_shard(shard_id);
+    let replay_start = Instant::now();
+    let replay_report = replicator
+        .replay_wal_strict(shard_id, 0, &follower)
+        .await
+        .expect("replay");
+    let replay_latency_us = replay_start.elapsed().as_micros();
+
+    let (retrieved_records, retrieval_latencies_us) =
+        retrieve_records(&follower, shard_id, entry_count, phase);
+
+    let secondary = test_engine(root, &format!("secondary-{phase}-{shard_id}"));
+    secondary.load_shard(shard_id);
+    let secondary_replay_start = Instant::now();
+    let secondary_replay_report = replicator
