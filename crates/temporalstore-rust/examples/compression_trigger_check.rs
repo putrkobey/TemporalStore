@@ -68,3 +68,38 @@ fn write_event(engine: &TemporalEngine, node: u64, ts: u64) {
     assert!(matches!(r, CommandResponse::ContextObjectKey { .. }));
 }
 
+fn query_compression(engine: &TemporalEngine, node: u64) -> Vec<(u64, u64)> {
+    match engine
+        .execute(ExecuteRequest {
+            shard_id: SHARD_ID,
+            command: Command::ContextQueryCompressionEvents {
+                tenant_hash: TENANT,
+                node_hashes: vec![node],
+                start_time_ms: 0,
+                end_time_ms: 10_000_000,
+                limit: None,
+            },
+        })
+        .response
+    {
+        CommandResponse::ContextCompressionEvents { events, .. } => events
+            .into_iter()
+            .map(|e| (e.source_start_ms, e.source_end_ms))
+            .collect(),
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+fn main() {
+    // Enable the trigger with small thresholds so it fires quickly.
+    std::env::set_var("MATRIXARK_CONTEXT_COMPRESSION_ENABLED", "1");
+    std::env::set_var("MATRIXARK_CONTEXT_COMPRESSION_MAX_RAW_EVENTS", "8");
+    std::env::set_var("MATRIXARK_CONTEXT_COMPRESSION_KEEP_RECENT", "4");
+    std::env::set_var("MATRIXARK_CONTEXT_COMPRESSION_WINDOW", "4");
+    // Large age so only the count trigger is in play for this test.
+    std::env::set_var("MATRIXARK_CONTEXT_COMPRESSION_MAX_AGE_MS", "1000000000000");
+
+    let e = engine();
+    // 20 events at times 1000..1019 on one node.
+    for ts in 1000u64..1020 {
+        write_event(&e, NODE, ts);
