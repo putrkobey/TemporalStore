@@ -45,3 +45,99 @@ fn seed(engine: &TemporalEngine, keys: usize) {
             .with_async_storage(),
         );
         assert!(response.status.ok, "seed must ack at {item}: {response:?}");
+    }
+}
+
+fn engine_over(dir: &std::path::Path) -> TemporalEngine {
+    TemporalEngine::with_local_dirs(
+        64,
+        dir.join("cache"),
+        dir.join("blocks"),
+        dir.join("indexes"),
+    )
+}
+
+/// One reading: what the LOAD of a store of `keys` encoded.
+struct LoadCost {
+    keys: usize,
+    encodes: u64,
+    encode_bytes: u64,
+    served: usize,
+}
+
+/// Seed a store, close it, and measure what reopening it encodes.
+///
+/// `flush_before_close` is the control: it persists the base index and advances the watermark, so
+/// the reopen has no WAL tail beyond it and the replay fold does not run.
+fn load_cost(keys: usize, flush_before_close: bool) -> LoadCost {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let engine = engine_over(dir.path());
+        engine.load_shard(SHARD);
+        seed(&engine, keys);
+        let seeded = engine
+            .shards
+            .read()
+            .expect("engine lock poisoned")
+            .get(&SHARD)
+            .expect("shard is loaded")
+            .strings()
+            .len();
+        assert_eq!(
+            keys, seeded,
+            "the seed must have landed, or nothing below means anything"
+        );
+        if flush_before_close {
+            engine.flush_shard_index(SHARD);
+        }
+        // The engine drops here, so the reopen below has to rebuild from the disk.
+    }
+
+    // THE RESET IS AFTER THE CONSTRUCTION AND BEFORE THE LOAD, so the figure is the load's and
+    // not the engine's.
+    let engine = engine_over(dir.path());
+    crate::engine::shard_write_guard::reset_index_encode_counts();
+    engine.load_shard(SHARD);
+    let counts = crate::engine::shard_write_guard::index_encode_counts();
+
+    // THE REGIME. A load that served nothing did not load anything, and would report a
+    // flattering zero.
+    let served = engine
+        .shards
+        .read()
+        .expect("engine lock poisoned")
+        .get(&SHARD)
+        .expect("shard is loaded after a reopen")
+        .strings()
+        .len();
+    assert_eq!(
+        keys, served,
+        "the reopened engine serves {served} of {keys} key(s), so this is a load that lost rows \
+         rather than a load whose cost is being measured"
+    );
+
+    println!(
+        "flushed_before_close={flush_before_close:<5} keys={keys:<6} encodes={:<3} \
+         encode_bytes={:<9} served={served}",
+        counts.encodes_total, counts.encode_bytes_total
+    );
+    LoadCost {
+        keys,
+        encodes: counts.encodes_total,
+        encode_bytes: counts.encode_bytes_total,
+        served,
+    }
+}
+
+/// THE REPLAY FOLD'S CHECKPOINT IS ONE ENCODE PER LOAD, AND IT DOES NOT MULTIPLY.
+#[test]
+fn the_replay_fold_checkpoint_is_one_whole_index_encode_per_load() {
+    println!();
+    println!("--- reopened with a WAL tail beyond the persisted index ---");
+    let stale: Vec<LoadCost> = [500usize, 2_000]
+        .into_iter()
+        .map(|keys| load_cost(keys, false))
+        .collect();
+    println!("--- the control: flushed before close, so there is no tail to fold ---");
+    let flushed: Vec<LoadCost> = [500usize, 2_000]
+        .into_iter()
