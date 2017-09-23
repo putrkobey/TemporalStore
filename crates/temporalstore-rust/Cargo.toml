@@ -52,3 +52,31 @@ alloc-probe = []
 # otherwise stateless nodes. The store crate is Apache-2.0 open source and is
 # pinned by revision above, exactly as the cache and consensus dependencies
 # are, so this feature builds from a clean checkout with nothing to re-add.
+#
+# It is OFF BY DEFAULT and the code is fully gated by
+# `#[cfg(feature = "matrixobject")]`, because the backend is a deployment
+# choice rather than a default: a single-node store needs nothing of it.
+#
+# It was an inert stub for as long as the crate had no public source, and
+# "inert" meant nobody compiled it -- the examples drifted out of step with
+# the store's API while the stub hid it. Enabling it in CI is what keeps that
+# from happening again.
+matrixobject = ["dep:matrixobjectstore-rs"]
+
+# This example links the optional MatrixObjectStore crate; gate it behind the
+# `matrixobject` feature so the default `cargo build --all-targets` does not try
+# to compile it without the dependency enabled.
+[[example]]
+name = "shared_store_append_blob_conformance_report"
+required-features = ["matrixobject"]
+
+[[example]]
+name = "shared_store_append_blob_smoke"
+required-features = ["matrixobject"]
+
+[[example]]
+name = "three_node_shared_store_report"
+required-features = ["matrixobject"]
+
+[[example]]
+name = "scale_shared_store_report"
