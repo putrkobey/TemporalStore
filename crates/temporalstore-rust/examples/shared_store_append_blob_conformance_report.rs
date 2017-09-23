@@ -748,3 +748,253 @@ async fn replay_and_retrieve(
     secondary.load_shard(shard_id);
     let secondary_replay_start = Instant::now();
     let secondary_replay_report = replicator
+        .replay_wal_strict(shard_id, 0, &secondary)
+        .await
+        .expect("secondary replay");
+    let secondary_replay_latency_us = secondary_replay_start.elapsed().as_micros();
+    let (secondary_retrieved_records, _) =
+        retrieve_records(&secondary, shard_id, entry_count, phase);
+
+    let single_node_reload = test_engine(root, &format!("single-node-reload-{phase}-{shard_id}"));
+    single_node_reload.load_shard(shard_id);
+    let single_node_reload_start = Instant::now();
+    let single_node_reload_report = replicator
+        .replay_wal_strict(shard_id, 0, &single_node_reload)
+        .await
+        .expect("single-node reload replay");
+    let single_node_reload_latency_us = single_node_reload_start.elapsed().as_micros();
+    let (single_node_reload_retrieved_records, _) =
+        retrieve_records(&single_node_reload, shard_id, entry_count, phase);
+
+    ReplayPhaseReport {
+        replay_latency_us,
+        replay_report,
+        retrieval_latencies_us,
+        retrieved_records,
+        retrieval_ok: retrieved_records == entry_count,
+        secondary_replay_latency_us,
+        secondary_replay_report,
+        secondary_retrieved_records,
+        secondary_retrieval_ok: secondary_retrieved_records == entry_count,
+        single_node_reload_latency_us,
+        single_node_reload_report,
+        single_node_reload_retrieved_records,
+        single_node_reload_ok: single_node_reload_retrieved_records == entry_count,
+    }
+}
+
+async fn run_journal_reopen(
+    root: &std::path::Path,
+    persistent_journal_path: std::path::PathBuf,
+    direct_shard_id: u64,
+    entry_count: u64,
+    phases: &[&str],
+) -> JournalReopenReport {
+    let disk_read_start = Instant::now();
+    let journal_bytes = std::fs::read(&persistent_journal_path)
+        .expect("read persistent matrixobject journal bytes for checksum");
+    let snapshot_disk_read_latency_us = disk_read_start.elapsed().as_micros();
+    let snapshot_sha256 = sha256_hex(&journal_bytes);
+    let import_start = Instant::now();
+    let reopened_store = Arc::new(
+        MatrixObjectObjectStore::new(
+            "temporalstore-shared",
+            matrixobject_options(Some(&persistent_journal_path)),
+        )
+        .expect("reopen persistent matrixobject journal"),
+    );
+    let snapshot_import_latency_us = import_start.elapsed().as_micros();
+    let snapshot_export_latency_us = 0;
+    let snapshot_disk_write_latency_us = 0;
+    let reopened_replicator = SharedStoreReplicator::new("cluster-a", reopened_store.clone())
+        .with_wal_append_mode(SharedStoreWalAppendMode::ProtobufAppendBlob);
+    let reopened_offset_metadata_ok = !reopened_replicator
+        .load_wal_offset_metadata(direct_shard_id)
+        .await
+        .expect("reopened offset metadata")
+        .is_empty();
+    let cache_before_replay = matrixobject_cache_stats(&reopened_store);
+
+    let mut replay_latency_total_us = 0u128;
+    let mut retrieval_latencies = Vec::new();
+    let mut replay_ok = true;
+    let mut retrieval_ok = true;
+    for (phase_index, phase) in phases.iter().enumerate() {
+        let shard_id = phase_index as u64 + 1;
+        let engine = test_engine(root, &format!("snapshot-reopen-{phase}-{shard_id}"));
+        engine.load_shard(shard_id);
+        let replay_start = Instant::now();
+        let replay_report = reopened_replicator
+            .replay_wal_strict(shard_id, 0, &engine)
+            .await
+            .expect("journal reopened replay");
+        replay_latency_total_us += replay_start.elapsed().as_micros();
+        replay_ok &= replay_report.applied == entry_count as usize;
+        let (retrieved, latencies) = retrieve_records(&engine, shard_id, entry_count, phase);
+        retrieval_ok &= retrieved == entry_count;
+        retrieval_latencies.extend(latencies);
+    }
+
+    let cache_after_retrieval = matrixobject_cache_stats(&reopened_store);
+    let cache_metrics_available = cache_after_retrieval.max_bytes > 0;
+
+    JournalReopenReport {
+        snapshot_export_latency_us,
+        snapshot_disk_write_latency_us,
+        snapshot_disk_read_latency_us,
+        snapshot_import_latency_us,
+        snapshot_bytes: journal_bytes.len() as u64,
+        snapshot_sha256,
+        reopened_offset_metadata_ok,
+        cache_before_replay,
+        cache_after_retrieval,
+        cache_metrics_available,
+        reopened_replay_recovered_all_records: replay_ok,
+        reopened_retrieval_recovered_all_records: retrieval_ok,
+        replay_latency_total_us,
+        retrieval_latency_avg_us: avg(&retrieval_latencies),
+    }
+}
+
+fn matrixobject_cache_stats(store: &MatrixObjectObjectStore) -> MatrixObjectCacheStatsReport {
+    let stats = store
+        .inner()
+        .lock()
+        .expect("matrixobject lock poisoned")
+        .read_cache_stats();
+    MatrixObjectCacheStatsReport {
+        entries: stats.entries,
+        bytes: stats.bytes,
+        max_bytes: stats.max_bytes,
+        hits: stats.hits,
+        misses: stats.misses,
+        evictions: stats.evictions,
+        // A COUNT'S SUCCESSOR IS A COUNT, AND THE COMPILER SUGGESTED THE OTHER ONE.
+        // `ChunkReadCacheStats` carries BOTH `direct_fill_blocks` and `direct_fill_bytes`, so
+        // when `direct_fill_blocks` went away rustc offered `direct_fill_bytes` -- the nearest
+        // NAME, and the wrong quantity. Taking it would have put a byte total under a field
+        // this report publishes as a number of fills, in all three of these rows, and the
+        // report would still have compiled and still have looked right.
+        //
+        // The report's own keys stay spelled `_blocks` because they are an output surface and
+        // the quantity has not changed; only the upstream field's name did.
+        direct_fill_blocks: stats.direct_fill_blocks,
+        direct_fill_bytes: stats.direct_fill_bytes,
+        compressed_fill_blocks: stats.compressed_fill_blocks,
+        compressed_fill_bytes: stats.compressed_fill_bytes,
+        ec_fill_blocks: stats.ec_fill_blocks,
+        ec_fill_bytes: stats.ec_fill_bytes,
+        pressure: stats.pressure,
+    }
+}
+
+fn retrieve_records(
+    engine: &TemporalEngine,
+    shard_id: u64,
+    entry_count: u64,
+    phase: &str,
+) -> (u64, Vec<u128>) {
+    let mut retrieved_records = 0;
+    let mut retrieval_latencies_us = Vec::new();
+    for index in 1..=entry_count {
+        let key = key_for(shard_id, index, phase);
+        let start = Instant::now();
+        let response = engine
+            .execute(ExecuteRequest {
+                shard_id,
+                command: Command::StringGet { key },
+            })
+            .response;
+        retrieval_latencies_us.push(start.elapsed().as_micros());
+        if matches!(response, CommandResponse::Bytes { value: Some(_) }) {
+            retrieved_records += 1;
+        }
+    }
+    (retrieved_records, retrieval_latencies_us)
+}
+
+fn validate_offset_index(
+    blob_key: &str,
+    receipts: &[AppendBlobReceipt],
+    offset_metadata: &std::collections::BTreeMap<u64, SharedStoreWalOffsetMetadata>,
+) -> OffsetIndexValidation {
+    let mut matched_entries = 0usize;
+    for (index, receipt) in receipts.iter().enumerate() {
+        let Some(metadata) = offset_metadata.get(&(index as u64 + 1)) else {
+            continue;
+        };
+        if metadata.wal_blob_key == blob_key
+            && metadata.wal_blob_start_offset == receipt.start_offset
+            && metadata.wal_blob_end_offset == receipt.end_offset
+            && metadata.wal_blob_bytes_written == receipt.bytes_written
+            && metadata.wal_blob_object_length == receipt.object_length
+        {
+            matched_entries += 1;
+        }
+    }
+    OffsetIndexValidation {
+        checked_entries: receipts.len(),
+        matched_entries,
+        all_wal_indexes_have_offset_metadata: offset_metadata.len() >= receipts.len(),
+        all_metadata_ranges_match_append_receipts: matched_entries == receipts.len(),
+    }
+}
+
+fn expected_offsets_from_receipts(
+    receipts: &[AppendBlobReceipt],
+) -> std::collections::BTreeMap<u64, (u64, u64, u64)> {
+    receipts
+        .iter()
+        .enumerate()
+        .map(|(index, receipt)| {
+            (
+                index as u64 + 1,
+                (
+                    receipt.start_offset,
+                    receipt.end_offset,
+                    receipt.bytes_written,
+                ),
+            )
+        })
+        .collect()
+}
+
+fn expected_offsets_from_write_reports(
+    reports: &[SharedStoreWriteReport],
+) -> std::collections::BTreeMap<u64, (u64, u64, u64)> {
+    reports
+        .iter()
+        .filter_map(|report| {
+            Some((
+                report.wal_index,
+                (
+                    report.wal_blob_start_offset?,
+                    report.wal_blob_end_offset?,
+                    report.wal_blob_bytes_written?,
+                ),
+            ))
+        })
+        .collect()
+}
+
+fn build_offset_metadata_mappings(
+    offset_metadata: &std::collections::BTreeMap<u64, SharedStoreWalOffsetMetadata>,
+    expected_offsets: Option<&std::collections::BTreeMap<u64, (u64, u64, u64)>>,
+) -> Vec<OffsetMetadataMapping> {
+    offset_metadata
+        .iter()
+        .map(|(wal_index, metadata)| {
+            let expected = expected_offsets.and_then(|offsets| offsets.get(wal_index));
+            let (
+                expected_start_offset,
+                expected_end_offset,
+                expected_bytes_written,
+                matches_expected_offsets,
+            ) = match expected {
+                Some((start, end, bytes)) => (
+                    Some(*start),
+                    Some(*end),
+                    Some(*bytes),
+                    metadata.wal_blob_start_offset == *start
+                        && metadata.wal_blob_end_offset == *end
+                        && metadata.wal_blob_bytes_written == *bytes,
