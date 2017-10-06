@@ -27,3 +27,17 @@
           <label>Tenant <input id="scope-tenant" value="tenant_codex" /></label>
           <label>User <input id="scope-user" value="local_user" /></label>
           <label>Session <input id="scope-session" placeholder="optional" /></label>
+          <label>Agent <input id="scope-agent" value="codex" /></label>
+          <label>Table <select id="dashboard-table"><option value="messages">Messages</option><option value="resources">Resources</option><option value="skills">Skills</option><option value="events">Events</option><option value="entities">Entities</option><option value="context_packs">Context Packs</option><option value="summary_refresh">Summary Refresh</option><option value="async_pipeline">Async Pipeline</option></select></label>
+          <label>Page size <input id="page-size" type="number" min="1" max="200" value="10" /></label>
+          <button id="load-sample" type="button">Load Sample</button>
+          <button id="copy-request" type="button">Copy MCP Request</button>
+        </div>
+      </section>
+      <section class="summary-grid dashboard-summary" aria-label="Ingestion totals">
+        <article><span>Messages</span><strong id="total-messages">-</strong><small>chat, tool, feedback</small></article>
+        <article><span>Resources</span><strong id="total-resources">-</strong><small>files, chunks, imports</small></article>
+        <article><span>Events / Entities</span><strong id="total-events-entities">-</strong><small>extracted memory</small></article>
+        <article><span>Context Packs</span><strong id="total-packs">-</strong><small>retrieval audits</small></article>
+      </section>
+      <section class="panel">
