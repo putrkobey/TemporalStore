@@ -95,3 +95,101 @@ fn over_reporting(state: &BTreeMap<u32, (bool, u64, u64)>) -> Vec<(u32, u64)> {
         .collect()
 }
 
+/// The buckets the set marks while their node reads clean -- the dump filter's hazard, reported
+/// here so the two directions are never read off one number.
+fn under_reporting(state: &BTreeMap<u32, (bool, u64, u64)>) -> Vec<(u32, u64)> {
+    state
+        .iter()
+        .filter(|(_bucket, (node_dirty, count, _claim))| !*node_dirty && *count > 0)
+        .map(|(bucket, (_node_dirty, count, _claim))| (*bucket, *count))
+        .collect()
+}
+
+fn print_phase(label: &str, state: &BTreeMap<u32, (bool, u64, u64)>) {
+    let node_dirty = state.values().filter(|(dirty, _, _)| *dirty).count();
+    let set_marked = state.values().filter(|(_, count, _)| *count > 0).count();
+    let over = over_reporting(state);
+    let under = under_reporting(state);
+    println!(
+        "    {label:<34} buckets {:>3}  node.dirty {node_dirty:>3}  set-marked {set_marked:>3}  \
+         OVER {:>3}  under {:>3}",
+        state.len(),
+        over.len(),
+        under.len()
+    );
+    if !over.is_empty() {
+        println!("        OVER-reporting (bucket, first_dirty_wal_sequence): {over:?}");
+    }
+    if !under.is_empty() {
+        println!("        under-reporting (bucket, set count): {under:?}");
+    }
+}
+
+#[test]
+fn whether_the_reclaim_checks_can_read_the_bucket_node() {
+    // ---- A NARROW ROUTING RANGE, so the removals' non-page-backed records route to buckets of
+    // ---- their own -- the population `clear_published_object_dirty_state` cannot recompute, and
+    // ---- so the one that could leave a flag standing over an empty set.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::TemporalEngine::with_local_dirs(
+        4 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    let loaded = engine.load_shard_with(crate::control::LoadShardRequest {
+        shard_id: 1,
+        table_name: "reclaim-presence".to_string(),
+        shard_uri: "local://reclaim-presence/1".to_string(),
+        start_routing_bucket: 0,
+        end_routing_bucket: END_ROUTING_BUCKET,
+        readonly: false,
+        load_version: 1,
+        local_node_id: Some(1),
+    });
+    assert!(
+        loaded.status.ok,
+        "the fixture could not load shard 1 on 0..{END_ROUTING_BUCKET}: {:?}",
+        loaded.status
+    );
+
+    let mut phases: Vec<(String, BTreeMap<u32, (bool, u64, u64)>)> = Vec::new();
+
+    for index in 0..KEYS {
+        let key = format!("reclaim-presence-{index:04}");
+        for command in [
+            Command::StringSet { key: key.clone(), value: vec![b'v'; 96] },
+            Command::HashSet {
+                key: key.clone(),
+                field: "f".to_string(),
+                value: vec![b'h'; 96],
+            },
+            Command::SetAdd { key: key.clone(), member: vec![b's'; 96] },
+        ] {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command });
+            assert!(out.status.ok, "fixture write {index}: {:?}", out.status);
+        }
+    }
+    phases.push(("after the ingest".to_string(), phase_state(&engine)));
+
+    // ---- A FULL DUMP: every dirty bucket selected, so both records are cleared together.
+    let _full = engine.apply_storage_lifecycle(crate::StorageLifecycleRequest {
+        shard_id: 1,
+        ..Default::default()
+    });
+    phases.push(("after a FULL dump".to_string(), phase_state(&engine)));
+
+    // ---- RE-DIRTY A FEW AND REMOVE TWO. The removals are what put a non-page-backed record in
+    // ---- the set, routed to a bucket holding no page.
+    for index in [1usize, 5, 9] {
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("reclaim-presence-{index:04}"),
+                value: vec![b'w'; 96],
+            },
+        });
+        assert!(out.status.ok, "re-dirtying {index}: {:?}", out.status);
+    }
+    for index in [2usize, 6] {
+        let out = engine.execute(ExecuteRequest {

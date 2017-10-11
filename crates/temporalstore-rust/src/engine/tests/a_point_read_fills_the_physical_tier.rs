@@ -52,21 +52,3 @@ fn a_point_read_fills_the_physical_tier() {
         command: Command::StringSet { key: key.to_string(), value: value.clone() },
     });
     assert!(write.status.ok, "write: {:?}", write.status);
-
-    // THE KEY MUST NOT BE POPULATED BY THE WRITE ALONE, or the read below proves nothing about the
-    // read path. Checked first, because a guard that cannot fail for the right reason is not one.
-    let physical = engine
-        .string_block_cache_key_for_test(1, key)
-        .expect("the write indexed the key, so its block has a physical cache key");
-    let before = engine.cache().peek_tier(&physical).is_some();
-
-    let read = engine.execute(ExecuteRequest {
-        shard_id: 1,
-        command: Command::StringGet { key: key.to_string() },
-    });
-    assert_eq!(
-        read.response,
-        CommandResponse::Bytes { value: Some(value) },
-        "the read did not return what was written, so nothing below is about caching"
-    );
-
