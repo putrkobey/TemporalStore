@@ -162,3 +162,85 @@ fn verify_engine_dump_load_recovery(case: &StorageMigrationCase) {
     engine = new_engine(dir.path(), &block_dir, &index_dir, case.shard_id);
     engine
         .install_bucket_dump_manifest(&installable_manifest)
+        .unwrap_or_else(|status| {
+            panic!(
+                "case={} slot dump manifest install failed after restart: {:?}",
+                case.name, status
+            )
+        });
+    assert_clean_recovery(&engine, case.shard_id, &case.name);
+    execute_steps(&engine, case.shard_id, &case.expected_reads, &case.name);
+    verify_redis_admin_replay(&engine, case);
+}
+
+async fn verify_shared_store_replay(case: &StorageMigrationCase, mode: SharedStoreStorageMode) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(FileObjectStore::new(
+        dir.path().join(format!("objects-{mode:?}")),
+    ));
+    let replicator = SharedStoreReplicator::new("storage-migration-corpus", store);
+    let writer = replicator.storage_writer(mode, 1);
+
+    for step in case.operations.iter().filter(|step| step.storage_mutation) {
+        writer
+            .write(case.shard_id, step.command.clone())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case={} step={} shared-store write failed: {error}",
+                    case.name, step.name
+                )
+            });
+    }
+    if mode == SharedStoreStorageMode::Async {
+        while writer.queued_len() > 0 {
+            writer
+                .flush_pending(1)
+                .await
+                .expect("async shared-store corpus flush should succeed");
+        }
+    }
+
+    let follower_dir = tempfile::tempdir().unwrap();
+    let follower = new_engine(
+        follower_dir.path(),
+        &follower_dir.path().join("blocks"),
+        &follower_dir.path().join("indexes"),
+        case.shard_id,
+    );
+    let replay = replicator
+        .replay_wal_strict(case.shard_id, 0, &follower)
+        .await
+        .expect("shared-store corpus replay should succeed");
+    assert_eq!(
+        replay.applied,
+        case.operations
+            .iter()
+            .filter(|step| step.storage_mutation)
+            .count()
+    );
+    execute_steps(&follower, case.shard_id, &case.expected_reads, &case.name);
+    assert_clean_recovery(&follower, case.shard_id, &case.name);
+}
+
+fn verify_raft_replication(case: &StorageMigrationCase) {
+    let cluster =
+        RaftCluster::new_single_shard_with_config(case.shard_id, [1, 2, 3], RaftConfig::default())
+            .expect("corpus raft cluster should start");
+
+    for step in case.operations.iter().filter(|step| step.storage_mutation) {
+        let response = cluster
+            .propose(step.command.clone())
+            .unwrap_or_else(|error| {
+                panic!(
+                    "case={} step={} raft propose failed: {error}",
+                    case.name, step.name
+                )
+            });
+        if let Some(expected) = &step.expect {
+            assert_eq!(
+                &response, expected,
+                "case={} step={} raft response mismatch",
+                case.name, step.name
+            );
+        }
