@@ -435,3 +435,441 @@ pub(super) fn admission_limits(
     }
     if let Some(table_name) = info
         .as_ref()
+        .map(|info| info.table_name.trim())
+        .filter(|table_name| !table_name.is_empty())
+    {
+        if let Some(limit) = (if write_command {
+            config.table_write_qps
+        } else {
+            config.table_read_qps
+        })
+        .filter(|&limit| limit > 0)
+        {
+            limits.push(AdmissionLimit {
+                scope: AdmissionScope::Table(table_name.to_string()),
+                limit,
+                label: if write_command {
+                    "table_write_qps"
+                } else {
+                    "table_read_qps"
+                },
+            });
+        }
+    }
+    if let Some(tenant_name) = config
+        .tenant_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|tenant_name| !tenant_name.is_empty())
+    {
+        if let Some(limit) = (if write_command {
+            config.tenant_write_qps
+        } else {
+            config.tenant_read_qps
+        })
+        .filter(|&limit| limit > 0)
+        {
+            limits.push(AdmissionLimit {
+                scope: AdmissionScope::Tenant(tenant_name.to_string()),
+                limit,
+                label: if write_command {
+                    "tenant_write_qps"
+                } else {
+                    "tenant_read_qps"
+                },
+            });
+        }
+    }
+    limits
+}
+
+pub(super) fn reset_admission_window(admission: &mut AdmissionState, now_sec: u64) {
+    if admission.window_epoch_sec != now_sec {
+        admission.window_epoch_sec = now_sec;
+        admission.read_count = 0;
+        admission.write_count = 0;
+    }
+}
+
+pub(super) fn admission_count(admission: &mut AdmissionState, write_command: bool) -> &mut u64 {
+    if write_command {
+        &mut admission.write_count
+    } else {
+        &mut admission.read_count
+    }
+}
+
+pub(super) fn now_epoch_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+pub(super) fn validate_command_preconditions(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    shard: &ShardState,
+    command: &Command,
+) -> Result<(), Status> {
+    match command {
+        // Expiry checks here use the SAME replay-aware clock as the executor's
+        // `remove_if_expired`. Validation runs only on the leader today, where the two
+        // clocks coincide, so this changes no production behaviour. It removes a split
+        // that would matter the moment anything validates during replay: deciding
+        // "is this key expired" against the restart clock is what makes a replayed
+        // command fail its precondition and abort a shard load.
+        Command::CommonExpire { key, .. } => {
+            if shard
+                .expires_at_ms()
+                .get(key.as_str())
+                .map(|expires_at| *expires_at <= resolve_now_ms())
+                .unwrap_or(false)
+                || !record_exists(shard, key)
+            {
+                return Err(Status::error("not_found", "key not found"));
+            }
+        }
+        Command::FeatureAppend { key, points } => {
+            let current = shard
+                .features()
+                .get(&key[..])
+                .map(|series| series.len())
+                .unwrap_or(0);
+            if current.saturating_add(points.len()) > FEATURE_ADD_HARD_MAX_SIZE {
+                return Err(Status::error(
+                    "invalid_argument",
+                    format!("{key} size bigger than {FEATURE_ADD_HARD_MAX_SIZE}"),
+                ));
+            }
+        }
+        Command::FeatureAppendWithPolicy {
+            key,
+            points,
+            policy,
+        } => {
+            if *policy == FeatureWritePolicy::Block {
+                return Err(Status::error("invalid_argument", "Invalid write policy"));
+            }
+            let current = shard
+                .features()
+                .get(&key[..])
+                .map(|series| series.len())
+                .unwrap_or(0);
+            if current.saturating_add(points.len()) > FEATURE_ADD_HARD_MAX_SIZE {
+                return Err(Status::error(
+                    "invalid_argument",
+                    format!("{key} size bigger than {FEATURE_ADD_HARD_MAX_SIZE}"),
+                ));
+            }
+        }
+        Command::FeatureReplace { key, points, .. } => {
+            let current = shard
+                .features()
+                .get(&key[..])
+                .map(|series| series.len())
+                .unwrap_or(0);
+            if current.saturating_add(points.len()) > FEATURE_ADD_HARD_MAX_SIZE {
+                return Err(Status::error(
+                    "invalid_argument",
+                    format!("{key} size bigger than {FEATURE_ADD_HARD_MAX_SIZE}"),
+                ));
+            }
+        }
+        Command::ContextUpsertNode { tenant_hash, node } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_node(node)?;
+        }
+        Command::ContextGetNode {
+            tenant_hash,
+            node_hash,
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(*node_hash != 0, "node_hash is required")?;
+        }
+        Command::ContextGetNodes {
+            tenant_hash,
+            node_hashes,
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(!node_hashes.is_empty(), "node_hashes are required")?;
+            for node_hash in node_hashes {
+                validate_context_required(*node_hash != 0, "node_hash is required")?;
+            }
+        }
+        Command::ContextQuerySummaryVectors {
+            tenant_hash,
+            node_hashes,
+            level,
+            as_of_ms,
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(!node_hashes.is_empty(), "node_hashes are required")?;
+            validate_context_required(*level != 0, "level is required")?;
+            validate_context_required(*as_of_ms != 0, "as_of_ms is required")?;
+            for node_hash in node_hashes {
+                validate_context_required(*node_hash != 0, "node_hash is required")?;
+            }
+        }
+        Command::ContextWriteEvent {
+            tenant_hash,
+            node_hash,
+            event,
+            ..
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(*node_hash != 0, "node_hash is required")?;
+            validate_context_event(event)?;
+        }
+        Command::ContextWriteExtractedEvent {
+            tenant_hash,
+            node_hash,
+            event,
+            indexes,
+            ..
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(*node_hash != 0, "node_hash is required")?;
+            validate_context_event(event)?;
+            validate_context_extracted_indexes(event, indexes)?;
+        }
+        Command::ContextQueryEvents {
+            tenant_hash,
+            node_hash,
+            start_time_ms,
+            end_time_ms,
+            limit,
+            max_scan,
+            kinds,
+            statuses,
+            min_confidence,
+            min_importance,
+            ..
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(*node_hash != 0, "node_hash is required")?;
+            validate_context_limit(*limit)?;
+            validate_context_limit(*max_scan)?;
+            validate_context_range(*start_time_ms, *end_time_ms)?;
+            validate_context_filters(kinds, statuses, *min_confidence, *min_importance)?;
+        }
+        Command::ContextWriteIndexRef {
+            tenant_hash,
+            index_name,
+            index_value_hash,
+            event_time_ms,
+            index_ref,
+            ..
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_index_name(index_name)?;
+            validate_context_required(*index_value_hash != 0, "index_value_hash is required")?;
+            validate_context_required(*event_time_ms != 0, "event_time_ms is required")?;
+            validate_context_timestamp(*event_time_ms)?;
+            validate_context_index_ref(index_ref)?;
+        }
+        Command::ContextQueryIndex {
+            tenant_hash,
+            index_name,
+            index_value_hash,
+            start_time_ms,
+            end_time_ms,
+            limit,
+            ..
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_index_name(index_name)?;
+            validate_context_required(*index_value_hash != 0, "index_value_hash is required")?;
+            validate_context_limit(*limit)?;
+            validate_context_range(*start_time_ms, *end_time_ms)?;
+        }
+        Command::ContextQueryIndexIntersection {
+            tenant_hash,
+            predicates,
+            limit,
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(!predicates.is_empty(), "predicates are required")?;
+            validate_context_limit(*limit)?;
+            for predicate in predicates {
+                validate_context_index_lookup(predicate)?;
+            }
+        }
+        Command::ContextWritePackAudit { tenant_hash, audit } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_pack_audit(audit)?;
+        }
+        Command::ContextQueryPackAudit {
+            tenant_hash,
+            session_hash,
+            start_time_ms,
+            end_time_ms,
+            limit,
+            ..
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(*session_hash != 0, "session_hash is required")?;
+            validate_context_limit(*limit)?;
+            validate_context_range(*start_time_ms, *end_time_ms)?;
+        }
+        Command::ContextMarkSummaryDirty {
+            tenant_hash,
+            node_hash,
+            event_time_ms,
+            reason,
+            propagate_depth,
+            ..
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_dirty_node(*node_hash, *event_time_ms, *reason, *propagate_depth)?;
+        }
+        Command::ContextQuerySummaryDirty {
+            tenant_hash,
+            node_hash,
+            start_time_ms,
+            end_time_ms,
+            limit,
+            ..
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(*node_hash != 0, "node_hash is required")?;
+            validate_context_limit(*limit)?;
+            validate_context_range(*start_time_ms, *end_time_ms)?;
+        }
+        Command::ContextMarkEmbeddingDirty {
+            tenant_hash,
+            node_hash,
+            event_time_ms,
+            reason,
+            propagate_depth,
+            ..
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_dirty_node(*node_hash, *event_time_ms, *reason, *propagate_depth)?;
+        }
+        Command::ContextQueryEmbeddingDirty {
+            start_time_ms,
+            end_time_ms,
+            limit,
+            ..
+        } => {
+            // Both node_hash == 0 (all pending nodes) and tenant_hash == 0 (all
+            // tenants on the shard) are permitted: together they are the drainer's
+            // O(pending) all-pending scan.
+            validate_context_limit(*limit)?;
+            validate_context_range(*start_time_ms, *end_time_ms)?;
+        }
+        Command::ContextUpsertEntity {
+            tenant_hash,
+            entity,
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_entity(entity)?;
+        }
+        Command::ContextGetEntity {
+            tenant_hash,
+            node_hash,
+            entity_hash,
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(*node_hash != 0, "node_hash is required")?;
+            validate_context_required(*entity_hash != 0, "entity_hash is required")?;
+        }
+        Command::ContextQueryEntities {
+            tenant_hash,
+            node_hash,
+            entity_hashes,
+            limit,
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(*node_hash != 0, "node_hash is required")?;
+            validate_context_limit(*limit)?;
+            if entity_hashes.len() > CONTEXT_MAX_LIMIT {
+                return Err(Status::error(
+                    "invalid_argument",
+                    "entity_hashes exceeds maximum",
+                ));
+            }
+            if entity_hashes.iter().any(|hash| *hash == 0) {
+                return Err(Status::error(
+                    "invalid_argument",
+                    "entity_hashes must be non-zero",
+                ));
+            }
+        }
+        Command::ContextUpsertChildRef {
+            tenant_hash,
+            child_ref,
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_child_ref(child_ref)?;
+        }
+        Command::ContextQueryChildren {
+            tenant_hash,
+            parent_hash,
+            limit,
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(*parent_hash != 0, "parent_hash is required")?;
+            validate_context_limit(*limit)?;
+        }
+        Command::ContextTraverseTree {
+            tenant_hash,
+            start_node_hash,
+            query_vector,
+            max_depth,
+            top_k_per_depth,
+            max_children_scored_per_parent,
+            max_candidate_nodes,
+            ..
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(*start_node_hash != 0, "start_node_hash is required")?;
+            validate_context_required(!query_vector.is_empty(), "query_vector is required")?;
+            validate_context_embedding_vector("query_vector", query_vector)?;
+            if max_depth.unwrap_or_default() > CONTEXT_MAX_TRAVERSAL_DEPTH {
+                return Err(Status::error(
+                    "invalid_argument",
+                    "max_depth exceeds maximum",
+                ));
+            }
+            for limit in [
+                *top_k_per_depth,
+                *max_children_scored_per_parent,
+                *max_candidate_nodes,
+            ] {
+                validate_context_limit(limit)?;
+            }
+        }
+        Command::ContextUpsertSummary {
+            tenant_hash,
+            summary,
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_summary(summary)?;
+        }
+        Command::ContextQuerySummaries {
+            tenant_hash,
+            node_hash,
+            level,
+            as_of_ms,
+            limit,
+        } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_required(*node_hash != 0, "node_hash is required")?;
+            validate_context_required(*level != 0, "level is required")?;
+            validate_context_required(*as_of_ms != 0, "as_of_ms is required")?;
+            validate_context_timestamp(*as_of_ms)?;
+            validate_context_limit(*limit)?;
+        }
+        Command::ContextWriteCompressionEvent { tenant_hash, event } => {
+            validate_context_required(*tenant_hash != 0, "tenant_hash is required")?;
+            validate_context_compression_event(event)?;
+        }
+        Command::ContextQueryCompressionEvents {
+            tenant_hash,
+            node_hashes,
+            start_time_ms,
+            end_time_ms,
+            limit,
