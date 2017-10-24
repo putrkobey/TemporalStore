@@ -61,3 +61,67 @@ fn production_sources() -> Vec<(String, String)> {
             let path = entry.path();
             if path.is_dir() {
                 if path.file_name().is_some_and(|name| name == "tests") {
+                    continue;
+                }
+                walk(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    out.push((path.display().to_string(), text));
+                }
+            }
+        }
+    }
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut out = Vec::new();
+    walk(&src, &mut out);
+    assert!(
+        out.len() > 50,
+        "the production walk found only {} files, so the scope is broken rather than the claim",
+        out.len()
+    );
+    out
+}
+
+/// Lines mentioning `needle`, outside any `#[cfg(test)]` region, as `path:line`.
+///
+/// REGIONS ARE TRACKED BY BRACE DEPTH from the attribute, which is the fragile part and is why the
+/// arm below carries a positive control: a site this is KNOWN to find must still be found.
+fn production_mentions(needle: &str) -> Vec<String> {
+    let mut hits = Vec::new();
+    for (path, text) in production_sources() {
+        let mut depth: i32 = 0;
+        let mut in_test = false;
+        let mut test_depth: i32 = 0;
+        for (number, line) in text.lines().enumerate() {
+            let trimmed = line.trim();
+            if !in_test && trimmed.starts_with("#[cfg(test)]") {
+                in_test = true;
+                test_depth = depth;
+                continue;
+            }
+            let opens = line.matches('{').count() as i32;
+            let closes = line.matches('}').count() as i32;
+            if !in_test && line.contains(needle) {
+                hits.push(format!("{path}:{}", number + 1));
+            }
+            depth += opens - closes;
+            if in_test && depth <= test_depth && closes > 0 {
+                in_test = false;
+            }
+        }
+    }
+    hits
+}
+
+#[test]
+fn the_records_deadline_and_dirty_bit_have_no_production_writer() {
+    // POSITIVE CONTROL FIRST. If the scanner cannot find something that is definitely there, a
+    // zero below means nothing. `ObjectSlot::default()` is the production slot construction, and
+    // it is the very call that leaves the deadline unset.
+    let control = production_mentions("ObjectSlot::default()");
+    assert!(
+        !control.is_empty(),
+        "the scanner found no `ObjectSlot::default()` in production, so it is not reading \
+         production source and every zero it reports is meaningless"
+    );
+

@@ -111,3 +111,59 @@ fn shard_state_fields() -> Vec<(String, String)> {
         if trimmed.trim_end().ends_with(':') {
             joined.push(trimmed.trim_end().to_string());
             continue;
+        }
+        match joined.last_mut() {
+            Some(last) if last.ends_with(':') => {
+                last.push(' ');
+                last.push_str(trimmed.trim());
+            }
+            _ => joined.push(trimmed.to_string()),
+        }
+    }
+
+    let mut fields = Vec::new();
+    for line in joined {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("pub(super) ") else {
+            continue;
+        };
+        let Some((name, ty)) = rest.split_once(':') else {
+            continue;
+        };
+        if name.contains(' ') || name.contains('(') {
+            continue;
+        }
+        let ty = ty.trim().trim_end_matches(',').split_whitespace().collect::<Vec<_>>().join(" ");
+        if ty.is_empty() {
+            continue;
+        }
+        fields.push((name.trim().to_string(), ty));
+    }
+    fields
+}
+
+/// Whether a type's OUTERMOST key is an object key.
+fn is_object_keyed(ty: &str) -> bool {
+    for container in ["HashMap<", "BTreeMap<"] {
+        if let Some(rest) = ty.strip_prefix(container) {
+            let key = rest.split(',').next().unwrap_or("").trim();
+            return matches!(key, "ModelKey" | "Arc<str>" | "String");
+        }
+    }
+    false
+}
+
+/// Whether a type is a domain-keyed field: `HashMap<SomeDomain, Table>` whose table is object-keyed.
+fn is_domain_keyed(ty: &str) -> bool {
+    let Some(rest) = ty.strip_prefix("HashMap<") else {
+        return false;
+    };
+    let key = rest.split(',').next().unwrap_or("").trim();
+    // `SideTable` is the merged domain key: the three stored domain-keyed fields became one, so the
+    // list that was four names is two. `RollupDomain` stays because `rollups` is `serde(skip)` and
+    // did not join -- folding a skipped map into a serialized one PERSISTS it, which this campaign
+    // already paid for once at a 2.27x stored-index cost and did not pay again here.
+    const DOMAINS: [&str; 2] = ["SideTable", "RollupDomain"];
+    DOMAINS.contains(&key)
+}
+
