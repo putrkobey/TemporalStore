@@ -627,3 +627,318 @@ fn the_recovery_report_derives_three_answers_from_one_walk_and_takes_a_second_fo
     assert_eq!(
         slabs_from_live_reports, slabs_from_id_list,
         "the slabs with live pages and the reported live-slab id list disagree"
+    );
+
+    // The ownership validation's findings are carried on the lifecycle report. Both now come
+    // from the one walk, so the count the report carries must be the count it was given.
+    assert_eq!(
+        report.object_lifecycle.owner_mismatch_block_refs,
+        report.owner_mismatch_block_refs.len() as u64,
+        "the lifecycle report carries {} owner mismatches but the validation returned {}",
+        report.object_lifecycle.owner_mismatch_block_refs,
+        report.owner_mismatch_block_refs.len()
+    );
+
+    // ---- COST: two walks, from two sites ----------------------------------
+    //
+    // IT SAID ONE, AND IT WAS NEVER ONE. The hoist above really did fold three passes into one,
+    // and this guard really did watch it -- but it watched through a counter that was charged in
+    // `collect_live_block_entries` and nowhere else. `storage_feature_block_layout_report` calls
+    // `collect_bucket_index_live_block_entries` directly, so its whole-store pass was charged to
+    // nothing and this assertion read 1 while the report took 2.
+    //
+    // Now that both walks are charged, the number is written down. It is two, it is asserted
+    // EXACTLY, and both sites are named below, so a third still fails here -- which is what this
+    // guard was for.
+    //
+    // NOT FOLDED INTO ONE HERE, and the reason is not effort. The two walks do not always read
+    // the same set: `collect_live_block_entries` takes the model-map arm when `bucket_map` is
+    // empty, while the layout report always takes the bucket-index one. Handing the first walk's
+    // entries to the second would be a silent answer change on an empty index, so removing the
+    // second pass is its own change with its own measurement.
+    println!(
+        "  storage_recovery_report_without_boundary over {RECORDS} records: {entries} live-page \
+         entries from {} site(s) = {}x the store",
+        sites.len(),
+        entries / RECORDS as u64
+    );
+    for (site, walked) in &sites {
+        println!("    {walked:>8}  {site}");
+    }
+    assert_eq!(
+        sites.len(),
+        2,
+        "the recovery report walked the live-page set from {} call sites, not 2: {sites:?}. The \
+         two are the hoisted probe/ownership/lifecycle walk and the feature-block layout \
+         report's own walk; a third means a pass has come back",
+        sites.len()
+    );
+    let mut walked_sites = sites.keys().map(String::as_str).collect::<Vec<_>>();
+    walked_sites.sort_unstable();
+    assert!(
+        walked_sites
+            .iter()
+            .any(|site| site.contains("recovery_sweep_compact.rs")),
+        "the hoisted walk must still be one of the two sites: {walked_sites:?}"
+    );
+    assert!(
+        walked_sites
+            .iter()
+            .any(|site| site.contains("storage_reporting.rs")),
+        "the feature-block layout report's walk must be the other: {walked_sites:?}"
+    );
+    // ---- WHAT ONE WALK OF THESE TWO COSTS --------------------------------
+    //
+    // More than the page set it hands back, and the difference is not small. A round leaves
+    // buckets RELEASED -- 16 of them on this fixture, which is an ordinary storage round and not
+    // a contrived state -- and a released bucket's index holds no pages. So
+    // `collect_bucket_index_live_block_entries` walks the index, then walks the WHOLE model-map
+    // page set a second time to supplement the released buckets' pages back in. It materialises
+    // `indexed + every live page` to return `indexed + released`.
+    //
+    // Charging the RETURN value, as this counter used to, therefore could not see the second
+    // walk at all: it read 2,000 for a call that built 3,984 entries. Both terms are derived
+    // from the shard below rather than written down, so a fixture that stops releasing anything
+    // fails the denominator instead of quietly measuring the easy case.
+    let (indexed_blocks, released_buckets) = {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 is loaded");
+        (
+            shard
+                .bucket_index
+                .bucket_map
+                .values()
+                .map(|bucket| bucket.block_index.len())
+                .sum::<usize>() as u64,
+            shard.bucket_index.released_buckets.len(),
+        )
+    };
+
+    // THE DENOMINATOR for everything below. With nothing released the supplement walk never
+    // runs, one walk costs exactly the page set, and this guard would be measuring a case that
+    // cannot show the cost it exists to name.
+    assert!(
+        released_buckets > 0,
+        "the fixture released no buckets, so the supplement walk never ran and the charge below \
+         is not the one this guard is about"
+    );
+    assert!(
+        indexed_blocks < report.total_block_refs as u64,
+        "the released buckets must be missing from the index ({indexed_blocks} indexed against \
+         {} returned), or there was nothing to supplement",
+        report.total_block_refs
+    );
+
+    let charges = sites.values().copied().collect::<Vec<_>>();
+    println!(
+        "    one walk charged {} to return {} ({indexed_blocks} indexed + a whole {}-page \
+         re-walk), {released_buckets} bucket(s) released",
+        charges[0], report.total_block_refs, report.total_block_refs
+    );
+    assert_eq!(
+        charges[0], charges[1],
+        "the two sites walk the same shard under the same guard, so they must materialise the \
+         same number of entries: {sites:?}"
+    );
+    assert_eq!(
+        charges[0],
+        indexed_blocks + report.total_block_refs as u64,
+        "one walk materialised {} entries; with {released_buckets} bucket(s) released it should \
+         build the {indexed_blocks} indexed pages and then the whole {}-page set again",
+        charges[0],
+        report.total_block_refs
+    );
+    assert_eq!(
+        entries,
+        2 * charges[0],
+        "the report charged {entries} across its two sites, which must be exactly twice what one \
+         of them costs"
+    );
+}
+
+/// WHAT ONE WALK COSTS PER LIVE PAGE, and that folding three into one REMOVED that cost rather
+/// than moving it somewhere else in the same function.
+///
+/// THE OLD CLAIM WAS STALE. "Each walk clones two strings per entry" was true of an earlier
+/// `LiveBlockEntry`; the three text fields are `Arc<str>` now, so a walk copies three pointers
+/// and bumps three refcounts per page and copies no text at all. Pinned as a size below, because
+/// that is the thing that would change if a field went back to `String` -- 24 bytes and a heap
+/// copy per page, per walk, on every periodic round.
+///
+/// THE HOIST DID NOT MOVE THE COST. The old function kept a `Vec<BlockAddress>` for its probe
+/// loop AND built a fresh `Vec<LiveBlockEntry>` inside the ownership validation that followed it,
+/// both alive under the same guard. The new one keeps the entries only, and reads each address
+/// out of the entry it is already holding. So the peak is lower by a whole address vector, not
+/// merely rearranged -- and the entries vector it does keep is one it used to build anyway.
+///
+/// Counted with `size_of`, so this needs no counting allocator and cannot be moved by box load.
+#[test]
+fn a_live_block_entry_carries_pointers_not_text_and_the_hoist_lowered_the_peak() {
+    let entry_bytes = std::mem::size_of::<LiveBlockEntry>();
+    let address_bytes = std::mem::size_of::<crate::block_store::ElementEntry>();
+    let arc_str_bytes = std::mem::size_of::<std::sync::Arc<str>>();
+    let string_bytes = std::mem::size_of::<String>();
+
+    println!("  LiveBlockEntry {entry_bytes} B, ElementEntry {address_bytes} B");
+    println!("  Arc<str> {arc_str_bytes} B against String {string_bytes} B");
+
+    // HALF ONE: the text fields are shared pointers, not owned text. Asserted FIRST because it
+    // is the claim the old note got wrong, and it is what makes a walk cheap per page.
+    assert!(
+        arc_str_bytes < string_bytes,
+        "an Arc<str> is {arc_str_bytes} B and a String {string_bytes} B; this test's whole \
+         premise is that the entry's text fields are shared rather than owned"
+    );
+    // object_key + kind + component are the three text fields; the rest is the address and
+    // three flags. If a text field became owned this would grow by at least 8 B.
+    let text_field_bytes = 3 * arc_str_bytes;
+    assert!(
+        entry_bytes <= text_field_bytes + address_bytes + 8,
+        "a live-page entry is {entry_bytes} B against {text_field_bytes} B of shared text \
+         pointers, {address_bytes} B of address and a few flags. Bigger than that means a field \
+         is carrying owned text, which is a heap copy per live page PER WALK on every periodic \
+         round"
+    );
+
+    // HALF TWO: the peak this function holds per live page fell. Ordered after the half above so
+    // a mutant that makes entries owned is reported as what it is rather than as a peak change.
+    let old_peak_per_block = entry_bytes + address_bytes;
+    let new_peak_per_block = entry_bytes;
+    println!(
+        "  recovery report peak per live page: {old_peak_per_block} B -> {new_peak_per_block} B, \
+         {} B/page of address vector no longer built beside the entries",
+        old_peak_per_block - new_peak_per_block
+    );
+    assert!(
+        new_peak_per_block < old_peak_per_block,
+        "the hoist holds {new_peak_per_block} B per live page where the three-walk version held \
+         {old_peak_per_block} B. If these are equal the address vector is still being built and \
+         the cost was moved rather than removed"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// WHAT A ROUND READS OF THE LOGS -- a different denominator from the live-page walks above.
+// ---------------------------------------------------------------------------------------------
+
+/// Bytes of the write-ahead log this engine has decoded, taken from the counter inside the walk.
+///
+/// `bytes_read` is incremented in `scan_collect`, the one walk every WAL scan shares, so a reader
+/// added to the log cannot avoid moving it. `raw_stats` is the NON-scanning accessor: reading an
+/// instrument must not be work the instrument counts, and `stats()` here would take a piece-tail
+/// read of its own.
+fn wal_bytes_decoded(engine: &TemporalEngine) -> u64 {
+    engine.write_ahead_log_store().raw_stats(1).bytes_read
+}
+
+/// The same for the index log, whose count sits one line below the write-ahead log's.
+fn index_log_bytes_decoded(engine: &TemporalEngine) -> u64 {
+    engine.index_log_store().stats(1).bytes_read
+}
+
+/// How many pieces the shard's log is in, and how many bytes are on disk under it.
+///
+/// The regime assertions rest on this: a log in ONE piece that has never rolled is not the log a
+/// steady store has, and every figure taken on it would be a small number about nothing.
+fn wal_shape(engine: &TemporalEngine) -> (usize, u64) {
+    let info = engine
+        .write_ahead_log_store()
+        .info(1)
+        .expect("write-ahead log info");
+    let root = info
+        .path
+        .parent()
+        .expect("the log's path has a parent")
+        .to_path_buf();
+    let pieces = crate::wal::wal_piece_extents_for_test(&root, 1);
+    let bytes = pieces
+        .iter()
+        .map(|(path, _, _, _)| path.metadata().map(|meta| meta.len()).unwrap_or(0))
+        .sum();
+    (pieces.len(), bytes)
+}
+
+/// xorshift64*, seeded per record.
+///
+/// The batched seeder above writes a repeated byte, and the log compresses its records: 2,000
+/// objects written that way put 30,737 bytes in the log where their payload is 280,000. A corpus
+/// of repeated bytes holds a fraction of the log its record count implies, so a fixture built from
+/// one does not roll, does not reach the regime, and measures a cost against a log it has not got.
+fn incompressible_value(len: usize, seed: u64) -> Vec<u8> {
+    let mut state = 0x2545_F491_4F6C_DD1D_u64
+        ^ (len as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ seed.wrapping_mul(0xD1B5_4A32_D192_ED03);
+    (0..len)
+        .map(|_| {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            state.wrapping_mul(0x2545_F491_4F6C_DD1D) as u8
+        })
+        .collect()
+}
+
+/// Bytes per value in the log-reading fixtures. Large enough that a few thousand records roll the
+/// log several times over at the shipped 256 KiB threshold, which is what puts the fixture into
+/// the regime this cost occurs in.
+const LOG_FIXTURE_VALUE_BYTES: usize = 512;
+
+/// Seed ONE log record per object, incompressibly.
+///
+/// One per object, not one per batch: a batch writes a SINGLE write-ahead log record however many
+/// commands it carries, so the batched seeder above puts 79 records in the log for 20,000 objects.
+/// That is below the dump threshold, so such a log is never dumped, never reclaimed, and the
+/// drained regime measured below could never be reached from it.
+fn seed_one_record_per_object(engine: &TemporalEngine, shard_id: ShardId, count: usize) {
+    for index in 0..count {
+        let response = engine.execute(crate::types::ExecuteRequest {
+            shard_id,
+            command: Command::StringSet {
+                key: format!("k-{index:08}"),
+                value: incompressible_value(LOG_FIXTURE_VALUE_BYTES, index as u64),
+            },
+        });
+        assert!(response.status.ok, "seed write failed: {:?}", response.status);
+    }
+}
+
+/// What one round, and the report it used to ask for, read of the two logs.
+struct LogReadCost {
+    records: usize,
+    pieces: usize,
+    log_bytes_on_disk: u64,
+    /// The instrument's own control: a deliberate whole-log `record_count()`, which must move the
+    /// counter by about the log's size. A counter that has quietly stopped incrementing reports a
+    /// perfect result for every claim below it, so it is planted and recovered before anything
+    /// else is measured.
+    planted_wal: u64,
+    /// What the FULL compatibility report reads of each log. This is what a round paid before the
+    /// pressure sites stopped asking for it -- measured live on this fixture, not kept here as a
+    /// constant that would go stale the moment a write logs a different number of bytes.
+    full_report_wal: u64,
+    full_report_index: u64,
+    /// What the CHEAP report -- the one the pressure sites now ask for -- reads of each log.
+    pressure_report_wal: u64,
+    pressure_report_index: u64,
+    /// What one whole round reads of each log now.
+    round_wal: u64,
+    round_index: u64,
+    /// The same full report, taken again once the round has drained the log. The DRAINED regime.
+    drained_report_wal: u64,
+    drained_log_bytes_on_disk: u64,
+}
+
+/// Measure one fixture: seed, plant, take both readings on the RETAINED log, then run the round
+/// and take the drained reading.
+///
+/// Order is load-bearing. The round reclaims, so every figure about a retained log has to be taken
+/// before it runs; the drained figure is the same report after it.
+fn log_read_cost(records: usize) -> LogReadCost {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = round_engine(dir.path());
+    seed_one_record_per_object(&engine, 1, records);
+
+    let (pieces, log_bytes_on_disk) = wal_shape(&engine);
+
+    // CONTROL FOR THE INSTRUMENT. Reading it twice, with nothing in between, must not move it.
+    let idle_before = wal_bytes_decoded(&engine);
