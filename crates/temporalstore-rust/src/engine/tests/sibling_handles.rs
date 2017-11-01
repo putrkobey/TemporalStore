@@ -98,36 +98,3 @@ fn two_entries_of_one_object_at_one_address_share_a_handle() {
     let handles: std::collections::BTreeSet<u64> = at_one_block
         .iter()
         .map(|(object_key, block)| block_index_handle(object_key, block))
-        .collect();
-    println!(
-        "[sibling-handles] {ENTRIES} entries of one object at one address -> {} distinct handle(s)",
-        handles.len()
-    );
-
-    // ONE HANDLE, AND THAT IS THE POINT RATHER THAN A DEFECT.
-    //
-    // This assertion used to be `ENTRIES == handles.len()`, and it held because the entries
-    // differed in their component. They have nothing left to differ in, so they hash alike and
-    // `block_index` would hold one of them -- which is exactly the forty-fields collapse the old
-    // assertion was written to catch, and the reason the next test pins that nothing files this
-    // state.
-    assert_eq!(
-        1,
-        handles.len(),
-        "{} distinct handles for {ENTRIES} entries of one object at one address. If these are \
-         separable then the handle has gained a discriminator the entry's field set does not \
-         show, and THIS MODULE IS THE WRONG WAY ROUND: the collision is what makes one entry a \
-         page a correctness requirement, so whoever adds a discriminator has to come past this \
-         line and restate the requirement rather than inherit it.",
-        handles.len(),
-    );
-}
-
-/// AND NOTHING FILES THE COLLIDING STATE, which is what makes the collision above unreachable
-/// rather than a live loss.
-///
-/// Asked of `index_entry_names_a_block` -- the single predicate every filing site in the engine
-/// reads, so the projection, `upsert_bucket_index_block_inner` and `fold_delta_block_items` cannot
-/// come to disagree about it -- and asked by `ModelKind::as_str` rather than by string literals,
-/// so a kind renamed in the registry cannot leave this matching nothing.
-///

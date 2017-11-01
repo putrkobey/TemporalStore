@@ -30,35 +30,3 @@ pub(super) fn mark_dirty(dirty: &Mutex<DirtyTracker>, shard_id: ShardId, key: Op
     }
     if let Some(entry) = dirty.by_key.get_mut(&object_key) {
         entry.last_dirty_at_ms = now;
-    }
-}
-
-pub(super) fn clear_dirty_shard_buckets(
-    dirty: &Mutex<DirtyTracker>,
-    engine: &TemporalEngine,
-    shard_id: ShardId,
-    selected_buckets: &[u32],
-) -> usize {
-    if selected_buckets.is_empty() {
-        return 0;
-    }
-    let selected_buckets = selected_buckets.iter().copied().collect::<BTreeSet<_>>();
-    let mut dirty = dirty.lock().expect("dirty tracker lock poisoned");
-    let before = dirty.by_key.len();
-    dirty.by_key.retain(|(dirty_shard_id, key), _| {
-        *dirty_shard_id != shard_id
-            || !selected_buckets.contains(&engine.routing_bucket_for_key(shard_id, key))
-    });
-    before - dirty.by_key.len()
-}
-
-pub(super) fn dirty_shards(dirty: &Mutex<DirtyTracker>) -> Vec<ShardId> {
-    dirty
-        .lock()
-        .expect("dirty tracker lock poisoned")
-        .by_key
-        .keys()
-        .map(|(shard_id, _)| *shard_id)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect()
