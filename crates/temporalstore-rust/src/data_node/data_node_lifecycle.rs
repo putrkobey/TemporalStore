@@ -106,3 +106,112 @@ pub(super) fn restore_lifecycle_snapshot_from_path_inner(inner: &DataNodeRuntime
 }
 
 pub(super) fn persist_lifecycle_snapshot_inner(inner: &DataNodeRuntimeInner) {
+    let Some(path) = &inner.lifecycle_snapshot_path else {
+        return;
+    };
+    let result: Result<(), Status> = if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)
+                .map_err(|err| Status::error("lifecycle_snapshot_io", err.to_string()))
+        } else {
+            Ok(())
+        }
+    } else {
+        Ok(())
+    }
+    .and_then(|_| {
+        serde_json::to_vec_pretty(&lifecycle_snapshot_inner(inner))
+            .map_err(|err| Status::error("bad_lifecycle_snapshot", err.to_string()))
+    })
+    .and_then(|bytes| {
+        let tmp_path = path.with_extension("tmp");
+        fs::write(&tmp_path, bytes)
+            .and_then(|_| fs::rename(&tmp_path, path))
+            .map_err(|err| Status::error("lifecycle_snapshot_io", err.to_string()))
+    });
+    let status = match result {
+        Ok(()) => Status::ok(),
+        Err(status) => status,
+    };
+    let mut report = inner
+        .lifecycle_persistence
+        .lock()
+        .expect("runtime lifecycle persistence lock poisoned");
+    report.last_persist_at_ms = now_ms();
+    report.last_persist_status = Some(status.clone());
+    if status.ok {
+        report.persist_success_total += 1;
+    } else {
+        report.persist_failure_total += 1;
+    }
+}
+
+pub(super) fn shard_has_queued_or_running_work(
+    inner: &DataNodeRuntimeInner,
+    shard_id: ShardId,
+) -> bool {
+    let queue = inner.queue.lock().expect("runtime queue lock poisoned");
+    queue.running_shards.contains(&shard_id)
+        || queue
+            .by_shard
+            .get(&shard_id)
+            .map(|queued| !queued.is_empty())
+            .unwrap_or(false)
+}
+
+pub(super) fn record_lifecycle_state_inner(
+    inner: &DataNodeRuntimeInner,
+    shard_id: ShardId,
+    state: &str,
+    operation: &str,
+    load_version: u64,
+    last_status: Option<Status>,
+) {
+    let token = inner
+        .lifecycle_tokens
+        .lock()
+        .expect("runtime lifecycle token lock poisoned")
+        .get(&(shard_id, operation.to_string()))
+        .cloned();
+    inner
+        .lifecycle
+        .lock()
+        .expect("runtime lifecycle lock poisoned")
+        .insert(
+            shard_id,
+            DataNodeShardLifecycleState {
+                shard_id,
+                state: state.to_string(),
+                operation: operation.to_string(),
+                load_version,
+                updated_at_ms: now_ms(),
+                last_status,
+                scheduler_task_id: token.as_ref().map(|token| token.task_id),
+                scheduler_generation: token.as_ref().map(|token| token.generation),
+            },
+        );
+    persist_lifecycle_snapshot_inner(inner);
+}
+
+pub(super) fn validate_lifecycle_token_inner(
+    inner: &DataNodeRuntimeInner,
+    shard_id: ShardId,
+    operation: &str,
+    load_version: u64,
+) -> Result<(), Status> {
+    let token = inner
+        .lifecycle_tokens
+        .lock()
+        .expect("runtime lifecycle token lock poisoned")
+        .get(&(shard_id, operation.to_string()))
+        .cloned();
+    let Some(token) = token else {
+        return Ok(());
+    };
+    if token.operation != operation {
+        return Err(Status::error(
+            "lifecycle_token_mismatch",
+            format!(
+                "expected lifecycle operation {}, got {operation}",
+                token.operation
+            ),
