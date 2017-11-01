@@ -164,3 +164,169 @@ const FOREIGN_NAME_NEEDLES: &[(&str, &str)] = &[
         "CamelCase method, so not Rust. Our expiry vocabulary is `expiry_by_deadline` and \
          `ensure_expiry_order`.",
     ),
+    (
+        "ComputeRawObjectSize",
+        "CamelCase method, so not Rust. Our sizes are the `stored_size` and `block_size` fields.",
+    ),
+];
+
+/// THE ONLY EXEMPT PATH, and it has to exist: this file lists every needle as source text, so a
+/// scan that read it would report itself. Asserted to be exactly one entry, because the way a
+/// check like this dies is by growing one exemption per inconvenient file until it scans nothing.
+const EXEMPT_RELATIVE_PATHS: &[&str] = &["foreign_type_name_guard.rs"];
+
+/// Measured on the tree that introduced this guard: 321 files and 17_181_182 bytes under
+/// `crates/temporalstore-rust/src`. The floors sit below those with room for ordinary churn --
+/// they are here to catch a walk that found nothing or almost nothing, which is the failure a
+/// clean report cannot otherwise be told apart from.
+const MIN_FILES_SCANNED: usize = 280;
+const MIN_BYTES_SCANNED: usize = 12_000_000;
+
+#[derive(Debug)]
+struct Finding {
+    path: String,
+    line: usize,
+    needle: String,
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// True when the byte before `start` cannot be part of an identifier, so the needle is not the
+/// tail of some longer word.
+fn left_boundary_ok(haystack: &[u8], start: usize) -> bool {
+    start == 0 || !is_ident_byte(haystack[start - 1])
+}
+
+/// True when the byte after the needle cannot continue an identifier AND is not a second `:`.
+///
+/// THE SECOND HALF IS THE WHOLE POINT for the `std::` needles: `std::string::String` and
+/// `std::stringify!` are ordinary Rust, and only this rule tells them apart from a bare
+/// `std::string` used as a type. Rejecting on `:` keeps the Rust path silent; rejecting on an
+/// identifier byte keeps `stringify` silent.
+fn right_boundary_ok(haystack: &[u8], end: usize) -> bool {
+    match haystack.get(end) {
+        None => true,
+        Some(&b) => !is_ident_byte(b) && b != b':',
+    }
+}
+
+enum Boundary {
+    /// Both ends must be clear, and a trailing `:` disqualifies.
+    BothEnds,
+    /// Only the left end is checked; the needle is a prefix expected to be followed by a name.
+    LeftOnly,
+}
+
+fn find_needle(text: &str, needle: &str, boundary: &Boundary) -> Vec<usize> {
+    let haystack = text.as_bytes();
+    let mut hits = Vec::new();
+    let mut from = 0usize;
+    while let Some(offset) = text[from..].find(needle) {
+        let start = from + offset;
+        let end = start + needle.len();
+        let ok = match boundary {
+            Boundary::BothEnds => {
+                left_boundary_ok(haystack, start) && right_boundary_ok(haystack, end)
+            }
+            Boundary::LeftOnly => left_boundary_ok(haystack, start),
+        };
+        if ok {
+            hits.push(start);
+        }
+        // Every needle starts with an ASCII byte, so `start + 1` is always a char boundary.
+        from = start + 1;
+    }
+    hits
+}
+
+fn line_of(text: &str, byte_offset: usize) -> usize {
+    text[..byte_offset].bytes().filter(|b| *b == b'\n').count() + 1
+}
+
+/// Scan one file's text. Pure, so the controls below can drive it without touching the disk.
+fn scan_text(path: &str, text: &str) -> Vec<Finding> {
+    let mut findings = Vec::new();
+    let mut push = |needle: &str, boundary: Boundary| {
+        for offset in find_needle(text, needle, &boundary) {
+            findings.push(Finding {
+                path: path.to_string(),
+                line: line_of(text, offset),
+                needle: needle.to_string(),
+            });
+        }
+    };
+    for needle in FOREIGN_NAMESPACE_TYPE_NEEDLES {
+        push(needle, Boundary::BothEnds);
+    }
+    for needle in FIXED_WIDTH_INT_NEEDLES {
+        push(needle, Boundary::BothEnds);
+    }
+    for (needle, _reason) in FOREIGN_NAME_NEEDLES {
+        push(needle, Boundary::BothEnds);
+    }
+    for needle in FOREIGN_NAMESPACE_PREFIXES {
+        push(needle, Boundary::LeftOnly);
+    }
+    findings.sort_by(|a, b| (a.line, &a.needle).cmp(&(b.line, &b.needle)));
+    findings
+}
+
+/// Every `.rs` file under the crate's `src`, derived by walking the tree. NOT a list anyone
+/// maintains: a hand-written subject list goes stale and nothing fails.
+fn walk_crate_rust_files() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut found = Vec::new();
+    let mut stack = vec![root];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("read_dir {} failed: {err}", dir.display()));
+        for entry in entries {
+            let entry = entry.expect("dir entry readable");
+            let path = entry.path();
+            let kind = entry.file_type().expect("file type readable");
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+fn is_exempt(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default();
+    EXEMPT_RELATIVE_PATHS.contains(&name)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// POSITIVE CONTROL. A scan that matched nothing and a scan that found nothing produce the
+    /// same output -- zero findings -- so every needle is planted and asserted to be recovered
+    /// by name. Without this the guard could be silently inert, which is how a scrub in this
+    /// repository once read clean three times over a file it had never opened.
+    #[test]
+    fn foreign_name_scan_finds_every_planted_needle() {
+        let mut planted: Vec<String> = Vec::new();
+        for needle in FOREIGN_NAMESPACE_TYPE_NEEDLES {
+            planted.push((*needle).to_string());
+        }
+        for needle in FIXED_WIDTH_INT_NEEDLES {
+            planted.push((*needle).to_string());
+        }
+        for (needle, _reason) in FOREIGN_NAME_NEEDLES {
+            planted.push((*needle).to_string());
+        }
+        for needle in FOREIGN_NAMESPACE_PREFIXES {
+            planted.push((*needle).to_string());
+        }
+        assert!(
+            planted.len() >= 32,
