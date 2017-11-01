@@ -81,3 +81,171 @@ fn the_owned_array_stays_sorted_whatever_order_the_points_arrive_in() {
     // A DUPLICATE INSTANT REPLACES, it does not grow the array. A representation that appended
     // would read back the same instant twice and the walk would still be ascending, so the length
     // is what separates the two.
+    let replaced = series.insert(500, address(5_000));
+    assert_eq!(
+        Some(address(500)),
+        replaced,
+        "writing an instant that is already there returns what it replaced"
+    );
+    assert_eq!(9, series.len(), "a replace does not grow the array");
+    assert_eq!(
+        Some(&address(5_000)),
+        series.get(&500),
+        "and the new address is what is read back"
+    );
+
+    // REMOVALS PRESERVE ORDER, from both ends and the middle.
+    for at in [100u64, 900, 500] {
+        assert!(series.remove(&at).is_some(), "{at} was there to remove");
+    }
+    assert_eq!(None, series.remove(&500), "a second removal finds nothing");
+    let walked: Vec<u64> = series.keys().copied().collect();
+    assert_eq!(
+        vec![200u64, 300, 400, 600, 700, 800],
+        walked,
+        "the walk is still ascending after removals at both ends and in the middle"
+    );
+
+    // AND THE ALLOCATION GOES BACK when the last point leaves.
+    for at in [200u64, 300, 400, 600, 700, 800] {
+        series.remove(&at);
+    }
+    assert!(series.is_empty(), "every point was removed");
+    assert_eq!(
+        0,
+        series.allocation_count(),
+        "a drained series must give its allocation back, not keep an empty buffer per key"
+    );
+}
+
+/// The round trip through the B-tree shape is lossless in both directions, which is what lets the
+/// stored image stay exactly what it was.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+fn the_array_and_the_btree_shape_round_trip_without_loss() {
+    let original = series_of(&[7, 3, 11, 1, 9]);
+    let array = OwnedTimestampedSeries::from(&original);
+    assert_eq!(
+        original,
+        array.to_btree(),
+        "the B-tree view of the array must be the B-tree it was built from -- this is the shape \
+         the capture blob carries and an older binary folds"
+    );
+    assert_eq!(original.len(), array.len(), "and no point was dropped");
+}
+
+
+
+/// THE PATH NO DECODE FOLD EVER COVERED, AND THE ONLY ONE LEFT.
+///
+/// `capture_key_states` writes a `context_events` field into the index-log blobs. When no base
+/// index decodes, `persistence.rs` takes `ShardState::default()` and folds those blobs straight
+/// through `apply_key_states`. This is not an unguarded door: there is no stored index on this
+/// path for a stamp to describe, and the blob was written by this binary at this stamp. What
+/// covers it is the `KeyedState` conversion from the stored B-tree shape into the array.
+///
+/// THE DECODE FOLD THIS ARM'S TITLE REFERS TO IS GONE, and the path it could not see is the
+/// only one left. That is why this arm survives the compatibility field's removal unchanged:
+/// it never tested the fold, it tested the path the fold did not cover.
+///
+/// THE REMOVAL HALF IS DRIVEN TOO. `apply_key_state_field` reads an ABSENT field as "this key had
+/// none" and REMOVES the entry, so the path writes removals as well as inserts.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+fn the_capture_path_writes_the_array_map_with_nothing_decoded() {
+    let mut shard = ShardState::default();
+
+    let arrival = serde_json::json!({
+        "key": "ctx:event:t:a",
+        "context_events": serde_json::to_value(series_of(&[1, 2])).expect("the series encodes"),
+    });
+    crate::engine::apply_key_states(&mut shard, std::slice::from_ref(&arrival));
+
+    assert_eq!(
+        2,
+        shard
+            .context_events()
+            .get("ctx:event:t:a")
+            .map_or(0, |slot| slot.owned_element_count()),
+        "the key-state fold delivered the series into the array map with nothing decoded"
+    );
+
+    // THE REMOVAL HALF: a blob naming the key but carrying no `context_events` field.
+    let departure = serde_json::json!({ "key": "ctx:event:t:a", "features": {} });
+    crate::engine::apply_key_states(&mut shard, std::slice::from_ref(&departure));
+
+    assert!(
+        !shard.context_events().contains_key("ctx:event:t:a"),
+        "an absent field is read as a removal, which is what this helper is for"
+    );
+}
+
+
+/// WHAT THE ARRAY COSTS AGAINST THE B-TREE IT REPLACES -- in BYTES and in ALLOCATIONS, reported as
+/// two numbers because they are two different components and one standing in for the other is how
+/// a footprint claim gets published wrong.
+///
+/// # WHY THIS IS STRUCTURAL AND NOT A COUNTER READING
+///
+/// The process-global allocation counters cannot attribute across concurrently running tests, and
+/// a mutex does not fix that -- the allocations of the other test still land in the same counter.
+/// So the allocation count here comes from the structure itself, which is exact and
+/// order-independent, and the per-element byte comparison is a `size_of` statement about the
+/// owning field rather than a reading of resident memory.
+///
+/// # WHAT IT DOES NOT CLAIM
+///
+/// Not a shard-level saving. The shard-level bracket in `index_bytes_per_key.rs` is seeded with
+/// `strings` and `features` and holds no context events at all, so it does not move for this map in
+/// either direction, and an unmoved bracket on an unseeded map is not evidence of anything.
+///
+/// rust-internal: measures this crate's own resident structures, no product behaviour
+#[test]
+fn the_owned_array_is_eight_bytes_and_two_allocations_where_the_btree_is_twenty_four_and_more() {
+    // THE OWNING FIELD. Eight bytes against twenty-four, per key, before any element is stored.
+    assert_eq!(
+        8,
+        std::mem::size_of::<OwnedTimestampedSeries>(),
+        "the array field is a thin pointer"
+    );
+    assert_eq!(
+        24,
+        std::mem::size_of::<BTreeMap<u64, ElementEntry>>(),
+        "the B-tree header it replaces is three words -- this is the per-key inline difference, \
+         and it is 16 bytes, which is NOT the whole story and must not be quoted as it"
+    );
+
+    // THE ALLOCATION COUNT, which is the other component and the larger one. A `BTreeMap` with a
+    // single element has allocated its root node; the array has a `Vec` header and a buffer.
+    let mut array = OwnedTimestampedSeries::default();
+    array.insert(1, address(1));
+    assert_eq!(
+        1,
+        array.len(),
+        "denominator: one element, which is the regime this comparison is about"
+    );
+    assert_eq!(
+        2,
+        array.allocation_count(),
+        "one element costs the array two allocations: the boxed `Vec` header and its buffer"
+    );
+
+    // AND AT A THOUSAND ELEMENTS IT IS STILL TWO. The B-tree grows a node per fanout group; the
+    // array grows its one buffer. That is the shape of the win, and it is why the allocation count
+    // is reported separately from the byte figure rather than folded into it.
+    let mut longer = OwnedTimestampedSeries::default();
+    for at in 0..1_000u64 {
+        longer.insert(at, address(at));
+    }
+    assert_eq!(1_000, longer.len(), "denominator: a thousand elements");
+    assert_eq!(
+        2,
+        longer.allocation_count(),
+        "a thousand elements still cost the array exactly two allocations"
+    );
+
+    println!(
+        "owned array: {} B inline, 2 allocations at 1 element, {} at 1000 elements",
+        std::mem::size_of::<OwnedTimestampedSeries>(),
