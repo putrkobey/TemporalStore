@@ -356,3 +356,361 @@ fn what_a_snapshot_reads_per_byte_of_log_it_discards_under_each_cadence() {
             "the priming snapshot did not fire ({}), so every round below would measure the \
              WHOLE regime rather than the routine one",
             priming.reason
+        );
+
+        let mut written = store_records;
+        let mut rounds = Vec::new();
+        for cadence in [
+            Cadence::Fixed,
+            Cadence::Relative,
+            Cadence::Relative,
+            Cadence::Fixed,
+        ] {
+            let (round, batches) = run_round(&cluster, cadence, FIXED_FLOOR_BYTES, &mut written);
+            println!("            (batches written this round: {batches})");
+            assert_the_guard_results_hold(
+                &round,
+                &format!("{} at store={}", cadence.label(), round.store_records),
+            );
+            rounds.push(round);
+        }
+
+        // The live set must still be more than one slab AFTER an install, because every round
+        // here measures a REBUILT engine and a rebuild that collapsed the store into one slab
+        // would not be expressing what the fixture was built to express. #1939's own note.
+        let live_after = cluster
+            .node_engine_for_test(1)
+            .expect("the leader serves an engine")
+            .live_block_slab_ids(1);
+        println!("  live slab ids after the rounds = {live_after:?}");
+        assert!(
+            live_after.len() > 1,
+            "the shard's live slab set after these installs is {live_after:?}: with one slab a \
+             per-slab cost and a per-snapshot cost are the same number"
+        );
+        let tallies = cluster
+            .node_engine_for_test(1)
+            .expect("the leader serves an engine")
+            .block_slab_live_tallies(1)
+            .expect("the leader's live tally must be derived");
+        let holding = tallies.iter().filter(|(_, _, bytes)| *bytes > 0).count();
+        println!("  slabs holding live bytes       = {holding} of {}", tallies.len());
+        assert!(
+            holding > 1,
+            "only {holding} slab holds live bytes: a cost spread over slabs cannot be told from \
+             a cost concentrated in one"
+        );
+
+        fixed_first.push(rounds[0]);
+        relative.push(rounds[1]);
+    }
+
+    let (fixed_small, fixed_large) = (fixed_first[0], fixed_first[1]);
+    let (rel_small, rel_large) = (relative[0], relative[1]);
+
+    println!("=== READ PER BYTE RELEASED, store {STORE_SMALL} -> {STORE_LARGE} ===");
+    let fixed_ratio = fixed_large.read_per_byte_released() / fixed_small.read_per_byte_released();
+    let rel_ratio = rel_large.read_per_byte_released() / rel_small.read_per_byte_released();
+    println!(
+        "  FIXED    (control)  {:>10.3} -> {:>10.3}   ({fixed_ratio:.3}x)",
+        fixed_small.read_per_byte_released(),
+        fixed_large.read_per_byte_released()
+    );
+    println!(
+        "  RELATIVE (subject)  {:>10.3} -> {:>10.3}   ({rel_ratio:.3}x), divisor {}",
+        rel_small.read_per_byte_released(),
+        rel_large.read_per_byte_released(),
+        SNAPSHOT_IMAGE_FRACTION_DIVISOR
+    );
+
+    // ---- EVERY QUANTITY, FLAT OR GROWING ----
+    println!("=== EVERY QUANTITY, FLAT OR GROWING (small -> large) ===");
+    for (label, small, large) in [
+        (
+            "slab bytes read          ",
+            fixed_small.counts.slab_read_bytes,
+            fixed_large.counts.slab_read_bytes,
+        ),
+        (
+            "addresses walked         ",
+            fixed_small.counts.live_slab_scan_addresses,
+            fixed_large.counts.live_slab_scan_addresses,
+        ),
+        (
+            "slab reads               ",
+            fixed_small.counts.slab_reads,
+            fixed_large.counts.slab_reads,
+        ),
+        (
+            "slab directory listings  ",
+            fixed_small.counts.slab_dir_listings,
+            fixed_large.counts.slab_dir_listings,
+        ),
+        (
+            "state images built       ",
+            fixed_small.counts.image_builds,
+            fixed_large.counts.image_builds,
+        ),
+        (
+            "engine rebuilds          ",
+            fixed_small.counts.engine_rebuilds,
+            fixed_large.counts.engine_rebuilds,
+        ),
+        (
+            "engine publishes         ",
+            fixed_small.counts.engine_publishes,
+            fixed_large.counts.engine_publishes,
+        ),
+        (
+            "rebuilds under the guard ",
+            fixed_small.counts.engine_rebuilds_under_guard,
+            fixed_large.counts.engine_rebuilds_under_guard,
+        ),
+        (
+            "slab bytes under guard   ",
+            fixed_small.counts.slab_install_bytes_under_guard,
+            fixed_large.counts.slab_install_bytes_under_guard,
+        ),
+        (
+            "image bytes under guard  ",
+            fixed_small.counts.image_clone_bytes_under_guard,
+            fixed_large.counts.image_clone_bytes_under_guard,
+        ),
+        (
+            "FIXED    released bytes  ",
+            fixed_small.released_bytes,
+            fixed_large.released_bytes,
+        ),
+        (
+            "FIXED    threshold       ",
+            fixed_small.threshold_bytes,
+            fixed_large.threshold_bytes,
+        ),
+        (
+            "RELATIVE released bytes  ",
+            rel_small.released_bytes,
+            rel_large.released_bytes,
+        ),
+        (
+            "RELATIVE threshold       ",
+            rel_small.threshold_bytes,
+            rel_large.threshold_bytes,
+        ),
+        (
+            "RELATIVE log high water  ",
+            rel_small.log_high_water_bytes,
+            rel_large.log_high_water_bytes,
+        ),
+        (
+            "FIXED    log high water  ",
+            fixed_small.log_high_water_bytes,
+            fixed_large.log_high_water_bytes,
+        ),
+    ] {
+        let verdict = if small == large { "FLAT" } else { "GROWING" };
+        println!("  {label} {small:>12} -> {large:>12}   {verdict}");
+    }
+    println!(
+        "  FIXED    read per byte released  {:>12.3} -> {:>12.3}   GROWING",
+        fixed_small.read_per_byte_released(),
+        fixed_large.read_per_byte_released()
+    );
+    println!(
+        "  RELATIVE read per byte released  {:>12.3} -> {:>12.3}   FLAT",
+        rel_small.read_per_byte_released(),
+        rel_large.read_per_byte_released()
+    );
+
+    // ---- THE CONTROL ARM, WHICH FAILS IF IT GOES FLAT ----
+    assert!(
+        fixed_ratio > 2.0,
+        "CONTROL ARM FIXED did not grow: {:.3} at store={} against {:.3} at store={}, a ratio of \
+         {fixed_ratio:.3} over a {:.3}x store. This arm IS #1939's finding, kept alive so the \
+         subject's flat reading keeps meaning something. A control that has gone flat is an \
+         apparatus that can no longer show the defect, and the subject below would then read \
+         healthy for the wrong reason",
+        fixed_small.read_per_byte_released(),
+        fixed_small.store_records,
+        fixed_large.read_per_byte_released(),
+        fixed_large.store_records,
+        fixed_large.store_records as f64 / fixed_small.store_records as f64,
+    );
+    assert_eq!(
+        fixed_small.threshold_bytes, FIXED_FLOOR_BYTES,
+        "the FIXED arm's threshold must be the configured constant and nothing else: {}",
+        fixed_small.threshold_bytes
+    );
+    assert_eq!(
+        fixed_large.threshold_bytes, FIXED_FLOOR_BYTES,
+        "the FIXED arm's threshold must be the configured constant and nothing else: {}",
+        fixed_large.threshold_bytes
+    );
+
+    // ---- THE SUBJECT ----
+    assert!(
+        rel_ratio > 0.8 && rel_ratio < 1.25,
+        "RELATIVE is not flat across a {:.3}x store: {:.3} -> {:.3}, a ratio of {rel_ratio:.3}. \
+         The claim of this change is that the figure stops moving with the store, and it moved",
+        rel_large.store_records as f64 / rel_small.store_records as f64,
+        rel_small.read_per_byte_released(),
+        rel_large.read_per_byte_released(),
+    );
+    for round in [rel_small, rel_large] {
+        assert!(
+            round.threshold_bytes > FIXED_FLOOR_BYTES,
+            "the RELATIVE arm at store={} was decided by the configured floor ({}), not by the \
+             relative term. Below the crossover this change does nothing at all, which is correct \
+             behaviour and a vacuous measurement: this arm must be ABOVE it",
+            round.store_records,
+            round.threshold_bytes
+        );
+        // The image is read BEFORE the round, and the store grows by the round's own writes
+        // while the threshold that admitted it stays where it was -- so the cost being divided is
+        // the larger one and the figure sits a little above the divisor rather than at it. What
+        // matters is that it does not move with the store, which is asserted above.
+        assert!(
+            round.read_per_byte_released() < (SNAPSHOT_IMAGE_FRACTION_DIVISOR * 2) as f64,
+            "the RELATIVE arm at store={} read {:.3} slab bytes per byte released, against a \
+             divisor of {SNAPSHOT_IMAGE_FRACTION_DIVISOR}. The bound is on the IMAGE, of which \
+             the slab bytes are a part, so this figure must sit below the divisor plus the \
+             round's own growth -- well inside twice it",
+            round.store_records,
+            round.read_per_byte_released(),
+        );
+    }
+    assert!(
+        fixed_large.read_per_byte_released() > rel_large.read_per_byte_released() * 2.0,
+        "at store={} the FIXED cadence read {:.3} bytes per byte released and the RELATIVE one \
+         {:.3}. With the two arms that close together this fixture is not expressing the \
+         difference it was built to express",
+        fixed_large.store_records,
+        fixed_large.read_per_byte_released(),
+        rel_large.read_per_byte_released(),
+    );
+}
+
+/// WHAT THE SLAB READ IS AS A FRACTION OF THE OPERATION -- the question that decides which fix is
+/// available.
+///
+/// #1941 found its subject was 99.43% of the dump, which is what made "cut the cadence, not the
+/// work" the right call there. The same accounting here, in bytes, at both sizes: everything a
+/// snapshot moves, and the share of it that is priced by the STORE rather than by the ROUND.
+#[test]
+fn the_slab_read_is_what_a_snapshot_is() {
+    let mut rows = Vec::new();
+    for store_records in [STORE_SMALL, STORE_LARGE] {
+        let cluster = cluster_with(store_records);
+        assert_the_fixture_is_populated(&cluster, store_records);
+        force_the_threshold(&cluster);
+        snapshot_probe::reset();
+        let report = cluster
+            .maybe_trigger_snapshot()
+            .expect("maybe_trigger_snapshot must succeed");
+        assert!(report.triggered, "the snapshot did not fire: {}", report.reason);
+        let counts = snapshot_probe::counts();
+        let (payload, index_bytes, slabs) = installed_image(&cluster);
+
+        // Everything a snapshot MOVES, in bytes. The read is the build's half; the installs are
+        // what the rebuilt engines write; the copies are the per-node images.
+        let read = counts.slab_read_bytes;
+        let encoded = index_bytes;
+        let installed = counts.slab_install_bytes;
+        let copied = counts.image_clone_bytes;
+        let total = read + encoded + installed + copied;
+        println!("=== WHAT A SNAPSHOT MOVES, store={store_records} ===");
+        println!("  {read:>12} B  slab bytes READ by the build");
+        println!("  {encoded:>12} B  served index ENCODED by the build");
+        println!("  {installed:>12} B  slab bytes INSTALLED into the rebuilt engines");
+        println!("  {copied:>12} B  image bytes COPIED per install target");
+        println!("  {total:>12} B  total");
+        println!(
+            "  THE BUILD'S WHOLE-STORE READ IS {:.2}% OF THE BYTES, AND THE SLAB READ ALONE IS \
+             {:.2}%",
+            (read + encoded) as f64 * 100.0 / total.max(1) as f64,
+            read as f64 * 100.0 / total.max(1) as f64,
+        );
+        println!(
+            "  image payload = {payload} B over {slabs} slabs; every one of these four terms is \
+             priced by the STORE"
+        );
+        assert!(total > 0, "a snapshot that moved no bytes measures nothing");
+        assert_eq!(
+            read,
+            SLAB_BYTES_PER_RECORD * store_records as u64,
+            "the read must be {SLAB_BYTES_PER_RECORD} slab bytes per record of store"
+        );
+        rows.push((store_records as u64, read, encoded, installed, copied, total));
+    }
+
+    // Every term scales with the store, which is the finding: there is no second term bounded by
+    // the round, so there is nothing to remove from the work. Asserted as a ratio against the
+    // store ratio rather than as a trend.
+    let (small, large) = (rows[0], rows[1]);
+    let store_ratio = large.0 as f64 / small.0 as f64;
+    for (label, s, l) in [
+        ("slab read     ", small.1, large.1),
+        ("index encode  ", small.2, large.2),
+        ("slab installs ", small.3, large.3),
+        ("image copies  ", small.4, large.4),
+        ("total         ", small.5, large.5),
+    ] {
+        let ratio = l as f64 / s.max(1) as f64;
+        println!("  {label} {s:>12} -> {l:>12}   {ratio:.3}x against a store ratio of {store_ratio:.3}x");
+        assert!(
+            ratio > store_ratio * 0.75,
+            "{label} grew only {ratio:.3}x over a {store_ratio:.3}x store. If some term of a \
+             snapshot were bounded by the ROUND rather than by the store there would be something \
+             to remove from the work, and this file's argument for cutting the cadence instead \
+             would not hold"
+        );
+    }
+    assert_eq!(
+        small.1 * large.0,
+        large.1 * small.0,
+        "the slab read is not exactly proportional to the store: {} at {} against {} at {}",
+        small.1,
+        small.0,
+        large.1,
+        large.0
+    );
+}
+
+/// WHY INCREMENTAL IS NOT AVAILABLE -- established from the installers, not assumed.
+///
+/// Every path that consumes a state image builds a FRESH `TemporalEngine` and replaces with it;
+/// none merges into what the receiver already holds. So an image carrying only what changed
+/// installs as a shard containing only what changed, and the receiver serves a store with the
+/// rest silently missing -- which is precisely the failure a snapshot exists to prevent and the
+/// one nothing would report.
+///
+/// Constructed rather than argued: a snapshot is built, its image is reduced to a PROPER SUBSET of
+/// its slabs, an engine is rebuilt from it, and the records in the dropped slab are asked for.
+#[test]
+fn a_receiving_peer_cannot_apply_an_increment() {
+    let records = 2_000usize;
+    let cluster = cluster_with(records);
+    assert_the_fixture_is_populated(&cluster, records);
+
+    let whole = cluster.create_snapshot().expect("create_snapshot must succeed");
+    let image = whole
+        .state_image
+        .as_ref()
+        .expect("the state-image path is the one under test");
+    assert!(
+        image.slabs.len() > 1,
+        "the image carries {} slab(s): a PROPER subset of one slab is the empty set, and this \
+         test would be dropping everything rather than dropping an increment's complement",
+        image.slabs.len()
+    );
+
+    // A peer built from the WHOLE image serves every record. This is the positive control: it is
+    // what makes the negative below a statement about the missing slab rather than about the
+    // rebuild being broken in general.
+    let whole_peer = crate::raft::rebuild_snapshot_engine(&whole);
+    let mut served_by_whole = 0usize;
+    for index in 0..records {
+        if read_back(&whole_peer, &format!("key-{index:08}")).is_some() {
+            served_by_whole += 1;
+        }
+    }
+    println!("  whole image: {served_by_whole} of {records} records served");
