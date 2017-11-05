@@ -1081,3 +1081,544 @@ mod tests {
             run(
                 &mut state,
                 vec!["SDIFF", "redis:core:set", "redis:core:other-set"]
+            ),
+            RespValue::Array(vec![RespValue::Bulk(Some(b"a".to_vec()))])
+        );
+        assert_eq!(
+            run(
+                &mut state,
+                vec!["SINTER", "redis:core:set", "redis:core:other-set"]
+            ),
+            RespValue::Array(vec![RespValue::Bulk(Some(b"b".to_vec()))])
+        );
+        assert_eq!(
+            run(
+                &mut state,
+                vec!["SUNION", "redis:core:set", "redis:core:other-set"]
+            ),
+            RespValue::Array(vec![
+                RespValue::Bulk(Some(b"a".to_vec())),
+                RespValue::Bulk(Some(b"b".to_vec())),
+                RespValue::Bulk(Some(b"c".to_vec())),
+            ])
+        );
+        assert_eq!(
+            run(&mut state, vec!["SRANDMEMBER", "redis:core:set"]),
+            RespValue::Bulk(Some(b"a".to_vec()))
+        );
+        assert_eq!(
+            run(&mut state, vec!["SSCAN", "redis:core:set", "0"]),
+            RespValue::Array(vec![
+                RespValue::Bulk(Some(b"0".to_vec())),
+                RespValue::Array(vec![
+                    RespValue::Bulk(Some(b"a".to_vec())),
+                    RespValue::Bulk(Some(b"b".to_vec())),
+                ]),
+            ])
+        );
+        assert_eq!(
+            run(
+                &mut state,
+                vec!["SMOVE", "redis:core:set", "redis:core:set-dest", "a"]
+            ),
+            RespValue::Integer(1)
+        );
+        assert_eq!(
+            run(&mut state, vec!["SPOP", "redis:core:set-dest"]),
+            RespValue::Bulk(Some(b"a".to_vec()))
+        );
+        assert_eq!(
+            run(&mut state, vec!["TYPE", "redis:core:set"]),
+            RespValue::SimpleString("set".to_string())
+        );
+        assert_eq!(
+            run(
+                &mut state,
+                vec!["COPY", "redis:core:string", "redis:core:string-copy"]
+            ),
+            RespValue::Integer(1)
+        );
+        assert_eq!(
+            run(
+                &mut state,
+                vec![
+                    "RENAMENX",
+                    "redis:core:string-copy",
+                    "redis:core:string-renamed"
+                ]
+            ),
+            RespValue::SimpleString("OK".to_string())
+        );
+        assert_eq!(
+            run(&mut state, vec!["GET", "redis:core:string-renamed"]),
+            RespValue::Bulk(Some(b"value-tail".to_vec()))
+        );
+        assert_eq!(
+            run(
+                &mut state,
+                vec![
+                    "RENAME",
+                    "redis:core:string-renamed",
+                    "redis:core:string-copy"
+                ]
+            ),
+            RespValue::SimpleString("OK".to_string())
+        );
+        assert_eq!(
+            run(&mut state, vec!["RANDOMKEY"]),
+            RespValue::Bulk(Some(b"redis:core:float".to_vec()))
+        );
+        assert_eq!(
+            run(
+                &mut state,
+                vec!["TOUCH", "redis:core:string", "redis:core:missing"]
+            ),
+            RespValue::Integer(1)
+        );
+        // `redis:core:set-dest` IS NOT HERE, AND THAT IS THE FIX RATHER THAN A LOSS. Above, `SMOVE`
+        // put its only member in and `SPOP` took that member out again, so it is an EMPTY set --
+        // and `SPOP` reaches `Command::SetRemove` once per popped member, which now removes the key
+        // when its last member goes, exactly as `HashDelete`, `ZSetRemove` and `ListPop` already
+        // did for their kinds.
+        //
+        // This expectation used to list it, which made it an assertion that an emptied set stays
+        // enumerable: `record_exists_exact` ORs `shard.sets.contains_key(key)` in, `SetRemove` left
+        // the key behind holding an empty member map, and `KEYS`, `SCAN`, `DBSIZE`, `EXISTS`, `TYPE`
+        // and `EXPIRE` all answered for a set with nothing in it. A set that holds no member does
+        // not exist, and the three `*_match_native` tests beside this one are the standard this
+        // surface is held to.
+        assert_eq!(
+            run(&mut state, vec!["KEYS", "redis:core:*"]),
+            RespValue::Array(vec![
+                RespValue::Bulk(Some(b"redis:core:float".to_vec())),
+                RespValue::Bulk(Some(b"redis:core:hash".to_vec())),
+                RespValue::Bulk(Some(b"redis:core:other-set".to_vec())),
+                RespValue::Bulk(Some(b"redis:core:set".to_vec())),
+                RespValue::Bulk(Some(b"redis:core:string".to_vec())),
+                RespValue::Bulk(Some(b"redis:core:string-copy".to_vec())),
+            ])
+        );
+        assert_eq!(
+            run(
+                &mut state,
+                vec!["SCAN", "0", "MATCH", "redis:core:*", "COUNT", "2"]
+            ),
+            RespValue::Array(vec![
+                RespValue::Bulk(Some(b"2".to_vec())),
+                RespValue::Array(vec![
+                    RespValue::Bulk(Some(b"redis:core:float".to_vec())),
+                    RespValue::Bulk(Some(b"redis:core:hash".to_vec())),
+                ]),
+            ])
+        );
+        assert_eq!(
+            run(&mut state, vec!["TYPE", "redis:core:missing"]),
+            RespValue::SimpleString("none".to_string())
+        );
+        // SIX, NOT SEVEN, and the one that went is the emptied `redis:core:set-dest` above. `DBSIZE`
+        // counts the same keys `KEYS` lists, so the two move together -- which is the point: they
+        // agreed on the phantom before and they agree without it now.
+        assert_eq!(run(&mut state, vec!["DBSIZE"]), RespValue::Integer(6));
+        assert_eq!(
+            run(&mut state, vec!["DEL", "redis:core:string"]),
+            RespValue::Integer(1)
+        );
+        assert_eq!(
+            run(&mut state, vec!["UNLINK", "redis:core:other-set"]),
+            RespValue::Integer(1)
+        );
+        // Four: six less the two removed on the two lines above.
+        assert_eq!(run(&mut state, vec!["DBSIZE"]), RespValue::Integer(4));
+        assert_eq!(
+            run(&mut state, vec!["FLUSHDB"]),
+            RespValue::SimpleString("OK".to_string())
+        );
+        assert_eq!(run(&mut state, vec!["DBSIZE"]), RespValue::Integer(0));
+    }
+
+    #[test]
+    // shared-corpus: redis_engine_product_command_flow;
+    fn advertised_redis_commands_have_dispatch_paths() {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let mut state = RedisCommandState::default();
+        for descriptor in redis_supported_commands() {
+            let args = sample_args_for_command(descriptor.name);
+            let response = execute_redis_command_with_state(
+                args.iter().map(|arg| arg.as_bytes().to_vec()).collect(),
+                1,
+                &mut state,
+                |command| {
+                    let response = engine.execute(ExecuteRequest {
+                        shard_id: 1,
+                        command,
+                    });
+                    if response.status.ok {
+                        Ok(response.response)
+                    } else {
+                        Err(response.status.message)
+                    }
+                },
+            );
+            assert_ne!(
+                response,
+                RespValue::Error("ERR syntax error".to_string()),
+                "{} is advertised by COMMAND but has no dispatch path",
+                descriptor.name
+            );
+        }
+    }
+
+    fn sample_args_for_command(command: &str) -> Vec<&'static str> {
+        match command {
+            "APPEND" => vec!["APPEND", "advertised:append", "x"],
+            "AUTH" => vec!["AUTH", ""],
+            "BGSAVE" => vec!["BGSAVE"],
+            "COMMAND" => vec!["COMMAND", "COUNT"],
+            "CONFIG" => vec!["CONFIG", "GET", "maxmemory"],
+            "BUCKETPEEK" => vec!["BUCKETPEEK", "advertised:bucket", "1", "10", "1"],
+            "BUCKETTAKE" => vec!["BUCKETTAKE", "advertised:bucket", "1", "10", "1"],
+            "COPY" => vec!["COPY", "advertised:missing", "advertised:copy"],
+            "DBSIZE" => vec!["DBSIZE"],
+            "DECR" => vec!["DECR", "advertised:decr"],
+            "DECRBY" => vec!["DECRBY", "advertised:decrby", "1"],
+            "DEL" => vec!["DEL", "advertised:missing"],
+            "ECHO" => vec!["ECHO", "hello"],
+            "EXISTS" => vec!["EXISTS", "advertised:missing"],
+            "EXPIRE" => vec!["EXPIRE", "advertised:missing", "10"],
+            "EXPIREAT" => vec!["EXPIREAT", "advertised:missing", "4102444800"],
+            "EXPIRETIME" => vec!["EXPIRETIME", "advertised:missing"],
+            "FLUSHALL" => vec!["FLUSHALL"],
+            "FLUSHDB" => vec!["FLUSHDB"],
+            "GET" => vec!["GET", "advertised:missing"],
+            "GETDEL" => vec!["GETDEL", "advertised:missing"],
+            "GETEX" => vec!["GETEX", "advertised:missing"],
+            "GETRANGE" => vec!["GETRANGE", "advertised:missing", "0", "-1"],
+            "GETSET" => vec!["GETSET", "advertised:getset", "v"],
+            "HDEL" => vec!["HDEL", "advertised:hash", "missing"],
+            "HEXISTS" => vec!["HEXISTS", "advertised:hash", "missing"],
+            "HGET" => vec!["HGET", "advertised:hash", "missing"],
+            "HGETALL" => vec!["HGETALL", "advertised:hash"],
+            "HINCRBY" => vec!["HINCRBY", "advertised:hash", "n", "1"],
+            "HINCRBYFLOAT" => vec!["HINCRBYFLOAT", "advertised:hash", "f", "1.5"],
+            "HKEYS" => vec!["HKEYS", "advertised:hash"],
+            "HLEN" => vec!["HLEN", "advertised:hash"],
+            "HMGET" => vec!["HMGET", "advertised:hash", "missing"],
+            "HMSET" => vec!["HMSET", "advertised:hash", "a", "1"],
+            "HSET" => vec!["HSET", "advertised:hash", "b", "2"],
+            "HSCAN" => vec!["HSCAN", "advertised:hash", "0"],
+            "HSETNX" => vec!["HSETNX", "advertised:hash", "c", "3"],
+            "HSTRLEN" => vec!["HSTRLEN", "advertised:hash", "a"],
+            "HVALS" => vec!["HVALS", "advertised:hash"],
+            "INFO" => vec!["INFO"],
+            "INCR" => vec!["INCR", "advertised:incr"],
+            "INCRBY" => vec!["INCRBY", "advertised:incrby", "1"],
+            "INCRBYFLOAT" => vec!["INCRBYFLOAT", "advertised:float", "1.5"],
+            "KEYS" => vec!["KEYS", "*"],
+            "LLEN" => vec!["LLEN", "advertised:list"],
+            "LPOP" => vec!["LPOP", "advertised:list"],
+            "LPUSH" => vec!["LPUSH", "advertised:list", "v"],
+            "LRANGE" => vec!["LRANGE", "advertised:list", "0", "-1"],
+            "RPOP" => vec!["RPOP", "advertised:list"],
+            "RPUSH" => vec!["RPUSH", "advertised:list", "v"],
+            "MGET" => vec!["MGET", "advertised:missing"],
+            "MSET" => vec!["MSET", "advertised:mset", "v"],
+            "MSETNX" => vec!["MSETNX", "advertised:msetnx", "v"],
+            "PARTITION" => vec!["PARTITION", "INFO"],
+            "PERSIST" => vec!["PERSIST", "advertised:missing"],
+            "PEXPIRE" => vec!["PEXPIRE", "advertised:missing", "10"],
+            "PEXPIREAT" => vec!["PEXPIREAT", "advertised:missing", "4102444800000"],
+            "PEXPIRETIME" => vec!["PEXPIRETIME", "advertised:missing"],
+            "PING" => vec!["PING"],
+            "PSETEX" => vec!["PSETEX", "advertised:psetex", "10", "v"],
+            "PTTL" => vec!["PTTL", "advertised:missing"],
+            "RANDOMKEY" => vec!["RANDOMKEY"],
+            "RENAME" => vec!["RENAME", "advertised:missing", "advertised:renamed"],
+            "RENAMENX" => vec!["RENAMENX", "advertised:missing", "advertised:renamed"],
+            "SADD" => vec!["SADD", "advertised:set", "a"],
+            "SEENCARD" => vec!["SEENCARD", "advertised:seen"],
+            "SEENCHECK" => vec!["SEENCHECK", "advertised:seen", "m", "60000"],
+            "SCARD" => vec!["SCARD", "advertised:set"],
+            "SDIFF" => vec!["SDIFF", "advertised:set", "advertised:other"],
+            "SCAN" => vec!["SCAN", "0"],
+            "SELECT" => vec!["SELECT", "0"],
+            "SET" => vec!["SET", "advertised:set-string", "v"],
+            "SETEX" => vec!["SETEX", "advertised:setex", "10", "v"],
+            "SETNX" => vec!["SETNX", "advertised:setnx", "v"],
+            "SETRANGE" => vec!["SETRANGE", "advertised:setrange", "0", "x"],
+            "SISMEMBER" => vec!["SISMEMBER", "advertised:set", "a"],
+            "SINTER" => vec!["SINTER", "advertised:set", "advertised:other"],
+            "SLAVEOF" => vec!["SLAVEOF", "no", "one"],
+            "SMEMBERS" => vec!["SMEMBERS", "advertised:set"],
+            "SMISMEMBER" => vec!["SMISMEMBER", "advertised:set", "a"],
+            "SMOVE" => vec!["SMOVE", "advertised:set", "advertised:other", "a"],
+            "SPOP" => vec!["SPOP", "advertised:set"],
+            "SRANDMEMBER" => vec!["SRANDMEMBER", "advertised:set"],
+            "SREM" => vec!["SREM", "advertised:set", "a"],
+            "SSCAN" => vec!["SSCAN", "advertised:set", "0"],
+            "STRLEN" => vec!["STRLEN", "advertised:missing"],
+            "SUNION" => vec!["SUNION", "advertised:set", "advertised:other"],
+            "TTL" => vec!["TTL", "advertised:missing"],
+            "TOUCH" => vec!["TOUCH", "advertised:missing"],
+            "TYPE" => vec!["TYPE", "advertised:missing"],
+            "ZADD" => vec!["ZADD", "advertised:zset", "1", "m"],
+            "ZCARD" => vec!["ZCARD", "advertised:zset"],
+            "ZCOUNT" => vec!["ZCOUNT", "advertised:zset", "-inf", "+inf"],
+            "ZINCRBY" => vec!["ZINCRBY", "advertised:zset", "1", "m"],
+            "ZPOPMAX" => vec!["ZPOPMAX", "advertised:zset"],
+            "ZPOPMIN" => vec!["ZPOPMIN", "advertised:zset"],
+            "ZRANK" => vec!["ZRANK", "advertised:zset", "m"],
+            "ZREVRANK" => vec!["ZREVRANK", "advertised:zset", "m"],
+            "ZRANGE" => vec!["ZRANGE", "advertised:zset", "0", "-1"],
+            "ZRANGEBYSCORE" => vec!["ZRANGEBYSCORE", "advertised:zset", "-inf", "+inf"],
+            "ZREM" => vec!["ZREM", "advertised:zset", "m"],
+            "ZREVRANGE" => vec!["ZREVRANGE", "advertised:zset", "0", "-1"],
+            "ZREVRANGEBYSCORE" => vec!["ZREVRANGEBYSCORE", "advertised:zset", "+inf", "-inf"],
+            "ZSCORE" => vec!["ZSCORE", "advertised:zset", "m"],
+            "UNLINK" => vec!["UNLINK", "advertised:missing"],
+            other => panic!("missing sample command for {other}"),
+        }
+    }
+
+    #[test]
+    fn control_state_family_verbs_new_spellings_match_legacy_aliases() {
+        // The families were renamed H/Cpc/Fol -> Counter/Distinct/Selection. The new,
+        // descriptive RESP verbs (COUNTER*/DISTINCT*/SELECTION*) must route to the same
+        // handler + family as the legacy verbs (CONTROLSTATEH*/CPC*/FOL*), which stay as
+        // compatibility aliases. Same op via new vs old spelling => identical response.
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let run = |args: Vec<&str>| {
+            execute_redis_command(
+                args.into_iter()
+                    .map(|arg| arg.as_bytes().to_vec())
+                    .collect(),
+                1,
+                |command| {
+                    let response = engine.execute(ExecuteRequest {
+                        shard_id: 1,
+                        command,
+                    });
+                    if response.status.ok {
+                        Ok(response.response)
+                    } else {
+                        Err(response.status.message)
+                    }
+                },
+            )
+        };
+        let not_error = |value: &RespValue| !matches!(value, RespValue::Error(_));
+
+        // Counter family (was H): SET + range aggregate query.
+        run(vec!["COUNTERSET", "cs-new", "10", "5"]);
+        run(vec!["CONTROLSTATEHSET", "cs-old", "10", "5"]);
+        let counter_new = run(vec!["COUNTERQUERY", "cs-new", "0", "20", "sum"]);
+        assert!(not_error(&counter_new), "COUNTERQUERY errored: {counter_new:?}");
+        assert_eq!(
+            counter_new,
+            run(vec!["HQUERY", "cs-old", "0", "20", "sum"]),
+            "COUNTER* verbs must match the legacy H* verbs"
+        );
+
+        // Distinct family (was Cpc).
+        run(vec!["DISTINCTSET", "ds-new", "10", "3"]);
+        run(vec!["CPCSET", "ds-old", "10", "3"]);
+        let distinct_new = run(vec!["DISTINCTQUERY", "ds-new", "0", "20", "sum"]);
+        assert!(not_error(&distinct_new), "DISTINCTQUERY errored: {distinct_new:?}");
+        assert_eq!(
+            distinct_new,
+            run(vec!["CPCQUERY", "ds-old", "0", "20", "sum"]),
+            "DISTINCT* verbs must match the legacy CPC* verbs"
+        );
+
+        // Selection family (was Fol): first/last value selection.
+        run(vec!["SELECTIONSET", "sel-new", "v1", "10", "0", "LAST"]);
+        run(vec!["FOLSET", "sel-old", "v1", "10", "0", "LAST"]);
+        let selection_new = run(vec!["SELECTIONQUERY", "sel-new"]);
+        assert!(not_error(&selection_new), "SELECTIONQUERY errored: {selection_new:?}");
+        assert_eq!(
+            selection_new,
+            run(vec!["FOLQUERY", "sel-old"]),
+            "SELECTION* verbs must match the legacy FOL* verbs"
+        );
+
+        // SETANDGET equivalence across the rename.
+        assert_eq!(
+            run(vec!["COUNTERSETANDGET", "cg-new", "10", "5", "0", "20", "sum"]),
+            run(vec!["HSETANDGET", "cg-old", "10", "5", "0", "20", "sum"]),
+        );
+        assert_eq!(
+            run(vec!["DISTINCTSETANDGET", "dg-new", "10", "3", "0", "20", "sum"]),
+            run(vec!["CPCSETANDGET", "dg-old", "10", "3", "0", "20", "sum"]),
+        );
+    }
+
+    #[test]
+    // shared-corpus: redis_engine_product_command_flow;
+    fn redis_string_hash_set_and_feature_commands_use_engine() {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let run = |args: Vec<&str>| {
+            execute_redis_command(
+                args.into_iter()
+                    .map(|arg| arg.as_bytes().to_vec())
+                    .collect(),
+                1,
+                |command| {
+                    let response = engine.execute(ExecuteRequest {
+                        shard_id: 1,
+                        command,
+                    });
+                    if response.status.ok {
+                        Ok(response.response)
+                    } else {
+                        Err(response.status.message)
+                    }
+                },
+            )
+        };
+
+        assert_eq!(
+            run(vec!["SET", "k", "v"]),
+            RespValue::SimpleString("OK".to_string())
+        );
+        assert_eq!(
+            run(vec!["SET", "k", "ignored", "NX"]),
+            RespValue::Bulk(None)
+        );
+        assert_eq!(
+            run(vec!["SET", "k", "v2", "XX", "GET"]),
+            RespValue::Bulk(Some(b"v".to_vec()))
+        );
+        assert_eq!(
+            run(vec!["SET", "new", "v", "NX", "PX", "1000"]),
+            RespValue::SimpleString("OK".to_string())
+        );
+        assert_eq!(run(vec!["GET", "k"]), RespValue::Bulk(Some(b"v2".to_vec())));
+        assert_eq!(run(vec!["SETNX", "k", "nope"]), RespValue::Integer(0));
+        assert_eq!(run(vec!["SETNX", "nx", "yes"]), RespValue::Integer(1));
+        assert_eq!(
+            run(vec!["GETSET", "nx", "after"]),
+            RespValue::Bulk(Some(b"yes".to_vec()))
+        );
+        assert_eq!(
+            run(vec!["MSETNX", "nx", "blocked", "msetnx-new", "v"]),
+            RespValue::Integer(0)
+        );
+        assert_eq!(
+            run(vec!["MSETNX", "msetnx-a", "a", "msetnx-b", "b"]),
+            RespValue::Integer(1)
+        );
+        assert_eq!(
+            run(vec!["APPEND", "append", "hello"]),
+            RespValue::Integer(5)
+        );
+        assert_eq!(
+            run(vec!["APPEND", "append", "-world"]),
+            RespValue::Integer(11)
+        );
+        assert_eq!(run(vec!["STRLEN", "append"]), RespValue::Integer(11));
+        assert_eq!(run(vec!["INCR", "counter"]), RespValue::Integer(1));
+        assert_eq!(run(vec!["INCRBY", "counter", "4"]), RespValue::Integer(5));
+        assert_eq!(run(vec!["DECR", "counter"]), RespValue::Integer(4));
+        assert_eq!(run(vec!["DECRBY", "counter", "2"]), RespValue::Integer(2));
+        assert_eq!(
+            run(vec!["SET", "not-int", "abc"]),
+            RespValue::SimpleString("OK".to_string())
+        );
+        assert_eq!(
+            run(vec!["INCR", "not-int"]),
+            RespValue::Error("ERR value is not an integer".to_string())
+        );
+        assert_eq!(
+            run(vec!["MSET", "k1", "v1", "k2", "v2"]),
+            RespValue::SimpleString("OK".to_string())
+        );
+        assert_eq!(
+            run(vec!["MGET", "k1", "missing", "k2"]),
+            RespValue::Array(vec![
+                RespValue::Bulk(Some(b"v1".to_vec())),
+                RespValue::Bulk(None),
+                RespValue::Bulk(Some(b"v2".to_vec())),
+            ])
+        );
+        assert_eq!(
+            run(vec!["EXISTS", "k", "missing", "k1"]),
+            RespValue::Integer(2)
+        );
+        assert_eq!(run(vec!["EXPIRE", "missing", "10"]), RespValue::Integer(0));
+        assert_eq!(run(vec!["EXPIRE", "k", "10"]), RespValue::Integer(1));
+        assert_eq!(
+            run(vec!["GETDEL", "k1"]),
+            RespValue::Bulk(Some(b"v1".to_vec()))
+        );
+        assert_eq!(run(vec!["GET", "k1"]), RespValue::Bulk(None));
+        assert_eq!(
+            run(vec!["DEL", "k", "missing", "k2"]),
+            RespValue::Integer(2)
+        );
+        assert_eq!(run(vec!["HSET", "h", "f", "x"]), RespValue::Integer(1));
+        assert_eq!(
+            run(vec!["HGET", "h", "f"]),
+            RespValue::Bulk(Some(b"x".to_vec()))
+        );
+        assert_eq!(
+            run(vec!["HSET", "h", "f", "x2", "f2", "y"]),
+            RespValue::Integer(1)
+        );
+        assert_eq!(
+            run(vec!["HMGET", "h", "f", "f2", "missing"]),
+            RespValue::Array(vec![
+                RespValue::Bulk(Some(b"x2".to_vec())),
+                RespValue::Bulk(Some(b"y".to_vec())),
+                RespValue::Bulk(None),
+            ])
+        );
+        assert_eq!(
+            run(vec!["HDEL", "h", "missing", "f2"]),
+            RespValue::Integer(1)
+        );
+        assert_eq!(run(vec!["HLEN", "h"]), RespValue::Integer(1));
+        assert_eq!(run(vec!["HINCRBY", "h", "n", "3"]), RespValue::Integer(3));
+        assert_eq!(run(vec!["HINCRBY", "h", "n", "-1"]), RespValue::Integer(2));
+        assert_eq!(run(vec!["HSET", "h", "bad", "abc"]), RespValue::Integer(1));
+        assert_eq!(
+            run(vec!["HINCRBY", "h", "bad", "1"]),
+            RespValue::Error("ERR hash value is not an integer".to_string())
+        );
+        assert_eq!(run(vec!["SADD", "s", "m", "m2"]), RespValue::Integer(2));
+        assert_eq!(run(vec!["SADD", "s", "m", "m3"]), RespValue::Integer(1));
+        assert_eq!(run(vec!["SCARD", "s"]), RespValue::Integer(3));
+        assert_eq!(run(vec!["SISMEMBER", "s", "m2"]), RespValue::Integer(1));
+        assert_eq!(
+            run(vec!["SMISMEMBER", "s", "m", "missing", "m3"]),
+            RespValue::Array(vec![
+                RespValue::Integer(1),
+                RespValue::Integer(0),
+                RespValue::Integer(1),
+            ])
+        );
+        assert_eq!(
+            run(vec!["SREM", "s", "missing", "m2"]),
+            RespValue::Integer(1)
+        );
+        assert_eq!(
+            run(vec!["SMEMBERS", "s"]),
+            RespValue::Array(vec![
+                RespValue::Bulk(Some(b"m".to_vec())),
+                RespValue::Bulk(Some(b"m3".to_vec())),
+            ])
+        );
+        assert_eq!(
+            run(vec!["FAPPEND", "feature", "10", "2"]),
+            RespValue::SimpleString("OK".to_string())
+        );
+        assert_eq!(
+            run(vec!["FAPPEND", "feature", "20", "3"]),
+            RespValue::SimpleString("OK".to_string())
+        );
+        assert_eq!(
+            run(vec!["FAGG", "feature", "0", "30", "sum"]),
+            RespValue::Integer(5)
+        );
+        assert_eq!(

@@ -65,3 +65,70 @@ fn what_the_two_cache_keys_are() {
     let value = vec![b'v'; 256];
 
     let write = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet { key: key.to_string(), value: value.clone() },
+    });
+    assert!(write.status.ok, "write: {:?}", write.status);
+
+    let read = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet { key: key.to_string() },
+    });
+    assert_eq!(
+        read.response,
+        CommandResponse::Bytes { value: Some(value.clone()) },
+        "the read did not return what was written, so nothing below is about caching"
+    );
+
+    let logical = matrixcache::CacheKey::string(1, key);
+    let physical = engine
+        .string_block_cache_key_for_test(1, key)
+        .expect("the key is indexed, so its block has a physical cache key");
+
+    let logical_held = engine.cache().peek_tier(&logical);
+    let physical_held = engine.cache().peek_tier(&physical);
+    // `peek_tier` names the TIER a key is resident in rather than returning the bytes, which is
+    // the more useful thing here: the asymmetry between the two keys is not only whether something
+    // is held but WHERE it can be held. The logical key had no tier of its own.
+    let held_tier = |h: &Option<matrixcache::CacheReadTier>| match h {
+        Some(tier) => format!("{tier:?}"),
+        None => "-- nothing".to_string(),
+    };
+
+    println!();
+    println!("  ONE KEY -- {:?}, {} user bytes, after one write and one read", key, value.len());
+    println!();
+    println!("  LOGICAL  CacheKey::string(shard, key)        addressed by WHAT WAS ASKED FOR");
+    println!("    shard_id    {}", logical.shard_id);
+    println!("    namespace   {:?}", logical.namespace);
+    println!("    record_key  {:?}", logical.record_key);
+    println!("    selector    {:?}", logical.selector);
+    println!("    resident in {}", held_tier(&logical_held));
+    println!();
+    println!("  PHYSICAL CacheKey::page_with_slot(...)       addressed by WHERE THE BYTES LANDED");
+    println!("    shard_id    {}", physical.shard_id);
+    println!("    namespace   {:?}", physical.namespace);
+    println!("    record_key  {:?}", physical.record_key);
+    println!("    selector    {:?}", physical.selector);
+    println!("    resident in {}", held_tier(&physical_held));
+    println!();
+
+    let stats = engine.cache().stats();
+    println!("  AND WHAT THE CACHE IS HOLDING IN TOTAL FOR THAT ONE READ");
+    println!("    user bytes offered    {:>8}", value.len());
+    println!("    cache memory_bytes    {:>8}", stats.memory_bytes);
+    println!("    cache disk_bytes      {:>8}", stats.disk_bytes);
+    println!("    puts                  {:>8}", stats.puts);
+    println!();
+
+    // ---- THE ADDRESS IS DENOMINATED IN STORED BYTES, shown without parsing the selector: two
+    // ---- keys of the SAME user size, one compressible and one not. If the address carried the
+    // ---- user size they would agree.
+    let incompressible: Vec<u8> = (0..256u32).map(|i| i.wrapping_mul(2_654_435_761) as u8).collect();
+    assert_eq!(incompressible.len(), value.len(), "the two fixtures must offer the same user bytes");
+
+    let other = "user:43:profile";
+    let write_other = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet { key: other.to_string(), value: incompressible.clone() },
+    });
