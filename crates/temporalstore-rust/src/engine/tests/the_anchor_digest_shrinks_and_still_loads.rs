@@ -52,3 +52,58 @@ struct AnchorAsArray {
     shard_id: crate::types::ShardId,
     sequence: u64,
     index_sha256: Vec<u8>,
+    index_len: u64,
+}
+
+fn digest() -> Vec<u8> {
+    // Digest-shaped: uniform, so about half the bytes sit at or above 0x80. A run of one low byte
+    // would make the array spelling look free and hide what the encodings actually differ by.
+    let mut state = 0x9E37_79B9_7F4A_7C15u64;
+    (0..32)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        })
+        .collect()
+}
+
+#[test]
+fn the_anchor_digest_shrinks_and_still_loads() {
+    let bytes = digest();
+    let above = bytes.iter().filter(|byte| **byte >= 0x80).count();
+    let anchor = IndexAnchorRecord {
+        shard_id: 1,
+        sequence: 7,
+        index_sha256: bytes.clone(),
+        index_len: 4_096,
+    };
+
+    let now = rmp_serde::to_vec(&anchor).expect("the anchor packs");
+    let as_base64 = rmp_serde::to_vec(&AnchorAsBase64 {
+        shard_id: 1,
+        sequence: 7,
+        index_sha256: bytes.clone(),
+        index_len: 4_096,
+    })
+    .expect("the base64 spelling packs");
+    let as_array = rmp_serde::to_vec(&AnchorAsArray {
+        shard_id: 1,
+        sequence: 7,
+        index_sha256: bytes.clone(),
+        index_len: 4_096,
+    })
+    .expect("the array spelling packs");
+
+    println!();
+    println!("  THE ANCHOR RECORD, WHOLE, IN THREE SPELLINGS OF ITS DIGEST");
+    println!();
+    println!("    digest bytes at or above 0x80: {above} of 32");
+    println!();
+    println!("    {:<40} {:>8}", "spelling", "bytes");
+    println!("    {:<40} {:>8}", "array of integers (oldest)", as_array.len());
+    println!("    {:<40} {:>8}", "base64 string (until this change)", as_base64.len());
+    println!("    {:<40} {:>8}", "bin string (now)", now.len());
+    println!();
+    println!("    saving against base64: {} bytes an anchor", as_base64.len() - now.len());

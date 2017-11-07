@@ -66,37 +66,3 @@ impl ObjectStore for AwsCliObjectStore {
         std::io::Write::write_all(&mut tmp, &bytes).map_err(ObjectStoreError::Io)?;
         let path = tmp.path().to_string_lossy().to_string();
         self.run_aws(&["s3", "cp", &path, &self.s3_uri(key)])?;
-        Ok(())
-    }
-
-    async fn get(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
-        let tmp = NamedTempFile::new().map_err(ObjectStoreError::Io)?;
-        let path = tmp.path().to_string_lossy().to_string();
-        self.run_aws(&["s3", "cp", &self.s3_uri(key), &path])?;
-        Ok(Bytes::from(
-            std::fs::read(path).map_err(ObjectStoreError::Io)?,
-        ))
-    }
-
-    async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectStoreError> {
-        let full_prefix = self.full_key(prefix);
-        let out = self.run_aws(&[
-            "s3api",
-            "list-objects-v2",
-            "--bucket",
-            &self.bucket,
-            "--prefix",
-            &full_prefix,
-            "--query",
-            "Contents[].Key",
-            "--output",
-            "json",
-        ])?;
-        let keys: Vec<String> = serde_json::from_str(&out).map_err(|err| {
-            ObjectStoreError::InvalidKey(format!("failed to parse aws list output: {err}"))
-        })?;
-        let strip = if self.prefix.is_empty() {
-            String::new()
-        } else {
-            format!("{}/", self.prefix)
-        };
