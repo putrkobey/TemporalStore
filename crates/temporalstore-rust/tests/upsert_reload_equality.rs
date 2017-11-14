@@ -63,25 +63,3 @@ fn copy_dir(from: &Path, to: &Path) {
             std::fs::copy(entry.path(), &target).unwrap();
         }
     }
-}
-
-#[test]
-fn upsert_delta_store_reloads_to_the_view_it_acked() {
-    let dir = tempfile::tempdir().unwrap();
-    let root = dir.path().join("store");
-    std::fs::create_dir_all(&root).unwrap();
-
-    // Generation 1: thousands of upsert batches, threshold dumps, then abort.
-    let (ok, log) = run("build", &root, GEN1_BATCHES, None, false);
-    assert!(!ok, "build must end in the simulated crash, not exit cleanly: {log}");
-    assert!(
-        log.contains("\"ok\":true"),
-        "generation-1 pre-crash view must verify before the crash counts: {log}"
-    );
-
-    // Generation 2: reload (verifies gen 1 inside), extend, abort. This is where the
-    // production stores lived: upsert records interleaved across restart generations.
-    let (ok, log) = run("extend", &root, GEN1_BATCHES, Some(GEN2_BATCHES), false);
-    assert!(!ok, "extend must end in the simulated crash: {log}");
-    assert!(
-        log.contains("\"ok\":true"),
