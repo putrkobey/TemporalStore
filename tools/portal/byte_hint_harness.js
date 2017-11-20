@@ -33,39 +33,3 @@ if (end < 0) {
   console.log("FAIL could not brace-match byteHint");
   process.exit(1);
 }
-const byteHint = new Function(scripts.slice(start, end) + "; return byteHint;")();
-
-let failures = 0;
-
-const cases = [
-  { env: "TS_BLOCK_SEGMENT_TARGET_BYTES", value: "1073741824", expect: "1 GiB" },
-  { env: "TS_COMPACTION_WATERMARK_BYTES", value: "268435456", expect: "256 MiB" },
-  { env: "TS_CONTEXT_PAGE_TARGET_BYTES", value: "65536", expect: "64 KiB" },
-  { env: "TS_INDEX_DUMP_WAL_GAP_BYTES", value: "1048576", expect: "1 MiB" },
-  { env: "MATRIXARK_QUOTA_MAX_BLOB_BYTES", value: "5368709120", expect: "5 GiB" },
-  { env: "MATRIXARK_QUOTA_MAX_BODY_BYTES", value: "16777216", expect: "16 MiB" },
-  /* The only case exercising the DEFAULT path. It named TS_PAGE_INDEX_CACHE_BYTES until that
-     variable was retired, which would have left it testing the rule against a name that
-     exists nowhere -- the same mistake the note below records. TS_CACHE_MEMORY_BYTES is the
-     cache budget the engine actually enforces, and its default is 16 MiB. */
-  { env: "TS_CACHE_MEMORY_BYTES", value: "", default: "16777216", expect: "16 MiB" },
-  /* Both are byte counts whose names do NOT end in _BYTES. The case here used to read
-     TS_STREAM_MAX_BLOB_SIZE_BYTES, a variable that exists nowhere -- so it exercised the suffix
-     rule against a name invented to satisfy it, and said nothing about the setting it was for. */
-  { env: "TS_STREAM_MAX_BLOB_SIZE", value: "10485760", expect: "10 MiB" }
-];
-
-for (const c of cases) {
-  const out = byteHint({ env: c.env, value: c.value, default: c.default });
-  if (!out.includes(c.expect)) {
-    console.log("FAIL " + c.env + ": expected " + c.expect + ", got " + JSON.stringify(out));
-    failures += 1;
-  } else {
-    console.log("ok   " + c.env + " -> " + c.expect);
-  }
-}
-
-/* `MATRIXARK_SUMMARY_REFRESH_LIMIT` is the interesting one: an int setting whose name ends in a
-   size-ish word but which counts summaries, not bytes. It belongs here rather than above, where
-   an `expect: ""` would have asserted nothing -- `"anything".includes("")` is true. */
-for (const env of ["TS_VECTOR_SCALED", "TS_MAX_RETAINED_FINISHED_JOBS", "MATRIXARK_HTTP_PORT",
