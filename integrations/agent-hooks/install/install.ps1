@@ -34,3 +34,39 @@ TEMPORALSTORE_REPO=$Repo
 TEMPORALSTORE_WSL_REPO=$WslRepo
 TEMPORALSTORE_AGENT_PROJECT=TemporalStore
 TEMPORALSTORE_AGENT_NAME=$Agent
+TEMPORALSTORE_METASERVER=127.0.0.1:18000
+TEMPORALSTORE_NAMESPACE=deploy_ns
+TEMPORALSTORE_TABLE=deploy_table
+MATRIXARK_STORAGE_PREFIX=matrixark:agent-hook
+MATRIXARK_ACCOUNT_ID=acct_local
+MATRIXARK_TENANT_ID=tenant_codex
+MATRIXARK_USER_ID=$env:USERNAME
+MATRIXARK_TEAM=agent
+MATRIXARK_MAX_CONTEXT_TOKENS=10000
+MATRIXARK_HOOK_ADDITIONAL_CONTEXT_CHAR_LIMIT=40000
+"@ | Set-Content -Path (Join-Path $Dest ".env") -Encoding ASCII
+Copy-Item (Join-Path $Dest ".env") (Join-Path $Dest ".env.example") -Force
+
+function Install-CodexPlugin {
+  $MarketplaceRoot = $env:USERPROFILE
+  $MarketplaceFile = Join-Path $MarketplaceRoot ".agents\plugins\marketplace.json"
+  New-Item -ItemType Directory -Force (Split-Path $MarketplaceFile) | Out-Null
+  New-Item -ItemType Directory -Force (Join-Path $MarketplaceRoot "plugins") | Out-Null
+  $FinalDest = Join-Path $MarketplaceRoot "plugins\temporalstore-agent-hooks"
+  if ($Dest -ne $FinalDest) {
+    if (Test-Path $FinalDest) { Remove-Item -Recurse -Force $FinalDest }
+    Copy-Item -Recurse -Force $Dest $FinalDest
+  }
+  $json = if (Test-Path $MarketplaceFile) { Get-Content -Raw $MarketplaceFile | ConvertFrom-Json } else { [pscustomobject]@{ name="personal"; interface=[pscustomobject]@{displayName="Personal"}; plugins=@() } }
+  if (-not $json.plugins) { $json | Add-Member -NotePropertyName plugins -NotePropertyValue @() }
+  $entry = [pscustomobject]@{ name="temporalstore-agent-hooks"; source=[pscustomobject]@{source="local"; path="./plugins/temporalstore-agent-hooks"}; policy=[pscustomobject]@{installation="AVAILABLE"; authentication="ON_INSTALL"}; category="Productivity" }
+  $plugins = @($json.plugins | Where-Object { $_.name -ne "temporalstore-agent-hooks" }) + $entry
+  $json.plugins = $plugins
+  $json | ConvertTo-Json -Depth 10 | Set-Content -Path $MarketplaceFile -Encoding ASCII
+  Write-Host "Codex marketplace updated: $MarketplaceFile"
+  if (-not $SkipCodexAdd) {
+    & $CodexBin plugin add temporalstore-agent-hooks@personal
+  } else {
+    Write-Host "Codex plugin add skipped. Run: $CodexBin plugin add temporalstore-agent-hooks@personal"
+  }
+}
