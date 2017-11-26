@@ -86,3 +86,32 @@ function run(payload, reject) {
 
 async function flush() {
   for (let i = 0; i < 8; i += 1) {
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+}
+
+(async () => {
+  /* ---------- nothing kept ---------- */
+  const off = await run({ status: "ok", audit_logs: [], recording: "off" });
+  ok("an empty log with recording off says nothing is being recorded",
+     /Nothing is being recorded/.test(off.recording), off.recording);
+  ok("and warns rather than reassures", /msg warn/.test(off.recording), off.recording);
+  ok("and says an empty list is not evidence",
+     /not evidence that nothing happened/.test(off.recording), off.recording);
+  ok("and says where to change it", /\/v1\/admin\/setup/.test(off.recording), off.recording);
+  ok("it does not also claim nothing has happened yet",
+     !/Nothing recorded yet/.test(off.message), off.message);
+
+  /* ---------- nothing happened ---------- */
+  const on = await run({ status: "ok", audit_logs: [], recording: "async" });
+  ok("an empty log with recording on says nothing has happened yet",
+     /Nothing recorded yet/.test(on.message), on.message);
+  ok("and does not warn", !/msg warn/.test(on.recording), on.recording);
+  ok("and still names the mode", /async/.test(on.recording), on.recording);
+
+  /* ---------- the two are not the same message ---------- */
+  ok("the two empties do not read the same", off.recording !== on.recording);
+
+  /* ---------- records ---------- */
+  const rows = await run({
+    status: "ok", recording: "async",
