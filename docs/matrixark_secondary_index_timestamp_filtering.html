@@ -142,3 +142,147 @@ Example value:
   &quot;source_ref&quot;: &quot;codex:debug-message-pdf-session:001&quot;
 }
 ```
+
+The timestamp key is used for:
+
+- latest-first retrieval;
+- time-window filtering;
+- temporal compression windows;
+- TTL/GC decisions after compression;
+- replay of a node or session timeline.
+
+The event value should not need to repeat large scope strings, node paths, summary text, embeddings, or debug extraction payloads.
+
+## Secondary Index Posting Timestamp
+
+A secondary index posting is a compact pointer from an index term to one or more candidate records or candidate nodes.
+
+The debug table may show fields like:
+
+```text
+data_model            index_name                  timestamp_key_ms  ref_type  ref_hashes  node_hash
+context_batch_commit  event_type:confirmation     1782681920550              []          2100209595829882121
+context_batch_commit  classification:batch_memory 1782681920550              []          2100209595829882121
+```
+
+This compact posting shape means:
+
+- `index_name` is the lookup term.
+- `timestamp_key_ms` is the time ordering for that posting bucket.
+- `ref_hashes=[]` means this posting is a node or batch hint, not a direct event/chunk/entity ref.
+- `node_hash=2100209595829882121` tells retrieval which node to enter after the index lookup.
+- `data_model` tells retrieval which candidate family the posting points at.
+
+In other words, the first row says:
+
+```text
+At time 1782681920550, node 2100209595829882121 had batch memory related to confirmation events.
+```
+
+Retrieval can use this to select or boost that node before fetching leaf events/entities/segments.
+
+## Why Timestamps Repeat
+
+One event, chunk, entity, skill section, or batch can produce several index terms.
+
+Example event:
+
+```json
+{
+  &quot;event_type&quot;: &quot;confirmation&quot;,
+  &quot;source_type&quot;: &quot;message&quot;,
+  &quot;keyword&quot;: [&quot;gpu&quot;, &quot;approval&quot;]
+}
+```
+
+This can produce postings:
+
+```text
+event_type:confirmation  -&gt; 1782681920550:event_hash
+source_type:message      -&gt; 1782681920550:event_hash
+keyword:gpu              -&gt; 1782681920550:event_hash
+keyword:approval         -&gt; 1782681920550:event_hash
+```
+
+The timestamp repeats because each posting belongs to a different inverted list. The final ContextPack should not include these posting internals unless debug mode is enabled.
+
+## How Filtering Works
+
+Retrieval should run in this order:
+
+```mermaid
+flowchart TD
+  A[&quot;Raw query&quot;] --&gt; B[&quot;Query understanding&quot;]
+  B --&gt; C[&quot;Scope filter&quot;]
+  C --&gt; D[&quot;Secondary-index lookup&quot;]
+  D --&gt; E[&quot;Node L0/L1 traversal&quot;]
+  E --&gt; F[&quot;Fetch leaf candidates&quot;]
+  F --&gt; G[&quot;Dense/sparse/time/business scoring&quot;]
+  G --&gt; H[&quot;Token-budget pack&quot;]
+  H --&gt; I[&quot;Compact ContextPack&quot;]
+```
+
+Query understanding emits a small structured plan:
+
+```json
+{
+  &quot;query_type&quot;: &quot;fact_lookup&quot;,
+  &quot;secondary_filters&quot;: {
+    &quot;source_type&quot;: [&quot;message&quot;, &quot;resource&quot;],
+    &quot;event_type&quot;: [&quot;confirmation&quot;],
+    &quot;resource_type&quot;: [&quot;pdf&quot;],
+    &quot;keyword&quot;: [&quot;gpu&quot;, &quot;approval&quot;]
+  },
+  &quot;temporal_window&quot;: {
+    &quot;mode&quot;: &quot;latest&quot;
+  }
+}
+```
+
+Then retrieval applies the plan:
+
+1. Scope first: only records visible to the account/tenant/user/session/team are eligible.
+2. Lookup postings:
+   - `event_type:confirmation`
+   - `keyword:gpu`
+   - `keyword:approval`
+   - `resource_type:pdf`
+3. Intersect or union based on the query plan:
+   - strict fact queries prefer intersection;
+   - broad exploration may use union with boosts.
+4. Convert postings into candidate nodes or candidate refs.
+5. Score only those candidates, instead of scanning all events/chunks.
+
+## Concrete Examples
+
+### Example 1: &quot;What did Alice approve about the GPU budget?&quot;
+
+Query understanding:
+
+```json
+{
+  &quot;query_type&quot;: &quot;fact_lookup&quot;,
+  &quot;secondary_filters&quot;: {
+    &quot;event_type&quot;: [&quot;confirmation&quot;, &quot;approval&quot;],
+    &quot;keyword&quot;: [&quot;alice&quot;, &quot;gpu&quot;, &quot;budget&quot;],
+    &quot;source_type&quot;: [&quot;message&quot;, &quot;resource&quot;]
+  },
+  &quot;temporal_window&quot;: {&quot;mode&quot;: &quot;latest&quot;}
+}
+```
+
+Filtering:
+
+```text
+visible scope
+-&gt; postings(event_type:confirmation)
+-&gt; postings(keyword:gpu)
+-&gt; postings(keyword:alice)
+-&gt; intersect or score-merge postings
+-&gt; fetch candidate events/resource facts/chunks
+-&gt; dense/sparse score
+-&gt; pack best evidence
+```
+
+The final ContextPack should contain human-usable text and citations, not index rows.
+

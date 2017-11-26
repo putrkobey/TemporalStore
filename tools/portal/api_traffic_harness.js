@@ -74,3 +74,41 @@ function el(id) {
   if (!els.has(id)) { els.set(id, makeEl(id)); }
   return els.get(id);
 }
+
+const win = {
+  document: {
+    getElementById: (id) => el(id),
+    querySelector: () => makeEl(),
+    querySelectorAll: (sel) => (sel === ".route-live" ? cells : []),
+    createElement: () => makeEl(), addEventListener() {}, body: makeEl(), hidden: false
+  },
+  addEventListener() {},
+  location: { origin: "http://localhost", href: "http://localhost", reload() {} },
+  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  navigator: { clipboard: { writeText() {} } },
+  setTimeout: () => 0, setInterval: () => 0, clearInterval() {},
+  Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
+  TextDecoder: function () { this.decode = (v) => Buffer.from(v || []).toString("utf8"); },
+  AbortController: function () { this.abort = () => {}; this.signal = {}; },
+  FileReader: function () {}, Blob: function () {},
+  URL: { createObjectURL: () => "", revokeObjectURL() {} },
+  fetch: (url) => {
+    if (String(url).indexOf("/v1/admin/routes") >= 0) {
+      return Promise.resolve({ ok: true, status: 200,
+                               json: () => Promise.resolve({ status: "ok", routes: ROUTES }) });
+    }
+    return new Promise(() => {});
+  }
+};
+win.window = win;
+
+const names = Object.keys(win);
+const values = names.map((k) => win[k]);
+scripts.forEach((body, index) => {
+  try { new Function(...names, body)(...values); }
+  catch (e) { console.log("FAIL script " + index + " threw: " + e.message); failures += 1; }
+});
+
+setTimeout(function () {
