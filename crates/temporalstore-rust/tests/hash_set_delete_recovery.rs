@@ -58,33 +58,3 @@ fn new_engine(root: &PathBuf) -> TemporalEngine {
     });
     assert!(loaded.status.ok, "the shard did not load: {:?}", loaded.status);
     engine
-}
-
-fn run(engine: &TemporalEngine, command: Command) -> CommandResponse {
-    let response = engine.execute(ExecuteRequest { shard_id: SHARD_ID, command });
-    assert!(response.status.ok, "command failed: {:?}", response.status);
-    response.response
-}
-
-fn get(engine: &TemporalEngine, key: &str) -> Option<Vec<u8>> {
-    match run(engine, Command::StringGet { key: key.to_string() }) {
-        CommandResponse::Bytes { value } => value,
-        other => panic!("unexpected response: {other:?}"),
-    }
-}
-
-fn hget(engine: &TemporalEngine, key: &str, field: &str) -> Option<Vec<u8>> {
-    match run(engine, Command::HashGet { key: key.to_string(), field: field.to_string() }) {
-        CommandResponse::Bytes { value } => value,
-        other => panic!("unexpected response: {other:?}"),
-    }
-}
-
-#[test]
-fn a_deleted_hash_field_stays_deleted_across_a_restart() {
-    let root = unique_root("hash");
-    let _ = std::fs::remove_dir_all(&root);
-    {
-        let engine = new_engine(&root);
-        run(&engine, Command::HashSet {
-            key: "h".to_string(), field: "alpha".to_string(), value: b"v1".to_vec() });
