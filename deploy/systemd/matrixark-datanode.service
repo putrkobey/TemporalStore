@@ -8,3 +8,8 @@
 [Unit]
 Description=TemporalStore datanode (Rust engine)
 After=network-online.target matrixark-metaserver.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/temporalstore

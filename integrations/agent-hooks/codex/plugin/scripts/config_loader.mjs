@@ -17,3 +17,10 @@ export function loadDotEnv(filePath) {
     if (idx <= 0) continue;
     const key = line.slice(0, idx).trim();
     let value = line.slice(idx + 1).trim();
+    if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+      value = value.slice(1, -1);
+    }
+    if (!(key in process.env)) {
+      process.env[key] = value;
+    }
+  }
