@@ -65,36 +65,3 @@ variable "redis_proxy_replicas" {
   description = "Replica count for the stateless Redis-compatible proxy."
   type        = number
   default     = 1
-}
-
-variable "proxy_service_type" {
-  description = "Service type for the HTTP proxy."
-  type        = string
-  default     = "LoadBalancer"
-}
-
-variable "redis_service_type" {
-  description = "Service type for the Redis-compatible proxy."
-  type        = string
-  default     = "LoadBalancer"
-}
-
-variable "labels" {
-  description = "Extra labels applied to Kubernetes resources."
-  type        = map(string)
-  default     = {}
-}
-
-variable "enable_validation_jobs" {
-  description = "Create one-shot EKS jobs that run TemporalStore Rust raft, storage, and QPS validation harnesses."
-  type        = bool
-  default     = false
-}
-
-variable "validation_backoff_limit" {
-  description = "Backoff limit for validation jobs."
-  type        = number
-  default     = 0
-}
-
-variable "validation_ttl_seconds_after_finished" {
