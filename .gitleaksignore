@@ -1,0 +1,4 @@
+# Reviewed findings that are not secrets, ignored by exact fingerprint
+# (commit:file:rule:line) so the scanner keeps full strength everywhere else.
+#
+# A fingerprint pins one occurrence in one commit. It cannot hide a later leak in

@@ -31,37 +31,3 @@ variable "image_pull_policy" {
   default     = "IfNotPresent"
 }
 
-variable "shard_id" {
-  description = "Single-node shard id."
-  type        = number
-  default     = 1
-}
-
-variable "storage_class_name" {
-  description = "Existing Kubernetes StorageClass for the server PVC. Empty uses the cluster default."
-  type        = string
-  default     = ""
-}
-
-variable "server_storage_size" {
-  description = "PVC size for local cache, page store, and index data."
-  type        = string
-  default     = "20Gi"
-}
-
-variable "cache_memory_bytes" {
-  description = "L1 memory cache size for temporalstore server."
-  type        = number
-  default     = 16777216
-}
-
-variable "proxy_replicas" {
-  description = "Replica count for the stateless HTTP proxy."
-  type        = number
-  default     = 1
-}
-
-variable "redis_proxy_replicas" {
-  description = "Replica count for the stateless Redis-compatible proxy."
-  type        = number
-  default     = 1

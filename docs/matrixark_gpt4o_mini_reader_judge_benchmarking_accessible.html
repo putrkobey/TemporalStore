@@ -48,3 +48,53 @@ many answer extraction and judge tasks.
 
 ## Get An OpenAI API Key
 
+1. Open &lt;https://platform.openai.com/&gt;.
+2. Sign in or create an OpenAI Platform account.
+3. Go to **Dashboard -&gt; API keys**.
+4. Create a new secret key.
+5. Copy it once and store it securely.
+6. Go to **Billing** and add payment method or credits if required.
+
+Do not commit the key to Git.
+
+Linux/macOS/WSL:
+
+```bash
+export OPENAI_API_KEY=&quot;sk-...&quot;
+```
+
+PowerShell:
+
+```powershell
+$env:OPENAI_API_KEY=&quot;sk-...&quot;
+```
+
+## Recommended Benchmark Env
+
+For MatrixArk benchmarking:
+
+```bash
+export MATRIXARK_READER_PROVIDER=openai
+export MATRIXARK_READER_MODEL=gpt-4o-mini
+export MATRIXARK_JUDGE_PROVIDER=openai
+export MATRIXARK_JUDGE_MODEL=gpt-4o-mini
+export OPENAI_API_KEY=&quot;sk-...&quot;
+```
+
+If you want to keep ingestion and retrieval fully local but use OpenAI only for
+answering/judging, keep:
+
+```bash
+export MATRIXARK_MCP_BACKEND=temporalstore-direct
+export MATRIXARK_TEMPORALSTORE_METASERVER=127.0.0.1:18000
+export MATRIXARK_TEMPORALSTORE_NAMESPACE=deploy_ns
+export MATRIXARK_TEMPORALSTORE_TABLE=deploy_table
+export MATRIXARK_TEMPORALSTORE_PREFIX=matrixark:benchmark:gpt4o-mini
+```
+
+## LOCOMO Command Shape
+
+Use TemporalStore-backed retrieval and GPT-4o-mini reader/judge:
+
+```bash
+cd <repo>
