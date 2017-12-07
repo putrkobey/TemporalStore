@@ -6546,3 +6546,2186 @@ fn is_the_appends_cost_the_series_or_the_shard() {
             dir.path().join("cache"),
             dir.path().join("blocks"),
             dir.path().join("indexes"),
+        ));
+        engine.load_shard(1);
+        let append = |key: &str, at: u64| {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureAppend {
+                    key: key.to_string(),
+                    points: vec![FeaturePoint {
+                        timestamp_ms: at,
+                        value: vec![b'v'; 8],
+                    }],
+                },
+            });
+            assert!(response.status.ok, "append {key}@{at}: {:?}", response.status);
+        };
+        for object in 0..spread_over {
+            let key = format!("filler-{object:06}");
+            for index in 0..points_each {
+                append(&key, T0 + index as u64);
+            }
+        }
+        let measure_key = "measured";
+        for index in 0..measure_points {
+            append(measure_key, T0 + index as u64);
+        }
+        let probe = Probe::start();
+        for index in 0..MEASURED {
+            append(measure_key, T0 + (measure_points + index) as u64);
+        }
+        let counts = probe.stop();
+        // The blocks the shard actually holds, read back rather than assumed: the arms are only
+        // a cross if C's shard really is the size B's is.
+        let blocks = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            shard.bucket_index.object_block_lookup.iter().map(|(_, _, refs)| refs.len()).sum()
+        };
+        (counts.allocs, counts.chunk_bytes, blocks)
+    };
+
+    let (a_allocs, a_bytes, a_blocks) = run(0, 0, SMALL);
+    let (b_allocs, b_bytes, b_blocks) = run(0, 0, BIG);
+    // C spreads the SAME number of blocks over many objects, so the measured object stays short.
+    let (c_allocs, c_bytes, c_blocks) = run(BIG / SMALL, SMALL, SMALL);
+
+    let per = |v: u64| v as f64 / MEASURED as f64;
+    println!();
+    println!("  {MEASURED} appends measured per arm");
+    println!("    arm                            allocs/append   bytes/append   blocks in shard");
+    println!("    A short series, small shard    {:>13.1}   {:>12.1}   {a_blocks:>15}", per(a_allocs), per(a_bytes));
+    println!("    B LONG  series, big shard      {:>13.1}   {:>12.1}   {b_blocks:>15}", per(b_allocs), per(b_bytes));
+    println!("    C short series, BIG shard      {:>13.1}   {:>12.1}   {c_blocks:>15}", per(c_allocs), per(c_bytes));
+
+    let b_over_a = per(b_bytes) / per(a_bytes).max(1.0);
+    let c_over_a = per(c_bytes) / per(a_bytes).max(1.0);
+    println!();
+    println!("    B/A (series AND shard grew) : {b_over_a:.2}x");
+    println!("    C/A (only the SHARD grew)   : {c_over_a:.2}x");
+    println!();
+    // The split is reported as a share rather than a verdict, because "mostly the shard" and
+    // "mostly the series" are not the only two answers: both terms can be real at once, and a
+    // threshold would hide that.
+    let shard_share = ((per(c_bytes) - per(a_bytes)) / (per(b_bytes) - per(a_bytes)).max(1.0)) * 100.0;
+    println!("    Of what B costs above A, the SHARD accounts for {shard_share:.0}% and the");
+    println!("    SERIES for the rest. A cost on the shard side does not go away by keeping");
+    println!("    series short; a cost on the series side does.");
+
+    // --- DENOMINATORS: every arm must have done work, and the cross must actually be a cross. ---
+    assert!(
+        a_bytes > 0 && b_bytes > 0 && c_bytes > 0,
+        "an arm allocated nothing: A={a_bytes} B={b_bytes} C={c_bytes}"
+    );
+    assert!(
+        per(b_bytes) > per(a_bytes) * 1.5,
+        "arm B is not materially more expensive than A ({:.1} vs {:.1}), so this fixture no \
+         longer reproduces the cost it is attributing and the split below it is of noise",
+        per(b_bytes),
+        per(a_bytes)
+    );
+    // C's shard must really be the size B's is, or "only the shard grew" is not what happened.
+    assert!(
+        c_blocks * 2 >= b_blocks,
+        "arm C's shard holds {c_blocks} blocks against arm B's {b_blocks}, so C is not the \
+         big-shard arm it is labelled and the share above is attributing to a shard that is not \
+         there"
+    );
+}
+
+/// WHAT ONE SET ADD COSTS AT TWO COLLECTION SIZES, because the append is not the only writer.
+///
+/// # WHY THIS IS ASKED SEPARATELY
+///
+/// The two terms removed by "An append walked the object's whole ref list twice" are not on the
+/// feature path. They are on the path EVERY block-backed write takes: the dirty mark in
+/// `push_object_dirty_onto_its_existing_blocks`, which every write calls once per touched object,
+/// and the publish step's bucket derivation in `sync_bucket_index_object_blocks_with_mode`, which
+/// every kind reaches. Both were sized by the object's page count, so any object with many pages
+/// paid them -- a long feature series was just the easiest one to grow.
+///
+/// If that reading is right, a set with 3,200 members should show the same shape as a feature
+/// series with 3,200 points, and the same cure. If it is wrong, the saving was specific to the
+/// feature arm and this arm says so. Either way it is measured rather than asserted, because "it
+/// is on the shared path so it must generalise" is exactly the kind of reasoning that named the
+/// wrong cause twice already on this series.
+///
+/// # WHAT IT FOUND: THE FIX GENERALISED AND THE SET IS STILL NOT FIXED
+///
+///     members   allocs/add   bytes/add   members held
+///         400        109.4     15147.2            450
+///        3200        109.4     60189.4           3250
+///     allocations ratio 1.00x over an 8x collection, bytes ratio 3.97x
+///
+/// So an add still costs the members already there. The allocation count is FLAT while the bytes
+/// climb, which by now is a familiar signature on this series: ONE allocation sized by the
+/// entries held, the shape behind both #2235 and the dirty-mark half of #2239.
+///
+/// THE TERM #2239 REMOVED IS GONE HERE TOO, which is the half the probe was written to test.
+/// Instrumenting the shared write path around this arm, on a 3,200-member set:
+///
+///     key_states        2,976 B/add
+///     items_and_dirty     992
+///     append_delta        318
+///     components          176
+///     push_dirty            0      <- 51,952 on the feature path before #2239
+///
+/// The dirty mark is free now for a 3,200-page object whatever kind it is, so that fix was on the
+/// shared path as claimed rather than specific to the feature arm.
+///
+/// AND THAT ACCOUNTS FOR ONLY ~4.5 KB OF 60 KB. The rest -- about 55.7 KB -- is spent inside the
+/// `SetAdd` arm itself, which is the opposite of where the feature append's cost was: there the
+/// caller held 78% of it and the arm 22%. So the next step for containers is to bracket the arm,
+/// not to look again at the path they share. Two things in it are already known to be sized by
+/// the collection and neither allocates, so neither is the figure above:
+/// `resident_highest_block_id`, which takes a max over every member's address to choose an
+/// ordinal (O(members) per add, so O(members squared) to fill), and
+/// `block_an_element_vacates`, which the filer consults when an index entry names a page.
+///
+/// WRITTEN DOWN RATHER THAN ACTED ON, because "it is on the shared path so it must generalise"
+/// was the reasoning this probe existed to check, and it was half right. The same caution applies
+/// to the two candidates above: they are candidates until something moves them and the number
+/// moves with it.
+///
+/// rust-internal: measures this crates own write path, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_one_set_add_costs_at_two_collection_sizes -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "seeds two shards to 400 and 3,200 members; run by name, and ALONE -- the allocation \
+            counters are process-global"]
+fn what_one_set_add_costs_at_two_collection_sizes() {
+    use crate::types::{Command, ExecuteRequest};
+
+    const MEASURED: usize = 50;
+
+    let mut rows: Vec<(usize, u64, u64, usize)> = Vec::new();
+    for members in [400usize, 3_200usize] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = std::sync::Arc::new(crate::TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        ));
+        engine.load_shard(1);
+        let key = format!("members-{members}");
+        let add = |index: usize| {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::SetAdd {
+                    key: key.clone(),
+                    member: format!("member-{index:08}").into_bytes(),
+                },
+            });
+            assert!(response.status.ok, "add {index}: {:?}", response.status);
+        };
+        // WARMED OUTSIDE THE WINDOW, so what is measured is a steady-state add and not the
+        // first-touch cost of creating the object.
+        for index in 0..members {
+            add(index);
+        }
+        let probe = Probe::start();
+        for index in 0..MEASURED {
+            add(members + index);
+        }
+        let counts = probe.stop();
+
+        // The membership the adds actually saw, read back rather than assumed.
+        let held = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            shard.sets.get(key.as_str()).map_or(0, |members| members.len())
+        };
+        rows.push((members, counts.allocs, counts.chunk_bytes, held));
+    }
+
+    println!();
+    println!("  {MEASURED} set adds measured per arm, set warmed to size first");
+    println!("    members   allocs/add   bytes/add   members held");
+    for (members, allocs, bytes, held) in &rows {
+        println!(
+            "    {members:>7}   {:>10.1}   {:>9.1}   {held:>12}",
+            *allocs as f64 / MEASURED as f64,
+            *bytes as f64 / MEASURED as f64
+        );
+    }
+
+    let (small, small_allocs, small_bytes, small_held) = rows[0];
+    let (big, big_allocs, big_bytes, big_held) = rows[1];
+    let size_ratio = big as f64 / small as f64;
+    let alloc_ratio = big_allocs as f64 / small_allocs.max(1) as f64;
+    let byte_ratio = big_bytes as f64 / small_bytes.max(1) as f64;
+    println!();
+    println!("    collection size ratio : {size_ratio:.2}x");
+    println!("    allocations ratio     : {alloc_ratio:.2}x");
+    println!("    bytes ratio           : {byte_ratio:.2}x");
+
+    // --- DENOMINATORS: the arms must be the sizes they are labelled, and must have done work. ---
+    assert!(
+        small_allocs > 0 && big_allocs > 0,
+        "an arm allocated nothing across {MEASURED} adds: {small_allocs} and {big_allocs}"
+    );
+    assert!(
+        small_held >= small && big_held >= big,
+        "the set does not hold the members this probe warmed it with ({small_held} of {small}, \
+         {big_held} of {big}), so the arms are not the sizes they are labelled and the ratios \
+         above are of something else"
+    );
+}
+
+/// WHAT THE GROUPED SERIES SHAPE COSTS AGAINST THE ONE THAT SHIPS, AT SIX OCCUPANCIES.
+///
+/// # WHY THIS HAS TO BE RE-MEASURED RATHER THAN CITED
+///
+/// `engine/grouped_series_index.rs` carries a table in its own doc -- 74.9 bytes a row against
+/// 366.0 for a B-tree a key at one point a key, better at every occupancy with no crossover -- and
+/// that table is the entire justification for converting a map onto it. It was measured for #2075,
+/// nothing on main pins it, and the module has grown from 186 lines to 743 since. Its eight
+/// in-module tests cover correctness: what it holds, windows, dedupe, removal, regrouping, the wire
+/// round trip, write direction and emptiness. None of them weighs it.
+///
+/// So this weighs it, because the next two steps of that conversion rest on the number and a
+/// footprint total is re-measured, never cited.
+///
+/// # WHAT IT FOUND: THE JUSTIFICATION HOLDS AND "NO CROSSOVER" DOES NOT
+///
+///     points a key   a B-tree a key   unstamped   rebucketed   ratio
+///                1            364.0       135.3         73.6    4.95x
+///                2            182.0        79.5         60.5    3.01x
+///                4             91.0        51.8         47.9    1.90x
+///               10             33.3        35.2         35.1    0.95x
+///              100             51.1        25.1         25.3    2.02x
+///             1000             49.1        24.2         24.2    2.03x
+///
+/// The sparse end reproduces the doc's table almost exactly -- 73.6 against its 74.9, on a shipped
+/// shape measured at 364.0 against its 366.0 -- and so does the dense floor, 24.2 against 24.1. The
+/// claim the conversion rests on is sound.
+///
+/// THE CROSSOVER THE DOC DENIES IS REAL. At ten points a key the shipped shape holds 33.3 bytes a
+/// row and this one 35.1, losing by 5%. Ten entries fit ONE nearly-full `BTreeMap` node, which is
+/// the best a B-tree ever does -- and it is the same fact that makes the shipped column
+/// non-monotonic, rising from 33.3 at ten to 51.1 at a hundred, because ascending inserts leave a
+/// larger map's nodes about half full. The module's own table reports 38.5 and 31.7 there and
+/// claims no crossover at all.
+///
+/// WHAT THAT MEANS FOR THE CONVERSION, since it is the reason to measure at all: the shape is worth
+/// taking for maps whose keys hold FEW points, which is the case it was built for, and is not a
+/// free win at every occupancy. A map whose keys cluster around ten points would be made slightly
+/// worse by it.
+///
+/// # TWO MISTAKES OF MY OWN ARE BAKED INTO HOW THIS MEASURES, BOTH WORTH KEEPING
+///
+/// FIRST, THE WRONG QUANTITY. I counted allocation TRAFFIC during construction and called it
+/// footprint. That is biased against this candidate in a way that matters: its `rows` run is ONE
+/// contiguous `Vec` grown by doubling, so it allocates about twice what it ends up holding, while a
+/// B-tree allocates each node once and is charged once. `deep_heap_bytes` -- a clone under the
+/// counting allocator, which allocates exactly what the value needs -- is the footprint question
+/// and the one the doc's table is about.
+///
+/// SECOND, THE WRONG STATE, which the module's doc had already warned about. `new()` starts on
+/// `0..u32::MAX`, and on that range `block_routing_bucket` gives every key a bucket of its own --
+/// so nothing is grouped and the shape's whole mechanism is switched off. The doc calls it
+/// "precisely the regime where the amortisation vanishes" and says a decoded container is "CORRECT
+/// but uncompacted" until `rebucket`. I measured without rebucketing and read the result as the
+/// table failing to reproduce.
+///
+/// So both states are reported. The gap between them is not noise: it is what a decoded index
+/// costs before anything stamps its range.
+///
+/// Neither column sees an `Arc<str>`'s characters, because cloning an `Arc` is a refcount bump.
+/// That is symmetric here: both shapes hold exactly one handle per object -- the shipped one as its
+/// map key, this one in its `ObjectRun` -- so the comparison is like for like, and what is being
+/// weighed is the per-object container overhead, which is the whole subject.
+///
+/// # HOW THE DENOMINATOR IS HELD STILL
+///
+/// Both shapes get the SAME total number of rows, spread over different numbers of keys. That is
+/// what makes the x-axis occupancy rather than size: at one point a key the shipped shape pays a
+/// whole B-tree node per row, and at a thousand it amortises that node away, so a comparison at one
+/// occupancy says nothing about another.
+///
+/// rust-internal: measures this crates own containers, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_the_grouped_series_shape_costs -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "builds twelve containers of 4,000 rows; run by name, and ALONE -- the allocation \
+            counters are process-global"]
+fn what_the_grouped_series_shape_costs_against_the_one_that_ships() {
+    use crate::engine::grouped_series_index::GroupedSeriesIndex;
+    use std::collections::{BTreeMap, HashMap};
+    use std::sync::Arc;
+
+    const ROWS: usize = 4_000;
+    const T0: u64 = 1_787_270_070_000;
+
+    let address = || crate::block_store::ElementEntry::from_parts(7, 11, 24, None, None);
+
+    println!();
+    println!("  {ROWS} rows per arm, spread over ROWS/occupancy keys");
+    println!("  the grouped shape is weighed in BOTH states: as built on the unstamped whole-");
+    println!("  keyspace range, where every key gets a bucket of its own and nothing is grouped,");
+    println!("  and after `rebucket` onto the shipped 0..{} range.", crate::DEFAULT_END_ROUTING_BUCKET);
+    println!();
+    println!("                 --------- RESIDENT bytes a row ---------");
+    println!("    points a key   a B-tree a key   unstamped   rebucketed   ratio");
+
+    let mut rows: Vec<(usize, f64, f64)> = Vec::new();
+    for occupancy in [1usize, 2, 4, 10, 100, 1_000] {
+        let objects = ROWS / occupancy;
+        // BUILT OUTSIDE BOTH WINDOWS and shared, so neither arm is charged for the characters.
+        let keys: Vec<Arc<str>> = (0..objects)
+            .map(|index| Arc::from(format!("series-{index:08}").as_str()))
+            .collect();
+
+        // --- the shape that ships: one B-tree per object key ---
+        let mut shipped: HashMap<Arc<str>, BTreeMap<u64, crate::block_store::ElementEntry>> =
+            HashMap::new();
+        let shipped_traffic = {
+            let probe = Probe::start();
+            for key in &keys {
+                let series = shipped.entry(Arc::clone(key)).or_default();
+                for point in 0..occupancy {
+                    series.insert(T0 + point as u64, address());
+                }
+            }
+            probe.stop().chunk_bytes
+        };
+        let shipped_resident = deep_heap_bytes(&shipped);
+
+        // --- the candidate: one run per routing bucket, identity named once an object ---
+        let mut grouped = GroupedSeriesIndex::new();
+        for key in &keys {
+            for point in 0..occupancy {
+                grouped.insert(key, T0 + point as u64, address());
+            }
+        }
+        // AS BUILT, on the whole-keyspace range an unstamped state routes on. Every key has its
+        // own bucket here, so this is the shape with its grouping switched off -- which is what I
+        // measured the first time and mistook for the shape itself.
+        let grouped_unstamped = deep_heap_bytes(&grouped);
+        // AND THEN COMPACTED, which is what `install_shard_state` causes in the engine.
+        grouped.rebucket(0, crate::DEFAULT_END_ROUTING_BUCKET);
+        let grouped_resident = deep_heap_bytes(&grouped);
+        assert_eq!(
+            grouped.routing_range(),
+            (0, crate::DEFAULT_END_ROUTING_BUCKET),
+            "rebucket did not take the range it was given, so the figure below is still the \
+             uncompacted one"
+        );
+
+        // --- DENOMINATORS: both arms must hold what the row count claims, or the per-row figures
+        // --- below are divisions by a number the fixture did not build.
+        assert_eq!(
+            shipped.len(),
+            objects,
+            "the shipped arm holds {} objects, not {objects}",
+            shipped.len()
+        );
+        assert_eq!(
+            grouped.object_count(),
+            objects,
+            "the grouped arm holds {} objects, not {objects}",
+            grouped.object_count()
+        );
+        assert_eq!(
+            grouped.point_count(),
+            ROWS,
+            "the grouped arm holds {} rows, not {ROWS}",
+            grouped.point_count()
+        );
+
+        let per_row = |bytes: u64| bytes as f64 / ROWS as f64;
+        println!(
+            "    {occupancy:>12}   {:>14.1}   {:>9.1}   {:>10.1}   {:>5.2}x",
+            per_row(shipped_resident),
+            per_row(grouped_unstamped),
+            per_row(grouped_resident),
+            per_row(shipped_resident) / per_row(grouped_resident).max(0.001),
+        );
+        let _ = shipped_traffic;
+        rows.push((
+            occupancy,
+            per_row(shipped_resident),
+            per_row(grouped_resident),
+        ));
+    }
+
+    // --- THE SPARSE SAVING, WHICH IS THE JUSTIFICATION. A key holding one point is the case the
+    // --- conversion exists for: there the shipped shape pays a whole B-tree node to carry one
+    // --- 24-byte row. Measured 4.95x, against the 4.9x the module's doc claims.
+    let (_, sparse_shipped, sparse_grouped) = rows[0];
+    assert!(
+        sparse_shipped / sparse_grouped > 4.0,
+        "at one point a key the grouped shape is only {:.2}x better ({sparse_grouped:.1} bytes a \
+         row against {sparse_shipped:.1}). The doc claims 4.9x and this arm measured 4.95x, so a \
+         fall below 4x means the shape has changed and the conversion needs re-justifying.",
+        sparse_shipped / sparse_grouped
+    );
+
+    // --- AND THE DENSE FLOOR, which is the other end of the same claim: a row is a `u64` and a
+    // --- 16-byte address, so 24 bytes is the data itself and the container overhead at density is
+    // --- a fraction of a byte.
+    let (_, _, dense_grouped) = rows[rows.len() - 1];
+    assert!(
+        dense_grouped < 25.0,
+        "at a thousand points a key the grouped shape holds {dense_grouped:.1} bytes a row. A row \
+         is 24 bytes of data, so this is the container overhead and the doc puts it at 24.1; past \
+         25 the container has started costing what it exists to save."
+    );
+
+    // --- THE CROSSOVER THE DOC DENIES, PINNED AS A SET RATHER THAN ASSERTED AWAY.
+    //
+    // "Better at every occupancy with no crossover" is false, and the exception is explainable
+    // rather than mysterious: TEN entries fit one nearly-full `BTreeMap` node, which is the best a
+    // B-tree ever does. It is the same reason the shipped column is not monotonic -- 33.3 bytes a
+    // row at ten, 51.1 at a hundred -- because ascending inserts leave a larger map's nodes about
+    // half full, so its per-row cost rises again past the single-node point.
+    //
+    // Pinning the SET is what makes this a guard rather than a known-failure: the occupancy that
+    // loses today may not lose tomorrow, and a crossover appearing at a DIFFERENT occupancy is a
+    // change in the shape of the curve, which is exactly what someone converting a map onto this
+    // needs to hear about.
+    const KNOWN_CROSSOVERS: &[usize] = &[10];
+    let crossovers: Vec<usize> = rows
+        .iter()
+        .filter(|(_, shipped, grouped)| grouped >= shipped)
+        .map(|(occupancy, _, _)| *occupancy)
+        .collect();
+    assert_eq!(
+        crossovers, KNOWN_CROSSOVERS,
+        "the occupancies where the grouped shape costs MORE than the shipped one have changed: \
+         {crossovers:?} against the known {KNOWN_CROSSOVERS:?}. If one has gone, say so and take \
+         it out of the list; if a new one has arrived, the curve has changed shape and the \
+         conversion's justification has to be re-read at that occupancy."
+    );
+}
+
+/// WHICH OF THE SIX B-TREE-BACKED SERIES MAPS THE GROUPED SHAPE WOULD ACTUALLY HELP.
+///
+/// # WHY THIS IS THE NEXT QUESTION
+///
+/// `what_the_grouped_series_shape_costs_against_the_one_that_ships` established the curve: the
+/// grouped shape is 4.95x better when a key holds ONE point, 1.9x at four, and 5% WORSE at ten,
+/// because ten entries fit one nearly-full `BTreeMap` node. So "convert a map onto it" is not a
+/// decision that can be made from the shape alone -- it depends on what the map being converted
+/// actually holds, which is why the corrected doc says to check the target's occupancy first.
+///
+/// Six `ShardState` maps are still `HashMap<ModelKey, BTreeMap<u64, ElementEntry>>`, which is
+/// exactly the shape the grouped index replaces: `context_indexes`, `context_audits`,
+/// `context_entities`, `context_children`, `context_summaries`, `context_compressions`.
+/// (`features` and the event series already moved to the owned sorted array, so they are not
+/// candidates for this.)
+///
+/// # WHAT IS MEASURED, AND WHY IT IS NOT A PROJECTION
+///
+/// Rather than apply the curve to an occupancy figure, this builds the REAL alternative: for each
+/// map it constructs a `GroupedSeriesIndex` holding the same (key, timestamp, address) triples the
+/// map holds, rebuckets it onto the shipped range, and weighs both with `deep_heap_bytes`. The
+/// comparison is then of two containers holding identical content, on the key distribution a real
+/// workload produced, rather than of a model.
+///
+/// THE WORKLOAD IS SHAPED TO PRODUCE BOTH REGIMES, because `context_indexes` has both and a
+/// single-regime fixture would answer for neither. Its five index kinds differ in cardinality by
+/// orders of magnitude: `EventKind`, `Status` and `Source` take a handful of distinct values, so
+/// their keys accumulate many points; `Entity` takes one per distinct entity, so its keys hold
+/// very few. The fixture gives each event a unique entity and a shared one, eight kinds, eight
+/// statuses, eight sources and twenty time buckets -- so most KEYS are sparse while most POINTS
+/// sit on a few dense keys, which is the mix that decides the answer.
+///
+/// # WHAT IT FOUND: `context_indexes` IS THE TENANT, WORTH 2.81x -- AND IT HAS SINCE MOVED
+///
+/// THE ROW BELOW IS THE COMPARISON THAT WAS MADE, NOT THE ONE THIS ARM NOW PRINTS. On the strength
+/// of it `context_indexes` was converted to `OwnedTimestampedSeries`, so the B-tree a key the
+/// 101.9 B/point column measures is no longer what that map holds. Its row now weighs the array it
+/// does hold against the grouped shape, and the five that have not moved still weigh a B-tree. The
+/// figures that decided it are kept here because a conversion whose justification is deleted is a
+/// conversion nobody can re-check.
+///
+/// AND RE-RUN AFTER THE CONVERSION THIS ARM REPORTS 1.01x, which is the result that closes the
+/// question for this map: 36.6 B/point resident against the grouped container's 36.3 for the same
+/// triples. The owned sorted array captured essentially the whole saving the grouped shape
+/// promised, so converting `context_indexes` onto `GroupedSeriesIndex` on top of this would buy
+/// nothing measurable, and the grouped container's remaining case rests on the five maps that have
+/// not moved -- each of which still needs its own workload here before anything is claimed for it.
+///
+///     map                keys   points   mean    shipped -> grouped   ratio
+///     context_indexes    2038    12000    5.9      101.9 ->    36.3    2.81x
+///
+///     occupancy: 1 point: 2000 keys (98.1%)   65-256: 36 (1.8%)   257+: 2 (0.1%)
+///
+/// The distribution is as bimodal as expected and it resolves the question: **98.1% of the keys
+/// hold exactly ONE point**, which is the regime the shape is 4.95x better in, while the handful of
+/// low-cardinality keys (kind, status, source) carry most of the POINTS. Footprint is driven by the
+/// per-key overhead, so the sparse keys decide it, and the whole container comes out 2.81x smaller
+/// on content it actually holds -- not projected from the curve but weighed against a
+/// `GroupedSeriesIndex` built from the same triples and rebucketed onto the shipped range.
+///
+/// THE OTHER FIVE MAPS ARE NOT ANSWERED HERE. This fixture drives the extracted-event index
+/// fan-out, which fills `context_indexes` and leaves `context_audits`, `context_entities`,
+/// `context_children`, `context_summaries` and `context_compressions` empty. Each prints that it
+/// was not exercised rather than a ratio, because a figure over an empty container reads as a
+/// measurement and is not one. Whichever of them is converted next needs its own workload here
+/// first.
+///
+/// rust-internal: measures this crates own containers, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib which_series_maps_the_grouped_shape_would_help -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "drives 2,000 extracted context events; run by name, and ALONE -- the allocation \
+            counters are process-global"]
+fn which_series_maps_the_grouped_shape_would_help() {
+    use crate::engine::grouped_series_index::GroupedSeriesIndex;
+    use crate::types::{
+        Command, ContextEvent, ContextExtractedEventIndexes, ExecuteRequest,
+    };
+    use std::collections::BTreeMap;
+
+    const EVENTS: u64 = 2_000;
+    const T0: u64 = 1_787_270_070_000;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine_on(dir.path(), crate::DEFAULT_END_ROUTING_BUCKET);
+
+    for index in 0..EVENTS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextWriteExtractedEvent {
+                tenant_hash: 7,
+                node_hash: 1_000 + (index % 50),
+                event: Box::new(ContextEvent {
+                    event_id_hash: 0xDEAD_0000_0000_0000 | index,
+                    event_time_ms: T0 + index,
+                    ingestion_time_ms: T0 + index,
+                    kind: 9,
+                    event_type: 2,
+                    actor_hash: 0,
+                    status: 0,
+                    valid_until_ms: 0,
+                    confidence: 0.9,
+                    importance: 0.7,
+                    text: "an extracted event".to_string(),
+                    source_ref: String::new(),
+                    related_node_hashes: Vec::new(),
+                    compact_attrs: Vec::new(),
+                    vector: Vec::new(),
+                }),
+                indexes: ContextExtractedEventIndexes {
+                    scope_hash: 3_001,
+                    // ONE UNIQUE ENTITY AND ONE SHARED: the unique one makes a key holding a
+                    // single point, which is the regime the shape is 4.95x better in; the shared
+                    // one makes a key holding all 2,000, which is the regime it loses in.
+                    entity_hashes: vec![500_000 + index, 1],
+                    status_hash: 600 + (index % 8),
+                    source_hash: 700 + (index % 8),
+                    event_time_bucket_ms: T0 + (index % 20) * 1_000_000,
+                    disabled_indexes: Vec::new(),
+                },
+                first_write_only: false,
+                cold_storage: false,
+            },
+        });
+        assert!(
+            response.status.ok,
+            "extracted event {index}: {:?}",
+            response.status
+        );
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+
+    // Weigh one map against a grouped index holding the same triples.
+    // GENERIC OVER THE SERIES TYPE, because the six maps no longer agree on one. `context_indexes`
+    // holds the owned sorted array after the conversion this arm argued for; the other five still
+    // hold a B-tree a key. Weighing them through the shared trait is what keeps the rows
+    // comparable -- each row is still "what this map resides as" against "what the grouped shape
+    // would cost for the same triples", which is the question, and the answer for a converted map
+    // is simply measured against its new resident form.
+    fn weigh<S>(
+        label: &str,
+        map: &std::collections::HashMap<std::sync::Arc<str>, S>,
+    ) -> (Occupancy, u64, u64)
+    where
+        S: crate::engine::timestamped_series::TimestampedSeries + Clone,
+    {
+        let mut occ = Occupancy::default();
+        let mut grouped = GroupedSeriesIndex::new();
+        for (key, series) in map.iter() {
+            occ.observe(series.len());
+            for (at, address) in series.points() {
+                grouped.insert(key, at, address.clone());
+            }
+        }
+        grouped.rebucket(0, crate::DEFAULT_END_ROUTING_BUCKET);
+
+        let shipped_bytes = deep_heap_bytes(map);
+        let grouped_bytes = deep_heap_bytes(&grouped);
+        // AN EMPTY MAP PRINTS NO RATIO. This arm's fixture drives the extracted-event index
+        // fan-out, which fills `context_indexes` and leaves the other five untouched -- so a
+        // "0.00x" against them would read as "measured, no benefit" when nothing was measured.
+        // That is the same mistake as a test filter matching nothing and reporting ok.
+        if occ.containers == 0 {
+            println!(
+                "    {label:<22}      -- not exercised by this fixture, so nothing is claimed for it"
+            );
+            return (occ, shipped_bytes, grouped_bytes);
+        }
+        let entries = occ.entries.max(1);
+        let mean = occ.entries as f64 / occ.containers.max(1) as f64;
+        println!(
+            "    {label:<22} {:>6} keys {:>7} points  mean {mean:>6.1}   {:>8.1} -> {:>8.1} B/point  {:>5.2}x",
+            occ.containers,
+            occ.entries,
+            shipped_bytes as f64 / entries as f64,
+            grouped_bytes as f64 / entries as f64,
+            shipped_bytes as f64 / grouped_bytes.max(1) as f64,
+        );
+        (occ, shipped_bytes, grouped_bytes)
+    }
+
+    println!();
+    println!("  {EVENTS} extracted events, one unique entity and one shared per event");
+    println!("    map                      keys    points       mean      shipped -> grouped      ratio");
+    let (index_occ, index_shipped, index_grouped) = weigh("context_indexes", shard.context_indexes());
+    let _ = weigh("context_audits", shard.context_audits());
+    let _ = weigh("context_entities", shard.context_entities());
+    let _ = weigh("context_children", shard.context_children());
+    let _ = weigh("context_summaries", shard.context_summaries());
+    let _ = weigh("context_compressions", shard.context_compressions());
+
+    println!();
+    println!("  context_indexes occupancy, which is the distribution that decides the answer:");
+    index_occ.report("context_indexes");
+
+    // --- DENOMINATOR: the map this conclusion is about has to have been built, or every figure
+    // --- above is a division by a fixture that did nothing.
+    assert!(
+        index_occ.containers > 100,
+        "context_indexes holds only {} keys after {EVENTS} extracted events, so the index fan-out \
+         did not happen and the comparison above is of an empty container",
+        index_occ.containers
+    );
+    assert!(
+        index_occ.entries as u64 >= EVENTS,
+        "context_indexes holds {} points for {EVENTS} events; each event is meant to write several \
+         index entries, so the fixture is not producing the fan-out this measures",
+        index_occ.entries
+    );
+    // --- AND THE VERDICT, stated as an assertion so a change in the answer is a failure rather
+    // --- than a line of output nobody re-reads. The bimodal mix is what makes this interesting:
+    // --- most keys are sparse, so the per-key saving dominates even though most points are not.
+    assert!(
+        index_shipped > index_grouped,
+        "on the real key distribution the grouped shape costs MORE for context_indexes \
+         ({index_grouped} bytes against {index_shipped}), so it is not the tenant to convert \
+         first and the choice has to be re-read against the occupancy printed above."
+    );
+}
+
+/// WHAT THE CONVERSION ACTUALLY SAVED ON `context_indexes`, WEIGHED ON ITS REAL DISTRIBUTION.
+///
+/// # WHY THIS EXISTS SEPARATELY FROM THE ARM THAT CHOSE THE MAP
+///
+/// `which_series_maps_the_grouped_shape_would_help` answered which map to convert, by comparing the
+/// B-tree a key against a `GroupedSeriesIndex` holding the same triples. This answers a different
+/// and smaller question: what the change that LANDED is worth. The map now holds
+/// `OwnedTimestampedSeries`, and the thing it no longer holds is a `BTreeMap` a key -- so the
+/// comparison here is between the container that ships and the container that shipped yesterday,
+/// built from the same content by `to_btree()`, which is the exact fold the key-state capture and
+/// the validator's report still use.
+///
+/// Both sides are weighed with `deep_heap_bytes`, which clones under the counting allocator and so
+/// reports RESIDENT bytes. Allocation traffic is a different quantity and is biased against the
+/// array, whose buffer is grown by doubling; a conversion justified on traffic would have been
+/// justified on the wrong number, which is a mistake this file has made before.
+///
+/// # TWO BEFORE-FIGURES, 22% APART, AND BOTH ARE HONEST
+///
+/// There is no single "what a B-tree a key costs" for this content, and the difference is large
+/// enough to matter:
+///
+///   * **101.9 B/point** -- the B-tree the ENGINE built, measured on this same fixture by
+///     `which_series_maps_the_grouped_shape_would_help` before the conversion. This is what the map
+///     actually held, so it is what the change actually saved.
+///   * **83.7 B/point** -- a B-tree rebuilt here from the same content by `to_btree()`, which
+///     `collect`s from a sorted iterator and so packs its nodes.
+///
+/// The second is lower because ascending insertion is the one order that leaves a B-tree half
+/// empty: every full leaf splits and the left half is never filled again. `repack_nested` exists in
+/// the decode path for exactly that reason -- and for this map it is now a no-op, because an array
+/// has no slack to repack.
+///
+/// This probe prints the rebuilt figure, because that is the one it can measure in-process, and
+/// states the engine-built one beside it. The saving is therefore reported as a RANGE whose floor
+/// is the representation change alone and whose ceiling includes the packing the array gets for
+/// free. Quoting the ceiling as though the floor did not exist, or the floor as though it were the
+/// whole change, would be one configuration's number presented as the other's.
+///
+/// WHAT NEITHER SIDE INCLUDES is the key. `ModelKey` is an `Arc<str>`, so a clone bumps a refcount
+/// and the payload is invisible to this instrument -- by design, because both containers share the
+/// identical set of handles and the difference between them is exactly the per-key series overhead
+/// this measures.
+///
+/// rust-internal: measures this crates own containers, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_the_context_index_map_costs_now_it_holds_the_array -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "drives 2,000 extracted context events; run by name, and ALONE -- the allocation \
+            counters are process-global"]
+fn what_the_context_index_map_costs_now_it_holds_the_array() {
+    use crate::types::{Command, ContextEvent, ContextExtractedEventIndexes, ExecuteRequest};
+    use std::collections::{BTreeMap, HashMap};
+
+    const EVENTS: u64 = 2_000;
+    const T0: u64 = 1_787_270_070_000;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine_on(dir.path(), crate::DEFAULT_END_ROUTING_BUCKET);
+
+    for index in 0..EVENTS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextWriteExtractedEvent {
+                tenant_hash: 7,
+                node_hash: 1_000 + (index % 50),
+                event: Box::new(ContextEvent {
+                    event_id_hash: 0xDEAD_0000_0000_0000 | index,
+                    event_time_ms: T0 + index,
+                    ingestion_time_ms: T0 + index,
+                    kind: 9,
+                    event_type: 2,
+                    actor_hash: 0,
+                    status: 0,
+                    valid_until_ms: 0,
+                    confidence: 0.9,
+                    importance: 0.7,
+                    text: "an extracted event".to_string(),
+                    source_ref: String::new(),
+                    related_node_hashes: Vec::new(),
+                    compact_attrs: Vec::new(),
+                    vector: Vec::new(),
+                }),
+                indexes: ContextExtractedEventIndexes {
+                    scope_hash: 3_001,
+                    // THE SAME FIXTURE THE CHOICE WAS MADE ON, one unique entity and one shared, so
+                    // this figure is comparable with the arm that picked this map rather than being
+                    // a second measurement of a second workload.
+                    entity_hashes: vec![500_000 + index, 1],
+                    status_hash: 600 + (index % 8),
+                    source_hash: 700 + (index % 8),
+                    event_time_bucket_ms: T0 + (index % 20) * 1_000_000,
+                    disabled_indexes: Vec::new(),
+                },
+                first_write_only: false,
+                cold_storage: false,
+            },
+        });
+        assert!(
+            response.status.ok,
+            "extracted event {index}: {:?}",
+            response.status
+        );
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+
+    // The container that ships, and the one it replaced, holding identical content.
+    let mut occ = Occupancy::default();
+    let mut as_btrees: HashMap<std::sync::Arc<str>, BTreeMap<u64, crate::block_store::ElementEntry>> =
+        HashMap::with_capacity(shard.context_indexes().len());
+    for (key, series) in shard.context_indexes().iter() {
+        occ.observe(series.len());
+        as_btrees.insert(key.clone(), series.to_btree());
+    }
+
+    let array_bytes = deep_heap_bytes(shard.context_indexes());
+    let btree_bytes = deep_heap_bytes(&as_btrees);
+    let points = occ.entries.max(1);
+    let keys = occ.containers.max(1);
+
+    println!();
+    println!("  context_indexes after {EVENTS} extracted events: {keys} keys, {points} points");
+    println!(
+        "    B-tree a key (was)  {:>10} B   {:>7.1} B/point   {:>7.1} B/key",
+        btree_bytes,
+        btree_bytes as f64 / points as f64,
+        btree_bytes as f64 / keys as f64,
+    );
+    println!(
+        "    owned array (now)   {:>10} B   {:>7.1} B/point   {:>7.1} B/key",
+        array_bytes,
+        array_bytes as f64 / points as f64,
+        array_bytes as f64 / keys as f64,
+    );
+    // THE PACKED REBUILD IS THE CONSERVATIVE SIDE, and the engine-built figure the real one. See
+    // the two-before-figures section above; `ENGINE_BUILT_B_PER_POINT` is the measurement the arm
+    // that chose this map recorded, on this same fixture, before the conversion.
+    const ENGINE_BUILT_B_PER_POINT: f64 = 101.9;
+    let array_per_point = array_bytes as f64 / points as f64;
+    let packed_per_point = btree_bytes as f64 / points as f64;
+    println!(
+        "    landed, against the packed rebuild above: {:.2}x smaller, {:+.1}%",
+        btree_bytes as f64 / array_bytes.max(1) as f64,
+        100.0 * (array_bytes as f64 - btree_bytes as f64) / btree_bytes as f64,
+    );
+    println!(
+        "    landed, against the {ENGINE_BUILT_B_PER_POINT} B/point the ENGINE built: {:.2}x \
+smaller, {:+.1}%",
+        ENGINE_BUILT_B_PER_POINT / array_per_point,
+        100.0 * (array_per_point - ENGINE_BUILT_B_PER_POINT) / ENGINE_BUILT_B_PER_POINT,
+    );
+    // --- AND THE ORDERING OF THE TWO IS GUARDED, because the whole reason both are printed is the
+    // --- claim that a `collect` rebuild packs tighter than the engine's ascending inserts. If that
+    // --- stops being true the range is upside down and the conservative figure is not conservative.
+    assert!(
+        packed_per_point < ENGINE_BUILT_B_PER_POINT,
+        "the packed rebuild costs {packed_per_point:.1} B/point against the {ENGINE_BUILT_B_PER_POINT} \
+the engine's own build order produced, so the rebuild is no longer the conservative side and the \
+range printed above is inverted"
+    );
+    println!();
+    occ.report("context_indexes");
+
+    // --- DENOMINATORS FIRST: this conclusion is a ratio over a map the fixture had to fill, and an
+    // --- empty map would divide into a confident figure meaning nothing.
+    assert!(
+        occ.containers > 100,
+        "context_indexes holds only {} keys after {EVENTS} extracted events, so the index fan-out \
+         did not happen and both figures above are of an empty container",
+        occ.containers
+    );
+    assert!(
+        occ.entries as u64 >= EVENTS,
+        "context_indexes holds {} points for {EVENTS} events; each event writes several index \
+         entries, so the fixture is not producing the fan-out this measures",
+        occ.entries
+    );
+    // --- AND THE CONTENT IS THE SAME CONTENT, so the comparison is of representations and not of
+    // --- two different sets of points. Without this a fold that silently dropped points would
+    // --- report as a footprint win.
+    let btree_points: usize = as_btrees.values().map(BTreeMap::len).sum();
+    assert_eq!(
+        btree_points, occ.entries,
+        "the B-tree rebuild holds {btree_points} points against the array's {}, so the two sides \
+         do not hold identical content and the ratio is not a comparison of representations",
+        occ.entries
+    );
+    // --- THE VERDICT, asserted so a regression fails instead of scrolling past.
+    assert!(
+        array_bytes < btree_bytes,
+        "the owned array costs {array_bytes} bytes against the B-tree's {btree_bytes} on this \
+         map's real distribution, so the conversion did not pay and the occupancy above has moved"
+    );
+}
+
+/// WHAT THE FOUR CONVERTED CONTEXT SERIES MAPS COST, EACH WEIGHED AGAINST THE B-TREE IT REPLACED.
+///
+/// # WHY FOUR ARMS AND NOT ONE FIGURE
+///
+/// `context_audits`, `context_children`, `context_summaries` and `context_compressions` moved to
+/// `OwnedTimestampedSeries` together, and they do NOT share an occupancy: a node accumulates
+/// summaries at one level, children by parent, compressions by node and audits by session, each at
+/// its own rate. The curve the choice rests on -- 24.0 B a point for the array against 49.1 for the
+/// B-tree at a thousand points, 48 B against 312 at one -- has the array ahead at every occupancy,
+/// which is why all four converted; but "how far ahead" is per map and is measured here rather than
+/// read off that curve.
+///
+/// # THE COMPARISON IS OF REPRESENTATIONS, NOT OF TWO WORKLOADS
+///
+/// For each map this weighs the array it now holds against a `BTreeMap` rebuilt from the SAME
+/// content by `to_btree()` -- the fold the key-state capture and the validator's report both use --
+/// with `deep_heap_bytes`, which clones under the counting allocator and so reports resident bytes.
+///
+/// AND THE REBUILD IS THE CONSERVATIVE SIDE, for the reason
+/// `what_the_context_index_map_costs_now_it_holds_the_array` sets out at length: `to_btree()`
+/// collects from a sorted iterator and packs its nodes, where the engine's own ascending inserts
+/// leave them half empty. On `context_indexes` that difference was 22% -- 83.7 B a point rebuilt
+/// against the 101.9 the engine had actually built. So each ratio below is a FLOOR on what the
+/// conversion saved, not an estimate of it.
+///
+/// # WHAT IT FOUND: 2.60x ON ALL FOUR, AND THE FOUR ROWS ARE ONE MEASUREMENT
+///
+///     map                      keys   points   mean    B-tree -> array    ratio
+///     context_audits            400     1200   3.00     110.8 ->   42.7    2.60x
+///     context_children          400     1200   3.00     110.8 ->   42.7    2.60x
+///     context_summaries         400     1200   3.00     110.8 ->   42.7    2.60x
+///     context_compressions      400     1200   3.00     110.8 ->   42.7    2.60x
+///
+///     all four: 532,032 B as B-trees -> 204,864 B as arrays, 2.60x smaller, -61.5%
+///
+/// THE IDENTICAL ROWS ARE NOT FOUR CONFIRMATIONS OF ONE RATIO; THEY ARE ONE RATIO FOUR TIMES. This
+/// fixture gives every map the same shape -- 400 keys of 3 points, carrying the same
+/// `(u64, ElementEntry)` payload -- and at equal shape two containers of the same types cost the
+/// same, so equality here is arithmetic rather than evidence. Reading the column as four independent
+/// results would be reading the fixture's symmetry as a finding.
+///
+/// WHAT THE FOUR ARMS DO ESTABLISH SEPARATELY is that each map is reached by its OWN command and
+/// filled: the per-arm denominator asserts more than a hundred keys, which is the claim that would
+/// have failed silently if a kind's writes had stopped landing in its map. That is the part worth
+/// four arms; the ratio needs one.
+///
+/// AND THE OCCUPANCY IS THE HARD CASE ON PURPOSE. At one point a key the array wins by 6.5x (48 B
+/// against 312) and the answer would restate the sparse end of the curve. Three points a key is
+/// where a B-tree node is partly paid for, and the array still wins by 2.60x.
+///
+/// rust-internal: measures this crates own containers, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_the_four_converted_context_maps_cost -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "drives 400 nodes x 3 points across four context kinds; run by name, and ALONE -- the \
+            allocation counters are process-global"]
+fn what_the_four_converted_context_maps_cost() {
+    use crate::types::{
+        Command, ContextChildRef, ContextCompressionEvent, ContextPackAudit, ContextSummary,
+        ExecuteRequest,
+    };
+    use std::collections::{BTreeMap, HashMap};
+
+    const NODES: u64 = 400;
+    // MORE THAN ONE POINT A KEY ON PURPOSE. At one point a key the array wins by 6.5x and the
+    // answer would be the sparse end of the curve restated. Three points puts every map in the
+    // regime where a B-tree node is partly paid for, which is the harder case for the array.
+    const POINTS: u64 = 3;
+    const TENANT: u64 = 7907;
+    const NOW_MS: u64 = 1_787_270_070_000;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine_on(dir.path(), crate::DEFAULT_END_ROUTING_BUCKET);
+
+    // FROM ONE, NOT ZERO. `ContextUpsertChildRef` refuses a zero `parent_hash` as a missing
+    // field -- the wire type cannot tell a zero hash from an absent one -- so a fixture starting at
+    // node 0 fails its first write.
+    for node in 1..=NODES {
+        for point in 0..POINTS {
+            let at = NOW_MS + node * 1_000 + point;
+            // THE KEY IS HELD CONSTANT ACROSS `point` AND THE TIMESTAMP VARIED, so each write adds
+            // a point to one series rather than creating a key. A fixture that varied the key
+            // would measure 1,200 series of one point and call it an occupancy of three.
+            for command in [
+                Command::ContextWritePackAudit {
+                    tenant_hash: TENANT,
+                    audit: ContextPackAudit {
+                        query_id: format!("q-{node}-{point}"),
+                        session_hash: 300 + node,
+                        request_time_ms: at,
+                        query_hash: 400 + node,
+                        max_prompt_tokens: 1_024,
+                        selected_tokens: 16,
+                        selected_refs: Vec::new(),
+                        blocked_refs: Vec::new(),
+                    },
+                },
+                Command::ContextUpsertChildRef {
+                    tenant_hash: TENANT,
+                    child_ref: ContextChildRef {
+                        parent_hash: node,
+                        child_hash: 600 + node * POINTS + point,
+                        updated_at_ms: at,
+                    },
+                },
+                Command::ContextUpsertSummary {
+                    tenant_hash: TENANT,
+                    summary: ContextSummary {
+                        node_hash: node,
+                        level: 1,
+                        text: format!("level-1 summary of node {node} at {point}"),
+                        valid_from_ms: at,
+                        vector: Vec::new(),
+                        embedding_model_hash: 0,
+                    },
+                },
+                Command::ContextWriteCompressionEvent {
+                    tenant_hash: TENANT,
+                    event: ContextCompressionEvent {
+                        compression_id_hash: 700 + node * POINTS + point,
+                        node_hash: node,
+                        source_start_ms: NOW_MS,
+                        source_end_ms: at,
+                        compressed_time_ms: at,
+                        summary: format!("compressed node {node} at {point}"),
+                    },
+                },
+            ] {
+                let response = engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command,
+                });
+                assert!(
+                    response.status.ok,
+                    "node {node} point {point}: {:?}",
+                    response.status
+                );
+            }
+        }
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+
+    // GENERIC OVER THE SERIES TYPE, because the four maps no longer share one: `context_children`
+    // lives in the consolidated map and its value is an `ObjectSlot`. An array literal of calls
+    // forces a single type parameter across its arms, which is what made this generic rather than
+    // four separate calls.
+    fn weigh<S>(
+        label: &str,
+        map: &HashMap<std::sync::Arc<str>, S>,
+    ) -> (Occupancy, u64, u64, usize)
+    where
+        S: crate::engine::timestamped_series::TimestampedSeries + Clone,
+    {
+        let mut occ = Occupancy::default();
+        let mut rebuilt: HashMap<std::sync::Arc<str>, BTreeMap<u64, crate::block_store::ElementEntry>> =
+            HashMap::with_capacity(map.len());
+        for (key, series) in map.iter() {
+            occ.observe(series.len());
+            // THROUGH THE TRAIT, not an inherent `to_btree`: a generic function cannot call one,
+            // and both representations answer `points()` identically -- which is the property this
+            // comparison rests on in any case.
+            rebuilt.insert(
+                key.clone(),
+                series
+                    .points()
+                    .map(|(at, address)| (at, address.clone()))
+                    .collect(),
+            );
+        }
+        let array_bytes = deep_heap_bytes(map);
+        let btree_bytes = deep_heap_bytes(&rebuilt);
+        let rebuilt_points: usize = rebuilt.values().map(BTreeMap::len).sum();
+        if occ.containers == 0 {
+            println!("    {label:<22}      -- not exercised by this fixture, so nothing is claimed for it");
+            return (occ, array_bytes, btree_bytes, rebuilt_points);
+        }
+        let points = occ.entries.max(1);
+        println!(
+            "    {label:<22} {:>6} keys {:>7} pts  mean {:>5.2}   {:>7.1} -> {:>7.1} B/pt   {:>5.2}x",
+            occ.containers,
+            occ.entries,
+            occ.entries as f64 / occ.containers.max(1) as f64,
+            btree_bytes as f64 / points as f64,
+            array_bytes as f64 / points as f64,
+            btree_bytes as f64 / array_bytes.max(1) as f64,
+        );
+        (occ, array_bytes, btree_bytes, rebuilt_points)
+    }
+
+    println!();
+    println!("  {NODES} nodes x {POINTS} points, per kind");
+    println!("    map                      keys     points      mean       B-tree -> array      ratio");
+    let arms = [
+        ("context_audits", weigh("context_audits", shard.context_audits())),
+        ("context_children", weigh("context_children", shard.context_children())),
+        ("context_summaries", weigh("context_summaries", shard.context_summaries())),
+        (
+            "context_compressions",
+            weigh("context_compressions", shard.context_compressions()),
+        ),
+    ];
+
+    let mut total_array = 0u64;
+    let mut total_btree = 0u64;
+    for (name, (occ, array_bytes, btree_bytes, rebuilt_points)) in &arms {
+        // --- DENOMINATOR PER ARM: a map the fixture did not fill divides into a confident figure
+        // --- meaning nothing, and four arms make that four chances to publish one.
+        assert!(
+            occ.containers > 100,
+            "{name} holds only {} keys after {NODES} nodes, so this kind's writes are not landing \
+             in it and its row above is a measurement of an empty container",
+            occ.containers
+        );
+        // --- AND THE TWO SIDES HOLD THE SAME CONTENT, so the ratio compares representations. A
+        // --- fold that dropped points would otherwise report as a footprint win.
+        assert_eq!(
+            *rebuilt_points, occ.entries,
+            "{name}: the B-tree rebuild holds {rebuilt_points} points against the array's {}, so \
+             the two sides are not the same content",
+            occ.entries
+        );
+        assert!(
+            array_bytes < btree_bytes,
+            "{name}: the array costs {array_bytes} bytes against the B-tree's {btree_bytes} at an \
+             occupancy of {:.2}, so this conversion did not pay and the curve it rests on has moved",
+            occ.entries as f64 / occ.containers.max(1) as f64
+        );
+        total_array += array_bytes;
+        total_btree += btree_bytes;
+    }
+
+    println!();
+    println!(
+        "  all four: {total_btree} B as B-trees -> {total_array} B as arrays, {:.2}x smaller, {:+.1}%",
+        total_btree as f64 / total_array.max(1) as f64,
+        100.0 * (total_array as f64 - total_btree as f64) / total_btree as f64,
+    );
+    println!("  (a floor: the rebuilt B-tree packs its nodes where the engine's inserts leave them half empty)");
+}
+
+/// WHAT ONE READ OF A SHARD'S STATS ALLOCATES, AT TWO CORPUS SIZES.
+///
+/// # WHY THIS IS A PERIODIC PATH AND NOT A REPORT
+///
+/// `shard_stats` is what a node answers a stats request with, and `object_manager_stats` inside it
+/// produces the `dirty_object_count` the meta server SORTS PLACEMENT CANDIDATES BY -- so this is
+/// read on a schedule, not when someone opens a dashboard. Anything it allocates, it allocates
+/// again on the next read, for as long as the node is up.
+///
+/// # WHAT IS MEASURED
+///
+/// `Probe` counts allocations and bytes for ONE `shard_stats` call, after a warm call so that no
+/// first-call lazy initialisation lands in the measurement. The corpus is varied and the key
+/// question is the SHAPE: a figure that grows with the store is a per-read cost proportional to
+/// what the store holds, which is the thing that cannot be left on a scheduled path.
+///
+/// VARYING THE CORPUS IS THE WHOLE POINT, because a single rung cannot tell a fixed cost from a
+/// linear one -- a series that varied the wrong dimension has hidden exactly this before. The
+/// denominator asserted below is that the pages the walk reads actually accumulated.
+///
+/// # WHAT IT FOUND, AND THE TWO CANDIDATES IT CLEARED
+///
+///     corpus   live pages   allocs   alloc_bytes   bytes/page
+///         40           40      377        220745       5518.6
+///        320          320     2645        776311       2426.0
+///
+///       of which, at 320 pages:  slab summary + block store stats       0 B
+///                                object_manager_stats                4,112 B
+///                                the rest of `shard_stats`         772,199 B   (99.5%)
+///
+/// ONE STATS READ ALLOCATES THREE QUARTERS OF A MEGABYTE over a 320-page store, and it is paid again
+/// on every read. The shape is not flat -- 220,745 B over 40 pages against 776,311 over 320 -- so a
+/// share of it follows what the store holds.
+///
+/// BOTH OF THE OBVIOUS SUSPECTS ARE INNOCENT, which is why they are named here rather than left for
+/// the next reader to re-suspect:
+///
+///   * `block_store.slab_summary()` and `block_store.stats()`, taken at the top of `shard_stats`
+///     over the whole store rather than the shard, allocate **0 bytes**;
+///   * `object_manager_stats` -- the per-map `values().map(len).sum()` chains over thirteen maps,
+///     which looked like the whole-index walk -- is 4,112 B of 776,311, or 0.5%.
+///
+/// AND A FIX THAT MEASURED ZERO IS WORTH MORE THAN THE BYTES IT SAVED. The arm of
+/// `object_manager_stats` that counts live pages built a `Vec` of every page's reference to take its
+/// `.len()`, which is an allocation that buys nothing; removing it moved this probe's figure by
+/// **zero bytes**, because that arm is only taken when `object_block_lookup` is EMPTY and a store
+/// with pages never takes it. The change stands because the allocation is pointless at any size, but
+/// the lesson is the probe's: a per-read cost nobody had measured was about to be "fixed" by a line
+/// that does not execute.
+///
+/// WHAT WAS NOT ANSWERED THEN, AND IS NOW. The 99.5% was inside the rest of `shard_stats`, and the
+/// split above found it in two steps:
+///
+///   * **the write-ahead log's full-file scan**, 771,062 of 776,311 B -- `stats` answered
+///     `last_sequence` by reading the whole log on every read. Replaced by the cached sequence the
+///     write path already trusts, scanning once on a miss. That took the read to 5,249 B.
+///   * **the dirty-bucket `BTreeSet`**, 4,112 of the remaining 5,249 B -- and the thirteen per-map
+///     `values().map(len).sum()` chains beside it at **ZERO**, which is the opposite of how they
+///     look. A `BTreeSet` collect buffers its iterator before building the tree; the sums walk keys
+///     and allocate nothing. Skipped in the two cases where the set cannot change the answer.
+///
+/// THE READ IS NOW FLAT: 1,137 B at 40 pages and 1,137 B at 320, where it began at 220,745 and
+/// 776,311. Flat is the property that matters -- a scheduled read whose cost follows the store is
+/// the thing that cannot be left in place -- and it is why the assertion below is about growth.
+///
+/// AND THE ROWS BELOW DO NOT SUM TO THE TOTAL, BY CONSTRUCTION. Three of them price expressions by
+/// REPLICATING them against the same shard: `wal.stats`, the per-map sums, and a dirty-bucket set.
+/// Two of those the path no longer runs. They are kept because they are what the saving is measured
+/// against, and labelled because 4,112 B printed beneath a 1,137 B total otherwise reads as a
+/// contradiction.
+///
+/// rust-internal: measures this crates own allocation behaviour, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_one_stats_read_allocates -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "drives two corpora and probes the allocator; run by name, and ALONE -- the allocation \
+            counters are process-global"]
+fn what_one_stats_read_allocates() {
+    use crate::types::{Command, ExecuteRequest};
+
+    println!();
+    println!("  corpus   live pages   allocs   alloc_bytes   bytes/page");
+
+    let mut measured: Vec<(usize, usize, u64, u64)> = Vec::new();
+    let mut scan_counts: Vec<(usize, usize, u64, u64)> = Vec::new();
+    for rung in [40_usize, 320] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = probe_engine_on(dir.path(), crate::DEFAULT_END_ROUTING_BUCKET);
+        for index in 0..rung {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("st-{index:06}"),
+                    value: vec![b'v'; 48],
+                },
+            });
+            assert!(response.status.ok, "corpus write {index}: {:?}", response.status);
+        }
+
+        let live_blocks: usize = {
+            let shards = engine.shards.read().expect("shards lock poisoned");
+            let shard = shards.get(&1).expect("shard 1 loaded");
+            shard
+                .bucket_index
+                .bucket_map
+                .values()
+                .map(|bucket| bucket.block_index.len())
+                .sum()
+        };
+
+        // WARM FIRST, so a one-off initialisation inside the stats path is not charged to the
+        // measurement and read as a per-call cost.
+        let warm = engine.shard_stats(1);
+        assert!(warm.is_some(), "the shard must report stats for this to measure anything");
+        // ATTRIBUTED, NOT GUESSED. `live_block_scan_sites` is keyed by the source location that
+        // asked, which is what this instrument exists for: the total says the stats read walks the
+        // shard, not WHICH line does it. Reset immediately before the measured call.
+        crate::engine::reset_live_block_scan_entries();
+        crate::engine::reset_live_block_scan_sites();
+        // THE SCAN COUNTER ACROSS THE MEASURED CALL. `stats_full_scans` moves only when a
+        // full-file scan actually runs, so this is the exact statement of "the stats path does not
+        // scan the log" -- a count, not a byte threshold that drifts with the fixture.
+        let scans_before = engine.wal_store.raw_stats(1).stats_full_scans;
+        let probe = crate::alloc_probe::Probe::start();
+        let stats = engine.shard_stats(1);
+        let counted = probe.stop();
+        let scans_after = engine.wal_store.raw_stats(1).stats_full_scans;
+        assert!(stats.is_some(), "the measured stats read returned nothing");
+        let scanned = crate::engine::live_block_scan_entries();
+        let sites = crate::engine::live_block_scan_sites_snapshot();
+
+        // SPLIT IN THREE, because the first version of this probe removed an allocation from the
+        // stats path and the figure did not move by one byte -- the line was in an arm a store with
+        // pages never takes. A total that cannot be attributed invites exactly that kind of fix.
+        let slab_probe = crate::alloc_probe::Probe::start();
+        let _ = engine.block_store.slab_summary();
+        let _ = engine.block_store.stats();
+        let slab_bytes = slab_probe.stop().alloc_bytes;
+        let om_bytes = {
+            let shards = engine.shards.read().expect("shards lock poisoned");
+            let shard = shards.get(&1).expect("shard 1 loaded");
+            let om_probe = crate::alloc_probe::Probe::start();
+            let _ = crate::engine::object_manager_stats_for_test(
+                shard,
+                0,
+                crate::DEFAULT_END_ROUTING_BUCKET,
+            );
+            om_probe.stop().alloc_bytes
+        };
+        // THE THREE SUB-REPORTS `shard_stats` EMBEDS, priced one at a time. The two bucket-index
+        // byte functions are excluded deliberately: both bodies only sum, so neither can allocate,
+        // and a row of zeroes for them would suggest the probe had tested something.
+        let cache_bytes = {
+            let probe = crate::alloc_probe::Probe::start();
+            let _ = engine.cache.stats();
+            probe.stop().alloc_bytes
+        };
+        let wal_bytes = {
+            let probe = crate::alloc_probe::Probe::start();
+            let _ = engine.wal_store.stats(1);
+            probe.stop().alloc_bytes
+        };
+        // AND THE WAL CALL SPLIT, because `stats` touches the disk twice: a full-file scan for the
+        // last sequence, and a segment walk for `persistent_bytes`. `raw_stats` does neither and
+        // `cached_last_sequence` is the floor, so the three together say which read costs what.
+        let wal_raw_bytes = {
+            let probe = crate::alloc_probe::Probe::start();
+            let _ = engine.wal_store.raw_stats(1);
+            probe.stop().alloc_bytes
+        };
+        let wal_cached_bytes = {
+            let probe = crate::alloc_probe::Probe::start();
+            let _ = engine.wal_store.cached_last_sequence(1);
+            probe.stop().alloc_bytes
+        };
+        let wal_scan_bytes = {
+            let probe = crate::alloc_probe::Probe::start();
+            let _ = engine.wal_store.probe_last_sequence_scan(1);
+            probe.stop().alloc_bytes
+        };
+        let wal_segment_bytes = {
+            let probe = crate::alloc_probe::Probe::start();
+            let _ = engine.wal_store.probe_all_segment_bytes(1);
+            probe.stop().alloc_bytes
+        };
+        let index_bytes = {
+            let shards = engine.shards.read().expect("shards lock poisoned");
+            let shard = shards.get(&1).expect("shard 1 loaded");
+            let probe = crate::alloc_probe::Probe::start();
+            let _ = crate::engine::storage_bucket_internals::bucket_index_resident_bytes(shard);
+            let _ = crate::engine::storage_bucket_internals::bucket_index_node_bytes(shard);
+            probe.stop().alloc_bytes
+        };
+        // THE TWO HALVES OF `object_manager_stats`, priced apart. The per-map sums look like the
+        // cost and this fixture writes only strings, so twelve of the thirteen maps they walk are
+        // empty -- which is exactly the kind of thing that has to be measured rather than reasoned
+        // about, because three earlier guesses at a cost in this function were wrong.
+        let (sums_bytes, dirty_set_bytes) = {
+            let shards = engine.shards.read().expect("shards lock poisoned");
+            let shard = shards.get(&1).expect("shard 1 loaded");
+            let sums = {
+                let probe = crate::alloc_probe::Probe::start();
+                let total = shard.strings().len()
+                    + shard.hashes.values().map(|fields| fields.len()).sum::<usize>()
+                    + shard.sets.values().map(std::collections::BTreeMap::len).sum::<usize>()
+                    + shard.lists.values().map(std::collections::BTreeMap::len).sum::<usize>()
+                    + shard.zsets.values().map(std::collections::BTreeMap::len).sum::<usize>()
+                    + shard.features().values().map(|series| series.len()).sum::<usize>()
+                    + shard.context_nodes().len();
+                let counted = probe.stop().alloc_bytes;
+                assert!(total > 0, "the sums walked nothing, so their price is not measured");
+                counted
+            };
+            let dirty_set = {
+                let probe = crate::alloc_probe::Probe::start();
+                let set = shard
+                    .bucket_index
+                    .bucket_map
+                    .iter()
+                    .filter_map(|(bucket, node)| node.dirty().then_some(*bucket))
+                    .collect::<std::collections::BTreeSet<_>>();
+                let counted = probe.stop().alloc_bytes;
+                assert!(
+                    !set.is_empty(),
+                    "no bucket read dirty, so the set this prices was empty and its price is not \
+                     a measurement"
+                );
+                counted
+            };
+            (sums, dirty_set)
+        };
+
+        println!(
+            "  {rung:>6}   {live_blocks:>10}   {:>6}   {:>11}   {:>10.1}   scanned {scanned}",
+            counted.allocs,
+            counted.alloc_bytes,
+            counted.alloc_bytes as f64 / live_blocks.max(1) as f64,
+        );
+        for (site, entries) in &sites {
+            println!("             {entries:>9} entries  <- {site}");
+        }
+        // PRICES OF INDIVIDUAL CALLS, NOT PARTS OF THE TOTAL ABOVE. `wal.stats` is priced here
+        // because it is what the stats path USED to call and what the saving is measured against;
+        // the path now calls `stats_without_rescan`, so its price is no longer inside the total and
+        // the rows deliberately do not sum to it.
+        println!(
+            "             priced separately: slab+store {slab_bytes} B, object_manager_stats \
+{om_bytes} B, cache.stats {cache_bytes} B, bucket_index bytes {index_bytes} B",
+        );
+        println!(
+            "             replicated, NOT parts of the total: the per-map sums {sums_bytes} B, a \
+dirty-bucket BTreeSet {dirty_set_bytes} B (the fast path skips building it)"
+        );
+        println!(
+            "             OFF THE PATH NOW: wal.stats {wal_bytes} B would be charged to every read \
+if the stats path still called it ({scans_after} total scans seen, {} across the measured read)",
+            scans_after.saturating_sub(scans_before)
+        );
+        println!(
+            "             the wal call: stats {wal_bytes} B, raw_stats {wal_raw_bytes} B, \
+cached_last_sequence {wal_cached_bytes} B  -> the two disk reads cost {} B",
+            wal_bytes.saturating_sub(wal_raw_bytes)
+        );
+        println!(
+            "             those two: full-file scan {wal_scan_bytes} B, segment walk \
+{wal_segment_bytes} B"
+        );
+        measured.push((rung, live_blocks, counted.allocs, counted.alloc_bytes));
+        scan_counts.push((rung, live_blocks, scans_after.saturating_sub(scans_before), wal_bytes));
+    }
+
+    // --- DENOMINATOR: the walk this prices reads live pages, so the corpus has to have produced
+    // --- them. Two rungs that both held nothing would print a flat zero and read as "free".
+    for (rung, blocks, _, _) in &measured {
+        assert!(
+            *blocks >= *rung,
+            "corpus {rung} left only {blocks} live pages, so the walk had nothing to read and the \
+             figures above are not measurements of it"
+        );
+    }
+
+    let (_, small_blocks, _, small_bytes) = measured[0];
+    let (_, large_blocks, _, large_bytes) = measured[1];
+    println!();
+    println!(
+        "  pages x{:.1}  ->  alloc_bytes x{:.1}",
+        large_blocks as f64 / small_blocks.max(1) as f64,
+        large_bytes as f64 / small_bytes.max(1) as f64,
+    );
+    println!("  a ratio near the page ratio means one stats read costs the store's size, every read.");
+    println!("  measured at x3.5 for x8.0 pages: a large fixed part, and a part that follows the store.");
+
+    // --- NO BOUND ASSERTED ON THE LEVEL. 776 KB a read is a finding, not a budget, and the share of
+    // --- it that follows the store is not yet attributed to a line -- so a threshold here would
+    // --- freeze a number nobody has explained. What IS asserted is the denominator above: that the
+    // --- corpus the figures are divided by actually exists.
+    assert!(
+        large_bytes > 0 && small_bytes > 0,
+        "one stats read allocated {small_bytes} B and {large_bytes} B at the two rungs, so at least \
+         one measured nothing and the split printed above divides into it"
+    );
+    // --- THE READ DOES NOT FOLLOW THE STORE. Measured at 1,137 B on both rungs after the scan and
+    // --- the set came off the path, where it was 220,745 and 776,311 before. A level is a fixture
+    // --- figure; the SHAPE is the claim, so growth is what is asserted. Allowing 1.5x over an 8x
+    // --- corpus leaves room for a fixed cost that is not perfectly constant without admitting a
+    // --- term that scales.
+    assert!(
+        (large_bytes as f64) < (small_bytes as f64) * 1.5,
+        "one stats read allocated {small_bytes} B over {small_blocks} pages and {large_bytes} B over \
+         {large_blocks} -- it is following the store again. `shard_stats` is what a node answers a \
+         stats request with, so a term that scales is paid on every read: check whether a full-file \
+         log scan or a per-bucket collect has come back onto the path."
+    );
+    // --- AND THE SCAN IS OFF THE PATH, ASSERTED AS A COUNT. This is the whole claim: a stats read
+    // --- must not run a full-file scan of the log. `stats_full_scans` moves only when one happens,
+    // --- and the warm call before the measurement has already seeded the cached sequence, so a
+    // --- scan here would mean the path went back to `stats`. A byte bound would say the same thing
+    // --- less exactly and would drift with the fixture's log size.
+    for (rung, _, scans, _) in &scan_counts {
+        assert_eq!(
+            *scans, 0,
+            "a warm stats read ran {scans} full-file WAL scan(s) at corpus {rung}. That scan is \
+             99.3% of what this read used to allocate -- 771,062 of 776,311 bytes over a 320-page \
+             store -- and `shard_stats` is what a node answers a stats request with, so it is paid \
+             again on every read. Use `stats_without_rescan`, which takes the sequence from the \
+             cache the append path maintains and scans only on a miss."
+        );
+    }
+}
+
+/// THE TWO PUBLISHED AMPLIFICATION RATIOS ARE THE RATIO THEY NAME.
+///
+/// # WHY A PUBLISHED FIGURE NEEDS THIS
+///
+/// Amplification was measured in probes and described in prose and appeared in no report, so
+/// nothing watched it between measurements. Publishing it fixes that only if the published number is
+/// the quantity its name claims -- a field computed once and never checked is how a counter ends up
+/// declared and never incremented, or counting a fraction of its call sites, which this tree has
+/// found six times.
+///
+/// So this pins the DEFINITION as an identity against the counters it is derived from, rather than
+/// asserting a bound. A bound would pass on the wrong arithmetic as long as the wrong answer landed
+/// inside it.
+///
+/// # WHAT THE WRITE RATIO IS NOT, WHICH MATTERS MORE THAN WHAT IT IS
+///
+/// Measured here at **0.1367x** -- 7,000 physical bytes for 51,200 logical. A write amplification
+/// BELOW ONE is not a defect: records are compressed on the way down and writes are coalesced, so
+/// many logical records share one physical append. The terms are printed beside the ratio for
+/// exactly that reason.
+///
+/// AND IT IS NOT COMPARABLE TO A REPLICATED STORE'S FIGURE. This counts one node's physical appends.
+/// A store configured with three data replicas multiplies its own physical term by three before any
+/// of this arithmetic happens, so a 3x figure there and a 0.1367x figure here are not the same
+/// measurement of the same thing, and neither is reachable from the other by tuning. Three replicas
+/// is a durability choice; the number that follows from it is not an efficiency result. Published
+/// side by side without that said, the smaller number reads as the better engine.
+///
+/// WHAT WOULD MAKE THEM COMPARABLE is a replica count to multiply by, and this crate has none --
+/// replication here is a `ReplicationMode` (raft or shared storage), not a factor. So the honest
+/// published quantity is per-node physical over logical, which is what this is.
+///
+/// # AND IT MAKES A VACUOUS PASS VISIBLE
+///
+/// Both ratios are 0 when their denominator is 0, which is the convention the slab descriptor's own
+/// utilisation already uses. That means a fixture which wrote nothing would satisfy every assertion
+/// here by reporting 0 against 0. The denominators are therefore asserted non-zero BEFORE the
+/// identities, and the branch taken is printed, so "it passed" cannot mean "it measured nothing".
+///
+/// # AND A GREEN RUN HERE DOES NOT MEAN THE NAMES ARE RIGHT
+///
+/// Every identity below is the name's own arithmetic AS THIS TREE COMPUTES IT. That is worth
+/// pinning -- it catches a numerator or denominator swapped under a stable name -- but it is
+/// self-consistency, not agreement with the definition the metric name comes from. This arm passed
+/// for the whole time `logical_write_amplification_ppm` published physical-over-logical, because it
+/// asserted exactly that. A guard can be green and the name still wrong.
+///
+/// What the names are checked AGAINST, rather than for self-consistency, is
+/// `the_amplification_set_in_the_published_format`, which computes each ratio from the external
+/// definition and compares. The two arms are not redundant: this one fails if the arithmetic
+/// drifts, that one fails if the arithmetic is right and the name is not.
+#[test]
+fn the_published_amplification_ratios_are_the_ratio_they_name() {
+    use crate::types::{Command, ExecuteRequest};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // --- THE ZERO CASE FIRST, on a shard that has not been written to. Asserted as the implication
+    // --- rather than as a flat 0, because a load is free to write something and the property is
+    // --- "zero denominator reports zero", not "a fresh shard reports zero".
+    let fresh = engine.shard_stats(1).expect("a loaded shard reports stats");
+    let fresh_store = engine.block_store.stats();
+    if fresh_store.logical_bytes_written == 0 {
+        assert_eq!(
+            fresh.storage.logical_write_amplification_ppm, 0,
+            "nothing logical has been written, so the write ratio must report 0 rather than a \
+             division or a misleading 1_000_000"
+        );
+        println!("  zero case exercised: no logical bytes written yet, write ratio reports 0");
+    } else {
+        println!(
+            "  zero case NOT exercised: the load wrote {} logical bytes",
+            fresh_store.logical_bytes_written
+        );
+    }
+
+    for index in 0..200 {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("amp-{index:06}"),
+                value: vec![b'v'; 256],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let after = engine.shard_stats(1).expect("a loaded shard reports stats");
+    let store = engine.block_store.stats();
+    let slabs = engine.block_store.slab_summary();
+
+    // --- DENOMINATORS BEFORE IDENTITIES, so neither identity can be satisfied by 0 == 0.
+    assert!(
+        store.logical_bytes_written > 0,
+        "200 writes left logical_bytes_written at 0, so the write ratio's denominator is zero and \
+         the identity below would hold vacuously"
+    );
+    let expected_write = store
+        .bytes_written
+        .saturating_mul(1_000_000)
+        / store.logical_bytes_written;
+    assert_eq!(
+        after.storage.logical_write_amplification_ppm, expected_write,
+        "the published write amplification is not physical/logical: {} physical bytes over {} \
+         logical should be {expected_write} ppm, and {} was published",
+        store.bytes_written,
+        store.logical_bytes_written,
+        after.storage.logical_write_amplification_ppm,
+    );
+
+    if slabs.live_physical_bytes > 0 {
+        let expected_space = slabs
+            .total_known_physical_bytes
+            .saturating_mul(1_000_000)
+            / slabs.live_physical_bytes;
+        assert_eq!(
+            after.storage.space_amplification_ppm, expected_space,
+            "the published space amplification is not known/live: {} known physical bytes over {} \
+             live should be {expected_space} ppm, and {} was published",
+            slabs.total_known_physical_bytes,
+            slabs.live_physical_bytes,
+            after.storage.space_amplification_ppm,
+        );
+        println!(
+            "  space amplification {:.4}x  ({} known / {} live physical bytes)",
+            expected_space as f64 / 1_000_000.0,
+            slabs.total_known_physical_bytes,
+            slabs.live_physical_bytes,
+        );
+    } else {
+        println!("  space amplification not exercised: nothing is live on a slab yet");
+    }
+
+    // --- THE CORRECTLY NAMED FIELD CARRIES THE SAME VALUE, which is the whole claim of keeping
+    // --- both spellings. If these two ever diverge, one of them was re-pointed and a consumer
+    // --- reading either one is getting a different quantity than it was.
+    assert_eq!(
+        after.storage.storage_write_amplification_ppm, expected_write,
+        "`storage_write_amplification_ppm` is the correct name for physical-over-logical and must \
+         equal {expected_write} ppm, and {} was published",
+        after.storage.storage_write_amplification_ppm,
+    );
+    assert_eq!(
+        after.storage.logical_write_amplification_ppm,
+        after.storage.storage_write_amplification_ppm,
+        "the two spellings of the storage-write ratio diverged -- {} under the old name, {} under \
+         the correct one. They are kept equal on purpose: the old name is a wire key that travels \
+         to the meta server, so its VALUE is frozen and the new name exists to describe it.",
+        after.storage.logical_write_amplification_ppm,
+        after.storage.storage_write_amplification_ppm,
+    );
+
+    // --- THE UNIT-MATCHED WRITE RATIO. Both halves are stored bytes, so this is 1.0x on a corpus
+    // --- written once however well it compressed -- which is the property that distinguishes it
+    // --- from the ratio above, and it is asserted rather than printed because the corpus here IS
+    // --- written once.
+    // THE DENOMINATOR HERE IS THE INDEX'S OWN TALLY, NOT THE SLAB SUMMARY'S. On this write-once
+    // corpus the two are equal, so an identity written against `live_physical_bytes` would pass
+    // whichever one the field used -- and that is exactly the substitution that must not go
+    // unnoticed, because the slab-granular denominator cannot fall under rewrite.
+    // `the_live_denominator_must_fall_when_a_key_is_overwritten` separates the two; this pins the
+    // arithmetic against the right one so that arm is not the only thing holding it.
+    let index_live_bytes = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let live = &shard.bucket_index.block_slab_live;
+        assert!(
+            live.is_ready(),
+            "the per-slab live tally is not ready, so the published denominator is 0 by \
+             construction and the identity below would be vacuous"
+        );
+        live.iter().map(|(_, tally)| tally.bytes).sum::<u64>()
+    };
+    if index_live_bytes > 0 {
+        let expected_live = store.bytes_written.saturating_mul(1_000_000) / index_live_bytes;
+        assert_eq!(
+            after.storage.lifetime_write_amplification_ppm, expected_live,
+            "the published lifetime write amplification is not written over the INDEX's live \
+             bytes: {} physical written over {index_live_bytes} live should be {expected_live} \
+             ppm, and {} was published",
+            store.bytes_written,
+            after.storage.lifetime_write_amplification_ppm,
+        );
+        println!(
+            "  lifetime write amplification {:.4}x  ({} physical written / {index_live_bytes} \
+             index-live bytes; the slab summary says {} live)",
+            expected_live as f64 / 1_000_000.0,
+            store.bytes_written,
+            slabs.live_physical_bytes,
+        );
+        // EVERY KEY WRITTEN EXACTLY ONCE AND NOTHING DELETED, so the store is holding precisely
+        // what it wrote and the ratio must be 1.0x. This is the assertion that would have caught
+        // the mixed-unit version: that one reads 7.3x here, on a workload with no rewrite at all.
+        assert_eq!(
+            1_000_000, after.storage.lifetime_write_amplification_ppm,
+            "200 keys were written once each and none deleted, so the store holds exactly the \
+             bytes it wrote and this ratio must be 1.000x. {} ppm means either the two halves are \
+             not in the same unit -- the defect this field exists to avoid -- or the fixture \
+             rewrote or reclaimed something and is no longer write-once.",
+            after.storage.lifetime_write_amplification_ppm,
+        );
+    } else {
+        println!("  lifetime write amplification not exercised: nothing is live on a slab yet");
+    }
+
+    println!(
+        "  logical write amplification {:.4}x  ({} physical / {} logical bytes written)",
+        expected_write as f64 / 1_000_000.0,
+        store.bytes_written,
+        store.logical_bytes_written,
+    );
+    // THE TERMS THAT EXPLAIN A RATIO BELOW 1, printed because an unexplained one in a published
+    // field invites the reader to assume a defect. Two things pull physical below logical: records
+    // compressed on the way down, and writes coalesced so that many logical records share one
+    // physical append.
+    println!(
+        "  of which: {} records compressed, {} bytes saved by compression; {} physical appends for \
+{} logical bytes",
+        store.compressed_records_written,
+        store.compression_bytes_saved,
+        store.writes,
+        store.logical_bytes_written,
+    );
+    assert!(
+        store.writes > 0,
+        "the block store recorded no appends, so the physical term above is not a measurement of \
+         this fixture's writes"
+    );
+
+    // --- AND THE UNIT-MATCHED RATIO IS INVARIANT TO HOW WELL THE VALUES COMPRESS, which is the
+    // --- whole reason for matching the units, and is asserted on a SECOND corpus rather than
+    // --- argued from the first.
+    //
+    // `vec![b'v'; n]` is not a neutral fixture: a run of one repeated byte compresses to almost
+    // nothing, so `live_physical_bytes` above is mostly per-block framing rather than data. Any
+    // ratio with a stored-byte denominator sits on that, and one with an UNCOMPRESSED numerator
+    // moves by the compression factor when the corpus changes compressibility. This one must not
+    // move at all: on a store written once and never deleted, the bytes live ARE the bytes
+    // written, whatever they compressed to.
+    //
+    // The values here are a byte sequence with no short run and no small period, so the codec has
+    // nothing to take. If this arm ever reports the two stores' live bytes as equal, the second
+    // corpus did not actually resist compression and the invariance below is untested.
+    let incompressible_dir = tempfile::tempdir().expect("tempdir");
+    let incompressible = crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        incompressible_dir.path().join("cache"),
+        incompressible_dir.path().join("blocks"),
+        incompressible_dir.path().join("indexes"),
+    );
+    incompressible.load_shard(1);
+    let mut seed: u64 = 0x9E3779B97F4A7C15;
+    for index in 0..200 {
+        let value: Vec<u8> = (0..256)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 24) as u8
+            })
+            .collect();
+        let response = incompressible.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet { key: format!("inc-{index:06}"), value },
+        });
+        assert!(response.status.ok, "incompressible write {index}: {:?}", response.status);
+    }
+    let incompressible_stats = incompressible.shard_stats(1).expect("a loaded shard reports stats");
+    let incompressible_slabs = incompressible.block_store.slab_summary();
+    println!(
+        "  incompressible corpus: {} live physical bytes against {} for the repeated-byte corpus \
+         ({:.1}x the stored footprint for the same 51,200 user bytes)",
+        incompressible_slabs.live_physical_bytes,
+        slabs.live_physical_bytes,
+        incompressible_slabs.live_physical_bytes as f64 / slabs.live_physical_bytes.max(1) as f64,
+    );
+    println!(
+        "    lifetime write amplification {:.4}x  -- unchanged, because both halves are stored bytes",
+        incompressible_stats.storage.lifetime_write_amplification_ppm as f64 / 1_000_000.0,
+    );
+    // THE DENOMINATOR REALLY DID MOVE. Without this, a second corpus that happened to compress the
+    // same way would satisfy the invariance below for the wrong reason.
+    assert!(
+        incompressible_slabs.live_physical_bytes > slabs.live_physical_bytes * 2,
+        "the incompressible corpus stored {} physical bytes against {} for the repeated-byte one. \
+         They are too close for this pair to test compressibility-invariance: the second fixture \
+         compressed after all, and the assertion below would pass without exercising anything.",
+        incompressible_slabs.live_physical_bytes,
+        slabs.live_physical_bytes,
+    );
+    assert_eq!(
+        1_000_000, incompressible_stats.storage.lifetime_write_amplification_ppm,
+        "the unit-matched write ratio read {} ppm on an incompressible write-once corpus where it \
+         reads 1.000x on a compressible one. Both halves are stored bytes, so the compression \
+         factor must cancel -- if it does not, the numerator and denominator are not in the same \
+         unit and this field has the defect it was added to avoid.",
+        incompressible_stats.storage.lifetime_write_amplification_ppm,
+    );
+    // AND THE MIXED-UNIT SPELLING WOULD HAVE MOVED, which is what makes the invariance a finding
+    // rather than an accident of this fixture.
+    let mixed_unit_here = incompressible
+        .block_store
+        .stats()
+        .logical_bytes_written
+        .saturating_mul(1_000_000)
+        / incompressible_slabs.live_physical_bytes.max(1);
+    let mixed_unit_there =
+        store.logical_bytes_written.saturating_mul(1_000_000) / slabs.live_physical_bytes.max(1);
+    println!(
+        "    the MIXED-UNIT ratio would read {:.3}x here against {:.3}x there -- it tracks the \
+         codec, not the rewrites",
+        mixed_unit_here as f64 / 1_000_000.0,
+        mixed_unit_there as f64 / 1_000_000.0,
+    );
+    assert_ne!(
+        mixed_unit_here, mixed_unit_there,
+        "the mixed-unit ratio came out the same on both corpora, so this pair does not demonstrate \
+         that matching the units is what bought the invariance"
+    );
+}
+
+/// THE AMPLIFICATION SET IN THE PUBLISHED FORMAT: three ppm ratios, two subsystems, two media.
+///
+/// The format this follows publishes three ratios in parts per million, and which numerator sits
+/// over which denominator IS the format:
+///
+/// ```text
+/// logical_write_amplification_ppm = ppm(logical bytes written, LIVE bytes)
+/// storage_write_amplification_ppm = ppm(physical bytes written, LOGICAL bytes written)
+/// space_amplification_ppm         = ppm(physical bytes resident, LIVE bytes)
+/// ```
+///
+/// The first asks how many times the workload rewrote what it kept; the second, how much the store
+/// spent recording what was asked of it; the third, how much it holds to serve what is live. All
+/// three land in the same order of magnitude, so a figure carrying one name while computing another
+/// is wrong in a way no range check catches.
+///
+/// THIS ENGINE PUBLISHED THE SECOND UNDER THE FIRST'S NAME, AND NOW PUBLISHES BOTH CORRECTLY.
+/// `ShardStats.storage.logical_write_amplification_ppm` computes `ppm(bytes_written,
+/// logical_bytes_written)` -- physical over logical -- which is `storage_write_amplification_ppm`.
+/// That field now exists and carries the same value under the name that describes it; the older
+/// spelling keeps its value because it is a serde key travelling to the meta server, where a
+/// re-pointed key would decode into the right shape with the wrong contents.
+///
+/// THE FIRST RATIO IS NOT PUBLISHED AT ALL, DELIBERATELY. Its two halves are in different units
+/// here: `logical_bytes_written` is uncompressed and every live figure this crate maintains is
+/// COMPRESSED stored bytes, so the quotient multiplies the real figure by the compression factor
+/// -- 7.314x on the corpus below, which rewrote nothing. `lifetime_write_amplification_ppm` answers
+/// the question that ratio is asked for, with stored bytes on both sides, and reads 1.000x here.
+/// Matching the units the other way needs an uncompressed size on the object record, which costs
+/// 4-8 B per object. Both figures are printed below so the difference is a number.
+///
+/// `the_published_amplification_ratios_are_the_ratio_they_name` asserts the implementation matches
+/// each name's own arithmetic: it pins self-consistency, not agreement with the definition the
+/// name was taken from, and it passed throughout the period the name was wrong.
+///
+/// rust-internal: measures this crate's own counters, no product behaviour
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib the_amplification_set_in_the_published_format -- --ignored --nocapture
+#[test]
+#[cfg(feature = "alloc-probe")]
+#[ignore = "seeds a store and weighs it; run by name"]
+fn the_amplification_set_in_the_published_format() {
+    use crate::types::{Command, ExecuteRequest};
+    const KEYS: usize = 2_000;
+    const VALUE: usize = 256;
+
+    let ppm = |numerator: u64, denominator: u64| -> u64 {
+        if denominator == 0 {
+            0
+        } else {
+            numerator.saturating_mul(1_000_000) / denominator
+        }
+    };
+    let as_x = |parts: u64| parts as f64 / 1_000_000.0;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine(dir.path());
+
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("amp-{index:06}"),
+                value: vec![b'v'; VALUE],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    // READ EVERY KEY BACK BEFORE MEASURING THE MEMORY SIDE. The page cache populates on READS,
+    // not on writes, so a payload resident figure taken after a write-only workload is zero -- and
+    // a zero numerator makes the quadrant vacuous rather than small. The symmetry assertion below
+    // is what caught that: the first version of this arm reported 0 ppm for payload memory and
+    // said so.
+    //
+    // This also makes the memory figure the right KIND of number: cache residency is a function of
+    // what has been read, so the honest denominator pairing is "bytes held to serve the live set
+    // after the live set has been served".
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet { key: format!("amp-{index:06}") },
+        });
+        assert!(response.status.ok, "read {index}: {:?}", response.status);
+    }
+
+    let store = engine.block_store.stats();
+    let slabs = engine.block_store.slab_summary();
+    let log = engine.index_log_store.stats(1);
+    let reported = engine.shard_stats(1).expect("a loaded shard reports stats");
+    let published = reported.storage.clone();
+    // THE PAYLOAD'S RESIDENT SIDE IS THE PAGE CACHE, and this is the figure the server itself
+    // reports for it -- the same term `ControlStats::load_memory_bytes` sums beside the index's.
+    // Taken from the report rather than re-measured here, so this arm and the server agree by
+    // construction instead of by coincidence.
+    let payload_resident = reported.cache.memory_bytes as u64;
+
+    // The logical payload the workload asked for, which is the denominator the format uses for the
+    // store's own spend. Taken from the counter rather than from KEYS * VALUE, so a change in what
+    // a write logically costs is visible here rather than hidden by arithmetic that assumes it.
+    let logical_written = store.logical_bytes_written;
+    let physical_written = store.bytes_written;
+    let physical_resident = slabs.total_known_physical_bytes;
+    let live = slabs.live_physical_bytes;
+
+    // THE INDEX'S LOGICAL SIZE is its encoded image: that is what the log exists to reproduce, so
+    // it is the denominator for both of the index's ratios.
+    let index_image = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        crate::engine::encode_index_bytes(shard).len() as u64
+    };
+    // WHAT THE INDEX OCCUPIES ON DISK, by stat rather than by model: the image file plus the
+    // index log that has accumulated since it was written. The log is not a copy of the image --
+    // it is the delta ahead of it -- and it is real occupancy. Measured the same way the payload's
+    // disk figure is, where `total_known_physical_bytes` is the slab files and not a sum of record
+    // widths.
+    // THE INDEX'S OWN BYTES, AND NOT THE DIRECTORY'S. The engine is handed one directory for its
+    // indexes and keeps the WAL under it, so summing the directory counts a different subsystem:
+    // the first version of this measured (index + WAL + index logs) and reported 5.084x, which is
+    // the numerator-over-the-wrong-population error these arms exist to catch. `wals/` has its own
+    // amplification and is reported separately rather than folded in.
+    let (index_physical_disk, wal_physical_disk, index_files) = {
+        fn walk(path: &std::path::Path, prefix: &str, out: &mut Vec<(String, u64)>) {
+            let Ok(entries) = std::fs::read_dir(path) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let rel = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => walk(&entry.path(), &rel, out),
+                    Ok(_) => {
+                        let len = entry.metadata().map(|meta| meta.len()).unwrap_or(0);
+                        out.push((rel, len));
+                    }
+                    Err(_) => {}
+                }
+            }
+        }
+        let mut files = Vec::new();
+        walk(&dir.path().join("indexes"), "", &mut files);
+        let is_wal = |rel: &str| rel == "wals" || rel.starts_with("wals/");
+        let index_bytes: u64 = files.iter().filter(|(r, _)| !is_wal(r)).map(|(_, l)| *l).sum();
+        let wal_bytes: u64 = files.iter().filter(|(r, _)| is_wal(r)).map(|(_, l)| *l).sum();
+        (index_bytes, wal_bytes, files)
+    };
+    let index_resident = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        deep_heap_bytes(shard)
+    };
+
+    println!();
+    println!("  {KEYS} keys x {VALUE} B, one shard");
+    println!("    logical written   {logical_written:>12} B");
+    println!("    physical written  {physical_written:>12} B");
+    println!("    physical resident {physical_resident:>12} B");
+    println!("    live              {live:>12} B");
+    println!("    payload resident  {payload_resident:>12} B   (the page cache)");
+    println!("    index image       {index_image:>12} B");
+    println!("    index resident    {index_resident:>12} B");
+    println!("    index log written {:>12} B", log.bytes_written);
+    println!("    index on disk     {index_physical_disk:>12} B   (the index's own files)");
+    println!("    wal on disk       {wal_physical_disk:>12} B   (under the same directory, NOT the index)");
+    // EVERY FILE, RECURSIVELY, because the first version of this printed only the top level and
+    // showed three entries totalling 8,250 B against a 367,680 B figure -- the two subdirectories
+    // reported their inode size and their contents were invisible. A breakdown that does not
+    // account for the total it sits under is what let a WAL into an index numerator.
+    {
+        let mut rows = index_files.clone();
+        rows.sort_by(|a, b| b.1.cmp(&a.1));
+        for (name, len) in rows.iter().take(10) {
+            println!("        {len:>12} B  {name}");
+        }
+        if rows.len() > 10 {
+            println!("        .. and {} more file(s)", rows.len() - 10);
+        }
+    }
+    println!();
+    println!("  PAYLOAD");
+    let payload_logical_write = ppm(logical_written, live);
+    let payload_storage_write = ppm(physical_written, logical_written);
+    let payload_space = ppm(physical_resident, live);
+    let payload_space_memory = ppm(payload_resident, live);
+    println!("    logical_write_amplification_ppm  {payload_logical_write:>9}  ({:.3}x)   logical written / live", as_x(payload_logical_write));
+    println!("    storage_write_amplification_ppm  {payload_storage_write:>9}  ({:.3}x)   physical written / logical written", as_x(payload_storage_write));
+    println!("    space_amplification_ppm (disk)   {payload_space:>9}  ({:.3}x)   slab bytes / live", as_x(payload_space));
+    println!("    space_amplification_ppm (memory) {payload_space_memory:>9}  ({:.3}x)   cache resident / live", as_x(payload_space_memory));
+    // AGAINST LOGICAL TOO, because the `live` denominator the format prescribes carries the same
+    // compression conflation the logical-write ratio does: `live` is counted on disk AFTER
+    // compression and the cache holds pages UNCOMPRESSED, so the headline figure multiplies the
+    // cache's own overhead by the compression factor. Both are printed; the first is the format's.
+    let payload_cache_over_logical = ppm(payload_resident, logical_written);
+    println!(
+        "      .. and {:>9} ppm ({:.3}x) against LOGICAL written, which is the cache's own",
+        payload_cache_over_logical,
+        as_x(payload_cache_over_logical)
+    );
+    println!("         overhead with the compression factor divided out");
+    println!();
+    println!("  INDEX LOG");
+    let index_storage_write = ppm(log.bytes_written, index_image);
+    // NOT `ppm(index_image, index_image)`, which this was: the image over itself is 1_000_000
+    // for every store, corpus and workload, and it satisfied the non-zero quadrant check the way a
+    // tautology satisfies anything. The index's occupancy is the directory; the image is what is
+    // live in it.
+    let index_space_disk = ppm(index_physical_disk, index_image);
+    let index_space_memory = ppm(index_resident, index_image);
+    println!("    storage_write_amplification_ppm  {index_storage_write:>9}  ({:.3}x)   log written / index image", as_x(index_storage_write));
+    println!("    space_amplification_ppm (disk)   {index_space_disk:>9}  ({:.3}x)   index on disk / index image", as_x(index_space_disk));
+    // WHY THIS LANDS WITHIN A THOUSANDTH OF THE STORAGE_WRITE RATIO ABOVE, and why that is a
+    // cross-check rather than one being derived from the other. THERE IS NO INDEX IMAGE FILE ON
+    // DISK until a dump writes one: the breakdown above lists only index logs and a routing-range
+    // json. So the index's on-disk bytes ARE the log, and the two ratios approach the same number
+    // from independent sources -- the log's own `bytes_written` counter on one side, the
+    // filesystem on the other. They agreeing is evidence both are right; they would DIVERGE after
+    // a dump, when an image file exists and the log is reclaimed behind it.
+    //
+    // Said here because two figures agreeing to three decimals is exactly what invites a reader to
+    // assume one is a restatement of the other, which is the error the whole set guards against.
+    println!(
+        "      .. the two agree because the index has no image FILE yet: {} B of log files against",
+        index_physical_disk
+    );
+    println!(
+        "         {} B the log counter reports written. A dump would separate them.",
+        log.bytes_written
+    );
+    println!("    space_amplification_ppm (memory) {index_space_memory:>9}  ({:.3}x)   index resident / index image", as_x(index_space_memory));
+    println!();
+    println!("  WHAT THIS ENGINE PUBLISHES, beside the same quantity computed the defined way:");
+    println!(
+        "    logical_write_amplification_ppm (frozen) {:>9}  ({:.3}x)",
+        published.logical_write_amplification_ppm,
+        as_x(published.logical_write_amplification_ppm)
+    );
+    println!(
+        "    storage_write_amplification_ppm          {:>9}  ({:.3}x)   agrees: {}",
+        published.storage_write_amplification_ppm,
+        as_x(published.storage_write_amplification_ppm),
+        published.storage_write_amplification_ppm == payload_storage_write
+    );
+    println!(
+        "    lifetime_write_amplification_ppm             {:>9}  ({:.3}x)   written / live",
+        published.lifetime_write_amplification_ppm,
+        as_x(published.lifetime_write_amplification_ppm)
+    );
+    println!(
+        "    space_amplification_ppm                  {:>9}  ({:.3}x)   agrees: {}",
+        published.space_amplification_ppm,
+        as_x(published.space_amplification_ppm),
+        published.space_amplification_ppm == payload_space
+    );
+    println!(
+        "      the MIXED-UNIT logical_write would be {payload_logical_write} ppm ({:.3}x) -- \
+         uncompressed",
+        as_x(payload_logical_write)
+    );
+    println!("      bytes written over COMPRESSED bytes live, which is why it is not published");
+
+    // --- DENOMINATORS FIRST, so no identity below can be satisfied by 0 == 0.
+    assert!(logical_written > 0, "nothing logical was written, so every payload ratio is vacuous");
+    assert!(live > 0, "nothing is live, so the two live-denominated ratios are vacuous");
+    assert!(index_image > 0, "the index encoded to nothing, so both index ratios are vacuous");
+
+    // THE SET IS SYMMETRIC: both subsystems report both media. It was not -- the payload had one
+    // space figure and the index log had two -- and an asymmetric set invites the reader to assume
+    // the missing half is the same as the one that is shown. Asserted rather than left to the
+    // printout, because a figure can go missing again and a printout does not fail.
+    let quadrants = [
+        ("payload space (disk)", payload_space),
+        ("payload space (memory)", payload_space_memory),
+        ("index space (disk)", index_space_disk),
+        ("index space (memory)", index_space_memory),
+    ];
+    // THE DEFECT THIS ARM CARRIED FOR TWO MERGES, GUARDED. `index_space_disk` was
+    // `ppm(index_image, index_image)` -- a ratio whose two sides are the same expression. No range
+    // check catches that, no non-zero check catches it, and no self-consistency identity catches
+    // it: all three pass on a tautology. What catches it is requiring the two sides to be
+    // DIFFERENT quantities, and the index gives a reason they must be -- the directory holds the
+    // image AND the log that is ahead of it, so on disk must exceed the image.
+    assert!(
+        index_physical_disk > index_image,
+        "the index's own files are {index_physical_disk} B against a {index_image} B image. They \
+         hold the image AND the log ahead of it, so they must exceed it -- if these are equal, the \
+         disk figure has become the image under another name and the ratio is a constant again"
+    );
+    // AND THE WAL IS NOT IN THE NUMERATOR. The engine keeps `wals/` under the directory it is
+    // handed for indexes, so summing the directory counts a different subsystem. The first version
+    // of this arm did exactly that and reported 5.084x.
+    assert!(
+        index_files.iter().all(|(rel, _)| rel != "wals" && !rel.starts_with("wals/"))
+            || wal_physical_disk > 0,
+        "the file walk found no WAL bytes under the index directory. Either the layout moved, in \
+         which case the exclusion below is now filtering nothing, or the walk stopped recursing -- \
+         and a breakdown that cannot see the WAL is how it got into this numerator the first time"
+    );
+
+    for (what, value) in quadrants {
+        assert!(
+            value > 0,
+            "{what} reports 0 ppm, so one quadrant of the set is missing or its denominator is \
+             zero -- the whole point of reporting four is that none of them is assumed from \
+             another"
+        );
+    }
+
+    assert_eq!(
+        published.space_amplification_ppm, payload_space,
+        "the published space ratio no longer matches the defined one (physical resident over \
+         live). That ratio has always agreed, so this is a regression."
+    );
+
+    // --- THE MISMATCH THIS ARM RECORDED IS FIXED, AND THIS IS WHAT REPLACED THE RECORD OF IT.
+    // --- Until the correction, the only published write ratio was `logical_write_amplification_ppm`
+    // --- carrying physical-over-logical, and this arm asserted that mismatch so it could not be
+    // --- fixed silently. The quantity now has a field whose NAME describes it, and the assertion
+    // --- is agreement rather than disagreement.
+    assert_eq!(
+        published.storage_write_amplification_ppm, payload_storage_write,
+        "`storage_write_amplification_ppm` must equal the DEFINED storage-write ratio \
+         ({payload_storage_write} ppm, physical written over logical written) and published {} \
+         instead.",
+        published.storage_write_amplification_ppm
+    );
+    // AND THE OLD NAME'S VALUE IS FROZEN. It is a serde key that travels to the meta server, so a
+    // consumer reading it must keep getting the quantity it has always got. If this fails, the
+    // field was re-pointed and every such reader silently changed meaning.
+    assert_eq!(
+        published.logical_write_amplification_ppm, payload_storage_write,
+        "`logical_write_amplification_ppm` is misnamed and its VALUE is deliberately frozen at the \
+         storage-write ratio ({payload_storage_write} ppm) because the name is a wire key. It \
+         published {} instead. If this was a deliberate re-pointing, it is a breaking change to \
+         every consumer of that key and needs to be taken as one rather than landed here.",
+        published.logical_write_amplification_ppm
+    );
+    // AND THE UNIT-MATCHED RATIO IS 1.0x ON A WRITE-ONCE CORPUS. This is the assertion that
+    // distinguishes it from the ratio above: the corpus is written once and nothing is deleted, so
+    // the store holds exactly the bytes it wrote. The mixed-unit spelling reads 7.3x here.
+    assert_eq!(
+        1_000_000,
+        published.lifetime_write_amplification_ppm,
+        "every key was written once and none deleted, so written-over-live must be 1.000x and {} \
+         ppm was published. The mixed-unit ratio -- logical bytes written over COMPRESSED live \
+         bytes -- reads {payload_logical_write} ppm on this same corpus, which is the compression \
+         factor and not a rewrite; that is the reading this field exists to avoid.",
+        published.lifetime_write_amplification_ppm
+    );
+    assert_ne!(
+        published.lifetime_write_amplification_ppm, payload_logical_write,
+        "the unit-matched write ratio and the mixed-unit one came out equal, so this corpus cannot \
+         tell them apart and the distinction the field rests on is untested here. It needs a \
+         corpus whose compression factor is not 1."
+    );
+}
+
+/// WHAT PERSISTING THE EVENT AND INDEX SERIES COSTS THE STORED INDEX.
+///
+/// `context_events` and `context_indexes` were `#[serde(skip)]` -- no stored image at all -- until
+/// their series moved into the serialized `objects` at stamp 20. They are durable now, as every
+/// other context kind already was, and the cost of that is what this arm reports.
+///
+/// MEASURED BY DIFFERENCE ON ONE STORE, which is the whole method. The same shard is encoded with
+/// the two kinds present and again with them dropped, so the container header, the codec, zstd and
+/// every other map are byte-identical on both sides and cancel out. Encoding a second time costs
+/// nothing here, and a figure taken from two separate builds would have been confounded by any
+/// difference in what the fixture happened to write.
+#[test]
+fn what_persisting_the_event_and_index_series_costs_the_stored_index() {
+    use crate::engine::storage_bucket_internals::StoredModelKind;
+    use crate::types::{Command, ContextEvent, ContextExtractedEventIndexes, ExecuteRequest};
+
+    const EVENTS: u64 = 2_000;
+    const T0: u64 = 1_787_270_070_000;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    // INLINED RATHER THAN BORROWED. `probe_engine_on` is gated on `alloc-probe` because its
+    // callers weigh allocations; this arm weighs encoded bytes and carries the assertion that
+    // these two kinds are persisted at all, so it must run in the default arm.
+    let engine = std::sync::Arc::new(crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    ));
+    let loaded = engine.load_shard_with(crate::control::LoadShardRequest {
+        shard_id: 1,
+        table_name: "what-persisting-the-two-kinds-costs".to_string(),
+        shard_uri: "local://what-persisting-the-two-kinds-costs/1".to_string(),
+        start_routing_bucket: 0,
+        end_routing_bucket: crate::DEFAULT_END_ROUTING_BUCKET,
+        readonly: false,
+        load_version: 1,
+        local_node_id: Some(1),
+    });
+    assert!(loaded.status.ok, "the fixture could not load shard 1: {:?}", loaded.status);
+    for index in 0..EVENTS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextWriteExtractedEvent {
+                tenant_hash: 7,
+                node_hash: 1_000 + (index % 50),

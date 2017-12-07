@@ -107,3 +107,112 @@ impl SingleNodeMeta {
     pub(super) fn apply_delete_table(
         &self,
         request: DeleteTableRequest,
+        at_ms: u64,
+    ) -> AckResponse {
+        if request.namespace.is_empty() || request.table_name.is_empty() {
+            return AckResponse {
+                status: Status::error("bad_request", "namespace and table_name are required"),
+            };
+        }
+        let mut state = self.inner.write().expect("meta lock poisoned");
+        let key = table_key(&request.namespace, &request.table_name);
+        let Some(current_state) = state.tables.get(&key).map(|table| table.info.state) else {
+            return AckResponse {
+                status: Status::error("table_not_found", "table not found"),
+            };
+        };
+        if current_state == MetaEntityState::Dropped {
+            return AckResponse {
+                status: Status::error("table_not_found", "table already dropped"),
+            };
+        }
+        let topology_version = record_topology_event(
+            &mut state,
+            "delete_table",
+            format!("table:{}/{}", request.namespace, request.table_name),
+            "state=dropped",
+        );
+        let table = state
+            .tables
+            .get_mut(&key)
+            .expect("table exists after state check");
+        table.info.state = MetaEntityState::Dropped;
+        table.info.topology_version = topology_version;
+        // Servers and proxies are dropped through `apply_set_*_state`, which
+        // stamps for them. Tables have their own path, and without the stamp a
+        // dropped table has no drop time -- so retention, which treats a missing
+        // time as "predates this feature, leave alone", never collects one.
+        stamp_dropped_since(
+            &mut state,
+            &dropped_key("table", &key),
+            MetaEntityState::Dropped,
+            at_ms,
+        );
+        AckResponse {
+            status: Status::ok(),
+        }
+    }
+
+    pub fn freeze_table(&self, request: DeleteTableRequest) -> AckResponse {
+        if let Some(status) = self.meta_change_refusal() {
+            return AckResponse { status };
+        }
+        let at_ms = self.record_mutation(MetaMutation::FreezeTable(request.clone()));
+        self.apply_set_table_state(request, MetaEntityState::Frozen, at_ms)
+    }
+
+    pub fn unfreeze_table(&self, request: DeleteTableRequest) -> AckResponse {
+        if let Some(status) = self.meta_change_refusal() {
+            return AckResponse { status };
+        }
+        let at_ms = self.record_mutation(MetaMutation::UnfreezeTable(request.clone()));
+        self.apply_set_table_state(request, MetaEntityState::Normal, at_ms)
+    }
+
+    pub fn update_table(&self, request: UpdateTableRequest) -> AckResponse {
+        if let Some(status) = self.meta_change_refusal() {
+            return AckResponse { status };
+        }
+        self.record_mutation(MetaMutation::UpdateTable(request.clone()));
+        self.apply_update_table(request)
+    }
+
+    pub(super) fn apply_update_table(&self, request: UpdateTableRequest) -> AckResponse {
+        if request.namespace.is_empty() || request.table_name.is_empty() {
+            return AckResponse {
+                status: Status::error("bad_request", "namespace and table_name are required"),
+            };
+        }
+        if request.shard_count.is_none()
+            && request.replica_count.is_none()
+            && request.first_shard_id.is_none()
+            && request.partition_version.is_none()
+            && request.serving_options.is_none()
+        {
+            return AckResponse {
+                status: Status::error("bad_request", "at least one table option is required"),
+            };
+        }
+
+        let mut state = self.inner.write().expect("meta lock poisoned");
+        let key = table_key(&request.namespace, &request.table_name);
+        let Some(existing) = state.tables.get(&key).map(|table| table.info.clone()) else {
+            return AckResponse {
+                status: Status::error("table_not_found", "table not found"),
+            };
+        };
+        if existing.state == MetaEntityState::Dropped {
+            return AckResponse {
+                status: Status::error("table_not_found", "table is dropped"),
+            };
+        }
+        if existing.state == MetaEntityState::Frozen {
+            return AckResponse {
+                status: Status::error("resource_frozen", "table is frozen"),
+            };
+        }
+        if matches!(request.shard_count, Some(0)) {
+            return AckResponse {
+                status: Status::error("bad_request", "shard_count must be > 0"),
+            };
+        }
