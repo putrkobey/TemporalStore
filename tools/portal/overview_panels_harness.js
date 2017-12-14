@@ -34,3 +34,76 @@ const OVERVIEW = {
     bounds_a_slow_call: "transport_request_timeout_ms",
     worst_case_single_call_ms: 60000, deadline_can_be_overrun_by_ms: 0
   } : {
+    available: true, deadline_ms: 5000, deadline_is_cooperative: true,
+    transport_request_timeout_ms: 60000, transport_io_timeout_ms: 60000,
+    bounds_a_slow_call: "transport_request_timeout_ms",
+    worst_case_single_call_ms: 60000, deadline_can_be_overrun_by_ms: 55000
+  },
+  config: {
+    skills: {
+      budgets: {
+        available: true,
+        context_budget_tokens: 500000,
+        skills: { percent: 10, asked_percent: 10, guard_percent: 50, tokens: 50000,
+                  ceiling_tokens: 262144, by_percentage_tokens: 50000,
+                  bound_by: "percentage" },
+        resources: { percent: 25, asked_percent: 40, guard_percent: 50, tokens: 125000,
+                     ceiling_tokens: 262144, by_percentage_tokens: 125000,
+                     bound_by: "share_guard" },
+        paths: [
+          { path: "api", label: "API callers", context_budget_tokens: 500000,
+            variable: "MATRIXARK_DEFAULT_MAX_CONTEXT_TOKENS",
+            sections: { skills: 50000, resources: 125000 } },
+          { path: "agent_hooks", label: "Agent hooks", context_budget_tokens: HOOK_BUDGET,
+            variable: "MATRIXARK_HOOK_MAX_CONTEXT_TOKENS",
+            sections: { skills: HOOK_BUDGET / 10, resources: HOOK_BUDGET / 4 } }
+        ],
+        paths_differ: mode !== "aligned"
+      }
+    }
+  }
+};
+
+const els = new Map();
+function makeEl(id) {
+  return {
+    id: id || "", hidden: false, textContent: "",
+    value: id === "key" ? "k-admin" : "", checked: true, className: "",
+    style: {}, dataset: {}, files: [], options: [], children: [], _html: "",
+    get innerHTML() { return this._html; },
+    set innerHTML(v) { this._html = String(v); },
+    addEventListener() {}, removeEventListener() {}, appendChild() {}, removeChild() {},
+    setAttribute() {}, getAttribute() { return null; }, closest() { return null; },
+    querySelector() { return null; }, querySelectorAll() { return []; },
+    scrollIntoView() {}, focus() {}, click() {},
+    classList: { add() {}, remove() {}, toggle() {} }
+  };
+}
+function el(id) {
+  if (!els.has(id)) { els.set(id, makeEl(id)); }
+  return els.get(id);
+}
+
+let overviewCalls = 0;
+
+const win = {
+  document: {
+    getElementById: (id) => el(id),
+    querySelector: () => makeEl(), querySelectorAll: () => [],
+    createElement: () => makeEl(), addEventListener() {}, body: makeEl(), hidden: false
+  },
+  addEventListener() {},
+  location: { origin: "http://localhost", href: "http://localhost", reload() {} },
+  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  navigator: {},
+  setTimeout: () => 0, setInterval: () => 0, clearInterval() {},
+  Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
+  TextDecoder: function () { this.decode = (v) => Buffer.from(v || []).toString("utf8"); },
+  AbortController: function () { this.abort = () => {}; this.signal = {}; },
+  FileReader: function () {}, Blob: function () {},
+  URL: { createObjectURL: () => "", revokeObjectURL() {} },
+  fetch: (url) => {
+    const u = String(url);
+    if (u.indexOf("/v1/admin/overview") >= 0) {

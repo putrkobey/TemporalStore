@@ -32,37 +32,3 @@ impl AwsCliObjectStore {
 
     fn full_key(&self, key: &str) -> String {
         if self.prefix.is_empty() {
-            key.to_string()
-        } else {
-            format!("{}/{}", self.prefix, key)
-        }
-    }
-
-    fn s3_uri(&self, key: &str) -> String {
-        format!("s3://{}/{}", self.bucket, self.full_key(key))
-    }
-
-    fn run_aws(&self, args: &[&str]) -> Result<String, ObjectStoreError> {
-        let output = Command::new("aws")
-            .args(args)
-            .output()
-            .map_err(ObjectStoreError::Io)?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).to_string())
-        } else {
-            Err(ObjectStoreError::InvalidKey(format!(
-                "aws {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&output.stderr)
-            )))
-        }
-    }
-}
-
-#[async_trait]
-impl ObjectStore for AwsCliObjectStore {
-    async fn put(&self, key: &str, bytes: Bytes) -> Result<(), ObjectStoreError> {
-        let mut tmp = NamedTempFile::new().map_err(ObjectStoreError::Io)?;
-        std::io::Write::write_all(&mut tmp, &bytes).map_err(ObjectStoreError::Io)?;
-        let path = tmp.path().to_string_lossy().to_string();
-        self.run_aws(&["s3", "cp", &path, &self.s3_uri(key)])?;

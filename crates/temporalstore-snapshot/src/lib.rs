@@ -5,11 +5,3 @@
 
 #[path = "snapshot_metrics.rs"]
 pub mod metrics;
-pub mod object_store;
-pub mod snapshot_store;
-#[path = "snapshot_manifest_types.rs"]
-pub mod types;
-
-pub use metrics::SnapshotMetrics;
-pub use object_store::{FileObjectStore, ObjectStore, ObjectStoreError};
-pub use snapshot_store::{S3SnapshotStore, SnapshotStore, SnapshotStoreError};
