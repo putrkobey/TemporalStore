@@ -34,3 +34,22 @@ pub fn release_free_heap_to_os() -> bool {
 /// operator who measures that as expensive on their heap should not need a build to stop it.
 fn trim_enabled() -> bool {
     !matches!(
+        std::env::var("TS_MALLOC_TRIM")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn trim() -> bool {
+    extern "C" {
+        /// glibc: release free heap above `pad` back to the OS. Non-zero if it freed any.
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // Safe: no arguments derived from Rust memory, no pointers handed over, and the allocator's own
+    // bookkeeping is what it walks. It cannot invalidate a live allocation -- only unused pages go
+    // back.
+    unsafe { malloc_trim(0) != 0 }
