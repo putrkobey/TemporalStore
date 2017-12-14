@@ -625,3 +625,317 @@ fn the_routing_range_field_changes_no_serialized_byte() {
     assert_eq!(
         stamped_bytes, unstamped_bytes,
         "stamping the routing range changed the serialized index. The field is supposed to be \
+         `#[serde(skip)]`; if it is now written, an index written by an older build no longer \
+         reads the same and this is a stored-format change."
+    );
+
+    let decoded = crate::engine::decode_index_bytes(&stamped_bytes)
+        .expect("the index this test just serialized decodes");
+    assert!(
+        !decoded.routing_range_known,
+        "a decoded index came back claiming to know a routing range; the field cannot have been \
+         skipped on the way out"
+    );
+    assert_eq!(
+        (0, WIDE_END),
+        decoded.routing_range(),
+        "a decoded index must answer the WHOLE range until the engine stamps it, which is what \
+         an index written before this change already did"
+    );
+    assert_eq!(
+        crate::engine::SHARD_INDEX_FORMAT_VERSION,
+        decoded.index_format_version,
+        "the on-disk format version this index decodes as is not the one this build writes, which \
+         says this change is a format change after all"
+    );
+    let decoded_unstamped = crate::engine::decode_index_bytes(&unstamped_bytes)
+        .expect("the unstamped index decodes too");
+    assert_eq!(
+        decoded.index_format_version, decoded_unstamped.index_format_version,
+        "the two arms decode as different on-disk versions"
+    );
+}
+
+// =============================================================================================
+// 6. THE CROSS-RANGE RESTORE, DRIVEN IN BOTH DIRECTIONS
+// =============================================================================================
+
+/// WRITE ON ONE RANGE, READ ON THE OTHER, BOTH WAYS.
+///
+/// mx#1945 found its refutation this way and it cost a record; mx#1949 re-drove it because a
+/// change that touches filing is silent when it loses something. This one moves where an unrouted
+/// page is filed, which is the same neighbourhood, so it is driven again: every record readable,
+/// every page present, and the buckets counted against the READING shard's range in each
+/// direction.
+///
+/// The second direction is the one with something to lose -- a store written on the whole range
+/// and read on `0..1023` has every whole-range bucket outside the reading range.
+/// AND IT IS NOW A REFUSAL -- the cross-range reopen this test drove is no longer reachable.
+///
+/// What this test established is not deleted, it is INVERTED, the same way
+/// `the_two_sites_that_file_a_block_now_file_it_under_the_shards_own_range` inverted mx#1949's
+/// measurement rather than removing it. It showed that a store written on one range reads back
+/// whole on the other -- true, and the reason the hazard was silent: every record read while every
+/// page sat in a bucket the reopened shard did not hold. `routing_range_stamp.rs` records the range
+/// a store was built under and the load REFUSES when the configured range disagrees.
+///
+/// REPLACED, NOT RETARGETED. Deleting the stamp to keep the old assertions passing would put both
+/// arms on the pre-stamp ADOPTION path, which honours the range the store was BUILT on -- so each
+/// arm would read on the range it wrote on while the name still said "on the other". A test that
+/// quietly starts measuring a different population is worse than a red one.
+///
+/// The `routing_range()` assertion this test carried -- that a reloaded shard carries the range it
+/// was LOADED with rather than the one it was written with -- is kept, over the arm where the load
+/// is now allowed.
+#[test]
+fn a_store_written_on_one_range_is_refused_on_the_other() {
+    for (write_end, read_end) in [(NARROW_END, WIDE_END), (WIDE_END, NARROW_END)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let keys = {
+            let engine = engine_on(dir.path());
+            load_on(&engine, write_end);
+            let keys = seed(&engine, RECORDS);
+            assert_eq!(RECORDS, read_back(&engine, &keys), "the write arm cannot read its own store");
+            engine.unload_shard(1);
+            keys
+        };
+        let engine = engine_on(dir.path());
+        let status = engine
+            .load_shard_with(crate::control::LoadShardRequest {
+                shard_id: 1,
+                table_name: "shard-carried-range".to_string(),
+                shard_uri: "local://shard-carried-range/1".to_string(),
+                start_routing_bucket: 0,
+                end_routing_bucket: read_end,
+                readonly: false,
+                load_version: 1,
+                local_node_id: Some(1),
+            })
+            .status;
+        println!(
+            "  wrote on 0..{write_end}, opened on 0..{read_end}: ok={} code={}",
+            status.ok, status.code
+        );
+        assert!(
+            !status.ok,
+            "wrote on 0..{write_end} and opened on 0..{read_end}: the load succeeded, so a \
+             populated store can still be opened on a range none of its pages are filed under"
+        );
+        assert_eq!(
+            "routing_range_mismatch", status.code,
+            "the load was refused with code `{}` rather than `routing_range_mismatch`",
+            status.code
+        );
+
+        // THE ARM WHERE THE LOAD IS ALLOWED, carrying every assertion that is still reachable.
+        load_on(&engine, write_end);
+        let recovered = read_back(&engine, &keys);
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 is loaded");
+        let contents = bucket_contents(shard);
+        let outside = buckets_outside(&contents, 0, write_end);
+        println!(
+            "  reopened on 0..{write_end}: {recovered}/{RECORDS} records, {} pages, {outside} \
+             buckets outside the range, stamp {:?}",
+            block_total(&contents),
+            shard.routing_range()
+        );
+        assert_eq!(
+            RECORDS, recovered,
+            "reopened on 0..{write_end}: {recovered} of {RECORDS} records came back"
+        );
+        assert!(
+            block_total(&contents) >= RECORDS,
+            "reopened on 0..{write_end}: {} pages for {RECORDS} records",
+            block_total(&contents)
+        );
+        assert_eq!(
+            0, outside,
+            "reopened on the range it was written on, {outside} buckets sit above the shard's end"
+        );
+        assert_eq!(
+            (0, write_end),
+            shard.routing_range(),
+            "the reloaded shard carries {:?} rather than the range it was loaded with",
+            shard.routing_range()
+        );
+    }
+}
+
+// =============================================================================================
+// 6b. THE MANIFEST INSTALL, WHICH SWAPS A WHOLE SHARD OUT FROM UNDER ITSELF
+// =============================================================================================
+
+/// A CROSS-RANGE MANIFEST INSTALL LEAVES THE TARGET CARRYING THE TARGET'S OWN RANGE.
+///
+/// THIS TEST EXISTS BECAUSE A MUTANT WAS KILLED BY A GUARD ALONE. Making the manifest install
+/// insert its restored state directly instead of through `install_shard_state` was caught only by
+/// `every_shard_the_engine_installs_carries_its_routing_range`, which reads the SHAPE of the call
+/// -- weaker evidence than a test that reads the answer. This reads the answer.
+///
+/// It is also the path with the most to lose. mx#1945 narrowed this install's REBUILD and dropped
+/// 0 of 400 pages; that rebuild still runs on the whole range and is untouched here. What the
+/// stamp decides is only where the NEXT write files a page. Both are asserted: every page still
+/// present, every record still readable, AND the target carrying `0..1023` rather than the range
+/// the image was written on.
+///
+/// rust-internal: drives the engine's own manifest install, no product behaviour
+#[test]
+fn a_manifest_installed_across_ranges_leaves_the_target_carrying_its_own_range() {
+    let source_dir = tempfile::tempdir().expect("tempdir");
+    let source = engine_on(source_dir.path());
+    load_on(&source, WIDE_END);
+    let keys = seed(&source, RECORDS);
+
+    let buckets: Vec<u32> = {
+        let shards = source.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1");
+        assert_eq!(
+            (0, WIDE_END),
+            shard.routing_range(),
+            "the SOURCE is not on the whole range, so this is not a cross-range install"
+        );
+        shard.bucket_index.bucket_map.keys().copied().collect()
+    };
+    assert!(!buckets.is_empty(), "the source holds no bucket to dump");
+    let manifest = source
+        .create_bucket_dump_manifest(1, buckets)
+        .expect("the source can dump its own buckets");
+
+    let target_dir = tempfile::tempdir().expect("tempdir");
+    let target = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        target_dir.path().join("cache"),
+        // The pages live where the source wrote them; only the index is restored.
+        source_dir.path().join("blocks"),
+        target_dir.path().join("indexes"),
+    );
+    load_on(&target, NARROW_END);
+    target
+        .install_bucket_dump_manifest(&manifest)
+        .expect("the manifest installs on the narrower shard");
+
+    let readable = read_back(&target, &keys);
+    let shards = target.shards.read().expect("shards lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 is loaded");
+    let contents = bucket_contents(shard);
+    println!(
+        "  installed a 0..{WIDE_END} image on a 0..{NARROW_END} shard: {readable}/{RECORDS} \
+         records, {} pages, stamp {:?}",
+        block_total(&contents),
+        shard.routing_range()
+    );
+    assert_eq!(
+        RECORDS, readable,
+        "{readable} of {RECORDS} records were readable after a cross-range manifest install -- \
+         the failure mx#1945 caught when it first narrowed this install's range"
+    );
+    assert!(
+        block_total(&contents) >= RECORDS,
+        "{} pages for {RECORDS} records after the install",
+        block_total(&contents)
+    );
+    assert_eq!(
+        (0, NARROW_END),
+        shard.routing_range(),
+        "the target came out of a manifest install carrying the IMAGE's range rather than its \
+         own, so the next unrouted page it files goes into a bucket it does not hold"
+    );
+}
+
+// =============================================================================================
+// 7. THE GUARD: there is one way in, and it stamps
+// =============================================================================================
+
+/// EVERY SHARD THE ENGINE INSTALLS CARRIES ITS ROUTING RANGE, HELD AS A LIST OF INSTALL SITES.
+///
+/// The unstamped default is the whole range, which is the OLD behaviour -- so an install site that
+/// forgot to stamp would not fail anything, it would simply keep the defect on that path. What
+/// makes that unreachable is that there is exactly ONE function which puts a `ShardState` into the
+/// served map, and it stamps. This holds that shape as an equality-compared list, with vacuity
+/// floors first and a CONTROL on the matcher itself.
+///
+/// rust-internal: reads this crate's own call sites, no product behaviour
+#[test]
+fn every_shard_the_engine_installs_carries_its_routing_range() {
+    use std::path::Path;
+
+    /// The production sites that insert a `ShardState` into the engine's served shard map.
+    const INSTALL_SITES: &[&str] = &["engine.rs :: install_shard_state"];
+
+    // THE MATCHER'S OWN CONTROL, before it is pointed at the tree. It must fire on both shapes an
+    // install can take, and stay SILENT on an insert into a field OF a shard, which is the shape
+    // that appears dozens of times on the write path.
+    let control_lines: Vec<&str> = vec![
+        "fn chain_form(&self) {",
+        "    self.shards",
+        "        .write()",
+        "        .expect(\"engine lock poisoned\")",
+        "        .insert(shard_id, state);",
+        "}",
+        "fn bound_form(&self) {",
+        "    let mut shards = self.shards.write().expect(\"engine lock poisoned\");",
+        "    shards.insert(shard_id, state);",
+        "}",
+        "fn not_an_install(&self) {",
+        "    let mut shards = self.shards.write().expect(\"engine lock poisoned\");",
+        "    let shard = shards.get_mut(&shard_id).expect(\"shard\");",
+        "    shard.strings.insert(key.clone(), durable.clone());",
+        "    shard.wal_resident_blocks.insert(object_id, placement);",
+        "}",
+    ];
+    let control_hits = shard_map_insert_sites(&control_lines);
+    assert_eq!(
+        vec!["chain_form".to_string(), "bound_form".to_string()],
+        control_hits,
+        "the matcher does not report what it is supposed to report on a planted input, so its \
+         verdict over the tree below means nothing"
+    );
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut pending = vec![root.clone()];
+    let mut files_scanned = 0usize;
+    let mut lines_scanned = 0usize;
+    let mut excluded = 0usize;
+    let mut shards_mentions = 0usize;
+    let mut sites: Vec<String> = Vec::new();
+
+    while let Some(path) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                pending.push(entry_path);
+                continue;
+            }
+            if entry_path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let display = entry_path.display().to_string();
+            if display.contains("/tests/") || display.ends_with("tests.rs") {
+                excluded += 1;
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&entry_path) else {
+                continue;
+            };
+            files_scanned += 1;
+            let lines: Vec<&str> = text.lines().collect();
+            lines_scanned += lines.len();
+            shards_mentions += lines.iter().filter(|line| line.contains("self.shards")).count();
+            let relative = display
+                .rsplit_once("/src/")
+                .map(|(_, tail)| tail.to_string())
+                .unwrap_or(display.clone());
+            for enclosing in shard_map_insert_sites(&lines) {
+                sites.push(format!("{relative} :: {enclosing}"));
+            }
+        }
+    }
+
+    // VACUITY FLOORS, BEFORE ANY VERDICT.
+    assert!(
+        files_scanned > 80,
+        "the scan read {files_scanned} production .rs files under {}; below 80 it has stopped \
