@@ -28,33 +28,3 @@ pub(crate) struct COptions {
     pub(crate) max_feature_points_per_request: c_int,
     pub(crate) max_feature_query_count: u64,
     pub(crate) max_key_bytes: u64,
-    pub(crate) max_value_bytes: u64,
-    pub(crate) pin_primary: c_int,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct CFeatureFilter {
-    pub(crate) field: *const c_char,
-    pub(crate) op: c_int,
-    pub(crate) value: u64,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct CFeaturePoint {
-    pub(crate) timestamp: u64,
-    pub(crate) value: *const c_char,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct CSequenceFeatureRow {
-    pub(crate) timestamp: u64,
-    pub(crate) gid: u64,
-    pub(crate) action_type: u32,
-    pub(crate) duration: u32,
-    pub(crate) author_id: u64,
-}
-
-#[repr(C)]

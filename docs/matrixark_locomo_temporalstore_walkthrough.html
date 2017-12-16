@@ -142,3 +142,51 @@
     <div class="step"><strong>4. Store</strong>Python memory or TemporalStore record log.</div>
     <div class="step"><strong>5. Retrieve</strong>Dense, sparse, keyword, time-decay recall.</div>
     <div class="step"><strong>6. Pack</strong>Question-type token-budgeted ContextPack.</div>
+    <div class="step"><strong>7. Judge</strong>Deterministic, OSS, or OpenAI-compatible reader/judge.</div>
+  </div>
+
+  <h2>Python Memory vs TemporalStore</h2>
+  <table>
+    <tr><th>Area</th><th>Python Memory</th><th>TemporalStore</th></tr>
+    <tr><td>Purpose</td><td>Fast dev, CI, logical debugging.</td><td>Production storage validation and benchmark parity.</td></tr>
+    <tr><td>Storage</td><td>In-process / JSONL-style records.</td><td>Native TemporalStore SDK/proxy-backed record log.</td></tr>
+    <tr><td>Data shape</td><td>MatrixArk logical records.</td><td>The same records serialized into TemporalStore hash fields.</td></tr>
+    <tr><td>Expected score</td><td>Baseline for logical retrieval behavior.</td><td>Should be on par when read/write parity is clean.</td></tr>
+  </table>
+
+  <pre><code>{storage_prefix}:record_count
+  -> total MatrixArk logical records
+
+{storage_prefix}:records:000000
+  HSET 00000000000000000000 -> JSON(context_event)
+  HSET 00000000000000000001 -> JSON(context_embedding)
+  HSET 00000000000000000002 -> JSON(context_entity)</code></pre>
+
+  <h2>Example A: Approval And Budget</h2>
+  <pre><code>Session date: 2026-06-01
+User: Alice says the GPU purchase request needs finance review.
+Assistant: Bob says the requested budget is $42,000.
+User: Alice approved the GPU purchase after finance review.
+
+Question: Who approved the GPU purchase?
+Answer: Alice.</code></pre>
+  <p>MatrixArk writes <code>ContextEvent</code> records for each turn, <code>ContextIndex</code> terms for approval/budget keywords, <code>ContextSummary</code> for the batch L0 summary, <code>ContextEmbedding</code> for event and summary scoring, and a <code>ContextSegment</code> for the coherent approval topic. Retrieval promotes the exact approval event through lexical score, dense score, node summary score, and time decay.</p>
+
+  <h2>Example B: Preference Supersession</h2>
+  <pre><code>Session date: 2026-06-03
+User: I prefer Python for dashboards.
+
+Session date: 2026-06-12
+User: Actually, I prefer Rust for low-latency storage work now.
+
+Question: What language does the user currently prefer for low-latency storage?
+Answer: Rust.</code></pre>
+  <p>MatrixArk writes old and new events, then updates a <code>ContextEntity</code> of type <code>preference</code>. The old Python preference remains replayable but becomes stale for current-state questions. The pack should include the Rust entity state first and the stale blocker only if useful.</p>
+
+  <h2>Example C: Temporal Location</h2>
+  <pre><code>Session date: 2026-03-02
+User: I moved to Seattle today.
+
+Session date: 2026-04-10
+User: I moved to Austin for the new infra project.
+
