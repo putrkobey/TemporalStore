@@ -32,37 +32,3 @@ function makeEl(id) {
     setAttribute() {}, getAttribute() { return null; }, closest() { return null; },
     querySelector() { return null; }, querySelectorAll() { return []; },
     scrollIntoView() {}, focus() {}, click() {},
-    classList: { add() {}, remove() {}, toggle() {} }
-  };
-}
-function el(id) {
-  if (!els.has(id)) { els.set(id, makeEl(id)); }
-  return els.get(id);
-}
-
-function snapshot() {
-  return {
-    status: "ok", warnings: [],
-    extraction: { provider: "deterministic" }, embedding: { provider: "deterministic" },
-    settings: {
-      status: "ok",
-      groups: { Extraction: [
-        { key: "extraction.model", kind: "str", label: "Model", help: "", value: "before",
-          env: "MATRIXARK_EXTRACTION_MODEL", applies: "live", source: "config", essential: false,
-          default: "", overridable_by: [], boot_pinned: false, pending_restart: false }
-      ] },
-      group_meta: {}, presets: [], history: [], inventory: {}, essential_keys: [],
-      config_file: "/tmp/runtime.json", pending_restart: [], unknown_stored: []
-    }
-  };
-}
-
-function reply(body) {
-  return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body),
-                           text: () => Promise.resolve(JSON.stringify(body)) });
-}
-
-const win = {
-  document: {
-    getElementById: (id) => el(id),
-    querySelector: () => makeEl(), querySelectorAll: () => [],

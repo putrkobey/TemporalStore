@@ -58,33 +58,3 @@ async fn bench_store<O: ObjectStore>(store: Arc<O>, backend: &str, sizes_mb: &[u
         // best-effort clean
         let _ = store.delete(&key).await;
 
-        // WRITE: chunked append_blob
-        let w_start = Instant::now();
-        for _ in 0..n_chunks {
-            store.append_blob(&key, chunk.clone()).await.expect("append_blob");
-        }
-        let w_elapsed = w_start.elapsed();
-        let written = (n_chunks * chunk_bytes) as f64;
-        let w_mbps = (written / (1024.0 * 1024.0)) / w_elapsed.as_secs_f64();
-        let w_p_chunk_ms = w_elapsed.as_secs_f64() * 1000.0 / n_chunks as f64;
-
-        // READ: whole-object get
-        let r_start = Instant::now();
-        let got = store.get(&key).await.expect("get");
-        let r_elapsed = r_start.elapsed();
-        let r_mbps = (got.len() as f64 / (1024.0 * 1024.0)) / r_elapsed.as_secs_f64();
-
-        let _ = store.delete(&key).await;
-        if !first {
-            println!(",");
-        }
-        first = false;
-        print!(
-            "  {{\"backend\":\"{backend}\",\"size_mb\":{size_mb},\"chunk_kb\":{chunk_kb},\"n_chunks\":{n_chunks},\
-\"write_mb_s\":{w_mbps:.1},\"write_ms_per_chunk\":{w_p_chunk_ms:.3},\"write_total_ms\":{:.1},\
-\"read_mb_s\":{r_mbps:.1},\"read_total_ms\":{:.1}}}",
-            w_elapsed.as_secs_f64() * 1000.0,
-            r_elapsed.as_secs_f64() * 1000.0
-        );
-    }
-    println!("\n]");
