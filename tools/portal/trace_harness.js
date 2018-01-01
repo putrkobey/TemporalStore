@@ -31,3 +31,20 @@ function response(status, body) {
 
 const answers = {
   "/ok": () => Promise.resolve(response(200, "{\"fine\":true}")),
+  "/refused": () => Promise.resolve(response(403, "{\"error\":\"forbidden\"}")),
+  "/gone": () => Promise.reject(new TypeError("Failed to fetch"))
+};
+
+const win = {
+  fetch: function (input, init) {
+    const url = String((input && input.url) || input || "");
+    const make = answers[url];
+    return make ? make() : Promise.resolve(response(404, "{}"));
+  }
+};
+const original = win.fetch;
+
+new Function("window", page.slice(from, to))(win);
+
+const changes = [];
+win.__matrixarkTrace.onChange(function (n) { changes.push(n); });
