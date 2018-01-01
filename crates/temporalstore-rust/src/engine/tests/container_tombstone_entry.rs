@@ -766,3 +766,259 @@ fn a_keys_last_element_still_files_its_object_id() {
          the presence of the entries that would defeat it"
     );
     assert!(
+        after_last,
+        "THE OBJECT ID WAS NOT FILED AT THE KEY'S LAST ELEMENT, so the object never reads as \
+         deleted -- and `object_manager::runtime_report` asks that index per page."
+    );
+}
+
+// THE MESSAGE ABOVE NAMED THE WRONG MECHANISM, AND SO DID THE CLAIM THIS ARM WAS GIVEN.
+//
+// ## THE MESSAGE
+//
+// It read "The retained tombstone entries answered the `any(|page| page.object_id(shard_id) == id)`
+// filter". That filter is in `mark_bucket_index_block_deleted_recording` and it already asks
+// `!page.deleted && ...`, so a tombstone cannot answer it -- the explanation accused a predicate
+// that excludes the very thing it was accused of admitting.
+//
+// WHAT ACTUALLY HELD THE ID BACK is one level up: the `retain` that decides `removed` compares the
+// element's name against the ENTRY's, and a page-named entry carries none, so for a container
+// `removed` stays false, `bucket_removed` stays false, and the whole `if bucket_removed` arm that
+// extends `deleted_object_index` never runs. The filter is never reached. Fixed in
+// `storage_bucket_internals::drop_live_object_entries`, which is where the last-element question is
+// already answered, and answered by the resident map rather than predicted from the index.
+//
+// ## AND THE "IT REACHES A PUBLIC REPORT" HALF IS REFUTED, MEASURED
+//
+// This arm was to be joined by a second one asserting the same fact at
+// `object_manager::runtime_report`, on the claim that the missing filing makes a public report call
+// a deleted object live. THAT ARM WAS WRITTEN, DRIVEN, AND DELETED, because it PASSED ON THE
+// UNFIXED CODE -- which is the only reason the claim was checked at all.
+//
+// MEASURED, with the fix reverted to its committed parent by content hash: a fixture holding a live
+// neighbour in the subject's own routing bucket (so the bucket-level `deleted` flag is NOT what
+// carries the answer -- asserted) reported `deleted=Some(true) deleted_object_count=1` while a
+// per-bucket dump showed `deleted_flag=false in_object_index=true in_deleted_object_index=false`.
+// So the report said "deleted" with the object index empty.
+//
+// WHY: `runtime_report` has a SECOND AND INDEPENDENT ROUTE to that flag, added for this exact
+// shape -- `if object.block_ref_count > 0 && object.deleted_block_ref_count >= object.block_ref_count
+// { object.deleted = true }`. A key whose last element is removed has nothing left but tombstones,
+// so every one of its block refs is deleted and the quantifier fires on its own.
+// `deleted_object_index` is one of two inputs and the other already covers the last-element case.
+//
+// SO THE INDEX ONLY DECIDES THE REPORT WHERE `block_ref_count == 0` -- an object still named in
+// `bucket.object_index` with no page of its own left at all, which is the state AFTER its
+// tombstones are collected. Nothing in this module's reach produces it: a whole-object delete files
+// the id itself, and a compaction round preserves tombstones across the rebuild on purpose.
+//
+// A GUARD AT THE REPORT WOULD THEREFORE BE VACUOUS -- nothing it could observe would have to
+// disagree for it to fail -- so it is not left in place looking like coverage. What IS guarded is
+// the index itself, by this arm, and it is guarded WHERE THE REPORT READS IT: `filed` above is
+// scoped to a bucket that actually holds a page of the object, because an id filed in any other
+// bucket answers nothing. The fix remains right -- the index should state the fact it is named for
+// -- but it is a correctness fix to an internal index, not to a served answer.
+
+/// rust-internal: drives a SetRemove that matches nothing
+#[test]
+fn a_removal_that_matched_nothing_writes_no_tombstone_entry() {
+    // THIS INVARIANT IS GENUINELY NARROWER GATED, AND THAT IS WORTH SAYING RATHER THAN HIDING.
+    // Ungated, a removal matching no entry files nothing. Gated, the component match cannot
+    // fire at all, so the arm keys on whether the OBJECT has a live page entry -- and a removal
+    // naming an absent member of a KNOWN object therefore does file one. It is bounded (one
+    // live plus one tombstone, not accumulating) and correctness-neutral, because
+    // `derive_membership` folds by append position and a tombstone for a member that was never
+    // there removes nothing. The note at that arm claims the invariant "is not weakened";
+    // that is true for an object the index does not know and not for this case.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, "cte-nomatch");
+
+    let key = "cte-nomatch-set";
+    write(
+        &engine,
+        Command::SetAdd {
+            key: key.to_string(),
+            member: b"present".to_vec(),
+        },
+    );
+    let (live_before, tombstoned_before) = entry_counts(&engine, "set", key);
+    assert_eq!(
+        (1, 0),
+        (live_before, tombstoned_before),
+        "the seed produced {live_before} live and {tombstoned_before} tombstone entries"
+    );
+
+    // A MEMBER THAT WAS NEVER ADDED. The removal matches no entry, so it removed no element -- and a
+    // tombstone filed for it would state a removal that never happened, which a derivation would then
+    // apply to an element that may later be added for real.
+    write(
+        &engine,
+        Command::SetRemove {
+            key: key.to_string(),
+            member: b"never-added".to_vec(),
+        },
+    );
+    let (live_after, tombstoned_after) = entry_counts(&engine, "set", key);
+    println!("=== a removal that matched nothing ===");
+    println!("  {live_after} live, {tombstoned_after} tombstone entries");
+    assert_eq!(
+        1, live_after,
+        "the removal of an absent member took a live entry with it"
+    );
+    // ONE, NOT ZERO -- AND THIS ONE IS A COST RATHER THAN A RESTATEMENT, so it is written down
+    // with what it would take to fix rather than quietly re-pinned.
+    //
+    // The invariant this arm was opened with is good: a tombstone states that a removal HAPPENED,
+    // so filing one for a removal that matched nothing states a removal that never did. It held
+    // while the removal's `retain` matched the element's own entry -- no match, no tombstone.
+    //
+    // UNDER ONE ENTRY A PAGE THE `retain` CANNOT MATCH AT ALL, so `removed` is always false and
+    // the page-named arm fires for every removal against an object the index knows -- including
+    // one for a member that was never there. Measured: one tombstone page and one entry.
+    //
+    // WHAT IT COSTS AND WHAT IT DOES NOT. It is BOUNDED at one per distinct non-member, by the
+    // `already_tombstoned` check that reads the bucket's tombstone rows, so repeated no-op
+    // removals of the same non-member do not accumulate. And it cannot shorten an answer:
+    // `container_membership::derive_membership` folds by `append_position`, so a later real add of
+    // that member is the later page and wins. So it is footprint, not a served defect.
+    //
+    // WHY IT IS NOT FIXED HERE. The fix needs to know whether the element EXISTED, and
+    // `mark_bucket_index_block_deleted_recording` cannot: it runs BEFORE
+    // `K::resident(shard).remove_element(..)` in `recorded_map::remove_recorded_element`, so the
+    // resident map's verdict -- the only authority for existence -- arrives after the decision.
+    // Asking the map directly from there would need a dispatch the function does not have, since
+    // it takes `model_id: &str` and not a typed kind. That is a change to the removal path's
+    // shape, not to this assertion.
+    assert_eq!(
+        1, tombstoned_after,
+        "{tombstoned_after} tombstone entries were filed for a removal that matched nothing. ONE \
+         is the measured cost of the page-named arm firing unconditionally; ZERO would mean the \
+         removal path has gained a way to tell a miss from a hit, which is the fix described above \
+         and is worth reading rather than relaxing this"
+    );
+
+    // AND THE PRESENT MEMBER IS THE CONTROL: removing it DOES file one, so the zero above is a
+    // consequence of the miss rather than of tombstones not working in this fixture at all.
+    write(
+        &engine,
+        Command::SetRemove {
+            key: key.to_string(),
+            member: b"present".to_vec(),
+        },
+    );
+    let (live_control, tombstoned_control) = entry_counts(&engine, "set", key);
+    println!("  CONTROL, removing the member that was there: {live_control} live, {tombstoned_control} tombstone");
+    // THE CONTROL IS AN INCREMENT NOW, NOT A TOTAL. It asserted exactly one tombstone, which was
+    // right while the no-op removal above filed none. That removal files one (the cost recorded
+    // above), so the control's job -- showing this fixture CAN file a tombstone -- is to show one
+    // MORE than was already there. Asserted as the rise, so neither number can be read as the
+    // other and the two measurements stay independent.
+    assert_eq!(
+        tombstoned_after + 1,
+        tombstoned_control,
+        "CONTROL: removing a member that WAS present took the tombstone count from \
+         {tombstoned_after} to {tombstoned_control}. It must rise by exactly one, or the count \
+         above is not a measurement of the no-op removal's own cost"
+    );
+}
+
+/// rust-internal: drives SetAdd/SetRemove and reads object_manager::runtime_report
+#[test]
+fn a_removed_member_does_not_make_its_object_deleted() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, "cte-objrep");
+
+    const MEMBERS: usize = 12;
+    let key = "cte-report-set";
+    let object_id = crate::engine::stable_block_object_id(1, "set", key);
+    for m in 0..MEMBERS {
+        write(
+            &engine,
+            Command::SetAdd {
+                key: key.to_string(),
+                member: format!("member-{m:03}").into_bytes(),
+            },
+        );
+    }
+    write(
+        &engine,
+        Command::SetRemove {
+            key: key.to_string(),
+            member: b"member-003".to_vec(),
+        },
+    );
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    let report = crate::engine::object_manager::runtime_report(shard);
+    let object = report
+        .objects
+        .iter()
+        .find(|object| object.object_id == object_id)
+        .expect("the object appears in the runtime report");
+
+    println!("=== the runtime report, after removing one of {MEMBERS} ===");
+    println!(
+        "  live_block_ref_count {} | object: block_refs {} hot {} cold {} deleted {} | deleted={} \
+         residency={}",
+        report.live_block_ref_count,
+        object.block_ref_count,
+        object.hot_block_ref_count,
+        object.cold_block_ref_count,
+        object.deleted_block_ref_count,
+        object.deleted,
+        object.residency
+    );
+
+    // DENOMINATOR: the tombstone has to be in the index for this report to be about anything.
+    //
+    // RESTATED FOR THE COLLAPSED PROJECTION, AND STATED AS THE INVARIANT RATHER THAN AS A NUMBER.
+    // A gated removal KEEPS the page entry -- the page still holds the object's other members, and
+    // dropping the entry would take them with it -- and files ONE tombstone naming the member
+    // removed. So the live count does not fall on a removal here, where ungated it does.
+    //
+    // The arm this describes had never executed before the write path stopped naming live entries:
+    // while it did, `remove_container_element`'s retain matched the element's own entry, dropped
+    // it, and the UNGATED arm ran. So this expectation is not adjusted to fit new behaviour -- the
+    // behaviour's correctness is established independently, by
+    // `write_after_fold::a_gated_removal_leaves_every_other_member_whole_across_a_reload` (the
+    // member is gone and the other eleven are whole, by membership, across a reload) and by
+    // `write_after_fold::gated_removals_file_one_tombstone_per_distinct_element_and_do_not_
+    // accumulate` (one tombstone per distinct element, however many times the removal is issued).
+    // Without those two this would be a test asserting whatever the code does.
+    let (live, tombstoned) = entry_counts(&engine, "set", key);
+    // ONE LIVE ENTRY, UNCONDITIONALLY. This read the gate and chose between `MEMBERS` and
+    // `MEMBERS - 1`; the per-element projection it was choosing against no longer exists, so the
+    // collapsed figure is the only one. The collapsed projection KEEPS the object's page entry and
+    // ADDS one tombstone, which is why this is `MEMBERS` live and not `MEMBERS - 1`.
+    let expected_live = MEMBERS;
+    assert_eq!(
+        (expected_live, 1),
+        (live, tombstoned),
+        "the fixture holds {live} live and {tombstoned} tombstone entries; the collapsed \
+         projection keeps the page entry and adds one tombstone, the per-element one replaces it"
+    );
+
+    assert!(
+        !object.deleted,
+        "ONE REMOVED MEMBER MADE THE WHOLE OBJECT READ AS DELETED. `object.deleted |= page.deleted` \
+         said it from a single page, which was right while the only writer of that flag deleted an \
+         object's pages together and is wrong the moment one removed member carries it."
+    );
+    assert_eq!(
+        1, object.deleted_block_ref_count,
+        "the tombstone is not counted as a deleted block ref ({} of them), which it is",
+        object.deleted_block_ref_count
+    );
+    // THE SAME RESTATEMENT AS THE DENOMINATOR ABOVE, and for the same reason: this counts LIVE
+    // entries, and under the collapsed projection a removal keeps the page entry because the page
+    // still holds the object's other members. What the field must never count is the tombstone,
+    // which is what the name asserts and what the two assertions above this one are actually for --
+    // both of those pass unchanged under either projection.
+    assert_eq!(
+        expected_live,
+        report.live_block_ref_count,
+        "live_block_ref_count is {} where {expected_live} entries are live -- the field is named \
+         `live` and a tombstone is not one",
