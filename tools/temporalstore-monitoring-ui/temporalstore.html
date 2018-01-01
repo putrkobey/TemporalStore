@@ -16,3 +16,39 @@
         <a href="./matrixkv.html" data-nav="matrixkv">MatrixKV</a>
         <a href="./prometheus.html" data-nav="prometheus">Prometheus</a>
       </nav>
+    </header>
+    <main class="shell">
+      <section class="intro compact">
+        <div>
+          <p class="eyebrow">Temporal Feature Serving</p>
+          <h1>TemporalStore</h1>
+          <p class="lead">
+            Built for high-cardinality temporal windows, filtered event state, long sequence
+            features, risk controls, and persisted online feature serving.
+          </p>
+        </div>
+        <div class="live-tile">
+          <span class="status-dot ok"></span>
+          <strong>Live scrape wired</strong>
+          <small>Metaserver plus two data nodes are visible through Prometheus text metrics.</small>
+        </div>
+      </section>
+
+      <section class="kpi-grid" data-temporal-kpis></section>
+
+      <section class="split wide-left">
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <p class="eyebrow">Runtime</p>
+              <h2>Node-level view</h2>
+            </div>
+            <a class="button" href="./prometheus.html">Prometheus</a>
+          </div>
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr><th>Node</th><th>Endpoint</th><th>Scrape series</th><th>CPU signal</th><th>Worker signal</th></tr>
+              </thead>
+              <tbody data-temporal-node-table></tbody>
+            </table>

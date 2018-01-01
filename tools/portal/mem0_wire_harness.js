@@ -19,3 +19,24 @@ function fn(name) {
 const nodes = {};
 const el = (id) => (nodes[id] = nodes[id] || { innerHTML: "" });
 
+const scope = {
+  $: el,
+  esc: (s) => String(s == null ? "" : s).replace(/[&<>"']/g, (c) =>
+    ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c])),
+  JSON: JSON,
+  Object: Object,
+  Date: Object.assign(function () {}, { now: () => 1760000000000 }),
+  String: String,
+  window: { __matrixarkWhen: (ms) => "AT:" + ms },
+};
+
+const names = Object.keys(scope);
+const api = new Function(...names, [
+  fn("headerRows"), fn("renderWire"), "var calls = [];", fn("recordCall"),
+  // The sentence the console puts above the exchange. A 200 carrying an empty pack is what a
+  // WORKING search looks like, only faster, so this is the line that has to say otherwise.
+  fn("emptyPackNote"),
+  "return { renderWire: renderWire, recordCall: recordCall,",
+  "         emptyPackNote: emptyPackNote,",
+  "         calls: function () { return calls; } };",
+].join("\n"))(...names.map((k) => scope[k]));
