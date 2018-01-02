@@ -28,34 +28,3 @@ function helperFrom(file) {
   return page.slice(start, end + 5);
 }
 
-function build(clipboard) {
-  const win = { navigator: clipboard === null ? {} : { clipboard: clipboard }, Promise: Promise };
-  win.window = win;
-  return win;
-}
-
-function load(file, clipboard) {
-  const body = helperFrom(file);
-  if (body === null) { return null; }
-  const win = build(clipboard);
-  new Function("window", "navigator", "Promise", body)(win, win.navigator, Promise);
-  return win.__matrixarkCopyText;
-}
-
-const seen = [];
-const resolving = { writeText(t) { seen.push(t); return Promise.resolve(); } };
-const rejecting = { writeText(t) { seen.push(t); return Promise.reject(new Error("denied")); } };
-const throwing = { get writeText() { throw new Error("blocked by policy"); } };
-
-(async function () {
-  const pages = process.argv.slice(2);
-  ok("pages were given", pages.length > 0, "none");
-
-  let carried = 0;
-  for (const file of pages) {
-    const name = path.basename(file);
-    const copy = load(file, resolving);
-    if (copy === null) {
-      console.log("FAIL " + name + " does not carry the shared copy helper");
-      failures += 1;
-      continue;
