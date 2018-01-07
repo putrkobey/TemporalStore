@@ -48,3 +48,103 @@ fn noisy_value(index: usize, round: usize, len: usize) -> Vec<u8> {
             state ^= state << 13;
             state ^= state >> 7;
             state ^= state << 17;
+            (state & 0xFF) as u8
+        })
+        .collect()
+}
+
+/// The index's own bytes on disk, and the WAL's, kept apart.
+fn index_and_wal_bytes(index_dir: &std::path::Path) -> (u64, u64) {
+    fn walk(path: &std::path::Path, prefix: &str, out: &mut Vec<(String, u64)>) {
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() { name } else { format!("{prefix}/{name}") };
+            match entry.file_type() {
+                Ok(kind) if kind.is_dir() => walk(&entry.path(), &rel, out),
+                Ok(_) => out.push((rel, entry.metadata().map(|m| m.len()).unwrap_or(0))),
+                Err(_) => {}
+            }
+        }
+    }
+    let mut files = Vec::new();
+    walk(index_dir, "", &mut files);
+    let is_wal = |rel: &str| rel == "wals" || rel.starts_with("wals/");
+    (
+        files.iter().filter(|(r, _)| !is_wal(r)).map(|(_, l)| *l).sum(),
+        files.iter().filter(|(r, _)| is_wal(r)).map(|(_, l)| *l).sum(),
+    )
+}
+
+fn ppm(numerator: u64, denominator: u64) -> u64 {
+    if denominator == 0 { 0 } else { numerator.saturating_mul(1_000_000) / denominator }
+}
+
+fn as_x(value: u64) -> f64 {
+    value as f64 / 1_000_000.0
+}
+
+#[test]
+#[ignore = "rewrites 2,000 keys eight times to cross the log threshold; run by name"]
+fn the_index_log_under_rewrite() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let index_dir = dir.path().join("indexes");
+
+    let snapshot = |label: String| -> (String, u64, u64, u64, u64) {
+        let log = engine.index_log_store.stats(1);
+        let image = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            crate::engine::encode_index_bytes(shard).len() as u64
+        };
+        let (index_bytes, wal_bytes) = index_and_wal_bytes(&index_dir);
+        (label, log.bytes_written, image, index_bytes, wal_bytes)
+    };
+
+    let mut rows = Vec::new();
+    for round in 0..ROUNDS {
+        for index in 0..KEYS {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("ilog-{index:06}"),
+                    value: noisy_value(index, round, VALUE),
+                },
+            });
+            assert!(response.status.ok, "round {round} write {index}: {:?}", response.status);
+        }
+        rows.push(snapshot(format!("after {} pass(es)", round + 1)));
+    }
+
+    println!();
+    println!(
+        "  THE INDEX UNDER REWRITE -- {KEYS} keys x {VALUE} B, {ROUNDS} passes, incompressible"
+    );
+    println!("  the log reclaim gate: {} B and at least 40% reclaimable",
+        DEFAULT_INDEX_GC_INDEX_LOG_BYTES_THRESHOLD);
+    println!();
+    println!(
+        "    {:<20} {:>11} {:>10} {:>12} {:>10} {:>8} {:>8}",
+        "", "log written", "image", "index disk", "wal disk", "wr ratio", "sp ratio"
+    );
+    for (label, log_written, image, index_bytes, wal_bytes) in &rows {
+        println!(
+            "    {:<20} {:>11} {:>10} {:>12} {:>10} {:>7.3}x {:>7.3}x",
+            label,
+            log_written,
+            image,
+            index_bytes,
+            wal_bytes,
+            as_x(ppm(*log_written, *image)),
+            as_x(ppm(*index_bytes, *image)),
+        );
+    }
