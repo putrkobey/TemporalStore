@@ -98,3 +98,104 @@ Use TemporalStore-backed retrieval and GPT-4o-mini reader/judge:
 
 ```bash
 cd <repo>
+
+python3 tools/run_matrixark_dataset_benchmark.py \
+  --dataset locomo \
+  --data-path /root/matrixark_benchmarks/data/locomo10.json \
+  --artifact-dir /root/matrixark_benchmarks/artifacts/gpt4o_mini_reader_judge \
+  --artifact-prefix locomo_gpt4o_mini_reader_judge_YYYYMMDD \
+  --metaserver 127.0.0.1:18000 \
+  --namespace deploy_ns \
+  --table deploy_table \
+  --storage-prefix matrixark:benchmark:locomo:gpt4o-mini:YYYYMMDD \
+  --batch-size 20 \
+  --max-context-tokens 1200 \
+  --checkpoint-interval 50
+```
+
+## LongMemEval_s Command Shape
+
+Use the official cleaned local file when available:
+
+```bash
+cd <repo>
+
+python3 tools/run_matrixark_dataset_benchmark.py \
+  --dataset longmemeval_s \
+  --data-path /root/matrixark_benchmarks/data/longmemeval_s_cleaned_official_hf.json \
+  --artifact-dir /root/matrixark_benchmarks/artifacts/gpt4o_mini_reader_judge \
+  --artifact-prefix longmemeval_s_gpt4o_mini_reader_judge_YYYYMMDD \
+  --metaserver 127.0.0.1:18000 \
+  --namespace deploy_ns \
+  --table deploy_table \
+  --storage-prefix matrixark:benchmark:longmemeval:gpt4o-mini:YYYYMMDD \
+  --batch-size 20 \
+  --max-message-chars 800 \
+  --max-context-tokens 1200 \
+  --checkpoint-interval 50
+```
+
+LongMemEval_s is large. The checkpoint interval matters because it writes
+partial artifacts while the run is still in progress.
+
+## Required Artifacts
+
+Every run should write:
+
+```text
+result.json
+report.json
+report.md
+hypotheses.jsonl
+context_packs.jsonl
+judge.jsonl
+progress.json
+```
+
+The benchmark report should keep MatrixArk metrics separate from the external baseline
+paper numbers until the same dataset, reader model, judge model, prompt, and
+scoring protocol are matched.
+
+## Metrics To Watch
+
+Core quality:
+
+```text
+context_recall
+evidence_session_recall
+answer_support_hit
+final_judge_score
+answer_quality_under_budget
+```
+
+Token efficiency:
+
+```text
+used_context_tokens
+answer_bearing_token_density
+judge_score_per_1k_tokens
+dropped_duplicate_tokens
+dropped_stale_tokens
+dropped_low_score_tokens
+dropped_over_budget_tokens
+```
+
+Acceptance gates:
+
+```text
+compression_answer_hidden_count == 0
+all canonical artifacts written
+reader/judge provider recorded as openai
+reader/judge model recorded as gpt-4o-mini
+```
+
+## Reader/Judge Prompt Policy
+
+Reader should be question-type aware:
+
+```text
+date            -&gt; answer date only, cite exact turn
+current-state   -&gt; latest entity state plus stale blocker if relevant
+multi-hop       -&gt; combine evidence across sessions/entities
+why/emotion     -&gt; extract reason or feeling only
+list/name       -&gt; compact list

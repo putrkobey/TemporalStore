@@ -32,3 +32,37 @@ impl From<SnapshotStatus> for StatusLabel {
         match value {
             SnapshotStatus::Success => StatusLabel::Success,
             SnapshotStatus::Failure => StatusLabel::Failure,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SnapshotMetrics {
+    create_total: Family<SnapshotStatusLabels, Counter>,
+    upload_total: Family<SnapshotStatusLabels, Counter>,
+    download_total: Family<SnapshotStatusLabels, Counter>,
+    restore_total: Family<SnapshotStatusLabels, Counter>,
+    snapshot_bytes: Family<ShardLabels, Gauge<i64, AtomicI64>>,
+    upload_seconds: Family<ShardLabels, Gauge<i64, AtomicI64>>,
+    download_seconds: Family<ShardLabels, Gauge<i64, AtomicI64>>,
+    last_success_log_index: Family<ShardLabels, Gauge<i64, AtomicI64>>,
+}
+
+impl SnapshotMetrics {
+    pub fn register(registry: &mut Registry) -> Self {
+        let create_total = Family::<SnapshotStatusLabels, Counter>::default();
+        let upload_total = Family::<SnapshotStatusLabels, Counter>::default();
+        let download_total = Family::<SnapshotStatusLabels, Counter>::default();
+        let restore_total = Family::<SnapshotStatusLabels, Counter>::default();
+        let snapshot_bytes = Family::<ShardLabels, Gauge<i64, AtomicI64>>::default();
+        let upload_seconds = Family::<ShardLabels, Gauge<i64, AtomicI64>>::default();
+        let download_seconds = Family::<ShardLabels, Gauge<i64, AtomicI64>>::default();
+        let last_success_log_index = Family::<ShardLabels, Gauge<i64, AtomicI64>>::default();
+
+        registry.register(
+            "temporalstore_snapshot_create",
+            "Total local snapshot creation attempts.",
+            create_total.clone(),
+        );
+        registry.register(
+            "temporalstore_snapshot_upload",
