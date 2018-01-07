@@ -146,3 +146,77 @@ fn write_corpus(engine: &TemporalEngine, keys: &[String], tag: u8) {
 
 /// WHAT THE DIRTY SHARE DOES AS A DUMP DRAINS IT, AND WHAT EACH OF THREE SHAPES COSTS ALONG THE WAY.
 ///
+/// ONE PHASE IS REPORTED, AND THE SECOND ONE IS AN OPEN QUESTION RATHER THAN A RESULT.
+///
+///   * **DRAIN**, reported. Write the corpus, then run capped rounds with NO intervening writes,
+///     recording the dirty share after every round. This is the ceiling on what draining achieves
+///     and it says how many rounds the shipped cap needs to reach a corpus. It is internally
+///     consistent across all four arms: exactly 128 buckets leave the dirty set per round,
+///     independent of corpus size and range.
+///   * **SUSTAINED**, built and WITHDRAWN. A write burst alternating with one capped round is the
+///     reading that would actually decide a drained side structure. It read 0.00% dirty at the first
+///     step of every arm -- including the arm holding 40,000 dirty buckets -- which cannot be true
+///     beside a drain that clears 128 a round. The body carries the note; the number is not
+///     reported, because it looked like a decisive win and a broken arm looks exactly like one.
+///
+/// EVERY DENOMINATOR IS ASSERTED. A run that wrote nothing, a run whose rounds dumped nothing, and a
+/// run at a range where every key lands in its own bucket all produce tidy-looking shares, and the
+/// third of those is a real population rather than a mistake -- so it is an ARM, reported, not
+/// excluded.
+///
+/// rust-internal: seeds up to 40,000 records per arm and runs up to 12 rounds, no external surface
+#[test]
+#[ignore = "seeds 8,000 and 40,000 records at two ranges and runs up to 12 dump rounds; run by name"]
+fn the_dirty_share_falls_as_a_dump_drains_it_and_the_side_structure_is_priced_along_the_curve() {
+    println!(
+        "  movable per node: {MOVABLE_BYTES_PER_NODE} B (the two TRANSIENT claims only; \
+         dirty_generation is durable and required on load)"
+    );
+    println!("  dump cap per round: {SHARE_DUMP_CAP}\n");
+
+    for (records, end_bucket, range_label) in [
+        (8_000usize, SHARE_END_BUCKET, "0..1023, the configured range"),
+        (8_000usize, u32::MAX, "the default range (CONTROL)"),
+        (40_000usize, SHARE_END_BUCKET, "0..1023, the configured range"),
+        (40_000usize, u32::MAX, "the default range (CONTROL)"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = share_engine(dir.path());
+        share_load(&engine, end_bucket);
+        let keys: Vec<String> =
+            (0..records).map(|index| format!("share-{index:06}")).collect();
+
+        write_corpus(&engine, &keys, b'a');
+        let (buckets0, dirty0, claiming0) = dirty_census(&engine);
+        assert!(buckets0 > 0, "DENOMINATOR: no bucket after {records} records");
+        assert!(
+            dirty0 > 0,
+            "DENOMINATOR: no dirty bucket after {records} records, so there is nothing for a dump \
+             to drain and nothing for a side structure to hold"
+        );
+
+        println!("=== {records} records, {range_label}");
+        println!(
+            "  round 0 (never dumped): buckets {buckets0}  dirty {dirty0} ({:.2}%)  claiming \
+             {claiming0} ({:.2}%)",
+            100.0 * dirty0 as f64 / buckets0 as f64,
+            100.0 * claiming0 as f64 / buckets0 as f64
+        );
+        println!(
+            "  one capped round can reach {SHARE_DUMP_CAP} of {buckets0} buckets = {:.2}%, so \
+             draining needs about {} rounds",
+            100.0 * SHARE_DUMP_CAP as f64 / buckets0 as f64,
+            buckets0.div_ceil(SHARE_DUMP_CAP)
+        );
+
+        // ---------------- PHASE 1: DRAIN, no writes.
+        let mut drain_shares: Vec<f64> = Vec::new();
+        let mut rounds_to_drain: Option<usize> = None;
+        let mut dumped_anything = false;
+        println!("  DRAIN (no writes between rounds)");
+        println!("    round  dirty  share%   today B   drained B   global B");
+        for round in 1..=MAX_ROUNDS {
+            one_capped_round(&engine);
+            let (buckets, dirty, _claiming) = dirty_census(&engine);
+            let share = 100.0 * dirty as f64 / buckets as f64;
+            drain_shares.push(share);

@@ -5,5 +5,3 @@ members = [
 ]
 exclude = ["sdk/rust/temporalstore"]
 resolver = "2"
-
-[workspace.package]
