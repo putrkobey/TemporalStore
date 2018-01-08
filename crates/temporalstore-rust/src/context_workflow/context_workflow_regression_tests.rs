@@ -1359,3 +1359,1365 @@ fn context_management_ingest_extract_builds_retrieval_pipeline() {
     assert!(sweep.min_token_reduction_percent > 0.0);
     assert!(sweep.max_selected_tokens_per_query <= 256);
     assert!(sweep.all_thresholds_passed);
+    assert!(sweep.threshold_violations.is_empty());
+    assert_eq!(sweep.reports.len(), 2);
+}
+
+#[test]
+fn text_with_nothing_to_redact_still_went_through_the_filter() {
+    // pii_filtering_applied answered "did redaction change the text", not "did this text go
+    // through the filter". With filtering on, most text has no personal data in it, so the flag
+    // read false in the ordinary healthy case: anyone auditing whether filtering ran got "no"
+    // for every clean record, which is the majority of them.
+    let policy = ContextWorkflowPolicy {
+        allowed_provider_kinds: vec![ContextProviderKind::OpenAiCompatible],
+        allowed_models: vec!["context-prod".to_string()],
+        max_extract_body_bytes: 256,
+        max_prompt_tokens: 64,
+        pii_filtering_enabled: true,
+        tenant_isolation_required: true,
+        rate_limit_per_minute: 100,
+        provider_failure_budget: 3,
+    };
+    let request = ContextExtractRequest {
+        shard_id: 1,
+        tenant_hash: 9,
+        source_kind: ContextSourceKind::Ticket,
+        source_id: "T-2".to_string(),
+        title: "Billing".to_string(),
+        body: "Customer asked when the next invoice run happens".to_string(),
+        timestamp_ms: 1,
+        provider: ContextModelProviderConfig {
+            provider_name: "openai-compatible".to_string(),
+            provider_kind: ContextProviderKind::OpenAiCompatible,
+            model: "context-prod".to_string(),
+            mock_mode: false,
+            ..ContextModelProviderConfig::default()
+        },
+    };
+
+    let report = validate_context_extract_policy(&policy, &request);
+    assert!(report.status.ok);
+    assert_eq!(
+        report.sanitized_text, request.body,
+        "premise: this text has nothing in it to redact"
+    );
+    assert!(
+        report.pii_filtering_applied,
+        "the text went through the filter -- it simply had nothing to remove, which is not          the same as the filter not running"
+    );
+
+    // And the other direction, so "applied" cannot quietly come to mean something else: with
+    // filtering switched off, nothing went through the filter and the report has to say so.
+    let unfiltered = ContextWorkflowPolicy {
+        pii_filtering_enabled: false,
+        ..policy
+    };
+    let report = validate_context_extract_policy(&unfiltered, &request);
+    assert!(report.status.ok);
+    assert!(
+        !report.pii_filtering_applied,
+        "filtering is switched off, so it was not applied to this text"
+    );
+}
+
+#[test]
+fn context_workflow_policy_controls_provider_model_and_pii() {
+    let policy = ContextWorkflowPolicy {
+        allowed_provider_kinds: vec![ContextProviderKind::OpenAiCompatible],
+        allowed_models: vec!["context-prod".to_string()],
+        max_extract_body_bytes: 256,
+        max_prompt_tokens: 64,
+        pii_filtering_enabled: true,
+        tenant_isolation_required: true,
+        rate_limit_per_minute: 100,
+        provider_failure_budget: 3,
+    };
+    let request = ContextExtractRequest {
+        shard_id: 1,
+        tenant_hash: 9,
+        source_kind: ContextSourceKind::Ticket,
+        source_id: "T-1".to_string(),
+        title: "Billing".to_string(),
+        body: "Customer jane@example.com has account 1234567890".to_string(),
+        timestamp_ms: 1,
+        provider: ContextModelProviderConfig {
+            provider_name: "openai-compatible".to_string(),
+            provider_kind: ContextProviderKind::OpenAiCompatible,
+            model: "context-prod".to_string(),
+            mock_mode: false,
+            ..ContextModelProviderConfig::default()
+        },
+    };
+
+    let report = validate_context_extract_policy(&policy, &request);
+    assert!(report.status.ok);
+    assert!(report.provider_allowed);
+    assert!(report.model_allowed);
+    assert!(report.pii_filtering_applied);
+    assert!(report.sanitized_text.contains("[redacted-email]"));
+    assert!(report.sanitized_text.contains("[redacted-id]"));
+}
+
+// shared-corpus: context_management_ingest_retrieve_pipeline
+#[test]
+fn context_workflow_exposes_reference_open_source_vlm_profiles() {
+    let providers = default_context_model_providers();
+    let reference_provider = providers
+        .iter()
+        .find(|provider| provider.provider_name == "reference-open-source-vlm")
+        .expect("reference open-source provider profile should be exposed");
+    assert_eq!(
+        reference_provider.provider_kind,
+        ContextProviderKind::OpenAiCompatible
+    );
+    assert_eq!(reference_provider.vlm_model, "qwen2.5vl:7b");
+    assert_eq!(reference_provider.embedding_model, "nomic-embed-text");
+    assert_eq!(reference_provider.base_url, "http://127.0.0.1:11434/v1");
+    let matrixark_provider = providers
+        .iter()
+        .find(|provider| provider.provider_name == "matrixark-native-oss-context")
+        .expect("MatrixArk OSS provider profile should be exposed");
+    assert_eq!(matrixark_provider.model, "google/flan-t5-small");
+    assert_eq!(
+        matrixark_provider.embedding_model,
+        "sentence-transformers/all-MiniLM-L6-v2"
+    );
+    let reference_reader = providers
+        .iter()
+        .find(|provider| provider.provider_name == "reference-gpt-4o-mini-reader")
+        .expect("reference GPT-4o-mini reader profile should be exposed");
+    assert_eq!(reference_reader.model, "gpt-4o-mini");
+    assert_eq!(reference_reader.api_key_env, "OPENAI_API_KEY");
+
+    let state = context_workflow_state_report();
+    assert_eq!(
+        state
+            .context_model_descriptors
+            .iter()
+            .map(|descriptor| (descriptor.name.as_str(), descriptor.model_id))
+            .collect::<Vec<_>>(),
+        vec![
+            ("ContextNodeModel", 9),
+            ("ContextEventModel", 10),
+            ("ContextIndexModel", 11),
+            ("ContextAuditModel", 12),
+            ("ContextChildModel", 14),
+            ("ContextSummaryModel", 16),
+            ("ContextCompressionModel", 17),
+            ("ContextEntityModel", 18),
+        ]
+    );
+    assert!(state.parity.native_context_model_ids_ready);
+    assert!(state.parity.native_context_timeline_semantics_ready);
+    assert!(state.parity.native_context_validation_limits_ready);
+    assert!(state
+        .reference_model_profiles
+        .iter()
+        .any(|profile| profile.vlm_model == "qwen2.5vl:7b"
+            && profile.embedding_model == "nomic-embed-text"
+            && profile
+                .capabilities
+                .contains(&"vlm_image_content_understanding".to_string())));
+    assert!(state
+        .reference_model_profiles
+        .iter()
+        .any(|profile| profile.vlm_model.contains("InternVL")));
+    assert!(state.reference_model_profiles.iter().any(|profile| {
+        profile.profile_name == "reference-gpt-4o-mini-reader"
+            && profile.chat_model == "gpt-4o-mini"
+            && profile
+                .capabilities
+                .contains(&"reference_reader_parity".to_string())
+    }));
+    assert!(state.reference_model_profiles.iter().any(|profile| {
+        profile.profile_name == "matrixark-native-oss-context"
+            && profile.chat_model == "google/flan-t5-small"
+            && profile.embedding_model == "sentence-transformers/all-MiniLM-L6-v2"
+            && profile
+                .capabilities
+                .contains(&"native_path_oss_model_parity".to_string())
+    }));
+    assert!(state.reference_model_profiles.iter().any(|profile| {
+        profile.profile_name == "reference-minigpt4-gpt-style-vlm"
+            && profile.vlm_model == "Vision-CAIR/MiniGPT-4"
+            && profile
+                .capabilities
+                .contains(&"gpt_style_vlm_reasoning".to_string())
+    }));
+    assert!(state.open_model_provider_packaged);
+    assert!(!state.open_model_local_run_proven);
+    assert!(state.vlm_provider_configured);
+    assert!(!state.vlm_benchmark_proven);
+}
+
+// shared-corpus: context_reference_blocks_provider_switches
+#[test]
+fn context_reference_blocks_and_provider_model_switches_are_reported() {
+    let engine = test_engine();
+    let open_source_text_provider = ContextModelProviderConfig {
+        provider_name: "matrixark-native-oss-context".to_string(),
+        provider_kind: ContextProviderKind::OpenAiCompatible,
+        base_url: "http://127.0.0.1:8000/v1".to_string(),
+        model: "google/flan-t5-small".to_string(),
+        embedding_model: "sentence-transformers/all-MiniLM-L6-v2".to_string(),
+        vlm_model: "none".to_string(),
+        mock_mode: true,
+        ..ContextModelProviderConfig::default()
+    };
+    let reference_vlm_provider = ContextModelProviderConfig {
+        provider_name: "reference-minigpt4-gpt-style-vlm".to_string(),
+        provider_kind: ContextProviderKind::OpenAiCompatible,
+        base_url: "http://127.0.0.1:8000/v1".to_string(),
+        model: "lmsys/vicuna-7b-v1.5".to_string(),
+        embedding_model: "BAAI/bge-m3".to_string(),
+        vlm_model: "Vision-CAIR/MiniGPT-4".to_string(),
+        mock_mode: true,
+        ..ContextModelProviderConfig::default()
+    };
+    let ingest = ingest_extract_context(
+            &engine,
+            ContextIngestExtractRequest {
+                shard_id: 1,
+                tenant_hash: 20260620,
+                sources: vec![
+                    ContextExtractRequest {
+                        shard_id: 0,
+                        tenant_hash: 0,
+                        source_kind: ContextSourceKind::Chat,
+                        source_id: "open-text-memory".to_string(),
+                        title: "Text memory".to_string(),
+                        body: "Open-source text reader memory: Dana suggested the observability dashboard for Lee.".to_string(),
+                        timestamp_ms: 1_000,
+                        provider: open_source_text_provider.clone(),
+                    },
+                    ContextExtractRequest {
+                        shard_id: 0,
+                        tenant_hash: 0,
+                        source_kind: ContextSourceKind::Document,
+                        source_id: "vlm-receipt-memory".to_string(),
+                        title: "Receipt image memory".to_string(),
+                        body: "Reference VLM memory: receipt image shows Northstar Cafe total $18.40.".to_string(),
+                        timestamp_ms: 2_000,
+                        provider: reference_vlm_provider.clone(),
+                    },
+                ],
+                query: "Which project did Dana suggest and what receipt total did the VLM see?"
+                    .to_string(),
+                start_time_ms: 0,
+                end_time_ms: 3_000,
+                max_events: 8,
+                provider: ContextModelProviderConfig::default(),
+            },
+        );
+    assert!(ingest.status.ok, "{:?}", ingest.status);
+    assert_eq!(ingest.accepted, 2);
+    assert_eq!(
+        ingest
+            .summary
+            .provider_counts
+            .get("matrixark-native-oss-context"),
+        Some(&1)
+    );
+    assert_eq!(
+        ingest
+            .summary
+            .provider_counts
+            .get("reference-minigpt4-gpt-style-vlm"),
+        Some(&1)
+    );
+    assert!(ingest
+        .extracts
+        .iter()
+        .any(|extract| extract.provider.model == "google/flan-t5-small"
+            && extract.provider.embedding_model == "sentence-transformers/all-MiniLM-L6-v2"));
+    assert!(ingest.extracts.iter().any(|extract| {
+        extract.provider.vlm_model == "Vision-CAIR/MiniGPT-4"
+            && extract.provider.embedding_model == "BAAI/bge-m3"
+    }));
+    for extract in &ingest.extracts {
+        let summaries = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextQuerySummaries {
+                tenant_hash: 20260620,
+                node_hash: extract.node.node_hash,
+                level: 1,
+                as_of_ms: extract.event.event_time_ms + 1,
+                limit: Some(4),
+            },
+        });
+        assert!(matches!(
+            summaries.response,
+            CommandResponse::ContextSummaries { ref summaries, .. }
+                if summaries.iter().any(|summary| summary.text == extract.l0)
+        ));
+
+        // The vectors live on their owners: both summary levels answer the batched
+        // vector query, and the event itself carries one. No separate rows exist to ask.
+        for level in [1u32, 2] {
+            let vectors = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ContextQuerySummaryVectors {
+                    tenant_hash: 20260620,
+                    node_hashes: vec![extract.node.node_hash],
+                    level,
+                    as_of_ms: extract.event.event_time_ms + 1,
+                },
+            });
+            assert!(
+                matches!(
+                    vectors.response,
+                    CommandResponse::ContextSummaryVectors { ref vectors }
+                        if vectors.len() == 1 && vectors[0].vector.len() == 16
+                ),
+                "level {level} summary must carry its vector"
+            );
+        }
+        let events = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextQueryEvents {
+                tenant_hash: 20260620,
+                node_hash: extract.node.node_hash,
+                start_time_ms: 0,
+                end_time_ms: extract.event.event_time_ms + 1,
+                limit: Some(8),
+                max_scan: None,
+                current_valid_only: false,
+                as_of_ms: 0,
+                kinds: Vec::new(),
+                statuses: Vec::new(),
+                min_confidence: 0.0,
+                min_importance: 0.0,
+            },
+        });
+        assert!(matches!(
+            events.response,
+            CommandResponse::ContextEvents { ref events, .. }
+                if events
+                    .iter()
+                    .any(|event| event.event_id_hash == extract.event.event_id_hash
+                        && event.vector.len() == 16)
+        ));
+
+        // The node itself must carry its L0 vector off the same ingest -- the traversal scores
+        // from node.vector first, so a happy-path ingest that left it empty would strand every
+        // fresh node on the separate-record fallback and the records could never be retired.
+        let node = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextGetNode {
+                tenant_hash: 20260620,
+                node_hash: extract.node.node_hash,
+            },
+        });
+        assert!(matches!(
+            node.response,
+            CommandResponse::ContextNode { node: Some(ref node), .. }
+                if node.vector.len() == 16
+                    && node.embedding_model_hash != 0
+                    && node.embedding_updated_at_ms == extract.event.event_time_ms
+        ));
+    }
+
+    let retrieve = retrieve_context(&engine, ingest.retrieve_request);
+    assert!(retrieve.status.ok, "{:?}", retrieve.status);
+    assert!(retrieve.blocks.iter().any(|block| {
+        block.tier == ContextTier::L2 && block.text.contains("observability dashboard")
+    }));
+    assert!(retrieve
+        .blocks
+        .iter()
+        .any(|block| { block.tier == ContextTier::L2 && block.text.contains("Northstar Cafe") }));
+}
+
+// shared-corpus: context_injection_prompt_pack_ordering
+#[test]
+fn context_injection_prompt_pack_preserves_retrieved_evidence_ordering() {
+    let engine = test_engine();
+    let stale = extract_context(
+        &engine,
+        ContextExtractRequest {
+            shard_id: 1,
+            tenant_hash: 20260621,
+            source_kind: ContextSourceKind::Chat,
+            source_id: "pet-stale".to_string(),
+            title: "Old pet note".to_string(),
+            body: "Old profile note: the family dog was called Pepper in a previous home."
+                .to_string(),
+            timestamp_ms: 1_000,
+            provider: ContextModelProviderConfig::default(),
+        },
+    );
+    let current = extract_context(
+        &engine,
+        ContextExtractRequest {
+            shard_id: 1,
+            tenant_hash: 20260621,
+            source_kind: ContextSourceKind::UserEvent,
+            source_id: "pet-current".to_string(),
+            title: "Latest pet note".to_string(),
+            body: "Latest pet update: the newly adopted dog is named Miso and needs evening walks."
+                .to_string(),
+            timestamp_ms: 2_000,
+            provider: ContextModelProviderConfig::default(),
+        },
+    );
+    assert!(stale.status.ok);
+    assert!(current.status.ok);
+    let retrieve = ContextRetrieveRequest {
+        shard_id: 1,
+        tenant_hash: 20260621,
+        node_hashes: vec![stale.node.node_hash, current.node.node_hash],
+        query: "What is the dog's name in the latest pet update?".to_string(),
+        start_time_ms: 0,
+        end_time_ms: 3_000,
+        max_events: 8,
+        min_confidence: 0.0,
+        min_importance: 0.0,
+        tiers: vec![ContextTier::L2],
+        max_summary_nodes: 32,
+        max_event_nodes: 16,
+        prefer_current_agent: false,
+        current_agent_scope_key: "agent:codex".to_string(),
+        provider: ContextModelProviderConfig::default(),
+    };
+    let retrieved = retrieve_context(&engine, retrieve.clone());
+    assert!(retrieved.status.ok, "{:?}", retrieved.status);
+    assert!(retrieved.blocks.len() >= 2);
+    assert!(retrieved.blocks[0].text.contains("Miso"));
+    assert!(retrieved.blocks[1].text.contains("Pepper"));
+
+    let inject = inject_context(
+        &engine,
+        ContextInjectRequest {
+            retrieve,
+            prompt: "Answer from current memory only.".to_string(),
+            session_hash: 99,
+            query_id: "pet-current-pack".to_string(),
+            max_prompt_tokens: 128,
+            provider: ContextModelProviderConfig::default(),
+        },
+    );
+    assert!(inject.status.ok, "{:?}", inject.status);
+    assert!(inject.injected_prompt.contains("<context>"));
+    let miso_pos = inject
+        .injected_prompt
+        .find("Miso")
+        .expect("current evidence should be injected");
+    let pepper_pos = inject
+        .injected_prompt
+        .find("Pepper")
+        .expect("stale evidence should still be available after current evidence");
+    assert!(miso_pos < pepper_pos);
+    assert_eq!(inject.audit.selected_refs[0].event_time_ms, 2_000);
+    assert_eq!(inject.audit.selected_refs[1].event_time_ms, 1_000);
+}
+
+// shared-corpus: context_reference_reasoning_vlm_parity
+#[test]
+fn context_reference_reasoning_vlm_cases_cover_required_gaps() {
+    let state = context_workflow_state_report();
+    for required_category in [
+        "multi_hop_reasoning",
+        "temporal",
+        "memory_update",
+        "stale_memory",
+        "open_domain_retrieval",
+        "vlm_image_content_understanding",
+    ] {
+        assert!(
+            state
+                .reference_parity_categories
+                .contains(&required_category.to_string()),
+            "missing reference parity category {required_category}"
+        );
+    }
+    assert_eq!(state.reference_parity_cases.len(), 6);
+    assert!(state
+        .reference_parity_cases
+        .iter()
+        .any(|case| case.uses_vlm && !case.benchmark_proven));
+    assert!(state
+        .reference_parity_cases
+        .iter()
+        .filter(|case| !case.uses_vlm)
+        .all(|case| case.benchmark_proven));
+
+    for case in state.reference_parity_cases {
+        assert!(
+            context_query_matches(&case.query, &case.positive_memory),
+            "{} did not match its positive memory",
+            case.case_name
+        );
+        assert!(
+            context_relevance_score(&case.query, &case.positive_memory)
+                > context_relevance_score(&case.query, &case.stale_memory),
+            "{} did not outrank stale memory",
+            case.case_name
+        );
+        for term in case.expected_terms {
+            let text_lower = case.positive_memory.to_ascii_lowercase();
+            let text_normalized = context_normalize_for_match(&case.positive_memory);
+            assert!(
+                context_text_matches_term(&text_lower, &text_normalized, &term),
+                "{} positive memory did not expose expected term {term}",
+                case.case_name
+            );
+        }
+    }
+}
+
+#[test]
+fn context_workflow_policy_rejects_disallowed_runtime_controls() {
+    let policy = ContextWorkflowPolicy {
+        allowed_provider_kinds: vec![ContextProviderKind::Mock],
+        allowed_models: vec!["context-prod".to_string()],
+        max_extract_body_bytes: 8,
+        max_prompt_tokens: 4,
+        pii_filtering_enabled: true,
+        tenant_isolation_required: true,
+        rate_limit_per_minute: 0,
+        provider_failure_budget: 0,
+    };
+    let request = ContextInjectRequest {
+        retrieve: ContextRetrieveRequest {
+            shard_id: 1,
+            tenant_hash: 0,
+            node_hashes: vec![1],
+            query: "risk".to_string(),
+            start_time_ms: 0,
+            end_time_ms: 10,
+            max_events: 8,
+            min_confidence: 0.0,
+            min_importance: 0.0,
+            tiers: default_tiers(),
+            max_summary_nodes: 32,
+            max_event_nodes: 16,
+            prefer_current_agent: false,
+            current_agent_scope_key: "agent:codex".to_string(),
+            provider: ContextModelProviderConfig::default(),
+        },
+        prompt: "one two three four five".to_string(),
+        session_hash: 7,
+        query_id: "q-policy".to_string(),
+        max_prompt_tokens: 32,
+        provider: ContextModelProviderConfig {
+            provider_kind: ContextProviderKind::OpenAiCompatible,
+            model: "wrong-model".to_string(),
+            mock_mode: false,
+            ..ContextModelProviderConfig::default()
+        },
+    };
+
+    let report = validate_context_inject_policy(&policy, &request);
+    assert!(!report.status.ok);
+    assert!(!report.provider_allowed);
+    assert!(!report.model_allowed);
+    assert!(!report.prompt_size_allowed);
+    assert!(!report.tenant_isolation_applied);
+    assert!(!report.rate_limit_allowed);
+    assert!(!report.provider_failure_budget_allowed);
+}
+
+#[test]
+fn context_workflow_extracts_with_openai_compatible_provider() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = thread::spawn(move || {
+        for expected_path in ["/v1/chat/completions", "/v1/embeddings"] {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&chunk[..read]);
+                if let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let request = String::from_utf8_lossy(&buffer[..header_end + 4]);
+                    if request.contains(format!("POST {expected_path} HTTP/1.1").as_str()) {
+                        assert!(request.contains("Authorization: Bearer test-context-key"));
+                        let content_length = request
+                            .lines()
+                            .find_map(|line| {
+                                line.strip_prefix("content-length:")
+                                    .or_else(|| line.strip_prefix("Content-Length:"))
+                                    .and_then(|value| value.trim().parse::<usize>().ok())
+                            })
+                            .unwrap_or_default();
+                        if buffer.len() >= header_end + 4 + content_length {
+                            break;
+                        }
+                    }
+                }
+            }
+            let body_start = buffer
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .map(|index| index + 4)
+                .unwrap_or(buffer.len());
+            let request_body: serde_json::Value =
+                serde_json::from_slice(&buffer[body_start..]).unwrap();
+            let body = if expected_path.ends_with("chat/completions") {
+                assert_eq!(request_body["model"], "context-live-test");
+                serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "content": "{\"l0\":\"live checkout incident\",\"l1\":\"kind=Incident; live facts=payment risk; customer impact\"}"
+                        }
+                    }]
+                })
+                .to_string()
+            } else {
+                assert_eq!(request_body["model"], "context-embedding-live-test");
+                // What the provider is actually asked to encode, read off the wire. A rich source
+                // sends the node text and the event body -- two texts. The level-2 summary embeds
+                // the same string as the node, and a third slot repeating it is work and money
+                // spent on a vector the first slot already returns.
+                let inputs = request_body["input"].as_array().unwrap();
+                assert_eq!(inputs.len(), 2, "one text per distinct thing to encode: {inputs:?}");
+                assert_ne!(
+                    inputs[0], inputs[1],
+                    "no text may appear twice in one embedding batch: {inputs:?}"
+                );
+                serde_json::json!({
+                    "data": [
+                        {"embedding": [1.0, 0.0, 0.0, 0.0]},
+                        {"embedding": [0.0, 1.0, 0.0, 0.0]}
+                    ]
+                })
+                .to_string()
+            };
+            write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .unwrap();
+            stream.flush().unwrap();
+        }
+    });
+    std::env::set_var("TS_CONTEXT_TEST_KEY", "test-context-key");
+    let engine = test_engine();
+    let report = extract_context(
+        &engine,
+        ContextExtractRequest {
+            shard_id: 1,
+            tenant_hash: 1,
+            source_kind: ContextSourceKind::Document,
+            source_id: "doc".to_string(),
+            title: "doc".to_string(),
+            body: "Customer checkout failed during payment. The risk score spiked sharply. The fraud team paused the account.".to_string(),
+            timestamp_ms: 1,
+            provider: ContextModelProviderConfig {
+                provider_name: "live-test".to_string(),
+                provider_kind: ContextProviderKind::OpenAiCompatible,
+                base_url: format!("http://{addr}/v1"),
+                api_key_env: "TS_CONTEXT_TEST_KEY".to_string(),
+                model: "context-live-test".to_string(),
+                embedding_model: "context-embedding-live-test".to_string(),
+                mock_mode: false,
+                ..ContextModelProviderConfig::default()
+            },
+        },
+    );
+    assert!(report.status.ok, "{}", report.status.message);
+    assert_eq!(report.l0, "live checkout incident");
+    assert!(report.l1.contains("payment risk"));
+    assert_eq!(report.provider.provider_name, "live-test");
+    assert_eq!(report.embedding_generation.provider_name, "live-test");
+    assert_eq!(
+        report.embedding_generation.embedding_model,
+        "context-embedding-live-test"
+    );
+    assert_eq!(report.embedding_generation.vector_dimension, 4);
+    assert_eq!(report.embedding_generation.requested_vector_count, 2);
+    assert_eq!(report.embedding_generation.generated_vector_count, 2);
+    assert_eq!(report.embedding_generation.batch_count, 1);
+    assert_eq!(report.embedding_generation.live_call_count, 1);
+    assert!(!report.embedding_generation.mock_mode);
+    assert!(report.embedding_generation.production_evidence_ready);
+    handle.join().unwrap();
+    std::env::remove_var("TS_CONTEXT_TEST_KEY");
+}
+
+// --- Hybrid retrieve scoring (un-embedded nodes rankable via lexical) ---
+
+// Upsert a raw ContextNode + one event with NO embedding (mirrors raw-first bulk
+// ingest). `last_event_time_ms` is shared across callers in a test so the freshness
+// tiebreak does not decide ranking -- lexical/cosine score must.
+fn upsert_raw_context_node(
+    engine: &TemporalEngine,
+    tenant_hash: u64,
+    node_hash: u64,
+    text: &str,
+    event_time_ms: u64,
+) {
+    let ok = engine
+        .execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextUpsertNode {
+                tenant_hash,
+                node: Box::new(ContextNode {
+                    node_hash,
+                    parent_hash: 0,
+                    kind: 0,
+                    canonical_name: format!("node {node_hash}"),
+                    l0: text.to_string(),
+                    status: 1,
+                    last_event_time_ms: event_time_ms,
+                    l1_ref: String::new(),
+                    raw_metadata_ref: format!("src://{node_hash}"),
+                    vector: Vec::new(),
+                    embedding_model_hash: 0,
+                    embedding_updated_at_ms: 0,
+                    summary_vector: Vec::new(),
+                    summary_vector_valid_from_ms: 0,
+                    summary_vector_model_hash: 0,
+                }),
+            },
+        })
+        .status
+        .ok;
+    assert!(ok);
+    let ok = engine
+        .execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextWriteEvent {
+                tenant_hash,
+                node_hash,
+                event: Box::new(ContextEvent {
+                    event_id_hash: node_hash.wrapping_mul(11).max(1),
+                    event_time_ms,
+                    ingestion_time_ms: event_time_ms,
+                    kind: 0,
+                    event_type: 1,
+                    actor_hash: 1,
+                    status: 1,
+                    valid_until_ms: 0,
+                    confidence: 1.0,
+                    importance: 1.0,
+                    text: text.to_string(),
+                    source_ref: String::new(),
+                    related_node_hashes: Vec::new(),
+                    compact_attrs: Vec::new(),
+                    vector: Vec::new(),
+                }),
+                first_write_only: false,
+                cold_storage: false,
+            },
+        })
+        .status
+        .ok;
+    assert!(ok);
+}
+
+fn retrieve_top_node(engine: &TemporalEngine, tenant_hash: u64, node_hashes: Vec<u64>, query: &str) -> u64 {
+    let report = retrieve_context(
+        engine,
+        ContextRetrieveRequest {
+            shard_id: 1,
+            tenant_hash,
+            node_hashes,
+            query: query.to_string(),
+            start_time_ms: 0,
+            end_time_ms: 1_000_000,
+            max_events: 8,
+            min_confidence: 0.0,
+            min_importance: 0.0,
+            tiers: default_tiers(),
+            max_summary_nodes: 1,
+            max_event_nodes: 1,
+            prefer_current_agent: false,
+            current_agent_scope_key: String::new(),
+            provider: ContextModelProviderConfig::default(),
+        },
+    );
+    assert!(report.status.ok, "{:?}", report.status);
+    report
+        .blocks
+        .first()
+        .map(|block| block.node_hash)
+        .unwrap_or(0)
+}
+
+#[test]
+fn hybrid_lexical_ranks_unembedded_nodes_above_flat_zero() {
+    let engine = test_engine();
+    let tenant_hash = 77;
+    // Both un-embedded. The relevant node has the LARGER node_hash so that WITHOUT
+    // hybrid (all scores 0) the ascending node_hash tiebreak would pick the
+    // irrelevant one; hybrid lexical scoring must flip that.
+    let irrelevant = 111u64;
+    let relevant = 222u64;
+    upsert_raw_context_node(
+        &engine,
+        tenant_hash,
+        irrelevant,
+        "Support ticket: user asked to update a notification preference.",
+        5_000,
+    );
+    upsert_raw_context_node(
+        &engine,
+        tenant_hash,
+        relevant,
+        "Checkout incident: payment fraud score spiked after an outage.",
+        5_000,
+    );
+
+    let top = retrieve_top_node(
+        &engine,
+        tenant_hash,
+        vec![irrelevant, relevant],
+        "payment fraud score",
+    );
+    assert_eq!(
+        top, relevant,
+        "un-embedded node with lexical overlap must outrank the flat-zero node"
+    );
+}
+
+#[test]
+fn hybrid_mixed_store_keeps_both_embedded_and_unembedded_rankable() {
+    let engine = test_engine();
+    let tenant_hash = 88;
+    // One node embedded via the extract path (stores cosine-scorable embeddings).
+    let embedded = extract_context(
+        &engine,
+        ContextExtractRequest {
+            shard_id: 1,
+            tenant_hash,
+            source_kind: ContextSourceKind::Incident,
+            source_id: "emb".to_string(),
+            title: "deploy".to_string(),
+            body: "Deployment rollout paused after a latency regression.".to_string(),
+            timestamp_ms: 6_000,
+            provider: ContextModelProviderConfig::default(),
+        },
+    );
+    assert!(embedded.status.ok, "{:?}", embedded.status);
+    // One node left un-embedded (raw upsert), lexically matching a different query.
+    let raw_node = 999u64;
+    upsert_raw_context_node(
+        &engine,
+        tenant_hash,
+        raw_node,
+        "Checkout incident: payment fraud score spiked after an outage.",
+        6_000,
+    );
+
+    // Query that lexically matches ONLY the un-embedded node: it must still surface
+    // (mixed store does not collapse un-embedded nodes to 0/invisible).
+    let report = retrieve_context(
+        &engine,
+        ContextRetrieveRequest {
+            shard_id: 1,
+            tenant_hash,
+            node_hashes: vec![embedded.node.node_hash, raw_node],
+            query: "payment fraud score".to_string(),
+            start_time_ms: 0,
+            end_time_ms: 1_000_000,
+            max_events: 8,
+            min_confidence: 0.0,
+            min_importance: 0.0,
+            tiers: default_tiers(),
+            max_summary_nodes: 8,
+            max_event_nodes: 8,
+            prefer_current_agent: false,
+            current_agent_scope_key: String::new(),
+            provider: ContextModelProviderConfig::default(),
+        },
+    );
+    assert!(report.status.ok, "{:?}", report.status);
+    assert!(
+        report.blocks.iter().any(|block| block.node_hash == raw_node),
+        "un-embedded lexical-matching node must be retrievable in a mixed store"
+    );
+}
+
+#[test]
+fn context_workflow_falls_back_when_live_provider_fails() {
+    let engine = test_engine();
+    let report = extract_context(
+        &engine,
+        ContextExtractRequest {
+            shard_id: 1,
+            tenant_hash: 1,
+            source_kind: ContextSourceKind::Document,
+            source_id: "doc".to_string(),
+            title: "doc".to_string(),
+            body: "body".to_string(),
+            timestamp_ms: 1,
+            provider: ContextModelProviderConfig {
+                provider_name: "offline-live-provider".to_string(),
+                provider_kind: ContextProviderKind::OpenAiCompatible,
+                base_url: "http://127.0.0.1:9/v1".to_string(),
+                mock_mode: false,
+                timeout_ms: 25,
+                max_retries: 0,
+                fallback_provider: Some(Box::new(ContextModelProviderConfig::default())),
+                ..ContextModelProviderConfig::default()
+            },
+        },
+    );
+    assert!(report.status.ok, "{}", report.status.message);
+    assert!(report
+        .provider
+        .provider_name
+        .starts_with("offline-live-provider+fallback:"));
+    assert!(report.embedding_generation.mock_mode);
+    assert!(!report.embedding_generation.production_evidence_ready);
+    assert_eq!(report.l0, "doc: body");
+}
+
+// shared-corpus: context_resource_large_object_store_spill
+#[test]
+fn context_resource_parser_spills_large_resource_body_to_object_store_ref() {
+    let large_text = "x".repeat(1_048_577);
+    let report = parse_context_resource(ContextResourceParseRequest {
+        raw_uri: "large-resource.pdf".to_string(),
+        resource_type: Some("pdf".to_string()),
+        text: large_text,
+        max_chunk_chars: 262_144,
+        overlap_chars: 0,
+        chunk_hash_base: Some(42_000),
+        owner_scope: "workspace:bench".to_string(),
+        version: "v-large".to_string(),
+        watch_interval_minutes: 0,
+        parser_name: "unit-test-parser".to_string(),
+    });
+    assert!(report.status.ok);
+    assert_eq!(report.payload_size_bytes, 1_048_577);
+    assert_eq!(report.max_inline_bytes, 1_048_576);
+    assert!(!report.inline_payload);
+    assert!(report
+        .external_object_uri
+        .starts_with("objectstore://matrixark/resources/"));
+    assert_eq!(
+        report.lifecycle.external_object_uri,
+        report.external_object_uri
+    );
+    assert_eq!(
+        report.lifecycle.payload_size_bytes,
+        report.payload_size_bytes
+    );
+    assert!(report.chunks.iter().all(|chunk| {
+        chunk.metadata.get("storage_backend").map(String::as_str) == Some("objectstore")
+            && chunk.metadata.get("storage_value_mode").map(String::as_str)
+                == Some("object_ref_json")
+            && chunk.metadata.get("external_object_uri") == Some(&report.external_object_uri)
+    }));
+}
+
+// shared-corpus: context_resource_skill_parser_reference_parity
+#[test]
+fn context_resource_parser_matches_reference_stable_refs() {
+    let report = parse_context_resource(ContextResourceParseRequest {
+        raw_uri: "runbook.md".to_string(),
+        resource_type: Some("md".to_string()),
+        text: "# Rollback\n\nUse canary rollback. See [runbook](baseline://resources/runbook-extra.md).\n\n## Checks\n\nConfirm p95 latency.\n\n```bash\ncurl /health\n```".to_string(),
+        max_chunk_chars: 1_400,
+        overlap_chars: 120,
+        chunk_hash_base: Some(900),
+        owner_scope: "team:ops".to_string(),
+        version: "v1".to_string(),
+        watch_interval_minutes: 60,
+        parser_name: "unit-test-parser".to_string(),
+    });
+    assert!(report.status.ok);
+    assert_eq!(report.resource_type, "md");
+    assert_eq!(report.uri_scheme, "file");
+    assert_eq!(report.resource_title, "runbook.md");
+    assert_eq!(report.lifecycle.owner_scope, "team:ops");
+    assert_eq!(report.lifecycle.parser_name, "unit-test-parser");
+    assert_eq!(report.lifecycle.parser_version, "reference-compatible-v1");
+    assert_eq!(report.lifecycle.version, "v1");
+    assert_eq!(
+        report.lifecycle.import_kind,
+        ContextResourceImportKind::Markdown
+    );
+    assert_eq!(
+        report.lifecycle.action,
+        ContextResourceLifecycleAction::Watch
+    );
+    assert!(report.lifecycle.watched);
+    assert_eq!(report.lifecycle.watch_interval_minutes, 60);
+    assert_eq!(report.lifecycle.next_refresh_after_ms, 3_600_000);
+    assert_eq!(report.chunks.len(), 2);
+    assert_eq!(report.chunks[0].chunk_hash, 900);
+    assert!(report.chunks[0].content_hash != 0);
+    assert_eq!(report.chunks[0].source_ref, "runbook.md#heading=rollback");
+    assert_eq!(report.chunks[0].heading_path, vec!["rollback"]);
+    assert_eq!(
+        report.chunks[0]
+            .metadata
+            .get("line_start")
+            .map(String::as_str),
+        Some("1")
+    );
+    assert_eq!(report.chunks[1].chunk_hash, 901);
+    assert_eq!(report.chunks[1].source_ref, "runbook.md#heading=checks");
+    assert_eq!(
+        report.chunks[1].parent_source_ref.as_deref(),
+        Some("runbook.md#heading=rollback")
+    );
+    assert_eq!(report.source_refs.len(), report.chunks.len());
+    assert_eq!(
+        report.chunks[1]
+            .metadata
+            .get("heading_level")
+            .map(String::as_str),
+        Some("2")
+    );
+    assert_eq!(
+        report.chunks[0]
+            .metadata
+            .get("linked_refs")
+            .map(String::as_str),
+        Some("baseline://resources/runbook-extra.md")
+    );
+    assert_eq!(
+        report.chunks[1]
+            .metadata
+            .get("code_language")
+            .map(String::as_str),
+        Some("bash")
+    );
+    assert_eq!(
+        report.chunks[1]
+            .metadata
+            .get("chunk_kind")
+            .map(String::as_str),
+        Some("code")
+    );
+}
+
+// shared-corpus: context_resource_lifecycle_reference_parity
+#[test]
+fn context_resource_lifecycle_models_import_paths_refresh_and_delete() {
+    let url = parse_context_resource(ContextResourceParseRequest {
+        raw_uri: "https://docs.example.com/runbook".to_string(),
+        resource_type: Some("html".to_string()),
+        text: "Remote runbook body".to_string(),
+        max_chunk_chars: 1_400,
+        overlap_chars: 120,
+        chunk_hash_base: None,
+        owner_scope: "team:docs".to_string(),
+        version: "etag-1".to_string(),
+        watch_interval_minutes: 30,
+        parser_name: "url-parser".to_string(),
+    });
+    let git = parse_context_resource(ContextResourceParseRequest {
+        raw_uri: "git@github.com:matrixarkai/TemporalStore.git".to_string(),
+        resource_type: Some("git".to_string()),
+        text: "README source".to_string(),
+        max_chunk_chars: 1_400,
+        overlap_chars: 120,
+        chunk_hash_base: None,
+        owner_scope: "team:code".to_string(),
+        version: "main@abc".to_string(),
+        watch_interval_minutes: 0,
+        parser_name: "git-parser".to_string(),
+    });
+    let pdf = parse_context_resource(ContextResourceParseRequest {
+        raw_uri: "file:///tmp/report.pdf".to_string(),
+        resource_type: None,
+        text: "Extracted PDF text".to_string(),
+        max_chunk_chars: 1_400,
+        overlap_chars: 120,
+        chunk_hash_base: None,
+        owner_scope: "team:docs".to_string(),
+        version: "pdf-v1".to_string(),
+        watch_interval_minutes: 0,
+        parser_name: "pdf-parser".to_string(),
+    });
+    let wiki = parse_context_resource(ContextResourceParseRequest {
+        raw_uri: "wiki://doc/abc123".to_string(),
+        resource_type: Some("doc".to_string()),
+        text: "Wiki imported document".to_string(),
+        max_chunk_chars: 1_400,
+        overlap_chars: 120,
+        chunk_hash_base: None,
+        owner_scope: "team:docs".to_string(),
+        version: "doc-v1".to_string(),
+        watch_interval_minutes: 10,
+        parser_name: "wiki-parser".to_string(),
+    });
+
+    assert_eq!(url.lifecycle.import_kind, ContextResourceImportKind::Url);
+    assert_eq!(
+        git.lifecycle.import_kind,
+        ContextResourceImportKind::GitRepo
+    );
+    assert_eq!(pdf.lifecycle.import_kind, ContextResourceImportKind::Pdf);
+    assert_eq!(
+        wiki.lifecycle.import_kind,
+        ContextResourceImportKind::WikiDoc
+    );
+    assert!(url.chunks[0].metadata.contains_key("parser_name"));
+
+    let report = update_context_resource_lifecycle(
+        vec![
+            url.lifecycle.clone(),
+            git.lifecycle.clone(),
+            pdf.lifecycle.clone(),
+            wiki.lifecycle.clone(),
+        ],
+        vec![
+            ContextResourceLifecycleUpdate {
+                raw_uri: url.raw_uri.clone(),
+                action: ContextResourceLifecycleAction::Refresh,
+                owner_scope: String::new(),
+                version: "etag-2".to_string(),
+                watch_interval_minutes: 30,
+                observed_at_ms: 1_000,
+            },
+            ContextResourceLifecycleUpdate {
+                raw_uri: git.raw_uri.clone(),
+                action: ContextResourceLifecycleAction::Delete,
+                owner_scope: String::new(),
+                version: String::new(),
+                watch_interval_minutes: 0,
+                observed_at_ms: 1_000,
+            },
+        ],
+    );
+    assert_eq!(report.watched_count, 2);
+    assert_eq!(report.deleted_count, 1);
+    assert!(report
+        .resources
+        .iter()
+        .any(|resource| resource.raw_uri == url.raw_uri
+            && resource.version == "etag-2"
+            && resource.invalidates_version == "etag-1"
+            && resource.next_refresh_after_ms == 1_801_000));
+    assert!(report
+        .resources
+        .iter()
+        .any(|resource| resource.raw_uri == git.raw_uri && resource.deleted));
+    assert_eq!(report.import_kinds.get("url").copied(), Some(1));
+    assert_eq!(report.import_kinds.get("git_repo").copied(), Some(1));
+    assert_eq!(report.import_kinds.get("pdf").copied(), Some(1));
+    assert_eq!(report.import_kinds.get("wiki_doc").copied(), Some(1));
+}
+
+// shared-corpus: context_resource_skill_parser_reference_parity
+#[test]
+fn context_skill_parser_extracts_frontmatter_and_capability_sections() {
+    let skill = parse_context_skill_markdown(
+            "skills/context-debug/SKILL.md",
+            "---\nname: context-debug\ndescription: Trace context ingestion and retrieval.\nversion: 1.2.0\nowner_scope: team:context\nprecedence: high\nenabled: true\ntags: [context, debug, reference]\nallowed_tools:\n  - context_workflow_harness\n  - codex_context_hook\ntriggers: [context-debug, retrieval-trace]\nmodels: [nomic-embed-text, qwen2.5vl]\n---\n\n# Context Debug\n\n## When To Use\n\n- Use for context trace debugging.\n\n## Tools\n\n- context_workflow_harness\n- `codex_context_hook` captures prompt context.\n\n## Resources\n\n- [Debug Resource](baseline://resources/context-debug.md)\n\n## Examples\n\n- Query the context debug flow for stale entity filters.\n",
+        );
+    assert!(skill.status.ok);
+    assert_eq!(skill.skill_name, "context-debug");
+    assert_eq!(skill.description, "Trace context ingestion and retrieval.");
+    assert_eq!(skill.version, "1.2.0");
+    assert_eq!(skill.owner_scope, "team:context");
+    assert!(skill.enabled);
+    assert_eq!(skill.precedence, ContextSkillPrecedence::High);
+    assert_eq!(
+        skill.front_matter.get("tags").map(String::as_str),
+        Some("[context, debug, reference]")
+    );
+    assert!(skill.tag_refs.contains(&"context".to_string()));
+    assert!(skill.tag_refs.contains(&"debug".to_string()));
+    assert!(skill.tag_refs.contains(&"reference".to_string()));
+    assert!(skill.capability_refs.contains(&"when-to-use".to_string()));
+    assert!(skill.capability_refs.contains(&"tools".to_string()));
+    assert!(skill
+        .instruction_refs
+        .contains(&"Use for context trace debugging".to_string()));
+    assert!(skill
+        .tool_refs
+        .contains(&"context_workflow_harness".to_string()));
+    assert!(skill.tool_refs.contains(&"codex_context_hook".to_string()));
+    assert!(skill
+        .allowed_tools
+        .contains(&"context_workflow_harness".to_string()));
+    assert!(skill
+        .allowed_tools
+        .contains(&"codex_context_hook".to_string()));
+    assert!(skill.triggers.contains(&"context-debug".to_string()));
+    assert!(skill.triggers.contains(&"retrieval-trace".to_string()));
+    assert!(skill.model_refs.contains(&"nomic-embed-text".to_string()));
+    assert!(skill.model_refs.contains(&"qwen2.5vl".to_string()));
+    assert!(skill
+        .resource_refs
+        .contains(&"baseline://resources/context-debug.md".to_string()));
+    assert!(skill
+        .example_refs
+        .contains(&"Query the context debug flow for stale entity filters".to_string()));
+    assert!(skill.resource.chunks.iter().all(|chunk| chunk
+        .metadata
+        .get("resource_type")
+        .map(String::as_str)
+        == Some("skill")));
+}
+
+// shared-corpus: context_resource_skill_registry_reference_parity
+#[test]
+fn context_skill_registry_supports_updates_and_retrieval_selection() {
+    let active = parse_context_skill_markdown(
+        "skills/context-debug/SKILL.md",
+        "---\nname: context-debug\ndescription: Trace context retrieval.\nversion: 1.0.0\nowner_scope: team:context\nprecedence: low\nallowed_tools: [context_workflow_harness]\ntriggers: [context-debug, retrieval]\n---\n\n# Context Debug\n",
+    );
+    let disabled = parse_context_skill_markdown(
+        "skills/payment-debug/SKILL.md",
+        "---\nname: payment-debug\ndescription: Disabled payment workflow.\nversion: 0.9.0\nowner_scope: team:payments\nstatus: disabled\nprecedence: critical\nallowed_tools: [context_workflow_harness]\ntriggers: [payment]\n---\n\n# Payment Debug\n",
+    );
+    let registry = context_skill_registry_from_parsed(&[active, disabled], 10);
+    assert_eq!(registry.enabled_count, 1);
+    assert_eq!(registry.disabled_count, 1);
+    assert_eq!(
+        registry.highest_precedence,
+        ContextSkillPrecedence::Critical
+    );
+
+    let updated = update_context_skill_registry(
+        registry.entries,
+        vec![
+            ContextSkillRegistryUpdate {
+                skill_name: "payment-debug".to_string(),
+                enabled: Some(true),
+                precedence: Some(ContextSkillPrecedence::Critical),
+                owner_scope: Some("team:context".to_string()),
+                triggers: Some(vec!["payment".to_string(), "retrieval".to_string()]),
+                allowed_tools: Some(vec!["context_workflow_harness".to_string()]),
+                version: Some("1.1.0".to_string()),
+                updated_at_ms: 20,
+            },
+            ContextSkillRegistryUpdate {
+                skill_name: "context-debug".to_string(),
+                enabled: Some(false),
+                precedence: None,
+                owner_scope: None,
+                triggers: None,
+                allowed_tools: None,
+                version: None,
+                updated_at_ms: 21,
+            },
+        ],
+    );
+    assert_eq!(updated.enabled_count, 1);
+    assert!(updated
+        .version_updates
+        .contains(&"payment-debug:0.9.0->1.1.0".to_string()));
+
+    let selection = select_context_skills_for_retrieval(ContextSkillSelectionRequest {
+        query: "payment retrieval trace".to_string(),
+        owner_scope: "team:context".to_string(),
+        tool_name: "context_workflow_harness".to_string(),
+        include_disabled: false,
+        allowed_scope_layers: Vec::new(),
+        limit: 4,
+        registry: updated.entries,
+    });
+    assert!(selection.status.ok, "{:?}", selection);
+    assert_eq!(selection.selected[0].skill_name, "payment-debug");
+    assert_eq!(selection.selected[0].version, "1.1.0");
+    assert_eq!(
+        selection.selected[0].precedence,
+        ContextSkillPrecedence::Critical
+    );
+    assert!(selection.selected[0]
+        .matched_triggers
+        .contains(&"payment".to_string()));
+    assert!(selection
+        .skipped_disabled
+        .contains(&"context-debug".to_string()));
+}
+
+// shared-corpus: context_resource_skill_parser_reference_parity
+#[test]
+fn parsed_resource_and_skill_chunks_feed_rust_ingestion_and_retrieval() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(1024 * 1024, &cache_dir, &block_dir, &index_dir);
+    engine.load_shard(1);
+    let report = ingest_resource_skill_context(
+        &engine,
+        ContextResourceSkillIngestRequest {
+            shard_id: 1,
+            tenant_hash: 42,
+            resources: vec![ContextResourceParseRequest {
+            raw_uri: "baseline://resources/runbook.md".to_string(),
+            resource_type: Some("md".to_string()),
+            text: "# Incident\n\nCheckout latency increased because the payment dependency timed out.\n\n## Fix\n\nRollback the payment gateway canary and verify p95 latency."
+                .to_string(),
+            max_chunk_chars: 220,
+            overlap_chars: 40,
+            chunk_hash_base: None,
+            owner_scope: "team:payments".to_string(),
+            version: "v1".to_string(),
+            watch_interval_minutes: 15,
+            parser_name: "unit-test-parser".to_string(),
+            },
+            ],
+            skills: vec![ContextSkillIngestInput {
+                raw_uri: "skills/payment-incident/SKILL.md".to_string(),
+                text: "---\nname: payment-incident\ndescription: Debug payment incident context.\nprecedence: high\nowner_scope: team:payments\nallowed_tools: [context_workflow_harness]\ntriggers: [payment, checkout, latency]\n---\n\n# Payment Incident\n\n## When To Use\n\nUse when checkout latency or payment risk spikes.\n"
+                    .to_string(),
+            }],
+            query: "payment dependency rollback p95 latency".to_string(),
+            start_time_ms: 0,
+            end_time_ms: 10_000,
+            max_events: 8,
+            provider: ContextModelProviderConfig::default(),
+        },
+    );
+    assert!(
+        report.status.ok,
+        "status={:?} fanout={:?} secondary_indexes={:?}",
+        report.status, report.fanout, report.secondary_indexes
+    );
+    assert_eq!(report.ingest.failed, 0);
+    assert!(report.ingest.extracts.iter().all(|extract| {
+        extract.event.source_ref.is_empty()
+            && extract.event.related_node_hashes.is_empty()
+            && extract.event.compact_attrs.is_empty()
+            && !extract.source_ref.is_empty()
+            && !extract.related_node_hashes.is_empty()
+            && extract.summary_refs.len() == 2
+    }));
+    assert_eq!(report.resource_lifecycle.watched_count, 1);
+    assert_eq!(
+        report
+            .resource_lifecycle
+            .import_kinds
+            .get("markdown")
+            .copied(),
+        Some(1)
+    );
+    assert_eq!(report.skill_registry.enabled_count, 1);
+    assert_eq!(
+        report.skill_registry.highest_precedence,
+        ContextSkillPrecedence::High
+    );
+    assert_eq!(
+        report.skill_selection.selected[0].skill_name,
+        "payment-incident"
+    );
+    assert!(report.skill_selection.selected[0]
+        .matched_triggers
+        .contains(&"payment".to_string()));
+    assert!(report.fanout.query_back_ok, "{:?}", report.fanout);
+    assert!(
+        report.secondary_indexes.query_back_ok,
+        "{:?}",
+        report.secondary_indexes
+    );
+    assert_eq!(report.fanout.node_count, report.ingest.accepted);
+    assert_eq!(report.fanout.event_count, report.ingest.accepted);
+    assert_eq!(report.fanout.slab_count, report.ingest.accepted);
+    assert_eq!(report.fanout.entity_count, report.ingest.accepted);
+    assert_eq!(report.fanout.child_ref_count, report.ingest.accepted);
+    assert_eq!(report.fanout.compression_count, report.ingest.accepted);
+    assert_eq!(report.fanout.summary_count, report.ingest.accepted * 2);
+    assert_eq!(report.fanout.embedding_count, report.ingest.accepted * 3);
+    assert_eq!(report.fanout.dirty_marker_count, report.ingest.accepted);
+    assert!(!report.secondary_indexes.resource_refs.is_empty());
+    assert!(!report.secondary_indexes.skill_refs.is_empty());

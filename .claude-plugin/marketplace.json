@@ -7,3 +7,7 @@
     "name": "MatrixArkAI",
     "url": "https://temporalstore.ai"
   },
+  "plugins": [
+    {
+      "name": "matrixark-memory",
+      "source": "./integrations/claude-plugin",

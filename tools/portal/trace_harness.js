@@ -48,3 +48,20 @@ new Function("window", page.slice(from, to))(win);
 
 const changes = [];
 win.__matrixarkTrace.onChange(function (n) { changes.push(n); });
+
+(async () => {
+  const okResponse = await win.fetch("/ok");
+  /* The whole point: the caller still gets a body. A recorder that read it to pull out an
+     incident token would hand back an empty one and break every panel on the portal. */
+  const bodyAfterRecording = await okResponse.text();
+
+  await win.fetch("/refused");
+  let refusedError = "";
+  try { await win.fetch("/gone"); } catch (e) { refusedError = e.message; }
+
+  /* Read the three before flooding the ring, or the assertions below describe whatever survived
+     the flood rather than the three calls they name. */
+  const three = win.__matrixarkTrace.calls();
+
+  /* The ring is bounded: a portal tab is left open for days. */
+  for (let i = 0; i < 80; i++) { await win.fetch("/ok"); }
