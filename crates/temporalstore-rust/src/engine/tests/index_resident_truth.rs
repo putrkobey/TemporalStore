@@ -293,3 +293,298 @@ pub(super) fn freed_by_dropping_block_indexes(engine: &TemporalEngine) -> (u64, 
 /// distribution so the size of that floor is a reading rather than an average applied to a guess.
 ///
 /// Returns `(request_bytes, chunk_bytes)`.
+#[cfg(feature = "alloc-probe")]
+pub(super) fn chunk_for_sizes(sizes: &[usize]) -> (u64, u64) {
+    // Allocated OUTSIDE the window and never grown inside it, so the carrier contributes nothing.
+    let mut held: Vec<Vec<u8>> = Vec::with_capacity(sizes.len());
+    let probe = Probe::start();
+    for size in sizes {
+        held.push(Vec::<u8>::with_capacity(*size));
+    }
+    let counts = probe.stop();
+    assert_eq!(
+        held.capacity(),
+        sizes.len(),
+        "the carrier grew inside the measurement and its own buffer is now an unknown term"
+    );
+    std::hint::black_box(&held);
+    drop(held);
+    (counts.alloc_bytes, counts.chunk_bytes)
+}
+
+// =============================================================================================
+// THE INSTRUMENT'S OWN CONTROLS
+// =============================================================================================
+
+/// THE PLANTED MARKER FOR THE DROP INSTRUMENT. Recovered exactly, or every figure below is noise.
+///
+/// The failure this guards against reads as good news: an instrument reporting near zero makes a
+/// shape look free.
+///
+/// rust-internal: measures the harness's own instrument, no product behaviour
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "the counting allocator is process-wide; run by name"]
+fn the_drop_instrument_used_here_recovers_a_planted_megabyte_exactly() {
+    const PLANTED: usize = 1 << 20;
+    let marker: Vec<u8> = vec![0xA5; PLANTED];
+    let probe = Probe::start();
+    drop(marker);
+    let counts = probe.stop();
+    println!(
+        "planted {PLANTED} B, drop instrument returned {} B in {} free(s)",
+        counts.free_bytes, counts.frees
+    );
+    assert_eq!(
+        PLANTED as u64, counts.free_bytes,
+        "the drop instrument returned {} B for a planted {PLANTED} B; it is not measuring what it \
+         is being read as measuring",
+        counts.free_bytes
+    );
+    assert_eq!(
+        1, counts.frees,
+        "one planted vector freed {} times, not once",
+        counts.frees
+    );
+}
+
+/// AND THE `Arc<str>` RULE IS RECOVERED, NOT ASSUMED.
+///
+/// The fixed report charges `ARC_HEADER_BYTES + len` for a name held out of line. That is a claim
+/// about `Arc`'s layout, which is not a guaranteed thing to know; this recovers it from the
+/// allocator at three lengths, so a standard library that changed it fails here rather than
+/// silently moving every out-of-line figure this module and the shipped report both charge.
+///
+/// rust-internal: measures the standard library's allocation for a shared name
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "the counting allocator is process-wide; run by name"]
+fn the_arc_payload_rule_used_here_is_recovered_from_the_allocator() {
+    // ONE is the length that refuted the first version of the rule, and it is kept for that.
+    // The other three straddle a word boundary in both directions.
+    for len in [1usize, 8, 17, 4096] {
+        let source: String = "k".repeat(len);
+        let probe = Probe::start();
+        let shared: std::sync::Arc<str> = std::sync::Arc::from(source.as_str());
+        let counts = probe.stop();
+        std::hint::black_box(&shared);
+        println!(
+            "  Arc<str> of {len} B: allocator charged {} B in {} call(s), rule says {} B",
+            counts.alloc_bytes,
+            counts.allocs,
+            arc_str_request(len)
+        );
+        assert_eq!(
+            arc_str_request(len) as u64,
+            counts.alloc_bytes,
+            "an Arc<str> of {len} B charged {} B; the rule this module charges out-of-line names \
+             with says {} B",
+            counts.alloc_bytes,
+            arc_str_request(len)
+        );
+        assert_eq!(
+            1, counts.allocs,
+            "one shared name took {} allocations",
+            counts.allocs
+        );
+    }
+}
+
+// =============================================================================================
+// THE MEASUREMENT
+// =============================================================================================
+
+/// THE SHIPPED REPORT AGAINST THE ALLOCATOR, AT BOTH RANGES AND TWO CORPUS SIZES.
+///
+/// Four arms. Each seeds a store, walks its bucket index, reads the SHIPPED figure, then destroys
+/// the index inside a probe window and reads back what the allocator actually returned. The
+/// denominator on every row is the exact instrument, never another `size_of` product.
+///
+/// WRITTEN DOWN, BECAUSE A PER-PAGE FIGURE NEEDS ITS POPULATION STATED. The page population is one
+/// page per routed string key, asserted against the seed's own key count; the bucket population is
+/// decided by the routing range and differs by three orders of magnitude between the two arms,
+/// which is the whole reason both are run.
+///
+/// rust-internal: measures the engine's own index report, no product behaviour
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "seeds four stores up to 40,000 records; the counting allocator is process-wide; run by name"]
+fn the_resident_index_report_is_measured_against_the_allocator() {
+    println!(
+        "size_of: BucketNode {} B, BlockIndex {} B, (u64, BlockIndex) {} B, BlockIndexMap {} B, \
+         growth step {BLOCK_LIST_GROWTH_STEP}",
+        std::mem::size_of::<BucketNode>(),
+        std::mem::size_of::<BlockIndex>(),
+        std::mem::size_of::<(u64, BlockIndex)>(),
+        std::mem::size_of::<BlockIndexMap>()
+    );
+    // ONE PAGE PER HASH FIELD, so the container arm's page population is keys * members and not
+    // one per key. #1959's whole measurement was an artefact of a page population nobody wrote
+    // down; both denominators are asserted below against the seed that produced them.
+    const MEMBERS: usize = 100;
+    for shape in [Shape::Routed, Shape::Container] {
+        for records in [SMALL, LARGE] {
+            for end_routing_bucket in [WIDE_END, NARROW_END] {
+                let dir = tempfile::tempdir().expect("tempdir");
+                let engine = engine_on(dir.path());
+                load_on(&engine, end_routing_bucket);
+                let seeded = match shape {
+                    Shape::Routed => seed_routed(&engine, records).len(),
+                    Shape::Container => {
+                        let keys = seed_container(&engine, records / MEMBERS, MEMBERS);
+                        keys.len() * MEMBERS
+                    }
+                };
+                let seen = walk(&engine);
+                assert_eq!(
+                    seen.blocks, seeded as u64,
+                    "{shape:?}/{records}/{end_routing_bucket}: the index holds {} pages for a seed \
+                     of {seeded}, so the per-record divisor below is not this fixture's",
+                    seen.blocks
+                );
+                assert!(
+                    seen.buckets > 0,
+                    "{shape:?}/{records}/{end_routing_bucket}: no buckets to divide by"
+                );
+                let reported = engine.bucket_index_resident_bytes(1);
+                let range = if end_routing_bucket == NARROW_END {
+                    "0..1023"
+                } else {
+                    "whole keyspace"
+                };
+                println!(
+                    "\n== {shape:?}, {records} pages on {range} ==\n  buckets {} (Empty {} / One \
+                     {} / Many {}), pages {}, list len {} vs capacity {} (p50 {}, p90 {}, MAX {}, \
+                     {} lists)",
+                    seen.buckets,
+                    seen.arm_empty,
+                    seen.arm_one,
+                    seen.arm_many,
+                    seen.blocks,
+                    seen.list_len,
+                    seen.list_capacity,
+                    seen.percentile(0.50),
+                    seen.percentile(0.90),
+                    seen.max_list(),
+                    seen.list_lengths.values().sum::<u64>()
+                );
+                println!(
+                    "  names: {} distinct key allocations for {} entries ({} B once per \
+                     allocation, {} B once per entry), {} also held outside this index; \
+                     components {} ({} B once per allocation, {} B once per entry), {} held \
+                     outside",
+                    seen.key_allocs,
+                    seen.blocks,
+                    seen.key_request,
+                    seen.key_request_per_entry,
+                    seen.keys_held_outside,
+                    seen.component_allocs,
+                    seen.component_request,
+                    seen.component_request_per_entry,
+                    seen.components_held_outside
+                );
+                println!(
+                    "  nodes inline {} B, page heap at capacity {} B, out of line {} B",
+                    seen.node_inline_request(),
+                    seen.block_heap_request,
+                    seen.out_of_line_request()
+                );
+                // THE SHIPPED PAGE TERM ON ITS OWN. The whole-report ratio mixes in the node term,
+                // which is INLINE in the bucket map and is not freed by the drop below -- comparing
+                // the two would be comparing different populations and reading the difference as an
+                // error. This is the term the change actually moves.
+                let shipped_block_term = seen
+                    .blocks
+                    .saturating_mul(std::mem::size_of::<BlockIndex>() as u64);
+                let (freed_bytes, frees) = freed_by_dropping_block_indexes(&engine);
+                assert!(
+                    freed_bytes > 0 && frees > 0,
+                    "{shape:?}/{records}/{end_routing_bucket}: the drop instrument returned \
+                     {freed_bytes} B in {frees} frees; a zero reading is the instrument failing, \
+                     not the index being free"
+                );
+                println!(
+                    "  whole report {reported} B (nodes {} + pages {shipped_block_term})",
+                    seen.node_inline_request()
+                );
+                println!(
+                    "  PAGE TERM shipped {shipped_block_term} B | walked at capacity {} B | \
+                     allocator returned {freed_bytes} B in {frees} frees",
+                    seen.block_heap_request
+                );
+                println!(
+                    "    shipped/returned {:.4}   shortfall {} B, {:.2} B a page",
+                    shipped_block_term as f64 / freed_bytes as f64,
+                    freed_bytes as i64 - shipped_block_term as i64,
+                    (freed_bytes as i64 - shipped_block_term as i64) as f64 / seen.blocks as f64
+                );
+                println!(
+                    "    walked/returned  {:.4}   difference {} B",
+                    seen.block_heap_request as f64 / freed_bytes as f64,
+                    freed_bytes as i64 - seen.block_heap_request as i64
+                );
+                // THE CHUNK COLUMN, over this index's own allocation size distribution.
+                let (replayed_request, replayed_chunk) = chunk_for_sizes(&seen.alloc_sizes);
+                assert_eq!(
+                    replayed_request, seen.block_heap_request,
+                    "{shape:?}/{records}/{end_routing_bucket}: the replay asked for \
+                     {replayed_request} B where the walk accounts for {} B, so the chunk column \
+                     below is not this index's size distribution",
+                    seen.block_heap_request
+                );
+                println!(
+                    "    CHUNK over {} allocations: request {replayed_request} B, allocator set \
+                     aside {replayed_chunk} B ({:.4}x, +{} B, +{:.2} B a page)",
+                    seen.alloc_sizes.len(),
+                    replayed_chunk as f64 / replayed_request as f64,
+                    replayed_chunk - replayed_request,
+                    (replayed_chunk - replayed_request) as f64 / seen.blocks as f64
+                );
+                println!(
+                    "    shipped/chunk    {:.4}   fixed/chunk {:.4}",
+                    shipped_block_term as f64 / replayed_chunk as f64,
+                    seen.block_heap_request as f64 / replayed_chunk as f64
+                );
+                assert!(
+                    replayed_chunk >= replayed_request,
+                    "{shape:?}/{records}/{end_routing_bucket}: the allocator set aside \
+                     {replayed_chunk} B for {replayed_request} B of request, which is below the \
+                     request. The chunk counter is not reading what it is documented to read"
+                );
+                // THE CALIBRATION. The walk is the arithmetic the fixed report ships; the drop is
+                // the allocator. If these ever stop agreeing, the shipped figure has acquired an
+                // error nobody measured -- which is the state this module exists to leave behind.
+                assert_eq!(
+                    seen.block_heap_request, freed_bytes,
+                    "{shape:?}/{records}/{end_routing_bucket}: the walk accounts for {} B of page \
+                     index and the allocator returned {freed_bytes} B. The fixed report ships this \
+                     walk, so a difference here is the shipped figure's error and not the test's",
+                    seen.block_heap_request
+                );
+                // AND THE SHIPPED FUNCTION IS THE WALK. Everything above calibrates an
+                // arithmetic; this is the assertion that the arithmetic calibrated is the one the
+                // engine publishes, at every one of the eight arms rather than at a chosen one.
+                assert_eq!(
+                    reported,
+                    seen.node_inline_request() + seen.block_heap_request,
+                    "{shape:?}/{records}/{end_routing_bucket}: the engine published {reported} B \
+                     where the walk this module calibrated against the allocator accounts for \
+                     {} B. The calibration is then of something other than the shipped figure",
+                    seen.node_inline_request() + seen.block_heap_request
+                );
+                // AND THE NAMES ARE NOT THIS INDEX'S TO CHARGE. The drop above returned the page
+                // buffers and NOTHING ELSE: every shared name survived it, because something other
+                // than the bucket index still owns one. Charging them to this report would be
+                // double counting, which is the correction this arm exists to establish.
+                assert_eq!(
+                    seen.key_allocs, seen.keys_held_outside,
+                    "{shape:?}/{records}/{end_routing_bucket}: {} of {} key allocations are held \
+                     ONLY by this index. The fixed report declines to charge out-of-line names on \
+                     the measured ground that the index never owns them; if that has stopped being \
+                     true, the report is now under-counting by whatever those names weigh",
+                    seen.key_allocs - seen.keys_held_outside,
+                    seen.key_allocs
+                );
+            }
+        }
+    }

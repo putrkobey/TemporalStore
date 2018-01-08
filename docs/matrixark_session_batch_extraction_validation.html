@@ -67,3 +67,37 @@ Expected behavior:
 - `ContextIndex` records are created
 - `batch_l0` summary is created
 - every segment/entity keeps `source_event_ids`
+- retrieval uses tree traversal and does not fall back to flat scan
+
+## Data Model Flow
+
+### Raw online ingestion
+
+Each incoming message writes:
+
+```text
+ContextEvent
+ContextEmbedding(event_text)
+ContextSummary(node_l0/node_l1/session_l0)
+ContextEmbedding(node_l0/node_l1/session_l0)
+session_buffer_event
+```
+
+These records make the message immediately retrievable even before the batch is committed.
+
+### Batch/session commit
+
+When the threshold is reached:
+
+```text
+pending_session_events(scope)
+-&gt; message_from_event_record(...)
+-&gt; batch_extract(derive_from_existing_events=true)
+-&gt; one_pass_memory_extraction(...)
+```
+
+The commit writes:
+
+```text
+ContextSegment
+ContextEmbedding(segment_text)
