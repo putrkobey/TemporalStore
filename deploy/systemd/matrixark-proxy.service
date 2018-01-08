@@ -4,9 +4,3 @@
 # Requires python3 on the node for the loader (a stdlib-only script).
 [Unit]
 Description=TemporalStore proxy
-After=network-online.target matrixark-metaserver.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-WorkingDirectory=/opt/temporalstore
