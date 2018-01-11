@@ -23,16 +23,3 @@ services:
       - "${TEMPORALSTORE_HF_READER_PORT:-8000}:8000"
     volumes:
       - temporalstore-hf-cache:/root/.cache/huggingface
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/v1/models', timeout=2).read()"]
-      interval: 10s
-      timeout: 5s
-      retries: 60
-
-  benchmark-runner:
-    image: python:3.11-slim
-    working_dir: /workspace
-    environment:
-      TEMPORALSTORE_READER_BASE_URL: "http://open-reader:11434/v1"
-      TEMPORALSTORE_READER_MODEL: "${TEMPORALSTORE_READER_MODEL:-qwen2.5:0.5b}"
-    volumes:
