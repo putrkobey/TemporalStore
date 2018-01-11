@@ -115,3 +115,239 @@ fn seed(engine: &TemporalEngine, shard_id: crate::types::ShardId) {
         });
         assert!(
             response.status.ok,
+            "hash write {index} on shard {shard_id}: {:?}",
+            response.status
+        );
+    }
+}
+
+/// A loaded, seeded engine holding every shard in [`SHARD_IDS`].
+fn multi_shard_engine(dir: &std::path::Path) -> TemporalEngine {
+    let engine = engine_on(dir);
+    for shard_id in SHARD_IDS {
+        load(&engine, shard_id);
+        seed(&engine, shard_id);
+    }
+    engine
+}
+
+/// THE PREDICATE UNDER TEST, named once so the control below can exercise the SAME code the verdict
+/// rests on. A state carries `routed_under` when it answers `Some` and answers that exact id.
+fn carries(state: &crate::engine::state::ShardState, routed_under: crate::types::ShardId) -> bool {
+    state.shard_id() == Some(routed_under)
+}
+
+// =================================================================================================
+// 1. THE STAMP EQUALS THE KEY THE SERVED MAP ROUTES BY
+// =================================================================================================
+
+/// EVERY SHARD THE ENGINE SERVES CARRIES THE ID ITS OWNER ROUTES IT UNDER.
+///
+/// The engine's shard map IS the routing authority: `self.shards` is keyed by `ShardId` and every
+/// read, write and report reaches a shard by looking it up under that key. So the property is an
+/// equality between the key and the stamp, over every entry the map holds, on a fixture holding
+/// five shards at once.
+///
+/// THE PREDICATE'S OWN CONTROL RUNS FIRST. A check that cannot fail is indistinguishable from one
+/// that passes, and this one compares two numbers that an installer bug would make equal by
+/// accident, so `carries` is driven on a right answer, on a wrong-shard answer and on an unstamped
+/// state before it is pointed at the engine.
+#[test]
+fn every_served_shard_carries_the_id_its_owner_routes_it_under() {
+    // --- THE CONTROL, before any verdict. ---
+    let mut planted = crate::engine::state::ShardState::default();
+    assert!(
+        !carries(&planted, 7),
+        "`carries` reports an UNSTAMPED state as carrying shard 7, so it cannot distinguish a \
+         stamped shard from one that never entered the engine and every verdict below is empty"
+    );
+    planted.set_shard_id(7);
+    assert!(
+        carries(&planted, 7),
+        "`carries` does not report a state stamped with 7 as carrying 7, so it reports nothing"
+    );
+    assert!(
+        !carries(&planted, 41),
+        "`carries` reports a state stamped with 7 as carrying 41 -- it is not comparing the id at \
+         all, and a shard holding the WRONG shard's id would pass the loop below"
+    );
+    assert!(
+        !carries(&planted, 0),
+        "`carries` reports a state stamped with 7 as carrying 0; a stamp stuck at zero is the \
+         first mutation this guard exists to kill and it would survive"
+    );
+
+    // --- THE TREE. ---
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = multi_shard_engine(dir.path());
+    let shards = engine.shards.read().expect("engine lock poisoned");
+
+    let observed: Vec<crate::types::ShardId> = shards.keys().copied().collect();
+    let distinct: BTreeSet<crate::types::ShardId> = observed.iter().copied().collect();
+
+    // --- VACUITY FLOORS, BEFORE THE VERDICT. An empty map satisfies a for-loop. ---
+    assert_eq!(
+        SHARD_IDS.len(),
+        shards.len(),
+        "the fixture loaded {} shards and the served map holds {}; the loop below would be \
+         checking a different set from the one this module reasons about",
+        SHARD_IDS.len(),
+        shards.len()
+    );
+    assert!(
+        shards.len() >= 5,
+        "the served map holds {} shard(s); a single-shard fixture cannot tell an id from a \
+         constant and this whole module would pass on a stamp that ignores its argument",
+        shards.len()
+    );
+    assert_eq!(
+        shards.len(),
+        distinct.len(),
+        "the served map holds {} shards under {} distinct ids, so at least two entries share a \
+         key and the equality below is not per-shard",
+        shards.len(),
+        distinct.len()
+    );
+    assert!(
+        distinct.iter().filter(|id| **id != 0).count() >= 4,
+        "only {} served shard(s) have a non-zero id; a stamp stuck at 0 needs at least two \
+         non-zero shards to be caught and this fixture would let it through",
+        distinct.iter().filter(|id| **id != 0).count()
+    );
+    assert!(
+        distinct.contains(&0),
+        "shard 0 is not in the served map; the fixture no longer proves that a REAL zero id is \
+         distinguishable from an unstamped state"
+    );
+
+    let mut verdict_lines = Vec::new();
+    let mut unstamped = 0usize;
+    let mut mismatched = Vec::new();
+    for (routed_under, state) in shards.iter() {
+        let carried = state.shard_id();
+        verdict_lines.push(format!(
+            "    routed under {routed_under:>5}  carries {carried:?}"
+        ));
+        if carried.is_none() {
+            unstamped += 1;
+        }
+        if !carries(state, *routed_under) {
+            mismatched.push(format!("{routed_under} carries {carried:?}"));
+        }
+    }
+    println!(
+        "  {} served shards, {} distinct ids, ids {:?}",
+        shards.len(),
+        distinct.len(),
+        distinct
+    );
+    for line in &verdict_lines {
+        println!("{line}");
+    }
+    assert_eq!(
+        0, unstamped,
+        "{unstamped} of {} served shards entered the map without a shard id stamped. There is one \
+         function that installs a ShardState (`install_shard_state`) and it stamps; if another way \
+         in has appeared, route it through that one.",
+        shards.len()
+    );
+    assert!(
+        mismatched.is_empty(),
+        "{} of {} served shards carry an id that is NOT the key the served map routes them under: \
+         {mismatched:?}. A wrong id here is worse than none: \
+         `stable_block_object_id(shard, kind, key)` would return a well-formed id belonging to a \
+         different shard's object.",
+        mismatched.len(),
+        shards.len()
+    );
+}
+
+// =================================================================================================
+// 2. THE STAMP DERIVES IDS THE WRITE PATH ALREADY STORED
+// =================================================================================================
+
+/// THE ID A SERVED SHARD CARRIES DERIVES THE OBJECT ID ALREADY STORED ON ITS OWN PAGES.
+///
+/// The check in part 1 compares the stamp to the key it was inserted under, which an installer that
+/// stamps the wrong thing could still satisfy if it derived both from one argument. This one cannot
+/// be satisfied that way. Every `object_id` on a live page entry was computed by the WRITE PATH from
+/// the shard the engine was routing that write to, before this field existed and without consulting
+/// it. Re-deriving them from the shard's own stamp is therefore an equality between the new field
+/// and the engine's pre-existing routing behaviour, page by page, on five shards at once.
+///
+/// It is also the payoff stated as a fact: this is `stable_block_object_id(shard, kind, key)`
+/// computed from a `&ShardState` and NOTHING ELSE, which is precisely what the four functions named
+/// in this module's header could not do.
+#[test]
+fn the_id_a_served_shard_carries_derives_the_object_id_already_stored_on_its_blocks() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = multi_shard_engine(dir.path());
+    let shards = engine.shards.read().expect("engine lock poisoned");
+
+    let mut checked = 0usize;
+    let mut without_stored_id = 0usize;
+    let mut shards_with_blocks = 0usize;
+    let mut differed = Vec::new();
+
+    for (routed_under, state) in shards.iter() {
+        // THE ONLY INPUT. Not the map key -- the shard's own answer, which is the reachability
+        // this module is about.
+        let carried = state
+            .shard_id()
+            .expect("a served shard carries its id; part 1 of this module holds that");
+        let named = super::BlockObjects::of(&state.bucket_index);
+        let mut blocks_here = 0usize;
+        for bucket in state.bucket_index.bucket_map.values() {
+            for (handle, block) in bucket.block_index.iter() {
+                let object_key = named.at(bucket.routing_bucket, *handle);
+                // THE INDEPENDENT SIDE IS NOW THE WRITE PATH'S OWN COPY, and it has to be: the
+                // address used to hold one and does not any more. `bucket.object_index` was filled
+                // by the write path from the id it ACTUALLY USED, before this field existed and
+                // without consulting it -- so comparing a fresh derivation against that membership
+                // is still an equality between two answers rather than between one and itself.
+                let derived = crate::engine::hashing::stable_block_object_id(
+                    carried,
+                    block.model_id.as_str(),
+                    object_key,
+                );
+                blocks_here += 1;
+                checked += 1;
+                if !bucket.object_index.contains(&derived) {
+                    without_stored_id += 1;
+                    differed.push(format!(
+                        "shard {routed_under} kind {} key {} derived {derived}, which the bucket's \
+                         own object index does not hold",
+                        block.model_id.as_str(),
+                        object_key
+                    ));
+                }
+            }
+        }
+        if blocks_here > 0 {
+            shards_with_blocks += 1;
+        }
+    }
+
+    println!(
+        "  derived from the shard's own id on {checked} live page entries across \
+         {shards_with_blocks} shards ({without_stored_id} not held by their bucket's object index), \
+         {} differed",
+        differed.len()
+    );
+
+    // --- DENOMINATORS. A zero-entry walk satisfies the emptiness assertion below. ---
+    assert!(
+        checked >= 100,
+        "the walk compared {checked} page entries; the fixture writes {} records of two kinds on \
+         {} shards, so below 100 it is not reading the page index and `differed` is empty for the \
+         wrong reason",
+        RECORDS,
+        SHARD_IDS.len()
+    );
+    assert_eq!(
+        SHARD_IDS.len(),
+        shards_with_blocks,
+        "only {shards_with_blocks} of {} shards contributed a page entry, so the derivation was \
+         never exercised on the other shards' ids -- which is where a wrong id shows up",
+        SHARD_IDS.len()
+    );
