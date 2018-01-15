@@ -1179,3 +1179,397 @@ fn the_summary_last_dump_sequence_comes_from_the_manifest_not_from_the_node() {
             .bucket_nodes
             .into_iter()
             .find(|node| node.routing_bucket == routing_bucket)
+            .map(|node| node.last_dump_sequence)
+            .unwrap_or_default()
+    };
+
+    let summary_covered = summary_of(&engine, covered.routing_bucket);
+    println!(
+        "\n=== a bucket the newest manifest NAMES: {} ===\n  \
+         summary.last_dump_sequence={summary_covered}\n  \
+         report.last_dump_sequence={}\n  \
+         manifest.index_log_sequence={}  manifest.wal_sequence={}",
+        covered.routing_bucket,
+        reported(&engine, covered.routing_bucket),
+        manifest.index_log_sequence,
+        manifest.wal_sequence
+    );
+
+    assert_eq!(
+        manifest.index_log_sequence, summary_covered,
+        "the summary's last_dump_sequence is {summary_covered}; the newest manifest's index-log \
+         sequence is {} and its WAL sequence is {}. If the summary has started following the WAL \
+         clock, the dump ordering's comment has become true and this module's finding is stale",
+        manifest.index_log_sequence, manifest.wal_sequence
+    );
+    assert_eq!(
+        manifest.index_log_sequence,
+        reported(&engine, covered.routing_bucket),
+        "the physical index report publishes {} for a bucket the newest manifest names; it is \
+         supposed to carry the summary's figure now that the node holds none",
+        reported(&engine, covered.routing_bucket)
+    );
+    println!(
+        "  the manifest's two sequences read {} (WAL) and {} (index-log); they need not differ, \
+         and the uncovered bucket below is what makes this test discriminating when they do not",
+        manifest.wal_sequence, manifest.index_log_sequence
+    );
+
+    // THE DISCRIMINATING HALF: a bucket the newest manifest does not name must report 0. Without
+    // it every assertion above is satisfied by a report that stamps the manifest's number on
+    // every row.
+    let uncovered = rows
+        .iter()
+        .find(|row| !manifest.bucket_ids.contains(&row.routing_bucket))
+        .copied();
+    match uncovered {
+        Some(row) => {
+            let summary_uncovered = summary_of(&engine, row.routing_bucket);
+            let reported_uncovered = reported(&engine, row.routing_bucket);
+            println!(
+                "=== a bucket the newest manifest does NOT name: {} ===\n  \
+                 summary.last_dump_sequence={summary_uncovered}  \
+                 report.last_dump_sequence={reported_uncovered}",
+                row.routing_bucket
+            );
+            assert_eq!(
+                0, summary_uncovered,
+                "a bucket the newest manifest does not name carries {summary_uncovered} in its \
+                 summary, so `merge_last_dump_sequence` is no longer separating covered from \
+                 uncovered"
+            );
+            assert_eq!(
+                0, reported_uncovered,
+                "a bucket the newest manifest does not name is reported as dumped at \
+                 {reported_uncovered}; the report cannot be reading the manifest"
+            );
+        }
+        None => panic!(
+            "every one of the {} buckets in the map is named by the newest manifest, so the \
+             control that distinguishes covered from uncovered cannot run; the fixture needs a \
+             capped round that leaves a bucket out",
+            rows.len()
+        ),
+    }
+}
+
+// -------------------------------------------------------------------------------------------
+// 5. WHAT THE ONLY SHAPE WORTH SIXTEEN BYTES WOULD ACTUALLY COST.
+// -------------------------------------------------------------------------------------------
+
+/// The counting allocator over one `clone()`, which is the SECOND instrument.
+///
+/// `Clone` on a `BTreeMap` rebuilds the tree node by node, so what the allocator charges is the
+/// map's own nodes -- key array, value array, header, and every slot a node has not filled --
+/// plus whatever each value owns on the heap. That owes nothing to `size_of` x count, which is
+/// what makes the difference between the two a reading rather than an identity.
+///
+/// BYTES AND ALLOCATIONS, both, because the two disagree in SIGN on this structure's neighbours:
+/// #1959 measured a shape where bytes fell 36.0% while allocations rose 121%. A cost reported in
+/// one of them is half a reading.
+#[cfg(feature = "alloc-probe")]
+fn clone_alloc<T: Clone>(value: &T) -> (u64, u64) {
+    let probe = Probe::start();
+    let copy = value.clone();
+    let counts = probe.stop();
+    std::hint::black_box(&copy);
+    drop(copy);
+    (counts.alloc_bytes, counts.allocs)
+}
+
+/// THE PLANTED MARKER, recovered exactly, or every residual below is noise.
+///
+/// The failure this guards against is the one that reads as good news: an instrument reporting
+/// near zero makes a structure look free. A megabyte is planted and has to come back as a
+/// megabyte in ONE allocation -- not less, which would be blindness, and not more, which would be
+/// the probe charging for something other than the clone.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn the_clone_instrument_in_this_module_recovers_a_planted_megabyte_exactly() {
+    const PLANTED: usize = 1 << 20;
+    let marker: Vec<u8> = vec![0xA5; PLANTED];
+    let (bytes, allocs) = clone_alloc(&marker);
+    println!(
+        "planted {PLANTED} B, instrument charged {bytes} B in {allocs} allocation(s) ({:.4}x)",
+        bytes as f64 / PLANTED as f64
+    );
+    assert_eq!(
+        PLANTED as u64, bytes,
+        "the clone instrument charged {bytes} B for a planted {PLANTED} B; a residual taken with \
+         it would be measuring the instrument"
+    );
+    assert_eq!(
+        1, allocs,
+        "the clone instrument charged {allocs} allocations for one planted vector; the \
+         allocation figures below would be counting something else"
+    );
+}
+
+/// THE HOIST, PRICED ON ONE INSTRUMENT AT TWO CORPUS SIZES, IN BYTES AND ALLOCATIONS.
+///
+/// Moving the two transient claims into a side map keyed by bucket takes 16 bytes off every node
+/// -- a real sixteen; the width table above says so -- and buys a map entry for every DIRTY
+/// bucket. So it turns entirely on the dirty FRACTION. #1958 declined it on a fraction it
+/// measured at 100% in a fixture that never ran a dump; this runs one, at the CONFIGURED cap of
+/// 64 buckets a round rather than at "dump everything", on the routing range
+/// `docs/runtime_tuning.md` tells an operator to set.
+///
+/// BOTH SIDES ARE MEASURED WITH THE SAME INSTRUMENT. A saving taken as `size_of` arithmetic
+/// against a cost taken from the allocator is how a decline gets its sign inverted, so the side
+/// map is built for real and cloned under the probe, and the map of nodes the saving would come
+/// off is cloned under the same probe. The residual between the allocator's figure for that map
+/// and the node widths alone is reported rather than assumed away: it is the reason a word off
+/// this structure is worth more than its own eight bytes, and it is asserted non-zero because a
+/// residual of zero would mean the two instruments are not independent.
+///
+/// THE STORE PATH LENGTH IS HELD CONSTANT and asserted: allocation bytes move with it at about
+/// six bytes a character.
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "seeds 8,000 then 40,000 records; needs --features alloc-probe; run by name"]
+fn what_hoisting_the_two_transient_claims_would_cost_at_two_corpus_sizes() {
+    let mut path_lengths: Vec<usize> = Vec::new();
+
+    for (records, end_routing_bucket, range_label) in [
+        (8_000usize, u32::MAX, "default range"),
+        (8_000usize, CONFIGURED_END_BUCKET, "0..1023, the configured range"),
+        (40_000usize, u32::MAX, "default range"),
+        (40_000usize, CONFIGURED_END_BUCKET, "0..1023, the configured range"),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        path_lengths.push(dir.path().as_os_str().len());
+
+        let engine = seq_engine(dir.path(), "hoist");
+        load_at(&engine, end_routing_bucket);
+        let first = seq_keys("first", records / 2);
+        let later = seq_keys("later", records / 2);
+        write_batches(&engine, &first, 118);
+        write_singles(&engine, &first[..16.min(first.len())], 119);
+        one_round_at_the_configured_cap(&engine);
+        write_batches(&engine, &later, 120);
+
+        let rows = sequences_by_bucket(&engine);
+        assert!(
+            !rows.is_empty(),
+            "denominator: no routing buckets at {records} records"
+        );
+        let dirty = rows.iter().filter(|row| row.dirty).count();
+        assert!(
+            dirty > 0,
+            "denominator: no dirty bucket at {records} records, so the side map this prices would \
+             be empty and its cost would read as zero"
+        );
+
+        // The side map, built for real and charged by the allocator across one clone.
+        let side: std::collections::BTreeMap<u32, (u64, u64)> = rows
+            .iter()
+            .filter(|row| row.dirty)
+            .map(|row| (row.routing_bucket, (row.wal_claim, row.index_log_claim)))
+            .collect();
+        let (side_bytes, side_allocs) = clone_alloc(&side);
+
+        // The map the sixteen bytes would come off, on the same instrument.
+        let (live_bytes, live_allocs, accounted) = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&SEQ_SHARD).expect("shard is loaded");
+            let (bytes, allocs) = clone_alloc(&shard.bucket_index.bucket_map);
+            (bytes, allocs, size_of::<BucketNode>() * rows.len())
+        };
+        let residual = live_bytes as i64 - accounted as i64;
+        let width_saving = 16 * rows.len();
+
+        println!(
+            "\n=== {records} records, {range_label}, dump cap {CONFIGURED_DUMP_CAP} ==="
+        );
+        println!(
+            "  buckets={} dirty={dirty} ({:.2}% dirty)",
+            rows.len(),
+            100.0 * dirty as f64 / rows.len() as f64
+        );
+        println!(
+            "  the bucket map, charged by the allocator: {live_bytes} B in {live_allocs} \
+             allocations; the node widths alone account for {accounted} B"
+        );
+        println!(
+            "  RESIDUAL outside the node widths: {residual} B, {:.2} B a bucket -- key arrays, \
+             node headers, unfilled value slots, and what each node owns on the heap",
+            residual as f64 / rows.len() as f64
+        );
+        println!(
+            "  off the nodes: 16 B x {} = {width_saving} B, {:.3} B a record, 0 allocations",
+            rows.len(),
+            width_saving as f64 / records as f64
+        );
+        println!(
+            "  onto the side map: {side_bytes} B in {side_allocs} allocations for {dirty} \
+             entries -- {:.1} B an entry, {:.3} B a record, {:.4} allocations a record",
+            side_bytes as f64 / dirty as f64,
+            side_bytes as f64 / records as f64,
+            side_allocs as f64 / records as f64
+        );
+        println!(
+            "  NET: {:+} B, {:+.3} B a record, {:+.4} allocations a record",
+            side_bytes as i64 - width_saving as i64,
+            (side_bytes as i64 - width_saving as i64) as f64 / records as f64,
+            side_allocs as f64 / records as f64
+        );
+
+        assert!(
+            side_bytes > 0,
+            "the allocator charged nothing for a side map of {dirty} entries; the probe is not \
+             measuring the clone"
+        );
+        assert!(
+            residual > 0,
+            "the allocator charged {live_bytes} B for a map of {} nodes whose widths add up to \
+             {accounted} B; a residual at or below zero means the two instruments are not \
+             independent and the subtraction is an identity",
+            rows.len()
+        );
+    }
+
+    assert_eq!(4, path_lengths.len(), "all four arms must have run");
+    let first_length = path_lengths[0];
+    for length in &path_lengths {
+        assert_eq!(
+            first_length, *length,
+            "the store path length moved between arms ({first_length} then {length}); allocation \
+             bytes move with it at about six bytes a character"
+        );
+    }
+
+    println!(
+        "\n=== the verdict, and it depends on the range ===\n  On the DEFAULT range a key lands \
+         in a bucket of its own, half the buckets are clean after a round, and the side map holds \
+         half as many entries as there are buckets -- so the hoist is a small win there. On the \
+         range an operator is told to configure, the buckets fill, the dump cap of \
+         {CONFIGURED_DUMP_CAP} cannot reach them all, essentially every bucket is dirty, and the \
+         side map costs more than the sixteen bytes it frees -- in bytes AND in allocations. The \
+         configured range is the one that decides it."
+    );
+}
+
+/// THE READ PATH OF THE HOISTED SHAPE, because the default assumption is a trade and a
+/// representation that slows the common path to shrink the node should be declined with numbers.
+///
+/// Today both claims are fields of a node the caller already has in hand: the reclaim plan walks
+/// `bucket_map` and reads them off each node as it goes, one pass, no second lookup. Hoisted,
+/// every one of those reads becomes a lookup in a second ordered map keyed by the bucket -- a
+/// tree descent per bucket, on a path that already holds the shard lock.
+///
+/// Both arms walk the SAME bucket set in the SAME order and produce the same total, and that
+/// equality is asserted before either is timed -- otherwise the two are not the same walk and the
+/// ratio compares nothing. ABBA rather than interleaving, so an order effect on a shared box
+/// cannot be read as a difference between the arms.
+///
+/// MEASURED IN THE TEST PROFILE, which is unoptimised, so the constant overstates what a release
+/// build would pay. The SIGN is what this is for: the hoisted arm does strictly more work -- a
+/// tree descent per bucket where the other reads a field -- and there is no configuration in
+/// which that reverses.
+#[test]
+#[ignore = "seeds 8,000 records; run by name"]
+fn the_read_path_of_the_hoisted_shape_is_priced() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (rows, _) = seeded_rows(dir.path(), "hoistread", 8_000, CONFIGURED_END_BUCKET);
+    let dirty_rows: Vec<Sequences> = rows.iter().filter(|row| row.dirty).copied().collect();
+    assert!(
+        dirty_rows.len() >= 64,
+        "denominator: only {} dirty buckets, too few to time a walk over",
+        dirty_rows.len()
+    );
+
+    let side: std::collections::BTreeMap<u32, (u64, u64)> = dirty_rows
+        .iter()
+        .map(|row| (row.routing_bucket, (row.wal_claim, row.index_log_claim)))
+        .collect();
+
+    // ABBA, so an order effect on a shared box cannot be read as a difference between the arms.
+    let inline_pass = || -> u128 {
+        let mut total = 0u128;
+        for row in &dirty_rows {
+            total += row.wal_claim as u128 + row.index_log_claim as u128;
+        }
+        std::hint::black_box(total)
+    };
+    let hoisted_pass = || -> u128 {
+        let mut total = 0u128;
+        for row in &dirty_rows {
+            let (wal, index_log) = side.get(&row.routing_bucket).copied().unwrap_or((0, 0));
+            total += wal as u128 + index_log as u128;
+        }
+        std::hint::black_box(total)
+    };
+
+    // THE CONTROL ON THE COMPARISON: both arms must produce the same total, or they are not
+    // reading the same thing and the timing compares two different walks.
+    assert_eq!(
+        inline_pass(),
+        hoisted_pass(),
+        "the two arms disagree on the total they read, so they are not the same walk"
+    );
+
+    const ROUNDS: usize = 200;
+    let mut inline_ns = 0u128;
+    let mut hoisted_ns = 0u128;
+    for _ in 0..ROUNDS {
+        let start = std::time::Instant::now();
+        std::hint::black_box(inline_pass());
+        inline_ns += start.elapsed().as_nanos();
+        let start = std::time::Instant::now();
+        std::hint::black_box(hoisted_pass());
+        hoisted_ns += start.elapsed().as_nanos();
+        // B then A.
+        let start = std::time::Instant::now();
+        std::hint::black_box(hoisted_pass());
+        hoisted_ns += start.elapsed().as_nanos();
+        let start = std::time::Instant::now();
+        std::hint::black_box(inline_pass());
+        inline_ns += start.elapsed().as_nanos();
+    }
+
+    println!(
+        "\n=== reading both claims for {} dirty buckets, {ROUNDS} ABBA rounds ===\n  off the \
+         node: {inline_ns} ns total\n  out of a side map: {hoisted_ns} ns total ({:.3}x)",
+        dirty_rows.len(),
+        hoisted_ns as f64 / inline_ns.max(1) as f64
+    );
+
+    assert!(
+        hoisted_ns > 0 && inline_ns > 0,
+        "one of the arms took no measurable time, so the ratio is not a reading"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// 6. WHAT A BOUNDED RING OF CLAIMS DOES WHEN IT WRAPS, AND WHICH DIRECTION IT ERRS.
+// -------------------------------------------------------------------------------------------
+
+/// A BOUNDED ring of per-bucket claims, which is the shape a shard-level side structure takes when
+/// it is not allowed to grow with the bucket count.
+///
+/// `push` overwrites the OLDEST entry once the ring is full. That is what bounded means, and it is
+/// the whole of the hazard: a claim is a FLOOR the bucket holds over the log, the oldest claim is
+/// the lowest floor, and so a ring that has wrapped has forgotten precisely the claims that were
+/// holding the log down. It is not an unlucky eviction order, it is the eviction order a ring has.
+struct ClaimRing {
+    slots: Vec<(u32, u64)>,
+    capacity: usize,
+    next: usize,
+    wrapped: bool,
+}
+
+impl ClaimRing {
+    fn with_capacity(capacity: usize) -> Self {
+        assert!(capacity > 0, "a ring of no slots remembers nothing and measures nothing");
+        Self { slots: Vec::with_capacity(capacity), capacity, next: 0, wrapped: false }
+    }
+
+    fn push(&mut self, routing_bucket: u32, sequence: u64) {
+        if self.slots.len() < self.capacity {
+            self.slots.push((routing_bucket, sequence));
+            return;
+        }
+        self.wrapped = true;
+        self.slots[self.next] = (routing_bucket, sequence);
+        self.next = (self.next + 1) % self.capacity;
+    }
