@@ -56,3 +56,62 @@ function hookArgs(event, env) {
     env.MATRIXARK_MAX_CONTEXT_TOKENS || "10000",
     "--request-timeout-ms",
     env.MATRIXARK_REQUEST_TIMEOUT_MS || "90000",
+    "--io-timeout-ms",
+    env.MATRIXARK_IO_TIMEOUT_MS || "90000",
+    "--session-commit-threshold",
+    env.MATRIXARK_SESSION_COMMIT_THRESHOLD || "20",
+    "--idle-commit-timeout-ms",
+    env.MATRIXARK_IDLE_COMMIT_TIMEOUT_MS || "300000",
+    "--codex-strict-output"
+  ];
+}
+
+export function callLocalPythonHook({ event, payload, env, mode }) {
+  const stdin = JSON.stringify(payload);
+  let command;
+  let args;
+
+  if (mode === "wsl") {
+    command = "wsl.exe";
+    args = [];
+    if (env.TEMPORALSTORE_WSL_DISTRO) {
+      args.push("-d", env.TEMPORALSTORE_WSL_DISTRO);
+    }
+    args.push(
+      "--cd",
+      env.TEMPORALSTORE_WSL_REPO || env.TEMPORALSTORE_REPO || "/opt/github-services/TemporalStore",
+      "-e",
+      env.TEMPORALSTORE_PYTHON || "python3",
+      ...hookArgs(event, env)
+    );
+  } else {
+    command = env.TEMPORALSTORE_PYTHON || "python3";
+    args = hookArgs(event, env);
+  }
+
+  const result = spawnSync(command, args, {
+    cwd: mode === "wsl" ? undefined : env.TEMPORALSTORE_REPO || process.cwd(),
+    input: stdin,
+    encoding: "utf8",
+    timeout: Number(env.TEMPORALSTORE_HOOK_TIMEOUT_MS || 120000),
+    env: process.env
+  });
+
+  if (result.error) {
+    throw result.error;
+  }
+  if (result.status !== 0) {
+    throw new Error(`TemporalStore hook exited ${result.status}: ${result.stderr || result.stdout}`);
+  }
+  return result.stdout || "{}";
+}
+
+export async function callRemoteHook({ event, normalizedEvent, payload, env }) {
+  const endpoint = env.TEMPORALSTORE_AGENT_ENDPOINT;
+  if (!endpoint) {
+    throw new Error("TEMPORALSTORE_AGENT_ENDPOINT is required for remote mode");
+  }
+  const url = new URL("/api/agent/hook", endpoint);
+  const body = JSON.stringify({ event, normalized_event: normalizedEvent, raw_payload: payload });
+  const client = url.protocol === "https:" ? https : http;
+  return new Promise((resolve, reject) => {

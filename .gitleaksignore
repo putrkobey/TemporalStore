@@ -2,3 +2,7 @@
 # (commit:file:rule:line) so the scanner keeps full strength everywhere else.
 #
 # A fingerprint pins one occurrence in one commit. It cannot hide a later leak in
+# the same file, which is what a path entry in .gitleaks.toml would do -- that is
+# why these live here instead.
+#
+# Gateway quota-test fixture: a fake api key in a unittest.TestCase, hashed
