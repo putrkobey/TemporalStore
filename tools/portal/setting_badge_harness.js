@@ -18,23 +18,3 @@ function ok(what, condition, detail) {
   else { console.log("FAIL " + what + (detail ? "\n     " + detail : "")); failures += 1; }
 }
 
-/* Read out of the built page rather than the generator: this is the copy a browser runs. */
-const start = page.indexOf("function fieldHtml(f) {");
-if (start < 0) { console.log("FAIL fieldHtml is not on the page"); process.exit(1); }
-const end = page.indexOf("\n  }", start);
-const body = page.slice(start, end + 4);
-
-const esc = (s) => String(s === undefined || s === null ? "" : s);
-
-/* The renderer reaches for several small helpers from the page around it, and naming them one by
-   one turns each into a round of "run it, read the ReferenceError, add a stub". Anything it asks
-   for that is not a real global answers with an inert function instead: this is about which badges
-   come out, and helper text would only be noise to match against. */
-const scope = new Proxy({}, {
-  has: () => true,
-  get: (_target, key) => {
-    if (key === Symbol.unscopables) { return undefined; }
-    if (key === "esc") { return esc; }
-    if (key in globalThis) { return globalThis[key]; }
-    return () => "";
-  }
