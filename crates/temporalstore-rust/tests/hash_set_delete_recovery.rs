@@ -28,33 +28,3 @@ use std::path::PathBuf;
 use temporalstore_rust::{Command, CommandResponse, ExecuteRequest, LoadShardRequest, TemporalEngine};
 
 const SHARD_ID: u64 = 1;
-const CACHE_BYTES: usize = 4096;
-
-fn unique_root(name: &str) -> PathBuf {
-    let mut root = std::env::temp_dir();
-    root.push(format!("ts-hash-set-delete-recovery-{name}-{}", std::process::id()));
-    root
-}
-
-fn new_engine(root: &PathBuf) -> TemporalEngine {
-    for sub in ["cache", "pages", "indexes"] {
-        std::fs::create_dir_all(root.join(sub)).expect("create engine dir");
-    }
-    let engine = TemporalEngine::with_local_dirs(
-        CACHE_BYTES,
-        root.join("cache"),
-        root.join("blocks"),
-        root.join("indexes"),
-    );
-    let loaded = engine.load_shard_with(LoadShardRequest {
-        shard_id: SHARD_ID,
-        load_version: 0,
-        local_node_id: None,
-        shard_uri: String::new(),
-        start_routing_bucket: 0,
-        end_routing_bucket: u32::MAX,
-        readonly: false,
-        table_name: String::new(),
-    });
-    assert!(loaded.status.ok, "the shard did not load: {:?}", loaded.status);
-    engine
