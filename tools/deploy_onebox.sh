@@ -17,23 +17,3 @@
 # =============================================================================
 set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deploy_profile_common.sh"
-
-# One node: no metaserver to register with, and no heartbeat loop.
-export TS_STANDALONE=1
-unset TS_META_ADDR TS_DISTRIBUTED 2>/dev/null || true
-
-# Name the backend rather than letting `auto` probe for a shared store that a
-# one-box deployment does not have. An explicit choice also skips the probe, so
-# startup does not pay a timeout to discover what this script already knows.
-export TS_STORAGE_BACKEND="${TS_STORAGE_BACKEND:-raft}"
-
-# No shared store, therefore no on-disk cache tier. Left to the backend rule
-# rather than forced, so the two cannot disagree.
-unset TS_SHARED_STORE_DIR TS_MATRIXOBJECT_ENDPOINT TS_CACHE_DISK_TIER 2>/dev/null || true
-
-export TS_SHARD_ID="${TS_SHARD_ID:-1}"
-export TS_SERVER_NODE_ID="${TS_SERVER_NODE_ID:-1}"
-export TS_SERVER_ADDR="${TS_SERVER_ADDR:-127.0.0.1:17002}"
-
-# There is no metaserver in a one-box, and the client has to be told so.
-#
