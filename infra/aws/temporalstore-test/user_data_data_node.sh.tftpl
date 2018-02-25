@@ -10,29 +10,3 @@ apt-get install -y \
 snap install amazon-ssm-agent --classic || true
 systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent.service || systemctl enable --now amazon-ssm-agent || true
 
-mkdir -p /mnt/temporalstore-shared
-if ! grep -q "/mnt/temporalstore-shared" /etc/fstab; then
-  echo "${efs_id}.efs.${region}.amazonaws.com:/ /mnt/temporalstore-shared nfs4 nfsvers=4.1,_netdev,noresvport,hard,timeo=600,retrans=2 0 0" >> /etc/fstab
-fi
-for _ in $(seq 1 60); do
-  mount /mnt/temporalstore-shared && break
-  sleep 2
-done
-
-mkdir -p \
-  /opt/temporalstore/bin \
-  /opt/temporalstore/conf \
-  /var/log/temporalstore \
-  /mnt/temporalstore-cache \
-  /mnt/temporalstore-shared/storage \
-  /mnt/temporalstore-shared/wal \
-  /mnt/temporalstore-shared/page \
-  /mnt/temporalstore-shared/index \
-  /mnt/temporalstore-shared/snapshots
-
-ROOT_SOURCE="$(findmnt -no SOURCE /)"
-ROOT_PARENT="$(lsblk -no PKNAME "$ROOT_SOURCE" 2>/dev/null || true)"
-if [ -n "$ROOT_PARENT" ]; then
-  ROOT_DISK="/dev/$ROOT_PARENT"
-else
-  ROOT_DISK="$ROOT_SOURCE"
