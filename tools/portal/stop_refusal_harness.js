@@ -22,27 +22,3 @@ function ok(what, condition, detail) {
 
 function slice(name) {
   const at = page.indexOf("function " + name + "(");
-  if (at === -1) { return null; }
-  let depth = 0;
-  for (let i = page.indexOf("{", at); i < page.length; i += 1) {
-    if (page[i] === "{") { depth += 1; }
-    else if (page[i] === "}") {
-      depth -= 1;
-      if (depth === 0) { return page.slice(at, i + 1); }
-    }
-  }
-  return null;
-}
-
-const cancel = slice("cancelJob");
-const failure = slice("failure");
-ok("the page defines cancelJob", !!cancel);
-ok("the page defines its status map", !!failure);
-if (!cancel || !failure) { console.log("FAILED " + failures); process.exit(1); }
-
-async function flush() {
-  for (let i = 0; i < 8; i += 1) {
-    await new Promise((resolve) => setImmediate(resolve));
-  }
-}
-
