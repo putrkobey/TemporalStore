@@ -2,12 +2,3 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "temporalstore",
   "description": "MatrixArk / TemporalStore agent-memory plugins for Claude Code",
-  "version": "1.0.0",
-  "owner": {
-    "name": "MatrixArkAI",
-    "url": "https://temporalstore.ai"
-  },
-  "plugins": [
-    {
-      "name": "matrixark-memory",
-      "source": "./integrations/claude-plugin",
