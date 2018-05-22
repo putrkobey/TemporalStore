@@ -7,12 +7,3 @@
 # No production credentials are allowlisted. A full-history scan reports no leaks
 # with this config. The Governance workflow pins gitleaks to the version this
 # schema targets (see GITLEAKS_VERSION in .github/workflows/governance.yml).
-title = "TemporalStore gitleaks config"
-
-[extend]
-useDefault = true
-
-[allowlist]
-description = "Test fixtures, local onebox test config, and public AWS resource identifiers (no production secrets)."
-paths = [
-  "tools/test_matrixark_access_governance\\.py",
