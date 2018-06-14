@@ -28,33 +28,3 @@ pub unsafe extern "C" fn temporalstore_rust_matrixark_batch_append_records_json(
                     entry.get("field")?.as_str()?.to_string(),
                     entry.get("value")?.as_str()?.to_string(),
                 ))
-            })
-            .collect();
-        let entries: Vec<(&str, &str, &str)> = entries_owned
-            .iter()
-            .map(|(key, field, value)| (key.as_str(), field.as_str(), value.as_str()))
-            .collect();
-        let count_key = if count_key.is_null() {
-            String::new()
-        } else {
-            cstr_arg(count_key, "count_key")?
-        };
-        let count_value = if count_value.is_null() {
-            String::new()
-        } else {
-            cstr_arg(count_value, "count_value")?
-        };
-        let count_key_opt = if count_key.is_empty() {
-            None
-        } else {
-            Some(count_key.as_str())
-        };
-        let count_value_opt = if count_value.is_empty() {
-            None
-        } else {
-            Some(count_value.as_str())
-        };
-        client_from_handle(handle)?.matrixark_batch_append_records(
-            &entries,
-            count_key_opt,
-            count_value_opt,
