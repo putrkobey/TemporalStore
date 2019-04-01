@@ -31,36 +31,3 @@ function slice(name) {
   for (let i = page.indexOf("{", at); i < page.length; i += 1) {
     if (page[i] === "{") { depth += 1; }
     else if (page[i] === "}") {
-      depth -= 1;
-      if (depth === 0) { return page.slice(at, i + 1); }
-    }
-  }
-  return null;
-}
-
-const parts = ["statusChips", "trafficTable", "renderTraffic", "renderLiveTraffic"];
-const sliced = {};
-for (const name of parts) {
-  sliced[name] = slice(name);
-  ok("the page defines " + name, !!sliced[name]);
-}
-if (parts.some((n) => !sliced[n])) { console.log("FAILED " + failures); process.exit(1); }
-
-ok("both renderers go through one builder",
-   /trafficTable\(/.test(sliced.renderTraffic) && /trafficTable\(/.test(sliced.renderLiveTraffic),
-   "two builders is how the two views came to disagree");
-
-function run(which, argument) {
-  const written = { html: "" };
-  const env = {
-    $: () => ({ set innerHTML(v) { written.html = v; }, get innerHTML() { return written.html; } }),
-    esc: (s) => String(s == null ? "" : s),
-  };
-  const src = sliced.statusChips + "\n" + sliced.trafficTable + "\n" + sliced[which]
-    + "\n; return " + which + ";";
-  new Function(...Object.keys(env), src)(...Object.values(env))(argument);
-  return written.html;
-}
-
-function headers(html) {
-  const row = /<thead><tr>([\s\S]*?)<\/tr>/.exec(html);
