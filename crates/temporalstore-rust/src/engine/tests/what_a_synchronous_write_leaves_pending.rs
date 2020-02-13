@@ -28,33 +28,3 @@
 //!
 //! # WHAT MAKES THAT BUILD AFFORDABLE, AND WHERE IT WOULD NOT BE
 //!
-//! The same run shows **64 objects in 64 buckets — one per bucket**. That is not a property of the
-//! workload but of the default routing range: `load_shard` uses `0..u32::MAX`, where the placement
-//! modulus is the range width, so a key lands alone by construction.
-//!
-//! **A batch of one buys nothing.** So at the default range, writing through per object costs no
-//! extra durable write than batching per bucket already does, and the write-back set is bookkeeping
-//! for batches that never form.
-//!
-//! That is the opposite at a narrow range. On the range the runtime tuning guide tells an operator
-//! to set, 94.7% of dirty buckets hold more than one key, and write-through would multiply durable
-//! writes by the keys per bucket. So this is one change with two costs, and which one applies is a
-//! deployment setting rather than a property of the design.
-//!
-//! rust-internal: reads the engine's own write-back set, no product behaviour
-
-use crate::types::{Command, EventReplicationMode, ExecuteRequest, ReplicatedExecuteRequest};
-
-const KEYS: usize = 64;
-
-fn engine(dir: &std::path::Path) -> crate::TemporalEngine {
-    let engine = crate::TemporalEngine::with_local_dirs(
-        4 * 1024 * 1024,
-        dir.join("cache"),
-        dir.join("blocks"),
-        dir.join("indexes"),
-    );
-    engine.load_shard(1);
-    engine
-}
-
