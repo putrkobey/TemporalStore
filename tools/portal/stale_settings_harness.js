@@ -28,34 +28,3 @@ function makeEl(id) {
     addEventListener() {}, removeEventListener() {}, appendChild() {}, removeChild() {},
     setAttribute() {}, getAttribute() { return null; }, closest() { return null; },
     querySelector() { return null; }, querySelectorAll() { return []; },
-    scrollIntoView() {}, focus() {}, click() {},
-    classList: { add() {}, remove() {}, toggle() {} }
-  };
-}
-function el(id) {
-  if (!els.has(id)) { els.set(id, makeEl(id)); }
-  return els.get(id);
-}
-
-const STALE = none ? [] : ["embedding.old_name", "extraction.retired_knob"];
-
-function snapshot() {
-  return {
-    status: "ok",
-    /* A real warning alongside, so an addition that swallowed the existing ones would show. */
-    warnings: ["extraction is falling back to rules"],
-    extraction: { provider: "deterministic" }, embedding: { provider: "deterministic" },
-    settings: {
-      status: "ok",
-      groups: { Extraction: [
-        { key: "extraction.model", kind: "str", label: "Model", help: "", value: "m",
-          env: "MATRIXARK_EXTRACTION_MODEL", applies: "live", source: "config", essential: false,
-          default: "", overridable_by: [], boot_pinned: false, pending_restart: false }
-      ] },
-      group_meta: {}, presets: [], history: [], inventory: {}, essential_keys: [],
-      config_file: "/etc/matrixark/runtime_config.json",
-      pending_restart: [], unknown_stored: STALE
-    }
-  };
-}
-
