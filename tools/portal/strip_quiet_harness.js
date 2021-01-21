@@ -19,25 +19,3 @@ function stripIife(text) {
     // leaves  unbalanced.
     else if (text[i] === "}") { depth--; if (depth === 0) return text.slice(start, i + 1) + ")();"; }
   }
-  throw new Error("unclosed IIFE");
-}
-
-const ORIGIN = 1_760_000_000_000;
-let clock = ORIGIN;
-let ticker = null;
-
-const dot = { className: "live-dot", title: "live" };
-const states = [];
-
-// The strip looks up `liveStrip` first and RETURNS if it is missing, so every id has to answer.
-const elements = { liveDot: dot };
-function element(id) {
-  if (!elements[id]) {
-    elements[id] = {
-      id: id, className: "", textContent: "", innerHTML: "", hidden: false,
-      // The key lookup calls .value.trim(), so every element needs one.
-      value: "",
-      style: {}, dataset: {}, title: "",
-      setAttribute() {}, getAttribute() { return null; },
-      appendChild() {}, addEventListener() {},
-      classList: { add() {}, remove() {}, toggle() {} },
