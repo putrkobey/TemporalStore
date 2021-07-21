@@ -5,10 +5,3 @@
 #   { "type": "agent-turn-complete", "thread-id": ..., "turn-id": ..., "cwd": ...,
 #     "input-messages": [...], "last-assistant-message": "..." }
 #
-# We ingest that turn into MatrixArk / TemporalStore memory, fire-and-forget.
-# Fail-open by design: never block or slow Codex, even if the engine is absent.
-set -uo pipefail
-
-HOME_DIR="${MATRIXARK_HOME:-__MATRIXARK_HOME__}"
-PAYLOAD="${1:-}"
-HOOK="${HOME_DIR%/}/tools/run_rust_codex_context_hook.sh"
