@@ -26,31 +26,3 @@ function makeEl(id) {
     id: id || "",
     hidden: false, innerHTML: "", textContent: "", value: "", checked: false, className: "",
     style: {}, dataset: {}, files: [], options: [], children: [],
-    addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
-    removeEventListener() {},
-    dispatch(type, ev) { (listeners[type] || []).forEach((fn) => fn(ev || {})); },
-    appendChild() {}, removeChild() {},
-    setAttribute(k, v) { attrs[k] = v; }, getAttribute(k) { return k in attrs ? attrs[k] : null; },
-    closest() { return null; },
-    querySelector() { return null; }, querySelectorAll() { return []; },
-    scrollIntoView() {}, focus() {}, click() {},
-    classList: { add() {}, remove() {}, toggle() {} }
-  };
-  return el;
-}
-
-function get(id) {
-  if (!byId.has(id)) { byId.set(id, makeEl(id)); }
-  return byId.get(id);
-}
-
-function respond(body) {
-  return Promise.resolve({
-    ok: true, status: 200,
-    json: () => Promise.resolve(body),
-    text: () => Promise.resolve(JSON.stringify(body))
-  });
-}
-
-const win = {
-  document: {
