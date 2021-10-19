@@ -15,20 +15,3 @@
 # Usage (per node):
 #   TS_META_ADDR=10.0.0.10:17001 TS_SERVER_NODE_ID=2 TS_SHARD_ID=1 \
 #   TS_SERVER_ADDR=10.0.0.11:17002 sudo -E tools/deploy_raft.sh
-# =============================================================================
-set -euo pipefail
-source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deploy_profile_common.sh"
-
-# Required, and checked here rather than left to a default that would quietly
-# produce a one-node cluster wearing a raft name.
-: "${TS_META_ADDR:?raft needs a metaserver address (TS_META_ADDR)}"
-: "${TS_SERVER_NODE_ID:?raft needs a unique node id (TS_SERVER_NODE_ID)}"
-case "$(tr '[:upper:]' '[:lower:]' <<<"${TS_META_ADDR}")" in
-  ''|local|none|standalone|off)
-    echo "[deploy] TS_META_ADDR='${TS_META_ADDR}' names no metaserver - that is one-box." >&2
-    echo "         Use tools/deploy_onebox.sh, or give a real address." >&2
-    exit 1 ;;
-esac
-
-export TS_DISTRIBUTED=1
-export TS_STANDALONE=0
