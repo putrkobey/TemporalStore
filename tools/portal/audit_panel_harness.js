@@ -27,32 +27,3 @@ function slice(name) {
   const at = page.indexOf("function " + name + "(");
   if (at === -1) { return null; }
   let depth = 0;
-  for (let i = page.indexOf("{", at); i < page.length; i += 1) {
-    if (page[i] === "{") { depth += 1; }
-    else if (page[i] === "}") {
-      depth -= 1;
-      if (depth === 0) { return page.slice(at, i + 1); }
-    }
-  }
-  return null;
-}
-
-const parts = ["sayRecording", "auditDetail", "loadAudit"].map((n) => [n, slice(n)]);
-for (const [name, body] of parts) {
-  ok("the page defines " + name, !!body);
-}
-if (parts.some(([, body]) => !body)) { console.log("FAILED " + failures); process.exit(1); }
-
-/* ---------- one run of the panel against one canned response ---------- */
-function run(payload, reject) {
-  const nodes = {};
-  function node(id) {
-    const rows = [];
-    return {
-      id,
-      innerHTML: "",
-      style: {},
-      rows,
-      appendChild(child) { rows.push(child); },
-      querySelector() { return nodes[id + ":tbody"] || (nodes[id + ":tbody"] = node(id + ":tbody")); },
-    };
