@@ -17,22 +17,3 @@ const path = require("path");
 let failures = 0;
 function ok(what, condition, detail) {
   if (condition) { console.log("ok   " + what); }
-  else { console.log("FAIL " + what + (detail ? "\n     " + detail : "")); failures += 1; }
-}
-
-function slice(page, header) {
-  const at = page.indexOf(header);
-  if (at === -1) { return null; }
-  let depth = 0;
-  for (let i = page.indexOf("{", at); i < page.length; i += 1) {
-    if (page[i] === "{") { depth += 1; }
-    else if (page[i] === "}") {
-      depth -= 1;
-      if (depth === 0) { return page.slice(at, i + 1); }
-    }
-  }
-  return null;
-}
-
-/* Statuses the edge actually answers with, and what a reader must not be left holding. */
-const EXPLAINED = [401, 403, 413, 429, 502, 503, 504];
