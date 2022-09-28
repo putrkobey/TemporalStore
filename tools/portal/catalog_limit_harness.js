@@ -10,15 +10,3 @@ const start = page.indexOf("  function load(keepMessage) {");
 if (start < 0) throw new Error("load not found");
 let depth = 0, end = -1;
 for (let i = page.indexOf("{", start); i < page.length; i++) {
-  if (page[i] === "{") depth++;
-  else if (page[i] === "}") { depth--; if (depth === 0) { end = i + 1; break; } }
-}
-
-const said = [];
-const values = {
-  filter: input.filter || "",
-  rtype: "",
-  limit: String(input.typed),
-};
-const el = (id) => ({
-  value: values[id] !== undefined ? values[id] : "",
