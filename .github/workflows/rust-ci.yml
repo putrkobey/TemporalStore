@@ -1,0 +1,338 @@
+name: Rust CI
+
+# Compile the Rust workspace. `cargo check --all-targets` is the fast gate that
+# runs on every Rust-touching push; the heavier release build + single-threaded
+# release test suite (a few high-cardinality tests are O(n^2) and far too slow
+# unoptimized) runs on pull requests and once nightly -- NOT on every push. That
+# keeps Actions minutes down on a high-churn main while PRs still get full CI.
+
+on:
+  push:
+    branches: [main, rust-main]
+    # Push only runs the fast `check` job (below); skip even that on
+    # doc/tool/website-only commits.
+    paths:
+      - 'crates/**'
+      - 'sdk/rust/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/rust-ci.yml'
+  pull_request:
+    # No `branches:` filter here, deliberately. This key filters on the BASE branch, and a
+    # stacked pull request is based on the branch below it, not on main -- so this job did not
+    # run on one at all. Worse, when the branch below it merged, GitHub retargeted the pull
+    # request to main and did NOT re-run anything: the stale checks from the feature-branch
+    # days stayed green and the pull request merged reporting success from a job that had
+    # never seen it. Running on every pull request costs a few Actions minutes and is the only
+    # way the gate covers the changes that actually reach main.
+  schedule:
+    - cron: '0 7 * * *'  # nightly full build + test on the default branch
+  workflow_dispatch:
+
+# Cancel superseded runs on the same ref so rapid pushes to a busy branch do not
+# each re-run CI -- only the newest commit's run survives.
+concurrency:
+  group: rust-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: cargo check (fast, on push)
+    # On push we only spend the fast compile gate; PRs / nightly run the full
+    # build+test job below instead.
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system build dependencies
+        # librocksdb-sys (via matrixcache's rocksdb-ssd feature) runs bindgen and
+        # needs libclang; building RocksDB itself needs cmake.
+        #
+        # protobuf-compiler is NOT optional and is NOT provided by the runner image.
+        # `raft-proto`'s build script runs prost-build, which shells out to `protoc`
+        # and panics without it. This was absent here and the gate still passed for
+        # months: `actions/cache` restores `target`, so the DEBUG build-script output
+        # came back from the cache and `cargo check` never re-ran it, while the
+        # release build below had nothing cached and had to. The job therefore failed
+        # only on the release profile, which made it look like a release-only problem
+        # rather than a missing package. Installing it here instead of relying on the
+        # image means a cold cache fails nothing.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev cmake protobuf-compiler
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --no-self-update && rustup default 1.88.0
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: cargo check (all targets)
+        run: cargo check -p temporalstore-rust --all-targets
+
+  build-and-test:
+    name: cargo check / build / test
+    # Runs on pull requests, the nightly schedule, and manual dispatch -- NOT on
+    # push, so post-merge pushes to a busy main do not each pay the ~45-min run.
+    if: github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system build dependencies
+        # librocksdb-sys (via matrixcache's rocksdb-ssd feature) runs bindgen and
+        # needs libclang; building RocksDB itself needs cmake.
+        #
+        # protobuf-compiler is NOT optional and is NOT provided by the runner image.
+        # `raft-proto`'s build script runs prost-build, which shells out to `protoc`
+        # and panics without it. This was absent here and the gate still passed for
+        # months: `actions/cache` restores `target`, so the DEBUG build-script output
+        # came back from the cache and `cargo check` never re-ran it, while the
+        # release build below had nothing cached and had to. The job therefore failed
+        # only on the release profile, which made it look like a release-only problem
+        # rather than a missing package. Installing it here instead of relying on the
+        # image means a cold cache fails nothing.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang libclang-dev cmake protobuf-compiler
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --no-self-update && rustup default 1.88.0
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ runner.os }}-
+
+      - name: cargo check (all targets)
+        run: cargo check -p temporalstore-rust --all-targets
+
+      # This example requires the optional backend and are skipped by default builds.
+      # Run the assertions: compiling a report does not enforce its byte ceilings.
+      - name: One append storage cost and recovery
+        run: cargo run --release --locked -p temporalstore-rust --features matrixobject --example one_append_amplification_report
+
+      - name: cargo build (release service binaries)
+        run: cargo build --release -p temporalstore-rust --bin matrixark_rust_metaserver --bin matrixark_rust_datanode
+
+      # The compile gates above are what enforce this workflow. The suite is run
+      # for visibility but is NOT yet a required gate: the tree carries a small
+      # number of known, pre-existing baseline failures. Flip continue-on-error
+      # off once the baseline is fully green.
+      #
+      # `--no-fail-fast` is what makes "for visibility" true of more than the lib.
+      # cargo stops at the first failing TARGET, not the first failing test, and the
+      # two known lib failures were stopping it before it reached any of the sixteen
+      # binaries under `tests/` -- the whole integration suite, including
+      # `wal_single_barrier_recovery`, never ran. `continue-on-error` does not help:
+      # it stops the step failing the job, which is why this reported success, and has
+      # no effect on cargo's own stopping. The run for mx#1180 printed two
+      # `test result:` lines for a command asked to run fifteen targets.
+      - name: cargo test (lib + integration, single-threaded, release)
+        timeout-minutes: 45
+        continue-on-error: true
+        run: cargo test --release -p temporalstore-rust --lib --tests --no-fail-fast -- --test-threads=1
+
+      # The step above is `continue-on-error`, so it REPORTS and does not GATE. The
+      # sender attribution below has to gate: when it broke, the three-node chaos
+      # harness went on claiming it had cut a node off while the leader kept
+      # replicating to it, and because nothing runs that harness the lie was
+      # invisible for 2,463 commits. The failure shape is silent by construction --
+      # the attribution returns None, None reads as "no peer to filter", and the
+      # filter allows -- so only an assertion catches it.
+      #
+      # `cargo test` EXITS 0 WHEN THE FILTER MATCHES NOTHING, so a renamed or moved
+      # test would turn this gate into a no-op that still reports success. The grep
+      # on `1 passed` is what makes the gate real; do not drop it.
+      # Five guards:
+      #   - the sender attribution, whose silent failure made the chaos harness lie
+      #   - the majority check, which is the ONLY thing refusing a read on a node that has lost
+      #     its peers; the freshness bar beside it is a value the node maintains itself and
+      #     freezes when it is cut off, so it cannot refuse
+      #   - binary outcome records must recover without a command
+      #   - a cycle request body that names no per-round bound must still decode to the
+      #     bounded round. 0 means NO bound in every one of them, a bare `#[serde(default)]`
+      #     on a number decodes an absent field to 0, and both cycle endpoints build the
+      #     request from a parsed body -- so the shipped bounds reached no HTTP caller at all
+      #     while the guard beside it, which asserts `Default`, stayed green
+      #   - and those shipped values are non-zero, which the equality above cannot say on its
+      #     own: if every bound went to 0 in `Default` too, both sides would agree
+      - name: cargo test (read-safety guards, hard gate)
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          # One invocation per guard, because `cargo test` takes a single positional filter and a
+          # second one is silently an error rather than a second filter.
+          for t in \
+            raft::tests::part5::only_the_majority_check_refuses_a_read_on_a_node_that_lost_its_peers \
+            raft::tests::part5::the_sender_of_an_append_is_attributed_in_both_encodings \
+            shared_store::tests::outcome_only_binary_frames_recover_in_every_supported_format \
+            shared_store::tests::default_shared_wal_preserves_multiple_binary_outcomes_and_older_json \
+            engine::tests::durable_outranks_derived::the_shared_install_pairs_carried_blocks_by_object_and_component \
+            engine::tests::what_each_maintenance_bound_costs_per_round::a_cycle_request_that_names_no_bound_still_arrives_bounded \
+            engine::tests::part4::every_maintenance_round_is_bounded_by_default ; do
+            echo "--- $t ---"
+            cargo test --release -p temporalstore-rust --lib "$t" \
+              -- --exact --test-threads=1 2>&1 | tee /tmp/gate.log
+            # `cargo test` exits 0 when a filter matches NOTHING, so the exit code is not the
+            # gate. Assert the COUNT as well as the result: a rename would otherwise leave this
+            # step green having run nothing at all.
+            ran=$(sed -n 's/^running \([0-9]*\) tests\?$/\1/p' /tmp/gate.log | head -1)
+            if [ "$ran" != "1" ]; then
+              echo "::error::$t: expected exactly 1 test, the run reported '${ran:-none}' -- renamed, moved, or dropped from the filter"
+              exit 1
+            fi
+            grep -q 'test result: ok\. 1 passed; 0 failed' /tmp/gate.log \
+              || { echo "::error::$t did not pass"; exit 1; }
+          done
+
+      - name: Unsupported append never replaces WAL bytes
+        run: |
+          set -o pipefail
+          cargo test --release -p temporalstore-snapshot --lib \
+            object_store::tests::a_put_only_store_refuses_append_without_replacing_bytes \
+            -- --exact --test-threads=1 2>&1 | tee /tmp/append-safety.log
+          grep -q 'test result: ok. 1 passed; 0 failed' /tmp/append-safety.log
+
+      # The published write and space ratios are only falsifiable at a consumer if the identities
+      # tying each ratio to its published terms actually run. They are NOT covered by the suite
+      # step above, which carries continue-on-error AND has been observed timing out at its limit,
+      # so that step can report success having finished no tests. And this workflow runs no
+      # unfiltered suite -- every invocation is an --exact named filter -- so a guard runs here
+      # only if its name is pinned. That is why this step exists.
+      - name: cargo test (published ratio guards, hard gate)
+        timeout-minutes: 20
+        run: |
+          set -o pipefail
+          for t in \
+            engine::tests::the_write_window_closes_at_compaction::the_write_window_closes_at_compaction \
+            engine::tests::the_user_byte_write_ratio::the_user_byte_write_ratio \
+            engine::tests::the_user_byte_write_ratio::no_string_row_is_removed_outside_its_door ; do
+            echo "--- $t ---"
+            cargo test --release -p temporalstore-rust --lib "$t" \
+              -- --exact --test-threads=1 2>&1 | tee /tmp/ratio_gate.log
+            # cargo test exits 0 when a filter matches NOTHING, so assert the COUNT as well as the
+            # result line: a rename would otherwise leave this step green having run nothing.
+            ran=$(sed -n 's/^running \([0-9]*\) tests\?$/\1/p' /tmp/ratio_gate.log | head -1)
+            if [ "$ran" != "1" ]; then
+              echo "::error::$t: expected exactly 1 test, the run reported '${ran:-none}' -- renamed, moved, or dropped from the filter"
+              exit 1
+            fi
+            grep -q 'test result: ok\. 1 passed; 0 failed' /tmp/ratio_gate.log \
+              || { echo "::error::$t did not pass"; exit 1; }
+          done
+
+          # AND THE IGNORED GUARDS, which need --ignored and CANNOT share the loop above:
+          # with --ignored, cargo runs ONLY ignored tests, so the three names above would each
+          # report 0 and the count assertion would fail. Same assertion, applied separately.
+          #
+          # every_published_ratio_is_rederivable_from_published_counters is the guard that every
+          # published amplification ratio can be re-derived from the counters published beside it.
+          # It was running in CI NEVER: it is #[ignore]d, and this workflow runs no unfiltered
+          # suite, so an ignored guard runs only if its name is pinned AND --ignored is passed.
+          for t in \
+            engine::tests::every_published_ratio_is_rederivable::every_published_ratio_is_rederivable_from_published_counters ; do
+            echo "--- $t (ignored) ---"
+            cargo test --release -p temporalstore-rust --lib "$t" \
+              -- --exact --ignored --test-threads=1 2>&1 | tee /tmp/ratio_gate.log
+            ran=$(sed -n 's/^running \([0-9]*\) tests\?$/\1/p' /tmp/ratio_gate.log | head -1)
+            if [ "$ran" != "1" ]; then
+              echo "::error::$t: expected exactly 1 test, the run reported '${ran:-none}' -- renamed, moved, or no longer #[ignore]d"
+              exit 1
+            fi
+            grep -q 'test result: ok\. 1 passed; 0 failed' /tmp/ratio_gate.log \
+              || { echo "::error::$t did not pass"; exit 1; }
+          done
+
+      # Bin unit tests are not covered by --lib/--tests, so a failing test in a
+      # service binary can sit on main unnoticed. Run the proxy bin's suite as a
+      # hard gate. Deliberately NOT --bins: some bin test harnesses run servers
+      # that never exit, which would hang the job.
+      - name: cargo test (matrixark_rust_proxy bin, single-threaded, release)
+        timeout-minutes: 20
+        run: cargo test --release -p temporalstore-rust --bin matrixark_rust_proxy -- --test-threads=1
+
+  # The published client SDK is `exclude`d from the root workspace and has its own
+  # lock file, so every `-p temporalstore-rust` command above is structurally blind
+  # to it. It sat un-compilable on main for months because of exactly that: nothing
+  # here built it. This job does, and it is cheap -- serde and serde_json only, no
+  # RocksDB, no bindgen, so it runs on push as well.
+  sdk-rust:
+    name: cargo build / test / package (client SDK)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk/rust/temporalstore
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.88.0 --profile minimal --no-self-update && rustup default 1.88.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-sdk-${{ runner.os }}-${{ hashFiles('sdk/rust/temporalstore/Cargo.lock') }}
+          restore-keys: cargo-sdk-${{ runner.os }}-
+
+      # Default features. This is the command a downloader runs, and the one that
+      # failed on main with a page of undefined `temporalstore_*` symbols.
+      - name: cargo build (default features)
+        run: cargo build --locked
+
+      - name: cargo test (default features)
+        run: cargo test --locked
+
+      - name: cargo build (no default features)
+        run: cargo build --locked --no-default-features
+
+      # The `direct` feature binds a native C ABI this repository does not build.
+      # It must fail, and it must fail by SAYING so in build.rs rather than by
+      # emitting undefined symbols at link time -- otherwise that message is a
+      # value nothing reads. Assert both the failure and the sentence.
+      - name: cargo build --features direct fails with an actionable message
+        run: |
+          set -o pipefail
+          if cargo build --locked --no-default-features --features direct > direct.log 2>&1; then
+            echo "FAIL: --features direct built, but no native library was supplied"
+            exit 1
+          fi
+          grep -q 'TEMPORALSTORE_LIB_DIR' direct.log || {
+            echo "FAIL: --features direct failed without naming TEMPORALSTORE_LIB_DIR"
+            sed -n '1,40p' direct.log
+            exit 1
+          }
+          grep -q 'undefined symbol' direct.log && {
+            echo "FAIL: --features direct still reaches the linker"
+            exit 1
+          }
+          echo "OK: build.rs refused --features direct with the documented message"
+          rm -f direct.log
+
+      # Builds the crate from its own packaged tarball, exactly as someone who
+      # downloads it would. This is the same verification `cargo publish
+      # --dry-run` performs, without needing a registry token.
+      - name: cargo package (verify the published tarball builds)
+        run: cargo package --locked
