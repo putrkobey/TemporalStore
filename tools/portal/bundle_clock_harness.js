@@ -51,3 +51,56 @@ const scope = {
         body: {
           getReader: () => {
             let sent = false;
+            return {
+              read: () => sent ? new Promise(() => {})
+                : ((sent = true), Promise.resolve({ done: false, value: opening.join("") })),
+            };
+          },
+        },
+      });
+    }
+    if (String(url).indexOf("/v1/metrics") === 0) {
+      return Promise.resolve({ ok: true, text: () => Promise.resolve("# metrics\n") });
+    }
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({ ok: true }) });
+  },
+  TextDecoder: function () { this.decode = (v) => (v === undefined ? "" : String(v)); },
+  AbortController: function () { this.abort = () => {}; this.signal = null; },
+  document: { hidden: false, addEventListener: () => {} },
+  window: { addEventListener: () => {} },
+  setTimeout: () => 0,
+  setInterval: (fn) => { ticker = fn; return 1; },
+  clearInterval: () => { ticker = null; },
+  location: { origin: "https://gw.example" },
+  auth: () => ({}),
+  lastReport: { checks: [] },
+  compactConfig: (c) => c,
+  JSON: JSON,
+  Promise: Promise,
+};
+// `Date` must be a constructor (the bundle calls `new Date(ms).toISOString()`) AND carry `now`.
+scope.Date = function (ms) { return new globalThis.Date(ms === undefined ? clock : ms); };
+scope.Date.now = () => clock;
+
+const names = Object.keys(scope);
+const api = new Function(...names, source + `
+  return {
+    start: function () {
+      return liveStream({ headers: function () { return {}; }, onState: function () {},
+                          onFrame: function (f) { lastFrame = f; } });
+    },
+    bundle: bundle
+  };
+`)(...names.map((k) => scope[k]));
+
+const wait = () => new Promise((r) => globalThis.setTimeout(r, 5));
+
+(async () => {
+  if (input.withStream !== false) {
+    api.start();
+    await wait();
+  }
+  clock += (input.advanceMs || 0);
+  const text = await api.bundle();
+  process.stdout.write(JSON.stringify({ bundle: JSON.parse(text) }));
+})();
