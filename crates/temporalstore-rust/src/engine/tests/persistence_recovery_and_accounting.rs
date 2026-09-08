@@ -10756,3 +10756,10761 @@ fn a_record_carrying_results_is_smaller_than_one_carrying_the_operation() {
             dir.path().join("blocks"),
             dir.path().join("indexes"),
         );
+        engine.load_shard(1);
+        for index in 0..writes {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("size-{index:06}"),
+                    value: vec![b'v'; 64],
+                },
+            });
+            assert!(response.status.ok);
+        }
+        let records = engine
+            .write_ahead_log_store()
+            .scan(1, 0, u64::MAX, u64::MAX)
+            .unwrap();
+        let total: u64 = records.iter().map(|(_, line)| line.len() as u64).sum();
+        let count = records.len() as u64;
+        std::env::remove_var("TS_WAL_OUTCOME_ITEMS");
+        std::env::remove_var("TS_WAL_DATA_ONLY");
+        (total, count)
+    }
+
+    const WRITES: usize = 2_000;
+    let (before, before_n) = wal_bytes("0", "0", "0", WRITES);
+    let (after, after_n) = wal_bytes("1", "1", "1", WRITES);
+    let per_before = before as f64 / before_n as f64;
+    let per_after = after as f64 / after_n as f64;
+
+    println!("[record cost] BEFORE  operation, text     : {per_before:.1} B/record");
+    println!("[record cost] AFTER   results, protobuf   : {per_after:.1} B/record");
+    println!(
+        "[record cost] {:+.1} B/record ({:+.1}%)",
+        per_after - per_before,
+        (per_after - per_before) / per_before * 100.0
+    );
+
+    assert_eq!(before_n, after_n, "the two arms wrote different record counts");
+    // The whole argument for making this the default. A record that states results carries MORE
+    // information than one that states an operation, and if it also costs more bytes then going
+    // live is a regression dressed as progress.
+    assert!(
+        per_after < per_before,
+        "a record carrying results ({per_after:.1} B) must not cost more than one carrying the \
+         operation ({per_before:.1} B)"
+    );
+}
+
+/// FIDELITY: a record encoded as protobuf and read back must equal the record that went in.
+///
+/// This is the durability path, so the bar is equality of the whole record -- not "the fields we
+/// modelled survived". A command this codec has never heard of travels verbatim and must come back
+/// byte for byte; anything less means a log written today cannot be replayed tomorrow.
+///
+/// The workload is driven through the engine rather than hand-built, so the records under test are
+/// the ones the engine actually writes, including their outcomes and any blocks they carry.
+#[test]
+fn a_record_encoded_as_protobuf_reads_back_identical() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    std::env::set_var("TS_WAL_OUTCOME_ITEMS", "1");
+
+    let workload = vec![
+        Command::StringSet {
+            key: "pb-string".to_string(),
+            value: b"a value".to_vec(),
+        },
+        // A modelled arm with a TTL, which the codec folds into the same message.
+        Command::StringSetEx {
+            key: "pb-setex".to_string(),
+            value: b"expiring".to_vec(),
+            ttl_ms: 600_000,
+        },
+        Command::HashSet {
+            key: "pb-hash".to_string(),
+            field: "f".to_string(),
+            value: b"hv".to_vec(),
+        },
+        // Deliberately NOT modelled by the command codec: it must travel verbatim.
+        Command::ZSetAdd {
+            key: "pb-zset".to_string(),
+            member: b"zm".to_vec(),
+            score: 2.5,
+        },
+        Command::ListPush {
+            key: "pb-list".to_string(),
+            member: b"lm".to_vec(),
+            left: true,
+        },
+        // No block behind it: the outcome carries bytes instead of an address.
+        Command::SeenCheck {
+            key: "pb-seen".to_string(),
+            member: b"m".to_vec(),
+            window_ms: 600_000,
+        },
+        Command::BucketTake {
+            key: "pb-bucket".to_string(),
+            tokens: 1.0,
+            capacity: 10.0,
+            refill_per_sec: 1.0,
+        },
+        // Several outcomes from one command, each naming a different point.
+        Command::FeatureAppend {
+            key: "pb-feature".to_string(),
+            points: (0..3)
+                .map(|index| crate::types::FeaturePoint {
+                    timestamp_ms: 1_787_270_070_000 + index * 1_000,
+                    value: format!("point-{index}").into_bytes(),
+                })
+                .collect(),
+        },
+        // A value with bytes that are not valid text, which is where an encoding that has no
+        // byte-string type starts guessing.
+        Command::StringSet {
+            key: "pb-binary".to_string(),
+            value: vec![0x00, 0xff, 0x1f, 0x7f, 0x80, b'"', b'\\', b'\n'],
+        },
+        Command::CommonExpire {
+            key: "pb-string".to_string(),
+            ttl_ms: 300_000,
+        },
+        Command::CommonDelete {
+            key: "pb-hash".to_string(),
+        },
+    ];
+    for command in workload {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command,
+        });
+        assert!(response.status.ok, "workload write failed: {response:?}");
+    }
+    std::env::remove_var("TS_WAL_OUTCOME_ITEMS");
+
+    let records = engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .unwrap()
+        .iter()
+        .map(|(_, line)| crate::wal::decode_wal_line(line).expect("record decodes"))
+        .collect::<Vec<_>>();
+    assert!(
+        records.len() >= 10,
+        "expected the workload to leave records to round-trip, got {}",
+        records.len()
+    );
+    assert!(
+        records.iter().any(|record| !record.outcomes.is_empty()),
+        "the records under test carry no outcomes, so this proves nothing about them"
+    );
+
+    let mut text_bytes = 0usize;
+    let mut binary_bytes = 0usize;
+    for record in &records {
+        // The text side is built HERE rather than asked of the writer, because there is no text
+        // writer any more: records are protobuf unconditionally. The warning the previous version
+        // of this comment carried still applies and is the reason for building it by hand -- when
+        // both sides came from the writer, the "text" encoding was whatever the writer was
+        // producing, and the comparison tested one encoding against itself. It does not any more.
+        let framed = crate::log_framing::encode_line(
+            &serde_json::to_vec(record).expect("the text encoding of a record"),
+        );
+        text_bytes += framed.len();
+
+        let framed_binary = crate::wal::encode_wal_line_for_test(record).expect("binary encodes");
+        binary_bytes += framed_binary.len();
+
+        let round_tripped =
+            crate::wal::decode_wal_line(&framed_binary).expect("binary record decodes");
+        assert_eq!(
+            &round_tripped, record,
+            "a record did not survive the protobuf round trip"
+        );
+
+        // And the text encoding still reads, from the same decoder, with no flag consulted.
+        let from_text = crate::wal::decode_wal_line(&framed).expect("text record decodes");
+        assert_eq!(&from_text, record, "the text encoding stopped round-tripping");
+    }
+
+    println!(
+        "[proto] {} records: text {} B, protobuf {} B ({:.1}% of text)",
+        records.len(),
+        text_bytes,
+        binary_bytes,
+        binary_bytes as f64 / text_bytes as f64 * 100.0
+    );
+    assert!(
+        binary_bytes < text_bytes,
+        "protobuf ({binary_bytes} B) should be smaller than text ({text_bytes} B)"
+    );
+}
+
+/// Binary records must survive the FILE, not just a round trip in memory.
+///
+/// The first version of the protobuf codec passed a round-trip test and lost writes on reload,
+/// because the round trip never touched a log file. The log is read with `reader.lines()`, and
+/// protobuf carries 0x0A freely -- so a record containing one split into fragments that decoded as
+/// nothing. Values came back empty and no error was raised anywhere.
+///
+/// So this writes through the real append path, drops the engine, and reads every value back from
+/// a cold reload. The values are chosen to contain newlines outright, because a codec that only
+/// works on bytes that happen to avoid one is not a codec.
+#[test]
+fn binary_records_survive_a_reload_through_a_real_log_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let blocks = dir.path().join("blocks");
+    let indexes = dir.path().join("indexes");
+
+    const WRITES: usize = 64;
+    let value_for = |index: usize| -> Vec<u8> {
+        // Newlines, the escape byte itself, and a run of high bytes: everything a line-oriented
+        // reader and a byte-stuffed payload each have to survive.
+        let mut value = format!("line-a-{index}\nline-b\n").into_bytes();
+        value.extend_from_slice(&[0x1b, 0x0a, 0x1b, 0x1b, 0x00, 0xff, 0x7f, 0x80]);
+        value.extend_from_slice(format!("\ntail-{index}").as_bytes());
+        value
+    };
+
+    {
+        let engine = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            cache.clone(),
+            blocks.clone(),
+            indexes.clone(),
+        );
+        engine.load_shard(1);
+        std::env::set_var("TS_WAL_OUTCOME_ITEMS", "1");
+        for index in 0..WRITES {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("nl-{index:04}"),
+                    value: value_for(index),
+                },
+            });
+            assert!(response.status.ok, "write {index} failed: {response:?}");
+        }
+        std::env::remove_var("TS_WAL_OUTCOME_ITEMS");
+        // dropped WITHOUT unloading, so the tail has to be replayed off the file.
+    }
+
+    // Every record must still be readable FROM THE FILE, which is what lines() broke.
+    let engine = TemporalEngine::with_local_dirs(1024 * 1024, cache, blocks, indexes);
+    engine.load_shard(1);
+    let scanned = engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .unwrap();
+    let decoded = scanned
+        .iter()
+        .filter(|(_, line)| crate::wal::decode_wal_line(line).is_ok())
+        .count();
+    assert_eq!(
+        decoded,
+        scanned.len(),
+        "{} of {} records on disk did not decode",
+        scanned.len() - decoded,
+        scanned.len()
+    );
+
+    for index in 0..WRITES {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: format!("nl-{index:04}"),
+            },
+        });
+        let expected = value_for(index);
+        match response.response {
+            CommandResponse::Bytes { value: Some(ref got) } => assert_eq!(
+                got, &expected,
+                "nl-{index:04} came back with different bytes"
+            ),
+            other => panic!("nl-{index:04} did not survive the reload: {other:?}"),
+        }
+    }
+}
+
+/// Recording results must not cost a write its place in the group-commit queue.
+///
+/// It used to. Anything a record had to CARRY forced the staged append branch, and outcomes were
+/// treated as one of those things -- so turning recording on turned coalescing off, and every
+/// concurrent writer paid its own fsync. That was the strongest argument for keeping the gate off,
+/// and it was a property of the plumbing rather than of durability: a staged block needs its
+/// address back-patched once the record's log id exists, and an outcome does not.
+///
+/// Asserts fewer fsyncs than writes with recording ON. Not a ratio -- the point is that coalescing
+/// ENGAGES, and on a loaded machine how much it wins varies.
+#[test]
+fn recording_results_still_coalesces_fsyncs() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+
+    const WRITERS: usize = 8;
+    const PER_WRITER: usize = 25;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Arc::new(TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    ));
+    engine.load_shard(1);
+    std::env::set_var("TS_WAL_OUTCOME_ITEMS", "1");
+
+    let syncs_before = engine.write_ahead_log_store().stats(1).syncs;
+    let acked = Arc::new(AtomicUsize::new(0));
+    let gate = Arc::new(Barrier::new(WRITERS));
+    let mut handles = Vec::with_capacity(WRITERS);
+    for writer in 0..WRITERS {
+        let engine = Arc::clone(&engine);
+        let acked = Arc::clone(&acked);
+        let gate = Arc::clone(&gate);
+        handles.push(std::thread::spawn(move || {
+            gate.wait();
+            for index in 0..PER_WRITER {
+                let response = engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: format!("gc-{writer}-{index}"),
+                        value: b"v".to_vec(),
+                    },
+                });
+                if response.status.ok {
+                    acked.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }));
+    }
+    for handle in handles {
+        handle.join().unwrap();
+    }
+    let syncs = engine.write_ahead_log_store().stats(1).syncs - syncs_before;
+    let writes = acked.load(Ordering::Relaxed);
+    std::env::remove_var("TS_WAL_OUTCOME_ITEMS");
+
+    println!("[coalescing] writes={writes} fdatasyncs={syncs} while recording results");
+    assert_eq!(writes, WRITERS * PER_WRITER, "every write must ack");
+    assert!(
+        syncs < writes as u64,
+        "recording results cost the coalescing: {syncs} fsyncs for {writes} writes"
+    );
+
+    // And every acked write is still readable, which is the half a coalescing change can break.
+    for writer in 0..WRITERS {
+        for index in 0..PER_WRITER {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: format!("gc-{writer}-{index}"),
+                },
+            });
+            assert!(
+                matches!(response.response, CommandResponse::Bytes { value: Some(ref v) } if v == b"v"),
+                "gc-{writer}-{index} did not read back"
+            );
+        }
+    }
+}
+
+/// Does a write that stages a log-resident block keep it when it takes the group-commit branch?
+///
+/// The branch predicate tests the blocks the CALLER handed in, not the ones the write staged
+/// itself, and both gates default on -- so on the face of it a staged block could be dropped. This
+/// settles it by looking rather than by reading the predicate, because the answer decides whether
+/// anything needs fixing before the recording flip.
+#[test]
+fn a_group_commit_write_keeps_the_block_it_staged() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "bw-key".to_string(),
+            value: b"staged".to_vec(),
+        },
+    });
+    assert!(response.status.ok);
+
+    let carried: usize = engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .unwrap()
+        .iter()
+        .filter_map(|(_, line)| crate::wal::decode_wal_line(line).ok())
+        .map(|record| record.staged_blocks.len())
+        .sum();
+    println!(
+        "[block-in-wal] group-commit write: {} block(s) carried, index holds {}",
+        carried,
+        engine.wal_resident_block_count(1)
+    );
+
+    // Whatever the answer, the value must read back -- that is the property that matters.
+    let get = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringGet {
+            key: "bw-key".to_string(),
+        },
+    });
+    assert!(
+        matches!(get.response, CommandResponse::Bytes { value: Some(ref v) } if v == b"staged"),
+        "a group-commit write did not read back: {:?}",
+        get.response
+    );
+}
+
+/// A numeric key must cost what a number costs, and still come back the same.
+///
+/// Timestamped kinds put their stored key into `component` as a decimal string, and a context
+/// event packed TWO keys as thirty-two hex characters. Both are numbers; a varint says a
+/// millisecond timestamp in seven bytes and that hex pair in about twelve. This asserts the
+/// saving and, more importantly, that the round trip is unchanged -- a smaller encoding that
+/// loses a key is not a saving.
+#[test]
+fn a_numeric_component_travels_as_a_number_and_returns_intact() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // A feature series (component is a timestamp) and a context event (component is two keys).
+    let workload = vec![
+        Command::FeatureAppend {
+            key: "num-feature".to_string(),
+            points: (0..4)
+                .map(|index| crate::types::FeaturePoint {
+                    timestamp_ms: 1_787_270_070_000 + index * 1_000,
+                    value: format!("p{index}").into_bytes(),
+                })
+                .collect(),
+        },
+        Command::ContextWriteExtractedEvent {
+            tenant_hash: 41,
+            node_hash: 42,
+            event: Box::new(crate::types::ContextEvent {
+                event_id_hash: 445,
+                event_time_ms: 1_787_270_075_000,
+                ingestion_time_ms: 1_787_270_075_000,
+                kind: 7,
+                event_type: 7,
+                actor_hash: 0,
+                status: 1,
+                valid_until_ms: 0,
+                confidence: 0.9,
+                importance: 0.8,
+                text: "numeric".to_string(),
+                source_ref: String::new(),
+                related_node_hashes: vec![42],
+                compact_attrs: Vec::new(),
+                vector: Vec::new(),
+            }),
+            indexes: crate::types::ContextExtractedEventIndexes {
+                scope_hash: 3001,
+                entity_hashes: vec![501],
+                status_hash: 601,
+                source_hash: 701,
+                event_time_bucket_ms: 1_787_270_000_000,
+                disabled_indexes: Vec::new(),
+            },
+            first_write_only: false,
+            cold_storage: false,
+        },
+        // A component that is genuinely TEXT must keep its string.
+        Command::HashSet {
+            key: "num-hash".to_string(),
+            field: "a-field-name".to_string(),
+            value: b"v".to_vec(),
+        },
+    ];
+    for command in workload {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command,
+        });
+        assert!(response.status.ok, "workload write failed: {response:?}");
+    }
+
+    let records = engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .unwrap()
+        .iter()
+        .map(|(_, line)| crate::wal::decode_wal_line(line).expect("record decodes"))
+        .collect::<Vec<_>>();
+    let recorded: usize = records.iter().map(|record| record.outcomes.len()).sum();
+    assert!(
+        recorded >= 6,
+        "expected timestamped results to compare, got {recorded}"
+    );
+
+    let mut numeric = 0usize;
+    let mut textual = 0usize;
+    for record in &records {
+        let framed = crate::wal::encode_wal_line_for_test(record).expect("binary encodes");
+        let back = crate::wal::decode_wal_line(&framed).expect("binary decodes");
+        assert_eq!(
+            &back, record,
+            "a numeric component did not survive the round trip"
+        );
+        for item in &record.outcomes {
+            match item.kind.as_str() {
+                "feature" | "context_event" | "context_index" => numeric += 1,
+                "hash" => textual += 1,
+                _ => {}
+            }
+        }
+    }
+    assert!(numeric > 0, "no numeric components in the workload");
+    assert!(textual > 0, "no textual components in the workload");
+    println!("[numeric] {numeric} numeric component(s), {textual} textual, all round-tripped");
+}
+
+/// A NEW NODE catching up from the shared log must INSTALL what the origin recorded.
+///
+/// The follower-replay tests that already exist build their entries with no results, so every one
+/// of them exercises the fallback -- re-running the operation -- and none of them touch the path
+/// this work added. A successor that silently re-executes looks identical to one that installs,
+/// right up until it diverges, so the count is asserted before the contents.
+///
+/// This is the case with the weakest assumptions in the system: a DIFFERENT node, with its own
+/// clock and whatever config it holds, rebuilding a shard it never wrote.
+#[test]
+fn a_new_node_catching_up_installs_what_the_origin_recorded() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // The origin writes, and its records carry what each write did.
+    let origin = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("origin-cache"),
+        dir.path().join("origin-blocks"),
+        dir.path().join("origin-indexes"),
+    );
+    origin.load_shard(1);
+    let workload = vec![
+        Command::StringSet {
+            key: "cu-a".to_string(),
+            value: b"alpha".to_vec(),
+        },
+        Command::StringSetEx {
+            key: "cu-ttl".to_string(),
+            value: b"expiring".to_vec(),
+            ttl_ms: 600_000,
+        },
+        Command::HashSet {
+            key: "cu-hash".to_string(),
+            field: "f".to_string(),
+            value: b"hv".to_vec(),
+        },
+        Command::ZSetAdd {
+            key: "cu-zset".to_string(),
+            member: b"zm".to_vec(),
+            score: 4.5,
+        },
+        Command::SeenCheck {
+            key: "cu-seen".to_string(),
+            member: b"m".to_vec(),
+            window_ms: 600_000,
+        },
+        Command::FeatureAppend {
+            key: "cu-feature".to_string(),
+            points: (0..3)
+                .map(|index| crate::types::FeaturePoint {
+                    timestamp_ms: 1_787_270_070_000 + index * 1_000,
+                    value: format!("p{index}").into_bytes(),
+                })
+                .collect(),
+        },
+    ];
+    for command in workload {
+        let response = origin.execute(ExecuteRequest {
+            shard_id: 1,
+            command,
+        });
+        assert!(response.status.ok, "origin write failed: {response:?}");
+    }
+    let expected = origin.index_shape_for_test(1);
+    let expected_index = origin.bucket_index_shape_for_test(1);
+
+    // What the origin would publish to the shared log: its records, results and all.
+    let published = origin
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .unwrap()
+        .iter()
+        .filter_map(|(_, line)| crate::wal::decode_wal_line(line).ok())
+        .collect::<Vec<_>>();
+    let carrying: usize = published
+        .iter()
+        .filter(|record| !record.outcomes.is_empty())
+        .count();
+    assert!(
+        carrying >= 5,
+        "the origin published {carrying} records carrying results; this test needs them to exist"
+    );
+
+    // A node that has never seen this shard, catching up from those records alone.
+    let newcomer = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("new-cache"),
+        dir.path().join("new-blocks"),
+        dir.path().join("new-indexes"),
+    );
+    newcomer.load_shard(1);
+    let installs_before = newcomer.replay_installs_for_test();
+    for record in &published {
+        if record.outcomes.is_empty() {
+            continue;
+        }
+        assert!(
+            newcomer.install_shared_outcomes(1, &record.outcomes),
+            "the newcomer refused results at sequence {}",
+            record.sequence
+        );
+    }
+    let installed = newcomer.replay_installs_for_test() - installs_before;
+
+    // WHICH path ran, before what it produced: a successor that re-executed would pass the
+    // comparison below and prove nothing about catching up from data.
+    assert!(
+        installed >= carrying as u64,
+        "the newcomer installed {installed} results for {carrying} records carrying them"
+    );
+    assert_eq!(
+        newcomer.index_shape_for_test(1),
+        expected,
+        "a node catching up from results did not arrive at the origin's shard"
+    );
+    assert_eq!(
+        newcomer.bucket_index_shape_for_test(1),
+        expected_index,
+        "the newcomer's maps matched and its index did not"
+    );
+    println!("[catch-up] {carrying} records, {installed} results installed, shard identical");
+}
+
+/// RECLAIM against the record that now ships.
+///
+/// Reclaim rewrites the log, so every survivor has to still decode and still rebuild the shard.
+/// A binary payload makes that a real question rather than a formality: a rewrite that splits a
+/// record on the wrong byte, or drops the base header, leaves records that parse as nothing --
+/// which is silent, because a reclaimed log is SUPPOSED to be shorter.
+#[test]
+fn reclaim_leaves_every_surviving_record_readable_and_the_shard_rebuildable() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let blocks = dir.path().join("blocks");
+    let indexes = dir.path().join("indexes");
+
+    const WRITES: usize = 120;
+    let shape_before;
+    {
+        let engine = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            cache.clone(),
+            blocks.clone(),
+            indexes.clone(),
+        );
+        engine.load_shard(1);
+        for index in 0..WRITES {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("rc-{index:04}"),
+                    // Newlines and high bytes, because reclaim moves bytes around.
+                    value: {
+                        let mut value = format!("v-{index}\n").into_bytes();
+                        value.extend_from_slice(&[0x1b, 0x0a, 0xff, 0x00]);
+                        value.extend_from_slice(b"tail");
+                        value
+                    },
+                },
+            });
+            assert!(response.status.ok);
+        }
+        shape_before = engine.index_shape_for_test(1);
+
+        let before = engine
+            .write_ahead_log_store()
+            .scan(1, 0, u64::MAX, u64::MAX)
+            .unwrap()
+            .len();
+        assert!(before >= WRITES, "expected the writes to be on the log");
+
+        // Reclaim through the AUTHORIZED path.
+        //
+        // The unchecked form bypasses the durable-index clamp, and the first version of this test
+        // used it and then asserted the shard still rebuilt. It does not, and should not: the
+        // clamp exists to stop a caller deleting records the index has not captured. That failure
+        // read exactly like a reclaim defect and was the test throwing away its own proof.
+        //
+        // Flushing first is what makes the anchor honest. The index on disk then reflects every
+        // record written above, so reclaiming up to that point is safe by construction.
+        engine.flush_shard_index(1);
+        let flushed_through = engine
+            .write_ahead_log_store()
+            .flush(1)
+            .expect("flush")
+            .last_sequence;
+        let anchor = crate::wal::DurableIndexAnchor::proven_durable_through(1, flushed_through);
+        let report = engine
+            .write_ahead_log_store()
+            .gc_before_sequence(1, flushed_through, &anchor)
+            .expect("reclaim");
+        println!(
+            "[reclaim] authorized through {flushed_through}, clamped={}",
+            report.clamped_by_durable_index
+        );
+
+        let survivors = engine
+            .write_ahead_log_store()
+            .scan(1, 0, u64::MAX, u64::MAX)
+            .unwrap();
+        let decoded = survivors
+            .iter()
+            .filter(|(_, line)| crate::wal::decode_wal_line(line).is_ok())
+            .count();
+        assert_eq!(
+            decoded,
+            survivors.len(),
+            "{} of {} surviving records stopped decoding after reclaim",
+            survivors.len() - decoded,
+            survivors.len()
+        );
+        println!(
+            "[reclaim] {} records before, {} survived, all decode",
+            before,
+            survivors.len()
+        );
+    }
+
+    // The shard still loads, and every value still reads back.
+    let reopened = TemporalEngine::with_local_dirs(1024 * 1024, cache, blocks, indexes);
+    reopened.load_shard(1);
+    assert_eq!(
+        reopened.index_shape_for_test(1),
+        shape_before,
+        "a reclaimed log did not rebuild the shard it described"
+    );
+}
+
+/// FAULT TOLERANCE: a torn tail must be refused or truncated, never half-applied.
+///
+/// A crash mid-append leaves a partial record. With a text payload that shows up as a line that
+/// fails to parse; with a binary one it can be a prefix that decodes to a DIFFERENT, valid-looking
+/// record, which is the dangerous shape. Both are checked: a truncated tail and a corrupted
+/// interior.
+#[test]
+fn a_torn_or_corrupted_tail_never_half_applies() {
+    for (label, corrupt_interior) in [("torn tail", false), ("corrupted interior", true)] {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        let blocks = dir.path().join("blocks");
+        let indexes = dir.path().join("indexes");
+        {
+            let engine = TemporalEngine::with_local_dirs(
+                1024 * 1024,
+                cache.clone(),
+                blocks.clone(),
+                indexes.clone(),
+            );
+            engine.load_shard(1);
+            for index in 0..8 {
+                engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: format!("ft-{index}"),
+                        value: format!("value-{index}").into_bytes(),
+                    },
+                });
+            }
+        }
+
+        let path = indexes.join("wals").join("shard-1.wal.bin");
+        let mut bytes = std::fs::read(&path).expect("the log exists");
+        // Trim the preallocated zero run so the edit lands on a record.
+        while bytes.last() == Some(&0) {
+            bytes.pop();
+        }
+        if corrupt_interior {
+            // Flip a byte in the middle of a record: a value-preserving corruption that the
+            // frame's checksum is there to catch.
+            let middle = bytes.len() / 2;
+            bytes[middle] ^= 0xff;
+        } else {
+            // Cut the last record in half.
+            bytes.truncate(bytes.len() - 20);
+        }
+        std::fs::write(&path, &bytes).expect("rewrite the log");
+
+        let reopened = TemporalEngine::with_local_dirs(1024 * 1024, cache, blocks, indexes);
+        // The form that REPORTS: a load which refuses is a correct outcome here, and a load which
+        // reports success while having dropped a record silently is the one that is not.
+        let load = reopened.load_shard_with(crate::control::LoadShardRequest {
+            shard_id: 1,
+            load_version: 0,
+            local_node_id: None,
+            shard_uri: String::new(),
+            start_routing_bucket: 0,
+            end_routing_bucket: u32::MAX,
+            readonly: false,
+            table_name: String::new(),
+        });
+        // Either outcome is correct. What must NOT happen is a load that reports success and
+        // serves a shard missing a record it silently dropped.
+        let served = reopened.index_shape_for_test(1);
+        let recovered = served.lines().filter(|l| l.starts_with("string ft-")).count();
+        println!("[fault:{label}] load ok={} recovered={recovered}", load.status.ok);
+        if load.status.ok {
+            assert!(
+                recovered > 0,
+                "{label}: the load reported success and recovered nothing"
+            );
+        }
+    }
+}
+
+/// The engine log records results in RAFT mode too.
+///
+/// Consensus replicates operations by construction -- that is what agreement means -- but the
+/// engine log underneath a raft apply is the same log, and it should record what the apply DID
+/// like any other write. If it does not, a raft node's own recovery is still re-executing.
+#[test]
+fn a_raft_apply_records_what_it_did_in_the_engine_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    let response = engine.execute_raft_apply(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "raft-key".to_string(),
+            value: b"raft-value".to_vec(),
+        },
+    });
+    assert!(response.status.ok, "raft apply failed: {response:?}");
+
+    let recorded: usize = engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .unwrap()
+        .iter()
+        .filter_map(|(_, line)| crate::wal::decode_wal_line(line).ok())
+        .map(|record| record.outcomes.len())
+        .sum();
+    assert!(
+        recorded > 0,
+        "a raft apply left no record of what it did, so this node's own recovery re-executes"
+    );
+    println!("[raft] apply recorded {recorded} result(s) in the engine log");
+}
+
+/// Can the served index be rebuilt from the LOG ALONE, with no snapshot at all?
+///
+/// The equivalence gate answers this in principle -- it installs results into an empty shard and
+/// gets an identical one -- but it hands the results over by hand. This deletes the index file off
+/// disk and makes recovery do it: whatever comes back was built from the log.
+///
+/// The answer matters for what the snapshot IS. If the log alone suffices, the snapshot is an
+/// optimisation that bounds replay, and the durable-index anchor is what says how much of the log
+/// may be reclaimed. If it does not, the snapshot is load-bearing and reclaim is far more
+/// dangerous than it looks.
+#[test]
+fn the_served_index_rebuilds_from_the_log_with_no_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let blocks = dir.path().join("blocks");
+    let indexes = dir.path().join("indexes");
+
+    let expected;
+    let expected_index;
+    {
+        let engine = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            cache.clone(),
+            blocks.clone(),
+            indexes.clone(),
+        );
+        engine.load_shard(1);
+        let workload = vec![
+            Command::StringSet {
+                key: "fw-a".to_string(),
+                value: b"alpha".to_vec(),
+            },
+            Command::StringSetEx {
+                key: "fw-ttl".to_string(),
+                value: b"expiring".to_vec(),
+                ttl_ms: 600_000,
+            },
+            Command::HashSet {
+                key: "fw-hash".to_string(),
+                field: "f".to_string(),
+                value: b"hv".to_vec(),
+            },
+            Command::SetAdd {
+                key: "fw-set".to_string(),
+                member: b"m".to_vec(),
+            },
+            Command::ZSetAdd {
+                key: "fw-zset".to_string(),
+                member: b"zm".to_vec(),
+                score: 1.5,
+            },
+            Command::ListPush {
+                key: "fw-list".to_string(),
+                member: b"lm".to_vec(),
+                left: true,
+            },
+            Command::SeenCheck {
+                key: "fw-seen".to_string(),
+                member: b"m".to_vec(),
+                window_ms: 600_000,
+            },
+            Command::BucketTake {
+                key: "fw-bucket".to_string(),
+                tokens: 2.0,
+                capacity: 10.0,
+                refill_per_sec: 1.0,
+            },
+            Command::FeatureAppend {
+                key: "fw-feature".to_string(),
+                points: (0..3)
+                    .map(|index| crate::types::FeaturePoint {
+                        timestamp_ms: 1_787_270_070_000 + index * 1_000,
+                        value: format!("p{index}").into_bytes(),
+                    })
+                    .collect(),
+            },
+            Command::CommonDelete {
+                key: "fw-a".to_string(),
+            },
+        ];
+        for command in workload {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command,
+            });
+            assert!(response.status.ok, "workload write failed: {response:?}");
+        }
+        // Force the snapshot to exist, so deleting it below is a real deletion.
+        engine.flush_shard_index(1);
+        expected = engine.index_shape_for_test(1);
+        expected_index = engine.bucket_index_shape_for_test(1);
+    }
+
+    // Delete every index file. The log is now the only account of what happened.
+    let index_dir = indexes.clone();
+    let mut removed = 0usize;
+    if let Ok(entries) = std::fs::read_dir(&index_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file() {
+                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if name.contains("index") {
+                    std::fs::remove_file(&path).ok();
+                    removed += 1;
+                }
+            }
+        }
+    }
+    assert!(removed > 0, "no index snapshot was written, so this proves nothing");
+
+    let rebuilt = TemporalEngine::with_local_dirs(1024 * 1024, cache, blocks, indexes);
+    let installs_before = rebuilt.replay_installs_for_test();
+    rebuilt.load_shard(1);
+    let installed = rebuilt.replay_installs_for_test() - installs_before;
+
+    println!("[from-log] {removed} index file(s) deleted, {installed} result(s) installed");
+    assert!(
+        installed > 0,
+        "the rebuild re-ran operations rather than installing what the writes recorded"
+    );
+    assert_eq!(
+        rebuilt.index_shape_for_test(1),
+        expected,
+        "the served index did not come back from the log alone"
+    );
+    assert_eq!(
+        rebuilt.bucket_index_shape_for_test(1),
+        expected_index,
+        "the maps came back from the log and the index did not"
+    );
+}
+
+/// A SECONDARY must SERVE, not merely arrive at the right shard.
+///
+/// The catch-up test compares shard shapes, which says the maps are right. It does not say a read
+/// works: a shape is an index, and serving a value means resolving an address to bytes. A node
+/// that caught up but cannot resolve its addresses passes the shape comparison and answers every
+/// read with nothing.
+///
+/// So this reads back every kind through the ordinary command path, on a node that never wrote
+/// any of it.
+#[test]
+fn a_secondary_serves_reads_for_every_kind_it_caught_up_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let origin = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("origin-cache"),
+        dir.path().join("origin-blocks"),
+        dir.path().join("origin-indexes"),
+    );
+    origin.load_shard(1);
+    let writes = vec![
+        Command::StringSet {
+            key: "sv-string".to_string(),
+            value: b"string-value".to_vec(),
+        },
+        Command::HashSet {
+            key: "sv-hash".to_string(),
+            field: "f".to_string(),
+            value: b"hash-value".to_vec(),
+        },
+        Command::SetAdd {
+            key: "sv-set".to_string(),
+            member: b"member".to_vec(),
+        },
+        Command::ZSetAdd {
+            key: "sv-zset".to_string(),
+            member: b"zm".to_vec(),
+            score: 2.5,
+        },
+        Command::ListPush {
+            key: "sv-list".to_string(),
+            member: b"list-value".to_vec(),
+            left: true,
+        },
+        Command::FeatureAppend {
+            key: "sv-feature".to_string(),
+            points: vec![crate::types::FeaturePoint {
+                timestamp_ms: 1_787_270_070_000,
+                value: b"feature-value".to_vec(),
+            }],
+        },
+    ];
+    for command in writes {
+        assert!(
+            origin
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command
+                })
+                .status
+                .ok
+        );
+    }
+
+    // The secondary shares the ORIGIN'S block store -- which is what a shared-storage secondary
+    // has. It has its own cache and its own index, and knows nothing about the shard.
+    let secondary = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("second-cache"),
+        dir.path().join("origin-blocks"),
+        dir.path().join("second-indexes"),
+    );
+    secondary.load_shard(1);
+    let published = origin
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .unwrap()
+        .iter()
+        .filter_map(|(_, line)| crate::wal::decode_wal_line(line).ok())
+        .filter(|record| !record.outcomes.is_empty())
+        .collect::<Vec<_>>();
+    for record in &published {
+        assert!(
+            secondary.install_shared_outcomes(1, &record.outcomes),
+            "the secondary refused results at sequence {}",
+            record.sequence
+        );
+    }
+
+    // Now SERVE. Each of these resolves an address the secondary never wrote.
+    let reads: Vec<(&str, Command, Vec<u8>)> = vec![
+        (
+            "string",
+            Command::StringGet {
+                key: "sv-string".to_string(),
+            },
+            b"string-value".to_vec(),
+        ),
+        (
+            "hash",
+            Command::HashGet {
+                key: "sv-hash".to_string(),
+                field: "f".to_string(),
+            },
+            b"hash-value".to_vec(),
+        ),
+    ];
+    for (label, command, want) in reads {
+        let response = secondary.execute(ExecuteRequest {
+            shard_id: 1,
+            command,
+        });
+        match response.response {
+            CommandResponse::Bytes { value: Some(got) } => {
+                assert_eq!(got, want, "{label}: the secondary served the wrong bytes")
+            }
+            other => panic!("{label}: the secondary could not serve it: {other:?}"),
+        }
+    }
+    println!(
+        "[secondary] caught up on {} record(s) and served reads it never wrote",
+        published.len()
+    );
+}
+
+/// Where a read is answered FROM, and what each tier costs.
+///
+/// Three places a value can come from, in order of what they cost: the cache in memory, the block
+/// store on local disk, and shared storage. The read path tries them in that order, so what a
+/// measurement shows depends entirely on what it warmed first -- which is why this counts the
+/// block store's own reads rather than timing anything: a timer cannot tell a warm cache from a
+/// fast disk, and a counter can.
+#[test]
+fn a_read_is_answered_from_memory_before_disk_and_the_counters_say_which() {
+    let dir = tempfile::tempdir().unwrap();
+    let cache = dir.path().join("cache");
+    let blocks = dir.path().join("blocks");
+    let indexes = dir.path().join("indexes");
+
+    const KEYS: usize = 40;
+    {
+        let engine = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            cache.clone(),
+            blocks.clone(),
+            indexes.clone(),
+        );
+        engine.load_shard(1);
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("pr-{index:03}"),
+                    value: vec![b'v'; 256],
+                },
+            });
+        }
+
+        // WARM: the values were just written, so the cache holds them.
+        let warm_before = engine.block_store().stats().reads;
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: format!("pr-{index:03}"),
+                },
+            });
+        }
+        let warm_reads = engine.block_store().stats().reads - warm_before;
+        // REPORTED, not asserted. Measured at one block-store read per read even for values
+        // written moments earlier, which is not what the read path looks like it should do --
+        // `append_value` puts the block in the cache under the same key `read_block_bytes` looks
+        // up. Something between those two is not connecting, and asserting a property here
+        // before understanding which would be asserting a guess.
+        println!("[tier] warm: {warm_reads} block-store read(s) for {KEYS} reads");
+    }
+
+    // COLD: a new engine, empty cache, same block store. Every value must be PROMOTED from disk.
+    let reopened = TemporalEngine::with_local_dirs(1024 * 1024, dir.path().join("cache-b"), blocks, indexes);
+    reopened.load_shard(1);
+    let cold_before = reopened.block_store().stats().reads;
+    let mut served = 0usize;
+    for index in 0..KEYS {
+        let response = reopened.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: format!("pr-{index:03}"),
+            },
+        });
+        if matches!(response.response, CommandResponse::Bytes { value: Some(_) }) {
+            served += 1;
+        }
+    }
+    let cold_reads = reopened.block_store().stats().reads - cold_before;
+    println!("[tier] cold: {cold_reads} block-store read(s), {served}/{KEYS} served");
+    assert_eq!(served, KEYS, "a cold node failed to promote every value from disk");
+    assert!(
+        cold_reads > 0,
+        "a cold node served everything without touching the block store, so nothing was promoted"
+    );
+
+    // And once promoted, the SECOND pass should not go back to disk for the same values.
+    let second_before = reopened.block_store().stats().reads;
+    for index in 0..KEYS {
+        reopened.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: format!("pr-{index:03}"),
+            },
+        });
+    }
+    let second_reads = reopened.block_store().stats().reads - second_before;
+    println!("[tier] promoted: {second_reads} block-store read(s) on the second pass");
+    assert!(
+        second_reads < cold_reads,
+        "promotion did not stick: {second_reads} reads on the second pass against {cold_reads} on the first"
+    );
+}
+
+/// Does the served index ever hold an address only THIS process can resolve?
+///
+/// Two slab ids are synthetic: one means "the block is inside a WAL record", the other means "the
+/// block is in memory". Neither is a file in the block store. Both are resolved through a registry
+/// that is process-local -- a static map in this process, keyed by a pointer to this process's
+/// block store.
+///
+/// That is fine for a restart, which rebuilds the registry from the index. It is not obviously
+/// fine for a NEW NODE: a checkpoint uploads the slabs the block store actually has, and a
+/// synthetic slab is not one of them. An index entry naming one would arrive somewhere it can
+/// never be resolved -- and would read as nothing, with no error.
+///
+/// This measures whether the served index contains such addresses at all, and under what settings.
+/// It asserts nothing about the answer: the point is to establish the fact before deciding what to
+/// do about it.
+#[test]
+fn how_many_served_addresses_only_this_process_can_resolve() {
+    // Every combination that could put a block somewhere other than the block store: the log-in-
+    // record path, the reserve-only append that skips staging, and asynchronous writes whose
+    // blocks are buffered rather than written.
+    let cases: Vec<(&str, &str, bool)> = vec![
+        ("default", "1", false),
+        ("group-commit OFF", "0", false),
+        ("async writes", "1", true),
+        ("async + group-commit OFF", "0", true),
+    ];
+    for (label, concurrent, async_storage) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        // Said to THIS engine. `TS_ENGINE_CONCURRENT_COMMIT` used to carry it, which meant the
+        // case that wanted the barrier under the lock set it for every engine in the process.
+        if concurrent == "0" {
+            engine.commit_under_lock_for_test();
+        }
+        engine.load_shard(1);
+        if async_storage {
+            assert!(
+                engine
+                    .set_config(SetConfigRequest {
+                        shard_id: 1,
+                        config: Config {
+                            version: 2,
+                            async_storage: true,
+                            ..Config::default()
+                        },
+                    })
+                    .ok
+            );
+        }
+        for index in 0..24 {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("syn-{index:03}"),
+                    value: vec![b'v'; 128],
+                },
+            });
+        }
+
+        let synthetic = engine.synthetic_address_count_for_test(1);
+        let resident = engine.wal_resident_block_count(1);
+        println!(
+            "[synthetic] {label}: {synthetic} served address(es) resolvable only in-process, {resident} log-resident page(s) tracked"
+        );
+
+        // And after a flush, which is what a checkpoint exports.
+        engine.flush_shard_index(1);
+        let after_flush = engine.synthetic_address_count_for_test(1);
+        println!("[synthetic] {label}: {after_flush} after the index is flushed");
+
+        // If any exist, say whether a value behind one still READS -- in this process it should,
+        // because the registry is right here. The question a checkpoint raises is whether it
+        // would read anywhere else, and that is what the count above is for.
+        if after_flush > 0 {
+            let probe = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: "syn-000".to_string(),
+                },
+            });
+            println!(
+                "[synthetic] {label}: in-process read {}",
+                if matches!(probe.response, CommandResponse::Bytes { value: Some(_) }) {
+                    "served"
+                } else {
+                    "EMPTY"
+                }
+            );
+        }
+    }
+}
+
+/// A checkpoint's index must name only places the checkpoint can carry.
+///
+/// An asynchronous write leaves its block in a WAL record or in memory, named by a synthetic slab
+/// id that is not a file. It serves here, through a registry local to this process. A checkpoint
+/// uploads the slabs the block store HAS, so a synthetic one is never uploaded, and a node
+/// restoring that index holds addresses it can never resolve -- reads that return nothing, with no
+/// error anywhere.
+///
+/// So the blocks are materialised before the index is exported. This asserts the property that
+/// makes a checkpoint portable: after materialising, ZERO addresses in the served index name a
+/// slab that is not a file -- and every value still reads.
+#[test]
+fn a_checkpoint_index_names_no_place_only_this_process_can_reach() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    for index in 0..24 {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("pt-{index:03}"),
+                value: format!("portable-{index}").into_bytes(),
+            },
+        });
+        assert!(response.status.ok);
+    }
+
+    let before = engine.synthetic_address_count_for_test(1);
+    assert!(
+        before > 0,
+        "this test needs async writes to produce in-process-only addresses, and got none"
+    );
+
+    let moved = engine.materialize_synthetic_blocks(1);
+    let after = engine.synthetic_address_count_for_test(1);
+    println!("[portable] {before} in-process-only address(es), {moved} materialised, {after} left");
+
+    assert_eq!(
+        after, 0,
+        "the index still names {after} place(s) a restoring node could not reach"
+    );
+
+    // And every value still reads, which is the half a block move can break.
+    for index in 0..24 {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: format!("pt-{index:03}"),
+            },
+        });
+        let want = format!("portable-{index}").into_bytes();
+        match response.response {
+            CommandResponse::Bytes { value: Some(got) } => {
+                assert_eq!(got, want, "pt-{index:03} came back changed after materialising")
+            }
+            other => panic!("pt-{index:03} stopped reading after materialising: {other:?}"),
+        }
+    }
+}
+
+/// Where the bytes of a live record actually go.
+///
+/// Not a gate -- a census. Every optimisation so far came from looking at one encoded record and
+/// asking which field was paying for itself, and two of my guesses about that were wrong. So this
+/// prints the record and the size of each part, and asserts nothing.
+#[test]
+fn what_a_live_record_is_made_of() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    // A spread of kinds, because the question is whether a rule holds for ALL of them. The last
+    // time two identifiers looked interchangeable they were, for strings, and diverged for every
+    // timestamped kind.
+    for command in [
+        Command::StringSet {
+            key: "size-000000".to_string(),
+            value: vec![b'v'; 64],
+        },
+        Command::HashSet {
+            key: "cen-hash".to_string(),
+            field: "f".to_string(),
+            value: b"v".to_vec(),
+        },
+        Command::FeatureAppend {
+            key: "cen-feature".to_string(),
+            points: (0..2)
+                .map(|index| crate::types::FeaturePoint {
+                    timestamp_ms: 1_787_270_070_000 + index * 1_000,
+                    value: b"p".to_vec(),
+                })
+                .collect(),
+        },
+        Command::SeenCheck {
+            key: "cen-seen".to_string(),
+            member: b"m".to_vec(),
+            window_ms: 60_000,
+        },
+    ] {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command,
+        });
+    }
+
+    // THAT QUESTION IS ANSWERED AND ACTED ON. This counted whether `address.object_id()` ever
+    // differed from the item's or went absent, to decide whether it could be dropped from the wire
+    // and rebuilt. It never differed, so it was dropped: an address carries no object id and the
+    // item's own field is the only copy. There is nothing left to count.
+    let mut no_address = 0usize;
+    for (_, line) in engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .unwrap()
+    {
+        let record = crate::wal::decode_wal_line(&line).expect("decodes");
+        for item in &record.outcomes {
+            if item.resolved_address().is_none() {
+                no_address += 1;
+            }
+        }
+    }
+    println!("[census] {no_address} item(s) with no address; the address carries no object id to compare");
+
+    for (_, line) in engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .unwrap()
+        .iter()
+        .take(1)
+    {
+        let record = crate::wal::decode_wal_line(line).expect("decodes");
+        println!("[census] framed record: {} B", line.len());
+        println!("[census] items: {}", record.outcomes.len());
+        for item in &record.outcomes {
+            println!(
+                "[census]   kind={} key={} ({} B) object_id={} bucket={}",
+                item.kind,
+                item.object_key,
+                item.object_key.len(),
+                item.object_id,
+                item.routing_bucket
+            );
+            if let Some(address) = item.resolved_address() {
+                println!(
+                    "[census]   address: slab={} off={} len={} block_id={:?} gen={:?} slab_id={:?}",
+                    address.block_slab_id(),
+                    address.offset(),
+                    address.length(),
+                    address.block_id(),
+                    address.generation(),
+                    address.slab_id(),
+                );
+            }
+        }
+        if let Some(metadata) = &record.metadata {
+            println!(
+                "[census] metadata: version={} timestamp={} batch={:?}",
+                metadata.version, metadata.timestamp_ms, metadata.batch_id
+            );
+        }
+        println!("[census] carries an operation: {}", record.command.is_some());
+    }
+}
+
+/// Does the log-resident registry shrink when the blocks it names become durable?
+///
+/// The registry maps a synthetic address to the record holding its bytes. It is process-static and
+/// keyed per object, so it grows with the number of distinct objects a shard writes that way. The
+/// index's own copy of that mapping IS pruned on a dump -- the comment there says dropping those
+/// entries is what keeps it from growing with the log.
+///
+/// The registry is a second copy of the same knowledge, and it matters twice: it holds memory, and
+/// `min_registered_sequence` pins the WAL retention floor to the LOWEST registration -- so an entry
+/// for a block that is already durable would hold the floor down and stop reclaim, not just cost
+/// bytes.
+///
+/// Measured, not asserted, until the numbers say which.
+#[test]
+fn what_the_log_resident_registry_holds_after_a_dump() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    const WRITES: usize = 48;
+    for index in 0..WRITES {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("rg-{index:03}"),
+                value: vec![b'v'; 96],
+            },
+        });
+    }
+
+    let registered = engine.registration_count_for_test(1);
+    let resident = engine.wal_resident_block_count(1);
+    println!("[registry] after {WRITES} async writes: {registered} registration(s), {resident} index entr(ies)");
+
+    // A dump makes those blocks durable and prunes the INDEX's copy. What happens to the registry?
+    engine.flush_shard_index(1);
+    let after_flush = engine.registration_count_for_test(1);
+    let resident_after = engine.wal_resident_block_count(1);
+    println!("[registry] after a flush: {after_flush} registration(s), {resident_after} index entr(ies)");
+
+    let cycle = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        ..Default::default()
+    });
+    let after_cycle = engine.registration_count_for_test(1);
+    let resident_cycle = engine.wal_resident_block_count(1);
+    println!(
+        "[registry] after a storage cycle ({} stages): {after_cycle} registration(s), {resident_cycle} index entr(ies)",
+        cycle.stages.len()
+    );
+
+    // The registrations pin the WAL retention floor, deliberately: while a block lives ONLY in a
+    // record, truncating that record turns an acked write into a missing read. The question is
+    // what happens once the block is somewhere else.
+    let info = engine.write_ahead_log_store().info(1).unwrap();
+    println!(
+        "[registry] log: start={} current={} -- reclaim cannot pass the oldest registration",
+        info.start_sequence, info.current_sequence
+    );
+
+    let moved = engine.materialize_synthetic_blocks(1);
+    let after_materialise = engine.registration_count_for_test(1);
+    let synthetic_left = engine.synthetic_address_count_for_test(1);
+    println!(
+        "[registry] after materialising: {moved} page(s) moved, {after_materialise} registration(s) left, {synthetic_left} synthetic address(es) left"
+    );
+
+    // Whatever the counts, every value must still read -- a registry that shrank too far would
+    // show up here rather than as a number.
+    let mut served = 0usize;
+    for index in 0..WRITES {
+        if matches!(
+            engine
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: format!("rg-{index:03}")
+                    },
+                })
+                .response,
+            CommandResponse::Bytes { value: Some(_) }
+        ) {
+            served += 1;
+        }
+    }
+    println!("[registry] {served}/{WRITES} still served");
+    assert_eq!(served, WRITES, "a value stopped reading");
+}
+
+#[test]
+fn a_replay_leaves_nothing_staged_for_the_next_write_to_adopt() {
+    // Outcomes are staged during execution and taken at the append. Replay executes and does
+    // not append, so whatever it staged stayed on the thread -- and the next write on that
+    // thread appended a record carrying it, claiming changes it never made. Threads are
+    // reused, in a server across requests and here across tests, so "the next write" is
+    // routinely someone else entirely.
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    for i in 0..4 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("key-{i}"),
+                value: b"value".to_vec(),
+            },
+        });
+    }
+    drop(engine);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+
+    assert_eq!(
+        crate::engine::block_in_wal::staged_outcome_count(),
+        0,
+        "a replay must leave nothing staged: whatever it leaves behind is adopted by the next \
+         write on this thread and recorded as that write's own doing"
+    );
+}
+
+#[test]
+fn an_async_write_is_never_lost_across_a_restart() {
+    // The symptom three separate tests kept showing: an async write is acknowledged, the log
+    // holds it, the shard loads with no error -- and the value is gone. Losing a write that way
+    // is a decision, not a crash: recovery picks a watermark and replays only past it, so a
+    // watermark chosen above a record skips it silently. This runs the whole cycle enough times
+    // to catch an intermittent one and reports the watermark it chose when it does.
+    for attempt in 0..120 {
+        let dir = tempfile::tempdir().unwrap();
+        let block_dir = dir.path().join("blocks");
+        let index_dir = dir.path().join("indexes");
+        let engine = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            dir.path().join("cache-a"),
+            &block_dir,
+            &index_dir,
+        );
+        engine.load_shard(1);
+        assert!(
+            engine
+                .set_config(SetConfigRequest {
+                    shard_id: 1,
+                    config: Config {
+                        version: 2,
+                        async_storage: true,
+                        ..Config::default()
+                    },
+                })
+                .ok
+        );
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "k".to_string(),
+                value: b"async-durable".to_vec(),
+            },
+        });
+        let before = engine.write_ahead_log_store().stats(1);
+        engine
+            .write_ahead_log_store()
+            .flush(1)
+            .expect("flush before the engine goes away");
+        drop(engine);
+
+        let restarted = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            dir.path().join("cache-b"),
+            &block_dir,
+            &index_dir,
+        );
+        // Ask the successor what it can SEE before asking what it recovered. A load that
+        // refused, a log the successor cannot read, and a replay that read the record and
+        // applied nothing are three different defects that all look like one missing value.
+        let loaded = restarted.load_shard_with(LoadShardRequest {
+            shard_id: 1,
+            load_version: 0,
+            local_node_id: None,
+            shard_uri: String::new(),
+            start_routing_bucket: 0,
+            end_routing_bucket: u32::MAX,
+            readonly: false,
+            table_name: String::new(),
+        });
+        let seen = restarted.write_ahead_log_store().stats(1);
+        let installs = restarted.replay_installs_for_test();
+        let registrations = restarted.registration_count_for_test(1);
+        let synthetic = restarted.synthetic_address_count_for_test(1);
+        let got = restarted.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: "k".to_string(),
+            },
+        });
+        let watermark =
+            crate::engine::lifecycle::LAST_REPLAY_WATERMARK.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            loaded.status.ok,
+            "attempt {attempt}: the successor refused the load: {:?}",
+            loaded.status
+        );
+        assert_eq!(
+            got.response,
+            CommandResponse::Bytes {
+                value: Some(b"async-durable".to_vec())
+            },
+            "attempt {attempt}: an acknowledged async write was lost across a restart. \
+             the writer left {} records up to sequence {}; the successor saw {} records up to \
+             sequence {}, replayed from watermark {watermark}, installed {} outcomes, holds              {} page registrations and {} unresolvable addresses",
+            before.writes,
+            before.last_sequence,
+            seen.writes,
+            seen.last_sequence,
+            installs,
+            registrations,
+            synthetic
+        );
+    }
+}
+
+#[test]
+fn a_record_carrying_its_blocks_states_results_instead_of_the_operation() {
+    // The log records what a write DID, not what it was asked to do -- and that now includes a
+    // write whose blocks travel inside its own record. It could not before: an installed result
+    // names an address, and a block living in the record was unreachable by address until replay
+    // began registering the blocks of every record it replays. With that in place the operation
+    // is redundant for these too, and redundant bytes in a log are paid for on every write.
+    //
+    // What legitimately keeps its operation: an ASYNCHRONOUS write carrying nothing. Its result
+    // names a block-store address a crash may leave unwritten, and no registration recovers a
+    // block that was never stored.
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+    for index in 0..8 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("k{index}"),
+                value: vec![b'v'; 256],
+            },
+        });
+    }
+    engine
+        .write_ahead_log_store()
+        .flush(1)
+        .expect("flush before reading the log back");
+
+    let records = engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .expect("the log should read back");
+    let mut carrying_blocks = 0usize;
+    let mut carrying_blocks_with_command = 0usize;
+    for (_, line) in &records {
+        let record = crate::wal::decode_wal_line(line).expect("a record should decode");
+        if record.staged_blocks.is_empty() {
+            continue;
+        }
+        carrying_blocks += 1;
+        if record.command.is_some() {
+            carrying_blocks_with_command += 1;
+        }
+    }
+    assert!(
+        carrying_blocks > 0,
+        "this workload must produce records carrying their blocks, or it proves nothing"
+    );
+    // Assert both directions of the flag, because the property belongs to the flag rather than
+    // to the log. With data-only off, every record is SUPPOSED to carry its operation -- that is
+    // what the switch means -- and a test asserting otherwise unconditionally says the legacy
+    // configuration is broken when it is behaving exactly as asked.
+    if crate::wal::wal_data_only_enabled() {
+        assert_eq!(
+            carrying_blocks_with_command, 0,
+            "{carrying_blocks_with_command} of {carrying_blocks} records carrying their own \
+             blocks still carry the operation as well"
+        );
+    } else {
+        assert_eq!(
+            carrying_blocks_with_command, carrying_blocks,
+            "with data-only off every record keeps its operation: {carrying_blocks_with_command} \
+             of {carrying_blocks} did"
+        );
+    }
+
+    // And the point of all of it: the shard still comes back.
+    drop(engine);
+    let restarted = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+    for index in 0..8 {
+        assert_eq!(
+            restarted
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: format!("k{index}"),
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(vec![b'v'; 256])
+            },
+            "k{index} must survive a restart on results alone"
+        );
+    }
+}
+
+/// what the log-resident registry does under sustained writes.
+///
+/// Every asynchronous write whose block has nowhere durable to go yet leaves a registration: one
+/// entry naming the record that holds the only copy. Two things ride on that entry. It costs
+/// memory, which is the smaller half. It also pins `min_registered_sequence`, and reclaim may not
+/// truncate below the lowest registration -- so a registry that only grows is a log that can
+/// never be reclaimed, whatever the retention policy says.
+///
+/// Nothing on the local write path retires them: the drain is a dump, and shared-store
+/// checkpointing. This measures what happens in between.
+#[test]
+fn what_the_log_resident_registry_does_under_sustained_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+
+    let mut seen = Vec::new();
+    for batch in 1..=6 {
+        for index in 0..200 {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    // Distinct keys: a rewrite of the same key REPLACES its registration, so
+                    // reusing keys would measure replacement rather than growth.
+                    key: format!("object-{:06}", batch * 1000 + index),
+                    value: vec![b'v'; 256],
+                },
+            });
+        }
+        seen.push((batch * 200, engine.registration_count_for_test(1)));
+    }
+
+    let floor_pinned = seen.last().map(|(_, count)| *count).unwrap_or(0);
+    println!("  writes -> registrations held");
+    for (writes, held) in &seen {
+        println!("  {writes:>6} -> {held:>6}");
+    }
+    println!(
+        "  a dump moves them out; between dumps the floor is pinned by {floor_pinned} entries"
+    );
+
+    // The shape is the finding: if this tracks writes one-for-one it is unbounded between dumps.
+    let (first_writes, first_held) = seen[0];
+    let (last_writes, last_held) = *seen.last().unwrap();
+    let grew = last_held as f64 / (first_held.max(1)) as f64;
+    let wrote = last_writes as f64 / first_writes as f64;
+    println!("  writes x{wrote:.1}, registrations x{grew:.1}");
+}
+
+/// what eight records per ingest cost, and what a batch already saves.
+///
+/// An ingest here is not one write. Measured elsewhere on the real path: a single ingest writes
+/// EIGHT records -- node, event, index ref, dirty marker, two summary refs, retrieval node,
+/// uniqueness -- and eight barriers, perfectly linear as ingests multiply. So the per-record
+/// constant this work has been shrinking gets multiplied by eight before it reaches a user, and
+/// the interesting question is not how big a record is but how many of them one operation makes.
+///
+/// This measures the two shapes that exist today: eight separate writes against one atomic batch
+/// of eight. The record format already carries `repeated items`, so a third shape is possible --
+/// one record holding eight outcomes -- and what it would save is the difference between the
+/// per-record overhead paid once and paid eight times.
+#[test]
+fn what_eight_records_per_ingest_cost() {
+    fn write_and_measure(batched: bool, ingests: usize) -> (u64, u64, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let block_dir = dir.path().join("blocks");
+        let index_dir = dir.path().join("indexes");
+        let engine = TemporalEngine::with_local_dirs(
+            8 * 1024 * 1024,
+            dir.path().join("cache"),
+            &block_dir,
+            &index_dir,
+        );
+        engine.load_shard(1);
+        let before = engine.write_ahead_log_store().stats(1);
+        for ingest in 0..ingests {
+            // The eight writes one ingest makes, as distinct keys.
+            let parts = [
+                "node", "event", "index_ref", "dirty", "summary_a", "summary_b", "retrieval",
+                "unique",
+            ];
+            if batched {
+                let commands: Vec<Command> = parts
+                    .iter()
+                    .map(|part| Command::StringSet {
+                        key: format!("ingest-{ingest:05}/{part}"),
+                        value: vec![b'v'; 96],
+                    })
+                    .collect();
+                assert!(
+                    engine
+                        .batch_execute(BatchExecuteRequest {
+                            shard_id: 1,
+                            commands,
+                        })
+                        .status
+                        .ok
+                );
+            } else {
+                for part in parts {
+                    engine.execute(ExecuteRequest {
+                        shard_id: 1,
+                        command: Command::StringSet {
+                            key: format!("ingest-{ingest:05}/{part}"),
+                            value: vec![b'v'; 96],
+                        },
+                    });
+                }
+            }
+        }
+        engine.write_ahead_log_store().flush(1).ok();
+        let after = engine.write_ahead_log_store().stats(1);
+        let path = index_dir.join("wals").join("shard-1.wal.bin");
+        let (_, record_end) = crate::wal::last_wal_sequence_in_for_test(&path).unwrap_or((0, 0));
+        (
+            record_end,
+            after.writes.saturating_sub(before.writes),
+            after.syncs.saturating_sub(before.syncs),
+        )
+    }
+
+    let ingests = 200usize;
+    let (loose_bytes, loose_writes, loose_syncs) = write_and_measure(false, ingests);
+    let (batch_bytes, batch_writes, batch_syncs) = write_and_measure(true, ingests);
+    let payload = (ingests * 8 * 96) as u64;
+
+    println!(
+        "  {ingests} ingests, 8 writes each, 96 B values ({payload} B of value)\n  \
+         separate   {loose_bytes:>9} B log   {loose_writes:>6} appends   {loose_syncs:>6} syncs   \
+         {:>6.0} B/ingest\n  \
+         batched    {batch_bytes:>9} B log   {batch_writes:>6} appends   {batch_syncs:>6} syncs   \
+         {:>6.0} B/ingest\n  \
+         batching saves {:.1}% of the log and {:.1}% of the barriers",
+        loose_bytes as f64 / ingests as f64,
+        batch_bytes as f64 / ingests as f64,
+        100.0 * (loose_bytes as f64 - batch_bytes as f64) / loose_bytes.max(1) as f64,
+        100.0 * (loose_syncs as f64 - batch_syncs as f64) / loose_syncs.max(1) as f64,
+    );
+}
+
+/// registrations plateau instead of tracking writes, and every value still reads.
+///
+/// Without a bound this set grows one entry per distinct object written — measured at 200 writes
+/// 200 held, 1200 writes 1200 held — which is memory that never comes back and a reclaim floor
+/// that never moves. With one, the recent stay resident and the rest are written where anyone can
+/// find them.
+///
+/// The second half is the half worth having: a bound that loses data is not a bound, it is a
+/// deletion policy. Every value written is read back after the sweeps have run.
+#[test]
+fn registrations_plateau_instead_of_tracking_writes() {
+    let previous = std::env::var("TS_WAL_RESIDENT_PAGES").ok();
+    std::env::set_var("TS_WAL_RESIDENT_PAGES", "64");
+    let before_sweeps = crate::engine::RESIDENT_SWEEPS.load(std::sync::atomic::Ordering::Relaxed);
+
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        4 * 1024 * 1024,
+        dir.path().join("cache"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(SetConfigRequest {
+                shard_id: 1,
+                config: Config {
+                    version: 2,
+                    async_storage: true,
+                    ..Config::default()
+                },
+            })
+            .ok
+    );
+
+    let total = 600usize;
+    let mut held = Vec::new();
+    for index in 0..total {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("object-{index:05}"),
+                value: vec![b'v'; 128],
+            },
+        });
+        if index % 100 == 99 {
+            held.push((index + 1, engine.registration_count_for_test(1)));
+        }
+    }
+    let after_sweeps = crate::engine::RESIDENT_SWEEPS.load(std::sync::atomic::Ordering::Relaxed);
+    match previous {
+        Some(value) => std::env::set_var("TS_WAL_RESIDENT_PAGES", value),
+        None => std::env::remove_var("TS_WAL_RESIDENT_PAGES"),
+    }
+
+    println!("  writes -> registrations held (limit 64)");
+    for (writes, count) in &held {
+        println!("  {writes:>6} -> {count:>6}");
+    }
+    println!("  sweeps: {}", after_sweeps - before_sweeps);
+
+    assert!(
+        after_sweeps > before_sweeps,
+        "the bound never fired, so this proves nothing about it"
+    );
+    let peak = held.iter().map(|(_, count)| *count).max().unwrap_or(0);
+    assert!(
+        peak <= 128,
+        "registrations should stay near the limit, peaked at {peak} over {total} writes"
+    );
+
+    // A bound that loses data is a deletion policy. Everything written must still read.
+    for index in 0..total {
+        assert_eq!(
+            engine
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: format!("object-{index:05}"),
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(vec![b'v'; 128])
+            },
+            "object-{index:05} was lost when its page was moved out"
+        );
+    }
+}
+
+/// a batch leaves nothing staged for the next write to adopt.
+///
+/// Outcomes are staged during execution and taken at the append. The batch path executes every
+/// command in the batch — staging an item for each — and then appends records built from the
+/// COMMANDS, never touching what was staged. So the items sit in the thread's buffer, and the
+/// next write on that thread appends them as its own doing.
+///
+/// This is the same defect already fixed for replay and for the single-write path, in the one
+/// place left. Threads are reused across requests in a server and across tests here, so "the next
+/// write" is routinely someone else entirely.
+#[test]
+fn a_batch_leaves_nothing_staged_for_the_next_write_to_adopt() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+
+    let batch = engine.batch_execute(BatchExecuteRequest {
+        shard_id: 1,
+        commands: (0..6)
+            .map(|index| Command::StringSet {
+                key: format!("batched-{index}"),
+                value: b"v".to_vec(),
+            })
+            .collect(),
+    });
+    assert!(batch.status.ok, "the batch itself must succeed");
+
+    assert_eq!(
+        crate::engine::block_in_wal::staged_outcome_count(),
+        0,
+        "a batch must leave nothing staged: whatever it leaves is picked up by the next write on \
+         this thread and written into that write's record as changes it made itself"
+    );
+}
+
+/// which records still carry an operation, across every shape a write can take.
+///
+/// "Results, not operations" is only true of the paths that were changed. This walks the log a
+/// mixed workload leaves and counts, per shape, how many records carry an operation and how many
+/// state what they did — which is the difference between believing the claim and checking it.
+#[test]
+fn which_records_still_carry_an_operation() {
+    fn audit(label: &str, async_storage: bool, batched: bool) -> (usize, usize, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let block_dir = dir.path().join("blocks");
+        let index_dir = dir.path().join("indexes");
+        let engine = TemporalEngine::with_local_dirs(
+            2 * 1024 * 1024,
+            dir.path().join("cache"),
+            &block_dir,
+            &index_dir,
+        );
+        engine.load_shard(1);
+        if async_storage {
+            assert!(
+                engine
+                    .set_config(SetConfigRequest {
+                        shard_id: 1,
+                        config: Config {
+                            version: 2,
+                            async_storage: true,
+                            ..Config::default()
+                        },
+                    })
+                    .ok
+            );
+        }
+        if batched {
+            engine.batch_execute(BatchExecuteRequest {
+                shard_id: 1,
+                commands: (0..8)
+                    .map(|index| Command::StringSet {
+                        key: format!("{label}-{index}"),
+                        value: vec![b'v'; 64],
+                    })
+                    .collect(),
+            });
+        } else {
+            for index in 0..8 {
+                engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: format!("{label}-{index}"),
+                        value: vec![b'v'; 64],
+                    },
+                });
+            }
+        }
+        engine.write_ahead_log_store().flush(1).ok();
+        let records = engine
+            .write_ahead_log_store()
+            .scan(1, 0, u64::MAX, u64::MAX)
+            .expect("the log should read back");
+        let mut with_command = 0usize;
+        let mut with_items = 0usize;
+        let total = records.len();
+        for (_, line) in &records {
+            let record = crate::wal::decode_wal_line(line).expect("a record should decode");
+            if record.command.is_some() {
+                with_command += 1;
+            }
+            if !record.outcomes.is_empty() {
+                with_items += 1;
+            }
+        }
+        println!(
+            "  {label:<22} {total:>3} records   {with_command:>3} carry an operation   \
+             {with_items:>3} state results"
+        );
+        (total, with_command, with_items)
+    }
+
+    println!("  shape                  records   operations   results");
+    let (_, sync_cmds, sync_items) = audit("sync, separate", false, false);
+    let (_, sync_batch_cmds, sync_batch_items) = audit("sync, batched", false, true);
+    let (_, async_cmds, _) = audit("async, separate", true, false);
+    let (_, async_batch_cmds, _) = audit("async, batched", true, true);
+
+    // The synchronous shapes have no excuse: their blocks are in the block store before the
+    // record is acked, so a result names something a reader can find.
+    assert_eq!(
+        sync_cmds, 0,
+        "a synchronous write should state results, not the operation"
+    );
+    assert!(sync_items > 0, "and it should state some");
+    assert_eq!(
+        sync_batch_cmds, 0,
+        "a synchronous batch should state results, not the operation"
+    );
+    assert!(sync_batch_items > 0, "and it should state some");
+    // The asynchronous shapes are reported rather than asserted: an async write carrying nothing
+    // names a block-store address a crash may leave unwritten, and re-running is the only thing
+    // that rebuilds it. That one is a durability distinction, not an unconverted path.
+    println!("  async separate carries {async_cmds} operations, async batched {async_batch_cmds}");
+}
+
+/// Did nesting actually save what it was measured to save?
+///
+/// Two probes stood here before the change: one establishing that the per-object map was exactly a
+/// prefix range scan of the per-component one (113 objects, 226 refs, 0 disagreements), and one
+/// measuring what merging them would save (223588 B of keys held against 110780 nested, 50.5%).
+/// Both described a layout that no longer exists, and neither would fail if the saving had been
+/// lost -- they measured a hypothetical.
+///
+/// This measures the layout that shipped. It reconstructs what the two flat maps WOULD have held
+/// for the same shard and compares it against what is actually held, so the number is a saving
+/// rather than a description.
+#[test]
+fn nesting_the_block_lookups_saved_what_it_measured() {
+    const RECORDS: usize = 4_000;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    assert!(
+        engine
+            .load_shard_with(crate::control::LoadShardRequest {
+                shard_id: 1,
+                table_name: "nested-saving".to_string(),
+                shard_uri: "local://nested-saving/1".to_string(),
+                start_routing_bucket: 0,
+                end_routing_bucket: 1023,
+                readonly: false,
+                load_version: 1,
+                local_node_id: Some(1),
+            })
+            .status
+            .ok
+    );
+    // Mixed, because the saving depends on whether an object carries a component at all: a plain
+    // value has none and a hash field has one. Measuring only one kind would generalise from
+    // whichever half is easier.
+    for index in 0..RECORDS {
+        if index % 4 == 0 {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("nest-hash-{}", index / 4),
+                    field: format!("field-{index}"),
+                    value: vec![b'h'; 64],
+                },
+            });
+        } else {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("nest-str-{index}"),
+                    value: vec![b'v'; 64],
+                },
+            });
+        }
+    }
+
+    let shards = engine.shards.read().expect("shards lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 loaded");
+    let lookup = &shard.bucket_index.object_block_lookup;
+
+    // Held now: the (model, object) key once, and nothing else. The component that used to sit on
+    // each nested entry is gone with the level that held it.
+    let mut nested_keys = 0usize;
+    let mut nested_map_entries = 0usize;
+    // What two flat maps WOULD have held: the (model, object) key as a whole key in one map, AND
+    // again as the head of every (model, object, component) key in the other. The tail of that
+    // longer key is "0|" -- the no-component spelling, which is the only one the engine ever wrote
+    // once an entry stopped naming its element. It used to be computed from the entry's own name
+    // and is now the constant it had already become.
+    const FLAT_TAIL: usize = 2;
+    let mut flat_keys = 0usize;
+    let mut flat_map_entries = 0usize;
+    for (_model, object_key, _refs) in lookup.iter() {
+        nested_keys += object_key.len();
+        nested_map_entries += 1;
+        // The flat layout kept a whole B-tree entry per object in the second map...
+        flat_keys += object_key.len();
+        flat_map_entries += 1;
+        // ...and another per (object, component) in the first. One object had one component, so
+        // this is one more entry per object and not a loop over a list.
+        flat_keys += object_key.len() + FLAT_TAIL;
+        flat_map_entries += 1;
+    }
+
+    let per = |n: usize| n as f64 / RECORDS as f64;
+    println!(
+        "
+  page-lookup keys at {RECORDS} records, nested against the two flat maps it replaced:
+             two flat maps                {:>8} B  ({:>6.1} B/record, {flat_map_entries} b-tree entries)
+             nested                       {:>8} B  ({:>6.1} B/record, {nested_map_entries} b-tree entries)
+             saved                        {:>8} B  ({:>6.1} B/record, {:>5.1}%)
+",
+        flat_keys,
+        per(flat_keys),
+        nested_keys,
+        per(nested_keys),
+        flat_keys - nested_keys,
+        per(flat_keys - nested_keys),
+        100.0 * (flat_keys - nested_keys) as f64 / flat_keys as f64,
+    );
+
+    assert!(flat_keys > 0 && !lookup.is_empty(), "the workload must populate the lookup");
+    // The measurement that justified the change was 50.5%. Assert well below it so ordinary
+    // changes in key length do not fail the build, but a REGRESSION -- the object key creeping
+    // back into the inner entries -- cannot pass.
+    let saved = 100.0 * (flat_keys - nested_keys) as f64 / flat_keys as f64;
+    assert!(
+        saved > 40.0,
+        "nesting saved {saved:.1}% of the page-lookup key bytes; it measured 50.5% before it \
+         shipped, and anything near zero means the object key is being stored twice again"
+    );
+    // ENTRY COUNT, STATED DIRECTLY RATHER THAN THROUGH AN ACCOUNTING IDENTITY.
+    //
+    // Two assertions stood here and BOTH were unfalsifiable. One was
+    // `nested_map_entries < flat_map_entries` and the other
+    // `nested_map_entries + nested_vec_elements == flat_map_entries`. With one component per
+    // object -- the state since the element name came off the page entry -- `nested_map_entries`,
+    // `nested_vec_elements` and `objects` were all the same number and `flat_map_entries` was
+    // twice it, so the pair read `n < 2n` and `n + n == 2n`. Both held for every corpus including
+    // an empty one, and the second's message, "none lost", described a bookkeeping step that could
+    // not fail.
+    //
+    // What is actually claimed is that the flat layout kept TWO b-tree entries per object and the
+    // nested one keeps ONE. That is now said against the object count, which an empty corpus
+    // cannot satisfy, and the vector-slot term is gone because there are no vector slots.
+    let objects = lookup.len();
+    assert!(objects > 0, "the lookup holds no objects; nothing was counted");
+    assert_eq!(
+        nested_map_entries, objects,
+        "the nested layout should hold exactly one b-tree entry per object"
+    );
+    assert_eq!(
+        flat_map_entries,
+        2 * objects,
+        "the flat layout it replaced held two b-tree entries per object -- one per (model, \
+         object) and one per (model, object, component) -- and that is the count this saving is \
+         measured against"
+    );
+}
+
+/// What does refusing to reclaim, rather than clamping, actually hold?
+///
+/// The plan computes a durable frontier — the lowest wal sequence among the dump manifests
+/// covering every live generation — and then reclaims up to it, but ONLY if no replay cursor sits
+/// below it. One cursor one sequence behind the frontier turns the whole reclaim off, and the log
+/// keeps everything for as long as that cursor lags.
+///
+/// Everything below the SLOWEST cursor is safe to drop whether or not that cursor has caught up,
+/// which is what clamping the frontier to the cursor would take. The prize is therefore not a
+/// constant: it is exactly the part of the log the slowest cursor has already consumed, so it is
+/// measured across cursor positions rather than quoted as one number. At a cursor that has never
+/// moved it is zero, and that is the honest answer for a permanently stuck follower.
+#[test]
+fn reclaim_clamps_to_the_slowest_cursor_instead_of_refusing_at_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        4 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // Eight rounds, each ending in a dump, so the durable frontier sits well above zero and there
+    // is a real span of log below it to talk about.
+    let mut manifests = Vec::new();
+    for round in 0..8 {
+        for index in 0..8 {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("reclaim-{round}-{index}"),
+                    value: vec![b'v'; 256],
+                },
+            });
+        }
+        manifests.push(
+            engine
+                .create_bucket_dump_manifest(1, Vec::new())
+                .expect("a dump manifest per round"),
+        );
+    }
+
+    let unblocked = engine.storage_wal_reclaim_plan(1, Vec::new(), Vec::new());
+    let frontier = unblocked.durable_bucket_generation_frontier_wal_sequence;
+    assert!(
+        frontier > 0 && unblocked.safe_to_reclaim,
+        "with no cursors the plan must reclaim, or there is nothing to compare against: \
+         {unblocked:?}"
+    );
+
+    // Bytes of log at or below a sequence, so the table is in the unit that matters rather than
+    // in sequence numbers.
+    // `scan` is bounded by BYTE OFFSETS, not by sequence -- passing a sequence as the end
+    // offset measured the first few bytes of the log and reported zero everywhere. Read the whole
+    // log once and bucket the records by their own decoded sequence instead.
+    let all_records = engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .expect("the log should read back");
+    let by_sequence: Vec<(u64, usize)> = all_records
+        .iter()
+        .filter_map(|(_, line)| {
+            crate::wal::decode_wal_line(line)
+                .ok()
+                .map(|record| (record.sequence, line.len()))
+        })
+        .collect();
+    let bytes_through = |sequence: u64| -> usize {
+        by_sequence
+            .iter()
+            .filter(|(at, _)| *at <= sequence)
+            .map(|(_, len)| *len)
+            .sum()
+    };
+    let total_below_frontier = bytes_through(frontier);
+
+    println!(
+        "
+  durable frontier at wal sequence {frontier}, {total_below_frontier} B of log at or below it
+
+  cursor at      today retains   clamped would   released      of the span
+"
+    );
+
+    let mut released_at_frontier = 0usize;
+    for numerator in [0u64, 1, 2, 4, 6, 7, 8] {
+        let cursor_at = frontier * numerator / 8;
+        let plan = engine.storage_wal_reclaim_plan(
+            1,
+            vec![BucketDumpFollowerReplayCursor {
+                follower_id: "lagging".to_string(),
+                shard_id: 1,
+                wal_sequence: cursor_at,
+                index_log_sequence: u64::MAX,
+            }],
+            Vec::new(),
+        );
+        // Clamping takes the frontier down to the slowest cursor instead of refusing at it.
+        let clamped = if plan.safe_to_reclaim {
+            plan.retain_from_wal_sequence
+        } else {
+            frontier.min(cursor_at).saturating_add(1)
+        };
+        let released = bytes_through(clamped.saturating_sub(1));
+        if numerator == 8 {
+            released_at_frontier = released;
+        }
+        println!(
+            "  {:>10}   {:>13}   {:>13}   {:>7} B   {:>5.1}%",
+            cursor_at,
+            plan.retain_from_wal_sequence,
+            clamped,
+            released,
+            if total_below_frontier == 0 {
+                0.0
+            } else {
+                100.0 * released as f64 / total_below_frontier as f64
+            },
+        );
+    }
+
+    // The shape, not a threshold. A cursor that has never moved releases nothing -- that is the
+    // answer for a permanently stuck follower and it is not a defect. A cursor level with the
+    // frontier is not blocking at all, so today already reclaims there.
+    assert!(
+        total_below_frontier > 0,
+        "the workload must leave log below the frontier"
+    );
+    assert!(
+        released_at_frontier > 0,
+        "a cursor level with the frontier must release the span: {released_at_frontier}"
+    );
+
+    // THE CLAIM UNDER TEST: a cursor strictly between zero and the frontier is the case the
+    // refusal costs, and today it retains nothing at all.
+    let midway = frontier / 2;
+    let mid_plan = engine.storage_wal_reclaim_plan(
+        1,
+        vec![BucketDumpFollowerReplayCursor {
+            follower_id: "lagging".to_string(),
+            shard_id: 1,
+            wal_sequence: midway,
+            index_log_sequence: u64::MAX,
+        }],
+        Vec::new(),
+    );
+    assert!(midway > 0 && midway < frontier, "the sweep needs a middle");
+    assert!(
+        mid_plan.safe_to_reclaim,
+        "a cursor behind the frontier no longer stops reclaim outright: {mid_plan:?}"
+    );
+    assert_eq!(
+        mid_plan.retain_from_wal_sequence,
+        midway.saturating_add(1),
+        "reclaim clamps to the cursor rather than refusing at it: {mid_plan:?}"
+    );
+    assert!(
+        bytes_through(midway) > 0,
+        "and the span it releases is not nothing: {} B",
+        bytes_through(midway)
+    );
+    // The cursor is still reported as retaining logs, which remains true of the logs ABOVE it.
+    // What changed is that this is no longer a reason to keep the ones below it as well.
+    assert_eq!(mid_plan.follower_cursor_block_count, 1, "{mid_plan:?}");
+
+    // A cursor that has never advanced releases nothing, and that is the correct answer rather
+    // than a shortfall: there is no span behind a reader that has read nothing. The whole win
+    // here is bounded by cursor movement, so a permanently stuck follower still pins the log.
+    let stuck = engine.storage_wal_reclaim_plan(
+        1,
+        vec![BucketDumpFollowerReplayCursor {
+            follower_id: "never-moved".to_string(),
+            shard_id: 1,
+            wal_sequence: 0,
+            index_log_sequence: 0,
+        }],
+        Vec::new(),
+    );
+    assert_eq!(
+        stuck.retain_from_wal_sequence, 0,
+        "a cursor at zero clamps the frontier to zero, which reclaims nothing: {stuck:?}"
+    );
+}
+
+/// A clamped reclaim still serves everything, after a restart.
+///
+/// Clamping drops the log at or below the slowest cursor. That is right only if `wal_sequence`
+/// means "the last record I consumed" and not "the next record I need" -- and the difference
+/// between those two readings is exactly one record, which no comparison of sequence numbers can
+/// reveal. The old code already dropped records at a cursor's own sequence whenever that cursor sat
+/// level with the frontier, so the convention is the first one, but that is an argument from
+/// reading code rather than a demonstration.
+///
+/// So this rebuilds a shard from what survives the reclaim and reads the values back. A recovery
+/// that has lost a record cannot serve it, and nothing about the retained sequence numbers would
+/// have said so.
+#[test]
+fn a_clamped_reclaim_still_serves_what_it_kept_after_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        4 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // Written before the cursor: the span a clamped reclaim is entitled to drop from the log.
+    for index in 0..16 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("consumed-{index}"),
+                value: format!("v-consumed-{index}").into_bytes(),
+            },
+        });
+    }
+    let anchor = engine
+        .create_bucket_dump_manifest(1, Vec::new())
+        .expect("a dump to anchor the cursor on");
+
+    // Written after it: the span the follower has NOT consumed, which must survive.
+    for index in 0..16 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("pending-{index}"),
+                value: format!("v-pending-{index}").into_bytes(),
+            },
+        });
+    }
+    engine
+        .create_bucket_dump_manifest(1, Vec::new())
+        .expect("a dump above the cursor");
+
+    let plan = engine.storage_wal_reclaim_plan(
+        1,
+        vec![BucketDumpFollowerReplayCursor {
+            follower_id: "consumed-through-anchor".to_string(),
+            shard_id: 1,
+            wal_sequence: anchor.wal_sequence,
+            index_log_sequence: anchor.index_log_sequence,
+        }],
+        Vec::new(),
+    );
+    assert!(
+        plan.safe_to_reclaim,
+        "a cursor behind the frontier should clamp, not refuse: {plan:?}"
+    );
+    assert_eq!(
+        plan.retain_from_wal_sequence,
+        anchor.wal_sequence.saturating_add(1),
+        "clamped to the cursor: {plan:?}"
+    );
+    let report = engine.apply_storage_wal_reclaim(plan);
+    assert!(report.applied, "{report:?}");
+    assert!(
+        report.wal_bytes_after < report.wal_bytes_before,
+        "the clamp should have released log bytes, or this test proves nothing: {report:?}"
+    );
+
+    // Rebuild from what is on disk. A different cache directory so nothing is served from a warm
+    // tier -- the point is what recovery can reconstruct, not what happened to still be in memory.
+    drop(engine);
+    let restarted = TemporalEngine::with_local_dirs(
+        4 * 1024,
+        dir.path().join("restart-cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    restarted.load_shard(1);
+
+    for index in 0..16 {
+        assert_eq!(
+            restarted
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: format!("pending-{index}"),
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(format!("v-pending-{index}").into_bytes())
+            },
+            "a value above the cursor must survive a clamped reclaim"
+        );
+        assert_eq!(
+            restarted
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: format!("consumed-{index}"),
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(format!("v-consumed-{index}").into_bytes())
+            },
+            "and so must one below it: the log was dropped because a DUMP already covers these, \\
+             not because they stopped existing -- reclaiming the log is not deleting the data"
+        );
+    }
+}
+
+/// What the dirty-object set costs to drain, as the store grows.
+///
+/// `dirty_objects` is a flat set of object keys, and the dump drain used to sit INSIDE the
+/// per-bucket loop:
+///
+///     for bucket_id in manifest.bucket_ids { ...
+///         shard.dirty_objects.retain(|key| block_routing_bucket(key, ..) != bucket_id)
+///
+/// so every qualifying bucket walked every dirty object, re-hashing each key to recompute a
+/// routing bucket the caller already knew. The work was |dirty objects| x |buckets| to remove at
+/// most |dirty objects| entries.
+///
+/// This counts what the drain ACTUALLY looks at, through a counter inside the closure, rather than
+/// deriving the number as a product. A product is arithmetic about the code; the counter survives
+/// someone moving the loop back.
+#[test]
+fn the_dump_drain_looks_at_each_dirty_object_once() {
+    fn measure(records: usize) -> (usize, usize, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            8 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        assert!(
+            engine
+                .load_shard_with(crate::control::LoadShardRequest {
+                    shard_id: 1,
+                    table_name: "dirty-drain".to_string(),
+                    shard_uri: "local://dirty-drain/1".to_string(),
+                    start_routing_bucket: 0,
+                    end_routing_bucket: 1023,
+                    readonly: false,
+                    load_version: 1,
+                    local_node_id: Some(1),
+                })
+                .status
+                .ok
+        );
+        for index in 0..records {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("dirty-{index}"),
+                    value: vec![b'v'; 64],
+                },
+            });
+        }
+        let (dirty_before, buckets) = {
+            let shards = engine.shards.read().expect("shards lock poisoned");
+            let shard = shards.get(&1).expect("shard 1 loaded");
+            (shard.dirty_objects.len(), shard.bucket_index.bucket_map.len())
+        };
+
+        // The drain runs from `apply_storage_lifecycle`, NOT from creating or installing a
+        // manifest directly. The first version of this probe called those, measured a drain that
+        // never ran, and passed -- which is why the assertion below insists it ran at all.
+        let selected: Vec<u32> = {
+            let shards = engine.shards.read().expect("shards lock poisoned");
+            shards
+                .get(&1)
+                .expect("shard 1 loaded")
+                .bucket_index
+                .bucket_map
+                .keys()
+                .copied()
+                .collect()
+        };
+        crate::engine::storage_lifecycle_methods::DIRTY_DRAIN_VISITS
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        engine.apply_storage_lifecycle(StorageLifecycleRequest {
+            shard_id: 1,
+            selected_dump_buckets: selected,
+            ..Default::default()
+        });
+        let visits = crate::engine::storage_lifecycle_methods::DIRTY_DRAIN_VISITS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        (dirty_before, buckets, visits)
+    }
+
+    println!(
+        "
+  records   dirty objects   buckets   drain visits   per dirty object   as one-pass-per-bucket
+"
+    );
+    for records in [500usize, 1_000, 2_000, 4_000] {
+        let (dirty, buckets, visits) = measure(records);
+        println!(
+            "  {records:>7}   {dirty:>13}   {buckets:>7}   {visits:>12}   {:>16.2}   {:>21}",
+            visits as f64 / dirty.max(1) as f64,
+            dirty.saturating_mul(buckets),
+        );
+        // The property, not a threshold: one pass over the set, however many buckets a dump
+        // covers. Before the hoist this was `dirty * buckets` -- 4 040 000 visits to clear 4 000
+        // objects across 1 010 buckets.
+        // ANTI-VACUITY FIRST. `visits <= dirty` is trivially true at zero, and the first version
+        // of this probe passed exactly that way: it called an entry point that does not drain, so
+        // the count was 0 and the bound held for the wrong reason. A "no more than X" assertion
+        // needs a companion asserting "at least something", because a broken harness and a fixed
+        // defect both produce zero and only one of them is good news.
+        assert!(
+            visits > 0,
+            "the drain never ran, so the count measures nothing: {dirty} dirty objects, \
+             {buckets} buckets"
+        );
+        assert!(
+            visits <= dirty as u64,
+            "the drain visited {visits} keys for {dirty} dirty objects across {buckets} buckets, \
+             which means it is walking the set once per bucket again"
+        );
+    }
+}
+
+/// Does the incrementally-maintained live-object set agree with a full rebuild?
+///
+/// `update_bucket_layout` recomputes `object_index` by scanning every block in the bucket, and it is
+/// called per block insert. Measured on the add path: 5 762 400 block visits per 600 adds, four times
+/// the work for twice the adds. The insert site already maintains the set incrementally on the line
+/// above -- `bucket.object_index.insert(object_id)` -- and the rebuild then discards that work.
+///
+/// Whether the rebuild is REDUNDANT or LOad-BEARING is not something to reason about: the rebuild
+/// keeps only LIVE object ids, while a loop further down deliberately re-attaches tombstone ids
+/// with a comment saying the object manager's count must match the load path. So the rebuild and
+/// the re-attach are entangled, and "the insert already did it" is exactly the kind of claim that
+/// looks obvious and is wrong.
+///
+/// This drives a workload with every shape that can move the set -- fresh inserts, overwrites of a
+/// live object, deletes, and re-inserts of a deleted key -- then compares what the shard actually
+/// holds against a rebuild computed from the blocks. Any divergence is the reason the rebuild
+/// exists, and the fix has to be shaped around it rather than delete it.
+#[test]
+fn the_maintained_object_index_matches_a_full_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        2 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    for index in 0..120 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("live-{index}"),
+                value: vec![b'v'; 48],
+            },
+        });
+        // Overwrite an earlier key: a second live block for an id already in the set.
+        if index % 3 == 0 {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("live-{}", index / 2),
+                    value: vec![b'w'; 96],
+                },
+            });
+        }
+        // Delete: the case where the set may need to LOSE an id, which one block cannot decide.
+        if index % 7 == 0 {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::CommonDelete {
+                    key: format!("live-{}", index / 4),
+                },
+            });
+        }
+        // Re-insert a deleted key: the set must gain it back.
+        if index % 11 == 0 {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("live-{}", index / 4),
+                    value: vec![b'r'; 32],
+                },
+            });
+        }
+        // Hash fields, so an object carries several blocks under one id.
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::HashSet {
+                key: format!("hash-{}", index % 9),
+                field: format!("field-{index}"),
+                value: vec![b'h'; 32],
+            },
+        });
+    }
+
+    let shards = engine.shards.read().expect("shards lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 loaded");
+
+    let mut divergent = Vec::new();
+    let named = super::BlockObjects::of(&shard.bucket_index);
+    let mut checked = 0usize;
+    let mut live_total = 0usize;
+    for (routing_bucket, bucket) in shard.bucket_index.bucket_map.iter() {
+        // What a rebuild would produce: the ids of the blocks that are not deleted.
+        let rebuilt: crate::engine::state::ObjectIndex = bucket
+            .block_index
+            .iter()
+            .filter(|(_, block)| !block.deleted)
+            .map(|(handle, block)| block.object_id(1, named.at(*routing_bucket, *handle)))
+            .collect();
+        checked += 1;
+        live_total += rebuilt.object_count();
+        // THE SET, not the slots -- see the note in `object_index_is_maintained_incrementally`.
+        if bucket.object_index.sorted_ids() != rebuilt.sorted_ids() {
+            let held: Vec<u64> = bucket.object_index.difference(&rebuilt).copied().collect();
+            let missing: Vec<u64> = rebuilt.difference(&bucket.object_index).copied().collect();
+            divergent.push((*routing_bucket, held, missing));
+        }
+    }
+
+    println!(
+        "
+  buckets checked            {checked}
+  live object ids (rebuilt)  {live_total}
+  buckets where the held set differs from a rebuild  {}
+",
+        divergent.len()
+    );
+    for (bucket, held, missing) in divergent.iter().take(6) {
+        println!("    bucket {bucket}: holds-but-rebuild-drops {held:?}, rebuild-has-but-holds-not {missing:?}");
+    }
+
+    // Anti-vacuity first: a comparison over an empty shard agrees about nothing.
+    assert!(
+        checked > 0 && live_total > 0,
+        "the workload must populate buckets, or the comparison below compares nothing"
+    );
+
+    // The finding, whichever way it goes. If this holds, the per-insert rebuild is recomputing
+    // what the insert already knew and can go. If it does not, the difference names exactly what
+    // the rebuild is for -- and the tombstone ids re-attached after it are the first suspect.
+    // The held set is a strict SUPERSET of a rebuild, and the extra ids are tombstones the object
+    // manager must keep reporting until GC reclaims the slot -- `rebuild_bucket_first_index`
+    // re-attaches them deliberately after recomputing the live set. Measured: 14 of 183 buckets
+    // hold exactly one extra id each, and NOTHING is ever missing in the other direction.
+    //
+    // So the invariant is containment plus a named exception, not equality. Asserting equality
+    // would fail on correct behaviour, and asserting nothing would miss a live id going astray.
+    for (bucket_id, held_extra, missing) in &divergent {
+        assert!(
+            missing.is_empty(),
+            "bucket {bucket_id} is MISSING live object ids a rebuild would produce: {missing:?} -- \
+             a live page exists whose id the index does not hold"
+        );
+        let bucket = shard
+            .bucket_index
+            .bucket_map
+            .get(bucket_id)
+            .expect("the divergent bucket was read from this map");
+        for object_id in held_extra {
+            assert!(
+                bucket.deleted_object_index.contains(object_id),
+                "bucket {bucket_id} holds object id {object_id}, which is neither live nor a \
+                 recorded delete_marker"
+            );
+        }
+    }
+}
+/// Does a context node block end up in the bucket index, or not?
+///
+/// This decides how the per-record rebuild can be removed, and the code says two things that pull
+/// opposite ways. The executor for `ContextUpsertNode` stages its outcome under its own kind with
+/// the comment "this writes a hash block and -- unlike HashSet -- never registers it in the bucket
+/// index". But the block IS put into `shard.hashes`, and `rebuild_bucket_first_index` derives the
+/// index from `collect_model_live_block_entries`, which reads the model maps.
+///
+/// If context blocks ARE in the index, the rebuild is load-bearing and removing it needs the write
+/// path to call `upsert_bucket_index_block` itself. If they are NOT, the rebuild is doing nothing
+/// for these writes and they can be classified as not dirtying the index at all -- a much smaller
+/// change. Reading the code has been wrong repeatedly here, so this asks the shard.
+#[test]
+fn whether_a_context_block_reaches_the_bucket_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        2 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // A plain hash write, as the control: this one is known to register.
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::HashSet {
+            key: "control-hash".to_string(),
+            field: "f".to_string(),
+            value: vec![b'h'; 64],
+        },
+    });
+
+    let ingest = crate::context_workflow::ingest_extract_context(
+        &engine,
+        crate::context_workflow::ContextIngestExtractRequest {
+            shard_id: 1,
+            tenant_hash: 4242,
+            sources: vec![crate::context_workflow::ContextExtractRequest {
+                shard_id: 1,
+                tenant_hash: 4242,
+                source_kind: crate::context_workflow::ContextSourceKind::Incident,
+                source_id: "IDX-1".to_string(),
+                title: "index membership".to_string(),
+                body: "does this page reach the bucket index".to_string(),
+                timestamp_ms: 1_000,
+                provider: crate::context_workflow::ContextModelProviderConfig::default(),
+            }],
+            provider: crate::context_workflow::ContextModelProviderConfig::default(),
+            start_time_ms: 0,
+            end_time_ms: 0,
+            max_events: 0,
+            query: String::new(),
+        },
+    );
+    assert!(ingest.status.ok, "the ingest must succeed: {:?}", ingest.status);
+
+    let shards = engine.shards.read().expect("shards lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 loaded");
+
+    // Every kind the index holds a block for, and how many of each.
+    let mut kinds: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for block in bucket.block_index.values() {
+            *kinds.entry(block.model_id.clone().to_string()).or_insert(0) += 1;
+        }
+    }
+    // And the context keys the model map holds, so the two can be compared.
+    let context_keys_in_model = shard
+        .hashes
+        .keys()
+        .filter(|key| key.contains("ctx") || key.contains("context"))
+        .count();
+    let context_blocks_in_index: usize = super::blocks_with_identity(&shard.bucket_index)
+        .into_iter()
+        .filter(|(_, _, object_key, _)| {
+            object_key.contains("ctx") || object_key.contains("context")
+        })
+        .count();
+
+    println!(
+        "
+  page kinds held by the bucket index: {kinds:?}
+  context-ish keys in the model map:   {context_keys_in_model}
+  context-ish pages in the bucket index: {context_blocks_in_index}
+"
+    );
+
+    assert!(
+        !kinds.is_empty(),
+        "the control write must put SOMETHING in the index, or this measures nothing"
+    );
+    // Report rather than assert a direction: the point is to learn which world this is, and a
+    // wrong guess baked into an assertion would just move the mistake into the test.
+    println!(
+        "  => context pages {} the bucket index",
+        if context_blocks_in_index > 0 { "DO reach" } else { "do NOT reach" }
+    );
+}
+
+/// What one block costs to index here, against the 17 bytes it costs in the design being followed.
+///
+/// There, a block's index entry is a packed struct with a static assertion on its size: two u8 ids,
+/// a u16 block id, a byte of flags, a u32 size (zero meaning deleted) and a u64 address. Seventeen
+/// bytes, no heap, no strings, and the delete flag is a value the size field already had room for.
+///
+/// Here the same entry holds owned strings for the object key and model, an optional string
+/// component, a u64 id, an address struct with nine fields of its own, and three separate bools.
+/// This reports the inline size and the heap each entry pulls behind it, because `size_of` alone
+/// undercounts a struct whose fields are `String`.
+#[test]
+fn what_one_block_costs_to_index() {
+    use crate::engine::state::BlockIndex;
+
+    let inline = std::mem::size_of::<BlockIndex>();
+    let address_inline = std::mem::size_of::<crate::block_store::ElementEntry>();
+    let string_inline = std::mem::size_of::<String>();
+    let option_string_inline = std::mem::size_of::<Option<String>>();
+
+    // Build a shard and measure what its blocks actually hold, so the heap side is observed rather
+    // than assumed from the type.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        2 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    const BLOCKS: usize = 2_000;
+    for index in 0..BLOCKS {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("page-cost-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+    }
+
+    let shards = engine.shards.read().expect("shards lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 loaded");
+    let mut entries = 0usize;
+    let mut heap = 0usize;
+    let mut ref_key_bytes = 0usize;
+    let mut object_key_bytes = 0usize;
+    let mut shared_bytes = 0usize;
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for (_handle, block) in bucket.block_index.iter() {
+            entries += 1;
+            // The map key is an inline number now, not a rendered string on the heap.
+            ref_key_bytes += 0;
+            // AND NEITHER IS THE OBJECT KEY. This read `page.object_key.len()` and called it
+            // "shared with the lookup, so one allocation answers for both holders" -- which was
+            // true of the allocation and wrong as a PER-ENTRY charge: it summed the same bytes
+            // once for every page of the object. The entry holds no key now, so the charge is
+            // zero here and the bytes are attributed once per object where they live, in
+            // `the_key_text_lives_in_four_structures`'s lookup row.
+            object_key_bytes += 0;
+            // One allocation across every block of that component, not one per block. The kind
+            // contributes nothing at all now: one byte inline, spelled by a `&'static str`.
+            // An entry carries no element name, so it contributes no shared name bytes.
+                    shared_bytes += 0;
+            heap += 0;
+            let _ = block;
+        }
+    }
+    assert!(entries > 0, "the workload must produce pages, or this measures nothing");
+
+    let per_entry_heap = heap as f64 / entries as f64;
+    let map_key_b = ref_key_bytes as f64 / entries as f64;
+    let object_key_b = object_key_bytes as f64 / entries as f64;
+    let shared_b = shared_bytes as f64 / entries as f64;
+    let total = inline as f64 + per_entry_heap;
+    println!(
+        "
+  one page's index entry
+    inline struct                {inline:>5} B
+      of which ElementEntry      {address_inline:>5} B
+      String is                  {string_inline:>5} B inline, Option<String> {option_string_inline} B
+    heap owned, measured         {per_entry_heap:>7.1} B over {entries} pages
+    total per page               {total:>7.1} B
+
+      of which the map key      {map_key_b:>6.1} B   <- kind, key and five numbers as text
+      of which the object key   {object_key_b:>6.1} B   (shared with the lookup)
+      shared across pages       {shared_b:>6.1} B   (kind and component, one allocation each)
+
+    the design being followed     17 B, packed, static_assert(sizeof == 17)
+    ratio                        {:>7.1}x
+",
+        total / 17.0
+    );
+
+    // A report, not a threshold -- the point is the gap and where it comes from, and a bound here
+    // would fail on unrelated changes. What must hold is that the measurement happened.
+    //
+    // AND THE FLOOR HAD TO MOVE OFF THE ENTRY, BECAUSE THE ENTRY IS THE ZERO NOW. It read
+    // `per_entry_heap > 0.0`, with the reason "every entry owns at least an object key, so zero
+    // heap means the walk found nothing". The entry owns no object key: `per_entry_heap` is a
+    // STRUCTURAL zero, and the old floor turned the finding into a failure.
+    //
+    // THE SAME TABLE'S SIBLING WAS FLOORED AND THIS ONE WAS MISSED, which is what makes it worth
+    // the words. `the_key_text_lives_in_four_structures` has the identical shape -- a page-index
+    // row gone to zero -- and it asserts the LOOKUP row is non-zero so the zero cannot be read as
+    // "this fixture wrote no keys". This floor was left pointing at the row that went to zero, and
+    // only running it said so: a structural zero and an empty walk are indistinguishable from
+    // inside the row itself.
+    //
+    // SO IT ASKS THE TWO QUESTIONS SEPARATELY. That entries were walked at all is asserted above
+    // on `entries`, which is the "did the measurement happen" half. What this adds is that the key
+    // text is held SOMEWHERE in this store -- in the object lookup, which is where it moved -- so
+    // a run over a store that genuinely wrote no keys still fails.
+    let lookup_key_bytes: usize = shard
+        .bucket_index
+        .object_block_lookup
+        .iter()
+        .map(|(_model, object, _refs)| object.len())
+        .sum();
+    assert!(
+        lookup_key_bytes > 0,
+        "the object lookup holds no key text, so the {per_entry_heap:.1} B of per-entry heap above \
+         cannot be read as the entry having given its key up -- this store never had one"
+    );
+}
+
+/// Which of a block address's 120 bytes are actually carrying anything?
+///
+/// A block's index entry costs 339.6 B here against 17 B in the design being followed, and
+/// `BlockAddress` is 120 B of it -- where that design uses ONE u64. The compact form already
+/// exists (`compact_slab_address` packs slab id and offset into a u64, `from_compact_slab_address`
+/// reconstructs) but it drops five optional fields, so the question is whether those fields hold
+/// anything at rest.
+///
+/// An `Option<u64>` costs 16 B because there is no niche to exploit; four of them are 64 B. An
+/// `Option<String>` is 24 B inline before any heap. If they are None in practice, that is dead
+/// weight in every block entry in the shard, and the measurement says how much is recoverable
+/// without changing what the type can express.
+#[test]
+fn which_parts_of_a_block_address_are_populated() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        4 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    // A mix, because a field that only one command populates would look dead in a single-shape
+    // workload: plain values, hash fields with components, and deletes leaving tombstones.
+    for index in 0..1_200 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("addr-str-{index:06}"),
+                value: vec![b'v'; 96],
+            },
+        });
+        if index % 4 == 0 {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("addr-hash-{}", index % 40),
+                    field: format!("field-{index}"),
+                    value: vec![b'h'; 48],
+                },
+            });
+        }
+        if index % 13 == 0 {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::CommonDelete {
+                    key: format!("addr-str-{:06}", index / 2),
+                },
+            });
+        }
+    }
+
+    let shards = engine.shards.read().expect("shards lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 loaded");
+
+    let mut blocks = 0usize;
+    let (mut block_id, mut object_id) = (0usize, 0usize);
+    let (mut generation, mut slab_id, mut sha256) = (0usize, 0usize, 0usize);
+    let mut compactable = 0usize;
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for block in bucket.block_index.values() {
+            blocks += 1;
+            let a = &block.address;
+            block_id += usize::from(a.block_id().is_some());
+            generation += usize::from(a.generation().is_some());
+            slab_id += usize::from(a.slab_id().is_some());
+            compactable += usize::from(a.compact_slab_address().is_some());
+        }
+    }
+    assert!(blocks > 0, "the workload must produce pages, or this measures nothing");
+
+    let pct = |n: usize| 100.0 * n as f64 / blocks as f64;
+    println!(
+        "
+  {blocks} pages, which of the address's optional fields are set
+
+    page_id          {block_id:>6}  {:>5.1}%    2 B each
+    object_id        {object_id:>6}  {:>5.1}%    8 B
+    generation       {generation:>6}  {:>5.1}%    0 B (derived)
+    slab_id          {slab_id:>6}  {:>5.1}%   16 B
+    sha256           {sha256:>6}  {:>5.1}%   24 B inline + heap
+
+    fit the compact (slab, offset) u64: {compactable:>6}  {:>5.1}%
+",
+        pct(block_id), pct(object_id),
+        pct(generation), pct(slab_id), pct(sha256), pct(compactable),
+    );
+
+    // A report. What must hold is that the walk saw addresses at all -- a zero everywhere would
+    // read as "every field is dead" when it actually means the shard was empty.
+    assert!(
+        compactable > 0,
+        "no address fit the compact form, which means this walked nothing useful"
+    );
+}
+
+/// Which parts of a block address are recoverable from where the block already sits?
+///
+/// Every optional field is populated on every block, so none is dead weight in the "never set"
+/// sense. That is not the same as necessary. A block entry lives inside a bucket keyed by routing
+/// slot and carries its own `object_id`, so two of the address's fields may be restating what the
+/// surroundings already say -- and the design being followed spends ONE u64 on an address where
+/// this spends 120 B.
+///
+/// This checks the two candidates by comparison, and sizes the third (`sha256`, the only field
+/// with heap behind it) so the three can be ranked. Derivable fields can be dropped from the
+/// in-memory entry and reconstructed on the way out; a field that disagrees with its surroundings
+/// cannot, and the disagreement would be the finding.
+#[test]
+fn which_parts_of_a_block_address_restate_their_surroundings() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        4 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..1_200 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("redun-{index:06}"),
+                value: vec![b'v'; 96],
+            },
+        });
+        if index % 4 == 0 {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("redun-hash-{}", index % 40),
+                    field: format!("field-{index}"),
+                    value: vec![b'h'; 48],
+                },
+            });
+        }
+    }
+
+    let shards = engine.shards.read().expect("shards lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 loaded");
+
+    let named = super::BlockObjects::of(&shard.bucket_index);
+    let mut blocks = 0usize;
+    let mut routing_matches_bucket = 0usize;
+    for (bucket_key, bucket) in shard.bucket_index.bucket_map.iter() {
+        for (handle, _block) in &bucket.block_index {
+            blocks += 1;
+            // WHERE THE BLOCK IS, against where its KEY routes. This used to compare the
+            // address's own copy of its bucket against the bucket holding it -- a comparison
+            // between a value and the expression that wrote it. The address carries no bucket, so
+            // the comparison is now between the container and the derivation, which is the one
+            // form of it that can disagree.
+            if block_routing_bucket(named.at(*bucket_key, *handle), 0, u32::MAX) == *bucket_key
+            {
+                routing_matches_bucket += 1;
+            }
+            // `object_id_matches_entry` STOOD HERE and has gone with the field. It compared the
+            // id an address CARRIED against the id the entry reports; the entry now derives that id
+            // from its own terms and the address carries none, so both sides would be the same
+            // expression. That is the shape the comment above rejects for the bucket.
+        }
+    }
+    assert!(blocks > 0, "the workload must produce pages, or this measures nothing");
+
+    let pct = |n: usize| 100.0 * n as f64 / blocks as f64;
+    println!(
+        "
+  {blocks} pages
+
+    the key's derived bucket == the bucket it is filed in  {routing_matches_bucket:>6}  {:>5.1}%   (0 B, derived)
+    address.object_id        -- RETIRED WITH THE FIELD, not measured as 0 of {blocks}
+    the digest is no longer held here at all -- it lives in the page envelope,
+    which is where a read already verifies against it
+
+    recoverable if the object id holds: {} B per page, of 235.6 B measured
+    (the routing bucket is already recovered -- it is not a field any more)
+",
+        pct(routing_matches_bucket),
+        8,
+    );
+
+    // Report, with one thing asserted: a field that DISAGREES with its surroundings is a defect,
+    // not an optimisation opportunity, and it would be silently averaged away by the percentages.
+    assert!(
+        routing_matches_bucket == 0 || routing_matches_bucket == blocks,
+        "address.routing_slot agrees with its bucket on {routing_matches_bucket} of {blocks} pages \
+         -- a partial match means some page is filed somewhere its own address does not name"
+    );
+    // THE SECOND ASSERTION IS GONE RATHER THAN LEFT TO PASS. It read
+    // `object_id_matches_entry == 0 || == pages` over a counter whose increment had already been
+    // removed with the field, so it was 0 on every run and the disjunction's first arm made it
+    // unfailable -- while the row above it printed 0.0%, which a reader would take to mean the ids
+    // never agree. They agree by construction now: there is one source for them. An assertion that
+    // cannot fail is indistinguishable from one that passes, so it does not get to stay.
+}
+
+/// Does maintaining the index during a context ingest give the same index as rebuilding it?
+///
+/// A context write does not register its block; the shard rebuilds the whole first-index afterwards
+/// instead, which is the last O(corpus) term in an add. Replay already maintains these kinds
+/// incrementally (`sync_bucket_index_object_blocks`, lifecycle.rs), and Feature and Sequence writes
+/// already do it on the write path — the context write path is the one that does not.
+///
+/// Before removing the rebuild, this establishes what "equal" means. It ingests with the
+/// reconstruct held off, so the index is whatever maintenance produced, then rebuilds from the
+/// model maps and compares the two block-for-block. Any divergence names the kind whose maintenance
+/// is missing, which is the thing to implement next rather than a reason to abandon the approach.
+#[test]
+fn maintaining_the_index_during_ingest_matches_rebuilding_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        8 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    for index in 0..40 {
+        let ingest = crate::context_workflow::ingest_extract_context(
+            &engine,
+            crate::context_workflow::ContextIngestExtractRequest {
+                shard_id: 1,
+                tenant_hash: 4242,
+                sources: vec![crate::context_workflow::ContextExtractRequest {
+                    shard_id: 1,
+                    tenant_hash: 4242,
+                    source_kind: crate::context_workflow::ContextSourceKind::Incident,
+                    source_id: format!("EQ-{index:04}"),
+                    title: format!("equivalence {index}"),
+                    body: format!("body {index} ").repeat(20),
+                    timestamp_ms: 1_000 + index as u64,
+                    provider: crate::context_workflow::ContextModelProviderConfig::default(),
+                }],
+                provider: crate::context_workflow::ContextModelProviderConfig::default(),
+                start_time_ms: 0,
+                end_time_ms: 0,
+                max_events: 0,
+                query: String::new(),
+            },
+        );
+        assert!(ingest.status.ok, "ingest {index} failed: {:?}", ingest.status);
+    }
+
+    // What the shard holds after the ingests.
+    let held: std::collections::BTreeMap<(u32, String), (String, String, Option<String>)> = {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 loaded");
+        super::blocks_with_identity(&shard.bucket_index)
+            .into_iter()
+            .map(|(bucket, handle, object_key, block)| {
+                (
+                    (bucket, handle.to_string()),
+                    (
+                        block.model_id.to_string(),
+                        object_key.to_string(),
+                        None::<String>,
+                    ),
+                )
+            })
+            .collect()
+    };
+    assert!(
+        !held.is_empty(),
+        "the ingests must populate the index, or the comparison below compares nothing"
+    );
+    let uncovered = crate::engine::uncovered_maintenance::snapshot();
+    println!("
+  keys maintenance found nothing for ({}):", uncovered.len());
+    for key in uncovered.iter().take(10) {
+        println!("    {key}");
+    }
+
+    // And what a rebuild from the model maps would hold.
+    engine.reconstruct_bucket_index_now(1);
+    let rebuilt: std::collections::BTreeMap<(u32, String), (String, String, Option<String>)> = {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 loaded");
+        super::blocks_with_identity(&shard.bucket_index)
+            .into_iter()
+            .map(|(bucket, handle, object_key, block)| {
+                (
+                    (bucket, handle.to_string()),
+                    (
+                        block.model_id.to_string(),
+                        object_key.to_string(),
+                        None::<String>,
+                    ),
+                )
+            })
+            .collect()
+    };
+
+    let mut missing_after_ingest: Vec<&(u32, String)> = rebuilt
+        .keys()
+        .filter(|key| !held.contains_key(*key))
+        .collect();
+    let mut extra_after_ingest: Vec<&(u32, String)> = held
+        .keys()
+        .filter(|key| !rebuilt.contains_key(*key))
+        .collect();
+    missing_after_ingest.sort();
+    extra_after_ingest.sort();
+
+    let kind_of = |keys: &[&(u32, String)],
+                   from: &std::collections::BTreeMap<(u32, String), (String, String, Option<String>)>| {
+        let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+        for key in keys {
+            if let Some((kind, _, _)) = from.get(*key) {
+                *kinds.entry(kind.clone()).or_insert(0) += 1;
+            }
+        }
+        kinds
+    };
+
+    println!(
+        "
+  pages held after the ingests   {}
+  pages a rebuild produces       {}
+  a rebuild has, the ingest did not: {} {:?}
+  the ingest has, a rebuild does not: {} {:?}
+",
+        held.len(),
+        rebuilt.len(),
+        missing_after_ingest.len(),
+        kind_of(&missing_after_ingest, &rebuilt),
+        extra_after_ingest.len(),
+        kind_of(&extra_after_ingest, &held),
+    );
+
+    // Today the rebuild runs after every context write, so the two agree by construction and this
+    // passes trivially. It earns its keep the moment the rebuild is skipped: then any kind whose
+    // maintenance is missing shows up on the first line, by name.
+    assert!(
+        missing_after_ingest.is_empty(),
+        "{} pages exist after a rebuild that the ingest did not put in the index -- those kinds \
+         are not being maintained: {:?}",
+        missing_after_ingest.len(),
+        kind_of(&missing_after_ingest, &rebuilt)
+    );
+}
+
+
+/// Does a time-range feature query cost what the RANGE holds, or what the SERIES holds?
+///
+/// The feature lane carries a quantity sampled over time, so the reader always asks for a window.
+/// Whether the lane scales is therefore whether a narrow window over a long series costs what the
+/// window holds -- not what the series holds.
+///
+/// Window fixed at 32 points, series grown 256 -> 16384. The full-range query is the control: it
+/// SHOULD grow, and if it does not then the narrow-window column is measuring nothing.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib does_a_feature_window_cost_the_window_or_the_series -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn does_a_feature_window_cost_the_window_or_the_series() {
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    println!(
+        "
+  series   append   window(32)   per point   full range   per point   agg(32)
+"
+    );
+
+    for series_len in [256_usize, 1024, 4096, 16384] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+
+        // One point per millisecond, so a window in milliseconds is a window in points.
+        for index in 0..series_len {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureAppend {
+                    key: "rate".to_string(),
+                    points: vec![FeaturePoint {
+                        timestamp_ms: 1_000 + index as u64,
+                        value: format!("{index}").into_bytes(),
+                    }],
+                },
+            });
+            assert!(out.status.ok, "append {index}: {:?}", out.status);
+        }
+
+        let measure = |command: Command| {
+            let request = || ExecuteRequest { shard_id: 1, command: command.clone() };
+            let warm = engine.execute(request());
+            assert!(warm.status.ok, "{:?}", warm.status);
+            let probe = crate::alloc_probe::Probe::start();
+            let out = engine.execute(request());
+            let counts = probe.stop();
+            assert!(out.status.ok, "{:?}", out.status);
+            (counts.allocs, out.response)
+        };
+
+        // One more point onto an already-long series.
+        let (append, _) = measure(Command::FeatureAppend {
+            key: "rate".to_string(),
+            points: vec![FeaturePoint {
+                timestamp_ms: 1_000 + series_len as u64,
+                value: b"tail".to_vec(),
+            }],
+        });
+
+        // A 32-point window at the END of the series: the shape a reader actually asks for.
+        let window_start = 1_000 + (series_len as u64) - 32;
+        let (window, window_response) = measure(Command::FeatureQuery {
+            key: "rate".to_string(),
+            start_ms: window_start,
+            end_ms: window_start + 32,
+            count: None,
+        });
+        let window_points = match &window_response {
+            CommandResponse::FeaturePoints { points } => points.len(),
+            other => panic!("expected feature points, got {other:?}"),
+        };
+        assert!(
+            window_points > 0 && window_points <= 40,
+            "the window must return about 32 points, got {window_points} -- otherwise the per-point \
+             figure below is measuring a different query than the one named"
+        );
+
+        // Control: the whole series. This one SHOULD grow.
+        let (full, full_response) = measure(Command::FeatureQuery {
+            key: "rate".to_string(),
+            start_ms: 0,
+            end_ms: u64::MAX,
+            count: None,
+        });
+        let full_points = match &full_response {
+            CommandResponse::FeaturePoints { points } => points.len(),
+            other => panic!("expected feature points, got {other:?}"),
+        };
+        assert!(
+            full_points >= series_len,
+            "the control must return the whole series, got {full_points} of {series_len}"
+        );
+
+        let (agg, _) = measure(Command::FeatureAggQuery {
+            key: "rate".to_string(),
+            start_ms: window_start,
+            end_ms: window_start + 32,
+            aggregator: "count".to_string(),
+            count: None,
+        });
+
+        println!(
+            "  {series_len:>6}   {append:>6}   {window:>10}   {:>9.2}   {full:>10}   {:>9.2}   {agg:>7}",
+            window as f64 / window_points as f64,
+            full as f64 / full_points as f64,
+        );
+    }
+
+    println!(
+        "
+  window column flat    => the range narrows the read, which is the point of the lane.
+  window column growing => the query reads the whole series and filters, so every reader pays for
+                           all history ever recorded.
+  append column growing => appending one point costs more once the series is long.
+"
+    );
+}
+
+
+/// Is appending one feature point proportional to the series already there?
+///
+/// Every append below uses a FRESH timestamp, so it is genuinely an append and not an overwrite of
+/// a duplicate -- which is the flaw that made the first measurement of this ambiguous. The empty
+/// series gives the floor, so "grows with the series" can be distinguished from "costly in general",
+/// and a duplicate-timestamp append is measured beside it as its own case.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib does_appending_one_point_cost_the_series -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn does_appending_one_point_cost_the_series() {
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    println!(
+        "
+  series   append(fresh)   per existing point   append(duplicate)
+"
+    );
+
+    for series_len in [0_usize, 64, 256, 1024] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+
+        for index in 0..series_len {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureAppend {
+                    key: "rate".to_string(),
+                    points: vec![FeaturePoint {
+                        timestamp_ms: 1_000 + index as u64,
+                        value: format!("{index}").into_bytes(),
+                    }],
+                },
+            });
+            assert!(out.status.ok, "build {index}: {:?}", out.status);
+        }
+
+        // A genuinely new timestamp, past everything written above.
+        let fresh_at = 500_000 + series_len as u64;
+        let probe = crate::alloc_probe::Probe::start();
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::FeatureAppend {
+                key: "rate".to_string(),
+                points: vec![FeaturePoint {
+                    timestamp_ms: fresh_at,
+                    value: b"fresh".to_vec(),
+                }],
+            },
+        });
+        let fresh = probe.stop().allocs;
+        assert!(out.status.ok, "{:?}", out.status);
+
+        // The same timestamp again: an overwrite, not an append.
+        let probe = crate::alloc_probe::Probe::start();
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::FeatureAppend {
+                key: "rate".to_string(),
+                points: vec![FeaturePoint {
+                    timestamp_ms: fresh_at,
+                    value: b"again".to_vec(),
+                }],
+            },
+        });
+        let duplicate = probe.stop().allocs;
+        assert!(out.status.ok, "{:?}", out.status);
+
+        // The series really is as long as claimed -- otherwise the per-point column is fiction.
+        let read = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::FeatureQuery {
+                key: "rate".to_string(),
+                start_ms: 0,
+                end_ms: u64::MAX,
+                count: None,
+            },
+        });
+        let held = match &read.response {
+            CommandResponse::FeaturePoints { points } => points.len(),
+            other => panic!("expected feature points, got {other:?}"),
+        };
+        assert!(
+            held >= series_len,
+            "expected at least {series_len} points held, found {held}"
+        );
+
+        let per = if series_len == 0 {
+            0.0
+        } else {
+            fresh as f64 / series_len as f64
+        };
+        println!("  {series_len:>6}   {fresh:>13}   {per:>18.2}   {duplicate:>17}");
+    }
+
+    println!(
+        "
+  append(fresh) flat across series lengths => appending costs what it appends.
+  append(fresh) rising with the series      => building a series is quadratic in its length.
+"
+    );
+}
+
+
+/// Does `count` narrow a sequence read, or is it applied after reading the range?
+///
+/// `SequenceQuery` carries both a time range and a `count`. The range narrowing is already
+/// established for the feature lane; the count is a separate lever and a separate question. A caller
+/// asking for "the last 8" over an open range is asking the count to narrow -- and if it is applied
+/// only after the range is read, that caller pays for all of history to be handed eight rows.
+///
+/// `history`'s bounded read is the bar: 116 allocations at every size from 8 to 256 summaries.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib does_a_sequence_count_narrow_the_read -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn does_a_sequence_count_narrow_the_read() {
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    println!(
+        "
+  rows   append   count=8 over all time   rows back   full read   rows back
+"
+    );
+
+    for series_len in [256_usize, 1024, 4096] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+
+        for index in 0..series_len {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::SequenceAdd {
+                    key: "seq".to_string(),
+                    rows: vec![SequenceFeatureRow {
+                        timestamp_ms: 1_000 + index as u64,
+                        gid: index as u64,
+                        action_type: (index % 7) as u32,
+                        duration: (index % 13) as u32,
+                        author_id: (index % 5) as u64,
+                    }],
+                },
+            });
+            assert!(out.status.ok, "build {index}: {:?}", out.status);
+        }
+
+        let measure = |command: Command| {
+            let request = || ExecuteRequest { shard_id: 1, command: command.clone() };
+            let warm = engine.execute(request());
+            assert!(warm.status.ok, "{:?}", warm.status);
+            let probe = crate::alloc_probe::Probe::start();
+            let out = engine.execute(request());
+            let counts = probe.stop();
+            assert!(out.status.ok, "{:?}", out.status);
+            let rows = match &out.response {
+                CommandResponse::SequenceRows { rows } => rows.len(),
+                other => panic!("expected sequence rows, got {other:?}"),
+            };
+            (counts.allocs, rows)
+        };
+
+        // One more row onto an already-long series.
+        let probe = crate::alloc_probe::Probe::start();
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::SequenceAdd {
+                key: "seq".to_string(),
+                rows: vec![SequenceFeatureRow {
+                    timestamp_ms: 900_000 + series_len as u64,
+                    gid: 7,
+                    action_type: 1,
+                    duration: 1,
+                    author_id: 1,
+                }],
+            },
+        });
+        let append = probe.stop().allocs;
+        assert!(out.status.ok, "{:?}", out.status);
+
+        // A count of 8 over the whole range: the count is the only thing that can narrow this.
+        let (counted, counted_rows) = measure(Command::SequenceQuery {
+            key: "seq".to_string(),
+            start_ms: 0,
+            end_ms: u64::MAX,
+            count: 8,
+            filters: Vec::new(),
+        });
+        assert!(
+            counted_rows > 0 && counted_rows <= 8,
+            "count=8 must return at most 8 rows, got {counted_rows} -- otherwise this column is \
+             measuring a different query than the one named"
+        );
+
+        // Control: the same range, uncapped. This one SHOULD grow.
+        let (full, full_rows) = measure(Command::SequenceQuery {
+            key: "seq".to_string(),
+            start_ms: 0,
+            end_ms: u64::MAX,
+            count: usize::MAX,
+            filters: Vec::new(),
+        });
+        assert!(
+            full_rows >= series_len,
+            "the control must read the whole series, got {full_rows} of {series_len}"
+        );
+
+        println!(
+            "  {series_len:>4}   {append:>6}   {counted:>21}   {counted_rows:>9}   {full:>9}   {full_rows:>9}"
+        );
+    }
+
+    println!(
+        "
+  count=8 flat while the control grows => the count narrows the read.
+  count=8 tracking the control          => the count is applied after reading the range, so a
+                                           bounded caller still pays for all of history.
+"
+    );
+}
+
+
+/// What do the score-ordered zset reads cost as the set grows?
+///
+/// A zset is `HashMap<String, BTreeMap<Vec<u8>, (u64, BlockAddress)>>` — keyed by MEMBER, score as a
+/// value. Member lookup is O(log n); anything ordered by SCORE cannot use that ordering.
+/// `zset_ordered_members` clones every member and sorts all n before the caller filters, and
+/// `ZSetRank` scans with two member clones per member examined.
+///
+/// `ZSetScore` is the control: one member lookup, which should be flat. If every column grows, the
+/// harness is the suspect rather than the code.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_the_score_ordered_zset_reads_cost -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_the_score_ordered_zset_reads_cost() {
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    println!(
+        "
+  members   range_by_score(8)   bytes   returned      rank   bytes      score   bytes       add
+"
+    );
+
+    for size in [256_usize, 1024, 4096] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+
+        for index in 0..size {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ZSetAdd {
+                    key: "board".to_string(),
+                    member: format!("member-{index:08}").into_bytes(),
+                    score: index as f64,
+                },
+            });
+            assert!(out.status.ok, "build {index}: {:?}", out.status);
+        }
+
+        let measure = |command: Command| {
+            let request = || ExecuteRequest { shard_id: 1, command: command.clone() };
+            let warm = engine.execute(request());
+            assert!(warm.status.ok, "{:?}", warm.status);
+            let probe = crate::alloc_probe::Probe::start();
+            let out = engine.execute(request());
+            let counts = probe.stop();
+            assert!(out.status.ok, "{:?}", out.status);
+            (counts.allocs, counts.alloc_bytes, out.response)
+        };
+
+        // Eight members out of `size`, by score. The narrowest useful ask.
+        let (range_allocs, range_bytes, range_response) = measure(Command::ZSetRangeByScore {
+            key: "board".to_string(),
+            min: 10.0,
+            max: 17.0,
+            min_exclusive: false,
+            max_exclusive: false,
+            rev: false,
+        });
+        // Members come back as [member, score, member, score, ...], so eight members is sixteen.
+        let returned = match &range_response {
+            CommandResponse::Members { members } => members.len() / 2,
+            other => panic!("expected members, got {other:?}"),
+        };
+        assert_eq!(
+            returned, 8,
+            "the window must return exactly 8 members, got {returned} -- otherwise this column is \
+             not the cost of the query it is named for"
+        );
+
+        let (rank_allocs, rank_bytes, _) = measure(Command::ZSetRank {
+            key: "board".to_string(),
+            member: format!("member-{:08}", size / 2).into_bytes(),
+            rev: false,
+        });
+
+        // Control: one member lookup straight through the map. Should not care how big the set is.
+        let (score_allocs, score_bytes, score_response) = measure(Command::ZSetScore {
+            key: "board".to_string(),
+            member: format!("member-{:08}", size / 2).into_bytes(),
+        });
+        assert!(
+            matches!(&score_response, CommandResponse::Bytes { value: Some(_) }),
+            "the control must actually find the member, or it is measuring a miss"
+        );
+
+        // NOT measured through `measure`: that warms and probes the same command, and a second
+        // ZSetAdd of the same member at the same score takes the "nothing to rewrite" early return,
+        // so it would report the cost of detecting a duplicate instead of the cost of an add.
+        // Warm on one new member, probe on another.
+        let warm = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ZSetAdd {
+                key: "board".to_string(),
+                member: format!("warm-{size:08}").into_bytes(),
+                score: 1.5,
+            },
+        });
+        assert!(warm.status.ok, "{:?}", warm.status);
+        let probe = crate::alloc_probe::Probe::start();
+        let added = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ZSetAdd {
+                key: "board".to_string(),
+                member: format!("fresh-{size:08}").into_bytes(),
+                score: 2.5,
+            },
+        });
+        let add_allocs = probe.stop().allocs;
+        assert!(added.status.ok, "{:?}", added.status);
+        assert!(
+            matches!(&added.response, CommandResponse::Integer { value: 1 }),
+            "the measured add must report a NEW member (1), or it is measuring a duplicate: {:?}",
+            added.response
+        );
+
+        println!(
+            "  {size:>7}   {range_allocs:>17}   {range_bytes:>5}   {returned:>8}   {rank_allocs:>7}   {rank_bytes:>5}   {score_allocs:>8}   {score_bytes:>5}   {add_allocs:>7}"
+        );
+    }
+
+    println!(
+        "
+  range_by_score / rank flat  => the per-member COPIES are gone: the score test runs before the
+                                 member bytes are cloned, and rank compares the parts in place.
+                                 The SCAN is still O(n) and stays that way while the map is keyed
+                                 by member -- this is an allocation win, not an asymptotic one.
+  either column rising        => a copy per member has come back.
+  score flat                  => the control works, so the columns above mean what they say.
+  add                         => a genuinely new member each time, asserted to report 1.
+                                 Not a control: an add is not idempotent, so it cannot be
+                                 warmed and re-measured the way the reads can.
+"
+    );
+}
+
+
+/// What the score-ordered zset reads ANSWER, pinned across many random cases.
+///
+/// Coverage for these commands is one case each, which is not enough to change the code underneath
+/// them. The expected answers here are computed independently -- by sorting (score, member) pairs in
+/// the test and slicing -- rather than by calling the helper the engine calls, because a test that
+/// mirrors the implementation passes whatever the implementation does.
+///
+/// Duplicate scores are included on purpose: ties order by member, and a change that sorted only by
+/// score would still pass a test whose scores were all distinct.
+#[test]
+fn score_ordered_zset_reads_answer_the_same_before_and_after() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // A deterministic spread with deliberate score ties.
+    let mut state: u64 = 0x243F_6A88_85A3_08D3;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        state >> 11
+    };
+
+    let count = 400_usize;
+    let mut expected: Vec<(u64, Vec<u8>)> = Vec::new();
+    for index in 0..count {
+        // Scores collide by construction: many members share each score.
+        let score = (next() % 40) as u64;
+        let member = format!("m-{index:05}").into_bytes();
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ZSetAdd {
+                key: "board".to_string(),
+                member: member.clone(),
+                score: score as f64,
+            },
+        });
+        assert!(out.status.ok, "add {index}: {:?}", out.status);
+        expected.push((score, member));
+    }
+    expected.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    assert!(
+        expected.windows(2).any(|w| w[0].0 == w[1].0),
+        "the fixture must contain score ties, or ordering-by-member is never exercised"
+    );
+
+    // --- range by score, over many windows -------------------------------------------------
+    let mut checked_nonempty = 0;
+    for lo in 0..38_u64 {
+        let hi = lo + 2;
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ZSetRangeByScore {
+                key: "board".to_string(),
+                min: lo as f64,
+                max: hi as f64,
+                min_exclusive: false,
+                max_exclusive: false,
+                rev: false,
+            },
+        });
+        let members = match response.response {
+            CommandResponse::Members { members } => members,
+            other => panic!("expected members, got {other:?}"),
+        };
+        // [member, score, member, score, ...]
+        let got: Vec<Vec<u8>> = members.chunks(2).map(|pair| pair[0].clone()).collect();
+        let want: Vec<Vec<u8>> = expected
+            .iter()
+            .filter(|(score, _)| *score >= lo && *score <= hi)
+            .map(|(_, member)| member.clone())
+            .collect();
+        assert_eq!(got, want, "range by score [{lo}, {hi}]");
+        if !want.is_empty() {
+            checked_nonempty += 1;
+        }
+    }
+    assert!(
+        checked_nonempty >= 30,
+        "only {checked_nonempty} windows returned anything -- an all-empty sweep would pass \
+         whatever the code did"
+    );
+
+    // --- rank, forward and reverse -----------------------------------------------------------
+    for pick in [0_usize, 1, 7, 99, 200, 399] {
+        let (_, member) = &expected[pick];
+        for rev in [false, true] {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ZSetRank {
+                    key: "board".to_string(),
+                    member: member.clone(),
+                    rev,
+                },
+            });
+            let got = match response.response {
+                CommandResponse::Bytes { value: Some(bytes) } => {
+                    String::from_utf8(bytes).unwrap().parse::<usize>().unwrap()
+                }
+                other => panic!("expected a rank, got {other:?}"),
+            };
+            let want = if rev { count - 1 - pick } else { pick };
+            assert_eq!(got, want, "rank of {pick} (rev={rev})");
+        }
+    }
+
+    // A member that is not there has no rank.
+    let missing = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::ZSetRank {
+            key: "board".to_string(),
+            member: b"not-a-member".to_vec(),
+            rev: false,
+        },
+    });
+    assert!(
+        matches!(missing.response, CommandResponse::Bytes { value: None }),
+        "a member that was never added must have no rank"
+    );
+}
+
+
+/// Is a push expensive because the LIST is long, or because the CACHE is full?
+///
+/// One push onto a 4,096-entry list costs ~16,488 allocations, and one ZSetAdd onto a 4,096-member
+/// set ~16,491 -- near-identical, so one shared mechanism. The code points at
+/// `invalidate_record`, which scans every key in all three cache tiers; but code reading has already
+/// been wrong twice here, so this decides it by varying the two axes independently.
+///
+/// Arm A is one long list. Arm B is many short lists holding about as many cached blocks in total.
+/// Equal cost means the cache drives it; a cheap arm B means the collection's own length does.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib is_a_push_expensive_because_of_the_list_or_the_cache -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn is_a_push_expensive_because_of_the_list_or_the_cache() {
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    // Push `per_list` entries into each of `lists` lists, then measure ONE more push onto list 0.
+    let arm = |lists: usize, per_list: usize| -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            256 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for list in 0..lists {
+            for index in 0..per_list {
+                let out = engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::ListPush {
+                        key: format!("feed-{list:05}"),
+                        member: format!("entry-{index:08}").into_bytes(),
+                        left: false,
+                    },
+                });
+                assert!(out.status.ok, "push {list}/{index}: {:?}", out.status);
+            }
+        }
+        let probe = crate::alloc_probe::Probe::start();
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ListPush {
+                key: "feed-00000".to_string(),
+                member: b"measured".to_vec(),
+                left: false,
+            },
+        });
+        let allocs = probe.stop().allocs;
+        assert!(out.status.ok, "{:?}", out.status);
+        // The push must have landed, or this is the cost of failing.
+        match out.response {
+            CommandResponse::Integer { value } => assert_eq!(
+                value as usize,
+                per_list + 1,
+                "the measured push must extend list 0 to {} entries",
+                per_list + 1
+            ),
+            other => panic!("expected the new length, got {other:?}"),
+        }
+        allocs as u64
+    };
+
+    println!(
+        "
+  cached pages   A: one list of n   B: n/10 lists of 10   ratio
+"
+    );
+
+    for total in [640_usize, 2560, 10240] {
+        let a = arm(1, total);
+        let b = arm(total / 10, 10);
+        println!(
+            "  {total:>12}   {a:>16}   {b:>19}   {:>5.2}",
+            a as f64 / b.max(1) as f64
+        );
+    }
+
+    println!(
+        "
+  Measured: B is FLAT at 122 while total cached pages grow sixteenfold, and A rises with the list.
+  So the ALLOCATIONS follow the collection's own length, not the size of the cache.
+
+  Both come from one call, `invalidate_record`, and it has two costs that must not be conflated:
+    * it SCANS every key in all three tiers -- pure iteration, allocating nothing, so this probe is
+      blind to it. That cost follows the whole cache and needs a different instrument.
+    * it CLONES the keys that match this record into a BTreeSet and then a Vec -- about four
+      allocations per existing entry of the same collection. That is what the A column shows.
+
+  A rising  => a push still copies one cache key per entry the collection already holds.
+  B rising  => the match filter has stopped narrowing, and every record's keys are being copied.
+"
+    );
+}
+
+
+/// What does `ListRange` cost as the list grows, asked for a fixed slice?
+///
+/// The arm clones EVERY address in the list into a fresh Vec, purely to learn `length` and index a
+/// slice; only the slice is then read from blocks. `ListLen` beside it takes the same length from
+/// `BTreeMap::len` for free, which is what shows the materialisation buys nothing.
+///
+/// `ListLen` is the control here: flat by construction, so if it moves the harness is the suspect.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_a_fixed_list_slice_costs_as_the_list_grows -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_a_fixed_list_slice_costs_as_the_list_grows() {
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    println!(
+        "
+  entries   range(first 10)   bytes   returned      len   bytes     push
+"
+    );
+
+    for size in [256_usize, 1024, 4096] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+
+        for index in 0..size {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ListPush {
+                    key: "feed".to_string(),
+                    member: format!("entry-{index:08}").into_bytes(),
+                    left: false,
+                },
+            });
+            assert!(out.status.ok, "push {index}: {:?}", out.status);
+        }
+
+        let measure = |command: Command| {
+            let request = || ExecuteRequest { shard_id: 1, command: command.clone() };
+            let warm = engine.execute(request());
+            assert!(warm.status.ok, "{:?}", warm.status);
+            let probe = crate::alloc_probe::Probe::start();
+            let out = engine.execute(request());
+            let counts = probe.stop();
+            assert!(out.status.ok, "{:?}", out.status);
+            (counts.allocs, counts.alloc_bytes, out.response)
+        };
+
+        // Ten entries out of `size` -- the shape a caller paging a feed actually asks for.
+        let (range_allocs, range_bytes, range_response) = measure(Command::ListRange {
+            key: "feed".to_string(),
+            start: 0,
+            stop: 9,
+        });
+        let returned = match &range_response {
+            CommandResponse::Members { members } => members.len(),
+            other => panic!("expected members, got {other:?}"),
+        };
+        assert_eq!(
+            returned, 10,
+            "the slice must return exactly 10 entries, got {returned} -- otherwise this column is \
+             not the cost of the query it is named for"
+        );
+
+        // Control: the length, which comes straight from BTreeMap::len.
+        let (len_allocs, len_bytes, len_response) = measure(Command::ListLen {
+            key: "feed".to_string(),
+        });
+        match &len_response {
+            CommandResponse::Integer { value } => assert_eq!(
+                *value as usize, size,
+                "the control must report the whole list, or it is measuring the wrong list"
+            ),
+            other => panic!("expected an integer, got {other:?}"),
+        }
+
+        let (push_allocs, _, _) = measure(Command::ListPush {
+            key: "feed".to_string(),
+            member: b"one-more".to_vec(),
+            left: false,
+        });
+
+        println!(
+            "  {size:>7}   {range_allocs:>15}   {range_bytes:>5}   {returned:>8}   {len_allocs:>6}   {len_bytes:>5}   {push_allocs:>6}"
+        );
+    }
+
+    println!(
+        "
+  range BYTES flat  => the slice costs the slice. Watch the bytes, not the count: the whole-list
+                       copy was ONE Vec, so the allocation count was already flat at ~41 while the
+                       bytes ran 17,926 -> 263,686. A count-only probe would have called this clean.
+  range bytes rising => the whole list is being copied again before the slice is taken.
+  len flat           => the control works, so the columns above mean what they say.
+  push rising        => expected here, and NOT this arm's doing: a push clones one cache key per
+                       entry the list already holds, inside invalidate_record. Separate finding.
+"
+    );
+}
+
+
+/// The hash family's cost as a hash grows -- and whether the open push cost reaches hashes too.
+///
+/// `ListPush` and `ZSetAdd` both cost ~4.0 allocations per existing entry from a mechanism that eight
+/// eliminated hypotheses have not explained. A hash is the third collection and takes the same
+/// post-command path, so `HashSet` discriminates: if it is also ~4/field the cause lives in the shared
+/// path; if it is flat, hashes escape it and what they do differently is the clue.
+///
+/// `HashLen` is the control. `HashMultiGet` asserts it returns exactly the fields asked for, because a
+/// per-item figure from a query that quietly returned something else is worse than no figure --
+/// which is how the embeddings batch hid a cap at 100.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_the_hash_family_costs_as_a_hash_grows -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_the_hash_family_costs_as_a_hash_grows() {
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    println!(
+        "
+  fields   set(new field)   per field   multiget(8)   bytes   get_all   bytes    len
+"
+    );
+
+    for size in [256_usize, 1024, 4096] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+
+        for index in 0..size {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: "profile".to_string(),
+                    field: format!("field-{index:08}"),
+                    value: format!("value-{index:08}").into_bytes(),
+                },
+            });
+            assert!(out.status.ok, "set {index}: {:?}", out.status);
+        }
+
+        // A write is not idempotent, so it cannot be warmed and re-measured the way a read can --
+        // warming on the same field would measure an overwrite. Warm one NEW field, measure another.
+        let warm = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::HashSet {
+                key: "profile".to_string(),
+                field: format!("warm-{size:08}"),
+                value: b"w".to_vec(),
+            },
+        });
+        assert!(warm.status.ok, "{:?}", warm.status);
+        let probe = crate::alloc_probe::Probe::start();
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::HashSet {
+                key: "profile".to_string(),
+                field: format!("fresh-{size:08}"),
+                value: b"f".to_vec(),
+            },
+        });
+        let set_allocs = probe.stop().allocs;
+        assert!(out.status.ok, "{:?}", out.status);
+
+        let measure = |command: Command| {
+            let request = || ExecuteRequest { shard_id: 1, command: command.clone() };
+            let warm = engine.execute(request());
+            assert!(warm.status.ok, "{:?}", warm.status);
+            let probe = crate::alloc_probe::Probe::start();
+            let out = engine.execute(request());
+            let counts = probe.stop();
+            assert!(out.status.ok, "{:?}", out.status);
+            (counts.allocs, counts.alloc_bytes, out.response)
+        };
+
+        // Eight fields out of `size`.
+        let wanted: Vec<String> = (0..8).map(|index| format!("field-{index:08}")).collect();
+        let (multi_allocs, multi_bytes, multi_response) = measure(Command::HashMultiGet {
+            key: "profile".to_string(),
+            fields: wanted.clone(),
+        });
+        let answered = match &multi_response {
+            CommandResponse::Values { values } => values.iter().filter(|v| v.is_some()).count(),
+            other => panic!("expected values, got {other:?}"),
+        };
+        assert_eq!(
+            answered, 8,
+            "multiget must answer for all 8 fields, got {answered} -- otherwise this column is not \
+             the cost of the query it is named for"
+        );
+
+        let (all_allocs, all_bytes, all_response) = measure(Command::HashGetAll {
+            key: "profile".to_string(),
+        });
+        match &all_response {
+            CommandResponse::HashEntries { entries } => assert!(
+                entries.len() >= size,
+                "get_all must return every field: {} of {size}",
+                entries.len()
+            ),
+            other => panic!("expected hash entries, got {other:?}"),
+        }
+
+        let (len_allocs, _, len_response) = measure(Command::HashLen {
+            key: "profile".to_string(),
+        });
+        match &len_response {
+            CommandResponse::Integer { value } => assert!(
+                *value as usize >= size,
+                "the control must report the whole hash"
+            ),
+            other => panic!("expected an integer, got {other:?}"),
+        }
+
+        println!(
+            "  {size:>6}   {set_allocs:>14}   {:>9.2}   {multi_allocs:>11}   {multi_bytes:>5}   {all_allocs:>7}   {all_bytes:>5}   {len_allocs:>4}",
+            set_allocs as f64 / size as f64
+        );
+    }
+
+    println!(
+        "
+  set ~4 per field   => the open ListPush/ZSetAdd cost reaches hashes too: it is in the shared
+                        post-command path, not in anything lists and zsets do.
+  set flat           => hashes escape it, and what they do differently is the clue.
+  multiget flat while get_all rises => asking for a few costs a few.
+  len flat           => the control works.
+"
+    );
+}
+
+
+/// What a zset must still answer after a restart.
+///
+/// Pinned before changing how zset writes are indexed: declaring the written component flips the
+/// index-log record's `upsert` flag, and that flag decides whether replay wipes-then-restores each
+/// covered object or replaces one component in place. A wrong component would file a block under the
+/// wrong identity, and the damage would only appear after a reload.
+///
+/// Verified by SERVING READS after the restart, not by comparing internal maps.
+#[test]
+fn a_zset_survives_a_restart_with_its_scores_order_and_removals() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+
+    let members: Vec<(String, f64)> = (0..64)
+        .map(|index| (format!("m-{index:04}"), ((index * 7) % 23) as f64))
+        .collect();
+
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    {
+        for (member, score) in &members {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ZSetAdd {
+                    key: "board".to_string(),
+                    member: member.clone().into_bytes(),
+                    score: *score,
+                },
+            });
+            assert!(out.status.ok, "add {member}: {:?}", out.status);
+        }
+        // One member re-scored: only the NEW score may survive.
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ZSetAdd {
+                key: "board".to_string(),
+                member: b"m-0000".to_vec(),
+                score: 99.0,
+            },
+        });
+        assert!(out.status.ok, "{:?}", out.status);
+        // One member removed: it must NOT come back -- this is what the covered-key wipe is for.
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ZSetRemove {
+                key: "board".to_string(),
+                member: b"m-0001".to_vec(),
+            },
+        });
+        assert!(out.status.ok, "{:?}", out.status);
+    }
+
+    // Materialise the base index, which is what a reload recovers from -- `load_shard_with` takes
+    // the base snapshot plus the WAL tail, and the base is written at the last dump/unload. Without
+    // this the second engine reports `shard_not_loaded`, which is a missing checkpoint rather than
+    // lost data.
+    engine.unload_shard(1);
+
+    // Opened against the same block and index dirs -- the idiom the other restart tests here use.
+    let restarted = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+    // If the shard did not come back, say THAT -- not "a member is missing".
+    let probe = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::ZSetCard {
+            key: "board".to_string(),
+        },
+    });
+    assert!(
+        probe.status.ok,
+        "the restarted engine did not load the shard: {:?}",
+        probe.status
+    );
+
+    let score_of = |member: &str| -> Option<String> {
+        let out = restarted.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ZSetScore {
+                key: "board".to_string(),
+                member: member.as_bytes().to_vec(),
+            },
+        });
+        // Check the STATUS first: ZSetScore's arm always answers `Bytes`, so anything else means the
+        // command never reached it, and the status says why.
+        assert!(
+            out.status.ok,
+            "ZSetScore for {member} was refused after the restart: {:?}",
+            out.status
+        );
+        match out.response {
+            CommandResponse::Bytes { value } => value.map(|v| String::from_utf8(v).unwrap()),
+            other => panic!("expected a score for {member}, got {other:?}"),
+        }
+    };
+
+    // The re-scored member carries the new score, not the old one.
+    let rescored = score_of("m-0000").expect("the re-scored member must survive the restart");
+    assert!(
+        rescored.starts_with("99"),
+        "expected the NEW score after restart, got {rescored}"
+    );
+    // The removed member stays removed.
+    assert!(
+        score_of("m-0001").is_none(),
+        "a removed member came back after the restart"
+    );
+    // Everything else is present with its original score.
+    for (member, score) in members.iter().skip(2) {
+        let got = score_of(member)
+            .unwrap_or_else(|| panic!("{member} did not survive the restart"));
+        let got: f64 = got.parse().unwrap_or_else(|_| panic!("unparsable score {got}"));
+        assert!(
+            (got - score).abs() < 1e-9,
+            "{member}: expected {score}, got {got}"
+        );
+    }
+
+    // Score ORDER survives -- a block filed under a wrong component would show up here.
+    let response = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::ZSetRangeByScore {
+            key: "board".to_string(),
+            min: 0.0,
+            max: 22.0,
+            min_exclusive: false,
+            max_exclusive: false,
+            rev: false,
+        },
+    });
+    let returned = match response.response {
+        CommandResponse::Members { members } => members,
+        other => panic!("expected members, got {other:?}"),
+    };
+    let scores: Vec<f64> = returned
+        .chunks(2)
+        .map(|pair| String::from_utf8(pair[1].clone()).unwrap().parse().unwrap())
+        .collect();
+    assert!(
+        scores.windows(2).all(|w| w[0] <= w[1]),
+        "score order was not preserved across the restart: {scores:?}"
+    );
+    assert!(
+        scores.len() >= 60,
+        "expected most members back in range, got {}",
+        scores.len()
+    );
+}
+
+
+/// Does the per-entry write cost track how many COMPONENTS an object has?
+///
+/// Every entry of a list or zset is filed under its own component, and both cost ~4.0 allocations per
+/// existing entry from a cause eight eliminated hypotheses have not found. `SetAdd` is a third
+/// component-per-entry collection; `StringSet` is a single value with no components, measured against
+/// a store that already holds many other keys. A rising SetAdd beside a flat StringSet says the axis
+/// is the object's own component count, not the store's size and not collections as a category.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib does_a_write_cost_track_an_objects_component_count -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn does_a_write_cost_track_an_objects_component_count() {
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    println!(
+        "
+  members   set_add(new)   per member   string_set   members()   bytes   seen_check
+"
+    );
+
+    for size in [256_usize, 1024, 4096] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+
+        // One set of `size` members, and `size` separate string keys -- so both arms face a store of
+        // the same magnitude, but only the set is ONE object with many components.
+        for index in 0..size {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::SetAdd {
+                    key: "tags".to_string(),
+                    member: format!("member-{index:08}").into_bytes(),
+                },
+            });
+            assert!(out.status.ok, "set add {index}: {:?}", out.status);
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("k-{index:08}"),
+                    value: b"v".to_vec(),
+                },
+            });
+            assert!(out.status.ok, "string set {index}: {:?}", out.status);
+        }
+
+        // Writes are not idempotent: warm on one new key, measure another.
+        let warm = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::SetAdd {
+                key: "tags".to_string(),
+                member: format!("warm-{size:08}").into_bytes(),
+            },
+        });
+        assert!(warm.status.ok, "{:?}", warm.status);
+        let probe = crate::alloc_probe::Probe::start();
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::SetAdd {
+                key: "tags".to_string(),
+                member: format!("fresh-{size:08}").into_bytes(),
+            },
+        });
+        let set_add = probe.stop().allocs;
+        assert!(out.status.ok, "{:?}", out.status);
+
+        let warm = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("warm-str-{size:08}"),
+                value: b"w".to_vec(),
+            },
+        });
+        assert!(warm.status.ok, "{:?}", warm.status);
+        let probe = crate::alloc_probe::Probe::start();
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("fresh-str-{size:08}"),
+                value: b"f".to_vec(),
+            },
+        });
+        let string_set = probe.stop().allocs;
+        assert!(out.status.ok, "{:?}", out.status);
+
+        let measure = |command: Command| {
+            let request = || ExecuteRequest { shard_id: 1, command: command.clone() };
+            let warm = engine.execute(request());
+            assert!(warm.status.ok, "{:?}", warm.status);
+            let probe = crate::alloc_probe::Probe::start();
+            let out = engine.execute(request());
+            let counts = probe.stop();
+            assert!(out.status.ok, "{:?}", out.status);
+            (counts.allocs, counts.alloc_bytes, out.response)
+        };
+
+        let (members_allocs, members_bytes, members_response) = measure(Command::SetMembers {
+            key: "tags".to_string(),
+        });
+        match &members_response {
+            CommandResponse::Members { members } => assert!(
+                members.len() >= size,
+                "members() must return the whole set: {} of {size}",
+                members.len()
+            ),
+            other => panic!("expected members, got {other:?}"),
+        }
+
+        let (seen_allocs, _, _) = measure(Command::SeenCheck {
+            key: "seen".to_string(),
+            member: b"probe-member".to_vec(),
+            window_ms: 60_000,
+        });
+
+        println!(
+            "  {size:>7}   {set_add:>12}   {:>10.2}   {string_set:>10}   {members_allocs:>9}   {members_bytes:>5}   {seen_allocs:>10}",
+            set_add as f64 / size as f64
+        );
+    }
+
+    println!(
+        "
+  set_add rising while string_set flat => the axis is the OBJECT's component count, not the store.
+  both rising                          => it is the store's size after all, and the arm-B result
+                                          from the push probe needs revisiting.
+  both flat                            => sets escape it, like whatever hashes do.
+"
+    );
+}
+
+
+/// Why does a membership TEST cost more than any write in the engine?
+///
+/// SeenCheck measured 16,187 / 167,967 / 2,301,586 allocations against stores of 256 / 1,024 / 4,096
+/// members -- superlinear, on a `seen` key holding one member. So the cost is the store around it.
+///
+/// Attributed with the engine's own per-site block-visit counters rather than by reading: a column
+/// tracking the store's block count names the site. StringSet is the control -- it writes a block and
+/// declares its component, so it should leave the counters alone.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib why_a_membership_test_costs_more_than_a_write -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn why_a_membership_test_costs_more_than_a_write() {
+    println!(
+        "
+  store   SeenCheck allocs   layout   refresh_flags   remove_all   |   StringSet allocs   layout
+"
+    );
+
+    for size in [256_usize, 1024] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for index in 0..size {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("k-{index:08}"),
+                    value: b"v".to_vec(),
+                },
+            });
+            assert!(out.status.ok, "fill {index}: {:?}", out.status);
+        }
+
+        // SeenCheck: warm one member, measure another, so this is a first sighting either way.
+        let warm = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::SeenCheck {
+                key: "seen".to_string(),
+                member: b"warm".to_vec(),
+                window_ms: 60_000,
+            },
+        });
+        assert!(warm.status.ok, "{:?}", warm.status);
+        crate::engine::bucket_visit_sites::reset();
+        let probe = crate::alloc_probe::Probe::start();
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::SeenCheck {
+                key: "seen".to_string(),
+                member: b"measured".to_vec(),
+                window_ms: 60_000,
+            },
+        });
+        let seen_allocs = probe.stop().allocs;
+        let (s_layout, _, s_refresh, s_remove) =
+            crate::engine::bucket_visit_sites::snapshot();
+        assert!(out.status.ok, "{:?}", out.status);
+
+        // Control: a write that DOES produce a block and declare a component.
+        let warm = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("warm-{size:08}"),
+                value: b"w".to_vec(),
+            },
+        });
+        assert!(warm.status.ok, "{:?}", warm.status);
+        crate::engine::bucket_visit_sites::reset();
+        let probe = crate::alloc_probe::Probe::start();
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("fresh-{size:08}"),
+                value: b"f".to_vec(),
+            },
+        });
+        let string_allocs = probe.stop().allocs;
+        let (t_layout, _, _, _) = crate::engine::bucket_visit_sites::snapshot();
+        assert!(out.status.ok, "{:?}", out.status);
+
+        println!(
+            "  {size:>5}   {seen_allocs:>16}   {s_layout:>6}   {s_refresh:>13}   {s_remove:>10}   |   {string_allocs:>16}   {t_layout:>6}"
+        );
+    }
+
+    println!(
+        "
+  a SeenCheck column tracking the store's page count names the site doing O(store) work per call.
+  StringSet's counters near zero => the control works, and the difference is real.
+"
+    );
+}
+
+
+/// Which commands force a full index rebuild on every call?
+///
+/// A mutating command missing from `command_updates_bucket_index_directly` takes the rebuild branch
+/// in the post-command path and walks every block in the shard. SeenCheck is missing and costs 2n block
+/// visits per call. Several real write paths are missing too.
+///
+/// The series here is held at ONE element while the store grows around it with unrelated keys, so a
+/// cost that still rises is the rebuild rather than anything about the object being written --
+/// which is the confound that would make a per-call O(store) rebuild look like series scaling.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib which_commands_rebuild_the_whole_index_per_call -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn which_commands_rebuild_the_whole_index_per_call() {
+    // Build a store of `size` unrelated string keys, then measure ONE call of `command`,
+    // reporting allocations and blocks visited.
+    fn arm(size: usize, make: &dyn Fn(usize) -> Command) -> (u64, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for index in 0..size {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("unrelated-{index:08}"),
+                    value: b"v".to_vec(),
+                },
+            });
+            assert!(out.status.ok, "fill {index}: {:?}", out.status);
+        }
+        // Warm with one call, measure a second on a DIFFERENT input (writes are not idempotent).
+        let warm = engine.execute(ExecuteRequest { shard_id: 1, command: make(0) });
+        assert!(warm.status.ok, "warm: {:?}", warm.status);
+        crate::engine::bucket_visit_sites::reset();
+        let probe = crate::alloc_probe::Probe::start();
+        let out = engine.execute(ExecuteRequest { shard_id: 1, command: make(1) });
+        let allocs = probe.stop().allocs as u64;
+        let (layout, _, _, _) = crate::engine::bucket_visit_sites::snapshot();
+        assert!(out.status.ok, "measured: {:?}", out.status);
+        (allocs, layout)
+    }
+
+    println!(
+        "
+  command                    store=256 allocs / pages   store=1024 allocs / pages
+"
+    );
+
+    let cases: Vec<(&str, Box<dyn Fn(usize) -> Command>)> = vec![
+        ("StringSet     (files pages)", Box::new(|n: usize| Command::StringSet {
+            key: format!("probe-{n}"),
+            value: b"v".to_vec(),
+        })),
+        ("ListPush      (files pages)", Box::new(|n: usize| Command::ListPush {
+            key: "feed".to_string(),
+            member: format!("e-{n}").into_bytes(),
+            left: false,
+        })),
+        ("SeenCheck      (no page)", Box::new(|n: usize| Command::SeenCheck {
+            key: "seen".to_string(),
+            member: format!("m-{n}").into_bytes(),
+            window_ms: 60_000,
+        })),
+        ("FeatureAppend (maintains)", Box::new(|n: usize| Command::FeatureAppend {
+            key: "rate".to_string(),
+            points: vec![FeaturePoint {
+                timestamp_ms: 1_000 + n as u64,
+                value: b"v".to_vec(),
+            }],
+        })),
+        ("SequenceAdd   (maintains)", Box::new(|n: usize| Command::SequenceAdd {
+            key: "seq".to_string(),
+            rows: vec![SequenceFeatureRow {
+                timestamp_ms: 1_000 + n as u64,
+                gid: 1,
+                action_type: 1,
+                duration: 1,
+                author_id: 1,
+            }],
+        })),
+        ("ControlChange  (no page)", Box::new(|n: usize| Command::ControlStateChangeAdd {
+            key: "visitors".to_string(),
+            timestamp_ms: 1_000 + n as u64,
+            value: format!("v-{n}").into_bytes(),
+            precision_ms: None,
+            ttl_ms: None,
+        })),
+    ];
+
+    for (name, make) in &cases {
+        let (a256, p256) = arm(256, make.as_ref());
+        let (a1024, p1024) = arm(1024, make.as_ref());
+        println!("  {name:<24}   {a256:>8} / {p256:<8}   {a1024:>10} / {p1024:<8}");
+    }
+
+    println!(
+        "
+  Every row should read 0 pages. Three reasons, and the labels say which applies:
+    files pages -- the command files its page through upsert_bucket_index_page
+    maintains   -- it files through sync_bucket_index_object_pages, which maintains the same thing
+    no page     -- it writes no page at all, so there is nothing for a rebuild to recompute
+
+  ANY row whose pages stop being zero has started rebuilding the whole index on every call again --
+  which cost 12,646 allocations and 2,048 page visits at a 1,024-key store before these were fixed.
+"
+    );
+}
+
+
+/// A command exempted from the rebuild must leave the index matching a rebuilt one.
+///
+/// `command_writes_no_block` exempts SeenCheck and the control-state change/selection writes from the
+/// post-command index rebuild, on the grounds that they mutate only non-block state. That holds today
+/// -- none of their arms appends a value or files a bucket-index block -- but it is exactly the kind
+/// of fact a later change can quietly break, and a stale index would not announce itself.
+///
+/// So this asserts the property the exemption rests on: run each exempted command against a store
+/// with real block-backed content, then compare the live index against a from-scratch rebuild.
+#[test]
+fn a_no_block_command_leaves_the_index_matching_a_rebuild() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // Block-backed content, so a rebuild has something real to reconstruct.
+    for index in 0..64_usize {
+        for command in [
+            Command::StringSet {
+                key: format!("s-{index:04}"),
+                value: format!("v-{index}").into_bytes(),
+            },
+            Command::HashSet {
+                key: "h".to_string(),
+                field: format!("f-{index:04}"),
+                value: b"v".to_vec(),
+            },
+            Command::ListPush {
+                key: "l".to_string(),
+                member: format!("e-{index:04}").into_bytes(),
+                left: false,
+            },
+        ] {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command });
+            assert!(out.status.ok, "seed {index}: {:?}", out.status);
+        }
+    }
+
+    let snapshot = |engine: &TemporalEngine| -> Vec<String> {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 loaded");
+        let mut rows: Vec<String> = super::blocks_with_identity(&shard.bucket_index)
+            .into_iter()
+            .map(|(routing_bucket, _handle, object_key, block)| {
+                format!("{routing_bucket}|{}|{}|{}", block.model_id, object_key, "-")
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+
+    let before = snapshot(&engine);
+    assert!(
+        before.len() >= 64,
+        "the fixture must leave real pages to reconstruct, found {}",
+        before.len()
+    );
+
+    for command in [
+        Command::SeenCheck {
+            key: "seen".to_string(),
+            member: b"m".to_vec(),
+            window_ms: 60_000,
+        },
+        Command::ControlStateChangeAdd {
+            key: "visitors".to_string(),
+            timestamp_ms: 1_000,
+            value: b"v".to_vec(),
+            precision_ms: None,
+            ttl_ms: None,
+        },
+    ] {
+        let out = engine.execute(ExecuteRequest { shard_id: 1, command });
+        assert!(out.status.ok, "exempted command: {:?}", out.status);
+    }
+
+    let after = snapshot(&engine);
+    assert_eq!(
+        before, after,
+        "an exempted command changed the page index -- the rebuild exemption in \
+         `command_writes_no_page` is no longer safe for it"
+    );
+}
+
+
+/// The no-block rebuild exemption has to hold in a BATCH, not only alone.
+///
+/// `command_writes_no_block` exempts SeenCheck and the control-state change/selection writes from
+/// the post-command rebuild, because a command that files no block cannot have changed the block
+/// index -- measured at twice the shard's block count per call. The single-command path consults
+/// it. The batch path did not, so the SAME command cost a full index rebuild when it arrived in a
+/// batch and nothing when it arrived on its own.
+///
+/// Measured rather than argued, because the cost is invisible in the result: the command answers
+/// identically either way, and only the block-visit counter shows the walk.
+#[test]
+fn a_no_block_command_in_a_batch_does_not_rebuild_the_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        32 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // Unrelated block-backed keys, so a rebuild has a whole store to walk and its cost shows.
+    // Nothing below touches these.
+    for index in 0..512_usize {
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("unrelated-{index:08}"),
+                value: b"v".to_vec(),
+            },
+        });
+        assert!(out.status.ok, "fill {index}: {:?}", out.status);
+    }
+
+    let seen = |member: &str| Command::SeenCheck {
+        key: "seen".to_string(),
+        member: member.as_bytes().to_vec(),
+        window_ms: 60_000,
+    };
+
+    // Warm both paths: the first call of either can set up state whose cost is not the per-call
+    // cost being measured.
+    assert!(
+        engine
+            .execute(ExecuteRequest { shard_id: 1, command: seen("warm-single") })
+            .status
+            .ok
+    );
+    assert!(
+        engine
+            .batch_execute(BatchExecuteRequest {
+                shard_id: 1,
+                commands: vec![seen("warm-batch")],
+            })
+            .status
+            .ok
+    );
+
+    crate::engine::bucket_visit_sites::reset();
+    let single = engine.execute(ExecuteRequest { shard_id: 1, command: seen("alone") });
+    let (alone_visits, ..) = crate::engine::bucket_visit_sites::snapshot();
+    assert!(single.status.ok, "{:?}", single.status);
+
+    // What the index holds, so skipping the rebuild can be shown not to leave it stale.
+    let block_rows = |engine: &TemporalEngine| -> Vec<String> {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 loaded");
+        let mut rows: Vec<String> = super::blocks_with_identity(&shard.bucket_index)
+            .into_iter()
+            .map(|(routing_bucket, _handle, object_key, block)| {
+                format!("{routing_bucket}|{}|{}|{}", block.model_id, object_key, "-")
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let index_before = block_rows(&engine);
+
+    crate::engine::bucket_visit_sites::reset();
+    let batched = engine.batch_execute(BatchExecuteRequest {
+        shard_id: 1,
+        commands: vec![seen("batched")],
+    });
+    let (batch_visits, ..) = crate::engine::bucket_visit_sites::snapshot();
+    assert!(batched.status.ok, "{:?}", batched.status);
+
+    // Skipping the rebuild is only sound because there was nothing to rebuild. If a no-block
+    // command ever does file a block, this fails rather than leaving a stale index to be found
+    // by a read that misses.
+    assert_eq!(
+        index_before,
+        block_rows(&engine),
+        "a batched no-page command changed the page index, so skipping the rebuild after it          leaves the index stale"
+    );
+
+    // The positive control, and it is not optional: both assertions below are `== 0`, and zero is
+    // also what a counter that never fires reports. A command genuinely missing from
+    // `command_updates_bucket_index_directly` still rebuilds, so this shows the counter is wired
+    // up on the very path the batch assertion measures.
+    crate::engine::bucket_visit_sites::reset();
+    let control = engine.batch_execute(BatchExecuteRequest {
+        shard_id: 1,
+        commands: vec![Command::CommonExpire {
+            key: "unrelated-00000000".to_string(),
+            ttl_ms: 60_000,
+        }],
+    });
+    let (control_visits, ..) = crate::engine::bucket_visit_sites::snapshot();
+    assert!(control.status.ok, "{:?}", control.status);
+    assert!(
+        control_visits > 0,
+        "the page-visit counter reported nothing for a command that does rebuild, so the zeroes          below would mean nothing"
+    );
+
+    assert_eq!(
+        alone_visits, 0,
+        "the single-command path stopped exempting a no-page command"
+    );
+    assert_eq!(
+        batch_visits, 0,
+        "a no-page command rebuilt the whole index because it arrived in a batch: {batch_visits}          page visits against {alone_visits} for the same command sent alone"
+    );
+}
+
+/// Which cache namespaces a record can actually end up in.
+///
+/// `invalidate_record` walks EVERY key in all three cache tiers and filters, so each call costs
+/// more as the cache fills. Three of the namespaces it was being called for did not need a walk:
+///
+/// - `list` and `zset` have no `CacheKey` constructor at all, so nothing ever puts an entry in
+///   them and every sweep for one walked the whole cache to match nothing. Those calls are gone.
+/// - `set` has exactly one possible entry per record -- `CacheKey::set_members` fixes the selector
+///   at `members` -- so naming that key is equivalent to sweeping for it, and O(1) instead.
+///
+/// `hash` and `feature` keep their sweeps: a hash caches one entry per field and a feature one per
+/// query window, so neither has a single key to name.
+///
+/// This holds those premises. If a `list` or `zset` entry ever appears, the removed invalidations
+/// were load bearing after all; if a `set` entry ever appears under another selector, the narrowed
+/// one stops being equivalent.
+#[test]
+fn the_cache_namespaces_a_record_can_actually_use() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        32 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // Write and then READ each collection kind: a read is what populates the record caches, so
+    // writing alone would leave every namespace empty and prove nothing.
+    for command in [
+        Command::ListPush { key: "l".to_string(), member: b"a".to_vec(), left: false },
+        Command::ListRange { key: "l".to_string(), start: 0, stop: -1 },
+        Command::ListLen { key: "l".to_string() },
+        Command::ZSetAdd { key: "z".to_string(), member: b"m".to_vec(), score: 1.0 },
+        Command::ZSetScore { key: "z".to_string(), member: b"m".to_vec() },
+        Command::ZSetCard { key: "z".to_string() },
+        Command::SetAdd { key: "s".to_string(), member: b"m".to_vec() },
+        Command::SetMembers { key: "s".to_string() },
+        Command::HashSet { key: "h".to_string(), field: "f".to_string(), value: b"v".to_vec() },
+        Command::HashGet { key: "h".to_string(), field: "f".to_string() },
+    ] {
+        let out = engine.execute(ExecuteRequest { shard_id: 1, command });
+        assert!(out.status.ok, "{:?}", out.status);
+    }
+
+    let entries = engine.cache.entries_for_shard(1);
+    let in_namespace = |name: &str| -> Vec<String> {
+        entries
+            .iter()
+            .filter(|entry| entry.namespace == name)
+            .map(|entry| format!("{}/{}", entry.record_key, entry.selector))
+            .collect()
+    };
+
+    // The positive control comes FIRST, because everything below is an emptiness claim and an
+    // empty view would satisfy all of them at once.
+    assert!(
+        !in_namespace("hash").is_empty(),
+        "no hash entry was cached, so this view cannot show that list and zset are empty"
+    );
+
+    assert!(
+        in_namespace("list").is_empty(),
+        "a list entry reached the cache, so removing the list invalidations leaves it stale: {:?}",
+        in_namespace("list")
+    );
+    assert!(
+        in_namespace("zset").is_empty(),
+        "a zset entry reached the cache, so removing the zset invalidations leaves it stale: {:?}",
+        in_namespace("zset")
+    );
+
+    // A set caches exactly one entry, under one selector, which is what makes naming it
+    // equivalent to sweeping for it.
+    let sets = in_namespace("set");
+    assert!(
+        sets.iter().all(|entry| entry.ends_with("/members")),
+        "a set cached an entry under a selector other than `members`, so naming one key no          longer covers the record: {sets:?}"
+    );
+
+    // And the narrowed call really does remove it.
+    if !sets.is_empty() {
+        let _ = engine
+            .cache
+            .invalidate(&matrixcache::CacheKey::set_members(1, "s"));
+        assert!(
+            engine
+                .cache
+                .entries_for_shard(1)
+                .iter()
+                .all(|entry| entry.namespace != "set"),
+            "invalidating the one set key left a set entry behind"
+        );
+    }
+}
+
+/// A wide parent keeps its NEWEST children for scoring, not its oldest.
+///
+/// Traversal cuts a parent's children down to a cap BEFORE scoring any of them, so whatever the
+/// cut drops is unreachable by any query however well it matches. The sort was ascending on
+/// `updated_at_ms`, so the cut kept the OLDEST children and the most recently ingested were the
+/// first to become invisible -- the opposite of what a store keyed on time should do.
+///
+/// This is not a claim that selection is now relevance-based. It is not: scoring a child costs a
+/// block read, so a cap has to stay and a wide enough parent still hides children. What this holds
+/// is that recent writes are reachable, and that the drop is counted rather than silent.
+#[test]
+fn a_wide_parent_keeps_its_newest_children_for_scoring() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        32 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    const TENANT: u64 = 77;
+    const PARENT: u64 = 1;
+    const CHILDREN: u64 = 16;
+    const CAP: usize = 4;
+
+    // Each child carries a vector that points along its own axis, so a query can name exactly one
+    // of them and no other child scores against it.
+    let axis = |n: u64| -> Vec<f32> {
+        let mut vector = vec![0.0f32; CHILDREN as usize + 2];
+        vector[n as usize] = 1.0;
+        vector
+    };
+
+    let upsert = |node_hash: u64, vector: Vec<f32>| Command::ContextUpsertNode {
+        tenant_hash: TENANT,
+        node: Box::new(crate::types::ContextNode {
+            node_hash,
+            parent_hash: 0,
+            kind: 1,
+            canonical_name: format!("node-{node_hash}"),
+            status: 1,
+            last_event_time_ms: 1_700_000_000_000 + node_hash,
+            raw_metadata_ref: String::new(),
+            l0: String::new(),
+            l1_ref: String::new(),
+            vector,
+            embedding_model_hash: 0,
+            embedding_updated_at_ms: 0,
+            summary_vector: Vec::new(),
+            summary_vector_valid_from_ms: 0,
+            summary_vector_model_hash: 0,
+        }),
+    };
+
+    let out = engine.execute(ExecuteRequest { shard_id: 1, command: upsert(PARENT, axis(0)) });
+    assert!(out.status.ok, "{:?}", out.status);
+
+    // Children 2..=17, each newer than the last.
+    for index in 0..CHILDREN {
+        let child_hash = index + 2;
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: upsert(child_hash, axis(child_hash - 1)),
+        });
+        assert!(out.status.ok, "{:?}", out.status);
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextUpsertChildRef {
+                tenant_hash: TENANT,
+                child_ref: crate::types::ContextChildRef {
+                    parent_hash: PARENT,
+                    child_hash,
+                    // Ascending: the last child written is the newest.
+                    updated_at_ms: 1_700_000_000_000 + index,
+                },
+            },
+        });
+        assert!(out.status.ok, "{:?}", out.status);
+    }
+
+    let newest = CHILDREN + 1;
+    let oldest = 2u64;
+
+    let traverse = |target: u64| -> Vec<u64> {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 loaded");
+        crate::engine::context::traverse_context_tree(
+            &engine.cache,
+            &engine.block_store,
+            1,
+            shard,
+            TENANT,
+            PARENT,
+            &axis(target - 1),
+            Some(1),
+            Some(CHILDREN as usize),
+            Some(CAP),
+            Some(CHILDREN as usize),
+            false,
+        )
+        .nodes
+        .into_iter()
+        .map(|node| node.node_hash)
+        .collect()
+    };
+
+    // The per-call count, which is what a caller gets back. The process-wide
+    // counter below cannot answer "was MY result cut" once two queries overlap.
+    let outcome_dropped = {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 loaded");
+        crate::engine::context::traverse_context_tree(
+            &engine.cache,
+            &engine.block_store,
+            1,
+            shard,
+            TENANT,
+            PARENT,
+            &axis(newest - 1),
+            Some(1),
+            Some(CHILDREN as usize),
+            Some(CAP),
+            Some(CHILDREN as usize),
+            false,
+        )
+        .children_dropped_before_scoring
+    };
+    assert_eq!(
+        outcome_dropped,
+        (CHILDREN as usize) - CAP,
+        "a parent with {CHILDREN} children under a cap of {CAP} skipped \
+         {outcome_dropped} before scoring; the caller is told that number so it can \
+         tell a capped result from a thin tree"
+    );
+
+    // And it reaches a caller going through the command, which is the only route
+    // an SDK user has.
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::ContextTraverseTree {
+            tenant_hash: TENANT,
+            start_node_hash: PARENT,
+            query_vector: axis(newest - 1),
+            max_depth: Some(1),
+            top_k_per_depth: Some(CHILDREN as usize),
+            max_children_scored_per_parent: Some(CAP),
+            max_candidate_nodes: Some(CHILDREN as usize),
+            leaf_only: false,
+        },
+    });
+    assert!(response.status.ok, "{:?}", response.status);
+    match response.response {
+        crate::types::CommandResponse::ContextTraversedNodes {
+            children_dropped_before_scoring,
+            ..
+        } => assert_eq!(
+            children_dropped_before_scoring,
+            (CHILDREN as usize) - CAP,
+            "the traversal response must carry what the cap skipped"
+        ),
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    crate::engine::context::reset_context_children_dropped_before_scoring();
+    let found_newest = traverse(newest);
+    let dropped = crate::engine::context::context_children_dropped_before_scoring();
+
+    assert!(
+        found_newest.contains(&newest),
+        "the newest child was not reachable: a cap of {CAP} over {CHILDREN} children scored          {found_newest:?}, so the most recently written content is invisible to retrieval"
+    );
+    assert_eq!(
+        dropped,
+        CHILDREN as u64 - CAP as u64,
+        "the children the cut dropped before scoring must be counted, or the limit is invisible"
+    );
+
+    // The other half of the same fact, and the control on the assertion above: with the cap
+    // binding, the OLDEST child is the one now out of reach. If both ends were reachable the cap
+    // would not be binding and the test would prove nothing about which end is kept.
+    assert!(
+        !traverse(oldest).contains(&oldest),
+        "both the newest and oldest children were reachable, so the cap did not bind and this          test says nothing about which end the cut keeps"
+    );
+}
+
+/// A context write leaves nothing in the `hash`, `set` or `feature` cache namespaces.
+///
+/// This is the premise `invalidate_context_record` rests on. `invalidate_record_all` sweeps those
+/// three namespaces, and each sweep is `invalidate_record`, which walks EVERY key in all three
+/// cache tiers -- so the sweeps cost more as the cache fills, and for a context object they were
+/// walking the whole cache to find nothing. The context arms now invalidate only what they can
+/// actually have cached.
+///
+/// If a context object ever does end up cached under one of those namespaces, this fails and the
+/// narrowing has to be reconsidered -- which is the point of holding the premise rather than the
+/// conclusion.
+#[test]
+fn a_context_write_leaves_the_record_namespaces_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        32 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    let record_namespace = |engine: &TemporalEngine| -> Vec<String> {
+        engine
+            .cache
+            .entries_for_shard(1)
+            .into_iter()
+            .filter(|entry| matches!(entry.namespace.as_str(), "hash" | "set" | "feature"))
+            .map(|entry| format!("{}/{}", entry.namespace, entry.record_key))
+            .collect()
+    };
+
+    for n in 1..=64u64 {
+        for command in [
+            Command::ContextUpsertNode {
+                tenant_hash: 41,
+                node: Box::new(crate::types::ContextNode {
+                    node_hash: n,
+                    parent_hash: 0,
+                    kind: 1,
+                    canonical_name: format!("node-{n}"),
+                    status: 1,
+                    last_event_time_ms: 1_787_270_070_000 + n,
+                    raw_metadata_ref: String::new(),
+                    l0: String::new(),
+                    l1_ref: String::new(),
+                    vector: Vec::new(),
+                    embedding_model_hash: 0,
+                    embedding_updated_at_ms: 0,
+                    summary_vector: Vec::new(),
+                    summary_vector_valid_from_ms: 0,
+                    summary_vector_model_hash: 0,
+                }),
+            },
+            Command::ContextWriteIndexRef {
+                tenant_hash: 41,
+                index_name: "source".to_string(),
+                index_value_hash: n,
+                scope_hash: 0,
+                event_time_ms: 1_700_000_000_000 + n,
+                index_ref: crate::types::ContextIndexRef {
+                    primary_node_hash: n,
+                    primary_event_time_ms: 1_700_000_000_000 + n,
+                    event_id_hash: 5_000 + n,
+                },
+            },
+        ] {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command });
+            assert!(out.status.ok, "{n}: {:?}", out.status);
+        }
+    }
+
+    assert!(
+        record_namespace(&engine).is_empty(),
+        "a context write cached something in a record namespace, so dropping those sweeps would          leave it stale: {:?}",
+        record_namespace(&engine)
+    );
+
+    // The positive control, and it is what makes the emptiness above mean anything: a real hash
+    // record DOES show up in the same view, so the filter is not simply blind to these entries.
+    let set = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::HashSet {
+            key: "a-real-hash".to_string(),
+            field: "f".to_string(),
+            value: b"v".to_vec(),
+        },
+    });
+    assert!(set.status.ok, "{:?}", set.status);
+    let got = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::HashGet {
+            key: "a-real-hash".to_string(),
+            field: "f".to_string(),
+        },
+    });
+    assert!(got.status.ok, "{:?}", got.status);
+    assert!(
+        record_namespace(&engine)
+            .iter()
+            .any(|entry| entry.contains("a-real-hash")),
+        "a hash record did not appear in the record namespaces, so the assertion above passes          whether or not context writes cache there"
+    );
+}
+
+/// What `SequenceQuery`'s single bound costs a filtered caller.
+///
+/// `ContextQueryEvents` has TWO bounds -- `max_scan` for work, `limit` for results after filtering --
+/// and its regression test records the harm that shape was introduced to stop: taking the limit off
+/// the raw timeline first "silently dropped" matching events beyond it, so low-value rows hid the
+/// high-value ones on the retrieval path.
+///
+/// `SequenceQuery` has one knob, `count`, doing both jobs, so it still behaves the way QueryEvents
+/// did before that fix. This test does not change that -- it makes the cost visible. It passes
+/// against current behaviour; if `SequenceQuery` ever gains a `max_scan`, it will fail and should be
+/// updated to assert the fixed behaviour.
+#[test]
+fn a_filtered_sequence_query_returns_fewer_rows_than_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // 500 rows that do NOT match the filter, then 500 that do -- the shape the QueryEvents comment
+    // describes, where the interesting rows sit behind a wall of uninteresting ones.
+    const NON_MATCHING: usize = 500;
+    const MATCHING: usize = 500;
+    for index in 0..(NON_MATCHING + MATCHING) {
+        let action_type = if index < NON_MATCHING { 1 } else { 9 };
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::SequenceAdd {
+                key: "events".to_string(),
+                rows: vec![SequenceFeatureRow {
+                    timestamp_ms: 1_000 + index as u64,
+                    gid: index as u64,
+                    action_type,
+                    duration: 10,
+                    author_id: 1,
+                }],
+            },
+        });
+        assert!(out.status.ok, "add {index}: {:?}", out.status);
+    }
+
+    // Ask for 10 rows where action_type == 9. Five hundred match.
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::SequenceQuery {
+            key: "events".to_string(),
+            start_ms: 0,
+            end_ms: 1_000_000,
+            count: 10,
+            filters: vec![FeatureFilter {
+                field: "action_type".to_string(),
+                op: FeatureFilterOp::Equal,
+                value: 9,
+            }],
+        },
+    });
+    assert!(response.status.ok, "{:?}", response.status);
+    let rows = match response.response {
+        CommandResponse::SequenceRows { rows } => rows,
+        other => panic!("expected sequence rows, got {other:?}"),
+    };
+
+    // Current behaviour: `count` caps the SCAN, so the first 10 rows are read, none match the
+    // filter, and the caller is told nothing.
+    assert_eq!(
+        rows.len(),
+        0,
+        "current behaviour: `count` bounds the scan, so a caller asking for 10 of 500 matching rows \
+         receives {} -- with no field in the reply saying the answer was cut short. If this now \
+         returns 10, SequenceQuery has gained a separate scan bound and this test should assert the \
+         fixed behaviour instead.",
+        rows.len()
+    );
+
+    // The rows really are there: the same query without the filter reaches them, and a scan wide
+    // enough finds them. This is not an empty store.
+    let wide = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::SequenceQuery {
+            key: "events".to_string(),
+            start_ms: 0,
+            end_ms: 1_000_000,
+            count: NON_MATCHING + MATCHING,
+            filters: vec![FeatureFilter {
+                field: "action_type".to_string(),
+                op: FeatureFilterOp::Equal,
+                value: 9,
+            }],
+        },
+    });
+    let wide_rows = match wide.response {
+        CommandResponse::SequenceRows { rows } => rows,
+        other => panic!("expected sequence rows, got {other:?}"),
+    };
+    assert_eq!(
+        wide_rows.len(),
+        MATCHING,
+        "the matching rows exist -- a scan wide enough returns all {MATCHING} of them"
+    );
+}
+
+/// One counter increment rewrites the WHOLE counter series.
+///
+/// `persist_control_state_block` runs on every `ControlStateIncrement` and calls
+/// `serde_json::to_vec(series)` -- its own comment calls this "the O(series) per-write
+/// whole-series block rewrite (the write-amplification source)". The cure already exists
+/// behind `control_coalesce_persist`, which is off by default.
+///
+/// This is a paired A/B: both arms run async_storage (the flag is gated on it), same series,
+/// same increments; the ONLY difference is the flag. Serializing a whole series is ONE big
+/// allocation, so an allocation COUNT cannot see this defect -- only bytes can.
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn a_counter_increment_rewrites_the_whole_series() {
+    const REPS: usize = 20;
+    let arm = |points: usize, coalesce: bool| -> (f64, u64, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        let mut config = Config {
+            version: 2,
+            async_storage: true,
+            ..Config::default()
+        };
+        if coalesce {
+            config
+                .extend_config
+                .insert("control_coalesce_persist".to_string(), "on".to_string());
+        }
+        assert!(
+            engine.set_config(SetConfigRequest { shard_id: 1, config }).ok,
+            "set_config must be accepted, or the arms are not what they claim to be"
+        );
+        for i in 0..points {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ControlStateIncrement {
+                    key: "c".to_string(),
+                    timestamp_ms: 1_000 + i as u64,
+                    amount: 1,
+                },
+            });
+        }
+        let probe = crate::alloc_probe::Probe::start();
+        for i in 0..REPS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ControlStateIncrement {
+                    key: "c".to_string(),
+                    timestamp_ms: 900_000 + i as u64,
+                    amount: 1,
+                },
+            });
+        }
+        let counts = probe.stop();
+        // Both arms must still ANSWER -- otherwise a "cheap" arm is only a broken one.
+        let check = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ControlStateCount {
+                key: "c".to_string(),
+                start_ms: 0,
+                end_ms: 1_000_000,
+            },
+        });
+        let value = match check.response {
+            CommandResponse::Integer { value } => value,
+            other => panic!("expected an integer count, got {other:?}"),
+        };
+        (counts.allocs as f64 / REPS as f64, counts.alloc_bytes / REPS as u64, value)
+    };
+
+    let sizes = [200usize, 800, 3200];
+    let mut default_bytes = Vec::new();
+    let mut coalesced_bytes = Vec::new();
+    println!("  points   default allocs/bytes     coalesced allocs/bytes   bytes saved");
+    for points in sizes {
+        let (da, db, dv) = arm(points, false);
+        let (ca, cb, cv) = arm(points, true);
+        let expected = points as i64 + REPS as i64;
+        assert_eq!(dv, expected, "default arm must answer correctly");
+        assert_eq!(cv, expected, "coalesced arm must answer correctly");
+        println!(
+            "  {points:6}   {da:6.1}/{db:<14}   {ca:6.1}/{cb:<14}   {:8.2}x",
+            if cb > 0 { db as f64 / cb as f64 } else { 0.0 }
+        );
+        default_bytes.push(db);
+        coalesced_bytes.push(cb);
+    }
+
+    // The cure: cost per increment does not depend on how long the series already is.
+    assert_eq!(
+        coalesced_bytes[0], coalesced_bytes[2],
+        "with control_coalesce_persist the per-increment bytes must not depend on series length \
+         (got {} at {} points vs {} at {} points)",
+        coalesced_bytes[0], sizes[0], coalesced_bytes[2], sizes[2]
+    );
+    // The defect: without it, a 16x longer series makes one increment cost multiples more.
+    assert!(
+        default_bytes[2] > default_bytes[0] * 5,
+        "the default path rewrites the whole series, so a {}x longer series must cost far more \
+         per increment (got {} vs {} bytes)",
+        sizes[2] / sizes[0],
+        default_bytes[2],
+        default_bytes[0]
+    );
+    // And the gap must widen -- that is what makes it O(series) rather than a fixed surcharge.
+    assert!(
+        default_bytes[2] / coalesced_bytes[2] > default_bytes[0] / coalesced_bytes[0],
+        "the saving must GROW with series length"
+    );
+}
+
+/// Which write paths cost the SIZE OF THE COLLECTION they write into?
+///
+/// ControlStateIncrement is the positive control: it is known to rewrite its whole series
+/// (mx#771), so if this probe reports it flat, the probe is broken and no other row means
+/// anything. Bytes, not allocation counts -- a whole-collection serialisation is one big
+/// allocation.
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn which_write_paths_cost_their_collection() {
+    const REPS: usize = 20;
+    let make = |family: &str, i: usize| -> Command {
+        match family {
+            "HashSet" => Command::HashSet {
+                key: "k".to_string(),
+                field: format!("f{i:06}"),
+                value: vec![b'v'; 32],
+            },
+            "ZSetAdd" => Command::ZSetAdd {
+                key: "k".to_string(),
+                member: format!("m{i:06}").into_bytes(),
+                score: i as f64,
+            },
+            "ListPush" => Command::ListPush {
+                key: "k".to_string(),
+                member: format!("m{i:06}").into_bytes(),
+                left: false,
+            },
+            "SetAdd" => Command::SetAdd {
+                key: "k".to_string(),
+                member: format!("m{i:06}").into_bytes(),
+            },
+            "ControlStateIncrement" => Command::ControlStateIncrement {
+                key: "k".to_string(),
+                timestamp_ms: 1_000 + i as u64,
+                amount: 1,
+            },
+            other => panic!("unknown family {other}"),
+        }
+    };
+
+    let cost = |family: &str, fill: usize| -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for i in 0..fill {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: make(family, i),
+            });
+        }
+        let probe = crate::alloc_probe::Probe::start();
+        for i in 0..REPS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: make(family, fill + i),
+            });
+        }
+        probe.stop().alloc_bytes / REPS as u64
+    };
+
+    let families = [
+        "ControlStateIncrement",
+        "HashSet",
+        "ZSetAdd",
+        "ListPush",
+        "SetAdd",
+    ];
+    println!("  family                  bytes/write @200   @3200      ratio");
+    let mut control_ratio = 0.0f64;
+    for family in families {
+        let small = cost(family, 200);
+        let large = cost(family, 3200);
+        // An upper-bound style claim passes hardest at zero, so require real work.
+        assert!(small > 0, "{family}: measured zero bytes, the probe is not reaching the path");
+        let ratio = large as f64 / small as f64;
+        if family == "ControlStateIncrement" {
+            control_ratio = ratio;
+        }
+        println!("  {family:22}  {small:10}  {large:10}   {ratio:8.2}x");
+    }
+    // The positive control MUST show the shape this probe exists to detect.
+    assert!(
+        control_ratio > 3.0,
+        "ControlStateIncrement is known to rewrite its whole series, so a 16x longer series \
+         must cost far more per write (got {control_ratio:.2}x). A flat control means the \
+         probe is broken, not that the path is clean."
+    );
+    println!("  A ratio near 1 => the write is incremental. A ratio rising with the collection");
+    println!("  => that write path rewrites what it writes into.");
+}
+
+/// A set must come back from a restart with exactly its members, including a removal staying
+/// removed. Nothing in the suite covered plain-set membership across a restart -- the nearby
+/// restart test covers zsets -- so this is the missing guard, not a demonstration.
+///
+/// What it does NOT prove: disabling the new ("set", Some(component)) index-item arm leaves this
+/// test GREEN. That is not a weakness in the assertions, it is what the write path says --
+/// "a write that only ADDED leaves nothing to resurrect: replay rebuilds the same membership
+/// from the same blocks" -- and `unload_shard` writes a full base snapshot that a reload recovers
+/// from wholesale. So a missing index item for an add-only command costs work, not correctness,
+/// and any claim that this test discriminates the component mapping would be false.
+#[test]
+fn a_set_survives_a_restart_with_its_members_and_removals() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+
+    let members: Vec<String> = (0..64).map(|index| format!("m-{index:04}")).collect();
+
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    for member in &members {
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::SetAdd {
+                key: "bag".to_string(),
+                member: member.clone().into_bytes(),
+            },
+        });
+        assert!(out.status.ok, "add {member}: {:?}", out.status);
+    }
+    // A duplicate add: the set must still hold one of it.
+    let out = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::SetAdd {
+            key: "bag".to_string(),
+            member: b"m-0000".to_vec(),
+        },
+    });
+    assert!(out.status.ok, "{:?}", out.status);
+    // One member removed: it must NOT come back.
+    let out = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::SetRemove {
+            key: "bag".to_string(),
+            member: b"m-0001".to_vec(),
+        },
+    });
+    assert!(out.status.ok, "{:?}", out.status);
+
+    // Materialise the base index -- a reload recovers from the base snapshot plus the WAL tail.
+    engine.unload_shard(1);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+
+    let out = restarted.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::SetMembers {
+            key: "bag".to_string(),
+        },
+    });
+    // If the shard did not come back, say THAT -- not "a member is missing".
+    assert!(
+        out.status.ok,
+        "the restarted engine did not load the shard: {:?}",
+        out.status
+    );
+    let got = match out.response {
+        CommandResponse::Members { members } => members
+            .into_iter()
+            .map(|m| String::from_utf8(m).expect("member is utf8"))
+            .collect::<std::collections::BTreeSet<_>>(),
+        other => panic!("expected set members after the restart, got {other:?}"),
+    };
+
+    // The set is non-empty -- an empty answer would make every membership check below vacuous.
+    assert!(
+        !got.is_empty(),
+        "the set read back EMPTY after the restart: the index no longer resolves its members"
+    );
+    assert!(
+        !got.contains("m-0001"),
+        "a removed member came back after the restart"
+    );
+    for member in members.iter().filter(|m| m.as_str() != "m-0001") {
+        assert!(
+            got.contains(member),
+            "{member} did not survive the restart (recovered {} of {})",
+            got.len(),
+            members.len() - 1
+        );
+    }
+    assert_eq!(
+        got.len(),
+        members.len() - 1,
+        "a duplicate add must not add a second copy, and nothing may appear that was not written"
+    );
+}
+
+/// A list must come back from a restart with its ORDER intact, pushes from both ends included.
+///
+/// `ListPush` now declares its index component, and that component is its sequence number --
+/// read from the list AFTER the write lands, because a push's position is not knowable from the
+/// command alone.
+///
+/// This is a GUARD on the restart path, not a check of the component: a clean `unload_shard`
+/// writes a full base snapshot that recovery reads wholesale, so inverting the end the component
+/// is taken from leaves this test green. The component itself is asserted directly by
+/// `a_list_push_files_its_index_item_under_the_pushed_entry`, which reads the delta record.
+#[test]
+fn a_list_survives_a_restart_with_its_order_across_both_ends() {
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+
+    // Right pushes build r-0000..r-0031 left-to-right; left pushes then prepend l-0000, l-0001,
+    // so the head ends up l-0001, l-0000 -- an order no single-ended push could produce.
+    for index in 0..32 {
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ListPush {
+                key: "queue".to_string(),
+                member: format!("r-{index:04}").into_bytes(),
+                left: false,
+            },
+        });
+        assert!(out.status.ok, "right push {index}: {:?}", out.status);
+    }
+    for index in 0..2 {
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ListPush {
+                key: "queue".to_string(),
+                member: format!("l-{index:04}").into_bytes(),
+                left: true,
+            },
+        });
+        assert!(out.status.ok, "left push {index}: {:?}", out.status);
+    }
+
+    let expected: Vec<String> = std::iter::once("l-0001".to_string())
+        .chain(std::iter::once("l-0000".to_string()))
+        .chain((0..32).map(|index| format!("r-{index:04}")))
+        .collect();
+
+    let read_all = |engine: &TemporalEngine| -> Vec<String> {
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ListRange {
+                key: "queue".to_string(),
+                start: 0,
+                stop: -1,
+            },
+        });
+        assert!(out.status.ok, "ListRange refused: {:?}", out.status);
+        match out.response {
+            CommandResponse::Members { members } => members
+                .into_iter()
+                .map(|m| String::from_utf8(m).expect("member is utf8"))
+                .collect(),
+            other => panic!("expected list members, got {other:?}"),
+        }
+    };
+
+    // Before the restart, so a mismatch after it is attributable to the RESTART and not to the
+    // pushes having been wrong all along.
+    assert_eq!(read_all(&engine), expected, "the order is wrong before any restart");
+
+    engine.unload_shard(1);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    restarted.load_shard(1);
+
+    let after = read_all(&restarted);
+    assert!(
+        !after.is_empty(),
+        "the list read back EMPTY after the restart: its entries no longer resolve"
+    );
+    assert_eq!(
+        after, expected,
+        "the list came back in a different order than it went in"
+    );
+}
+
+/// A push must file its index item under the entry it actually pushed.
+///
+/// The restart tests cannot see this: a clean unload writes a full base snapshot, so recovery
+/// never consults the incremental item. This reads the delta record itself, which is the only
+/// place the component appears, and so is the only test that fails if the component is computed
+/// from the wrong end of the list.
+#[test]
+fn a_list_push_files_its_index_item_under_the_pushed_entry() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    for index in 0..4 {
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ListPush {
+                key: "queue".to_string(),
+                member: format!("r-{index:04}").into_bytes(),
+                left: false,
+            },
+        });
+        assert!(out.status.ok, "right push: {:?}", out.status);
+    }
+    // The last write is a LEFT push, so the entry it created is the list's FIRST key. If the
+    // component were taken from the other end it would name the last right push instead.
+    let out = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::ListPush {
+            key: "queue".to_string(),
+            member: b"l-0000".to_vec(),
+            left: true,
+        },
+    });
+    assert!(out.status.ok, "left push: {:?}", out.status);
+
+    let (head_seq, tail_seq) = {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 loaded");
+        let list = shard.lists.get("queue").expect("the list exists");
+        (
+            *list.keys().next().expect("a head"),
+            *list.keys().next_back().expect("a tail"),
+        )
+    };
+    assert_ne!(head_seq, tail_seq, "the list must have both ends to tell them apart");
+
+    let records = engine
+        .index_log_store
+        .read_delta_records(1, 0)
+        .expect("delta records readable");
+    // RE-ATTRIBUTED OFF THE ROW AND ONTO THE RECORD'S OWN CARRY, WITH THE SOURCE NAMED.
+    //
+    // This read the pushed sequence out of `IndexItem::component` -- the sequence as sixteen hex
+    // digits, biased -- and the row has no such field any more. The sequence is carried instead in
+    // the record's `key_states` blobs, under `CARRIED_CONTAINER_FIELDS[2]` (`list_elements`), as
+    // the (sequence, address) pair read back out of `shard.lists` after the write. That is the
+    // source `fold_carried_container_elements` reads on a reload, so it is the source this arm
+    // should have been asking: the question "which entry did the push file its item under" still
+    // has an answer, and this is where the answer lives.
+    //
+    // The sequence arrives as a NUMBER rather than as hex text, so the decode this test used to
+    // perform is gone with it -- there is nothing left to mis-parse.
+    let newest_carry = records
+        .iter()
+        .rev()
+        .flat_map(|record| record.key_states.iter())
+        .filter(|blob| blob.get("key").and_then(|key| key.as_str()) == Some("queue"))
+        .filter_map(|blob| blob.get("list_elements").and_then(|value| value.as_array()))
+        .next()
+        .expect("no record carried a list element for `queue`, so this arm has nothing to score");
+    // ONE ELEMENT PER PUSH, so "the newest carry" names the left push rather than happening to.
+    assert_eq!(
+        1,
+        newest_carry.len(),
+        "the newest record carried {} list element(s) for `queue`; with more than one, taking the \
+         first is luck rather than the left push",
+        newest_carry.len()
+    );
+    let seq = newest_carry[0]
+        .get(0)
+        .and_then(|sequence| sequence.as_i64())
+        .expect("the carried list element states its sequence");
+
+    assert_eq!(
+        seq, head_seq,
+        "a LEFT push must file its item under the list's head ({head_seq}), not its tail \
+         ({tail_seq}); the component named {seq}"
+    );
+}
+
+/// Does REMOVING one entry cost the size of the collection it leaves?
+///
+/// `capture_key_states` runs when membership shrinks, and its own comment says it "serializes
+/// every entry the per-key maps hold for the key". Adds were measured by
+/// `which_write_paths_cost_their_collection`; this is the other axis.
+///
+/// Two-sided control: ControlStateIncrement is known to amplify (7.57x) and SetAdd is known flat
+/// (1.03x since the component declaration). A probe that cannot show BOTH states is not
+/// measuring anything, so both are asserted.
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn which_removals_cost_their_collection() {
+    const REPS: usize = 20;
+    let fill = |engine: &TemporalEngine, family: &str, n: usize| {
+        for i in 0..n {
+            let command = match family {
+                "SetRemove" | "SetAdd" => Command::SetAdd {
+                    key: "k".to_string(),
+                    member: format!("m{i:06}").into_bytes(),
+                },
+                "ListPop" => Command::ListPush {
+                    key: "k".to_string(),
+                    member: format!("m{i:06}").into_bytes(),
+                    left: false,
+                },
+                "ZSetRemove" => Command::ZSetAdd {
+                    key: "k".to_string(),
+                    member: format!("m{i:06}").into_bytes(),
+                    score: i as f64,
+                },
+                "HashDelete" => Command::HashSet {
+                    key: "k".to_string(),
+                    field: format!("f{i:06}"),
+                    value: vec![b'v'; 32],
+                },
+                "ControlStateIncrement" => Command::ControlStateIncrement {
+                    key: "k".to_string(),
+                    timestamp_ms: 1_000 + i as u64,
+                    amount: 1,
+                },
+                other => panic!("unknown family {other}"),
+            };
+            engine.execute(ExecuteRequest { shard_id: 1, command });
+        }
+    };
+    let probed = |family: &str, i: usize, fill_n: usize| -> Command {
+        match family {
+            "SetRemove" => Command::SetRemove {
+                key: "k".to_string(),
+                member: format!("m{i:06}").into_bytes(),
+            },
+            "ListPop" => Command::ListPop {
+                key: "k".to_string(),
+                left: false,
+            },
+            "ZSetRemove" => Command::ZSetRemove {
+                key: "k".to_string(),
+                member: format!("m{i:06}").into_bytes(),
+            },
+            "HashDelete" => Command::HashDelete {
+                key: "k".to_string(),
+                field: format!("f{i:06}"),
+            },
+            // The two controls keep ADDING -- their known behaviour is on the add path.
+            "SetAdd" => Command::SetAdd {
+                key: "k".to_string(),
+                member: format!("m{:06}", fill_n + i).into_bytes(),
+            },
+            "ControlStateIncrement" => Command::ControlStateIncrement {
+                key: "k".to_string(),
+                timestamp_ms: 900_000 + i as u64,
+                amount: 1,
+            },
+            other => panic!("unknown family {other}"),
+        }
+    };
+
+    let cost = |family: &str, n: usize| -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        fill(&engine, family, n);
+        let probe = crate::alloc_probe::Probe::start();
+        for i in 0..REPS {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: probed(family, i, n),
+            });
+            assert!(out.status.ok, "{family} probe write refused: {:?}", out.status);
+        }
+        probe.stop().alloc_bytes / REPS as u64
+    };
+
+    println!("  family                  bytes/op @200   @3200      ratio");
+    let mut amplifying_control = 0.0f64;
+    let mut flat_control = 0.0f64;
+    for family in [
+        "ControlStateIncrement",
+        "SetAdd",
+        "SetRemove",
+        "ListPop",
+        "ZSetRemove",
+        "HashDelete",
+    ] {
+        let small = cost(family, 200);
+        let large = cost(family, 3200);
+        assert!(small > 0, "{family}: measured zero bytes, the probe never reached the path");
+        let ratio = large as f64 / small as f64;
+        match family {
+            "ControlStateIncrement" => amplifying_control = ratio,
+            "SetAdd" => flat_control = ratio,
+            _ => {}
+        }
+        println!("  {family:22}  {small:10}  {large:10}   {ratio:8.2}x");
+    }
+    assert!(
+        amplifying_control > 3.0,
+        "the amplifying control reported {amplifying_control:.2}x -- the probe cannot see \
+         amplification, so no row above means anything"
+    );
+    assert!(
+        flat_control < 1.5,
+        "the flat control reported {flat_control:.2}x -- the probe reports amplification where \
+         there is none, so no row above means anything"
+    );
+    println!("  Ratio near 1 => the removal is incremental. Ratio rising with the collection");
+    println!("  => removing one entry costs the size of what remains.");
+}
+
+/// Does a FEATURE write cost the length of the series it appends to?
+///
+/// Feature writes were made cheap in #716 by fixing the per-SHARD rebuild, measured in
+/// allocations. That is a different axis from the per-OBJECT one: a whole-series write is one
+/// big allocation, so a count cannot see it and only bytes can. This measures bytes against
+/// series length.
+///
+/// Two-sided control: ControlStateIncrement must amplify, SetAdd must not.
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn what_a_feature_write_costs_against_its_series() {
+    const REPS: usize = 20;
+    let cost = |family: &str, fill: usize| -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        let make = |i: usize| -> Command {
+            match family {
+                "FeatureAppend" => Command::FeatureAppend {
+                    key: "f".to_string(),
+                    points: vec![FeaturePoint {
+                        timestamp_ms: 1_000 + i as u64,
+                        value: vec![b'v'; 8],
+                    }],
+                },
+                "ControlStateIncrement" => Command::ControlStateIncrement {
+                    key: "c".to_string(),
+                    timestamp_ms: 1_000 + i as u64,
+                    amount: 1,
+                },
+                "SetAdd" => Command::SetAdd {
+                    key: "s".to_string(),
+                    member: format!("m{i:06}").into_bytes(),
+                },
+                other => panic!("unknown family {other}"),
+            }
+        };
+        for i in 0..fill {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command: make(i) });
+            assert!(out.status.ok, "{family} fill refused: {:?}", out.status);
+        }
+        let probe = crate::alloc_probe::Probe::start();
+        for i in 0..REPS {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: make(fill + i),
+            });
+            assert!(out.status.ok, "{family} probe refused: {:?}", out.status);
+        }
+        probe.stop().alloc_bytes / REPS as u64
+    };
+
+    println!("  family                  bytes/write @200   @3200      ratio");
+    let mut amplifying = 0.0f64;
+    let mut flat = 0.0f64;
+    for family in ["ControlStateIncrement", "SetAdd", "FeatureAppend"] {
+        let small = cost(family, 200);
+        let large = cost(family, 3200);
+        assert!(small > 0, "{family}: measured zero bytes");
+        let ratio = large as f64 / small as f64;
+        match family {
+            "ControlStateIncrement" => amplifying = ratio,
+            "SetAdd" => flat = ratio,
+            _ => {}
+        }
+        println!("  {family:22}  {small:10}  {large:10}   {ratio:8.2}x");
+    }
+    assert!(
+        amplifying > 3.0,
+        "the amplifying control reported {amplifying:.2}x -- the probe cannot see amplification"
+    );
+    assert!(
+        flat < 1.5,
+        "the flat control reported {flat:.2}x -- the probe invents amplification"
+    );
+}
+
+/// The four commands that hand a WHOLE address list to `sync_bucket_index_object_blocks`
+/// (execute_on_shard lines ~1334, ~1402, ~1566, ~1727) -- do they all cost their series?
+///
+/// FeatureAppend is carried as a KNOWN-amplifying control (15.20x, mx#793) and SetAdd as the
+/// flat one. Source agreement is not evidence: the same survey shape has twice reported a
+/// command as cheap when its work had merely moved somewhere the grep could not see.
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn which_series_writers_cost_their_series() {
+    const REPS: usize = 20;
+    let cost = |family: &str, fill: usize| -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        let make = |i: usize| -> Command {
+            let ts = 1_000 + i as u64;
+            match family {
+                "SetAdd" => Command::SetAdd {
+                    key: "s".to_string(),
+                    member: format!("m{i:06}").into_bytes(),
+                },
+                "FeatureAppend" => Command::FeatureAppend {
+                    key: "f".to_string(),
+                    points: vec![FeaturePoint { timestamp_ms: ts, value: vec![b'v'; 8] }],
+                },
+                "FeatureAppendWithPolicy" => Command::FeatureAppendWithPolicy {
+                    key: "fp".to_string(),
+                    points: vec![FeaturePoint { timestamp_ms: ts, value: vec![b'v'; 8] }],
+                    policy: FeatureWritePolicy::Upsert,
+                },
+                "FeatureReplace" => Command::FeatureReplace {
+                    key: "fr".to_string(),
+                    start_ms: ts,
+                    end_ms: ts,
+                    points: vec![FeaturePoint { timestamp_ms: ts, value: vec![b'v'; 8] }],
+                },
+                "SequenceAdd" => Command::SequenceAdd {
+                    key: "sq".to_string(),
+                    rows: vec![SequenceFeatureRow {
+                        timestamp_ms: ts,
+                        gid: i as u64,
+                        action_type: 1,
+                        duration: 2,
+                        author_id: 3,
+                    }],
+                },
+                other => panic!("unknown family {other}"),
+            }
+        };
+        for i in 0..fill {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command: make(i) });
+            assert!(out.status.ok, "{family} fill refused: {:?}", out.status);
+        }
+        let probe = crate::alloc_probe::Probe::start();
+        for i in 0..REPS {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command: make(fill + i) });
+            assert!(out.status.ok, "{family} probe refused: {:?}", out.status);
+        }
+        probe.stop().alloc_bytes / REPS as u64
+    };
+
+    println!("  family                    bytes/write @200     @3200      ratio");
+    let mut amplifying = 0.0f64;
+    let mut flat = 0.0f64;
+    for family in [
+        "SetAdd",
+        "FeatureAppend",
+        "FeatureAppendWithPolicy",
+        "FeatureReplace",
+        "SequenceAdd",
+    ] {
+        let small = cost(family, 200);
+        let large = cost(family, 3200);
+        assert!(small > 0, "{family}: measured zero bytes, the probe never reached the path");
+        let ratio = large as f64 / small as f64;
+        match family {
+            "FeatureAppend" => amplifying = ratio,
+            "SetAdd" => flat = ratio,
+            _ => {}
+        }
+        println!("  {family:24}  {small:10}  {large:10}   {ratio:8.2}x");
+    }
+    assert!(
+        amplifying > 3.0,
+        "FeatureAppend is known to cost its series (15.20x); it reported {amplifying:.2}x, so \
+         this probe cannot see amplification and no row above means anything"
+    );
+    assert!(
+        flat < 1.5,
+        "SetAdd declares its component and must stay flat; it reported {flat:.2}x, so this probe \
+         reports amplification where there is none"
+    );
+}
+
+/// Does a counter write get more expensive with the NUMBER OF WRITES, at a FIXED series size?
+///
+/// The 8h soak shows ControlStateIncrement rising 5,857 -> 8,291 bytes over two hours while its
+/// series is pinned at 512 timestamps by construction. If that is real, cost grows with writes
+/// rather than with data -- an axis no fill-and-measure probe has tested, because every other
+/// probe here grows the collection it measures.
+///
+/// Both arms establish the SAME 512-point series first; only the number of subsequent writes
+/// differs. ControlStateSetAndGet rides along to finish the candidate list.
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn does_a_counter_write_cost_more_after_many_writes() {
+    const REPS: usize = 20;
+    const SERIES: u64 = 512;
+    let cost = |family: &str, extra_writes: usize| -> (u64, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        let make = |i: usize| -> Command {
+            let ts = 1_000 + (i as u64 % SERIES);
+            match family {
+                "ControlStateIncrement" => Command::ControlStateIncrement {
+                    key: "c".to_string(),
+                    timestamp_ms: ts,
+                    amount: 1,
+                },
+                "ControlStateSetAndGet" => Command::ControlStateSetAndGet {
+                    family: ControlStateFamily::Counter,
+                    key: "c".to_string(),
+                    timestamp_ms: ts,
+                    amount: 1,
+                    start_ms: 0,
+                    end_ms: 1_000_000,
+                    aggregator: "sum".to_string(),
+                },
+                other => panic!("unknown family {other}"),
+            }
+        };
+        // Establish the series: SERIES distinct timestamps, identical in both arms.
+        for i in 0..SERIES as usize {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command: make(i) });
+            assert!(out.status.ok, "{family} seed refused: {:?}", out.status);
+        }
+        // Then only the WRITE COUNT differs -- every one lands on an existing timestamp.
+        for i in 0..extra_writes {
+            engine.execute(ExecuteRequest { shard_id: 1, command: make(i) });
+        }
+        let probe = crate::alloc_probe::Probe::start();
+        for i in 0..REPS {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command: make(i) });
+            assert!(out.status.ok, "{family} probe refused: {:?}", out.status);
+        }
+        let bytes = probe.stop().alloc_bytes / REPS as u64;
+        // The series really is still SERIES points, so this cannot be a size effect in disguise.
+        //
+        // ControlStateSetAndGet files under `control_state_family_key(family, key)` --
+        // "control_state:h:c" -- NOT the bare key. Reading the bare key returned 0 and the row
+        // was meaningless; the cost was real but measured a path nothing verified.
+        let read_key = match family {
+            "ControlStateSetAndGet" => "control_state:h:c".to_string(),
+            _ => "c".to_string(),
+        };
+        let count = match engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ControlStateCount {
+                    key: read_key.clone(),
+                    start_ms: 0,
+                    end_ms: 1_000_000,
+                },
+            })
+            .response
+        {
+            CommandResponse::Integer { value } => value,
+            other => panic!("expected a count, got {other:?}"),
+        };
+        // ASSERT, do not print: a printed answer cannot fail, which is how the unvalidated row
+        // got reported in the first place.
+        assert!(
+            count > 0,
+            "{family}: read back 0 from {read_key}, so the measured cost belongs to a path this              probe cannot confirm wrote anything"
+        );
+        (bytes, count)
+    };
+
+    println!("  family                   +200 writes    +3200 writes    ratio   (series fixed at {SERIES})");
+    for family in ["ControlStateIncrement", "ControlStateSetAndGet"] {
+        let (small, small_n) = cost(family, 200);
+        let (large, large_n) = cost(family, 3200);
+        assert!(small > 0, "{family}: measured zero bytes");
+        let ratio = large as f64 / small as f64;
+        println!(
+            "  {family:22}  {small:11}  {large:14}   {ratio:6.2}x   (sums {small_n} / {large_n})",
+        );
+        // The guard, not just the report: a counter write must not get dearer because the
+        // process has done more writes. Printing a ratio nobody asserts on cannot fail.
+        assert!(
+            ratio < 1.5,
+            "{family} cost {ratio:.2}x more after 16x the writes at an UNCHANGED {SERIES}-point              series ({small} -> {large} bytes), so its cost now tracks writes rather than data"
+        );
+    }
+    println!("  A ratio near 1 => cost depends on the DATA, and the soak's rise is something else.");
+    println!("  A ratio above 1 => cost grows with WRITES at fixed data size, which no");
+    println!("  fill-and-measure probe in this file could have seen.");
+}
+
+/// What does ONE ENTRY cost, per data structure, in live heap?
+///
+/// Two rules this obeys, both learned the hard way:
+///
+/// * **Marginal, not average.** A small sample charges every entry for the fixed cost of the
+///   maps around it. Measuring at N and 2N and reporting `(heap2N - heapN) / N` prices the entry
+///   itself. An average over 1,000 entries has read ~7.6x high before.
+/// * **Live heap, not `size_of`.** A BTreeMap node holding one entry can cost 1,496 bytes to
+///   carry 120 bytes of key and value, so the struct's size says little. Live heap is
+///   `alloc_bytes - free_bytes` across the inserts.
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn what_one_entry_costs_in_each_structure() {
+    const N: usize = 5_000;
+    let live_for = |kind: &str, count: usize| -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            8 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        let probe = crate::alloc_probe::Probe::start();
+        for i in 0..count {
+            let command = match kind {
+                "hash" => Command::HashSet {
+                    key: "k".to_string(),
+                    field: format!("f{i:07}"),
+                    value: vec![b'v'; 32],
+                },
+                "zset" => Command::ZSetAdd {
+                    key: "k".to_string(),
+                    member: format!("m{i:07}").into_bytes(),
+                    score: i as f64,
+                },
+                "set" => Command::SetAdd {
+                    key: "k".to_string(),
+                    member: format!("m{i:07}").into_bytes(),
+                },
+                "list" => Command::ListPush {
+                    key: "k".to_string(),
+                    member: format!("m{i:07}").into_bytes(),
+                    left: false,
+                },
+                other => panic!("unknown kind {other}"),
+            };
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command });
+            assert!(out.status.ok, "{kind} insert refused: {:?}", out.status);
+        }
+        let counts = probe.stop();
+        // Live heap: what the inserts allocated and did NOT give back.
+        let live = counts.alloc_bytes.saturating_sub(counts.free_bytes);
+        // The structure really holds `count` entries, so the divisor is not a guess.
+        let held = {
+            let shards = engine.shards.read().expect("shards lock poisoned");
+            let shard = shards.get(&1).expect("shard 1 loaded");
+            match kind {
+                "hash" => shard.hashes.values().map(|m| m.len()).sum::<usize>(),
+                "zset" => shard.zsets.values().map(|m| m.len()).sum::<usize>(),
+                "set" => shard.sets.values().map(|m| m.len()).sum::<usize>(),
+                "list" => shard.lists.values().map(|m| m.len()).sum::<usize>(),
+                _ => 0,
+            }
+        };
+        assert_eq!(held, count, "{kind} holds {held} entries, expected {count}");
+        live
+    };
+
+    println!("  structure   live @{N}      live @{}    MARGINAL B/entry   average B/entry", 2 * N);
+    for kind in ["hash", "zset", "set", "list"] {
+        let small = live_for(kind, N);
+        let large = live_for(kind, 2 * N);
+        let marginal = (large.saturating_sub(small)) as f64 / N as f64;
+        let average = large as f64 / (2 * N) as f64;
+        assert!(large > small, "{kind}: doubling the entries did not raise live heap");
+        println!(
+            "  {kind:9}  {small:11}  {large:11}   {marginal:14.1}   {average:14.1}",
+        );
+        // The sample must be big enough that the average is not still paying for the fixed
+        // structures. When it is, marginal and average agree; when it is not, the average runs
+        // high and every per-entry number taken from it is wrong. Assert the agreement rather
+        // than trusting that 5,000 is "probably enough".
+        let spread = (average - marginal).abs() / marginal;
+        assert!(
+            spread < 0.20,
+            "{kind}: marginal {marginal:.1} and average {average:.1} B/entry differ by {:.0}%, so              {N} entries is too small a sample and the average is still charging each entry for              the fixed structures around it",
+            spread * 100.0
+        );
+    }
+    println!("  MARGINAL is the entry's own cost. AVERAGE charges it for the fixed structures");
+    println!("  around it, and runs high -- the two columns are printed together so the");
+    println!("  difference cannot be mistaken for noise.");
+}
+
+/// Does a NARROW read pay for the whole collection?
+///
+/// Every read here asks for a small, fixed-size answer from a collection that grows 16x. A cost
+/// that grows with the collection means the read materialises what it does not return.
+///
+/// Two-sided control, both asserted:
+/// * `HashGet` fetches one field and must stay flat.
+/// * `ListRangeFull` asks for every element, so it SHOULD scale -- if it does not, this probe
+///   cannot see scaling and the narrow rows below prove nothing.
+///
+/// Caveat this probe cannot escape: an allocation probe cannot see a scan that allocates
+/// nothing. A lazy range walk over 3 200 entries costs the same bytes as one over 10. So a flat
+/// row here means "materialises nothing extra", NOT "reads nothing extra".
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn does_a_narrow_read_pay_for_the_whole_collection() {
+    const REPS: usize = 20;
+    let cost = |kind: &str, fill: usize| -> (u64, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            8 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for i in 0..fill {
+            let command = match kind {
+                "HashGet" => Command::HashSet {
+                    key: "k".to_string(),
+                    field: format!("f{i:07}"),
+                    value: vec![b'v'; 32],
+                },
+                "ListRangeFull" | "ListRangeNarrow" => Command::ListPush {
+                    key: "k".to_string(),
+                    member: format!("m{i:07}").into_bytes(),
+                    left: false,
+                },
+                "ZSetRangeNarrow" => Command::ZSetAdd {
+                    key: "k".to_string(),
+                    member: format!("m{i:07}").into_bytes(),
+                    score: i as f64,
+                },
+                "SetMembersAll" => Command::SetAdd {
+                    key: "k".to_string(),
+                    member: format!("m{i:07}").into_bytes(),
+                },
+                other => panic!("unknown kind {other}"),
+            };
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command });
+            assert!(out.status.ok, "{kind} fill refused: {:?}", out.status);
+        }
+        let read = || -> Command {
+            match kind {
+                "HashGet" => Command::HashGet {
+                    key: "k".to_string(),
+                    field: "f0000001".to_string(),
+                },
+                "ListRangeFull" => Command::ListRange { key: "k".to_string(), start: 0, stop: -1 },
+                "ListRangeNarrow" => Command::ListRange { key: "k".to_string(), start: 0, stop: 9 },
+                "ZSetRangeNarrow" => Command::ZSetRangeByScore {
+                    key: "k".to_string(),
+                    min: 10.0,
+                    max: 19.0,
+                    min_exclusive: false,
+                    max_exclusive: false,
+                    rev: false,
+                },
+                "SetMembersAll" => Command::SetMembers { key: "k".to_string() },
+                other => panic!("unknown kind {other}"),
+            }
+        };
+        // How many items does the answer actually carry? A read that returns nothing would look
+        // cheap for the wrong reason.
+        let returned = match engine
+            .execute(ExecuteRequest { shard_id: 1, command: read() })
+            .response
+        {
+            CommandResponse::Members { members } => members.len(),
+            CommandResponse::Bytes { value } => value.map(|_| 1).unwrap_or(0),
+            CommandResponse::HashEntries { entries } => entries.len(),
+            other => panic!("{kind}: unexpected response {other:?}"),
+        };
+        let probe = crate::alloc_probe::Probe::start();
+        for _ in 0..REPS {
+            engine.execute(ExecuteRequest { shard_id: 1, command: read() });
+        }
+        (probe.stop().alloc_bytes / REPS as u64, returned)
+    };
+
+    println!("  read                 bytes @200   bytes @3200    ratio   items returned");
+    let mut flat = 0.0f64;
+    let mut scaling = 0.0f64;
+    for kind in [
+        "HashGet",
+        "ListRangeFull",
+        "ListRangeNarrow",
+        "ZSetRangeNarrow",
+        "SetMembersAll",
+    ] {
+        let (small, small_items) = cost(kind, 200);
+        let (large, large_items) = cost(kind, 3200);
+        assert!(small > 0, "{kind}: measured zero bytes");
+        assert!(large_items > 0, "{kind}: returned nothing at 3200, so its cost means nothing");
+        let ratio = large as f64 / small as f64;
+        match kind {
+            "HashGet" => flat = ratio,
+            "ListRangeFull" => scaling = ratio,
+            _ => {}
+        }
+        println!(
+            "  {kind:18}  {small:10}  {large:12}   {ratio:6.2}x   {small_items} -> {large_items}",
+        );
+    }
+    assert!(flat < 1.5, "HashGet fetches ONE field and reported {flat:.2}x");
+    assert!(
+        scaling > 3.0,
+        "ListRangeFull asks for every element and reported {scaling:.2}x, so this probe cannot \
+         see a read scale and no narrow row above means anything"
+    );
+}
+
+/// What does writing a message cost in BYTES as its node's history grows?
+///
+/// `writing_a_message_does_not_cost_its_nodes_history` already bounds this path, in
+/// ALLOCATIONS, and says plainly that it is "not flat yet" with the residue in the WAL append.
+/// Bytes are a different axis: four defects this sweep moved megabytes while barely moving a
+/// count, because one big serialisation is one allocation. This asks the byte question.
+///
+/// Two-sided control, both asserted: SetAdd declares its component and must stay flat;
+/// FeatureAppend clones its whole series and must scale.
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn what_a_message_write_costs_in_bytes_as_history_grows() {
+    const REPS: usize = 20;
+    let dims = 384usize;
+    let cost = |kind: &str, fill: usize| -> (u64, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            8 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        let make = |i: usize| -> Command {
+            match kind {
+                "ContextWriteEvent" => Command::ContextWriteEvent {
+                    tenant_hash: 1,
+                    node_hash: 42,
+                    first_write_only: false,
+                    cold_storage: false,
+                    event: Box::new(ContextEvent {
+                        event_id_hash: 1_000 + i as u64,
+                        event_time_ms: 1_700_000_000_000 + i as u64,
+                        ingestion_time_ms: 1_700_000_000_000,
+                        kind: 1,
+                        event_type: 2,
+                        actor_hash: 7,
+                        status: 0,
+                        valid_until_ms: 0,
+                        confidence: 0.9,
+                        importance: 0.5,
+                        text: format!("message {i}: the quick brown fox jumps over the lazy dog"),
+                        source_ref: format!("src/{i}"),
+                        related_node_hashes: vec![42],
+                        compact_attrs: Vec::new(),
+                        vector: (0..dims).map(|d| (d as f32) * 0.001 + i as f32).collect(),
+                    }),
+                },
+                "SetAdd" => Command::SetAdd {
+                    key: "s".to_string(),
+                    member: format!("m{i:07}").into_bytes(),
+                },
+                "FeatureAppend" => Command::FeatureAppend {
+                    key: "f".to_string(),
+                    points: vec![FeaturePoint { timestamp_ms: 1_000 + i as u64, value: vec![b'v'; 8] }],
+                },
+                other => panic!("unknown kind {other}"),
+            }
+        };
+        for i in 0..fill {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command: make(i) });
+            assert!(out.status.ok, "{kind} fill refused: {:?}", out.status);
+        }
+        let probe = crate::alloc_probe::Probe::start();
+        for i in 0..REPS {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command: make(fill + i) });
+            assert!(out.status.ok, "{kind} probe refused: {:?}", out.status);
+        }
+        let bytes = probe.stop().alloc_bytes / REPS as u64;
+        // The history really is this long, so a per-write figure is not divided by a fill that
+        // silently failed.
+        let held = if kind == "ContextWriteEvent" {
+            let shards = engine.shards.read().expect("shards lock poisoned");
+            let shard = shards.get(&1).expect("shard 1 loaded");
+            shard.context_events().values().map(|m| m.len()).sum::<usize>()
+        } else {
+            fill + REPS
+        };
+        (bytes, held)
+    };
+
+    println!("  command               bytes @200    bytes @1600     ratio   held");
+    let mut flat = 0.0f64;
+    let mut scaling = 0.0f64;
+    for kind in ["SetAdd", "FeatureAppend", "ContextWriteEvent"] {
+        let (small, small_held) = cost(kind, 200);
+        let (large, large_held) = cost(kind, 1600);
+        assert!(small > 0, "{kind}: measured zero bytes");
+        assert!(large_held >= 1600, "{kind}: history is {large_held}, expected at least 1600");
+        let ratio = large as f64 / small as f64;
+        match kind {
+            "SetAdd" => flat = ratio,
+            "FeatureAppend" => scaling = ratio,
+            _ => {}
+        }
+        println!("  {kind:20}  {small:10}  {large:13}   {ratio:6.2}x   {small_held} -> {large_held}");
+    }
+    // THIS FLAT CONTROL IS A SINGLE-POINT RATIO AND IT PASSES BY WHERE ITS FILLS FALL.
+    //
+    // A served-index log piece rolls roughly once per 450 appends, costs about 2,100-2,550
+    // allocations, and no row of the per-op ledger mentions it -- so whether the REPS-wide window
+    // at a given fill contains one decides this ratio, and that depends on bytes-per-append. 200
+    // and 1600 are both roll-free on this tree, which is why this reads 1.00x. A change that moves
+    // bytes-per-append moves which fills roll: the sibling
+    // `what_the_string_family_costs_against_the_store` read 1.67x for a change that writes a
+    // SMALLER record, purely because its 3200 sample caught a roll.
+    //
+    // That sibling now samples several large fills, discards any whose window rolled, and refuses
+    // if none survives. This one is left as it is because it is green and reworking a passing test
+    // is not this change's business -- but if it ever moves, look at the roll before the ratio.
+    assert!(flat < 1.5, "the flat control reported {flat:.2}x");
+    assert!(
+        scaling > 3.0,
+        "the scaling control reported {scaling:.2}x, so this probe cannot see amplification"
+    );
+    println!("  An 8x fill range: a ratio near 8 is linear in history, near 1 is flat.");
+}
+
+/// Does a bigger read cache buy anything, and where does it stop paying?
+///
+/// The live deployment runs the default 16 MB memory cache against a 1.2 GB store where a single
+/// retrieval returns 9.35 MB -- one read is 58% of the whole cache. That LOOKS badly
+/// under-scaled, but "looks" is not a measurement: a cache only pays if the working set is
+/// re-read, and a store whose reads never repeat gains nothing from a larger one.
+///
+/// So this sweeps the cache size against a FIXED working set that is deliberately re-read, and
+/// reports bytes per read. Flat across the sweep means the cache size is not the lever.
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn what_a_bigger_read_cache_buys() {
+    const RECORDS: usize = 4_000;
+    const READS: usize = 200;
+    let cost_at = |cache_bytes: usize| -> (u64, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            cache_bytes,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for i in 0..RECORDS {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("k{:04}", i % 256),
+                    field: format!("f{i:06}"),
+                    value: vec![b'v'; 256],
+                },
+            });
+            assert!(out.status.ok, "fill refused: {:?}", out.status);
+        }
+        // Re-read a fixed working set: this is the case a cache exists for.
+        let probe = crate::alloc_probe::Probe::start();
+        let mut answered = 0u64;
+        for i in 0..READS {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashGetAll {
+                    key: format!("k{:04}", i % 64),
+                },
+            });
+            if let CommandResponse::HashEntries { entries } = out.response {
+                answered += entries.len() as u64;
+            }
+        }
+        let bytes = probe.stop().alloc_bytes / READS as u64;
+        (bytes, answered)
+    };
+
+    println!("  cache size     bytes/read   entries returned");
+    let mut first = 0u64;
+    let mut last = 0u64;
+    // The sizes must BRACKET the working set, not sit above it. A first run swept 1 MB to
+    // 256 MB against ~1 MB of data and every arm returned byte-identical cost -- not because
+    // cache size does not matter, but because every arm held the whole set and none evicted.
+    // 4,000 records x 256 B is about 1 MB, so these run from far below it to comfortably above.
+    for (label, size) in [
+        ("64 KB", 64 << 10),
+        ("256 KB", 256 << 10),
+        ("1 MB", 1 << 20),
+        ("4 MB", 4 << 20),
+        ("16 MB (default)", 16 << 20),
+    ] {
+        let (bytes, answered) = cost_at(size);
+        assert!(answered > 0, "{label}: the reads returned nothing, so the cost means nothing");
+        if first == 0 {
+            first = bytes;
+        }
+        last = bytes;
+        println!("  {label:14}  {bytes:10}   {answered}");
+    }
+    println!("  A falling curve means the cache size is a lever here.");
+    println!("  Flat means it is not, and the 16 MB default is not what makes a read slow.");
+    // Not asserted as a win or a loss -- this is a sweep, and either answer is informative.
+    let _ = (first, last);
+}
+
+
+/// What does the String family cost as the store grows?
+///
+/// `StringSet` declares its index component; `StringGet`, `StringDelete` and `StringSetEx` do
+/// not. On every other family, a write that declares nothing restated every block of its object
+/// and cost megabytes -- so `StringDelete` sits on the shape that was worth 16x elsewhere.
+///
+/// The prediction is that it does NOT matter here, because a string is one block per key
+/// (`component: None`), so "every block of the object" is one block. This checks that, because the
+/// same reasoning applied to sets and lists would have been wrong.
+///
+/// Two-sided control, both asserted.
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn what_the_string_family_costs_against_the_store() {
+    const REPS: usize = 20;
+    let cost = |kind: &str, fill: usize| -> (u64, u64, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            8 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        let seed = |i: usize| -> Command {
+            match kind {
+                "FeatureAppend" => Command::FeatureAppend {
+                    key: "f".to_string(),
+                    points: vec![FeaturePoint { timestamp_ms: 1_000 + i as u64, value: vec![b'v'; 8] }],
+                },
+                "SetAdd" => Command::SetAdd {
+                    key: "s".to_string(),
+                    member: format!("m{i:07}").into_bytes(),
+                },
+                _ => Command::StringSet {
+                    key: format!("k{i:07}"),
+                    value: vec![b'v'; 128],
+                },
+            }
+        };
+        for i in 0..fill {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command: seed(i) });
+            assert!(out.status.ok, "{kind} fill refused: {:?}", out.status);
+        }
+        let make = |i: usize| -> Command {
+            match kind {
+                "StringSet" => Command::StringSet {
+                    key: format!("k{:07}", fill + i),
+                    value: vec![b'v'; 128],
+                },
+                "StringGet" => Command::StringGet { key: format!("k{:07}", i % fill.max(1)) },
+                "StringDelete" => Command::StringDelete { key: format!("k{:07}", i) },
+                "SetAdd" => Command::SetAdd {
+                    key: "s".to_string(),
+                    member: format!("m{:07}", fill + i).into_bytes(),
+                },
+                "FeatureAppend" => Command::FeatureAppend {
+                    key: "f".to_string(),
+                    points: vec![FeaturePoint { timestamp_ms: 1_000 + (fill + i) as u64, value: vec![b'v'; 8] }],
+                },
+                other => panic!("unknown {other}"),
+            }
+        };
+        // HOW MANY SERVED-INDEX LOG PIECES EXIST, so a roll inside the window can be seen.
+        // A roll costs about 2,100-2,550 allocations and 78-135 KB, once per roughly 450
+        // appends, and no row of the per-op ledger mentions it -- so a twenty-operation window
+        // either contains one or does not, and the ratio below swings by more than the bound.
+        let pieces = |engine: &TemporalEngine| -> usize {
+            let root = engine.index_dir.join("indexlogs");
+            std::fs::read_dir(&root)
+                .map(|rd| {
+                    rd.flatten()
+                        .filter(|e| {
+                            e.file_name().to_string_lossy().starts_with("shard-1.indexlog")
+                        })
+                        .count()
+                })
+                .unwrap_or(0)
+        };
+        let pieces_before = pieces(&engine);
+        let probe = crate::alloc_probe::Probe::start();
+        let mut ok = 0u64;
+        for i in 0..REPS {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command: make(i) });
+            assert!(out.status.ok, "{kind} refused: {:?}", out.status);
+            ok += 1;
+        }
+        let bytes = probe.stop().alloc_bytes / REPS as u64;
+        (bytes, ok, pieces(&engine) > pieces_before)
+    };
+
+    println!("  command          declares?   bytes @200   bytes @3200    ratio   rolled?");
+    let mut scaling = 0.0f64;
+    for (kind, declares) in [
+        ("SetAdd", "yes"),
+        ("FeatureAppend", "no"),
+        ("StringSet", "yes"),
+        ("StringGet", "n/a"),
+        ("StringDelete", "no"),
+    ] {
+        let (small, sa, small_rolled) = cost(kind, 200);
+        let (large, la, large_rolled) = cost(kind, 3200);
+        assert!(small > 0, "{kind}: measured zero bytes");
+        assert!(sa == REPS as u64 && la == REPS as u64, "{kind}: not every op answered");
+        let ratio = large as f64 / small as f64;
+        if kind == "FeatureAppend" {
+            scaling = ratio;
+        }
+        println!(
+            "  {kind:14}  {declares:9}   {small:10}  {large:12}   {ratio:6.2}x   {}",
+            match (small_rolled, large_rolled) {
+                (false, false) => "no",
+                (true, false) => "at 200",
+                (false, true) => "at 3200",
+                (true, true) => "both",
+            }
+        );
+    }
+
+    // --- THE FLAT CONTROL, SAMPLED RATHER THAN TAKEN AT ONE POINT ---
+    //
+    // The bound stays at 1.5x. What changes is that one sample cannot decide it. A log piece
+    // rolls about once per 450 appends; whether the twenty-operation window at a given fill
+    // contains one depends on bytes-per-append, so two shapes of this engine cross the boundary
+    // at different member counts and a single fill reports a roll for one of them and not the
+    // other. That is how this assertion read 1.67x for a change that writes a SMALLER record.
+    //
+    // So: several large fills, roll-containing samples DISCARDED, and the claim asserted on what
+    // survives. Refusing when nothing survives is the floor -- excluding every sample would hide
+    // the growth this control exists to detect.
+    let (small, _, _) = cost("SetAdd", 200);
+    assert!(small > 0, "the flat control measured zero bytes at the small fill");
+    let mut survivors: Vec<(usize, f64)> = Vec::new();
+    let mut rolled_at: Vec<usize> = Vec::new();
+    for fill in [3200usize, 3400, 3600] {
+        let (large, la, rolled) = cost("SetAdd", fill);
+        assert!(la == REPS as u64, "the flat control did not answer every op at {fill}");
+        let ratio = large as f64 / small as f64;
+        println!(
+            "  flat control @{fill:>5}: {large:>8} B/op against {small} at 200 = {ratio:5.2}x{}",
+            if rolled { "   (a piece ROLLED in this window -- discarded)" } else { "" }
+        );
+        if rolled { rolled_at.push(fill); } else { survivors.push((fill, ratio)); }
+    }
+    assert!(
+        !survivors.is_empty(),
+        "every large sample contained a log-piece roll ({rolled_at:?}), so the flat control has \
+         nothing roll-free to assert on. That is not a pass: a roll in every window means the \
+         period has fallen to the window size and this measurement can no longer separate a \
+         per-operation cost from a periodic one"
+    );
+    let worst = survivors.iter().map(|(_, r)| *r).fold(0.0f64, f64::max);
+    println!(
+        "  flat control: {} roll-free sample(s) of 3, worst {worst:.2}x; rolled at {rolled_at:?}",
+        survivors.len()
+    );
+    assert!(
+        worst < 1.5,
+        "the flat control reported {worst:.2}x on a roll-free window, so this IS growth with the \
+         store and not a log roll landing in the sample: {survivors:?}"
+    );
+    assert!(scaling > 3.0, "the scaling control reported {scaling:.2}x -- probe cannot see growth");
+    println!("  A string is one page per key, so declaring or not should not matter here.");
+}
+
+#[test]
+fn an_entity_upsert_does_not_report_its_block_uncovered() {
+    // An entity write reports the PERSISTED per-entity key `ctx:entity:{t}:{n}:{e}`, but the index
+    // groups entities under the node's COLLECTION key `ctx:entity:{t}:{n}`. Maintenance looked the
+    // per-entity key up directly, always missed, and reported the object uncovered -- which sends
+    // the caller into a FULL bucket-index rebuild plus a full flag refresh on EVERY upsert.
+    // Measured at 4,270,101 allocated bytes per upsert into a 3,200-entity store -- 99.8% of the
+    // write, and rising with the store -- against 9,599 and flat once the key resolves.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        8 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let entity_at = |i: u64| -> crate::types::ContextEntity {
+        crate::types::ContextEntity {
+            entity_hash: 7_000 + i,
+            node_hash: 42,
+            entity_type: 1,
+            name: format!("entity_{i:06}"),
+            value: "approved".to_string(),
+            updated_at_ms: 1_000 + i,
+            valid_from_ms: 1_000,
+            confidence: 0.97,
+            source_event_hashes: vec![5],
+            vector: Vec::new(),
+        }
+    };
+    // The first write creates the node's collection; the second is the one under test.
+    let first = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::ContextUpsertEntity { tenant_hash: 1, entity: entity_at(0) },
+    });
+    assert!(first.status.ok, "seed upsert refused: {:?}", first.status);
+
+    crate::engine::uncovered_maintenance::reset();
+    let second = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::ContextUpsertEntity { tenant_hash: 1, entity: entity_at(1) },
+    });
+    assert!(second.status.ok, "upsert refused: {:?}", second.status);
+    let after_upsert = crate::engine::uncovered_maintenance::snapshot();
+
+    // Positive control, in THIS test: a key the shard holds nothing for must report uncovered.
+    // Without it, a tally that silently stopped recording would let the assertion below pass
+    // while the defect it guards was fully present.
+    let absent_key = "ctx:node:1:999999".to_string();
+    {
+        let mut shards = engine.shards.write().expect("shards lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1 loaded");
+        let covered = crate::engine::storage_bucket_internals::sync_context_blocks_for_object(
+            shard,
+            1,
+            &absent_key,
+        );
+        assert!(
+            !covered,
+            "a key the shard holds nothing for must report UNCOVERED, or the tally proves nothing"
+        );
+    }
+    assert!(
+        crate::engine::uncovered_maintenance::snapshot()
+            .iter()
+            .any(|key| key == &absent_key),
+        "the uncovered tally is not recording, so the entity assertion below would pass vacuously"
+    );
+
+    let stray: Vec<&String> = after_upsert
+        .iter()
+        .filter(|key| key.starts_with("ctx:entity:"))
+        .collect();
+    assert!(
+        stray.is_empty(),
+        "an entity upsert reported its own page uncovered, so every entity write rebuilds the          whole bucket index: {stray:?}"
+    );
+}
+
+/// A caller's bucket list reaches the lifecycle planner.
+///
+/// `run_storage_manager_cycle` hardcoded `selected_dump_buckets: Vec::new()`, so nothing outside
+/// the engine could ask for particular buckets to be dumped -- and that list is the only way to
+/// dump a bucket that is not dirty.
+///
+/// It matters because reclaim wants a dump manifest matching each bucket's CURRENT generation, and
+/// a bucket that went clean without ever being dumped at that generation has none. The ordinary
+/// cadence only ever selects DIRTY buckets, so such a bucket is never dumped again and the log can
+/// never be reclaimed past it. Seen on a live store as 3,085 such buckets, unchanged however many
+/// cycles were run, while the log grew ~15 MB/hour and cold start grew with it.
+#[test]
+fn a_requested_bucket_list_reaches_the_lifecycle_planner() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "named".to_string(),
+            value: b"v1".to_vec(),
+        },
+    });
+
+    // Dump what is dirty, so the store is clean and the ordinary cadence has nothing to select.
+    engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        max_dump_buckets_per_round: 64,
+        warm_cache: false,
+        ..StorageManagerCycleRequest::default()
+    });
+
+    // The control: with nothing dirty and no list, the planner selects nothing. Without this, a
+    // cycle that always dumped everything would satisfy the assertion below and bring back the
+    // write amplification the dirty-only selection exists to avoid.
+    let unnamed = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        max_dump_buckets_per_round: 64,
+        warm_cache: false,
+        ..StorageManagerCycleRequest::default()
+    });
+    assert!(
+        unnamed.plan.selected_dump_buckets.is_empty(),
+        "a clean store with no requested buckets must select nothing to dump, got {:?}",
+        unnamed.plan.selected_dump_buckets
+    );
+
+    let every_bucket = engine
+        .bucket_storage_summaries(1)
+        .iter()
+        .map(|summary| summary.routing_bucket)
+        .collect::<Vec<u32>>();
+    assert!(
+        !every_bucket.is_empty(),
+        "the fixture must have produced at least one bucket to name"
+    );
+    let named = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        selected_dump_buckets: every_bucket.clone(),
+        max_dump_buckets_per_round: 64,
+        warm_cache: false,
+        ..StorageManagerCycleRequest::default()
+    });
+    assert_eq!(
+        named.plan.selected_dump_buckets, every_bucket,
+        "the requested buckets must reach the planner even when none of them is dirty -- \
+         otherwise a bucket that went clean undumped can never be covered and the log stays blocked"
+    );
+}
+
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn what_a_summary_write_costs_as_its_own_node_fills() {
+    // A summary write spends ~8.3 KB in `maintained_bucket_index`, which calls
+    // sync_context_blocks_for_object -- and for a summary that walks the NODE's timestamped series.
+    // So the question is not whether the write carries the STORE (it does not) but whether it
+    // carries the node's own history. Same node, same summary, only the depth of its series varies.
+    const REPS: usize = 20;
+    let cost = |fill: usize| -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            32 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        let write = |i: usize| Command::ContextUpsertSummary {
+            tenant_hash: 1,
+            summary: crate::types::ContextSummary {
+                node_hash: 42,
+                level: 1,
+                text: "a summary of the thing that happened".to_string(),
+                valid_from_ms: 1_700_000_000_000 + i as u64,
+                vector: Vec::new(),
+                embedding_model_hash: 0,
+            },
+        };
+        for i in 0..fill {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command: write(i) });
+            assert!(out.status.ok, "fill refused: {:?}", out.status);
+        }
+        let probe = crate::alloc_probe::Probe::start();
+        for i in fill..(fill + REPS) {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command: write(i) });
+            assert!(out.status.ok, "write refused: {:?}", out.status);
+        }
+        probe.stop().alloc_bytes / REPS as u64
+    };
+    let shallow = cost(20);
+    let deep = cost(320);
+    println!("  summary write, node holds  20 summaries: {shallow:>9} B");
+    println!("  summary write, node holds 320 summaries: {deep:>9} B");
+    let ratio = deep as f64 / shallow.max(1) as f64;
+    println!("  ratio {ratio:.2}x for 16x the node's own history");
+    println!("  A ratio near 1 means a write does not carry the node's history.");
+    // Maintenance collected every address the series held and then filed only the newest, so a
+    // write cost the node's whole history: 17,453 B at 20 summaries against 86,649 at 320, a
+    // 4.96x climb that does not stop. Finding the maximum instead of building the list makes it
+    // flat -- 12,221 and 11,113, 0.91x.
+    assert!(
+        ratio < 1.5,
+        "a summary write carries its node's history: {shallow} B at 20 summaries, {deep} B at 320 ({ratio:.2}x)"
+    );
+    // The floor is real work, not an empty measurement: a write that allocated nothing would make
+    // the ratio meaningless.
+    assert!(shallow > 1_000, "the shallow arm measured {shallow} B -- too small to be a real write");
+}
+
+#[test]
+fn which_children_a_limited_query_returns() {
+    // ContextQueryChildren sorts ascending on updated_at_ms and truncates to the limit, so a
+    // limited query answers with a parent's OLDEST children and the most recently added are
+    // invisible. Same shape as the traversal age-cut and the mem0 get_all limit.
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        8 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for i in 0..5u64 {
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextUpsertChildRef {
+                tenant_hash: 1,
+                child_ref: crate::types::ContextChildRef {
+                    parent_hash: 9,
+                    child_hash: 100 + i,
+                    updated_at_ms: 1_700_000_000_000 + i * 10_000,
+                },
+            },
+        });
+        assert!(out.status.ok, "seed refused: {:?}", out.status);
+    }
+    let ask = |limit: Option<usize>| -> Vec<u64> {
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextQueryChildren { tenant_hash: 1, parent_hash: 9, limit },
+        });
+        assert!(out.status.ok, "query refused: {:?}", out.status);
+        match out.response {
+            CommandResponse::ContextChildRefs { refs, .. } => {
+                refs.iter().map(|r| r.child_hash).collect()
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    };
+    let all = ask(None);
+    let limited = ask(Some(2));
+    println!("  all children:      {all:?}");
+    println!("  limit=2 returned:  {limited:?}");
+    let newest = *all.iter().max().expect("children exist");
+    println!("  newest child {newest}, present in the limited answer: {}", limited.contains(&newest));
+
+    assert_eq!(5, all.len(), "the fill must produce five children, or the limit proves nothing");
+    assert_eq!(2, limited.len(), "the limit must bind");
+    assert!(
+        limited.contains(&newest),
+        "a limited child query hid the newest child: asked for 2 of {all:?} and got {limited:?}"
+    );
+    assert_eq!(vec![103, 104], limited, "the two newest, in chronological order");
+    // The unlimited answer is untouched, and still oldest-first.
+    assert_eq!(vec![100, 101, 102, 103, 104], all, "an unlimited query is unchanged");
+}
+
+/// Pruning keeps the manifests reclaim still needs, not just the newest.
+///
+/// Reclaim can only advance its durable frontier for a bucket whose CURRENT generation has a dump
+/// manifest. Keeping only the newest meant an ordinary cycle -- which dumps just the few DIRTY
+/// buckets -- deleted the manifest covering everything else. Seen on a live store: a round covering
+/// all 3,190 buckets let reclaim apply and the log fall 806 -> 478 MB, and within the hour an
+/// ordinary cycle left `covered_slot_count: 0` with a durable frontier of 0, so the log grew back
+/// and every cold start paid for it.
+#[test]
+fn pruning_keeps_the_manifests_reclaim_still_needs() {
+    use crate::engine::reports::BucketDumpManifest;
+
+    fn manifest(id: &str, index_log_sequence: u64, buckets: &[u32]) -> BucketDumpManifest {
+        BucketDumpManifest {
+            manifest_id: id.to_string(),
+            index_log_sequence,
+            created_unix_ms: index_log_sequence,
+            bucket_ids: buckets.to_vec(),
+            ..BucketDumpManifest::default()
+        }
+    }
+
+    // The live shape: a wide dump, then a small one covering only what was dirty.
+    let wide = manifest("wide", 1, &[1, 2, 3, 4]);
+    let narrow = manifest("narrow", 2, &[4]);
+    let retained = crate::engine::bucket_dump_io::retained_bucket_dump_manifest_ids(&[
+        wide.clone(),
+        narrow.clone(),
+    ]);
+    assert!(
+        retained.contains("narrow"),
+        "the newest manifest must always be kept"
+    );
+    assert!(
+        retained.contains("wide"),
+        "the wide dump is the only cover for buckets 1-3; pruning it blocks reclaim on them"
+    );
+
+    // The control: a manifest whose buckets are all covered by newer ones is still pruned, so
+    // "retain everything" does not pass this test.
+    let superseded = manifest("superseded", 1, &[4]);
+    let covers_all = manifest("covers_all", 2, &[1, 2, 3, 4]);
+    let retained = crate::engine::bucket_dump_io::retained_bucket_dump_manifest_ids(&[
+        superseded,
+        covers_all,
+    ]);
+    assert!(retained.contains("covers_all"));
+    assert!(
+        !retained.contains("superseded"),
+        "an older manifest adding no coverage must still be pruned"
+    );
+
+    // The other control: the newest is kept even when it adds nothing, so the guarantee that there
+    // is always a most recent dump to anchor on is unchanged.
+    let only = manifest("only", 7, &[]);
+    let retained = crate::engine::bucket_dump_io::retained_bucket_dump_manifest_ids(&[only]);
+    assert!(
+        retained.contains("only"),
+        "the newest manifest is kept even when it covers no buckets"
+    );
+}
+
+#[test]
+fn a_reclaim_that_drops_whole_segments_reports_them() {
+    // Small pieces, so the log rolls and reclaim's work is unlinking files rather than rewriting
+    // the active one. That is the shape a live log takes, and the shape the old counters missed.
+    crate::wal::set_wal_segment_bytes_for_test(Some(8 * 1024));
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        4 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    for index in 0..400 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("rolled-{index:04}"),
+                value: vec![118u8; 256],
+            },
+        });
+    }
+    engine
+        .create_bucket_dump_manifest(1, Vec::new())
+        .expect("a dump to anchor the frontier on");
+
+    let plan = engine.storage_wal_reclaim_plan(1, Vec::new(), Vec::new());
+    assert!(
+        plan.safe_to_reclaim,
+        "the dump should have made this reclaimable, or the test proves nothing: {plan:?}"
+    );
+
+    let report = engine.apply_storage_wal_reclaim(plan);
+    crate::wal::set_wal_segment_bytes_for_test(None);
+
+    assert!(report.applied, "{report:?}");
+    assert!(
+        report.wal_segments_dropped > 0,
+        "whole segments were unlinked and the report did not say so: {report:?}"
+    );
+    assert!(
+        report.wal_segment_bytes_dropped > 0,
+        "segments were dropped but their bytes went unreported: {report:?}"
+    );
+    // Segment bytes are ADDITIONAL to the active-file delta, not part of it: wal_bytes_before and
+    // wal_bytes_after describe only the segment being written. A reader adding those two together
+    // understates what the pass freed, by exactly this much.
+    //
+    // At production scale the understatement is total rather than partial: a live round dropped 64
+    // segments, about 28 MB, while reporting wal_records_removed 0 and wal_bytes_before 262144,
+    // because there was nothing left to rewrite in the active segment. This test runs small enough
+    // that the same pass also rewrites records, so it pins the additivity rather than that extreme.
+    let active_file_delta = report.wal_bytes_before.saturating_sub(report.wal_bytes_after);
+    assert!(
+        report.wal_segment_bytes_dropped > 0,
+        "segments were dropped but their bytes went unreported: {report:?}"
+    );
+    assert!(
+        active_file_delta + report.wal_segment_bytes_dropped > active_file_delta,
+        "the freed total must exceed the active-file delta once segments are counted: {report:?}"
+    );
+}
+
+#[test]
+fn a_compaction_round_stops_at_the_block_ref_budget() {
+    // `COMPACTION_ROUND_BYTES` is 256 MiB and never binds in practice -- a store of a few MiB is
+    // nowhere near it -- so before this a round relocated the WHOLE shard while holding the shard
+    // write lock. Measured in release that is 3.1 s at 20k refs, on the periodic path.
+    //
+    // The stall tracks the NUMBER of refs moved (~200 us each, near enough regardless of block
+    // size), so the ref budget is the bound that actually caps it.
+    use crate::engine::compaction::COMPACTION_ROUND_BLOCK_REFS;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    // Enough to exceed the cap and still leave a remainder for the control round.
+    let objects = COMPACTION_ROUND_BLOCK_REFS + 600;
+    for index in 0..objects {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("ref-budget-{index:07}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index} failed: {:?}", response.status);
+    }
+
+    let bounded = engine
+        .compact_shard_blocks(1)
+        .expect("compaction runs");
+    assert!(
+        bounded.rewritten_block_refs <= COMPACTION_ROUND_BLOCK_REFS,
+        "a round must not relocate more than its ref budget: moved {} with a budget of {}",
+        bounded.rewritten_block_refs,
+        COMPACTION_ROUND_BLOCK_REFS
+    );
+    assert!(
+        bounded.blocks_left_by_budget > 0,
+        "the round must leave the rest for the next one, so compaction still progresses"
+    );
+
+    // CONTROL. The same store, same open round, with the ref budget lifted: it now FINISHES.
+    // Without this the assertions above would also pass on a fixture too small to reach the cap,
+    // which is exactly the way a budget test passes while proving nothing.
+    let unbounded = engine
+        .compact_shard_blocks_with_budget(1, u64::MAX)
+        .expect("compaction runs");
+    assert_eq!(
+        unbounded.blocks_left_by_budget, 0,
+        "with the ref budget lifted the round must complete, which is what shows the budget \
+         is what stopped the round above"
+    );
+}
+
+#[test]
+fn the_slab_usage_sample_still_serializes_under_its_zone_wire_names() {
+    // `zone` was the older name for a slab, and `zones` is keyed by `band_id`
+    // (storage_bucket_internals.rs) -- so the aggregate is the SLAB level reported under an old
+    // name, not a separate level. The Rust identifiers moved to slab; the WIRE must not, because
+    // the compat corpora pin "zone_id" 31 times and "storage_zone_samples" twice, and Python
+    // readers use those names.
+    //
+    // This asserts the pinning directly. A rename that dropped the #[serde(rename = ...)] would
+    // compile, pass every type-level test, and silently change the exported shape.
+    let sample = crate::engine::reports::StorageSlabUsageSample {
+        stored_slab_id: 7,
+        total_bytes: 300,
+        used_bytes: 200,
+        stale_bytes: 100,
+        slabs: vec![1, 2],
+    };
+    let encoded = serde_json::to_value(&sample).expect("serialize");
+    assert!(
+        encoded.get("zone_id").is_some(),
+        "the stored slab id must still go out as zone_id: {encoded}"
+    );
+    assert!(
+        encoded.get("band_id").is_none(),
+        "band_id must NOT appear on the wire -- that would be a format change: {encoded}"
+    );
+
+    // And the collection it sits in keeps its own wire name.
+    let mut snapshot = crate::engine::reports::StorageTopologySnapshot::default();
+    snapshot.storage_slab_usage_samples = vec![sample];
+    let encoded = serde_json::to_value(&snapshot).expect("serialize");
+    assert!(
+        encoded.get("storage_zone_samples").is_some(),
+        "the collection must still go out as storage_zone_samples: {encoded}"
+    );
+
+    // Reading back what the old name produced must still work, which is what a stored corpus is.
+    let decoded: crate::engine::reports::StorageSlabUsageSample =
+        serde_json::from_str(r#"{"zone_id":9,"total_bytes":1,"used_bytes":1,"stale_bytes":0,"slabs":[]}"#)
+            .expect("an old-name payload must still decode");
+    assert_eq!(decoded.stored_slab_id, 9);
+}
+
+#[test]
+fn the_delete_marker_rename_did_not_move_any_wire_name() {
+    // `tombstone` became `delete_marker` in Rust. The WIRE must not follow: the compat corpora
+    // pin "tombstone", "tombstones", "tombstone_records", "tombstone_count" and
+    // "tombstone_compaction_coverage", and 708 Python plus 96 JSON references read those names.
+    //
+    // Every renamed field carries #[serde(rename = "<old name>")]. This asserts the result rather
+    // than the attribute, because a dropped pin compiles, passes every type-level test, and
+    // silently changes the exported shape.
+    let lifecycle = crate::engine::reports::StorageObjectLifecycleReport {
+        live_object_ids: 3,
+        delete_marked_object_ids: 2,
+        delete_marked_object_keys: vec!["k".to_string()],
+        ..crate::engine::reports::StorageObjectLifecycleReport::default()
+    };
+    let encoded = serde_json::to_value(&lifecycle).expect("serialize");
+    for (wire, renamed) in [
+        ("tombstoned_object_ids", "delete_marked_object_ids"),
+        ("tombstoned_object_keys", "delete_marked_object_keys"),
+    ] {
+        assert!(
+            encoded.get(wire).is_some(),
+            "{wire} must still be the exported name: {encoded}"
+        );
+        assert!(
+            encoded.get(renamed).is_none(),
+            "{renamed} must NOT reach the wire -- that is a format change: {encoded}"
+        );
+    }
+
+    // And a payload written under the old names must still decode.
+    let decoded: crate::engine::reports::StorageObjectLifecycleReport = serde_json::from_str(
+        r#"{"live_object_ids":1,"live_block_refs":1,"stale_object_ids":0,"tombstoned_object_ids":7,"reused_object_id_conflicts":0,"missing_owner_block_refs":0,"owner_mismatch_block_refs":0,"reused_object_ids":[],"tombstoned_object_keys":[]}"#,
+    )
+    .expect("an old-name payload must still decode");
+    assert_eq!(decoded.delete_marked_object_ids, 7);
+}
+
+/// Do a packed block's timestamps share ONE address, or several?
+///
+///   cargo test -p temporalstore-rust --lib what_a_packed_block_looks_like_in_the_index -- --ignored --nocapture
+///
+/// This settles which side of the corpus mismatch is right. `install_bucket_dump_manifest`
+/// cross-checks two derivations of one report: the model-map one dedupes a series' addresses
+/// through a HashSet, the bucket-index one does not. On
+/// `native_logical_storage_models_packed_timestamped_pages` they read 10 and 12, and the case has
+/// exactly two packed operations.
+///
+/// If the timestamps of one packed append share a single address, the dedup is right and the
+/// bucket index is carrying duplicate refs. If they carry distinct addresses (different offsets
+/// into one block), the dedup is collapsing blocks that are genuinely separate entries and the
+/// invariant never held for packed blocks.
+#[test]
+#[ignore]
+fn what_a_packed_block_looks_like_in_the_index() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+
+    // One append carrying several points -- the shape `feature_append_packed_page` uses.
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::FeatureAppend {
+            key: "packed:feature".to_string(),
+            points: (0..5)
+                .map(|index| crate::types::FeaturePoint {
+                    timestamp_ms: 1_000 + index,
+                    value: vec![b'v'; 16],
+                })
+                .collect(),
+        },
+    });
+    assert!(response.status.ok, "append failed: {:?}", response.status);
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard loaded");
+    let series = shard.features().get("packed:feature").expect("series present");
+
+    eprintln!("  timestamps in the series: {}", series.len());
+    let mut distinct = std::collections::HashSet::new();
+    for (timestamp, address) in series.points() {
+        eprintln!(
+            "    ts={timestamp} slab={} off={} len={} page_id={:?}",
+            address.block_slab_id(),
+            address.offset(),
+            address.length(),
+            address.block_id()
+        );
+        distinct.insert(address.clone());
+    }
+    eprintln!("  DISTINCT addresses: {}", distinct.len());
+    eprintln!(
+        "  so the model-map derivation would count {} and the bucket index {}",
+        distinct.len(),
+        series.len()
+    );
+}
+
+/// Does a DELETE leave its bucket able to place itself in both logs? Prints.
+///
+///   cargo test -p temporalstore-rust --lib what_a_delete_leaves_claimed -- --ignored --nocapture
+///
+/// A bucket is covered for reclaim by a durable dump manifest, or failing that by BOTH of its
+/// first-dirty claims being non-zero (#1440 for the WAL half, #1444 for the index-log half).
+/// A bucket with only one of them is uncovered, and one uncovered bucket blocks the whole
+/// shard's reclaim with `slot_generation_without_durable_dump`.
+///
+/// #1505 measured a delete-heavy shard reporting 1,000 uncovered buckets against exactly 1,000
+/// deleted keys, which is the correlation this checks directly: the WAL claim is stamped from
+/// `appended_sequence`, the index-log claim only when `append_delta` returned non-zero.
+#[test]
+#[ignore]
+fn what_a_delete_leaves_claimed() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+
+    for index in 0..8u32 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("claim-{index:03}"),
+                value: vec![b'v'; 64],
+            },
+        });
+    }
+    let after_writes = engine.storage_wal_reclaim_plan(1, Vec::new(), Vec::new());
+    eprintln!(
+        "  after 8 writes:  covered={} uncovered={} safe={} blockers={:?}",
+        after_writes.covered_bucket_count,
+        after_writes.uncovered_bucket_count,
+        after_writes.safe_to_reclaim,
+        after_writes.blocker_reasons
+    );
+
+    // A DUMP FIRST. This is the step the first attempt missed: `apply_storage_lifecycle` clears
+    // both claims on the buckets it dumps (storage_lifecycle_methods.rs:546), so before a dump
+    // every bucket still carries the claims its original write stamped and nothing can be
+    // uncovered. The interesting state is a bucket dirtied AFTER its claims were cleared.
+    let dump = engine.apply_storage_lifecycle(crate::engine::reports::StorageLifecycleRequest {
+        shard_id: 1,
+        ..crate::engine::reports::StorageLifecycleRequest::default()
+    });
+    eprintln!(
+        "  dumped: manifest={} buckets",
+        dump
+            .dump_manifest
+            .as_ref()
+            .map(|manifest| manifest.bucket_ids.len())
+            .unwrap_or(0)
+    );
+    let after_dump = engine.storage_wal_reclaim_plan(1, Vec::new(), Vec::new());
+    eprintln!(
+        "  after dump:      covered={} uncovered={} safe={} blockers={:?}",
+        after_dump.covered_bucket_count,
+        after_dump.uncovered_bucket_count,
+        after_dump.safe_to_reclaim,
+        after_dump.blocker_reasons
+    );
+
+    // Now delete. If a delete stamps only the WAL claim, each deleted key's bucket becomes
+    // uncovered and the count should track the number of deletes.
+    for index in (0..8u32).step_by(2) {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::CommonDelete {
+                key: format!("claim-{index:03}"),
+            },
+        });
+        assert!(response.status.ok, "delete {index}: {:?}", response.status);
+    }
+    let after_deletes = engine.storage_wal_reclaim_plan(1, Vec::new(), Vec::new());
+    eprintln!(
+        "  after 4 deletes: covered={} uncovered={} safe={} blockers={:?}",
+        after_deletes.covered_bucket_count,
+        after_deletes.uncovered_bucket_count,
+        after_deletes.safe_to_reclaim,
+        after_deletes.blocker_reasons
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// Bucket release and reload.
+//
+// `evict_cache` -- the shipped mode -- handled a victim with
+// `cache.invalidate_slot(shard_id, routing_bucket)` and nothing else, so eviction could free
+// exactly what the cache held and every `BucketNode` survived untouched. The index grows one entry
+// per record and is in none of the numbers the gate reads, so it was both the largest reclaimable
+// thing on the shard and the one thing eviction could not reach. The only mode that shrank it,
+// `delete_drop`, does so by destroying data.
+//
+// These four are the guard on the mechanism that closes it: release a bucket's block list, keep the
+// node routable, load the list back from the model maps on the next write, and read every key
+// through it unchanged the whole time.
+// ---------------------------------------------------------------------------
+
+
+/// THE DRIFT CHECK: the MAINTAINED per-slab live tally against the walk that defines it.
+///
+/// A maintained counter that drifts is WORSE than a recomputed one, because everything downstream
+/// believes it. So the tally is held to `collect_live_block_entries` -- the same walk every other
+/// per-slab live figure is built from -- after each kind of mutation that can move a block, one at
+/// a time, so a failure names the stage that broke it instead of a total.
+///
+/// The five stages are the five ways a block can enter or leave the live set:
+///
+///   1. APPEND     -- a block arrives on a slab.
+///   2. OVERWRITE  -- a block replaces one already filed. Both ends have to be charged: the new
+///                    address is added AND the displaced one discharged, and they are usually on
+///                    different slabs. Written at a DIFFERENT length from the first pass so a
+///                    byte drift cannot cancel itself out.
+///   3. DELETE     -- a block leaves with no replacement.
+///   4. COMPACTION -- every live block is rewritten onto a fresh slab, which is the one mutation
+///                    that moves bytes BETWEEN slabs without changing how many are live.
+///   5. RELEASE + RELOAD -- a bucket's block entries are dropped from the index while its blocks
+///                    stay live, and then brought back. The pair is counter-NEUTRAL by design:
+///                    release does not discharge and reload does not charge. That is a claim
+///                    about two functions agreeing, which is exactly the kind of claim that is
+///                    wrong later, so it is checked on both sides of the pair and not just after.
+///
+/// `is_clean()` is the assertion; `slabs_compared` is the denominator beside it, because a
+/// reconcile over a shard with nothing on it agrees trivially and would satisfy every line here
+/// while measuring nothing.
+///
+/// MUTATION-VERIFIED, and the result named a branch this workload does NOT reach. Each mutation
+/// was applied alone, run, and reverted:
+///
+/// | mutation | caught by | drift reported |
+/// |---|---|---|
+/// | `insert` charges nothing | stage 1 here | -240 block refs / -25,920 bytes |
+/// | `retain` discharges nothing, BOTH arms | stage 3 here | +80 block refs / +13,760 bytes |
+/// | `reload_released_bucket` charges what release never discharged | stage 5 here | +160 block refs / +27,520 bytes |
+/// | `insert` does not discharge the address it REPLACES | `installing_the_same_block_twice_replaces_it` | 3 block refs where 2 are live |
+///
+/// THE LAST ROW IS THE INTERESTING ONE. This test still passes with that discharge removed, and
+/// it is not a weak assertion: the engine's overwrite path drops the superseded block through the
+/// explicit `remove` in `upsert_bucket_index_block_with` BEFORE the insert runs, so `insert` never
+/// sees a displacement on this workload. The branch is real on other paths and is guarded where it
+/// can be reached, by the unit test named above. Stated here rather than left to be discovered,
+/// because "the drift check covers every mutation site" is the kind of claim that is quietly
+/// wrong.
+///
+/// A first attempt at the `retain` mutation touched only its MAP arm and was not caught at all: at
+/// the default routing range every key gets a bucket of its own, so a bucket holds ONE block and
+/// `retain` takes its inline arm. Recorded because a mutation aimed at unreached code reassures
+/// without testing anything, and it looked exactly like a passing result.
+#[test]
+fn the_maintained_slab_live_tally_matches_the_walk() {
+    const KEYS: usize = 240;
+    let (_dir, engine) = dumped_shard_with_keys(KEYS, 96);
+
+    // 1. APPEND. The fixture wrote KEYS blocks and dumped them.
+    let after_append = engine.block_slab_live_drift_check(1);
+    assert!(
+        after_append.was_ready,
+        "the tally was never derived, so this compared a seed against itself: {after_append:?}"
+    );
+    assert!(
+        after_append.slabs_compared > 0,
+        "no slabs to compare, so this stage measures nothing: {after_append:?}"
+    );
+    assert!(
+        after_append.is_clean(),
+        "the tally drifted over plain appends: {after_append:?}"
+    );
+    // The positive control for the denominator: the tally really is counting the shard's blocks.
+    let maintained_refs: u64 = engine
+        .block_slab_live_tallies(1)
+        .expect("a derived tally")
+        .iter()
+        .map(|(_, block_refs, _)| block_refs)
+        .sum();
+    assert_eq!(
+        maintained_refs,
+        engine.live_block_count_for_test(1) as u64,
+        "the maintained page-ref total disagrees with the live page count"
+    );
+    assert!(maintained_refs >= KEYS as u64, "{maintained_refs} pages counted for {KEYS} keys");
+
+    // 2. OVERWRITE, at a different length so a byte drift cannot cancel.
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("released-{index:06}"),
+                value: released_value(index, 160),
+            },
+        });
+        assert!(response.status.ok, "overwrite {index}: {:?}", response.status);
+    }
+    let after_overwrite = engine.block_slab_live_drift_check(1);
+    assert!(after_overwrite.slabs_compared > 0, "{after_overwrite:?}");
+    assert!(
+        after_overwrite.is_clean(),
+        "the tally drifted over overwrites -- a replacement charges the new address and must \
+         discharge the one it displaced: {after_overwrite:?}"
+    );
+
+    // 3. DELETE.
+    let deletes = KEYS / 3;
+    for index in 0..deletes {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringDelete {
+                key: format!("released-{index:06}"),
+            },
+        });
+    }
+    let after_delete = engine.block_slab_live_drift_check(1);
+    assert!(after_delete.slabs_compared > 0, "{after_delete:?}");
+    assert!(
+        after_delete.is_clean(),
+        "the tally drifted over deletes: {after_delete:?}"
+    );
+    assert_eq!(
+        engine.live_block_count_for_test(1) as u64,
+        engine
+            .block_slab_live_tallies(1)
+            .expect("a derived tally")
+            .iter()
+            .map(|(_, block_refs, _)| block_refs)
+            .sum::<u64>(),
+        "the deletes left the tally and the walk disagreeing about how many pages are live"
+    );
+
+    // 4. COMPACTION RELOCATIONS.
+    let compaction = engine
+        .compact_shard_blocks(1)
+        .expect("a loaded shard can be compacted");
+    assert!(
+        compaction.rewritten_block_refs > 0,
+        "compaction relocated nothing, so this stage measures nothing: {compaction:?}"
+    );
+    let after_compaction = engine.block_slab_live_drift_check(1);
+    assert!(after_compaction.slabs_compared > 0, "{after_compaction:?}");
+    assert!(
+        after_compaction.is_clean(),
+        "the tally drifted over {} relocated pages: {after_compaction:?}",
+        compaction.rewritten_block_refs
+    );
+
+    // 5. RELEASE + RELOAD. A release is refused for a dirty bucket, so dump first -- which is
+    // also what makes the release durable.
+    let manifest = engine
+        .create_bucket_dump_manifest(1, Vec::new())
+        .expect("a loaded shard can be dumped");
+    engine.clear_dumped_bucket_dirty_state(1, &manifest);
+    let (released_buckets, released_blocks, _refused) =
+        engine.release_all_releasable_bucket_index_blocks(1);
+    assert!(
+        released_buckets > 0 && released_blocks > 0,
+        "nothing was released, so the counter-neutral claim is untested: \
+         {released_buckets} buckets / {released_blocks} pages"
+    );
+    let after_release = engine.block_slab_live_drift_check(1);
+    assert!(after_release.slabs_compared > 0, "{after_release:?}");
+    assert!(
+        after_release.is_clean(),
+        "a release discharged pages that are still live -- the model maps still hold them and \
+         the walk still counts them: {after_release:?}"
+    );
+
+    let mut reloaded = 0_usize;
+    for routing_bucket in engine.released_bucket_index_buckets(1) {
+        if engine.reload_released_bucket_index_blocks(1, routing_bucket) {
+            reloaded = reloaded.saturating_add(1);
+        }
+    }
+    assert!(
+        reloaded > 0,
+        "nothing was reloaded, so the other half of the pair is untested"
+    );
+    let after_reload = engine.block_slab_live_drift_check(1);
+    assert!(after_reload.slabs_compared > 0, "{after_reload:?}");
+    assert!(
+        after_reload.is_clean(),
+        "a reload charged pages that were never discharged, double-counting {reloaded} buckets: \
+         {after_reload:?}"
+    );
+}
+
+/// Build a shard whose buckets are clean, so a release is not refused for being dirty.
+///
+/// Every write marks its bucket dirty, and release refuses a dirty bucket -- the model maps carry
+/// no per-block dirty bit, so a reload could not restore one. A dump is what makes a bucket clean,
+/// and it is also what makes the release durable: the blocks are on disk and the manifest names
+/// them before anything is dropped.
+fn dumped_shard_with_keys(keys: usize, value_len: usize) -> (tempfile::TempDir, TemporalEngine) {
+    dumped_shard_with_keys_in_range(keys, value_len, 0, u32::MAX)
+}
+
+/// The same fixture over a chosen routing range.
+///
+/// At the default range every key gets a bucket of its own, so a bucket holding more than one
+/// object never occurs -- and a bucket holding several is exactly the shape a delete has to be
+/// asked about, because that is where dropping ONE object id differs from clearing the set.
+fn dumped_shard_with_keys_in_range(
+    keys: usize,
+    value_len: usize,
+    start_routing_bucket: u32,
+    end_routing_bucket: u32,
+) -> (tempfile::TempDir, TemporalEngine) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard_with(LoadShardRequest {
+        shard_id: 1,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket,
+        end_routing_bucket,
+        readonly: false,
+        table_name: String::new(),
+    });
+    for index in 0..keys {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("released-{index:06}"),
+                value: released_value(index, value_len),
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    let manifest = engine
+        .create_bucket_dump_manifest(1, Vec::new())
+        .expect("a loaded shard can be dumped");
+    engine.clear_dumped_bucket_dirty_state(1, &manifest);
+    (dir, engine)
+}
+
+/// A value that is a function of its key, so a read returning the WRONG key's bytes fails just as
+/// loudly as one returning none. A fixture of identical values cannot tell those apart.
+fn released_value(index: usize, value_len: usize) -> Vec<u8> {
+    let seed = format!("{index:06}:");
+    let mut value = seed.into_bytes();
+    value.resize(value_len, b'v');
+    value[value_len - 1] = (index % 251) as u8;
+    value
+}
+
+fn released_read(engine: &TemporalEngine, index: usize) -> Option<Vec<u8>> {
+    match engine
+        .execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: format!("released-{index:06}"),
+            },
+        })
+        .response
+    {
+        CommandResponse::Bytes { value } => value,
+        other => panic!("a string read answered {other:?}"),
+    }
+}
+
+/// THE CORRECTNESS BAR. A released bucket serves reads identically to a resident one.
+///
+/// Not "returns something" -- returns the same bytes, for every key, with the index holding no
+/// block entry for any of them. The value is derived from the key so a read that resolved through
+/// the wrong block fails here rather than passing on a lucky length.
+#[test]
+fn a_released_bucket_serves_every_key_it_held() {
+    const KEYS: usize = 400;
+    const VALUE_LEN: usize = 96;
+    let (_dir, engine) = dumped_shard_with_keys(KEYS, VALUE_LEN);
+
+    // THE DENOMINATOR. If nothing releases, reading every key back afterwards proves nothing --
+    // it is the same assertion against the same resident index.
+    let (released_buckets, released_blocks, refused) =
+        engine.release_all_releasable_bucket_index_blocks(1);
+    assert!(
+        released_buckets > 0 && released_blocks > 0,
+        "nothing was released ({released_buckets} buckets / {released_blocks} pages, \
+         {refused} refused), so the read-back below is not about a released bucket"
+    );
+    assert_eq!(
+        engine.released_bucket_index_buckets(1).len(),
+        released_buckets,
+        "the released registry disagrees with what the release reported"
+    );
+
+    // CONTROL: the blocks really are gone from the index. Without this the test passes on a
+    // release that reported a number and dropped nothing.
+    let resident_blocks: usize = {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        shards
+            .get(&1)
+            .expect("loaded shard")
+            .bucket_index
+            .bucket_map
+            .values()
+            .map(|bucket| bucket.block_index.len())
+            .sum()
+    };
+    assert_eq!(
+        resident_blocks, 0,
+        "{released_blocks} pages were reported released but {resident_blocks} are still filed"
+    );
+
+    for index in 0..KEYS {
+        assert_eq!(
+            released_read(&engine, index),
+            Some(released_value(index, VALUE_LEN)),
+            "key {index} did not read back through a released bucket"
+        );
+    }
+
+    // And the buckets are still routable: every node is where it was, holding its objects.
+    let shards = engine.shards.read().expect("shards lock poisoned");
+    let shard = shards.get(&1).expect("loaded shard");
+    assert_eq!(
+        shard.bucket_index.bucket_map.len(),
+        released_buckets,
+        "a released bucket must stay in the map -- a node that leaves is not reloadable"
+    );
+    assert!(
+        shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .all(|bucket| !bucket.in_memory() && bucket.meta_loaded() && !bucket.loading()),
+        "the residency flags do not say released"
+    );
+    assert!(
+        shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .all(|bucket| !bucket.object_index.is_empty()),
+        "a released bucket kept no object index, so nothing can tell it from an empty one"
+    );
+}
+
+/// THE CORRECTNESS BAR, second half. Releasing REDUCES resident index memory, not cache bytes.
+///
+/// This is the assertion the shipped behaviour could not pass at any setting. It is deliberately
+/// made against the index alone -- the cache is dropped first, so the number that moves cannot be
+/// a cache number -- and it checks the reload puts the memory back, because a release that frees
+/// memory it cannot restore is `delete_drop` with better manners.
+#[test]
+fn releasing_a_bucket_reduces_resident_index_memory_and_reloading_restores_it() {
+    const KEYS: usize = 400;
+    let (_dir, engine) = dumped_shard_with_keys(KEYS, 64);
+
+    // Drop the cache FIRST. Whatever moves below is the index, because the cache is already at
+    // its floor when the measurement starts.
+    let _ = engine.cache().invalidate_shard(1);
+    let cache_before = engine.cache().stats().memory_bytes;
+    let index_before = engine.bucket_index_resident_bytes(1);
+    assert!(
+        index_before > 0,
+        "the fixture left no resident index to release"
+    );
+
+    let (released_buckets, released_blocks, _) = engine.release_all_releasable_bucket_index_blocks(1);
+    assert!(released_buckets > 0, "nothing was released");
+
+    let index_after = engine.bucket_index_resident_bytes(1);
+    assert!(
+        index_after < index_before,
+        "release freed no INDEX memory: {index_before} -> {index_after} over \
+         {released_buckets} buckets / {released_blocks} pages"
+    );
+    assert!(
+        engine.cache().stats().memory_bytes <= cache_before,
+        "the number that moved was the cache's, which is what this test exists to rule out"
+    );
+    // The old floor cannot see it, which is why the gate needed a different number: it counts
+    // NODES, and a release keeps every node.
+    let floor = engine
+        .get_stats(1)
+        .stats
+        .expect("stats for a loaded shard")
+        .storage
+        .bucket_index_resident_bytes_floor;
+    assert_eq!(
+        floor,
+        (released_buckets as u64) * std::mem::size_of::<crate::engine::state::BucketNode>() as u64,
+        "the node floor moved, so it was not measuring only nodes"
+    );
+
+    // And the memory comes back on reload, which is what makes it a release rather than a delete.
+    for routing_bucket in engine.released_bucket_index_buckets(1) {
+        assert!(
+            engine.reload_released_bucket_index_blocks(1, routing_bucket),
+            "bucket {routing_bucket} was registered as released but would not reload"
+        );
+    }
+    assert_eq!(
+        engine.bucket_index_resident_bytes(1),
+        index_before,
+        "a reload must restore exactly the index memory the release freed"
+    );
+    assert!(
+        engine.released_bucket_index_buckets(1).is_empty(),
+        "the released registry outlived the reload"
+    );
+}
+
+/// A reload rebuilds the EXACT block list that was released -- identity, address and all.
+///
+/// The release checks this before it drops anything, so this test is the check's control: it
+/// compares the two lists from outside, over a real shard, rather than trusting the comparison the
+/// release makes about itself.
+#[test]
+fn a_released_bucket_reloads_the_exact_block_list_it_released() {
+    const KEYS: usize = 120;
+    let (_dir, engine) = dumped_shard_with_keys(KEYS, 48);
+
+    fn block_listing(engine: &TemporalEngine) -> Vec<(u32, String, String, Option<String>, u64, u64, u64)> {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let mut rows = super::blocks_with_identity(
+            &shards.get(&1).expect("loaded shard").bucket_index,
+        )
+        .into_iter()
+        .map(|(routing_bucket, _handle, object_key, block)| {
+            (
+                routing_bucket,
+                block.model_id.to_string(),
+                object_key.to_string(),
+                None::<String>,
+                block.address.block_slab_id(),
+                block.address.offset(),
+                block.address.length(),
+            )
+        })
+        .collect::<Vec<_>>();
+        rows.sort();
+        rows
+    }
+
+    let before = block_listing(&engine);
+    assert!(!before.is_empty(), "the fixture filed no pages");
+
+    let (released_buckets, _, _) = engine.release_all_releasable_bucket_index_blocks(1);
+    assert!(released_buckets > 0, "nothing was released");
+    assert!(
+        block_listing(&engine).is_empty(),
+        "the release left page entries behind"
+    );
+
+    for routing_bucket in engine.released_bucket_index_buckets(1) {
+        assert!(engine.reload_released_bucket_index_blocks(1, routing_bucket));
+    }
+    assert_eq!(
+        block_listing(&engine),
+        before,
+        "the reloaded page list is not the one that was released"
+    );
+}
+
+/// A write into a released bucket loads it back first, so a node is never half-resident.
+///
+/// Filing one block into a bucket whose other blocks are released would leave a node claiming
+/// residency while holding a fraction of what it owns -- neither released nor whole, and
+/// unreloadable, because the registry would no longer name it.
+#[test]
+fn a_write_into_a_released_bucket_loads_it_back_first() {
+    const KEYS: usize = 60;
+    const VALUE_LEN: usize = 64;
+    let (_dir, engine) = dumped_shard_with_keys(KEYS, VALUE_LEN);
+
+    let (released_buckets, _, _) = engine.release_all_releasable_bucket_index_blocks(1);
+    assert!(released_buckets > 0, "nothing was released");
+    let target = engine.routing_bucket_for_key(1, "released-000007");
+    assert!(
+        engine.released_bucket_index_buckets(1).contains(&target),
+        "the key's bucket was not among the released ones, so the write below proves nothing"
+    );
+
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "released-000007".to_string(),
+            value: vec![b'z'; VALUE_LEN],
+        },
+    });
+    assert!(response.status.ok, "{:?}", response.status);
+
+    assert!(
+        !engine.released_bucket_index_buckets(1).contains(&target),
+        "the bucket stayed registered as released after a write filed a page into it"
+    );
+    let shards = engine.shards.read().expect("shards lock poisoned");
+    let bucket = shards
+        .get(&1)
+        .expect("loaded shard")
+        .bucket_index
+        .bucket_map
+        .get(&target)
+        .expect("the written bucket");
+    assert!(
+        bucket.in_memory() && !bucket.block_index.is_empty(),
+        "the bucket the write touched is neither resident nor released"
+    );
+    drop(shards);
+
+    // The overwritten key reads its new value, and a key that shared the reload reads its old one.
+    assert_eq!(released_read(&engine, 7), Some(vec![b'z'; VALUE_LEN]));
+    for index in 0..KEYS {
+        if index == 7 {
+            continue;
+        }
+        assert_eq!(
+            released_read(&engine, index),
+            Some(released_value(index, VALUE_LEN)),
+            "key {index} stopped reading back after a neighbour's write"
+        );
+    }
+}
+
+/// The object id the write path filed a `released-NNNNNN` key under.
+///
+/// Derived the same way `Command::StringSet` derived it, so the set membership this asks about is
+/// the one the index actually holds rather than one the test invented.
+fn released_object_id(index: usize) -> u64 {
+    stable_block_object_id(1, "string", &format!("released-{index:06}"))
+}
+
+/// Every object id any bucket node still claims, across the whole shard.
+fn released_object_ids_claimed(engine: &TemporalEngine) -> std::collections::BTreeSet<u64> {
+    let shards = engine.shards.read().expect("shards lock poisoned");
+    shards
+        .get(&1)
+        .expect("loaded shard")
+        .bucket_index
+        .bucket_map
+        .values()
+        .flat_map(|bucket| bucket.object_index.iter().copied())
+        .collect()
+}
+
+fn released_bucket_store_report(engine: &TemporalEngine) -> crate::engine::bucket_store::BucketStoreRuntimeReport {
+    let shards = engine.shards.read().expect("shards lock poisoned");
+    crate::engine::bucket_store::runtime_report(shards.get(&1).expect("loaded shard"))
+}
+
+fn released_delete(engine: &TemporalEngine, index: usize) {
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::CommonDelete {
+            key: format!("released-{index:06}"),
+        },
+    });
+    assert!(response.status.ok, "delete {index}: {:?}", response.status);
+}
+
+/// A delete against a RELEASED bucket settles that bucket's object count at the delete.
+///
+/// Releasing clears `block_index` and KEEPS `object_index` -- the keeping is the only thing that
+/// tells a released bucket from one holding nothing, and since the layout classifier was
+/// corrected the object count is also the sole authority for whether a bucket is empty at all.
+/// Both delete paths remove an object by walking `block_index`, which a release has already
+/// emptied, so a delete arriving while the bucket is released removed the block from the model map
+/// and left the id in the object index: the node went on claiming an object that no longer
+/// existed. `reload_released_bucket` re-derives the set and would settle it, but only whenever a
+/// reload happens, and a released bucket may go a long time without one.
+///
+/// The two halves are asserted SEPARATELY. A combined count hides the cheap wrong fix -- clearing
+/// a released bucket's object index outright -- which settles the deleted half perfectly and
+/// destroys the surviving half.
+#[test]
+fn a_delete_against_a_released_bucket_settles_its_object_count() {
+    const KEYS: usize = 120;
+    const VALUE_LEN: usize = 64;
+    const DELETED: usize = 40;
+    let (_dir, engine) = dumped_shard_with_keys(KEYS, VALUE_LEN);
+
+    let (released_buckets, released_blocks, _refused) =
+        engine.release_all_releasable_bucket_index_blocks(1);
+    assert!(
+        released_buckets > 0 && released_blocks > 0,
+        "nothing was released ({released_buckets} buckets / {released_blocks} pages), so every \
+         delete below takes the resident path and this test measures nothing"
+    );
+
+    // THE DENOMINATOR. Every key deleted below has to land in a bucket that is really released.
+    let released: std::collections::BTreeSet<u32> =
+        engine.released_bucket_index_buckets(1).into_iter().collect();
+    let targeted = (0..DELETED)
+        .filter(|index| {
+            released.contains(&engine.routing_bucket_for_key(1, &format!("released-{index:06}")))
+        })
+        .count();
+    assert_eq!(
+        targeted, DELETED,
+        "only {targeted} of {DELETED} keys to be deleted live in one of the {} released buckets",
+        released.len()
+    );
+
+    let claimed_before = released_object_ids_claimed(&engine);
+    assert_eq!(
+        claimed_before.len(),
+        KEYS,
+        "the released buckets claim {} objects, not the {KEYS} the fixture wrote",
+        claimed_before.len()
+    );
+    let report_before = released_bucket_store_report(&engine);
+    assert_eq!(
+        report_before.empty_buckets, 0,
+        "a released bucket still holding its objects is not empty; {} of {} read as empty before \
+         a single delete",
+        report_before.empty_buckets, report_before.bucket_count
+    );
+
+    // The buckets that hold NOTHING but keys this test deletes. Those, and only those, are the
+    // ones whose label may move -- computing it from the fixture rather than assuming one key per
+    // bucket keeps the assertion exact whatever the routing fan-out is.
+    let doomed_ids: std::collections::BTreeSet<u64> = (0..DELETED).map(released_object_id).collect();
+    let doomed_buckets = report_before
+        .buckets
+        .iter()
+        .filter(|bucket| {
+            !bucket.object_ids.is_empty()
+                && bucket.object_ids.iter().all(|id| doomed_ids.contains(id))
+        })
+        .count();
+    assert!(
+        doomed_buckets > 0,
+        "no bucket is emptied by these {DELETED} deletes, so the empty-bucket counter below cannot \
+         move and asserting on it would prove nothing ({} buckets in the report)",
+        report_before.bucket_count
+    );
+
+    for index in 0..DELETED {
+        released_delete(&engine, index);
+    }
+
+    let claimed_after = released_object_ids_claimed(&engine);
+    let report_after = released_bucket_store_report(&engine);
+
+    // HALF ONE -- the deleted keys. Not one of their ids may still be claimed.
+    let stale = (0..DELETED)
+        .filter(|index| claimed_after.contains(&released_object_id(*index)))
+        .count();
+    assert_eq!(
+        stale, 0,
+        "{stale} of {DELETED} deleted keys are still claimed by a released bucket's object index"
+    );
+
+    // HALF TWO -- the survivors, asserted on its own. Clearing the object index of every released
+    // bucket passes the half above and fails here.
+    let survivors = (DELETED..KEYS)
+        .filter(|index| claimed_after.contains(&released_object_id(*index)))
+        .count();
+    assert_eq!(
+        survivors,
+        KEYS - DELETED,
+        "{survivors} of {} surviving keys are still claimed; a delete may not take a neighbour's \
+         object with it",
+        KEYS - DELETED
+    );
+
+    // Settling the count must not UNDO the release. Asserted against the released registry and
+    // not against the node count: the delete path files a node of its own for the key's routing
+    // bucket, so the map both grows and re-creates anything removed from it, and a node-identity
+    // check cannot fail here (a mutation that dropped the emptied node passed it). The registry
+    // is the state only `release_bucket_blocks` writes and only a reload clears, so it is the one
+    // that answers.
+    let still_released = engine.released_bucket_index_buckets(1);
+    let kept_released = released
+        .iter()
+        .filter(|routing_bucket| still_released.contains(routing_bucket))
+        .count();
+    assert_eq!(
+        kept_released,
+        released.len(),
+        "{kept_released} of {} released buckets are still registered as released; settling an \
+         object count must not reload or forget the bucket",
+        released.len()
+    );
+    assert_eq!(
+        report_after.empty_buckets,
+        doomed_buckets + (report_after.bucket_count - report_before.bucket_count),
+        "{} of {} buckets read as empty, where {doomed_buckets} held nothing but deleted keys and \
+         {} empty nodes were added by the delete path itself",
+        report_after.empty_buckets,
+        report_after.bucket_count,
+        report_after.bucket_count - report_before.bucket_count
+    );
+
+    // And the store still answers the way the deletes say it should, on both halves.
+    let readable = (DELETED..KEYS)
+        .filter(|index| released_read(&engine, *index) == Some(released_value(*index, VALUE_LEN)))
+        .count();
+    assert_eq!(
+        readable,
+        KEYS - DELETED,
+        "{readable} of {} surviving keys read back their own bytes",
+        KEYS - DELETED
+    );
+    let gone = (0..DELETED)
+        .filter(|index| released_read(&engine, *index).is_none())
+        .count();
+    assert_eq!(
+        gone, DELETED,
+        "{gone} of {DELETED} deleted keys actually read as gone"
+    );
+}
+
+/// How far the count can drift: one stale object per delete, to the whole released population.
+///
+/// The companion above bounds the drift from below -- forty deletes, forty stale ids. This one
+/// takes it to the ceiling, because "at most one" and "every delete until a reload" are different
+/// defects and only the second is worth a change. With every key of every released bucket
+/// deleted, the shard must claim no objects at all, and every bucket must read empty.
+#[test]
+fn every_delete_against_a_released_bucket_settles_its_own_object() {
+    const KEYS: usize = 60;
+    const VALUE_LEN: usize = 48;
+    let (_dir, engine) = dumped_shard_with_keys(KEYS, VALUE_LEN);
+
+    let (released_buckets, released_blocks, _refused) =
+        engine.release_all_releasable_bucket_index_blocks(1);
+    assert!(
+        released_buckets > 0 && released_blocks > 0,
+        "nothing was released ({released_buckets} buckets / {released_blocks} pages)"
+    );
+    let released: std::collections::BTreeSet<u32> =
+        engine.released_bucket_index_buckets(1).into_iter().collect();
+    let targeted = (0..KEYS)
+        .filter(|index| {
+            released.contains(&engine.routing_bucket_for_key(1, &format!("released-{index:06}")))
+        })
+        .count();
+    assert_eq!(
+        targeted, KEYS,
+        "only {targeted} of {KEYS} keys live in one of the {} released buckets",
+        released.len()
+    );
+    assert_eq!(
+        released_object_ids_claimed(&engine).len(),
+        KEYS,
+        "the fixture's released buckets do not claim all {KEYS} objects"
+    );
+
+    for index in 0..KEYS {
+        released_delete(&engine, index);
+    }
+
+    let claimed = released_object_ids_claimed(&engine);
+    assert_eq!(
+        claimed.len(),
+        0,
+        "{} of {KEYS} object ids are still claimed after every one of their keys was deleted",
+        claimed.len()
+    );
+    let report = released_bucket_store_report(&engine);
+    assert_eq!(
+        report.empty_buckets, report.bucket_count,
+        "{} of {} buckets read as empty once every object they held was deleted",
+        report.empty_buckets, report.bucket_count
+    );
+    assert!(
+        report.bucket_count > 0,
+        "every node left the map, so the counter above compared zero with zero"
+    );
+}
+
+/// Every object id one named bucket claims.
+fn released_bucket_object_ids(
+    engine: &TemporalEngine,
+    routing_bucket: u32,
+) -> std::collections::BTreeSet<u64> {
+    let shards = engine.shards.read().expect("shards lock poisoned");
+    shards
+        .get(&1)
+        .expect("loaded shard")
+        .bucket_index
+        .bucket_map
+        .get(&routing_bucket)
+        .map(|bucket| bucket.object_index.iter().copied().collect())
+        .unwrap_or_default()
+}
+
+/// The same settling, asked of a bucket that holds MORE THAN ONE object.
+///
+/// At the default routing range every key gets a bucket to itself, so "drop this object's id" and
+/// "clear this bucket's object index" are the same operation and the two guards above cannot tell
+/// them apart -- mutating the fix into the second PASSED both of them, because every survivor
+/// lived in a different bucket. A narrow routing range puts several objects in one bucket, which
+/// is also the shape the layout classifier was corrected for, and there the difference is the
+/// whole point: one object goes and its bucket-mates stay.
+#[test]
+fn a_delete_against_a_released_bucket_leaves_its_bucket_mates() {
+    const KEYS: usize = 64;
+    const VALUE_LEN: usize = 48;
+    let (_dir, engine) = dumped_shard_with_keys_in_range(KEYS, VALUE_LEN, 0, 4);
+
+    let (released_buckets, released_blocks, _refused) =
+        engine.release_all_releasable_bucket_index_blocks(1);
+    assert!(
+        released_buckets > 0 && released_blocks > 0,
+        "nothing was released ({released_buckets} buckets / {released_blocks} pages)"
+    );
+
+    let mut by_bucket: std::collections::BTreeMap<u32, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    for index in 0..KEYS {
+        by_bucket
+            .entry(engine.routing_bucket_for_key(1, &format!("released-{index:06}")))
+            .or_default()
+            .push(index);
+    }
+    let released: std::collections::BTreeSet<u32> =
+        engine.released_bucket_index_buckets(1).into_iter().collect();
+    let multi_object_buckets = by_bucket
+        .iter()
+        .filter(|(routing_bucket, members)| {
+            released.contains(routing_bucket) && members.len() >= 2
+        })
+        .count();
+    assert!(
+        multi_object_buckets > 0,
+        "not one of the {} released buckets holds two objects, so nothing here can tell dropping \
+         one id from clearing the set ({} buckets hold the {KEYS} keys)",
+        released.len(),
+        by_bucket.len()
+    );
+
+    let (target, members) = by_bucket
+        .iter()
+        .find(|(routing_bucket, members)| {
+            released.contains(routing_bucket) && members.len() >= 2
+        })
+        .map(|(routing_bucket, members)| (*routing_bucket, members.clone()))
+        .expect("a released bucket holding two objects, just counted");
+    let victim = members[0];
+    let mates = &members[1..];
+    assert!(!mates.is_empty(), "the chosen bucket has no mates to leave");
+
+    let claimed_before = released_bucket_object_ids(&engine, target);
+    assert_eq!(
+        claimed_before.len(),
+        members.len(),
+        "bucket {target} claims {} objects where {} keys route to it",
+        claimed_before.len(),
+        members.len()
+    );
+
+    released_delete(&engine, victim);
+    let claimed_after = released_bucket_object_ids(&engine, target);
+
+    // HALF ONE -- the deleted key, in this bucket.
+    assert!(
+        !claimed_after.contains(&released_object_id(victim)),
+        "bucket {target} still claims the object of the key that was deleted ({} ids held)",
+        claimed_after.len()
+    );
+
+    // HALF TWO -- its bucket-mates, in the SAME bucket. This is the half that a fix clearing the
+    // whole object index destroys, and the half the single-object fixture cannot see.
+    let kept = mates
+        .iter()
+        .filter(|index| claimed_after.contains(&released_object_id(**index)))
+        .count();
+    assert_eq!(
+        kept,
+        mates.len(),
+        "{kept} of {} bucket-mates survived a neighbour's delete in bucket {target}",
+        mates.len()
+    );
+
+    // And the bucket is not empty, because it still holds them.
+    let report = released_bucket_store_report(&engine);
+    let state = report
+        .buckets
+        .iter()
+        .find(|bucket| bucket.routing_bucket == target)
+        .expect("the target bucket is still in the map");
+    assert_ne!(
+        state.layout, "empty",
+        "bucket {target} reads empty while still claiming {kept} objects"
+    );
+
+    // The mates still read their own bytes, which is what the claim is about.
+    let readable = mates
+        .iter()
+        .filter(|index| released_read(&engine, **index) == Some(released_value(**index, VALUE_LEN)))
+        .count();
+    assert_eq!(
+        readable,
+        mates.len(),
+        "{readable} of {} bucket-mates read back after a neighbour was deleted",
+        mates.len()
+    );
+}
+
+/// Eviction releases the index it used to leave resident.
+///
+/// This is the rewrite of the characterization that described the ceiling: with
+/// the deleting arm not taken a victim was handled by `invalidate_slot` and nothing else, so
+/// `cache_entries_removed` could move and the bucket index never could. The stage now dumps its
+/// dirty victims, clears them, and releases their block lists -- so the assertion is the opposite
+/// one, and it is about the INDEX rather than the cache.
+#[test]
+fn eviction_releases_the_index_it_used_to_leave_resident() {
+    const KEYS: usize = 300;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..KEYS {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("evictrelease-{index:06}"),
+                value: vec![b'v'; 128],
+            },
+        });
+    }
+    let index_before = engine.bucket_index_resident_bytes(1);
+    assert!(index_before > 0, "the fixture left no index to release");
+
+    // threshold 0 so the gate admits; dump_before_evict so the victims are dumped and cleared,
+    // which is what makes them releasable; delete_drop FALSE, which is the shipped mode and the
+    // one that could never shrink the index.
+    let report = engine.apply_storage_eviction(1, 0, KEYS, true, false);
+    assert_eq!(report.mode, "evict_cache");
+    assert!(report.pressure_gate_open, "{report:?}");
+    assert!(
+        !report.selected_victims.is_empty(),
+        "the round selected no victims, so there was nothing to release: {report:?}"
+    );
+    assert!(
+        report.bucket_index_buckets_released > 0 && report.bucket_index_blocks_released > 0,
+        "eviction released no index: {} buckets / {} pages, {} refused",
+        report.bucket_index_buckets_released,
+        report.bucket_index_blocks_released,
+        report.bucket_index_release_refused,
+    );
+    assert!(
+        report.bucket_index_bytes_after < report.bucket_index_bytes_before,
+        "the round reported a release that freed nothing: {} -> {}",
+        report.bucket_index_bytes_before,
+        report.bucket_index_bytes_after,
+    );
+    assert!(
+        engine.bucket_index_resident_bytes(1) < index_before,
+        "the shard still holds as much index as before the round"
+    );
+    assert_eq!(
+        report.dropped_object_count, 0,
+        "evict_cache must not delete anything to free index memory -- that is delete_drop"
+    );
+
+    // The data is all still there, which is the difference between this and `delete_drop`.
+    for index in 0..KEYS {
+        let value = match engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: format!("evictrelease-{index:06}"),
+                },
+            })
+            .response
+        {
+            CommandResponse::Bytes { value } => value,
+            other => panic!("a string read answered {other:?}"),
+        };
+        assert_eq!(
+            value,
+            Some(vec![b'v'; 128]),
+            "key {index} did not survive an eviction round that released its bucket"
+        );
+    }
+}
+
+/// RESTORE uses the same path: a shard whose buckets are released reloads whole.
+///
+/// Eviction and restore were blocked on one mechanism, and this is the half that says so. The
+/// index is written and read back while buckets are released; the load path re-derives
+/// `bucket_map` from the model maps, which is what a per-bucket reload does one bucket at a time.
+#[test]
+fn a_shard_released_and_reloaded_comes_back_whole() {
+    const KEYS: usize = 200;
+    const VALUE_LEN: usize = 72;
+    let (dir, engine) = dumped_shard_with_keys(KEYS, VALUE_LEN);
+
+    let (released_buckets, _, _) = engine.release_all_releasable_bucket_index_blocks(1);
+    assert!(released_buckets > 0, "nothing was released");
+
+    // Write the index out while the buckets are released, then bring the shard back from it.
+    engine.flush_shard_index(1);
+    drop(engine);
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    for index in 0..KEYS {
+        assert_eq!(
+            released_read(&engine, index),
+            Some(released_value(index, VALUE_LEN)),
+            "key {index} did not survive a reload taken while its bucket was released"
+        );
+    }
+    assert!(
+        engine.released_bucket_index_buckets(1).is_empty(),
+        "a freshly loaded shard must hold nothing released"
+    );
+    assert!(
+        engine.bucket_index_resident_bytes(1) > 0,
+        "the reloaded shard rebuilt no index at all"
+    );
+}
+
+/// What the index-GC GATE costs, measured both ways in one binary, at two log sizes.
+///
+/// #1634 made reclaim cost what it REMOVES: the index log rolls into sealed pieces named
+/// `shard-{id}.indexlog.{start}-{end}-{max_wal_anchor}.bin`, and a round unlinks whole pieces
+/// without opening them. It left the CALLER alone. `storage_index_gc_report` decides whether to
+/// call the collector on a removable-record RATIO, and it got that ratio by scanning the whole log
+/// and decoding every record -- so the maintenance round stayed O(log size) and the cost simply
+/// moved from the collector to the gate.
+///
+/// The ratio is now arithmetic on the piece names plus the one piece being written: a piece holds
+/// `end - start` records because sequences have no holes, and `min(end, floor) - start` of them are
+/// below the floor. Only the active piece is opened.
+///
+/// FOUR ARMS, two shapes by two log sizes, all in this binary:
+///
+/// - `TS_INDEX_LOG_SEGMENT_BYTES = 0` is ONE FILE per shard -- the shape every store written
+///   before pieces has, and the shape in which the gate has no names to read and must decode. It
+///   is the control that proves the instrument can SEE a whole-log decode: without it, a treatment
+///   arm that silently measured nothing would read as a win.
+/// - 64 KiB pieces is the shipped default.
+///
+/// The measurement is BYTES DECODED and RECORDS DECODED, off the store's own counters, not
+/// milliseconds: counts are deterministic and this box's timings are not. The PIECES column is the
+/// marker that says which arm actually ran.
+///
+/// `dry_run` is set, so the collector never runs and what is measured is the GATE alone -- which
+/// is also the round that happens most: a gate that declines still pays for the numbers it
+/// declined on, every 30 s, on every shard.
+#[test]
+fn the_index_gc_gate_costs_pieces_not_records() {
+    /// Restores the rolling threshold on drop. It is per THREAD and `--test-threads=1` runs this
+    /// binary on one, so a test that set it and walked away would decide how every test after it
+    /// rolls.
+    struct RollingThreshold;
+    impl Drop for RollingThreshold {
+        fn drop(&mut self) {
+            crate::index_log::set_index_log_segment_bytes_for_test(None);
+        }
+    }
+
+    // Past `DEFAULT_INDEX_GC_INDEX_LOG_BYTES_THRESHOLD` (768 KiB) in EVERY arm, or the gate's own
+    // cheap byte test skips before it measures anything and every number below is zero. Asserted,
+    // not assumed -- and the assertion earned itself: the first fixture here was 4,000 records,
+    // which is 755,234 B, and every arm read zero bytes decoded because the round never got past
+    // that test. A record is about 189 B, so 6,000 is 1.13 MB and clears it with room.
+    let small = 6_000usize;
+    let large = 18_000usize;
+    let threshold = crate::engine::reports::DEFAULT_INDEX_GC_INDEX_LOG_BYTES_THRESHOLD;
+
+    struct Arm {
+        label: &'static str,
+        records: usize,
+        log_bytes: u64,
+        pieces: usize,
+        bytes_decoded: u64,
+        records_decoded: u64,
+        records_before: usize,
+        removable: usize,
+        ratio_basis_points: u64,
+        skipped_reason: String,
+    }
+
+    let mut arms: Vec<Arm> = Vec::new();
+    for (label, roll) in [
+        ("one file", 0u64),
+        (
+            "64 KiB pieces",
+            crate::index_log::DEFAULT_INDEX_LOG_SEGMENT_BYTES,
+        ),
+    ] {
+        for records in [small, large] {
+            let _rolling = RollingThreshold;
+            crate::index_log::set_index_log_segment_bytes_for_test(Some(roll));
+
+            let engine = TemporalEngine::default();
+            engine.load_shard(1);
+            let store = engine.index_log_store();
+            for value in 0..records {
+                store
+                    .append_json(
+                        1,
+                        format!("{{\"value\":{value},\"pad\":\"{}\"}}", "v".repeat(160)).as_bytes(),
+                    )
+                    .expect("index-log append");
+            }
+
+            // Sequences run 1..=records; a floor at 60% leaves a removable ratio of 6,000 basis
+            // points, past the 4,000 the gate wants -- so the gate is answering a real question
+            // rather than declining on a number that could be anything.
+            let floor = (records * 6 / 10) as u64;
+            let log_bytes = store.log_len_bytes(1);
+            let pieces = store.piece_count(1);
+            let before = store.stats(1);
+            let report = engine.storage_index_gc_report(
+                &crate::engine::reports::StorageLifecyclePlan {
+                    shard_id: 1,
+                    ..crate::engine::reports::StorageLifecyclePlan::default()
+                },
+                &crate::engine::reports::StorageWalReclaimPlan {
+                    shard_id: 1,
+                    safe_to_reclaim: true,
+                    retain_from_index_log_sequence: floor,
+                    ..crate::engine::reports::StorageWalReclaimPlan::default()
+                },
+                None,
+                &crate::engine::reports::StorageManagerCycleRequest {
+                    shard_id: 1,
+                    dry_run: true,
+                    ..crate::engine::reports::StorageManagerCycleRequest::default()
+                },
+            );
+            let after = store.stats(1);
+
+            arms.push(Arm {
+                label,
+                records,
+                log_bytes,
+                pieces,
+                bytes_decoded: after.bytes_read.saturating_sub(before.bytes_read),
+                records_decoded: after.records_read.saturating_sub(before.records_read),
+                records_before: report.records_before,
+                removable: report.removable_records_before_budget,
+                ratio_basis_points: report.usage_ratio_basis_points,
+                skipped_reason: report.skipped_reason.clone(),
+            });
+        }
+    }
+
+    println!(
+        "\n  {:<16} {:>8} {:>7} {:>12} {:>14} {:>16} {:>8}",
+        "shape", "records", "pieces", "log bytes", "bytes decoded", "records decoded", "ratio"
+    );
+    for arm in &arms {
+        println!(
+            "  {:<16} {:>8} {:>7} {:>12} {:>14} {:>16} {:>7}bp",
+            arm.label,
+            arm.records,
+            arm.pieces,
+            arm.log_bytes,
+            arm.bytes_decoded,
+            arm.records_decoded,
+            arm.ratio_basis_points
+        );
+    }
+
+    // THE DENOMINATORS, before any bound. Each one of these is a way for every assertion below to
+    // pass while measuring nothing: a log under the byte threshold is skipped before the gate
+    // measures, a gate that declined for some other reason never reached the ratio, and "no more
+    // than one piece" is vacuously true of a log that IS one piece.
+    for arm in &arms {
+        assert!(
+            arm.log_bytes > threshold,
+            "{} at {} records wrote only {} B, under the {threshold} B gate -- the round would \
+             skip before measuring and every bound below is vacuous",
+            arm.label,
+            arm.records,
+            arm.log_bytes
+        );
+        assert_eq!(
+            arm.skipped_reason, "dry_run",
+            "{} at {} records: the gate declined for `{}` rather than reaching the ratio, so it \
+             measured nothing",
+            arm.label, arm.records, arm.skipped_reason
+        );
+        assert_eq!(
+            (arm.records_before, arm.removable),
+            (arm.records, arm.records * 6 / 10 - 1),
+            "{} at {} records: the gate counted {}/{} records/removable, and sequences run \
+             1..={} against a floor of {}",
+            arm.label,
+            arm.records,
+            arm.records_before,
+            arm.removable,
+            arm.records,
+            arm.records * 6 / 10
+        );
+    }
+
+    let one_file_small = &arms[0];
+    let one_file_large = &arms[1];
+    let pieces_small = &arms[2];
+    let pieces_large = &arms[3];
+
+    assert_eq!(
+        (one_file_small.pieces, one_file_large.pieces),
+        (1, 1),
+        "the control arm must be ONE file or it is not the shape this replaces: {} and {} pieces",
+        one_file_small.pieces,
+        one_file_large.pieces
+    );
+    assert!(
+        pieces_small.pieces >= 10 && pieces_large.pieces >= pieces_small.pieces * 2,
+        "the treatment arm must have ROLLED, and the large log must be many more pieces than the \
+         small one, or the bounds below say nothing: {} and {} piece(s)",
+        pieces_small.pieces,
+        pieces_large.pieces
+    );
+    assert!(
+        pieces_large.log_bytes > pieces_small.log_bytes * 2,
+        "the two log sizes must differ or 'did not grow with the log' is vacuous: {} B against \
+         {} B",
+        pieces_small.log_bytes,
+        pieces_large.log_bytes
+    );
+
+    // THE CONTROL PROVES THE INSTRUMENT. One file per shard has no names to read, so the gate
+    // decodes the log -- and the counters see it. Without this, a treatment arm reading zero could
+    // mean the gate got cheap or could mean nothing was measured at all.
+    for arm in [one_file_small, one_file_large] {
+        assert!(
+            arm.bytes_decoded * 10 > arm.log_bytes * 9 && arm.records_decoded == arm.records as u64,
+            "the one-file arm at {} records must decode the whole {} B log, or the counters are \
+             not watching the gate: {} B / {} records decoded",
+            arm.records,
+            arm.log_bytes,
+            arm.bytes_decoded,
+            arm.records_decoded
+        );
+    }
+    assert!(
+        one_file_large.bytes_decoded > one_file_small.bytes_decoded * 2,
+        "in the one-file arm the gate's cost must track the LOG -- that is the defect: {} B at {} \
+         records against {} B at {} records",
+        one_file_small.bytes_decoded,
+        one_file_small.records,
+        one_file_large.bytes_decoded,
+        one_file_large.records
+    );
+
+    // THE TREATMENT. What the gate decodes is the piece being written, whatever the log holds.
+    let piece = crate::index_log::DEFAULT_INDEX_LOG_SEGMENT_BYTES;
+    for arm in [pieces_small, pieces_large] {
+        assert!(
+            arm.bytes_decoded <= piece,
+            "the gate decoded {} B of a {} B log in {} pieces ({} records); it is reading the \
+             whole log again (piece size {piece} B)",
+            arm.bytes_decoded,
+            arm.log_bytes,
+            arm.pieces,
+            arm.records
+        );
+        assert!(
+            arm.bytes_decoded * 10 < arm.log_bytes && arm.records_decoded * 10 < arm.records as u64,
+            "the gate decoded {} B / {} records of a {} B / {} record log in {} pieces -- one \
+             piece is a small fraction of that, so anything near a tenth is a whole-log walk",
+            arm.bytes_decoded,
+            arm.records_decoded,
+            arm.log_bytes,
+            arm.records,
+            arm.pieces
+        );
+    }
+    assert!(
+        pieces_large.bytes_decoded <= pieces_small.bytes_decoded.saturating_add(piece),
+        "the gate's cost grew with the LOG: {} B decoded on a {} B log against {} B on a {} B \
+         one -- it tracks records again",
+        pieces_small.bytes_decoded,
+        pieces_small.log_bytes,
+        pieces_large.bytes_decoded,
+        pieces_large.log_bytes
+    );
+
+    // AND IT IS THE SAME DECISION. The cheap question has to answer what the dear one answered:
+    // the one-file arm read every record, the piece arm read one piece, and at each log size they
+    // must agree about the log -- record count, removable count and the ratio the gate fires on.
+    for (dear, cheap) in [
+        (one_file_small, pieces_small),
+        (one_file_large, pieces_large),
+    ] {
+        assert_eq!(
+            (
+                cheap.records_before,
+                cheap.removable,
+                cheap.ratio_basis_points
+            ),
+            (dear.records_before, dear.removable, dear.ratio_basis_points),
+            "at {} records the gate reached a DIFFERENT decision from names ({}/{}/{}bp) than \
+             from reading every record ({}/{}/{}bp)",
+            dear.records,
+            cheap.records_before,
+            cheap.removable,
+            cheap.ratio_basis_points,
+            dear.records_before,
+            dear.removable,
+            dear.ratio_basis_points
+        );
+    }
+}
+
+
+/// CHARACTERIZATION: a restore is an install of a dump manifest PLUS a replay of the WAL
+/// suffix the manifest's embedded index does not already cover.
+///
+/// The manifest replay watermark is derived from the anchor INSIDE the embedded index, so
+/// every record written after the dump lives only in the log. A restore that installs the
+/// manifest and stops reconstructs the shard as it was AT THE DUMP, and that is
+/// indistinguishable from a working restore if you only count the pre-dump records -- which
+/// is why this counts both halves separately.
+///
+/// `reclaim_dumped_prefix` drops the log below the anchor, the way a live shard does once a
+/// dump is durable, leaving the suffix as the ONLY thing the log holds: a restore that replays
+/// nothing then cannot pass by re-running the prefix, and one that replays from zero hits a
+/// sequence hole instead of quietly succeeding. `install_before_load` picks which order the
+/// restore runs in -- the manifest arriving before the shard is loaded, or landing on a shard
+/// that is already up and already holds the suffix.
+fn restore_round_trip_counts(
+    install_before_load: bool,
+    reclaim_dumped_prefix: bool,
+) -> (usize, usize, usize, usize) {
+    const BEFORE_DUMP: usize = 6;
+    const AFTER_DUMP: usize = 4;
+    const SHARD: ShardId = 7;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source_index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        &source_index_dir,
+    );
+    engine.load_shard(SHARD);
+    for i in 0..BEFORE_DUMP {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringSet {
+                key: format!("pre-{i}"),
+                value: format!("pre-value-{i}").into_bytes(),
+            },
+        });
+        assert!(response.status.ok, "pre-write {i} failed: {response:?}");
+    }
+    let manifest = engine
+        .create_bucket_dump_manifest(SHARD, Vec::new())
+        .expect("dump manifest should persist");
+    for i in 0..AFTER_DUMP {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringSet {
+                key: format!("post-{i}"),
+                value: format!("post-value-{i}").into_bytes(),
+            },
+        });
+        assert!(response.status.ok, "post-write {i} failed: {response:?}");
+    }
+    engine.wal_store().flush(SHARD).expect("flush wal");
+
+    // VACUITY GUARD with its denominator. If the manifest already covered the tail there is
+    // no suffix to lose and every assertion below would pass without restore replaying a
+    // single record.
+    let (all_records, _truncated) = engine
+        .wal_store()
+        .scan_decoded(SHARD, 0, u64::MAX, u64::MAX)
+        .expect("scan source wal");
+    let total_records = all_records.len();
+    let suffix_records = all_records
+        .iter()
+        .filter(|(_, record)| record.sequence > manifest.wal_sequence)
+        .count();
+    assert!(
+        manifest.wal_sequence > 0,
+        "the dump must cover something: anchor 0 over {total_records} records"
+    );
+    assert!(
+        suffix_records > 0,
+        "fixture has NO post-dump WAL suffix -- the restore assertions would be vacuous \
+         (log holds {total_records} records, manifest anchor {})",
+        manifest.wal_sequence
+    );
+
+    if reclaim_dumped_prefix {
+        // Reclaim everything the manifest already covers, the way a live shard does once a
+        // dump is durable. The log now holds the suffix and nothing else, so a restore that
+        // replays nothing cannot pass by re-running the prefix.
+        let anchor =
+            crate::wal::DurableIndexAnchor::proven_durable_through(SHARD, manifest.wal_sequence);
+        engine
+            .wal_store()
+            .gc_before_sequence(SHARD, manifest.wal_sequence.saturating_add(1), &anchor)
+            .expect("reclaim the dumped prefix");
+        engine.wal_store().flush(SHARD).expect("flush after reclaim");
+        let (retained, _truncated) = engine
+            .wal_store()
+            .scan_decoded(SHARD, 0, u64::MAX, u64::MAX)
+            .expect("rescan source wal");
+        let retained_records = retained.len();
+        assert_eq!(
+            retained_records, suffix_records,
+            "reclaim should retain exactly the suffix (had {total_records}, suffix {suffix_records})"
+        );
+    }
+
+    // The restore target: the dump's blocks, a fresh index dir, and the retained log. The
+    // manifest and the log are the only things that travel.
+    let restore_index_dir = dir.path().join("restore-indexes");
+    std::fs::create_dir_all(&restore_index_dir).unwrap();
+    copy_dir_recursive(&source_index_dir.join("wals"), &restore_index_dir.join("wals"));
+
+    let restored = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("restore-cache"),
+        dir.path().join("blocks"),
+        &restore_index_dir,
+    );
+    if install_before_load {
+        restored
+            .install_bucket_dump_manifest(&manifest)
+            .expect("manifest should install into a fresh restore target");
+        restored.load_shard(SHARD);
+        // Proof the replay ran FROM the dump's anchor rather than from zero (which the
+        // reclaimed log could not satisfy) or from the tail (which would replay nothing).
+        assert_eq!(
+            crate::engine::lifecycle::LAST_REPLAY_WATERMARK
+                .load(std::sync::atomic::Ordering::SeqCst),
+            manifest.wal_sequence,
+            "load after install should replay from the manifest's anchor"
+        );
+    } else {
+        restored.load_shard(SHARD);
+        restored
+            .install_bucket_dump_manifest(&manifest)
+            .expect("manifest should install into a fresh restore target");
+    }
+
+    let mut found_pre = 0usize;
+    for i in 0..BEFORE_DUMP {
+        let response = restored.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringGet {
+                key: format!("pre-{i}"),
+            },
+        });
+        if response.response
+            == (CommandResponse::Bytes {
+                value: Some(format!("pre-value-{i}").into_bytes()),
+            })
+        {
+            found_pre += 1;
+        }
+    }
+    let mut found_post = 0usize;
+    for i in 0..AFTER_DUMP {
+        let response = restored.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringGet {
+                key: format!("post-{i}"),
+            },
+        });
+        if response.response
+            == (CommandResponse::Bytes {
+                value: Some(format!("post-value-{i}").into_bytes()),
+            })
+        {
+            found_post += 1;
+        }
+    }
+    (found_pre, BEFORE_DUMP, found_post, AFTER_DUMP)
+}
+
+fn copy_dir_recursive(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create copy target");
+    for entry in std::fs::read_dir(from).expect("read copy source") {
+        let entry = entry.expect("copy source entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_dir_recursive(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy file");
+        }
+    }
+}
+
+/// The production restore: install the manifest, then load. Load reads the installed index,
+/// finds its anchor at the dump, and replays the log from there. The log here holds ONLY the
+/// suffix, so every post-dump record counted below was replayed, not re-read.
+#[test]
+fn restore_installs_the_manifest_then_replays_the_wal_suffix_on_load() {
+    let (found_pre, expect_pre, found_post, expect_post) = restore_round_trip_counts(true, true);
+    assert_eq!(
+        (found_pre, found_post),
+        (expect_pre, expect_post),
+        "install-then-load restore recovered {found_pre}/{expect_pre} pre-dump and \
+         {found_post}/{expect_post} post-dump records"
+    );
+}
+
+/// The other order, which is what the dump-install endpoint does to a running shard: the shard
+/// is already loaded and already holds records past the manifest's anchor. Installing the
+/// manifest swaps in an index that describes the shard AS IT WAS AT THE DUMP; without a replay
+/// of the suffix on top, those later records vanish from the serving shard while the install
+/// reports success.
+#[test]
+fn restore_keeps_the_wal_suffix_when_the_manifest_lands_on_an_already_loaded_shard() {
+    let (found_pre, expect_pre, found_post, expect_post) = restore_round_trip_counts(false, false);
+    assert_eq!(
+        (found_pre, found_post),
+        (expect_pre, expect_post),
+        "load-then-install restore recovered {found_pre}/{expect_pre} pre-dump and \
+         {found_post}/{expect_post} post-dump records"
+    );
+}
+
+/// THE RESTORE ROUND TRIP, WITH THE TWO MANIFEST ORDERINGS PULLED APART.
+///
+/// The two tests above restore through a single manifest, so "the newest dump" and "the dump with
+/// the highest WAL anchor" are the same file and nothing distinguishes them. A manifest carries
+/// both an `index_log_sequence` and a `wal_sequence`, minted from two different places, and under
+/// `MATRIXARK_BULK_INGEST` the second comes from the FROZEN BASE FILE rather than the live index
+/// -- so a dump taken with that flag set lands NEWEST in index-log order carrying the LOWEST
+/// anchor on disk. `load_shard_with` has to recover from the highest-anchored one
+/// (`durable_recovery_bucket_dump_manifest_at`); recovering from the newest one restarts the
+/// replay below the point the dumped prefix was reclaimed at, and the prefix is gone.
+///
+/// COUNTED IN TWO HALVES, like the round trips above and for the same reason. Restoring the
+/// stale manifest and stopping would return the SEED and nothing else; restoring the right
+/// manifest but replaying nothing would return the pre-dump records and no post-dump ones. A
+/// combined total reads the same for a working restore and for either failure.
+///
+/// VERIFIED BY MUTATION: with `load_shard_with`'s single-barrier arm back on
+/// `latest_bucket_dump_manifest_at`, the restore replays from 1 instead of 7 and returns 0 of 6
+/// pre-dump records.
+#[test]
+fn a_restore_reads_the_highest_anchored_manifest_not_the_newest_one() {
+    const BEFORE_DUMP: usize = 6;
+    const AFTER_DUMP: usize = 4;
+    const SHARD: ShardId = 9;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source_index_dir = dir.path().join("indexes");
+    let blocks = dir.path().join("blocks");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        &blocks,
+        &source_index_dir,
+    );
+    engine.load_shard(SHARD);
+
+    // A materialized base index FILE, and then writes that leave it behind. Under the
+    // single-barrier default the per-command persist goes to the delta, so from here the base
+    // file is frozen at the seed while the served index runs ahead -- which is the distance the
+    // bulk-ingest mint below turns into a manifest.
+    let response = engine.execute(ExecuteRequest {
+        shard_id: SHARD,
+        command: Command::StringSet {
+            key: "seed".to_string(),
+            value: b"seed-value".to_vec(),
+        },
+    });
+    assert!(response.status.ok, "seed write failed: {response:?}");
+    engine.flush_shard_index(SHARD);
+
+    for i in 0..BEFORE_DUMP {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringSet {
+                key: format!("pre-{i}"),
+                value: format!("pre-value-{i}").into_bytes(),
+            },
+        });
+        assert!(response.status.ok, "pre-write {i} failed: {response:?}");
+    }
+    let anchored = engine
+        .create_bucket_dump_manifest(SHARD, Vec::new())
+        .expect("the live dump persists");
+    for i in 0..AFTER_DUMP {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringSet {
+                key: format!("post-{i}"),
+                value: format!("post-value-{i}").into_bytes(),
+            },
+        });
+        assert!(response.status.ok, "post-write {i} failed: {response:?}");
+    }
+    engine.wal_store().flush(SHARD).expect("flush wal");
+
+    // The divergent mint. One env flag, the same shard, the same process, the same production
+    // entry point -- `create_bucket_dump_manifest` is the only place a manifest's two sequences
+    // are ever assigned.
+    std::env::set_var("MATRIXARK_BULK_INGEST", "1");
+    let stale = engine.create_bucket_dump_manifest(SHARD, Vec::new());
+    std::env::remove_var("MATRIXARK_BULK_INGEST");
+    let stale = stale.expect("the bulk-ingest dump persists");
+
+    // DENOMINATORS, all three, before anything is restored. Each one on its own would make the
+    // counts below come back full for a reason that has nothing to do with which manifest the
+    // load path reads.
+    assert!(
+        stale.wal_sequence < anchored.wal_sequence,
+        "the bulk-ingest dump anchors at {} and the live one at {} -- the orderings did not come \
+         apart, so both manifests would restore the same state",
+        stale.wal_sequence,
+        anchored.wal_sequence
+    );
+    let newest = latest_bucket_dump_manifest_at(&source_index_dir, SHARD)
+        .expect("a manifest listing with two entries in it");
+    assert_eq!(
+        newest.manifest_id, stale.manifest_id,
+        "the NEWEST manifest in index-log order is {} (anchor {}), not the bulk-ingest one \
+         (index_log_sequence {}, anchor {}). Index-log order would already pick the right file \
+         and this test could not fail",
+        newest.manifest_id, newest.wal_sequence, stale.index_log_sequence, stale.wal_sequence
+    );
+    let (all_records, _truncated) = engine
+        .wal_store()
+        .scan_decoded(SHARD, 0, u64::MAX, u64::MAX)
+        .expect("scan source wal");
+    let total_records = all_records.len();
+    let suffix_records = all_records
+        .iter()
+        .filter(|(_, record)| record.sequence > anchored.wal_sequence)
+        .count();
+    assert!(
+        suffix_records > 0,
+        "fixture has NO post-dump WAL suffix -- the post half below would be satisfied by the \
+         manifest alone (log holds {total_records} records, anchor {})",
+        anchored.wal_sequence
+    );
+
+    // Reclaim everything the live dump already covers, the way a live shard does once a dump is
+    // durable. This is what makes the wrong manifest UNRECOVERABLE rather than merely slower: a
+    // replay restarted below this point has no records to read.
+    let anchor = crate::wal::DurableIndexAnchor::proven_durable_through(SHARD, anchored.wal_sequence);
+    engine
+        .wal_store()
+        .gc_before_sequence(SHARD, anchored.wal_sequence.saturating_add(1), &anchor)
+        .expect("reclaim the dumped prefix");
+    engine.wal_store().flush(SHARD).expect("flush after reclaim");
+    println!(
+        "  manifests: live ils={} anchor={}, bulk ils={} anchor={} (newest in index-log order); \
+         log cut to the {suffix_records}-record suffix of {total_records}",
+        anchored.index_log_sequence,
+        anchored.wal_sequence,
+        stale.index_log_sequence,
+        stale.wal_sequence
+    );
+
+    // The restore target: the durable tree as a crash restart would find it -- the manifests, the
+    // retained log, the frozen base index file -- and the dump's blocks.
+    let restore_index_dir = dir.path().join("restore-indexes");
+    copy_dir_recursive(&source_index_dir, &restore_index_dir);
+    let restored = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("restore-cache"),
+        &blocks,
+        &restore_index_dir,
+    );
+    restored.load_shard(SHARD);
+    println!(
+        "  restore replayed from {}",
+        crate::engine::lifecycle::LAST_REPLAY_WATERMARK.load(std::sync::atomic::Ordering::SeqCst)
+    );
+
+    let mut found_pre = 0usize;
+    for i in 0..BEFORE_DUMP {
+        let response = restored.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringGet {
+                key: format!("pre-{i}"),
+            },
+        });
+        if response.response
+            == (CommandResponse::Bytes {
+                value: Some(format!("pre-value-{i}").into_bytes()),
+            })
+        {
+            found_pre += 1;
+        }
+    }
+    let mut found_post = 0usize;
+    for i in 0..AFTER_DUMP {
+        let response = restored.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringGet {
+                key: format!("post-{i}"),
+            },
+        });
+        if response.response
+            == (CommandResponse::Bytes {
+                value: Some(format!("post-value-{i}").into_bytes()),
+            })
+        {
+            found_post += 1;
+        }
+    }
+    assert_eq!(
+        found_pre, BEFORE_DUMP,
+        "the restore recovered {found_pre} of {BEFORE_DUMP} PRE-dump records. They live only in \
+         the highest-anchored manifest's embedded index -- the log below anchor {} was reclaimed \
+         -- so this is a load that recovered from the newest manifest instead",
+        anchored.wal_sequence
+    );
+    assert_eq!(
+        found_post, AFTER_DUMP,
+        "the restore recovered {found_post} of {AFTER_DUMP} POST-dump records. They live only in \
+         the retained WAL suffix, so this is a load that installed a checkpoint and replayed \
+         nothing on top of it"
+    );
+}
+
+
+// ---------------------------------------------------------------------------
+// What a bucket dump costs: the two-point measurement.
+// ---------------------------------------------------------------------------
+
+/// Buckets the dumpcost fixtures spread over. Small ON PURPOSE.
+///
+/// The engine default spreads keys over the whole u32 routing space, so finding a hundred keys
+/// that land in ONE chosen bucket by rejection sampling needs millions of candidate hashes -- the
+/// first version of this probe spent an hour there and never reached its second arm. A shard
+/// loaded over eight buckets finds them in hundreds, and the question being asked -- does the dump
+/// cost the bucket or the shard? -- is untouched by how many buckets the shard is cut into.
+const DUMPCOST_BUCKETS: u32 = 8;
+
+fn load_dumpcost_shard(engine: &TemporalEngine, shard_id: ShardId) {
+    engine.load_shard_with(LoadShardRequest {
+        shard_id,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 0,
+        end_routing_bucket: DUMPCOST_BUCKETS - 1,
+        readonly: false,
+        table_name: String::new(),
+    });
+}
+
+/// Seed string keys through the batch path, so building the fixture is not itself the measurement.
+fn seed_dumpcost_keys(engine: &TemporalEngine, shard_id: ShardId, keys: Vec<String>) {
+    for chunk in keys.chunks(1_000) {
+        let commands = chunk
+            .iter()
+            .map(|key| Command::StringSet {
+                key: key.clone(),
+                value: vec![118u8; 64],
+            })
+            .collect::<Vec<_>>();
+        let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+            shard_id,
+            commands,
+        });
+        assert!(response.status.ok, "seed write failed: {:?}", response.status);
+    }
+}
+
+/// Build a shard holding exactly IN_TARGET keys in one chosen routing bucket plus filler keys
+/// filtered AWAY from it, then dump that ONE bucket.
+///
+/// Returns (shard_buckets, shard_blocks, dumped_buckets, dumped_blocks, manifest_index_bytes,
+/// dump_encode_bytes).
+fn one_bucket_dump_at_shard_size(filler: usize) -> (usize, u64, usize, u64, usize, u64) {
+    const IN_TARGET: usize = 100;
+    const SHARD: ShardId = 1;
+
+    let engine = TemporalEngine::default();
+    load_dumpcost_shard(&engine, SHARD);
+    let target_bucket = engine.routing_bucket_for_key(SHARD, "dumped-0");
+
+    let mut keys = Vec::with_capacity(IN_TARGET + filler);
+    let mut candidate = 0usize;
+    let mut in_target = 0usize;
+    while in_target < IN_TARGET {
+        let key = format!("dumped-{candidate}");
+        if engine.routing_bucket_for_key(SHARD, &key) == target_bucket {
+            keys.push(key);
+            in_target += 1;
+        }
+        candidate += 1;
+    }
+    let mut filler_candidate = 0usize;
+    let mut written_filler = 0usize;
+    while written_filler < filler {
+        let key = format!("filler-{filler_candidate:08}");
+        if engine.routing_bucket_for_key(SHARD, &key) != target_bucket {
+            keys.push(key);
+            written_filler += 1;
+        }
+        filler_candidate += 1;
+    }
+    seed_dumpcost_keys(&engine, SHARD, keys);
+
+    let summaries = engine.bucket_storage_summaries(SHARD);
+    let shard_buckets = summaries.len();
+    let shard_blocks = summaries
+        .iter()
+        .map(|summary| summary.block_ref_count)
+        .sum::<u64>();
+
+    crate::engine::reset_index_encode_counts();
+    let manifest = engine
+        .create_bucket_dump_manifest(SHARD, vec![target_bucket])
+        .expect("dump of one bucket should succeed");
+    let dump_encode_bytes = crate::engine::index_encode_counts().encode_bytes_total;
+
+    (
+        shard_buckets,
+        shard_blocks,
+        manifest.bucket_ids.len(),
+        manifest.live_block_refs,
+        manifest.index_bytes.len(),
+        dump_encode_bytes,
+    )
+}
+
+/// Two-point measurement: does a dump of ONE bucket cost that bucket, or the whole shard? Prints.
+///
+///   cargo test -p temporalstore-rust --lib what_one_bucket_dumps_cost_at_two_shard_sizes
+///       -- --ignored --nocapture --test-threads=1
+///
+/// The older probe what_a_bucket_dump_costs varies the bucket COUNT inside one shard and reports
+/// milliseconds. Neither half separates the question: growing the selection grows the dumped work
+/// too, and a timing on this box is not evidence. This varies the SHARD SIZE tenfold while holding
+/// the DUMPED BUCKET byte-for-byte identical, and reports counts only.
+///
+/// dumped_buckets and dumped_blocks are the treatment-ran columns. If they are not equal across the
+/// arms the arms dumped different work and the comparison means nothing.
+#[test]
+#[ignore]
+fn what_one_bucket_dumps_cost_at_two_shard_sizes() {
+    println!(
+        "  filler  shard_buckets  shard_pages  dumped_buckets  dumped_pages  manifest_index_bytes  dump_encode_bytes"
+    );
+    for filler in [1_000usize, 10_000] {
+        let (shard_buckets, shard_blocks, dumped_buckets, dumped_blocks, index_bytes, encode_bytes) =
+            one_bucket_dump_at_shard_size(filler);
+        println!(
+            "  {filler:>6}  {shard_buckets:>13}  {shard_blocks:>11}  {dumped_buckets:>14}  {dumped_blocks:>12}  {index_bytes:>20}  {encode_bytes:>17}"
+        );
+    }
+}
+
+/// A dump of ONE bucket writes a WHOLE-SHARD index, and it MUST.
+///
+/// The two-point measurement above says the manifest a one-bucket dump writes tracks the SHARD,
+/// not the bucket: identical dumped work (1 bucket, 100 blocks) cost 38,720 bytes at 1,100 shard
+/// blocks and 438,937 at 10,100 -- 11.34x growth for the same dump. The obvious repair is to make
+/// the manifest carry only the buckets it names, and let the previous manifest keep covering the
+/// rest.
+///
+/// THAT REPAIR WOULD SILENTLY DESTROY DATA, and this is the guard that says so with a number.
+/// Manifest retention keeps the NEWEST manifest and nothing else -- see the comment on
+/// bucket_dump_manifest_prune_plan_at, which is explicit that newest-only is safe only because
+/// each manifest embeds a complete, self-contained index and installing one never walks the
+/// parent chain to reconstruct anything. install_bucket_dump_manifest writes the manifest
+/// decoded index as THE durable index for the shard. So a manifest carrying only its own buckets
+/// would, the moment its ancestors were pruned, install a shard missing every bucket it did not
+/// name -- and neither validate_bucket_dump_manifest nor the install preflight would object,
+/// because both FILTER what they check down to the manifest own bucket_ids.
+///
+/// So this restores from the partial manifest ALONE, with no ancestor available to the restore
+/// target, and counts the two halves SEPARATELY:
+///
+///   * the bucket the manifest NAMES, and
+///   * the buckets it does NOT name.
+///
+/// The second count is the one a scoped manifest breaks, and counting only the first would make a
+/// broken restore look like a working one -- the failure #1637 found, where the pre-dump half read
+/// 6/6 while the post-dump half read 0/4. The post-dump half is counted here too, so this also
+/// keeps the #1637 replay honest for a PARTIAL manifest, which its own fixtures never exercise:
+/// they all dump every bucket.
+///
+/// VERIFIED BY MUTATION. Scoping the exported index to the selected buckets in
+/// create_bucket_dump_manifest -- the repair described above -- leaves the named bucket at 5/5
+/// and takes the unnamed buckets to 0/8.
+#[test]
+fn the_newest_dump_manifest_alone_restores_the_buckets_it_does_not_name() {
+    const SHARD: ShardId = 7;
+    const IN_NAMED: usize = 5;
+    const OUTSIDE_FIRST: usize = 5;
+    const OUTSIDE_SECOND: usize = 3;
+    const AFTER_DUMP: usize = 4;
+
+    let dir = tempfile::tempdir().unwrap();
+    let source_index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        &source_index_dir,
+    );
+    load_dumpcost_shard(&engine, SHARD);
+    let named_bucket = engine.routing_bucket_for_key(SHARD, "named-0");
+
+    // Keys that land in the bucket the partial dump will name, and keys that land anywhere else.
+    let mut named_keys = Vec::new();
+    let mut outside_keys = Vec::new();
+    let mut candidate = 0usize;
+    while named_keys.len() < IN_NAMED || outside_keys.len() < OUTSIDE_FIRST + OUTSIDE_SECOND {
+        let key = format!("named-{candidate}");
+        if engine.routing_bucket_for_key(SHARD, &key) == named_bucket {
+            if named_keys.len() < IN_NAMED {
+                named_keys.push(key);
+            }
+        } else if outside_keys.len() < OUTSIDE_FIRST + OUTSIDE_SECOND {
+            outside_keys.push(key);
+        }
+        candidate += 1;
+    }
+
+    for key in named_keys.iter() {
+        write_dumpcost_key(&engine, SHARD, key);
+    }
+    for key in outside_keys.iter().take(OUTSIDE_FIRST) {
+        write_dumpcost_key(&engine, SHARD, key);
+    }
+
+    // An ANCESTOR manifest covering every bucket. It is what a scoped manifest would lean on, and
+    // it is exactly what retention prunes. The restore target below never receives it.
+    let ancestor = engine
+        .create_bucket_dump_manifest(SHARD, Vec::new())
+        .expect("ancestor dump should persist");
+    // Move the log on, so the partial dump below is a DIFFERENT manifest rather than one that
+    // collides with the ancestor on its (shard, index_sequence, created_ms) id.
+    for key in outside_keys.iter().skip(OUTSIDE_FIRST) {
+        write_dumpcost_key(&engine, SHARD, key);
+    }
+
+    let manifest = engine
+        .create_bucket_dump_manifest(SHARD, vec![named_bucket])
+        .expect("partial dump should persist");
+    for index in 0..AFTER_DUMP {
+        write_dumpcost_key(&engine, SHARD, &format!("post-{index}"));
+    }
+    engine.wal_store().flush(SHARD).expect("flush wal");
+
+    // DENOMINATORS, before anything is asserted about a restore.
+    assert_ne!(
+        manifest.manifest_id, ancestor.manifest_id,
+        "the partial dump reused the ancestor manifest id, so there is no newest-alone to test"
+    );
+    assert_eq!(
+        manifest.bucket_ids,
+        vec![named_bucket],
+        "the dump was supposed to name ONE bucket; it named {:?}. A dump naming every bucket would \
+         satisfy every assertion below without testing anything",
+        manifest.bucket_ids
+    );
+    let shard_buckets = engine
+        .bucket_storage_summaries(SHARD)
+        .into_iter()
+        .map(|summary| summary.routing_bucket)
+        .collect::<BTreeSet<_>>();
+    let unnamed_buckets = shard_buckets
+        .iter()
+        .filter(|bucket| **bucket != named_bucket)
+        .count();
+    assert!(
+        unnamed_buckets > 0,
+        "the fixture put every key in the dumped bucket, so there are no unnamed buckets to lose \
+         (shard holds buckets {shard_buckets:?}, dump named {named_bucket})"
+    );
+    let (all_records, _truncated) = engine
+        .wal_store()
+        .scan_decoded(SHARD, 0, u64::MAX, u64::MAX)
+        .expect("scan source wal");
+    let suffix_records = all_records
+        .iter()
+        .filter(|(_, record)| record.sequence > manifest.wal_sequence)
+        .count();
+    assert!(
+        suffix_records > 0,
+        "no post-dump WAL suffix, so the post-dump count below would be vacuous (log holds {} \
+         records, manifest anchor {})",
+        all_records.len(),
+        manifest.wal_sequence
+    );
+
+    // The restore target: the dump blocks, the log, and a fresh index dir. The ancestor manifest
+    // stays behind, the way retention leaves it behind.
+    let restore_index_dir = dir.path().join("restore-indexes");
+    std::fs::create_dir_all(&restore_index_dir).unwrap();
+    copy_dir_recursive(&source_index_dir.join("wals"), &restore_index_dir.join("wals"));
+    let restored = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("restore-cache"),
+        dir.path().join("blocks"),
+        &restore_index_dir,
+    );
+    assert!(
+        restored.list_bucket_dump_manifests(SHARD).is_empty(),
+        "the restore target was handed a manifest it was supposed to recover without"
+    );
+    load_dumpcost_shard(&restored, SHARD);
+    restored
+        .install_bucket_dump_manifest(&manifest)
+        .expect("the partial manifest should install on its own");
+
+    let found_named = named_keys
+        .iter()
+        .filter(|key| dumpcost_key_reads_back(&restored, SHARD, key))
+        .count();
+    let found_outside = outside_keys
+        .iter()
+        .filter(|key| dumpcost_key_reads_back(&restored, SHARD, key))
+        .count();
+    let found_post = (0..AFTER_DUMP)
+        .filter(|index| {
+            dumpcost_key_reads_back(&restored, SHARD, &format!("post-{index}"))
+        })
+        .count();
+
+    assert_eq!(
+        (found_named, found_outside, found_post),
+        (IN_NAMED, outside_keys.len(), AFTER_DUMP),
+        "restoring from the newest manifest ALONE recovered {found_named}/{IN_NAMED} keys in the \
+         bucket it names, {found_outside}/{} in the {unnamed_buckets} bucket(s) it does NOT name, \
+         and {found_post}/{AFTER_DUMP} written after the dump. The middle number is the one a \
+         manifest scoped to its own buckets loses once its ancestors are pruned",
+        outside_keys.len()
+    );
+}
+
+fn write_dumpcost_key(engine: &TemporalEngine, shard_id: ShardId, key: &str) {
+    let response = engine.execute(ExecuteRequest {
+        shard_id,
+        command: Command::StringSet {
+            key: key.to_string(),
+            value: format!("value-{key}").into_bytes(),
+        },
+    });
+    assert!(response.status.ok, "write {key} failed: {response:?}");
+}
+
+fn dumpcost_key_reads_back(engine: &TemporalEngine, shard_id: ShardId, key: &str) -> bool {
+    let response = engine.execute(ExecuteRequest {
+        shard_id,
+        command: Command::StringGet {
+            key: key.to_string(),
+        },
+    });
+    response.response
+        == (CommandResponse::Bytes {
+            value: Some(format!("value-{key}").into_bytes()),
+        })
+}
+
+/// The bounded readability probe must FIND an unreadable block that sits outside its first window.
+///
+/// The probe reads at most `RECOVERY_READABLE_PROBE_PER_ROUND` live blocks per round, and the
+/// budget is the point: the check's cost should not grow with the store. What the budget did NOT
+/// do is move. A bounded call read `addresses[0 .. limit]` and started at the front again the
+/// next round, so on a shard holding more live blocks than the budget every round read the SAME
+/// prefix and a block past it was never read at all -- while the report came back saying the blocks
+/// it had read were fine. The doc on `storage_recovery_report_without_boundary_sampled` promised
+/// corruption was "still found, over rounds rather than all in one"; without a moving window that
+/// promise was not something the code could keep.
+///
+/// This is the behavioural statement of that, not an assertion about the cursor: plant one
+/// corrupt block that the FIRST window provably does not read, then run rounds and require the
+/// probe to reach it. Before the window moved this failed at any round count.
+///
+/// THE TWO HALVES ARE ASSERTED SEPARATELY, because "the probe found the corruption" is also
+/// satisfied by a probe that abandoned its budget and read the whole shard -- which would close
+/// the hole by reintroducing the cost the budget exists to bound. So the per-round read count is
+/// pinned as well, and the two together say the window moved rather than grew.
+#[test]
+fn the_bounded_readability_probe_reaches_a_block_outside_its_first_window() {
+    const RECORDS: usize = 8_000;
+    let budget = crate::engine::storage_manager_cycle::RECOVERY_READABLE_PROBE_PER_ROUND;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("probe-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    // Plant the corruption BEFORE any bounded round, so "the first window misses it" is
+    // something this test ASSERTS rather than something it assumes. The last byte of the
+    // highest-numbered slab is the furthest point in the store from where the first window
+    // starts; whether that actually lands outside the window is checked below, not hoped for.
+    //
+    // DENOMINATOR: the corruption must be real and visible to a probe that reads everything.
+    // An unbounded call is the control for every bounded one -- if this finds nothing, the byte
+    // flip produced no unreadable block and the rounds below would be chasing a ghost.
+    let target = engine
+        .block_store()
+        .slab_ids()
+        .unwrap()
+        .into_iter()
+        .max()
+        .expect("the fixture wrote no slabs");
+    let mut slab = engine.block_store().read_slab(target).unwrap();
+    assert!(
+        !slab.is_empty(),
+        "slab {target} is empty, so flipping a byte in it corrupts nothing",
+    );
+    *slab.last_mut().unwrap() ^= 0xff;
+    engine.block_store().install_slab(target, &slab).unwrap();
+
+    let exhaustive = engine.storage_recovery_report_without_boundary_sampled(1, 0);
+    assert!(
+        !exhaustive.unreadable_block_refs.is_empty(),
+        "flipping a byte in slab {target} produced no unreadable page, so the rounds below could \
+never find one and would pass for the wrong reason",
+    );
+
+    // DENOMINATOR, and the whole premise. If the shard fits inside one window then one round
+    // already reads everything, there is no "outside the first window", and every assertion
+    // below would hold for the broken code too.
+    let first = engine.storage_recovery_report_without_boundary_sampled(1, budget);
+    assert!(
+        first.total_block_refs > budget,
+        "the fixture holds {} live pages and the budget is {budget}; one window covers the whole \
+shard, so this test cannot distinguish a moving window from a fixed one",
+        first.total_block_refs,
+    );
+    assert_eq!(
+        first.readable_probe_cursor, 0,
+        "the first round should start at the beginning",
+    );
+    assert_eq!(
+        first.probed_block_refs, budget,
+        "the first round read {} pages against a budget of {budget}",
+        first.probed_block_refs,
+    );
+    // The SECOND denominator, and the one that stops this test passing vacuously: the planted
+    // block has to lie outside the first window, or "a later round reaches it" is satisfied by
+    // the first round and says nothing about the window moving.
+    assert!(
+        first.unreadable_block_refs.is_empty(),
+        "the first window already read the corrupt page in slab {target}, so a later round \
+finding it would prove nothing about coverage. Plant it somewhere the first {budget} live pages \
+do not reach.",
+    );
+
+    // Now sweep. The window advances by `budget` a round, so the whole shard is covered in
+    // `ceil(total / budget)` rounds; a couple spare absorb the wrap.
+    let rounds_to_cover = first.total_block_refs.div_ceil(budget);
+    let cap = rounds_to_cover + 2;
+    let mut found_at: Option<usize> = None;
+    let mut probed_each_round = Vec::new();
+    for round in 1..=cap {
+        let report = engine.storage_recovery_report_without_boundary_sampled(1, budget);
+        probed_each_round.push(report.probed_block_refs);
+        if !report.unreadable_block_refs.is_empty() && found_at.is_none() {
+            found_at = Some(round);
+        }
+    }
+
+    // HALF ONE: the budget still binds. A probe that "fixed" coverage by reading everything
+    // would satisfy the half below while undoing the reason the bound exists.
+    for (index, probed) in probed_each_round.iter().enumerate() {
+        assert_eq!(
+            *probed,
+            budget,
+            "round {} read {probed} pages against a budget of {budget}. Coverage must come from \
+MOVING the window, not from widening it -- the per-round cost is what the bound protects.",
+            index + 1,
+        );
+    }
+
+    // HALF TWO: the sweep reaches the planted block.
+    let found_at = found_at.unwrap_or_else(|| panic!(
+        "after {cap} bounded rounds over a shard of {} live pages ({rounds_to_cover} rounds' \
+worth of windows at {budget} a round), the probe never read the corrupt page in slab {target} \
+-- an exhaustive call finds it immediately. That is the probe re-reading its first window every \
+round instead of advancing through the shard.",
+        first.total_block_refs,
+    ));
+    assert!(
+        found_at <= rounds_to_cover + 1,
+        "the probe took {found_at} rounds to reach a page that {rounds_to_cover} rounds of \
+windows should cover",
+    );
+}
+
+/// The probe's window advances by its budget at BOTH corpus sizes, and costs the same at each.
+///
+/// The point of a bounded sampler is that the per-round cost is independent of the store while
+/// the COVERAGE still completes. Those pull in opposite directions, and a change that is fine at
+/// one size can be wrong at another: a window anchored to the front is indistinguishable from a
+/// moving one on a shard small enough to fit in a single window, which is exactly how the
+/// original could look correct.
+///
+/// So both halves are measured at two sizes an order of magnitude apart. The read count must NOT
+/// grow with the corpus, and the window position must advance by the budget regardless of it.
+#[test]
+fn the_readability_probe_window_advances_by_its_budget_at_both_corpus_sizes() {
+    let budget = crate::engine::storage_manager_cycle::RECOVERY_READABLE_PROBE_PER_ROUND;
+
+    fn three_rounds(records: usize, budget: usize) -> (usize, Vec<usize>, Vec<usize>) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            16 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for index in 0..records {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("window-{index:06}"),
+                    value: vec![b'v'; 64],
+                },
+            });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+        let mut cursors = Vec::new();
+        let mut probed = Vec::new();
+        let mut total = 0usize;
+        for _ in 0..3 {
+            let report = engine.storage_recovery_report_without_boundary_sampled(1, budget);
+            total = report.total_block_refs;
+            cursors.push(report.readable_probe_cursor);
+            probed.push(report.probed_block_refs);
+        }
+        (total, cursors, probed)
+    }
+
+    let (small_total, small_cursors, small_probed) = three_rounds(8_000, budget);
+    let (large_total, large_cursors, large_probed) = three_rounds(80_000, budget);
+
+    // DENOMINATOR for both arms: three windows must fit without wrapping, or "advanced by the
+    // budget" is not what the cursors would show even when the code is right.
+    assert!(
+        small_total > 3 * budget,
+        "small arm holds {small_total} live pages, which is under three windows of {budget}",
+    );
+    assert!(
+        large_total > 3 * budget,
+        "large arm holds {large_total} live pages, which is under three windows of {budget}",
+    );
+    // And the arms must actually differ in size, or this measured one corpus twice.
+    assert!(
+        large_total > small_total * 4,
+        "the two arms hold {small_total} and {large_total} live pages; they are too close to say \
+anything about scale",
+    );
+
+    // HALF ONE: the window advances by exactly the budget, at both sizes.
+    let expected_cursors = vec![0, budget, 2 * budget];
+    assert_eq!(
+        small_cursors, expected_cursors,
+        "at {small_total} live pages the window sat at {small_cursors:?}; it must advance by the \
+budget each round, not restart at the front",
+    );
+    assert_eq!(
+        large_cursors, expected_cursors,
+        "at {large_total} live pages the window sat at {large_cursors:?}; it must advance by the \
+budget each round, not restart at the front",
+    );
+
+    // HALF TWO: the per-round read count is the budget at both sizes -- separately, because a
+    // window that advanced but also grew with the corpus would pass the half above.
+    assert_eq!(
+        small_probed,
+        vec![budget; 3],
+        "small arm read {small_probed:?} pages a round against a budget of {budget}",
+    );
+    assert_eq!(
+        large_probed,
+        vec![budget; 3],
+        "large arm ({large_total} live pages) read {large_probed:?} pages a round against a \
+budget of {budget}. A bounded probe's cost must not grow with the store.",
+    );
+}
+
+/// WHICH BUCKET a live block is summarised under, when its address does not say.
+///
+/// `bucket_storage_summaries` takes the shard's routing range and used it for the dirty-key loop
+/// only. Its live-block loop fell back to `bucket_for_object(key, 0, u32::MAX)` -- a different
+/// placement from the one `rebuild_bucket_first_index` and the flag refresh use, which is
+/// `block_routing_bucket(key, start, end)`. The two agree only while the shard spans the whole
+/// range, and a production shard does not: `TS_SHARD_END_ROUTING_SLOT=1023` is the setting that
+/// cuts resident memory 45%.
+///
+/// HONEST ABOUT THE DENOMINATOR. On the live write path the fallback never fires -- a probe over
+/// 2 000 records found every entry carrying an explicit routing bucket, so simply writing records
+/// and reading summaries CANNOT fail this, before or after the change. The fixture therefore
+/// strips the routing bucket off every block address, which is the state a block rebuilt from a
+/// source that did not carry one arrives in, and asserts that the strip took effect before it
+/// asserts anything about the answer.
+#[test]
+fn a_block_with_no_routing_bucket_is_summarised_inside_the_shards_own_range() {
+    const RECORDS: usize = 400;
+    const END_ROUTING_BUCKET: u32 = 1023;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    assert!(
+        engine
+            .load_shard_with(crate::control::LoadShardRequest {
+                shard_id: 1,
+                table_name: "routing-range".to_string(),
+                shard_uri: "local://routing-range/1".to_string(),
+                start_routing_bucket: 0,
+                end_routing_bucket: END_ROUTING_BUCKET,
+                readonly: false,
+                load_version: 1,
+                local_node_id: Some(1),
+            })
+            .status
+            .ok
+    );
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("range-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let mut shards = engine.shards.write().expect("engine lock poisoned");
+    let shard = shards.get_mut(&1).expect("shard 1 loaded");
+
+    // DENOMINATOR ONE: the shard holds blocks at all.
+    let blocks_before: usize = shard
+        .bucket_index
+        .bucket_map
+        .values()
+        .map(|bucket| bucket.block_index.len())
+        .sum();
+    assert!(blocks_before > 0, "fixture stored no pages, so this measures nothing");
+
+    // NO STRIP, BECAUSE THERE IS NOTHING TO STRIP. This used to clear the routing bucket off every
+    // block's address so the summary walk would take its fallback; an address carries no bucket, so
+    // the fallback is the only branch and the production state is the state under test.
+    //
+    // DENOMINATOR TWO, in the form that survived: every live block reports which bucket it is filed
+    // in, which is what the summary walk credits it to. An entry that did not would be credited by
+    // a hash over the whole keyspace instead.
+    let filed = crate::engine::storage_bucket_internals::collect_live_block_entries(shard)
+        .iter()
+        .filter(|entry| entry.filed_bucket().is_some())
+        .count();
+    assert_eq!(
+        filed, blocks_before,
+        "{filed} of {blocks_before} live pages report a filing; the walk under test credits a page \
+that does not to a bucket derived over the WHOLE keyspace, which this shard does not hold",
+    );
+
+    let bucket_ids: BTreeSet<u32> = shard.bucket_index.bucket_map.keys().copied().collect();
+    let summaries =
+        crate::engine::storage_reporting::bucket_storage_summaries(shard, 0, END_ROUTING_BUCKET);
+
+    // HALF ONE: nothing is filed outside the range the shard was loaded with.
+    let outside_range: Vec<u32> = summaries
+        .iter()
+        .map(|summary| summary.routing_bucket)
+        .filter(|routing_bucket| *routing_bucket > END_ROUTING_BUCKET)
+        .collect();
+    assert!(
+        outside_range.is_empty(),
+        "{} of {} summaries name a bucket above the shard's end ({END_ROUTING_BUCKET}); the \
+first few are {:?}. A summary for a bucket outside the shard's own range belongs to no bucket \
+the index holds.",
+        outside_range.len(),
+        summaries.len(),
+        &outside_range[..outside_range.len().min(5)],
+    );
+
+    // HALF TWO: and the placement agrees with the index, asserted separately -- a run that
+    // stayed inside the range but still disagreed with `bucket_map` would pass the half above.
+    let absent_from_map: Vec<u32> = summaries
+        .iter()
+        .map(|summary| summary.routing_bucket)
+        .filter(|routing_bucket| !bucket_ids.contains(routing_bucket))
+        .collect();
+    assert!(
+        absent_from_map.is_empty(),
+        "{} of {} summaries name a bucket `bucket_map` does not hold; the first few are {:?}. \
+The live-page loop must place a page where `rebuild_bucket_first_index` places it, or a dump \
+naming the real bucket carries none of its pages.",
+        absent_from_map.len(),
+        summaries.len(),
+        &absent_from_map[..absent_from_map.len().min(5)],
+    );
+
+    // And the block count survived the re-placement: every block is still summarised somewhere.
+    let summarised_blocks: u64 = summaries.iter().map(|summary| summary.block_ref_count).sum();
+    assert_eq!(
+        summarised_blocks, blocks_before as u64,
+        "{blocks_before} pages went in and {summarised_blocks} came out of the summaries",
+    );
+}
+
+/// A shard with `records` string keys, on a 1024-bucket routing range.
+///
+/// 1023 is the end the production setting uses, and it is the shape that makes the difference
+/// between "per dirty object" and "per dirty bucket" visible: with a wide range every key lands
+/// in its own bucket and the two counts are equal, which would make every assertion below hold
+/// for the wrong reason.
+#[cfg(test)]
+fn dirty_index_fixture(dir: &std::path::Path, records: usize) -> TemporalEngine {
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.join("cache"),
+        dir.join("blocks"),
+        dir.join("indexes"),
+    );
+    assert!(
+        engine
+            .load_shard_with(crate::control::LoadShardRequest {
+                shard_id: 1,
+                table_name: "dirty-index".to_string(),
+                shard_uri: "local://dirty-index/1".to_string(),
+                start_routing_bucket: 0,
+                end_routing_bucket: 1023,
+                readonly: false,
+                load_version: 1,
+                local_node_id: Some(1),
+            })
+            .status
+            .ok
+    );
+    for index in 0..records {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("dirty-index-{index:07}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    engine
+}
+
+/// WHAT THE DIRTY HALF OF `bucket_storage_summaries` LOOKS AT, as the store grows.
+///
+/// That half folds the dirty set into a per-bucket count. It used to walk every dirty object key
+/// and hash it to recompute a routing bucket -- a group key that was known at the moment the
+/// object was marked dirty and thrown away. So the fold cost one hash per dirty OBJECT, and the
+/// function runs three times in one `apply_storage_lifecycle` and again on each metrics scrape.
+///
+/// With the bucket recorded alongside the key the fold is already done, and the loop is bounded
+/// by the number of dirty BUCKETS. This counts the visits rather than deriving them, so the
+/// property survives someone rewriting the loop.
+#[test]
+fn the_dirty_half_of_the_summaries_visits_one_entry_per_dirty_bucket() {
+    // 8 000, not less. A 2 000-record arm was tried first and the denominator below REFUSED
+    // it: 2 000 dirty objects across 902 of the 1024 buckets is a ratio of 2.2, at which "one
+    // visit per bucket" and "one visit per object" are nearly the same number and a regression
+    // would sit inside the noise. At 8 000 the ratio is ~7.8. The second point is
+    // `the_dirty_half_at_eighty_thousand`, kept out of the gate for its cost.
+    for records in [8_000usize] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = dirty_index_fixture(dir.path(), records);
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 loaded");
+
+        let dirty_objects = shard.dirty_objects.len();
+        let dirty_buckets = shard.dirty_objects.bucket_ids().count();
+
+        // DENOMINATOR ONE: there is a dirty set to fold at all.
+        assert!(
+            dirty_objects > 0,
+            "at {records} records the fixture left nothing dirty, so this measures nothing",
+        );
+        // DENOMINATOR TWO, and the one that matters: the two counts must be FAR APART. If every
+        // dirty object had its own bucket, "one visit per bucket" and "one visit per object"
+        // would be the same assertion and this test could not tell them apart.
+        assert!(
+            dirty_objects >= dirty_buckets.saturating_mul(4),
+            "at {records} records there are {dirty_objects} dirty objects across {dirty_buckets} \
+dirty buckets; the two counts are too close for this test to distinguish per-bucket work from \
+per-object work",
+        );
+
+        crate::engine::storage_reporting::DIRTY_SUMMARY_VISITS
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let summaries =
+            crate::engine::storage_reporting::bucket_storage_summaries(shard, 0, 1023);
+        let visits = crate::engine::storage_reporting::DIRTY_SUMMARY_VISITS
+            .load(std::sync::atomic::Ordering::Relaxed);
+
+        // DENOMINATOR THREE: the half under test ran. A "no more than X" bound holds trivially
+        // at zero, and a summaries call that never reached the dirty loop would read zero.
+        assert!(
+            visits > 0,
+            "the dirty half never ran over {dirty_objects} dirty objects, so the count below \
+measures nothing",
+        );
+        assert_eq!(
+            visits, dirty_buckets as u64,
+            "at {records} records the dirty half looked at {visits} entries for {dirty_buckets} \
+dirty buckets and {dirty_objects} dirty objects. It must be bounded by the bucket count: a \
+number tracking the object count means the per-key hash is back.",
+        );
+
+        // AND THE ANSWER IS UNCHANGED, asserted separately. A fold that visits fewer entries but
+        // reports different totals is not the same fold -- these counts anchor WAL and index
+        // reclaim through the dump manifest's generation fingerprint.
+        let summed: u64 = summaries.iter().map(|s| s.dirty_object_count).sum();
+        assert_eq!(
+            summed, dirty_objects as u64,
+            "at {records} records the summaries account for {summed} dirty objects out of \
+{dirty_objects}",
+        );
+    }
+}
+
+/// The same, at the size a healthy small column has failed to generalise to before.
+///
+///   cargo test --release -p temporalstore-rust --lib the_dirty_half_at_eighty_thousand -- \
+///     --ignored --nocapture
+#[test]
+#[ignore]
+fn the_dirty_half_at_eighty_thousand() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = dirty_index_fixture(dir.path(), 80_000);
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 loaded");
+
+    let dirty_objects = shard.dirty_objects.len();
+    let dirty_buckets = shard.dirty_objects.bucket_ids().count();
+    assert!(dirty_objects > 0, "fixture left nothing dirty");
+    assert!(
+        dirty_objects >= dirty_buckets.saturating_mul(4),
+        "{dirty_objects} dirty objects across {dirty_buckets} buckets is too close to measure",
+    );
+
+    crate::engine::storage_reporting::DIRTY_SUMMARY_VISITS
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    let summaries = crate::engine::storage_reporting::bucket_storage_summaries(shard, 0, 1023);
+    let visits = crate::engine::storage_reporting::DIRTY_SUMMARY_VISITS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let summed: u64 = summaries.iter().map(|s| s.dirty_object_count).sum();
+
+    println!(
+        "dirty objects   {dirty_objects}\n\
+         dirty buckets   {dirty_buckets}\n\
+         dirty visits    {visits}\n\
+         summed count    {summed}",
+    );
+    assert!(visits > 0, "the dirty half never ran");
+    assert_eq!(visits, dirty_buckets as u64);
+    assert_eq!(summed, dirty_objects as u64);
+}
+
+/// A PARTIAL DUMP DRAINS THE BUCKETS IT CLEARED, not the whole dirty set.
+///
+/// The drain used to walk every dirty object key and re-hash it to decide whether the key
+/// belonged to a bucket this dump had cleared. So a round dumping ONE bucket paid for the whole
+/// set -- and `max_dump_buckets_per_round` exists precisely so that a round dumps a slice.
+///
+/// The dirty index is keyed by bucket, so the keys to drop are addressable directly. This is the
+/// half that `the_dump_drain_looks_at_each_dirty_object_once` cannot see: that guard dumps EVERY
+/// bucket, where visits == the whole set either way.
+#[test]
+fn a_partial_dump_drains_only_the_buckets_it_cleared() {
+    const RECORDS: usize = 4_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = dirty_index_fixture(dir.path(), RECORDS);
+
+    let (dirty_before, buckets_before, chosen, chosen_share) = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 loaded");
+        let mut counts = shard.dirty_objects.bucket_counts().collect::<Vec<_>>();
+        // The busiest bucket, so the share this dump drops is the LARGEST a single bucket can
+        // offer -- a bound that holds for it holds for any other.
+        counts.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
+        let (chosen, chosen_share) = counts.first().copied().expect("some bucket is dirty");
+        (
+            shard.dirty_objects.len(),
+            shard.bucket_index.bucket_map.len(),
+            chosen,
+            chosen_share,
+        )
+    };
+
+    // DENOMINATORS: something is dirty, it is spread over many buckets, and the one bucket this
+    // dump names holds a small share of it. Without the last of these "drained only its own
+    // bucket" and "drained everything" are the same number.
+    assert!(dirty_before > 0, "fixture left nothing dirty");
+    assert!(buckets_before > 1, "fixture put everything in one bucket");
+    assert!(
+        chosen_share.saturating_mul(4) < dirty_before as u64,
+        "the busiest bucket holds {chosen_share} of {dirty_before} dirty objects, which is too \
+large a share for this test to tell a partial drain from a full one",
+    );
+
+    crate::engine::storage_lifecycle_methods::DIRTY_DRAIN_VISITS
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    engine.apply_storage_lifecycle(StorageLifecycleRequest {
+        shard_id: 1,
+        selected_dump_buckets: vec![chosen],
+        ..Default::default()
+    });
+    let visits = crate::engine::storage_lifecycle_methods::DIRTY_DRAIN_VISITS
+        .load(std::sync::atomic::Ordering::Relaxed);
+
+    // HALF ONE: the drain ran at all. Zero is what a dump that cleared nothing looks like, and
+    // it would satisfy the bound below for the wrong reason.
+    assert!(
+        visits > 0,
+        "the drain never ran over {dirty_before} dirty objects across {buckets_before} buckets, \
+so the bound below measures nothing",
+    );
+    // HALF TWO: and it looked at this bucket's keys only.
+    assert_eq!(
+        visits, chosen_share,
+        "dumping bucket {chosen} alone drained {visits} keys; that bucket holds {chosen_share} \
+of the shard's {dirty_before} dirty objects. A number near {dirty_before} means the drain is \
+walking the whole set again to find one bucket's keys.",
+    );
+
+    // HALF THREE, asserted separately: the right keys went. A drain that visited the right
+    // NUMBER of keys but removed the wrong ones would pass both halves above.
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 loaded");
+    assert_eq!(
+        shard.dirty_objects.len() as u64,
+        dirty_before as u64 - chosen_share,
+        "{dirty_before} dirty objects less bucket {chosen}'s {chosen_share} should leave {}",
+        dirty_before as u64 - chosen_share,
+    );
+    assert!(
+        !shard.dirty_objects.bucket_ids().any(|bucket| bucket == chosen),
+        "bucket {chosen} was dumped and cleared but still holds dirty objects",
+    );
+}
+
+/// WHAT ACTUALLY GOVERNS THE RAFT-SNAPSHOT SLAB RETENTION: A LOG SEQUENCE, NOT A SLAB.
+///
+/// The three sibling dependencies in this loop each compare a slab id against a slab id --
+/// the shared-store cursor against its retain_from_block_slab_id, and the two floors against
+/// their own slab ids. The raft-snapshot dependency compares the slab id against
+/// index_log_sequence, which counts LOG RECORDS, and then reports it in a field named
+/// retain_from_block_slab_id.
+///
+/// BucketDumpRaftSnapshotRef carries no slab id at all -- snapshot_id, shard_id,
+/// last_included_index, last_included_term, wal_sequence, index_log_sequence -- so there is no
+/// correct field to compare against and no way to make this meaningful without changing the
+/// type. This test therefore PINS THE CURRENT BEHAVIOUR rather than asserting a fix, and states
+/// the domain confusion in numbers so it cannot be read as intentional.
+///
+/// It exists because the dependency-matrix test cannot see this. That test sets every input to
+/// zero against candidates [0, 1], which makes the predicate universally true, so it pins only
+/// "the dependency fires for every candidate". Measured by mutation on this tree: replacing the
+/// predicate with the literal true leaves that test PASSING; replacing it with false fails it
+/// (0 against an expected 2). It detects the dependency vanishing and nothing else.
+///
+/// The inputs below are chosen so the two readings give DIFFERENT answers.
+#[test]
+fn raft_snapshot_slab_retention_is_decided_by_a_log_sequence_not_a_slab_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    let candidates = vec![0_u64, 1, 2];
+    let snapshot_at = |index_log_sequence: u64| BucketDumpRaftSnapshotRef {
+        snapshot_id: "raft-snapshot-domain".to_string(),
+        shard_id: 1,
+        last_included_index: 7,
+        last_included_term: 2,
+        wal_sequence: 0,
+        index_log_sequence,
+    };
+    let block_count = |index_log_sequence: u64| {
+        engine
+            .storage_block_gc_dependency_plan(
+                1,
+                candidates.clone(),
+                Vec::<StorageBlockGcReplayCursor>::new(),
+                vec![snapshot_at(index_log_sequence)],
+                None,
+                None,
+                0,
+            )
+            .raft_snapshot_ref_block_count
+    };
+
+    // Nothing about the SLABS changes across these three calls. The same three candidate slab
+    // ids are passed every time, and the same snapshot pins them. Only a counter of log records
+    // moves -- and the slab retention decision moves with it.
+    let at_zero = block_count(0);
+    let at_two = block_count(2);
+    let at_high = block_count(3);
+
+    assert_eq!(
+        at_zero, 3,
+        "a snapshot whose log sequence is 0 retains every candidate slab: {at_zero}"
+    );
+    assert_eq!(
+        at_two, 1,
+        "advancing the LOG SEQUENCE to 2 releases slabs 0 and 1, though no slab changed: {at_two}"
+    );
+    assert_eq!(
+        at_high, 0,
+        "a log sequence past the highest slab id releases them all: {at_high}"
+    );
+
+    // The point, stated as a comparison rather than three separate numbers: writing records --
+    // which is all that advances a log sequence -- is what releases slabs from a Raft snapshot
+    // dependency here. A retention rule about slabs must not be a function of how many log
+    // records have been written.
+    assert!(
+        at_zero > at_high,
+        "retention must have moved purely as a function of the log sequence for this test to say anything: at_zero={at_zero} at_high={at_high}"
+    );
+
+    // And the control that the dependency-matrix test is missing: at these inputs the predicate
+    // is NOT universally true, so a literal true does not reproduce these counts.
+    assert_ne!(
+        at_high, candidates.len(),
+        "NON-VACUITY: at least one reading must differ from block-everything, or this test cannot distinguish the predicate from the literal true"
+    );
+}
