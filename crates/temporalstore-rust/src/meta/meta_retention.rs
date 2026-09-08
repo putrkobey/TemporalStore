@@ -768,3 +768,774 @@ mod tests {
         // The retention clock must measure since the first drop; restarting it
         // would let a repeated no-op drop keep a table alive indefinitely.
         use crate::meta::*;
+        let meta = SingleNodeMeta::default();
+        meta.add_namespace(AddNamespaceRequest {
+            namespace: "ns".to_string(),
+        });
+        meta.add_table(AddTableRequest {
+            namespace: "ns".to_string(),
+            table_name: "orders".to_string(),
+            first_shard_id: 1,
+            shard_count: 1,
+            replica_count: 1,
+            partition_version: 0,
+            serving_options: TableServingOptions::default(),
+        });
+        let request = DeleteTableRequest {
+            namespace: "ns".to_string(),
+            table_name: "orders".to_string(),
+        };
+        assert!(meta.delete_table(request.clone()).status.ok);
+        let first = meta.export_snapshot().dropped_since_ms["table:ns/orders"];
+        // The second drop is refused, and must leave the clock where it was.
+        assert!(!meta.delete_table(request).status.ok);
+        assert_eq!(
+            meta.export_snapshot().dropped_since_ms["table:ns/orders"],
+            first
+        );
+    }
+
+    #[test]
+    fn a_purge_is_not_undone_by_a_restart() {
+        // The log still holds the register and the drop of everything this
+        // round forgets. If the purge itself is not recorded, replay brings all
+        // of it back and the GC has to forget it again on every boot -- so the
+        // state it exists to bound never actually shrinks.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("purge-mutations.jsonl");
+        {
+            let meta = purgeable(&log_path);
+            let report = meta.purge_expired_meta(purge_everything());
+            assert!(report.status.ok);
+            assert_eq!(report.plan.servers, vec!["node-a"]);
+            assert_eq!(report.plan.proxies, vec!["proxy-a"]);
+            assert_eq!(report.plan.tables, vec!["ns/orders"]);
+            assert!(meta.list_servers().servers.is_empty());
+        }
+
+        let recovered = crate::meta::SingleNodeMeta::with_mutation_log(&log_path).unwrap();
+        assert!(
+            recovered.list_servers().servers.is_empty(),
+            "the purged server came back"
+        );
+        assert!(
+            recovered.list_proxies().proxies.is_empty(),
+            "the purged proxy came back"
+        );
+        assert!(
+            recovered.list_tables().tables.is_empty(),
+            "the purged table came back"
+        );
+    }
+
+    #[test]
+    fn a_replayed_purge_forgets_exactly_what_the_live_round_forgot() {
+        // Retention is computed from the wall clock, so replay must apply the
+        // recorded list rather than re-plan: re-planning at a later `now` would
+        // purge a superset, and at a stricter setting a subset.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("selective-mutations.jsonl");
+        {
+            let meta = purgeable(&log_path);
+            let report = meta.purge_expired_meta(MetaRetentionOptions {
+                // Only the proxy is old enough to forget this round.
+                server_retention_ms: u64::MAX,
+                table_retention_ms: u64::MAX,
+                proxy_retention_ms: 0,
+                ..MetaRetentionOptions::default()
+            });
+            assert_eq!(report.plan.proxies, vec!["proxy-a"]);
+            assert!(report.plan.servers.is_empty());
+        }
+
+        let recovered = crate::meta::SingleNodeMeta::with_mutation_log(&log_path).unwrap();
+        assert!(recovered.list_proxies().proxies.is_empty());
+        assert_eq!(
+            recovered.list_servers().servers.len(),
+            1,
+            "a server the live round kept must survive replay"
+        );
+        assert_eq!(recovered.list_tables().tables.len(), 1);
+    }
+
+    #[test]
+    fn an_empty_round_records_nothing() {
+        // A GC that ticks every minute must not append a log entry per tick,
+        // or the log grows faster than the state it is bounding.
+        let dir = tempfile::tempdir().unwrap();
+        let log_path = dir.path().join("empty-round-mutations.jsonl");
+        let meta = crate::meta::SingleNodeMeta::with_mutation_log(&log_path).unwrap();
+        let before = std::fs::read_to_string(&log_path).unwrap_or_default();
+        for _ in 0..5 {
+            assert!(meta.purge_expired_meta(purge_everything()).status.ok);
+        }
+        let after = std::fs::read_to_string(&log_path).unwrap_or_default();
+        assert_eq!(before, after, "an empty retention round wrote to the log");
+    }
+
+    #[test]
+    fn a_frozen_resource_is_dropped_once_its_cooldown_expires() {
+        let plan = plan_freeze_aging(
+            &candidates(&[("s0", NOW - 7 * HOUR)]),
+            &candidates(&[("p0", NOW - 7 * HOUR)]),
+            &[],
+            NOW,
+            FreezeAgingOptions::default(),
+        );
+        assert_eq!(plan.servers, vec!["s0"]);
+        assert_eq!(plan.proxies, vec!["p0"]);
+        assert_eq!(plan.capped, 0);
+    }
+
+    #[test]
+    fn a_frozen_resource_inside_its_cooldown_is_left_alone() {
+        // A frozen node can still come back; dropping it early throws away the
+        // chance for it to re-register into the same identity.
+        let plan = plan_freeze_aging(
+            &candidates(&[("s0", NOW - 60_000)]),
+            &candidates(&[("p0", NOW - 60_000)]),
+            &[],
+            NOW,
+            FreezeAgingOptions::default(),
+        );
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn a_zero_threshold_disables_aging_for_that_kind() {
+        // Zero must mean "never", not "immediately" -- an unset knob that meant
+        // immediately would drop the whole fleet on the first round.
+        let plan = plan_freeze_aging(
+            &candidates(&[("s0", NOW - 7 * HOUR)]),
+            &[],
+            &[],
+            NOW,
+            aging(FreezeAgingOptions {
+                server_freeze_ms: 0,
+                ..FreezeAgingOptions::default()
+            }),
+        );
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn tables_are_not_aged_unless_asked() {
+        // Freezing a table is an operator action, and an operator who froze it
+        // may still intend to unfreeze it, so the default never ages one.
+        let frozen_tables = candidates(&[("ns/t0", NOW - 7 * HOUR)]);
+        assert!(plan_freeze_aging(
+            &[],
+            &[],
+            &frozen_tables,
+            NOW,
+            FreezeAgingOptions::default()
+        )
+        .is_empty());
+
+        let configured = plan_freeze_aging(
+            &[],
+            &[],
+            &frozen_tables,
+            NOW,
+            aging(FreezeAgingOptions {
+                table_freeze_ms: 6 * HOUR,
+                ..FreezeAgingOptions::default()
+            }),
+        );
+        assert_eq!(configured.tables, vec!["ns/t0"]);
+    }
+
+    #[test]
+    fn a_freeze_with_no_timestamp_is_never_aged() {
+        let plan = plan_freeze_aging(
+            &candidates(&[("legacy", 0)]),
+            &[],
+            &[],
+            NOW,
+            FreezeAgingOptions::default(),
+        );
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn the_per_round_cap_bounds_drops() {
+        let servers = (0..10)
+            .map(|index| RetentionCandidate {
+                id: format!("s{index}"),
+                dropped_since_ms: NOW - 7 * HOUR,
+            })
+            .collect::<Vec<_>>();
+        let plan = plan_freeze_aging(
+            &servers,
+            &[],
+            &[],
+            NOW,
+            aging(FreezeAgingOptions {
+                max_drops_per_round: 3,
+                ..FreezeAgingOptions::default()
+            }),
+        );
+        assert_eq!(plan.drop_count(), 3);
+        assert_eq!(plan.capped, 7);
+        assert_eq!(plan.servers, vec!["s0", "s1", "s2"]);
+    }
+
+    #[test]
+    fn a_dead_node_is_frozen_then_dropped_then_forgotten() {
+        // The whole point of this stage: retention only collects *dropped*
+        // resources, so without aging a node the failure detector froze would
+        // stay in the meta state -- and in every exported snapshot -- forever.
+        let meta = SingleNodeMeta::default();
+        meta.register_server(RegisterServerRequest {
+            registered_at_ms: 0,
+            numa_nodes: Vec::new(),
+            server_addr: "node-a".to_string(),
+            node_id: 1,
+            location: "rack-1".to_string(),
+            binary_version: "v1".to_string(),
+        });
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // The failure detector freezes it.
+        let frozen = meta.freeze_stale_resources(0);
+        assert_eq!(frozen.frozen_servers, vec!["node-a"]);
+        // Retention cannot see it: it is frozen, not dropped.
+        assert!(meta
+            .purge_expired_meta(MetaRetentionOptions {
+                server_retention_ms: 0,
+                proxy_retention_ms: 0,
+                table_retention_ms: 0,
+                max_purges_per_round: 20,
+            })
+            .plan
+            .is_empty());
+
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let aged = meta.age_frozen_meta(aging(FreezeAgingOptions {
+            server_freeze_ms: 1,
+            ..FreezeAgingOptions::default()
+        }));
+        assert!(aged.status.ok);
+        assert_eq!(aged.plan.servers, vec!["node-a"]);
+        assert_eq!(
+            meta.list_servers().servers[0].state,
+            MetaEntityState::Dropped
+        );
+
+        // Now retention can finish the job.
+        let purged = meta.purge_expired_meta(MetaRetentionOptions {
+            server_retention_ms: 0,
+            proxy_retention_ms: 0,
+            table_retention_ms: 0,
+            max_purges_per_round: 20,
+        });
+        assert_eq!(purged.plan.servers, vec!["node-a"]);
+        assert!(meta.list_servers().servers.is_empty());
+        assert!(meta.export_snapshot().servers.is_empty());
+    }
+
+    #[test]
+    fn a_round_that_stops_early_does_not_count_what_it_did_not_drop() {
+        // `temporalstore_meta_freeze_aged_total` is documented as "Frozen
+        // resources aged into the dropped state", but it was incremented from
+        // the plan before the round ran. A round returns on the first drop that
+        // fails and leaves the rest of the plan untouched, so the counter
+        // claimed resources had reached Dropped that are still sitting there
+        // frozen -- and a counter is exactly what an operator would trust to
+        // tell them aging is keeping up.
+        let meta = SingleNodeMeta::default();
+        meta.register_server(RegisterServerRequest {
+            registered_at_ms: 0,
+            numa_nodes: Vec::new(),
+            server_addr: "node-a".to_string(),
+            node_id: 1,
+            location: "rack-1".to_string(),
+            binary_version: "v1".to_string(),
+        });
+        meta.register_proxy(RegisterProxyRequest {
+            registered_at_ms: 0,
+            proxy_addr: "p1".to_string(),
+            namespace: String::new(),
+            location: "rack-1".to_string(),
+            config_version: 0,
+            binary_version: "v1".to_string(),
+        });
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let frozen = meta.freeze_stale_resources(0);
+        assert_eq!(frozen.frozen_servers, vec!["node-a"]);
+        assert_eq!(frozen.frozen_proxies, vec!["p1"]);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        // Muting metadata change refuses every drop the round attempts, so it
+        // stops on the first one. The background loop checks the mute before a
+        // round, but a round is many drops and the mute can land inside one.
+        assert!(meta.set_meta_change_muted(true).status.ok);
+
+        let report = meta.age_frozen_meta(aging(FreezeAgingOptions {
+            server_freeze_ms: 1,
+            proxy_freeze_ms: 1,
+            ..FreezeAgingOptions::default()
+        }));
+        assert!(
+            !report.status.ok,
+            "the round should have been refused: {report:?}"
+        );
+        assert_eq!(
+            meta.list_servers().servers[0].state,
+            MetaEntityState::Frozen,
+            "nothing was dropped, so the server is still frozen"
+        );
+
+        let exported = meta.subsystem_metrics().prometheus();
+        assert!(
+            exported.contains("temporalstore_meta_freeze_aged_total{kind=\"proxy\"} 0"),
+            "counted a proxy the round never dropped:\n{exported}"
+        );
+        assert!(
+            exported.contains("temporalstore_meta_freeze_aged_total{kind=\"server\"} 0"),
+            "counted a server the round never dropped:\n{exported}"
+        );
+        // The round still happened, and the cap it hit is still the plan's.
+        assert!(
+            exported.contains("temporalstore_meta_detector_rounds_total{subsystem=\"freeze_aging\"} 1"),
+            "the round itself stopped being counted:\n{exported}"
+        );
+    }
+
+    #[test]
+    fn a_server_that_comes_back_is_not_aged() {
+        // Re-registering clears frozen_since_ms, so the cooldown does not keep
+        // running underneath a node that is serving again.
+        let meta = SingleNodeMeta::default();
+        let register = || {
+            meta.register_server(RegisterServerRequest {
+                registered_at_ms: 0,
+                numa_nodes: Vec::new(),
+                server_addr: "node-a".to_string(),
+                node_id: 1,
+                location: "rack-1".to_string(),
+                binary_version: "v1".to_string(),
+            })
+        };
+        register();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        meta.freeze_stale_resources(0);
+        assert!(register().status.ok);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let aged = meta.age_frozen_meta(aging(FreezeAgingOptions {
+            server_freeze_ms: 1,
+            ..FreezeAgingOptions::default()
+        }));
+        assert!(aged.plan.is_empty());
+        assert_eq!(meta.list_servers().servers[0].state, MetaEntityState::Normal);
+    }
+
+    #[test]
+    fn a_frozen_table_gets_a_clock_that_unfreezing_clears() {
+        let meta = SingleNodeMeta::default();
+        meta.add_namespace(AddNamespaceRequest {
+            namespace: "ns".to_string(),
+        });
+        meta.add_table(AddTableRequest {
+            namespace: "ns".to_string(),
+            table_name: "orders".to_string(),
+            first_shard_id: 1,
+            shard_count: 1,
+            replica_count: 1,
+            partition_version: 0,
+            serving_options: TableServingOptions::default(),
+        });
+        let request = DeleteTableRequest {
+            namespace: "ns".to_string(),
+            table_name: "orders".to_string(),
+        };
+        assert!(meta.freeze_table(request.clone()).status.ok);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+
+        let options = aging(FreezeAgingOptions {
+            table_freeze_ms: 1,
+            ..FreezeAgingOptions::default()
+        });
+        assert_eq!(meta.plan_freeze_aging_now(options).tables, vec!["ns/orders"]);
+
+        // Unfreezing takes it back out of scope.
+        assert!(meta.unfreeze_table(request).status.ok);
+        assert!(meta.plan_freeze_aging_now(options).is_empty());
+    }
+
+    #[test]
+    fn a_frozen_tables_clock_survives_a_snapshot_round_trip() {
+        let meta = SingleNodeMeta::default();
+        meta.add_namespace(AddNamespaceRequest {
+            namespace: "ns".to_string(),
+        });
+        meta.add_table(AddTableRequest {
+            namespace: "ns".to_string(),
+            table_name: "orders".to_string(),
+            first_shard_id: 1,
+            shard_count: 1,
+            replica_count: 1,
+            partition_version: 0,
+            serving_options: TableServingOptions::default(),
+        });
+        assert!(meta
+            .freeze_table(DeleteTableRequest {
+                namespace: "ns".to_string(),
+                table_name: "orders".to_string(),
+            })
+            .status
+            .ok);
+        let snapshot = meta.export_snapshot();
+        assert_eq!(snapshot.frozen_since_ms.len(), 1);
+
+        let restored = SingleNodeMeta::default();
+        assert!(restored.install_snapshot(snapshot).status.ok);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        assert_eq!(
+            restored
+                .plan_freeze_aging_now(aging(FreezeAgingOptions {
+                    table_freeze_ms: 1,
+                    ..FreezeAgingOptions::default()
+                }))
+                .tables,
+            vec!["ns/orders"]
+        );
+    }
+
+    fn candidates(pairs: &[(&str, u64)]) -> Vec<RetentionCandidate> {
+        pairs
+            .iter()
+            .map(|(id, dropped_since_ms)| RetentionCandidate {
+                id: (*id).to_string(),
+                dropped_since_ms: *dropped_since_ms,
+            })
+            .collect()
+    }
+
+    fn map(pairs: &[(ShardId, &str)]) -> BTreeMap<ShardId, String> {
+        pairs
+            .iter()
+            .map(|(shard_id, value)| (*shard_id, (*value).to_string()))
+            .collect()
+    }
+
+    fn plan(
+        servers: &[RetentionCandidate],
+        proxies: &[RetentionCandidate],
+        tables: &[RetentionCandidate],
+        shard_owners: &BTreeMap<ShardId, String>,
+        shard_tables: &BTreeMap<ShardId, String>,
+        options: MetaRetentionOptions,
+    ) -> MetaRetentionPlan {
+        plan_meta_retention(
+            servers,
+            proxies,
+            tables,
+            shard_owners,
+            shard_tables,
+            NOW,
+            options,
+        )
+    }
+
+    #[test]
+    fn delete_markers_past_their_retention_are_collected() {
+        let result = plan(
+            &candidates(&[("old-server", NOW - 2 * DAY)]),
+            &candidates(&[("old-proxy", NOW - 2 * DAY)]),
+            &candidates(&[("ns/old-table", NOW - 2 * DAY)]),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            MetaRetentionOptions::default(),
+        );
+        assert_eq!(result.servers, vec!["old-server"]);
+        assert_eq!(result.proxies, vec!["old-proxy"]);
+        assert_eq!(result.tables, vec!["ns/old-table"]);
+        assert_eq!(result.capped, 0);
+    }
+
+    #[test]
+    fn a_recent_delete_marker_is_kept() {
+        // Retention exists so an operator can still see what was decommissioned
+        // an hour ago.
+        let result = plan(
+            &candidates(&[("recent", NOW - 60_000)]),
+            &candidates(&[("recent-proxy", NOW - 60_000)]),
+            &candidates(&[("ns/recent", NOW - 60_000)]),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            MetaRetentionOptions::default(),
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn a_dropped_server_that_still_owns_a_shard_is_held_back() {
+        // Forgetting it would leave the owner map naming an address the
+        // metaserver knows nothing about, which is worse than the tombstone.
+        let result = plan(
+            &candidates(&[("owner", NOW - 2 * DAY)]),
+            &[],
+            &[],
+            &map(&[(1, "owner")]),
+            &BTreeMap::new(),
+            MetaRetentionOptions::default(),
+        );
+        assert!(result.servers.is_empty());
+        assert_eq!(result.blocked_servers, vec!["owner"]);
+    }
+
+    #[test]
+    fn the_server_is_collected_once_its_shard_has_moved_away() {
+        let result = plan(
+            &candidates(&[("owner", NOW - 2 * DAY)]),
+            &[],
+            &[],
+            &map(&[(1, "somebody-else")]),
+            &BTreeMap::new(),
+            MetaRetentionOptions::default(),
+        );
+        assert_eq!(result.servers, vec!["owner"]);
+        assert!(result.blocked_servers.is_empty());
+    }
+
+    #[test]
+    fn a_purged_tables_shard_routes_go_with_it() {
+        // They already resolve to nothing: get_table_topology refuses a dropped
+        // table. Leaving them behind orphans them permanently.
+        let result = plan(
+            &[],
+            &[],
+            &candidates(&[("ns/gone", NOW - 2 * DAY)]),
+            &map(&[(1, "s1"), (2, "s1"), (3, "s1")]),
+            &map(&[(1, "ns/gone"), (2, "ns/gone"), (3, "ns/stays")]),
+            MetaRetentionOptions::default(),
+        );
+        assert_eq!(result.tables, vec!["ns/gone"]);
+        assert_eq!(result.shards, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_delete_marker_with_no_timestamp_is_left_alone() {
+        // Pre-existing tombstones carry no drop time. Treating a missing
+        // timestamp as "infinitely old" would purge the entire history on the
+        // first round after an upgrade.
+        let result = plan(
+            &candidates(&[("legacy", 0)]),
+            &candidates(&[("legacy-proxy", 0)]),
+            &candidates(&[("ns/legacy", 0)]),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            MetaRetentionOptions::default(),
+        );
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn the_per_round_cap_bounds_how_much_one_pass_rewrites() {
+        // Decommissioning a rack retires many resources at once; rewriting most
+        // of the meta state in one pass would stall every other operation behind
+        // the write lock.
+        let servers = (0..10)
+            .map(|index| (format!("s{index}"), NOW - 2 * DAY))
+            .collect::<Vec<_>>();
+        let servers = servers
+            .iter()
+            .map(|(id, dropped)| RetentionCandidate {
+                id: id.clone(),
+                dropped_since_ms: *dropped,
+            })
+            .collect::<Vec<_>>();
+        let result = plan(
+            &servers,
+            &[],
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            MetaRetentionOptions {
+                max_purges_per_round: 3,
+                ..MetaRetentionOptions::default()
+            },
+        );
+        assert_eq!(result.purge_count(), 3);
+        assert_eq!(result.capped, 7);
+        // Deterministic: the lowest addresses go first.
+        assert_eq!(result.servers, vec!["s0", "s1", "s2"]);
+    }
+
+    #[test]
+    fn the_cap_spends_on_proxies_before_servers() {
+        // Proxies have no dependents, so they are the cheapest thing to forget.
+        let result = plan(
+            &candidates(&[("s0", NOW - 2 * DAY)]),
+            &candidates(&[("p0", NOW - 2 * DAY)]),
+            &[],
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            MetaRetentionOptions {
+                max_purges_per_round: 1,
+                ..MetaRetentionOptions::default()
+            },
+        );
+        assert_eq!(result.proxies, vec!["p0"]);
+        assert!(result.servers.is_empty());
+        assert_eq!(result.capped, 1);
+    }
+
+    #[test]
+    fn each_resource_kind_ages_on_its_own_clock() {
+        let result = plan(
+            &candidates(&[("s0", NOW - 2 * DAY)]),
+            &candidates(&[("p0", NOW - 2 * DAY)]),
+            &candidates(&[("ns/t0", NOW - 2 * DAY)]),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            MetaRetentionOptions {
+                server_retention_ms: DAY,
+                proxy_retention_ms: 60_000,
+                table_retention_ms: 7 * DAY,
+                ..MetaRetentionOptions::default()
+            },
+        );
+        assert_eq!(result.servers, vec!["s0"]);
+        assert_eq!(result.proxies, vec!["p0"]);
+        // The table is only two days old against a seven-day retention.
+        assert!(result.tables.is_empty());
+    }
+
+    #[test]
+    fn purging_removes_the_resources_from_meta_state_and_from_snapshots() {
+        let meta = SingleNodeMeta::default();
+        meta.register_server(RegisterServerRequest {
+            registered_at_ms: 0,
+            numa_nodes: Vec::new(),
+            server_addr: "node-a".to_string(),
+            node_id: 1,
+            location: "rack-1".to_string(),
+            binary_version: "v1".to_string(),
+        });
+        meta.register_proxy(RegisterProxyRequest {
+            registered_at_ms: 0,
+            proxy_addr: "proxy-a".to_string(),
+            namespace: "ns".to_string(),
+            location: "rack-1".to_string(),
+            config_version: 1,
+            binary_version: "v1".to_string(),
+        });
+        assert!(meta
+            .drop_server(StateChangeRequest {
+                reason: FreezeReason::Unspecified,
+                endpoint: "node-a".to_string(),
+                freeze_cooldown_ms: 0,
+            })
+            .status
+            .ok);
+        assert!(meta
+            .drop_proxy(StateChangeRequest {
+                reason: FreezeReason::Unspecified,
+                endpoint: "proxy-a".to_string(),
+                freeze_cooldown_ms: 0,
+            })
+            .status
+            .ok);
+
+        // The tombstones are visible until they age out.
+        assert_eq!(meta.list_servers().servers.len(), 1);
+        assert_eq!(meta.list_proxies().proxies.len(), 1);
+        assert!(meta
+            .purge_expired_meta(MetaRetentionOptions::default())
+            .plan
+            .is_empty());
+
+        let report = meta.purge_expired_meta(MetaRetentionOptions {
+            server_retention_ms: 0,
+            proxy_retention_ms: 0,
+            table_retention_ms: 0,
+            max_purges_per_round: 20,
+        });
+        assert!(report.status.ok);
+        assert_eq!(report.plan.servers, vec!["node-a"]);
+        assert_eq!(report.plan.proxies, vec!["proxy-a"]);
+        assert!(meta.list_servers().servers.is_empty());
+        assert!(meta.list_proxies().proxies.is_empty());
+        // And they are gone from the snapshot that raft peers install.
+        let snapshot = meta.export_snapshot();
+        assert!(snapshot.servers.is_empty());
+        assert!(snapshot.proxies.is_empty());
+    }
+
+    #[test]
+    fn a_resource_that_comes_back_loses_its_delete_marker_clock() {
+        // Re-registering a dropped server must not leave it scheduled for
+        // collection while it is serving.
+        let meta = SingleNodeMeta::default();
+        let register = || {
+            meta.register_server(RegisterServerRequest {
+                registered_at_ms: 0,
+                numa_nodes: Vec::new(),
+                server_addr: "node-a".to_string(),
+                node_id: 1,
+                location: "rack-1".to_string(),
+                binary_version: "v1".to_string(),
+            })
+        };
+        register();
+        meta.drop_server(StateChangeRequest {
+            reason: FreezeReason::Unspecified,
+            endpoint: "node-a".to_string(),
+            freeze_cooldown_ms: 0,
+        });
+        register();
+        let report = meta.purge_expired_meta(MetaRetentionOptions {
+            server_retention_ms: 0,
+            proxy_retention_ms: 0,
+            table_retention_ms: 0,
+            max_purges_per_round: 20,
+        });
+        assert!(report.plan.is_empty());
+        assert_eq!(meta.list_servers().servers.len(), 1);
+        // Not collected while serving is guaranteed by the candidate filter on
+        // its own. What actually has to be true is that the clock is gone, so
+        // the next drop starts a fresh one.
+        assert!(
+            !meta
+                .export_snapshot()
+                .dropped_since_ms
+                .contains_key("server:node-a"),
+            "the drop clock outlived the drop"
+        );
+    }
+
+    #[test]
+    fn drop_timestamps_survive_a_snapshot_round_trip() {
+        // A peer installing a snapshot must keep ageing the tombstones it
+        // inherits rather than restarting every one of their clocks.
+        let meta = SingleNodeMeta::default();
+        meta.register_server(RegisterServerRequest {
+            registered_at_ms: 0,
+            numa_nodes: Vec::new(),
+            server_addr: "node-a".to_string(),
+            node_id: 1,
+            location: "rack-1".to_string(),
+            binary_version: "v1".to_string(),
+        });
+        meta.drop_server(StateChangeRequest {
+            reason: FreezeReason::Unspecified,
+            endpoint: "node-a".to_string(),
+            freeze_cooldown_ms: 0,
+        });
+        let snapshot = meta.export_snapshot();
+        assert_eq!(snapshot.dropped_since_ms.len(), 1);
+
+        let restored = SingleNodeMeta::default();
+        assert!(restored.install_snapshot(snapshot).status.ok);
+        let report = restored.purge_expired_meta(MetaRetentionOptions {
+            server_retention_ms: 0,
+            proxy_retention_ms: 0,
+            table_retention_ms: 0,
+            max_purges_per_round: 20,
+        });
+        assert_eq!(report.plan.servers, vec!["node-a"]);
+    }
+}

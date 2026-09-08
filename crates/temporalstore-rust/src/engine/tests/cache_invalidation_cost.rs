@@ -154,3 +154,471 @@ fn in_situ_charge_per_record(records: usize) -> (f64, f64) {
     (
         row.allocs as f64 / records as f64,
         row.alloc_bytes as f64 / records as f64,
+    )
+}
+
+#[cfg(feature = "alloc-probe")]
+#[derive(Clone, Copy)]
+struct Arm {
+    label: &'static str,
+    allocs: u64,
+    bytes: u64,
+}
+
+#[cfg(feature = "alloc-probe")]
+impl Arm {
+    fn per(&self, n: usize) -> f64 {
+        self.allocs as f64 / n as f64
+    }
+    fn bytes_per(&self, n: usize) -> f64 {
+        self.bytes as f64 / n as f64
+    }
+}
+
+#[cfg(feature = "alloc-probe")]
+fn arm(label: &'static str, counts: AllocCounts) -> Arm {
+    Arm {
+        label,
+        allocs: counts.allocs,
+        bytes: counts.alloc_bytes,
+    }
+}
+
+/// Run the whole ladder at one corpus size, under one store path.
+#[cfg(feature = "alloc-probe")]
+fn ladder(n: usize, dir: &std::path::Path) -> Vec<Arm> {
+    let keys = corpus(n);
+
+    // Each arm gets its OWN cache, so an arm never inherits the tier state a previous arm left.
+    let key_cache = engine_cache(&dir.join("c-key"));
+    let peek_cache = engine_cache(&dir.join("c-peek"));
+    let mem_cache = engine_cache(&dir.join("c-mem"));
+    let full_cache = engine_cache(&dir.join("c-full"));
+    let batch_cache = engine_cache(&dir.join("c-batch"));
+    // The SAME cache this engine already builds when a node is configured without a disk cache
+    // tier -- `with_local_dirs_block_store_options_and_disk_cache(.., false)`. Not a hypothetical
+    // shape: a supported deployment, measured here beside the default one.
+    let no_disk_cache = MultiLayerCache::with_tiering_policy(
+        dir.join("c-nodisk"),
+        matrixcache::CacheTieringPolicy {
+            memory_capacity_bytes: MEMORY_CAPACITY,
+            pmem_capacity_bytes: 0,
+            ssd_capacity_bytes: 0,
+            ..Default::default()
+        },
+        matrixcache::CacheBlockOptions::default(),
+    );
+
+    // The shipped call returns a Result and `invalidate_cache_key` discards it. A cache that was
+    // never started answers `Err(Stopped)` and returns having done NOTHING, which would read as a
+    // very cheap invalidation rather than as an invalidation that did not happen.
+    assert!(
+        full_cache
+            .invalidate(&CacheKey::string(1, "started-probe"))
+            .is_ok(),
+        "the cache under measurement is not started, so `invalidate` returns early and every \
+         figure below is the cost of doing nothing"
+    );
+    let _ = key_cache.peek(&CacheKey::string(1, "started-probe"));
+
+    let key_only = arm(
+        "key_only",
+        measure(|| {
+            for key in &keys {
+                std::hint::black_box(CacheKey::string(1, key));
+            }
+        }),
+    );
+    let peek = arm(
+        "peek",
+        measure(|| {
+            for key in &keys {
+                std::hint::black_box(peek_cache.peek(&CacheKey::string(1, key)));
+            }
+        }),
+    );
+    let memory_only = arm(
+        "invalidate_memory_only",
+        measure(|| {
+            for key in &keys {
+                mem_cache.invalidate_memory_only(&CacheKey::string(1, key));
+            }
+        }),
+    );
+    let full = arm(
+        "invalidate",
+        measure(|| {
+            for key in &keys {
+                let _ = full_cache.invalidate(&CacheKey::string(1, key));
+            }
+        }),
+    );
+
+    // CANDIDATE, PRICED: one call per key replaced by one call per hundred keys. Same key set,
+    // same round; only WHEN each key leaves the cache changes.
+    let batched = arm(
+        "invalidate_batch(100)",
+        measure(|| {
+            for chunk in keys.chunks(100) {
+                let batch = chunk
+                    .iter()
+                    .map(|key| CacheKey::string(1, key))
+                    .collect::<Vec<_>>();
+                let _ = batch_cache.invalidate_batch(&batch);
+            }
+        }),
+    );
+    // CANDIDATE, PRICED: the disk cache tier switched off, which this engine already supports.
+    let no_disk = arm(
+        "invalidate@no-disk-tier",
+        measure(|| {
+            for key in &keys {
+                let _ = no_disk_cache.invalidate(&CacheKey::string(1, key));
+            }
+        }),
+    );
+
+    vec![key_only, peek, memory_only, full, batched, no_disk]
+}
+
+#[cfg(feature = "alloc-probe")]
+fn print_ladder(n: usize, arms: &[Arm]) {
+    println!("\n  {n} keys, cache cold, every key absent");
+    println!(
+        "  {:<24} {:>12} {:>10} {:>14} {:>11}",
+        "arm", "allocs", "per key", "alloc bytes", "B per key"
+    );
+    for entry in arms {
+        println!(
+            "  {:<24} {:>12} {:>10.3} {:>14} {:>11.1}",
+            entry.label,
+            entry.allocs,
+            entry.per(n),
+            entry.bytes,
+            entry.bytes_per(n)
+        );
+    }
+}
+
+/// The instrument's own control: plant a known number of allocations and recover exactly that many.
+///
+/// Without this the ladder cannot tell a correct reading from a counter that is off by a constant
+/// per iteration, and every difference it reports would inherit the error.
+///
+/// THE PROBE IS SPELLED OUT IN FULL BELOW ON PURPOSE. The repo-wide guard
+/// `every_counting_allocator_probe_is_gated_on_the_feature_that_installs_it` finds probe-reading
+/// tests by matching the fully qualified spelling of the counter type and its start call, so a
+/// module that imports those names and uses them bare is INVISIBLE to it. Measured, not assumed:
+/// with every read in this file going through the import, that guard scanned this file, found no
+/// markers at all, and went on passing after the feature gate on this very test was deleted.
+/// Written out below it sees this test, counts it, and fails if the gate is removed.
+///
+/// The marker must not appear in PROSE either, here or anywhere else. The guard walks BACKWARDS
+/// from each match to the nearest enclosing test attribute, and a doc comment sits above its own
+/// function's attributes -- so a marker written in a comment is attributed to the PREVIOUS test in
+/// the file, or to no test at all. Spelling it in this doc comment turned this guard red, which is
+/// how that was learned.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn the_span_counter_recovers_exactly_the_allocations_planted_in_it() {
+    const PLANTED: usize = 512;
+    let probe = crate::alloc_probe::Probe::start();
+    for index in 0..PLANTED {
+        std::hint::black_box(vec![0u8; 64 + index % 8]);
+    }
+    let counts: crate::alloc_probe::AllocCounts = probe.stop();
+    assert_eq!(
+        counts.allocs, PLANTED as u64,
+        "planted {PLANTED} allocations and the span counter recovered {}; every difference the \
+         ladder reports is taken with this instrument",
+        counts.allocs
+    );
+}
+
+/// Without the counting allocator every arm reads zero, which is indistinguishable from an
+/// invalidation that allocates nothing. Make not-counting representable rather than silent.
+#[test]
+fn the_invalidation_ladder_refuses_to_report_without_the_counting_allocator() {
+    let counted = crate::alloc_probe::counted_now();
+    #[cfg(feature = "alloc-probe")]
+    assert!(
+        counted.is_some(),
+        "built with `alloc-probe` and the counters are still absent"
+    );
+    #[cfg(not(feature = "alloc-probe"))]
+    assert!(
+        counted.is_none(),
+        "built without `alloc-probe`, so a reading here would be a table of zeros presented as a \
+         measurement"
+    );
+}
+
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "measurement; run with --features alloc-probe --ignored --nocapture"]
+fn where_the_allocations_of_one_cache_invalidation_go() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    println!(
+        "\nSTORE PATH HELD CONSTANT: {} ({} characters)",
+        dir.path().display(),
+        dir.path().as_os_str().len()
+    );
+
+    let small = ladder(SMALL, &dir.path().join("small"));
+    let large = ladder(LARGE, &dir.path().join("large"));
+    print_ladder(SMALL, &small);
+    print_ladder(LARGE, &large);
+
+    let find = |arms: &[Arm], label: &str| -> Arm {
+        *arms
+            .iter()
+            .find(|entry| entry.label == label)
+            .expect("arm present")
+    };
+
+    println!("\n  THE BREAKDOWN, per key, at {LARGE} keys");
+    println!("  {:<44} {:>10} {:>11}", "term", "allocs", "bytes");
+    let key_only = find(&large, "key_only");
+    let peek = find(&large, "peek");
+    let memory_only = find(&large, "invalidate_memory_only");
+    let full = find(&large, "invalidate");
+    let rows: Vec<(&str, f64, f64)> = vec![
+        (
+            "CacheKey::string (OUTSIDE the charged class)",
+            key_only.per(LARGE),
+            key_only.bytes_per(LARGE),
+        ),
+        (
+            "memory+pmem removal, pins, access record",
+            memory_only.per(LARGE) - key_only.per(LARGE),
+            memory_only.bytes_per(LARGE) - key_only.bytes_per(LARGE),
+        ),
+        (
+            "persistence bookkeeping (disk/ssd/pmem)",
+            full.per(LARGE) - memory_only.per(LARGE),
+            full.bytes_per(LARGE) - memory_only.bytes_per(LARGE),
+        ),
+    ];
+    for (label, allocs, bytes) in &rows {
+        println!("  {label:<44} {allocs:>10.3} {bytes:>11.1}");
+    }
+    let charged = full.per(LARGE) - key_only.per(LARGE);
+    println!(
+        "  {:<44} {:>10.3} {:>11.1}",
+        "= what the charged class pays (invalidate)",
+        charged,
+        full.bytes_per(LARGE) - key_only.bytes_per(LARGE)
+    );
+    println!(
+        "  {:<44} {:>10.3}",
+        "(read-side floor, for scale: peek)",
+        peek.per(LARGE) - key_only.per(LARGE)
+    );
+
+    // FLATNESS. Every arm is a per-key cost or the ladder is measuring its own fixture.
+    for (small_arm, large_arm) in small.iter().zip(large.iter()) {
+        assert_eq!(small_arm.label, large_arm.label);
+        let ratio = large_arm.per(LARGE) / small_arm.per(SMALL);
+        assert!(
+            ratio > 0.5 && ratio < 2.0,
+            "{} costs {:.3} allocations a key at {SMALL} and {:.3} at {LARGE} ({ratio:.3}x); a \
+             ladder rung that is not flat is measuring the loop, not the call",
+            small_arm.label,
+            small_arm.per(SMALL),
+            large_arm.per(LARGE)
+        );
+    }
+
+    // NON-VACUITY: a rung that costs nothing is a rung that did not run.
+    for entry in &large {
+        assert!(
+            entry.allocs > 0,
+            "{} allocated nothing across {LARGE} keys",
+            entry.label
+        );
+    }
+
+    // THE FINDING, AS AN ASSERTION. Dropping the key from the memory and pmem maps, clearing its
+    // pin entry and emitting the access record costs NOTHING beyond building the key: the whole
+    // 27 is the persistence bookkeeping underneath it. If a later revision of the cache changes
+    // that, this is where it is noticed rather than in a table nobody re-reads.
+    assert!(
+        memory_only.per(LARGE) - key_only.per(LARGE) < 1.0,
+        "the memory-tier half of an invalidation now costs {:.3} allocations a key on top of the \
+         key itself; it was free when this was measured, and the claim that the whole cost is \
+         persistence bookkeeping rests on it being free",
+        memory_only.per(LARGE) - key_only.per(LARGE)
+    );
+    // RETARGETED again when the cache pin moved to 81ba390, which builds the SSD store key in one
+    // allocation instead of nine. Measured on this ladder at both corpus sizes: 54.063 allocations
+    // a key two pins ago, 35.063 at the previous pin, 27.063 at this one.
+    //
+    // BANDED rather than floored, because the two ways this can go wrong point in opposite
+    // directions: a floor alone still passes if the removed bookkeeping comes back, and a ceiling
+    // alone still passes if the invalidation stops happening at all. The lower bound doubles as
+    // the vacuity floor -- a collapse toward zero reads as a free invalidation, which is what the
+    // original one-sided assertion was written to catch and what this must keep catching.
+    //
+    // NARROWED as well as moved, which is the part that mattered. The old 25..45 still contains
+    // the new 27.063, so it would have passed untouched and nobody would have looked -- but it
+    // also contains 35.063, so it could not have noticed the eight allocations this pin removes
+    // coming back. A band wide enough to hold both the before and the after cannot report the
+    // change it straddles. 22..32 keeps the measured 27.063 with about five either side, and
+    // fails on 35.063 above and on a collapse toward zero below.
+    let persistence = full.per(LARGE) - memory_only.per(LARGE);
+    assert!(
+        (22.0..32.0).contains(&persistence),
+        "the persistence term is {persistence:.3} allocations a key, outside the 22..32 this \
+         ladder expects: it measured 54.063 two cache pins ago, 35.063 at the previous pin and \
+         27.063 at this one, so a reading above the band means removed bookkeeping is back, and \
+         one below it means the invalidation stopped happening and this ladder is no longer \
+         measuring the shipped call"
+    );
+
+    // THE CANDIDATES, PRICED SEPARATELY. Neither is applied; both are measured so the reason for
+    // declining them carries a number.
+    let batched = find(&large, "invalidate_batch(100)");
+    let no_disk = find(&large, "invalidate@no-disk-tier");
+    println!("\n  CANDIDATES, priced against {:.3} allocations a key", full.per(LARGE));
+    println!(
+        "  {:<44} {:>10.3} {:>11.3}",
+        "one call per 100 keys instead of per key",
+        batched.per(LARGE),
+        full.per(LARGE) - batched.per(LARGE)
+    );
+    println!(
+        "  {:<44} {:>10.3} {:>11.3}",
+        "disk cache tier off (already supported)",
+        no_disk.per(LARGE),
+        full.per(LARGE) - no_disk.per(LARGE)
+    );
+    assert!(
+        batched.allocs > 0 && no_disk.allocs > 0,
+        "a priced candidate that allocated nothing did not run"
+    );
+
+    // THE RECONCILIATION, against an instrument this ladder does not feed, MEASURED IN THIS RUN
+    // rather than quoted from the pull request that found it. Taken at two corpus sizes so a fixed
+    // per-ingest cost divides away instead of hiding in a single number.
+    let (in_situ_small, in_situ_small_bytes) = in_situ_charge_per_record(SMALL);
+    let (in_situ_large, in_situ_large_bytes) = in_situ_charge_per_record(LARGE);
+    println!("\n  RECONCILIATION (two instruments, two workloads)");
+    println!(
+        "  {:<44} {:>10.3} {:>11.1}",
+        "in-situ class ledger, per record, 2,000", in_situ_small, in_situ_small_bytes
+    );
+    println!(
+        "  {:<44} {:>10.3} {:>11.1}",
+        "in-situ class ledger, per record, 20,000", in_situ_large, in_situ_large_bytes
+    );
+    println!(
+        "  {:<44} {:>10.3} {:>11.1}",
+        "this ladder, invalidate minus key_only",
+        charged,
+        full.bytes_per(LARGE) - key_only.bytes_per(LARGE)
+    );
+    let residual = in_situ_large - charged;
+    println!(
+        "  {:<44} {:>10.3}",
+        "residual (independent, not a row sum)", residual
+    );
+
+    // The in-situ charge must be a real reading, not a class nothing entered.
+    assert!(
+        in_situ_large > 0.0,
+        "the `cache_invalidation` class recorded nothing across {LARGE} records; either the write \
+         path stopped invalidating or the charge stopped being made, and both read as a free \
+         invalidation here"
+    );
+    // FLAT PER RECORD, which is the claim this whole subject rests on: a constant paid on every
+    // write, not a cost that grows with the store.
+    let in_situ_ratio = in_situ_large / in_situ_small;
+    assert!(
+        in_situ_ratio > 0.5 && in_situ_ratio < 2.0,
+        "the shipped call site charged {in_situ_small:.3} allocations a record at {SMALL} and \
+         {in_situ_large:.3} at {LARGE} ({in_situ_ratio:.3}x); this was FLAT when it was measured, \
+         and a per-write constant and a sink that grows with the store want opposite fixes"
+    );
+    assert!(
+        residual.abs() < 6.0,
+        "the ladder says one invalidation costs {charged:.3} allocations and the class ledger \
+         charged inside the shipped call site says {in_situ_large:.3}; a residual of \
+         {residual:.3} means the synthetic loop is not in the same regime as the write path and \
+         the breakdown above it describes something else"
+    );
+}
+
+/// WHICH PART OF THE COST MOVES WITH THE STORE'S DIRECTORY NAME.
+///
+/// #1922 recorded, without chasing it, that `cache_invalidation`'s BYTES per record went
+/// 1,474 -> 1,546 -> 1,606 across store paths of 15, 27 and 37 characters while its allocation
+/// COUNT did not move at all. This says where that lives: the same invalidation, the same keys,
+/// two cache directories differing only in name length.
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "measurement; run with --features alloc-probe --ignored --nocapture"]
+fn the_bytes_an_invalidation_allocates_move_with_the_cache_directory_name() {
+    const N: usize = 5_000;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let keys = corpus(N);
+
+    let short = dir.path().join("s");
+    let long = dir.path().join("l".repeat(65));
+    let extra = long.as_os_str().len() - short.as_os_str().len();
+
+    let short_cache = engine_cache(&short);
+    let long_cache = engine_cache(&long);
+
+    let short_counts = measure(|| {
+        for key in &keys {
+            let _ = short_cache.invalidate(&CacheKey::string(1, key));
+        }
+    });
+    let long_counts = measure(|| {
+        for key in &keys {
+            let _ = long_cache.invalidate(&CacheKey::string(1, key));
+        }
+    });
+
+    let short_allocs = short_counts.allocs as f64 / N as f64;
+    let long_allocs = long_counts.allocs as f64 / N as f64;
+    let short_bytes = short_counts.alloc_bytes as f64 / N as f64;
+    let long_bytes = long_counts.alloc_bytes as f64 / N as f64;
+    println!(
+        "\n  cache dir {extra} chars longer, {N} invalidations each\n  \
+         {:<24} {:>10} {:>12}\n  {:<24} {:>10.3} {:>12.1}\n  {:<24} {:>10.3} {:>12.1}\n  \
+         {:<24} {:>10.3} {:>12.1}",
+        "arm",
+        "allocs/key",
+        "bytes/key",
+        "short path",
+        short_allocs,
+        short_bytes,
+        "long path",
+        long_allocs,
+        long_bytes,
+        "delta",
+        long_allocs - short_allocs,
+        long_bytes - short_bytes,
+    );
+
+    assert!(
+        short_counts.allocs > 0 && long_counts.allocs > 0,
+        "nothing was counted, so neither column is a measurement"
+    );
+    // THE COUNT DOES NOT MOVE. This is the half of #1922's observation that says the effect is
+    // capacity, not extra calls -- the same allocations, asked for more bytes.
+    assert!(
+        (long_allocs - short_allocs).abs() < 1.0,
+        "the allocation COUNT moved {short_allocs:.3} -> {long_allocs:.3} with nothing but the \
+         directory name; #1922 recorded the count as unchanged and only the bytes moving"
+    );
+    // AND THE BYTES DO. Asserted as a floor rather than a value: how much depends on how the
+    // allocator rounds a growing path buffer, and that is not this repository's to pin.
+    assert!(
+        long_bytes > short_bytes,
+        "a cache directory {extra} characters longer allocated {long_bytes:.1} bytes a key \
+         against {short_bytes:.1}; #1922's observation that the byte cost follows the store path \
+         does not reproduce, so the note it left should be corrected rather than repeated"
+    );
+}
