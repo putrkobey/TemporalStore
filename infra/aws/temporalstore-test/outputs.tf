@@ -26,3 +26,32 @@ output "data_nodes" {
       private_ip = instance.private_ip
       public_ip  = instance.public_ip
       cache_ebs  = aws_ebs_volume.data_cache[name].id
+    }
+  }
+}
+
+output "metaservers" {
+  value = {
+    for name, instance in aws_instance.metaserver :
+    name => {
+      id             = instance.id
+      private_ip     = instance.private_ip
+      public_ip      = instance.public_ip
+      monitoring_url = "http://${instance.public_ip}:8088/"
+    }
+  }
+}
+
+output "monitoring_urls" {
+  value = {
+    for name, instance in aws_instance.metaserver :
+    name => "http://${instance.public_ip}:8088/"
+  }
+}
+
+output "ssm_commands" {
+  value = {
+    data_1 = "aws ssm start-session --profile ${var.aws_profile} --region ${var.aws_region} --target ${aws_instance.data["data-01"].id}"
+    meta_1 = "aws ssm start-session --profile ${var.aws_profile} --region ${var.aws_region} --target ${aws_instance.metaserver["meta-01"].id}"
+  }
+}
