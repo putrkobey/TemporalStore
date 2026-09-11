@@ -33,3 +33,75 @@ fn engine() -> TemporalEngine {
     engine
 }
 
+fn mark(engine: &TemporalEngine, node: u64, ts: u64, depth: u32) {
+    let r = engine
+        .execute(ExecuteRequest {
+            shard_id: SHARD_ID,
+            command: Command::ContextMarkSummaryDirty {
+                tenant_hash: TENANT,
+                node_hash: node,
+                event_time_ms: ts,
+                reason: 1,
+                propagate_depth: depth,
+            },
+        })
+        .response;
+    assert!(matches!(r, CommandResponse::ContextObjectKey { .. }));
+}
+
+fn query(engine: &TemporalEngine, node: u64, start: u64, end: u64) -> Vec<ContextDirtyNode> {
+    match engine
+        .execute(ExecuteRequest {
+            shard_id: SHARD_ID,
+            command: Command::ContextQuerySummaryDirty {
+                tenant_hash: TENANT,
+                node_hash: node,
+                start_time_ms: start,
+                end_time_ms: end,
+                limit: None,
+            },
+        })
+        .response
+    {
+        CommandResponse::ContextSummaryDirtyNodes { nodes, .. } => nodes,
+        other => panic!("unexpected: {other:?}"),
+    }
+}
+
+fn main() {
+    // 1) Coalescing: three out-of-order marks for one node -> one marker, latest ts, max depth.
+    let e = engine();
+    mark(&e, 42, 1_000, 1);
+    mark(&e, 42, 3_000, 2);
+    mark(&e, 42, 2_000, 1);
+    let m = query(&e, 42, 0, 10_000);
+    assert_eq!(m.len(), 1, "coalesce to one");
+    assert_eq!(m[0].last_event_time_ms, 3_000, "latest ts wins");
+    assert_eq!(m[0].first_event_time_ms, 1_000, "and the span keeps the earliest");
+    assert_eq!(m[0].mark_count, 3, "three marks, one entry");
+    assert_eq!(m[0].propagate_depth, 2, "max depth wins");
+
+    // 2) Distinct nodes independent.
+    mark(&e, 99, 5_000, 3);
+    assert_eq!(query(&e, 42, 0, 10_000).len(), 1);
+    assert_eq!(query(&e, 99, 0, 10_000)[0].propagate_depth, 3);
+
+    // 3) Time window still filters; unknown node empty.
+    assert!(query(&e, 42, 8_000, 9_000).is_empty(), "after-range empty");
+    assert!(query(&e, 42, 0, 500).is_empty(), "before-range empty");
+    assert!(query(&e, 7, 0, 10_000).is_empty(), "unknown node empty");
+
+    // 4) Bounded: 500 marks on one node stay one marker (the whole point).
+    let e2 = engine();
+    for i in 0..500u64 {
+        mark(&e2, 42, 1_000 + i, (i % 4) as u32);
+    }
+    let m2 = query(&e2, 42, 0, 10_000_000);
+    assert_eq!(m2.len(), 1, "500 marks -> 1 coalesced marker");
+    assert_eq!(m2[0].last_event_time_ms, 1_499);
+    assert_eq!(m2[0].first_event_time_ms, 1_000);
+    assert_eq!(m2[0].mark_count, 500, "500 marks recorded, still one entry");
+    assert_eq!(m2[0].propagate_depth, 3);
+
+    println!("inmemory_dirty_check: OK (coalescing, latest-ts, max-depth, window-filter, bounded 500->1)");
+}
