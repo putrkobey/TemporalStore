@@ -53,3 +53,115 @@ ts_profile_perf_flags() {
   # WAL: binary framing. Records are protobuf unconditionally now, so there is no
   # longer a variable for that half of it.
   export TS_WAL_BINARY_FRAME="${TS_WAL_BINARY_FRAME:-1}"
+  export TS_WAL_OUTCOME_ITEMS="${TS_WAL_OUTCOME_ITEMS:-1}"
+  export TS_WAL_DATA_ONLY="${TS_WAL_DATA_ONLY:-1}"
+  # One fsync barrier per commit instead of the historical three. There is no variable to
+  # export for it: TS_WAL_SINGLE_BARRIER is read by nothing, so setting it did nothing, and
+  # this profile exported it anyway. Single-barrier is the DEFAULT -- engine::wal_single_barrier
+  # is `!wal_legacy_recovery()` -- so the behaviour this line promised is what you already get.
+  # The live escape hatch, if you ever want the historical three barriers back, is
+  # TS_WAL_LEGACY_RECOVERY=1. Kept as a comment rather than deleted so the name stays greppable
+  # for anyone who set it in a fork and wondered why nothing changed.
+  # Grow the WAL in chunks rather than a syscall per append.
+  export TS_WAL_PREALLOCATE="${TS_WAL_PREALLOCATE:-1}"
+
+  # Index log: binary codec rather than JSON lines.
+
+  # Embeddings: uniform scale=1e4 quantization, 1024 B for a 384-dim vector.
+  #
+  # This is the encoding that SHIPS, and it is not int8. Measured over 713 real
+  # document chunks with 8 bilingual queries, uniform scaling held every query's
+  # top-1 and the exact order of all 10 hits; int8 kept a 0.99983 reconstruction
+  # cosine and still lost one top-1 and reordered 5 of 8 result lists. Uniform
+  # scaling is rank-preserving and per-vector peak scaling is not, and rank is
+  # what retrieval serves. Set TS_VECTOR_INT8=1 to trade that for half the bytes.
+  export TS_VECTOR_SCALED="${TS_VECTOR_SCALED:-1}"
+
+  # Drain dirty rows into embeddings/extraction twice a second, so a write is
+  # searchable without waiting for a batch job.
+  export MATRIXARK_EMBED_DRAINER="${MATRIXARK_EMBED_DRAINER:-1}"
+  export MATRIXARK_EMBED_DRAINER_INTERVAL_MS="${MATRIXARK_EMBED_DRAINER_INTERVAL_MS:-500}"
+
+  # Page store compression.
+  export TS_BLOCK_STORE_COMPRESSION_ENABLED="${TS_BLOCK_STORE_COMPRESSION_ENABLED:-${TS_PAGE_STORE_COMPRESSION_ENABLED:-1}}"
+}
+
+# --- data directories --------------------------------------------------------
+ts_profile_dirs() {
+  # Same rule as the container entrypoint: an existing profile keeps the directory it was
+  # created with, a new one is created under the canonical name.
+  if [ -d "${TS_PROFILE_DATA}/blocks" ] && [ ! -d "${TS_PROFILE_DATA}/blocks" ]; then
+    _ts_default_block_dir="${TS_PROFILE_DATA}/blocks"
+  else
+    _ts_default_block_dir="${TS_PROFILE_DATA}/blocks"
+  fi
+  export TS_BLOCK_STORE_DIR="${TS_BLOCK_STORE_DIR:-${TS_PAGE_STORE_DIR:-${_ts_default_block_dir}}}"
+  export TS_CACHE_DIR="${TS_CACHE_DIR:-${TS_PROFILE_DATA}/cache}"
+  export TS_INDEX_DIR="${TS_INDEX_DIR:-${TS_PROFILE_DATA}/index}"
+  export TS_BLOB_STORE_DIR="${TS_BLOB_STORE_DIR:-${TS_BLOCK_STORE_DIR}/blobs}"
+  mkdir -p "$TS_BLOCK_STORE_DIR" "$TS_CACHE_DIR" "$TS_INDEX_DIR" "$TS_BLOB_STORE_DIR" \
+           "$(dirname "$TS_PROFILE_LOG")"
+}
+
+# --- launch, then make the node prove which profile it resolved --------------
+#
+# The node derives its profile from the topology it is actually running, so
+# reading it back is the only way to know the script's intent survived. A
+# launcher that announces "one-box" while the node resolved shared-storage is
+# precisely the confusion these three scripts exist to end - so it is checked,
+# and a mismatch is a failed deploy rather than a surprise weeks later.
+ts_profile_launch() {
+  : "${TS_PROFILE_EXPECT:?profile script must set TS_PROFILE_EXPECT}"
+  [[ -x "$TS_PROFILE_BIN" ]] || { echo "[deploy] no datanode at ${TS_PROFILE_BIN}" >&2; exit 1; }
+  ts_profile_perf_flags
+  ts_profile_dirs
+
+  # Env-only: set the profile up and start nothing.
+  #
+  # Sourcing a profile script to borrow its environment is a normal thing to want -- a
+  # harness that starts the node itself, a tool that only needs the paths and flags. Without
+  # this the source LAUNCHES a datanode, so a caller that then starts its own gets the
+  # profile's node on the port and its own dying with `Address already in use`. The caller's
+  # later exports never reach the process that ends up serving, which reads as a flag that
+  # does not work rather than a node it did not start.
+  #
+  # The env and the directories are still established above, because that is what the caller
+  # asked for; only the launch and its readback are skipped.
+  if matrixark_flag_on "${TS_PROFILE_ENV_ONLY:-}" 0; then
+    echo "[deploy] env-only: profile=${TS_PROFILE_EXPECT} data=${TS_PROFILE_DATA} (no node started)"
+    return 0
+  fi
+
+  export NO_COLOR="${NO_COLOR:-1}"
+  echo "[deploy] profile=${TS_PROFILE_EXPECT} data=${TS_PROFILE_DATA} bin=${TS_PROFILE_BIN}"
+  setsid nohup "$TS_PROFILE_BIN" >>"$TS_PROFILE_LOG" 2>&1 </dev/null &
+  local pid=$!
+
+  local waited=0 line=""
+  while (( waited < TS_PROFILE_WAIT_S )); do
+    line="$(grep -a 'deployment profile' "$TS_PROFILE_LOG" | tail -1 || true)"
+    [[ -n "$line" ]] && break
+    kill -0 "$pid" 2>/dev/null || { echo "[deploy] datanode exited during startup" >&2
+                                    tail -20 "$TS_PROFILE_LOG" >&2; exit 1; }
+    sleep 1; waited=$((waited + 1))
+  done
+  [[ -n "$line" ]] || { echo "[deploy] node never announced a profile in ${TS_PROFILE_WAIT_S}s" >&2
+                        tail -20 "$TS_PROFILE_LOG" >&2; exit 1; }
+
+  # The node styles its log with ANSI and quotes string-valued fields, so a
+  # literal "profile=" never matches. Strip the styling, then take the value
+  # with or without its quotes.
+  local got
+  got="$(printf '%s' "$line" \
+         | sed 's/\x1b\[[0-9;]*m//g' \
+         | grep -o 'profile="\?[a-z-]*' | head -1 \
+         | sed 's/^profile="\?//')"
+  if [[ "$got" != "$TS_PROFILE_EXPECT" ]]; then
+    echo "[deploy] FAILED: asked for '${TS_PROFILE_EXPECT}', node resolved '${got}'" >&2
+    echo "  $line" >&2
+    kill "$pid" 2>/dev/null || true
+    exit 1
+  fi
+  echo "[deploy] ok pid=${pid}"
+  echo "  $line"
+}
