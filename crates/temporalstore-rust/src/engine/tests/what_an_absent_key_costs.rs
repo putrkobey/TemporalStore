@@ -444,3 +444,449 @@ fn measure_present(engine: &TemporalEngine, arm: &str, route: Route, keys: usize
     );
     let before = Work::take(engine);
     let mut answered_present = 0usize;
+    for index in 0..LOOKUPS {
+        let key = present_key(index);
+        // The value is a function of the key, so a read resolving through the WRONG block fails
+        // here rather than passing on a lucky length.
+        assert_eq!(
+            Some(seeded_value(index)),
+            read_through(engine, route, &key),
+            "{arm}/{route:?}: {key} was supposed to be present"
+        );
+        answered_present += 1;
+    }
+    assert_eq!(
+        LOOKUPS, answered_present,
+        "{arm}/{route:?}: {answered_present} of {LOOKUPS} lookups ran"
+    );
+    let work = Work::take(engine).since(before);
+    assert_eq!(
+        0, work.cache_expired_reads,
+        "{arm}/{route:?}: {} expired reads landed in this span",
+        work.cache_expired_reads
+    );
+    work.print(arm, route, keys, LOOKUPS);
+    work
+}
+
+/// ARM 1's reading: absent keys whose bucket exists and is RESIDENT, on the deployed route.
+fn resident_bucket_arm(keys: usize) -> Work {
+    let (_dir, engine) = fixture(keys, NARROW_START, NARROW_END);
+    assert_routing_regime(
+        &engine,
+        "resident-bucket",
+        Residency::ResidentBucket,
+        NARROW_START,
+        NARROW_END,
+    );
+    measure_absent(&engine, "resident-bucket", Route::Durable, keys)
+}
+
+/// ARM 2's reading: absent keys whose bucket exists and has been RELEASED, on the deployed route.
+fn released_bucket_arm(keys: usize) -> Work {
+    let (_dir, engine) = fixture(keys, NARROW_START, NARROW_END);
+    release_everything(&engine);
+    assert_routing_regime(
+        &engine,
+        "released-bucket",
+        Residency::ReleasedBucket,
+        NARROW_START,
+        NARROW_END,
+    );
+    measure_absent(&engine, "released-bucket", Route::Durable, keys)
+}
+
+/// ARM 3's reading: absent keys whose bucket is not in the map at all, on the deployed route.
+fn no_bucket_arm(keys: usize) -> Work {
+    // THE DEFAULT RANGE, where every key gets a bucket of its own -- so an absent key's bucket is
+    // one nothing has ever filed anything in.
+    let (_dir, engine) = fixture(keys, 0, u32::MAX);
+    assert_routing_regime(&engine, "no-bucket", Residency::NoBucketAtAll, 0, u32::MAX);
+    measure_absent(&engine, "no-bucket", Route::Durable, keys)
+}
+
+// ---------------------------------------------------------------------------------------------
+// ARM 1: the bucket exists and is resident.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn an_absent_key_in_a_resident_bucket_descends_no_cache_tier() {
+    let work = resident_bucket_arm(PROBE_KEYS);
+    assert_eq!(
+        0, work.cache_misses,
+        "{LOOKUPS} absent lookups into resident buckets made {} tier descents. Each descent is one \
+         SSD-store get plus one failing fs::read, for a key the shard's own model map had already \
+         said was absent",
+        work.cache_misses
+    );
+}
+
+#[test]
+fn an_absent_key_in_a_resident_bucket_is_admitted_to_no_cache_tier() {
+    let work = resident_bucket_arm(PROBE_KEYS);
+    assert_eq!(
+        0, work.cache_puts,
+        "{LOOKUPS} absent lookups into resident buckets admitted {} cache entries. A burst of \
+         distinct absent keys that admits one entry each is cache pressure that evicts live \
+         entries to hold answers that are all \"no\"",
+        work.cache_puts
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// ARM 2: the bucket exists and has been released. THE CONTESTED CASE.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn an_absent_key_in_a_released_bucket_descends_no_cache_tier() {
+    let work = released_bucket_arm(PROBE_KEYS);
+    assert_eq!(
+        0, work.cache_misses,
+        "{LOOKUPS} absent lookups into RELEASED buckets made {} tier descents, so releasing a \
+         bucket has started to cost absent reads",
+        work.cache_misses
+    );
+}
+
+#[test]
+fn an_absent_key_in_a_released_bucket_is_admitted_to_no_cache_tier() {
+    let work = released_bucket_arm(PROBE_KEYS);
+    assert_eq!(
+        0, work.cache_puts,
+        "{LOOKUPS} absent lookups into RELEASED buckets admitted {} cache entries",
+        work.cache_puts
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// ARM 3: the bucket does not exist at all.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn an_absent_key_whose_bucket_does_not_exist_descends_no_cache_tier() {
+    let work = no_bucket_arm(PROBE_KEYS);
+    assert_eq!(
+        0, work.cache_misses,
+        "{LOOKUPS} absent lookups whose bucket does not exist made {} tier descents",
+        work.cache_misses
+    );
+}
+
+#[test]
+fn an_absent_key_whose_bucket_does_not_exist_is_admitted_to_no_cache_tier() {
+    let work = no_bucket_arm(PROBE_KEYS);
+    assert_eq!(
+        0, work.cache_puts,
+        "{LOOKUPS} absent lookups whose bucket does not exist admitted {} cache entries",
+        work.cache_puts
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE CLEAR NEGATIVE, AND IT IS LABELLED AS ONE.
+// ---------------------------------------------------------------------------------------------
+
+/// An absent key reads no block-store file, in any of the three residencies.
+///
+/// WHY THIS IS NOT A PROVEN CLAIM IN THE SAME SENSE AS THE OTHERS. No plant falsifies it: the one
+/// change that makes an absent key pay again -- restoring the cache-first order in
+/// `execute_read_only_fast_path` -- moves the cache counters and leaves this one at zero, because
+/// `read_block_bytes` is reached only through an address and an absent key has none. So this arm is
+/// a standing negative: it is the assertion that would fail if an absent answer ever started
+/// needing a page, a bucket reload or a dump manifest, and it has nothing to show for being green
+/// today beyond that it is.
+///
+/// THE THREE ARMS ARE IN ONE TEST FOR THAT REASON. Splitting an unplantable negative three ways
+/// buys nothing a plant could use.
+#[test]
+fn an_absent_key_reads_no_block_store_file_in_any_residency() {
+    let resident = resident_bucket_arm(PROBE_KEYS);
+    let released = released_bucket_arm(PROBE_KEYS);
+    let no_bucket = no_bucket_arm(PROBE_KEYS);
+    for (name, work) in [
+        ("resident bucket", resident),
+        ("released bucket", released),
+        ("no bucket at all", no_bucket),
+    ] {
+        assert_eq!(
+            0, work.block_store_reads,
+            "{LOOKUPS} absent lookups with the key's bucket {name} read the block store {} times \
+             ({} bytes), so an absent answer has started to need a page or a bucket reload and the \
+             remedy is a different one from the one this module records",
+            work.block_store_reads, work.block_store_bytes
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE OTHER ROUTE, which never paid and is here so the comparison has two sides.
+// ---------------------------------------------------------------------------------------------
+
+/// `engine.execute` pays nothing for an absent key, and always did.
+///
+/// It resolves through `read_bucket_index_value`, which returns `None` without calling
+/// `read_block_bytes` when `bucket_index_block_address` has no address -- and never consults the
+/// cache at all. This is the control that made the finding attributable to the ENTRY POINT rather
+/// than to absent keys in general: same fixture, same keys, same index state, different route.
+#[test]
+fn the_direct_read_route_pays_nothing_for_an_absent_key() {
+    let (_dir, engine) = fixture(PROBE_KEYS, NARROW_START, NARROW_END);
+    assert_routing_regime(
+        &engine,
+        "direct-route",
+        Residency::ResidentBucket,
+        NARROW_START,
+        NARROW_END,
+    );
+    let work = measure_absent(&engine, "direct-route", Route::Direct, PROBE_KEYS);
+    assert_eq!(
+        Work {
+            cache_misses: 0,
+            cache_puts: 0,
+            cache_memory_hits: 0,
+            cache_memory_evictions: 0,
+            cache_expired_reads: 0,
+            block_store_reads: 0,
+            block_store_bytes: 0,
+        },
+        work,
+        "`engine.execute` did physical work for an absent key, so the control arm is no longer a \
+         control and the attribution to the entry point needs revisiting"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE FALSIFIER. Everything above is a zero; this is what makes those zeros mean something.
+// ---------------------------------------------------------------------------------------------
+
+/// A PRESENT key on the deployed route still descends a tier and still fills the cache.
+///
+/// WHY IT IS A SEPARATE TEST AND NOT A CLAUSE IN THE ARMS ABOVE. The arms above assert zeros. A
+/// change that removed the cache from this route entirely would satisfy every one of them, and the
+/// only thing that tells that apart from the intended change is an arm that STILL PAYS. Put after
+/// a zero it would never be reached by its own plant, so it is here on its own.
+///
+/// WHY THE FIGURE IS 2 PER LOOKUP AND NOT 1. A present read consults the cache twice under two
+/// different keys: the response under `CacheKey::string`, and the block frame under
+/// `CacheKey::page_with_slot` inside `read_block_bytes`. Both miss on a first read of a cold key.
+/// That is why this asserts "at least one per lookup" rather than an exact count -- the claim is
+/// that the path still descends, not how many times.
+///
+/// WHAT A PLANT CAN AND CANNOT REACH HERE, SAID PLAINLY. The over-wide version of the change --
+/// taking the early return for EVERY key rather than only an absent one -- is what this arm is
+/// aimed at, and it is caught by the CORRECTNESS assertion inside `measure_present`, which sits
+/// ahead of the figure below and therefore fires first. So a plant proves this arm is not vacuous;
+/// it does not prove the `>= LOOKUPS` bound itself, because the only change that would take the
+/// descent away while still serving the right bytes is one inside `read_block_bytes`, which is a
+/// different function from the one this module is about. The bound is kept as the weaker of the
+/// two claims rather than dropped, because it is the one that fails if the cache leaves this route.
+#[test]
+fn a_present_key_still_descends_a_tier_and_still_fills_the_cache() {
+    let (_dir, engine) = fixture(PROBE_KEYS, NARROW_START, NARROW_END);
+    let work = measure_present(&engine, "present/control", Route::Durable, PROBE_KEYS);
+    assert!(
+        work.cache_misses >= LOOKUPS as u64,
+        "{LOOKUPS} present lookups on the deployed route made only {} tier descents. The cache is \
+         supposed to still be consulted for a key the shard HOLDS, so the zeros the absent arms \
+         report may be a path with no cache in it rather than an absent key that stopped paying \
+         for one",
+        work.cache_misses
+    );
+}
+
+#[test]
+fn a_present_key_still_reads_its_block_off_the_block_store() {
+    let (_dir, engine) = fixture(PROBE_KEYS, NARROW_START, NARROW_END);
+    let work = measure_present(&engine, "present/control", Route::Durable, PROBE_KEYS);
+    assert!(
+        work.block_store_reads > 0,
+        "{LOOKUPS} present lookups read the block store {} times. The block-store counter has to be \
+         shown live in this process, or the zero the absent arms report could be a counter that \
+         never moves",
+        work.block_store_reads
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE REPEAT, where the two kinds of key now differ in kind rather than in degree.
+// ---------------------------------------------------------------------------------------------
+
+/// An absent key is not admitted to the cache at all, so asking twice costs twice nothing.
+///
+/// BEFORE, the first ask paid a descent and cached the negative answer, so the SECOND ask was a
+/// memory hit -- which looked like a mitigation and was not one, because the entry is per key and a
+/// burst is across many distinct keys. Now there is no entry to find and nothing for a later delete
+/// to have to invalidate.
+#[test]
+fn a_repeated_absent_key_is_still_not_cached_on_the_second_ask() {
+    let (_dir, engine) = fixture(500, NARROW_START, NARROW_END);
+    let missing = absent_key("repeat", 0);
+
+    // REGIME: the key is absent and routes to a bucket that exists.
+    {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&SHARD).expect("shard is loaded");
+        assert!(
+            !shard.strings().contains_key(missing.as_str()),
+            "the absent probe key is in the resident map, so it is not absent"
+        );
+        let routing_bucket =
+            crate::engine::hashing::block_routing_bucket(&missing, NARROW_START, NARROW_END);
+        assert!(
+            shard.bucket_index.bucket_map.contains_key(&routing_bucket),
+            "{missing} routes to bucket {routing_bucket}, which is not in the map"
+        );
+    }
+
+    let before = Work::take(&engine);
+    assert_eq!(None, read_through(&engine, Route::Durable, &missing));
+    let first = Work::take(&engine).since(before);
+
+    let between = Work::take(&engine);
+    assert_eq!(None, read_through(&engine, Route::Durable, &missing));
+    let second = Work::take(&engine).since(between);
+
+    println!(
+        "absent  first misses={} puts={} mem_hits={} | second misses={} puts={} mem_hits={}",
+        first.cache_misses,
+        first.cache_puts,
+        first.cache_memory_hits,
+        second.cache_misses,
+        second.cache_puts,
+        second.cache_memory_hits,
+    );
+
+    assert_eq!(
+        0, second.cache_memory_hits,
+        "the second ask for the same absent key took {} memory hits, so the first one cached \
+         something after all",
+        second.cache_memory_hits
+    );
+}
+
+/// And the counterpart, so "nothing was cached" is read as a fact about absent keys rather than
+/// about this engine: a PRESENT key is cached on its first read and served from memory on its
+/// second.
+#[test]
+fn a_repeated_present_key_is_cached_on_the_first_ask_and_served_from_memory_on_the_second() {
+    let (_dir, engine) = fixture(500, NARROW_START, NARROW_END);
+    let held = present_key(0);
+
+    // REGIME: the key is present.
+    assert!(
+        engine
+            .shards
+            .read()
+            .expect("shards lock poisoned")
+            .get(&SHARD)
+            .expect("shard is loaded")
+            .strings()
+            .contains_key(held.as_str()),
+        "the present probe key is not in the resident map, so it is not present"
+    );
+
+    let before = Work::take(&engine);
+    assert_eq!(
+        Some(seeded_value(0)),
+        read_through(&engine, Route::Durable, &held),
+        "{held} did not answer the bytes it was written with on the first ask"
+    );
+    let first = Work::take(&engine).since(before);
+
+    let between = Work::take(&engine);
+    assert_eq!(
+        Some(seeded_value(0)),
+        read_through(&engine, Route::Durable, &held),
+        "{held} did not answer the bytes it was written with on the second ask"
+    );
+    let second = Work::take(&engine).since(between);
+
+    println!(
+        "present first misses={} puts={} mem_hits={} | second misses={} puts={} mem_hits={}",
+        first.cache_misses,
+        first.cache_puts,
+        first.cache_memory_hits,
+        second.cache_misses,
+        second.cache_puts,
+        second.cache_memory_hits,
+    );
+
+    assert!(
+        first.cache_puts > 0,
+        "the first read of a present key admitted no cache entry, so this engine is not caching \
+         reads at all and the absent arms' zeros say nothing"
+    );
+    assert!(
+        second.cache_memory_hits > 0,
+        "the second read of a present key took no memory hit, so the entry the first one admitted \
+         is not being read back"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE SWEEP. The cost is per LOOKUP, which is what makes a retry burst the thing that multiplies
+// it -- so it must not move with the size of the store.
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn the_absent_key_cost_does_not_move_with_the_store_size() {
+    let sizes = [500usize, 2_000, 8_000];
+    let mut rows: Vec<(usize, Work, Work, Work)> = Vec::new();
+    for keys in sizes {
+        rows.push((
+            keys,
+            resident_bucket_arm(keys),
+            released_bucket_arm(keys),
+            no_bucket_arm(keys),
+        ));
+    }
+
+    // REGIME: the sweep ran at every size. A loop over an empty or short list below would agree
+    // with anything.
+    assert_eq!(
+        sizes.len(),
+        rows.len(),
+        "the sweep produced {} readings for {} sizes",
+        rows.len(),
+        sizes.len()
+    );
+    assert!(
+        rows[rows.len() - 1].0 > rows[0].0,
+        "the sweep must actually widen: {} -> {}",
+        rows[0].0,
+        rows[rows.len() - 1].0
+    );
+
+    let (first_keys, first_resident, first_released, first_no_bucket) = rows[0];
+    for (keys, resident, released, no_bucket) in rows.iter().copied().skip(1) {
+        for (name, baseline, measured) in [
+            ("resident bucket", first_resident, resident),
+            ("released bucket", first_released, released),
+            ("no bucket at all", first_no_bucket, no_bucket),
+        ] {
+            assert_eq!(
+                (
+                    baseline.cache_misses,
+                    baseline.cache_puts,
+                    baseline.block_store_reads
+                ),
+                (
+                    measured.cache_misses,
+                    measured.cache_puts,
+                    measured.block_store_reads
+                ),
+                "with the key's bucket {name}, {LOOKUPS} absent lookups cost \
+                 (descents, admissions, block-store reads) = ({}, {}, {}) in a {first_keys}-key \
+                 store and ({}, {}, {}) in a {keys}-key store. An absent answer's cost is supposed \
+                 to be set by the lookup and not by the corpus, so if this moves the reading needs \
+                 revisiting rather than reporting",
+                baseline.cache_misses,
+                baseline.cache_puts,
+                baseline.block_store_reads,
+                measured.cache_misses,
+                measured.cache_puts,
+                measured.block_store_reads,
+            );
+        }
+    }
+}
