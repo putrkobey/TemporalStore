@@ -4064,3 +4064,4069 @@ fn command_touched_container_elements(
 /// record written before this field existed simply does not carry it, `apply_key_states` finds it
 /// absent and does nothing, and the fold behaves as it always has. So nothing positional moves,
 /// no reader has to be upgraded first, and `SHARD_INDEX_FORMAT_VERSION` does not change.
+///
+/// THE ADDRESS, AND A ZSET'S SCORE, ARE READ BACK OUT OF THE MAP THE WRITE JUST UPDATED, so the
+/// entry carried is the one a reload has to serve. That is the rule `collect_upsert_index_items`
+/// already applies to the block items beside these blobs, and an element the map does not hold is
+/// skipped here for the same reason it is skipped there: its append failed, so it produced no block
+/// to pin and there is nothing to fold.
+/// The blob fields the container-element carry rides in. Named once so the writer, the fold's
+/// collector and any future reader cannot disagree about the spelling of one of them -- a
+/// mis-spelled field is not an error anywhere, it is simply a carry that silently never arrives.
+pub(super) const CARRIED_CONTAINER_FIELDS: [&str; 4] =
+    ["set_elements", "zset_elements", "list_elements", "hash_fields"];
+
+fn capture_container_element_states(
+    shard: &ShardState,
+    touched: &[TouchedContainerElement],
+) -> Vec<serde_json::Value> {
+    if touched.is_empty() {
+        return Vec::new();
+    }
+    let mut by_key: std::collections::BTreeMap<&str, serde_json::Map<String, serde_json::Value>> =
+        std::collections::BTreeMap::new();
+    for element in touched {
+        let carried = match element {
+            TouchedContainerElement::Set { key, member } => shard
+                .sets
+                .get(key)
+                .and_then(|members| members.get(member))
+                .and_then(|address| serde_json::to_value((member, address)).ok())
+                .map(|value| (CARRIED_CONTAINER_FIELDS[0], value)),
+            TouchedContainerElement::ZSet { key, member } => shard
+                .zsets
+                .get(key)
+                .and_then(|members| members.get(member))
+                .and_then(|scored| serde_json::to_value((member, scored)).ok())
+                .map(|value| (CARRIED_CONTAINER_FIELDS[1], value)),
+            TouchedContainerElement::List { key, sequence } => shard
+                .lists
+                .get(key)
+                .and_then(|entries| entries.get(sequence))
+                .and_then(|address| serde_json::to_value((sequence, address)).ok())
+                .map(|value| (CARRIED_CONTAINER_FIELDS[2], value)),
+            TouchedContainerElement::Hash { key, field } => shard
+                .hashes
+                .get(key)
+                .and_then(|fields| fields.get(field))
+                .and_then(|address| serde_json::to_value((field, address)).ok())
+                .map(|value| (CARRIED_CONTAINER_FIELDS[3], value)),
+        };
+        let Some((field, value)) = carried else {
+            continue;
+        };
+        let blob = by_key.entry(element.key()).or_default();
+        if let Some(array) = blob
+            .entry(field)
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+            .as_array_mut()
+        {
+            array.push(value);
+        }
+    }
+    by_key
+        .into_iter()
+        .map(|(key, mut blob)| {
+            blob.insert(
+                "key".to_string(),
+                serde_json::Value::String(key.to_string()),
+            );
+            serde_json::Value::Object(blob)
+        })
+        .collect()
+}
+
+fn capture_key_states(shard: &ShardState, keys: &[String]) -> Vec<serde_json::Value> {
+    keys.iter()
+        .map(|key| {
+            let mut blob = serde_json::Map::new();
+            blob.insert("key".to_string(), serde_json::Value::String(key.clone()));
+            let mut put = |name: &str, value: Option<serde_json::Value>| {
+                if let Some(value) = value {
+                    if !value.is_null() {
+                        blob.insert(name.to_string(), value);
+                    }
+                }
+            };
+            // THE BLOB KEEPS THE STORED SHAPE. The map holds the owned array; the capture field has
+        // always been the B-tree object, and changing it here would change the blob format for
+        // a representation change that is supposed to be invisible outside the map.
+        put(
+            "features",
+            shard
+                .features()
+                .get(&key[..])
+                .and_then(|v| serde_json::to_value(v.to_btree()).ok()),
+        );
+            put("expires_at_ms", shard.expires_at_ms().get(key.as_str()).and_then(|v| serde_json::to_value(v).ok()));
+            put("control_state_changes", shard.control_state_changes.get(&key[..]).and_then(|v| serde_json::to_value(v).ok()));
+            put("control_state_selection", shard.control_state_selection.get(&key[..]).and_then(|v| serde_json::to_value(v).ok()));
+            put(
+            "context_nodes",
+            shard
+                .context_nodes()
+                .get(key.as_str())
+                .and_then(|v| serde_json::to_value(v).ok()),
+        );
+            // CAPTURED AS THE B-TREE IT HAS ALWAYS BEEN CAPTURED AS. The representation behind the
+            // read changed; the shape this blob carries must not, because `apply_key_state_field`
+            // on the other side deserializes it, and a capture written by this binary is folded
+            // by an older one.
+            put(
+                "context_events",
+                shard
+                    .context_events()
+                    .get(&**key)
+                    .and_then(|series| serde_json::to_value(series.to_btree()).ok()),
+            );
+            // CAPTURED AS THE B-TREE IT HAS ALWAYS BEEN CAPTURED AS, for the reason stated over
+            // `context_events` above: the representation behind the read changed, the shape this
+            // blob carries must not, because a capture this binary writes is folded by
+            // `apply_key_state_field` in an older one.
+            put(
+                "context_indexes",
+                shard
+                    .context_indexes()
+                    .get(&key[..])
+                    .and_then(|series| serde_json::to_value(series.to_btree()).ok()),
+            );
+            // The B-tree shape, as the `context_events` note above requires: a blob this
+            // binary writes is folded by `apply_key_state_field` in an older one.
+            put(
+                "context_audits",
+                shard
+                    .context_audits()
+                    .get(&key[..])
+                    .and_then(|series| serde_json::to_value(series.to_btree()).ok()),
+            );
+            // The B-tree shape, as the `context_events` note above requires: a blob this
+            // binary writes is folded by `apply_key_state_field` in an older one.
+            put(
+                "context_children",
+                shard
+                    .context_children()
+                    .get(&key[..])
+                    .and_then(|series| serde_json::to_value(series.to_btree()).ok()),
+            );
+            // The B-tree shape, as the `context_events` note above requires: a blob this
+            // binary writes is folded by `apply_key_state_field` in an older one.
+            put(
+                "context_summaries",
+                shard
+                    .context_summaries()
+                    .get(&key[..])
+                    .and_then(|series| serde_json::to_value(series.to_btree()).ok()),
+            );
+            // The B-tree shape, as the `context_events` note above requires: a blob this
+            // binary writes is folded by `apply_key_state_field` in an older one.
+            put(
+                "context_compressions",
+                shard
+                    .context_compressions()
+                    .get(&key[..])
+                    .and_then(|series| serde_json::to_value(series.to_btree()).ok()),
+            );
+            put("context_entities", shard.context_entities().get(&key[..]).and_then(|v| serde_json::to_value(v).ok()));
+            serde_json::Value::Object(blob)
+        })
+        .collect()
+}
+
+/// Apply the captured per-key state blobs back onto a shard (last blob wins per key),
+/// pinning the authoritative membership a write produced. Used on reload after WAL replay
+/// to correct the exact touched keys, so reconstruction from physical blocks honors the
+/// evicted/tombstoned membership instead of resurrecting it.
+fn apply_key_states(shard: &mut ShardState, key_states: &[serde_json::Value]) {
+    for blob in key_states {
+        let Some(key) = blob.get("key").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        // A CONTAINER-ELEMENT CARRY IS NOT A PER-KEY STATE CAPTURE, AND MUST NOT BE READ AS ONE.
+        //
+        // Every field below goes through `apply_key_state_field`, which treats an ABSENT field as
+        // "this key had none" and REMOVES the entry -- that is the whole point of the capture, and
+        // it is why a capture blob naming only its key is meaningful. A container carry names only
+        // its key and its elements, so reading it as a capture would clear this key's TTL and every
+        // context series it holds: a `SetAdd` against a key with a deadline would drop the deadline
+        // on the next fold, and nothing would report it.
+        //
+        // The two kinds of blob come from two functions and are never merged into one, so carrying
+        // a container field identifies one exactly. `capture_key_states` writes only the twelve
+        // names below and `capture_container_element_states` only the four in
+        // `CARRIED_CONTAINER_FIELDS`, which is what makes this partition total rather than a guess.
+        if CARRIED_CONTAINER_FIELDS
+            .iter()
+            .any(|field| blob.get(field).is_some())
+        {
+            continue;
+        }
+        // The type parameter is named because this map implements `KeyedState` for two value
+        // types, exactly as the event map does: the blob carries the B-tree shape and the map
+        // holds the array.
+        apply_key_state_field::<std::collections::BTreeMap<u64, ElementEntry>, _>(
+            shard.features_mut(),
+            key,
+            blob.get("features"),
+        );
+        // DIRECT WRITE TO `expires_at_ms` -- the deadline-ordered mirror is invalidated at the
+        // end of this function. See the note there.
+        apply_key_state_field(shard.expires_at_ms_mut(), key, blob.get("expires_at_ms"));
+        apply_key_state_field(
+            &mut shard.control_state_changes,
+            key,
+            blob.get("control_state_changes"),
+        );
+        apply_key_state_field(
+            &mut shard.control_state_selection,
+            key,
+            blob.get("control_state_selection"),
+        );
+        apply_key_state_field(shard.context_nodes_mut(), key, blob.get("context_nodes"));
+        // THE STORED B-TREE SHAPE, CONVERTED INTO THE ARRAY. `capture_key_states` writes a
+        // `context_events` field into the index-log blobs; when no base index decodes,
+        // `persistence.rs` takes `ShardState::default()` and folds those blobs straight through
+        // here, with nothing decoded, so the decode fold never sees them. The type parameter is
+        // named because this map implements `KeyedState` for two different value types.
+        apply_key_state_field::<std::collections::BTreeMap<u64, ElementEntry>, _>(
+            shard.context_events_mut(),
+            key,
+            blob.get("context_events"),
+        );
+        // THE STORED B-TREE SHAPE, FOLDED INTO THE ARRAY, as for `context_events` just above. The
+        // type parameter is named because this map implements `KeyedState` for two value types.
+        apply_key_state_field::<std::collections::BTreeMap<u64, ElementEntry>, _>(
+            shard.context_indexes_mut(),
+            key,
+            blob.get("context_indexes"),
+        );
+        apply_key_state_field::<std::collections::BTreeMap<u64, ElementEntry>, _>(
+            shard.context_audits_mut(),
+            key,
+            blob.get("context_audits"),
+        );
+        apply_key_state_field::<std::collections::BTreeMap<u64, ElementEntry>, _>(
+            shard.context_children_mut(),
+            key,
+            blob.get("context_children"),
+        );
+        apply_key_state_field::<std::collections::BTreeMap<u64, ElementEntry>, _>(
+            shard.context_summaries_mut(),
+            key,
+            blob.get("context_summaries"),
+        );
+        apply_key_state_field::<std::collections::BTreeMap<u64, ElementEntry>, _>(
+            shard.context_compressions_mut(),
+            key,
+            blob.get("context_compressions"),
+        );
+        // The type parameter is named as for the kinds above: the blob carries the B-tree
+        // shape and the map holds a slot.
+        apply_key_state_field::<std::collections::BTreeMap<u64, ElementEntry>, _>(
+            shard.context_entities_mut(),
+            key,
+            blob.get("context_entities"),
+        );
+        // THE FOUR CONTAINER MAPS ARE NOT APPLIED HERE, and the reason is the whole shape of
+        // `fold_carried_container_elements`: an element may only be restored once the fold has
+        // FINISHED, because a later record in the same fold can take its block away again. See
+        // that function.
+    }
+    if !key_states.is_empty() {
+        // THE ONE PLACE `expires_at_ms` IS WRITTEN WITHOUT `set_expiry` / `clear_expiry`.
+        //
+        // Those two keep the deadline-ordered mirror `expiry_by_deadline` in step entry by entry.
+        // This cannot: it restores a whole captured map for each key, and an ABSENT
+        // `expires_at_ms` field means "this key had no deadline", which `apply_key_state_field`
+        // turns into a removal -- so both directions are reachable, and neither is visible from
+        // the blob without re-deriving it.
+        //
+        // So the mirror is dropped instead and `ensure_expiry_order` rebuilds it from the
+        // corrected map on first use. Dropping is not merely the cheap option, it is the only one
+        // that works: `ensure_expiry_order` repairs ONLY an entirely empty mirror, so a mirror
+        // left populated and wrong is never repaired and the keys it misses silently never expire.
+        //
+        // Today this is a no-op -- the delta fold only ever runs on a freshly decoded state, whose
+        // mirror is already empty because the field is `#[serde(skip)]`. It is written down
+        // because that is a property of the CALLER, not of this function, and the first caller
+        // that folds a delta onto a shard already in service would land exactly on the
+        // never-repaired case.
+        shard.expiry_by_deadline.clear();
+    }
+}
+
+/// The one thing [`merge_container_elements`] does to a container's element map, so it does not
+/// have to name the map. `sets`, `zsets` and `lists` keep their elements in a `BTreeMap` and
+/// `hashes` in a sorted vector behind [`hash_field_map::HashFieldMap`]; the difference is not this
+/// function's business.
+trait ElementMap: Default {
+    type Element: serde::de::DeserializeOwned;
+    type Value: serde::de::DeserializeOwned;
+    fn insert_element(&mut self, element: Self::Element, value: Self::Value);
+
+    /// INSERT ONLY WHERE THE ELEMENT IS ABSENT, which is a SECOND operation and not a variant of
+    /// the first, because the two merges want opposite things from a collision.
+    ///
+    /// `merge_container_elements` folds the delta's carried elements and wants the carry to WIN --
+    /// it is the newer statement. `fill_absent_elements` merges the PERSISTED map, which is the
+    /// OLDER of its two inputs, and its whole rule is that the DERIVED view decides which elements
+    /// exist and which block backs each; the durable map only supplies what the derived view could
+    /// not produce. Reusing `insert_element` there would let the older map overwrite the newer
+    /// derived address -- the exact inversion `durable_outranks_derived` exists to catch -- so the
+    /// distinction is in the trait rather than in a caller remembering which way round it goes.
+    fn insert_element_if_absent(&mut self, element: Self::Element, value: Self::Value);
+}
+
+impl<E, V> ElementMap for std::collections::BTreeMap<E, V>
+where
+    E: Ord + serde::de::DeserializeOwned,
+    V: serde::de::DeserializeOwned,
+{
+    type Element = E;
+    type Value = V;
+    fn insert_element(&mut self, element: E, value: V) {
+        self.insert(element, value);
+    }
+
+    fn insert_element_if_absent(&mut self, element: E, value: V) {
+        self.entry(element).or_insert(value);
+    }
+}
+
+impl<V> ElementMap for std::collections::HashMap<String, V>
+where
+    V: serde::de::DeserializeOwned,
+{
+    type Element = String;
+    type Value = V;
+    fn insert_element(&mut self, element: String, value: V) {
+        self.insert(element, value);
+    }
+
+    fn insert_element_if_absent(&mut self, element: String, value: V) {
+        self.entry(element).or_insert(value);
+    }
+}
+
+/// The block a carried durable-map value points at, so [`fold_carried_container_elements`] can ask
+/// whether that block is still there without knowing which of the four maps it came from.
+trait CarriedValue {
+    fn carried_address(&self) -> &ElementEntry;
+}
+
+impl CarriedValue for ElementEntry {
+    fn carried_address(&self) -> &ElementEntry {
+        self
+    }
+}
+
+/// A zset's value is `(score bits, page)`.
+impl CarriedValue for (u64, ElementEntry) {
+    fn carried_address(&self) -> &ElementEntry {
+        &self.1
+    }
+}
+
+/// The identity of a block as a live-address set holds it. Slab, offset and length together name
+/// exactly one block, and `fold_delta_block_items` restores a block at its ORIGINAL address -- which
+/// is what makes the address a usable answer to "is this element's block still here".
+type LiveBlockKey = (u64, u64, u64);
+
+fn live_block_key(address: &ElementEntry) -> LiveBlockKey {
+    (address.block_slab_id(), address.offset(), address.length())
+}
+
+/// Fold one key's carried container elements into the map that holds them, skipping any element
+/// whose block the fold did not leave behind.
+///
+/// INSERTS AND NEVER REMOVES. An absent field is a no-op, not a removal -- both because the record
+/// carries only the elements one write touched (so absence says nothing about the rest) and because
+/// a record written before these fields existed has none of them and must fold exactly as it did
+/// before.
+///
+/// A field that does not deserialize is dropped rather than guessed at. The reconcile's derived
+/// view still produces the element from its block, so the outcome is the behaviour that predates
+/// this carry -- never a defaulted identity, which is the failure #1989 took out of three arms.
+fn merge_container_elements<M>(
+    outer: &mut std::collections::HashMap<state::ModelKey, M>,
+    key: &str,
+    value: Option<&serde_json::Value>,
+    live: &std::collections::HashSet<LiveBlockKey>,
+    skipped: &mut usize,
+) where
+    M: ElementMap,
+    M::Value: CarriedValue,
+{
+    let Some(value) = value else {
+        return;
+    };
+    let Ok(elements) = serde_json::from_value::<Vec<(M::Element, M::Value)>>(value.clone()) else {
+        return;
+    };
+    if elements.is_empty() {
+        return;
+    }
+    for (element, element_value) in elements {
+        if !live.contains(&live_block_key(element_value.carried_address())) {
+            *skipped += 1;
+            continue;
+        }
+        outer
+            // LIKE FOR LIKE: `to_string()` allocated the characters here too, so the
+            // allocation count is unchanged, and adoption converges this onto the
+            // page index's handle once the page is filed. Taking a handle here would
+            // be strictly better and needs the caller to hold one.
+            .entry(std::sync::Arc::from(key))
+            .or_default()
+            .insert_element(element, element_value);
+    }
+}
+
+/// Restore the container elements a whole fold carried, AFTER the fold has finished, and only where
+/// the block each one names is still in the bucket index.
+///
+/// WHY THIS CANNOT BE DONE RECORD BY RECORD, which is where the first shape of this change was
+/// wrong. A fold replays a SUFFIX of the log, so one fold can both add an element and take it away
+/// again. Applying a record's carried elements as that record is folded puts the element into the
+/// durable map, and `fill_absent_elements` -- which keeps every durable element the derived view
+/// could not produce, #1989's rule -- then handed it back after a later record removed its block. The
+/// element would be served after being deleted. Nothing did that before the carry existed, because
+/// the fold never wrote these maps at all.
+///
+/// THAT MERGE NOW ASKS THE SAME QUESTION THIS FUNCTION DOES, so a per-record carry would no longer
+/// be handed back: the carry lands in `shard.sets`, which the reconcile then takes as its PERSISTED
+/// input and filters on whether each element's block is still there. So this is no longer the only
+/// guard against that particular resurrection. It is still the right shape and is not relaxed: the
+/// ordering argument above is about which answer this function computes, not about who catches it
+/// afterwards, and a fold that left a known-dead element in the map for a later stage to strip would
+/// be depending on that stage rather than being correct.
+///
+/// AND A TOMBSTONE IS NOT ENOUGH TO CATCH IT. Matching the record's `deleted` items would look like
+/// the symmetric answer and is not one: `mark_bucket_index_block_deleted_with` -- which `SetRemove`,
+/// `ZSetRemove`, `ListPop` and `HashDelete` all reach -- is named for a mark it does not make, and
+/// its body is a `retain` that DROPS the block. So by the time the record is built there is no block
+/// left to describe and no tombstone is emitted; the removal is spelled as the ABSENCE of a block
+/// under a covered key, which the fold's covered-key wipe then performs. (The doc on
+/// `collect_command_index_items_for` still claims a typed removal "marks its block deleted ... so
+/// the item this emits carries `deleted: true`". That claim does not hold, and a removal half built
+/// on it is dead code.)
+///
+/// SO THE QUESTION ASKED IS THE ONLY ONE THAT SETTLES IT: is there still a block at the address this
+/// element was carried with? That is answered once, against the finished bucket index, and it is
+/// correct however the block went away -- a covered-key wipe, a tombstone, or an upsert record
+/// replacing its predecessor at a new address (in which case the stale carry is skipped and the
+/// fresh one applied, with no reliance on record order).
+fn fold_carried_container_elements(shard: &mut ShardState, carried: &[serde_json::Value]) {
+    if carried.is_empty() {
+        return;
+    }
+    let mut live: std::collections::HashSet<LiveBlockKey> = std::collections::HashSet::new();
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for block in bucket.block_index.values() {
+            if !block.deleted {
+                live.insert(live_block_key(&block.address));
+            }
+        }
+    }
+    let mut skipped = 0usize;
+    let mut applied = 0usize;
+    for blob in carried {
+        let Some(key) = blob.get("key").and_then(|value| value.as_str()) else {
+            continue;
+        };
+        let before = skipped;
+        shard.sets.fold_carried_elements(
+            key,
+            blob.get(CARRIED_CONTAINER_FIELDS[0]),
+            &live,
+            &mut skipped,
+        );
+        shard.zsets.fold_carried_elements(
+            key,
+            blob.get(CARRIED_CONTAINER_FIELDS[1]),
+            &live,
+            &mut skipped,
+        );
+        shard.lists.fold_carried_elements(
+            key,
+            blob.get(CARRIED_CONTAINER_FIELDS[2]),
+            &live,
+            &mut skipped,
+        );
+        shard.hashes.fold_carried_elements(
+            key,
+            blob.get(CARRIED_CONTAINER_FIELDS[3]),
+            &live,
+            &mut skipped,
+        );
+        if skipped == before {
+            applied += 1;
+        }
+    }
+    if skipped > 0 {
+        // Said out loud, because a skip here is the fold declining to resurrect something.
+        eprintln!(
+            "fold: {skipped} carried container element(s) named a page the fold did not leave \
+             behind and were not restored; {applied} blob(s) applied whole of {} carried, over \
+             {} live page(s)",
+            carried.len(),
+            live.len()
+        );
+    }
+}
+
+/// Set or clear one key's entry, in whichever map holds it.
+///
+/// Written against the operations it actually uses -- insert and remove -- so that a map can be
+/// kept in key order where that matters without this having to care.
+/// The two things [`apply_key_state_field`] does to a map, so it does not have to name the map.
+trait KeyedState<V> {
+    /// Takes `&str`, not `String`: the three bare-address model maps are keyed by
+    /// [`super::state::ModelKey`] and the ordered ones by `String`, so the key type belongs to the
+    /// implementor and not to this signature. Spelling `String` here is what made a key-type
+    /// change reach a helper that has no interest in the key type at all.
+    fn insert_entry(&mut self, key: &str, value: V);
+    fn remove_entry(&mut self, key: &str);
+}
+
+impl<V> KeyedState<V> for std::collections::HashMap<String, V> {
+    fn insert_entry(&mut self, key: &str, value: V) {
+        self.insert(key.to_string(), value);
+    }
+    fn remove_entry(&mut self, key: &str) {
+        self.remove(key);
+    }
+}
+
+impl<V> KeyedState<V> for std::collections::BTreeMap<String, V> {
+    fn insert_entry(&mut self, key: &str, value: V) {
+        self.insert(key.to_string(), value);
+    }
+    fn remove_entry(&mut self, key: &str) {
+        self.remove(key);
+    }
+}
+
+/// The deadline map, whose key is a SHARED handle so that it and its ordered mirror hold one copy
+/// of the characters between them.
+///
+/// This impl is three lines because the trait above was built for exactly this change: its own
+/// doc says the key type "belongs to the implementor and not to this signature", which is what
+/// keeps a key-type change from reaching a helper with no interest in the key type. Note that an
+/// insert HERE allocates -- this door is reached only by the index-log delta fold, which has a
+/// `&str` and no handle to share, and which invalidates the mirror wholesale rather than keeping
+/// it in step. `set_expiry` is the path that shares.
+impl<V> KeyedState<V> for std::collections::BTreeMap<std::sync::Arc<str>, V> {
+    fn insert_entry(&mut self, key: &str, value: V) {
+        self.insert(std::sync::Arc::from(key), value);
+    }
+    fn remove_entry(&mut self, key: &str) {
+        self.remove(key);
+    }
+}
+
+/// The three bare-address model maps. `Box<str>: Borrow<str>` is what lets `remove` take the `&str`
+/// this trait is written against, exactly as it does for `String`.
+impl<V> KeyedState<V> for std::collections::HashMap<state::ModelKey, V> {
+    fn insert_entry(&mut self, key: &str, value: V) {
+        self.insert(key.into(), value);
+    }
+    fn remove_entry(&mut self, key: &str) {
+        self.remove(key);
+    }
+}
+
+/// THE ARRAY MAP, WRITTEN FROM THE STORED B-TREE SHAPE THE CAPTURE BLOB CARRIES.
+///
+/// `apply_key_state_field` writes through [`KeyedState`], whose own doc says the key type -- and by
+/// the same argument the representation -- "belongs to the implementor and not to this signature".
+/// This is that implementor for a map of owned arrays: the blob still carries
+/// `BTreeMap<u64, ElementEntry>`, because the stored shape did not move, and the conversion to the
+/// array happens here rather than at the call site.
+///
+/// IT IS A CONVERSION AND NO LONGER A MIRROR. An earlier revision routed this through a mutator
+/// pair so the write reached two live copies; there is one live copy now, so this writes the map
+/// and nothing else. What survives from that reasoning is only the reason the conversion has to
+/// exist at all: `capture_key_states` writes a `context_events` field into the index-log blobs, and
+/// with no base index `persistence.rs` folds those blobs straight through `apply_key_states` with
+/// nothing decoded -- so the stored B-tree shape arrives on a path the decode fold never sees.
+///
+/// It does not overlap the blanket `impl<V> KeyedState<V> for HashMap<ModelKey, V>`: that one gives
+/// this map `KeyedState<OwnedTimestampedSeries>`, and this gives it `KeyedState<BTreeMap<..>>`.
+/// Different type parameter, same `Self`, so the call site names which one it means.
+/// THE SAME CONVERSION FOR THE `String`-KEYED ARRAY MAP, which is `features`.
+///
+/// It does not overlap the blanket `impl<V> KeyedState<V> for HashMap<String, V>`: that one gives
+/// this map `KeyedState<OwnedTimestampedSeries>`, and this gives it `KeyedState<BTreeMap<..>>`.
+/// Different type parameter, so the call site names which one it means -- and it has to, because
+/// the capture blob carries the stored B-tree shape while the map holds the array.
+impl KeyedState<std::collections::BTreeMap<u64, ElementEntry>>
+    for std::collections::HashMap<String, timestamped_series::OwnedTimestampedSeries>
+{
+    fn insert_entry(&mut self, key: &str, value: std::collections::BTreeMap<u64, ElementEntry>) {
+        self.insert(key.to_string(), value.into());
+    }
+
+    fn remove_entry(&mut self, key: &str) {
+        self.remove(key);
+    }
+}
+
+impl KeyedState<std::collections::BTreeMap<u64, ElementEntry>>
+    for std::collections::HashMap<state::ModelKey, timestamped_series::OwnedTimestampedSeries>
+{
+    fn insert_entry(&mut self, key: &str, value: std::collections::BTreeMap<u64, ElementEntry>) {
+        self.insert(key.into(), value.into());
+    }
+
+    fn remove_entry(&mut self, key: &str) {
+        self.remove(key);
+    }
+}
+
+/// THE SAME CONVERSION FOR THE CONSOLIDATED MAP'S INNER TABLE, which is where a migrated series
+/// map lives.
+///
+/// `capture_key_states` writes the stored B-tree shape into the index-log blobs, and with no base
+/// index `persistence.rs` folds those blobs straight through `apply_key_states` with nothing
+/// decoded -- so that shape arrives on a path the decode fold never sees, whatever representation
+/// the map holds. The two impls above say the same thing for the owned-array maps; this says it for
+/// the slot map.
+///
+/// It does not overlap the blanket `impl<V> KeyedState<V> for HashMap<ModelKey, V>`: that one gives
+/// this map `KeyedState<ObjectSlot>`, and this gives it `KeyedState<BTreeMap<..>>`. Different type
+/// parameter, same `Self`, so a call site names which one it means -- and the migrated maps' folds
+/// do, with a turbofish.
+///
+/// BUILT THROUGH THE WRITE TRAIT RATHER THAN A `From`, so the slot's array keeps the invariant its
+/// own door keeps: sorted by instant, because every reader binary-searches it.
+impl KeyedState<std::collections::BTreeMap<u64, ElementEntry>>
+    for std::collections::HashMap<state::ModelKey, object_record::ObjectSlot>
+{
+    fn insert_entry(&mut self, key: &str, value: std::collections::BTreeMap<u64, ElementEntry>) {
+        let mut slot = object_record::ObjectSlot::default();
+        for (at, address) in value {
+            timestamped_series::TimestampedSeriesWrite::set(&mut slot, at, address);
+        }
+        self.insert(key.into(), slot);
+    }
+
+    fn remove_entry(&mut self, key: &str) {
+        self.remove(key);
+    }
+}
+
+fn apply_key_state_field<V, M>(map: &mut M, key: &str, value: Option<&serde_json::Value>)
+where
+    V: serde::de::DeserializeOwned,
+    M: KeyedState<V>,
+{
+    match value {
+        Some(value) if !value.is_null() => {
+            if let Ok(parsed) = serde_json::from_value::<V>(value.clone()) {
+                map.insert_entry(key, parsed);
+            }
+        }
+        _ => {
+            map.remove_entry(key);
+        }
+    }
+}
+
+/// Apply one delta record's block items to the bucket index, making the delta's view of the
+/// covered object keys authoritative: every existing live block entry for a covered key is
+/// removed first (so an overwrite that relocated or dropped a block does not leave the stale
+/// entry behind), then the delta's live items are inserted at their ORIGINAL recorded
+/// addresses. This is what lets reload reconstruct the exact on-disk block layout without
+/// re-executing the WAL (which would write fresh blocks and relocate them to the active
+/// slab). `covered_keys` are the object keys the write touched (from the key-state blobs).
+fn fold_delta_block_items(
+    bucket_index: &mut CoreIndex,
+    covered_keys: &BTreeSet<String>,
+    items: &[crate::index_log::IndexItem],
+    upsert: bool,
+) {
+    // FILING AND UN-FILING ARE ONE OBLIGATION, AND THIS SITE OWED BOTH.
+    //
+    // This function writes page entries and NOT the object lookup -- the tree says so in as many
+    // words at `block_entry_element_naming`'s fold fixture -- and it was covered by a whole-shard
+    // `rebuild_object_block_lookup` immediately after it on the load path. With that rebuild gone
+    // the two halves are not symmetrical in consequence: an unfiled page is a page the readers
+    // cannot name, and an un-un-filed position is a position that SURVIVES ITS PAGE and names an
+    // entry that no longer exists. The second is worse, and it is the one a "file as you go"
+    // change forgets.
+    //
+    // Both are collected rather than applied inline: filing and un-filing take the whole index
+    // mutably while each loop below holds one bucket out of it, which is the same borrow split
+    // `reload_released_bucket` and the two refile loops already work around.
+    let mut unfiled: Vec<(crate::engine::storage_bucket_internals::StoredModelKind, Arc<str>, crate::engine::state::BlockLookupRef)> =
+        Vec::new();
+    let mut filed_blocks: Vec<(u32, u64, Arc<str>, BlockIndex)> = Vec::new();
+    if upsert {
+        // Upsert record: each item replaces exactly its (kind, object, component) predecessor,
+        // the same replacement the write path performed in memory. The predecessor lives in the
+        // same routing bucket (the bucket derives from the object key), so the removal scans one
+        // bucket per item and the covered-key wipe below stays untouched for snapshot records.
+        for item in items {
+            let Some(bucket) = bucket_index.bucket_map.get_mut(&item.routing_bucket) else {
+                continue;
+            };
+            // CONVERGE ON THE PAGE WHEN THE PAGE IS THE IDENTITY, exactly as the write path's
+            // upsert does -- and through the SAME condition, so the two routes cannot come to
+            // disagree about which entries one filing supersedes.
+            //
+            // Keyed on the component alone this matches every entry of a gated container, because
+            // all of them carry `None`: replaying one item would drop every other page of the
+            // object. The item's own address is what distinguishes the page it is about. An item
+            // carrying no address cannot name a page, so it keeps the component-keyed behaviour it
+            // has always had rather than matching everything.
+            let names_a_block =
+                crate::engine::storage_bucket_internals::index_entry_names_a_block(&item.model_id);
+            let here = item
+                .entry
+                .as_ref()
+                .map(|entry| live_block_key(entry));
+            // THE FILING-NAME TERM IS DELETED AS A TAUTOLOGY, WITH THE REASON HERE RATHER THAN
+            // IN A COMMIT MESSAGE.
+            //
+            // It read `page.component.as_deref() == filed_name`, where
+            // `filed_name = if names_a_block { None } else { item.component.as_deref() }`. BOTH
+            // SIDES WERE ALREADY `None` FOR EVERY KIND: `names_a_block` answers true for all four
+            // container kinds, and the kinds it answers false for -- `string`, `control_state`,
+            // `context_node` and the timestamped series -- carry no element name to begin with, so
+            // `filed_name` was unconditionally `None` and no entry had a name to compare with it.
+            // The term asserted nothing before the field was touched, and with the field gone it
+            // cannot be written at all.
+            //
+            // WHAT STILL DECIDES THE SUPERSEDE is the page key below: keyed on `live_block_key`
+            // when a kind converges on the page, and on (kind, object key) alone when it converges
+            // on the object. That distinction is `names_a_block`'s remaining job here, which is why
+            // the binding above it is kept and only this comparison goes.
+            // THE IDENTITY OF EVERY PAGE IN THIS BUCKET, TAKEN BEFORE THE MUTATION.
+            //
+            // `retain` borrows the page index mutably and `identity_of` needs the NODE, so the
+            // closure cannot ask which object the page it is looking at belongs to. Taken once
+            // here, from the same two sources -- see `state::block_identities_in`.
+            //
+            // NO DESTRUCTURING IS NEEDED: `object_block_lookup`, `bucket_map` and
+            // `block_slab_live` are disjoint fields of `bucket_index`, which is why the line
+            // below could already take `&mut bucket_index.block_slab_live` while holding `bucket`.
+            let names = crate::engine::state::block_identities_in(
+                bucket,
+                &crate::engine::state::BlockKeysByPosition::from_lookup(
+                    &bucket_index.object_block_lookup,
+                ),
+            );
+            let routing_bucket = item.routing_bucket;
+            bucket.block_index.retain(
+                &mut bucket_index.block_slab_live,
+                crate::engine::state::StaleCause::Overwrite,
+                |handle, block| {
+                let Some(beside) = names.get(handle) else {
+                    // A PAGE NOTHING NAMES IS NOT SUPERSEDED BY THIS ITEM. It cannot match an
+                    // object key it has none of, and dropping it on the kind alone would take
+                    // every other page of the bucket with it.
+                    return true;
+                };
+                let drop = block.model_id.as_str() == item.model_id
+                    && &**beside == item.object_key.as_ref()
+                    && match (names_a_block, here.as_ref()) {
+                        (true, Some(here)) => live_block_key(&block.address) == *here,
+                        _ => true,
+                    };
+                if drop {
+                    // ITS POSITION GOES WITH IT. Recorded from the page being dropped rather than
+                    // recomputed from the item, because the item's terms are what MATCHED and the
+                    // page's are what was FILED -- and the handle is only knowable here.
+                    unfiled.push((
+                        block.model_id,
+                        Arc::clone(beside),
+                        crate::engine::state::BlockLookupRef {
+                            routing_bucket,
+                            block_ref_key: *handle,
+                        },
+                    ));
+                }
+                !drop
+            });
+        }
+    } else if !covered_keys.is_empty() {
+        let CoreIndex {
+            bucket_map,
+            block_slab_live: live,
+            object_block_lookup,
+            ..
+        } = &mut *bucket_index;
+        // NAMED BEFORE THE MUTATION, for the reason at the upsert arm above. Here the destructure
+        // is what lets the inversion be read while the bucket map is held mutably.
+        let identities = crate::engine::state::BlockKeysByPosition::from_lookup(object_block_lookup);
+        for (routing_bucket, bucket) in bucket_map.iter_mut() {
+            let routing_bucket = *routing_bucket;
+            let names = crate::engine::state::block_identities_in(bucket, &identities);
+            bucket.block_index.retain(
+                live,
+                crate::engine::state::StaleCause::Overwrite,
+                |handle, block| {
+                let Some(beside) = names.get(handle) else {
+                    // NOT COVERED BY A KEY IT HAS NONE OF.
+                    return true;
+                };
+                let drop = covered_keys.contains(&**beside);
+                if drop {
+                    unfiled.push((
+                        block.model_id,
+                        Arc::clone(beside),
+                        crate::engine::state::BlockLookupRef {
+                            routing_bucket,
+                            block_ref_key: *handle,
+                        },
+                    ));
+                }
+                !drop
+            });
+        }
+    }
+    for item in items {
+        if item.deleted {
+            continue;
+        }
+        let Some(address) = item.entry.as_ref().cloned() else {
+            continue;
+        };
+        let bucket = bucket_index
+            .bucket_map
+            .entry(item.routing_bucket)
+            .or_insert_with(|| BucketNode {
+                routing_bucket: item.routing_bucket,
+                flags: BucketFlags::default().with(BucketFlags::META_LOADED, true).with(BucketFlags::IN_MEMORY, true),
+                ..BucketNode::default()
+            });
+        bucket.object_index.insert(item.object_id);
+        // The record's key is not carried into memory: the map assigns a handle, and the
+        // record's spelling is only rebuilt when the index is written back out.
+        let object_key: Arc<str> = Arc::from(item.object_key.clone());
+        let handle = bucket.insert_block(&object_key, 
+            BlockIndex {
+                model_id: crate::engine::storage_bucket_internals::stored_model_kind(
+                    &item.model_id,
+                ),
+                // NO NAME IS FILED, AND THERE IS NO LONGER A CONDITION DECIDING IT. This read
+                // `if index_entry_names_a_block(..) { None } else { item.component }`, on the
+                // reasoning that the two routes must compute the same written key for the same
+                // page. Both branches are gone with the field: the entry has no slot for an
+                // element name, so there is nothing for the two routes to disagree about.
+                //
+                // AND THE ROW IS NOT WHERE RECOVERY GETS THE ELEMENT'S NAME. This said the item
+                // "still carries the element's own name ... which recovery needs to restore the
+                // model map". It was wrong about which record recovery reads, and the row has no
+                // such field now. The model maps come back from two places, neither of them this
+                // row: `apply_outcome_item` installs elements from `wal::WalOutcomeItem::component`,
+                // which is the WAL's own record of the write; and `shard.hashes`, `sets`, `zsets`
+                // and `lists` carry `#[serde(default)]` and come back from the index snapshot
+                // directly. What a FOLD needs arrives beside these items in the record's own
+                // `key_states` blobs -- `CARRIED_CONTAINER_FIELDS` carries the member bytes, the
+                // sequence, the field and the address for all four kinds, and
+                // `fold_carried_container_elements` filters them on the ADDRESS, not on any name.
+                // The record carries the id and the address no longer does, so there is nothing
+                // to copy across: the entry derives the id from its own terms.
+                address,
+                dirty: false,
+                deleted: false,
+            },
+            &mut bucket_index.block_slab_live,
+        );
+        // TAKEN BACK OUT BY ITS HANDLE rather than cloned on the way in, so the position the
+        // lookup records names the entry the map HOLDS -- the decoder's rule, for the decoder's
+        // reason: a page whose handle collided with an earlier one is not in the map twice and
+        // must not be in the lookup twice either.
+        if let Some(placed) = bucket.block_index.get(&handle) {
+            filed_blocks.push((item.routing_bucket, handle, object_key, placed.clone()));
+        }
+    }
+    // UN-FILE BEFORE FILING, AND THE ORDER IS LOAD-BEARING. A fold can drop a page and place one
+    // at the SAME handle in the same call -- an upsert of the same object at the same address is
+    // exactly that -- so filing first and un-filing second would remove the position just
+    // established and leave the surviving page unnamed.
+    for (model_id, object_key, block_ref) in &unfiled {
+        bucket_index.remove_object_block_lookup_ref(
+            model_id.as_str(),
+            object_key,
+            None,
+            block_ref,
+        );
+    }
+    for (routing_bucket, handle, object_key, block) in &filed_blocks {
+        bucket_index.insert_object_block_lookup(*routing_bucket, *handle, object_key, block);
+    }
+}
+
+/// Collect the object keys a delta record touched, read from its per-key state blobs.
+fn delta_record_covered_keys(record: &crate::index_log::IndexDeltaRecord) -> BTreeSet<String> {
+    let mut keys: BTreeSet<String> = record
+        .key_states
+        .iter()
+        .filter_map(|blob| blob.get("key").and_then(|value| value.as_str()))
+        .map(str::to_string)
+        .collect();
+    // Fall back to the items' own object keys if a record carried block items but no blobs.
+    for item in &record.items {
+        keys.insert(item.object_key.to_string());
+    }
+    keys
+}
+
+thread_local! {
+    // Set while replaying the WAL into a shard on load. Writes issued during replay
+    // must NOT re-append to the WAL (they are already logged) and must not re-persist
+    // the index per record; the reconstructed index is persisted once when replay
+    // finishes. Thread-local because replay runs synchronously on the loading thread.
+    static REPLAYING_WAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn replaying_wal() -> bool {
+    REPLAYING_WAL.with(|cell| cell.get())
+}
+
+thread_local! {
+    // Set while applying a committed raft entry to the state machine. On this path the raft
+    // log is the durability source (quorum-replicated + fsync'd), and a node reconstructs on
+    // restart by loading the base and REPLAYING the raft log from the snapshot/base anchor --
+    // which re-executes the commands and rebuilds the served index. The per-apply index-log
+    // fsync is therefore redundant on the critical replication path (it only slows apply and
+    // widens the snapshot-transfer window), so the index-log delta is appended NON-BLOCKING
+    // (buffered, no fsync). Losing a non-fsync'd index-log tail on crash is safe: raft replay
+    // rebuilds it. Thread-local because raft apply runs synchronously on the apply thread.
+    static RAFT_APPLYING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn raft_applying() -> bool {
+    RAFT_APPLYING.with(|cell| cell.get())
+}
+
+struct RaftApplyGuard;
+
+impl RaftApplyGuard {
+    fn enter() -> Self {
+        RAFT_APPLYING.with(|cell| cell.set(true));
+        RaftApplyGuard
+    }
+}
+
+impl Drop for RaftApplyGuard {
+    fn drop(&mut self) {
+        RAFT_APPLYING.with(|cell| cell.set(false));
+    }
+}
+
+thread_local! {
+    // Set while applying a COMMITTED raft batch under TS_RAFT_APPLY_COALESCE. While set, each
+    // per-command WAL append reserves its sequence with sync=false (append_for_group_commit) and
+    // records the reserved sequence in RAFT_APPLY_BATCH_BARRIER instead of taking its own
+    // fdatasync; `execute_raft_apply_batch` issues ONE coalesced `commit_barrier` for the whole
+    // batch after every command is applied. Thread-local because raft apply runs synchronously on
+    // the apply thread. A raft group is one shard, so the accumulator holds a single (shard, seq).
+    static RAFT_APPLY_BATCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static RAFT_APPLY_BATCH_BARRIER: std::cell::RefCell<Option<(ShardId, u64)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+fn raft_apply_batch_active() -> bool {
+    RAFT_APPLY_BATCH.with(|cell| cell.get())
+}
+
+fn record_raft_apply_batch_barrier(shard_id: ShardId, sequence: u64) {
+    RAFT_APPLY_BATCH_BARRIER.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        match *slot {
+            Some((existing_shard, existing_seq)) if existing_shard == shard_id => {
+                *slot = Some((existing_shard, existing_seq.max(sequence)));
+            }
+            _ => *slot = Some((shard_id, sequence)),
+        }
+    });
+}
+
+/// Drop-guarded batch scope: sets RAFT_APPLY_BATCH on enter (clearing any stale barrier) and clears
+/// it on drop, so a panic mid-batch cannot leave the thread stuck in batch mode.
+struct RaftApplyBatchGuard;
+
+impl RaftApplyBatchGuard {
+    fn enter() -> Self {
+        RAFT_APPLY_BATCH.with(|cell| cell.set(true));
+        RAFT_APPLY_BATCH_BARRIER.with(|cell| *cell.borrow_mut() = None);
+        RaftApplyBatchGuard
+    }
+
+    fn take_barrier(&self) -> Option<(ShardId, u64)> {
+        RAFT_APPLY_BATCH_BARRIER.with(|cell| cell.borrow_mut().take())
+    }
+}
+
+impl Drop for RaftApplyBatchGuard {
+    fn drop(&mut self) {
+        RAFT_APPLY_BATCH.with(|cell| cell.set(false));
+    }
+}
+
+thread_local! {
+    // During a replayed command, the leader's wall-clock timestamp captured in the
+    // replayed record's metadata. Time-dependent resolution (TTL deadlines, context
+    // event time) reads this instead of the live clock so a re-executed command
+    // resolves the SAME absolute value the leader did (resolve-then-log), keeping
+    // replay deterministic across crash recovery and followers instead of drifting to a
+    // later restart-time deadline.
+    static REPLAY_CLOCK_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+}
+
+pub(super) fn set_replay_clock_ms(clock_ms: Option<u64>) {
+    REPLAY_CLOCK_MS.with(|cell| cell.set(clock_ms));
+}
+
+/// Holds the replay clock for the span of ONE apply and restores whatever was there before.
+///
+/// The clock is a thread-local, and a raft apply runs on a pooled thread that goes straight back
+/// to serving live commands. Setting it without restoring would leave the NEXT command on that
+/// thread resolving its deadlines against a committed entry's timestamp -- a leak that widens with
+/// every apply and shows up as deadlines in the past. Restoring on drop also survives a panic
+/// inside the apply.
+pub(super) struct ReplayClockGuard(Option<u64>);
+
+impl ReplayClockGuard {
+    /// `None`, and a zero timestamp, both mean "unstamped": leave the live clock in charge.
+    pub(super) fn enter(clock_ms: Option<u64>) -> Self {
+        let previous = REPLAY_CLOCK_MS.with(|cell| cell.get());
+        set_replay_clock_ms(clock_ms.filter(|stamp| *stamp > 0).or(previous));
+        Self(previous)
+    }
+}
+
+impl Drop for ReplayClockGuard {
+    fn drop(&mut self) {
+        set_replay_clock_ms(self.0);
+    }
+}
+
+/// Wall-clock time for deadline / event-time stamping. Returns the replay clock (the
+/// leader timestamp of the record being replayed) when set, otherwise the live clock.
+pub(super) fn resolve_now_ms() -> u64 {
+    REPLAY_CLOCK_MS
+        .with(|cell| cell.get())
+        .unwrap_or_else(now_ms)
+}
+
+thread_local! {
+    static COALESCING_INDEX_RECONSTRUCT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn coalescing_index_reconstruct() -> bool {
+    COALESCING_INDEX_RECONSTRUCT.with(|cell| cell.get())
+}
+
+/// Hold the per-record index reconstruct for the span of ONE logical ingest.
+///
+/// A context ingest issues about eight writes, and no `Command::Context*` appears in
+/// `command_updates_bucket_index_directly`, so each one fires `rebuild_bucket_first_index` --
+/// which walks every live block in the shard. Measured end to end: 5 762 400 block visits across
+/// 600 adds, the per-add cost doubling as the corpus doubles, and latency degrading 11.79x over a
+/// run. With the reconstruct deferred the same run is FLAT at 0.97x and 26.6x faster on the last
+/// thirty adds.
+///
+/// This is the same mechanism bulk backfill and WAL replay already use, scoped to one ingest
+/// instead of a whole session: the window defers, and the caller reconstructs ONCE as it closes.
+/// It cuts eight reconstructs to one. It does NOT make an add O(1) in the corpus -- the single
+/// remaining reconstruct still walks the store -- and that needs the context write path to
+/// maintain the index the way `StringSet` does.
+///
+/// A guard rather than a pair of calls so an early return cannot leave the window open: a leaked
+/// window would silently stop reconstructing for the rest of the thread's life.
+pub(crate) struct IngestReconstructWindow;
+
+impl IngestReconstructWindow {
+    pub(crate) fn open() -> Self {
+        COALESCING_INDEX_RECONSTRUCT.with(|cell| cell.set(true));
+        Self
+    }
+}
+
+impl Drop for IngestReconstructWindow {
+    fn drop(&mut self) {
+        COALESCING_INDEX_RECONSTRUCT.with(|cell| cell.set(false));
+    }
+}
+
+struct WalReplayGuard;
+
+impl WalReplayGuard {
+    fn enter() -> Self {
+        REPLAYING_WAL.with(|cell| cell.set(true));
+        WalReplayGuard
+    }
+}
+
+impl Drop for WalReplayGuard {
+    fn drop(&mut self) {
+        REPLAYING_WAL.with(|cell| cell.set(false));
+        REPLAY_CLOCK_MS.with(|cell| cell.set(None));
+    }
+}
+
+fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
+    atomic_write_bytes_synced(path, bytes, true)
+}
+
+/// Atomic temp-write + rename. When `sync` is true the temp file is `fsync`'d before the
+/// rename (crash-durable). When false, the content + rename are still issued (so the new
+/// bytes are immediately visible to any reader via the page cache), but the durability
+/// barrier is DEFERRED. Deferral is safe ONLY for the served-index checkpoint on the
+/// write/ack path: the WAL (durably synced before ack) is the recovery source of truth
+/// and replay rebuilds the served index from it, so a stale-on-crash index just replays a
+/// longer WAL suffix -- no acked write is lost. Durability-critical writers (dump
+/// manifest, manifest install-on-load) MUST pass sync=true.
+fn atomic_write_bytes_synced(path: &Path, bytes: &[u8], sync: bool) -> Result<(), std::io::Error> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("index");
+    let temp_path = parent.join(format!(
+        ".{file_name}.tmp-{}-{}",
+        std::process::id(),
+        next_temp_counter()
+    ));
+    let write_result = (|| {
+        let mut file = File::create(&temp_path)?;
+        file.write_all(bytes)?;
+        if sync {
+            file.sync_all()?;
+        }
+        drop(file);
+        fs::rename(&temp_path, path)?;
+        if sync {
+            // The rename is only crash-durable once the PARENT DIRECTORY entry is fsync'd:
+            // sync_all above makes the temp file's data+inode durable, but the rename that
+            // publishes it under `path` is a directory mutation that can still be lost on a
+            // crash. This backs the dump manifest (the durable WAL-reclaim watermark), the
+            // base index, and the install markers -- if the rename is not durable, a dump can
+            // let WAL-GC truncate the WAL to the manifest watermark, then a crash loses the
+            // manifest directory entry while the reclaimed WAL is already gone = permanent
+            // acked-write loss. Every other durable writer (wal.rs, index_log.rs,
+            // block_store) already syncs the parent dir here.
+            sync_parent_dir(path)?;
+        }
+        Ok(())
+    })();
+    if write_result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    write_result
+}
+
+/// Make the atomic-rename that published `path` crash-durable by fsync'ing the parent
+/// directory entry (mirrors `wal::sync_parent_dir` / `index_log::sync_parent_dir`).
+fn sync_parent_dir(path: &Path) -> Result<(), std::io::Error> {
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = File::open(parent) {
+            dir.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+/// TS_WAL_LEGACY_RECOVERY: emergency escape hatch. When set, the engine falls back to the
+/// legacy multi-barrier write path (WAL + data-block + served-index delta all fsync'd on the ack
+/// path) AND delta-fold recovery. Default OFF -> the single write-path durability barrier
+/// (WAL-only fsync) + base-only recovery is the DEFAULT. This exists solely so an operator can
+/// revert the default in the field without a rebuild; steady state runs single-barrier.
+pub(crate) fn wal_legacy_recovery() -> bool {
+    env_flag_on("TS_WAL_LEGACY_RECOVERY")
+}
+
+/// On the write/ack path only the WAL takes a synchronous durability barrier; the served-index
+/// checkpoint write is issued but its fsync is deferred to the background flush / OS writeback
+/// (reconstructable from the WAL on recovery). Implied by the single-barrier default; disabled
+/// only by the TS_WAL_LEGACY_RECOVERY escape hatch.
+pub(super) fn wal_only_sync() -> bool {
+    wal_single_barrier()
+}
+
+/// The true SINGLE write-path durability barrier. Only the WAL takes a
+/// synchronous fdatasync per write (1.00/write); the data-block fdatasync, the served-index
+/// delta-log fdatasync, the slab-manifest persist, and the base-index sync are all deferred.
+/// Correctness rests on the WAL + the durable dump checkpoint being a COMPLETE source of truth:
+///  - config changes (feature_max_size etc.) become durable and WAL-sequence-ordered via a
+///    per-shard config-log, so replay re-derives config-driven eviction (trims) at the exact
+///    frontier they took effect (see `append_config_log_entry` / `config_log_entries`). Without
+///    this, WAL-only replay re-executed feature appends with the default config and resurrected
+///    evicted points.
+///  - expiry (TTL) resolves against the leader timestamp captured in each WAL record (replay
+///    clock) and applies lazily; compaction is background + non-destructive to logical
+///    membership -- both already WAL-re-derivable.
+///  - `flush_shard_index` fsyncs every data block (and the WAL) BEFORE advancing the dump
+///    watermark, so every block at/below the watermark is durable. Recovery is BASE-ONLY: it
+///    trusts only the durable base/manifest checkpoint (never the un-synced delta or the anchor
+///    it advances), then replays the WAL tail from the watermark, re-deriving every post-dump
+///    block EXACTLY ONCE. A block written but never fsync'd is rebuilt from its WAL command rather
+///    than left dangling -- no block loss, no double-apply.
+/// Default ON (the productionized write/recovery path). Set TS_WAL_LEGACY_RECOVERY=1 to fall
+/// back to the legacy multi-barrier write path + delta-fold recovery.
+///
+/// This block used to open by naming `TS_WAL_SINGLE_BARRIER`, which is read by nothing -- the
+/// only variable in it is TS_WAL_LEGACY_RECOVERY, two lines up. The two halves of one comment
+/// named two different variables, and `tools/deploy_profile_common.sh` exported the dead one on
+/// every deploy profile. Same shape as the two notes below about `TS_ENGINE_CONCURRENT_COMMIT`
+/// and `TS_RAFT_APPLY_COALESCE`: the name is recorded rather than removed, so setting it still
+/// finds an explanation.
+pub(super) fn wal_single_barrier() -> bool {
+    !wal_legacy_recovery()
+}
+
+// CONCURRENT COMMIT: run the WAL durability barrier OUTSIDE the global `shards` write lock.
+// A synchronous write reserves its WAL sequence and appends its record UNDER the `shards` lock
+// (preserving WAL-order == apply-order), then RELEASES the lock and awaits the durable barrier
+// (`commit_barrier`). This lets concurrent same-shard writers reach the group-commit queue while
+// a peer's fdatasync is in flight, so #45's fsync coalescing actually engages (fewer fsyncs than
+// writes; QPS scales with concurrency). The ack is always returned strictly AFTER the covering
+// barrier succeeds, so durability is never weakened.
+//
+// This is the `concurrent_commit` field, per engine, true everywhere but the test that measures
+// what the in-lock barrier costs. `TS_ENGINE_CONCURRENT_COMMIT` used to decide it for every
+// engine in the process at once; it is read by nothing now, so setting it does nothing.
+
+
+// RAFT APPLY COALESCE: on the raft state-machine apply path, coalesce the per-committed-entry
+// engine-WAL fdatasync across a whole committed batch (one fsync per AppendEntries batch /
+// recovery replay / pipelined-propose group instead of one per entry) and anchor the served index
+// off the O(1) cached WAL sequence. The raft log stays the durability + reconstruction source;
+// the coalesced barrier still completes before the raft runtime advances the durable
+// applied_index.
+//
+// This is the `raft_apply_coalesce` field, per engine, true everywhere but the test that measures
+// the per-entry loop. `TS_RAFT_APPLY_COALESCE` used to decide it for every engine in the process
+// at once; it is read by nothing now, so setting it does nothing.
+
+fn env_flag_on(name: &str) -> bool {
+    crate::env_flag::env_bool(name, false)
+}
+
+
+/// THE ONE-ENTRY-A-PAGE GATE IS RETIRED, AND THIS IS WHERE IT WAS.
+///
+/// `TS_CONTAINER_ONE_ENTRY_A_PAGE` and `container_index_files_one_entry_a_page()` stood here. Every
+/// container kind files one index entry per PAGE, carrying no element name, and there is no longer
+/// a position in which it does otherwise.
+///
+/// # WHY IT COULD NOT STAY
+///
+/// `BlockIndex` is the structure the index is MADE of -- one per page, millions of them -- and
+/// `component` was the only place on it an element name could live. Taking that field out is the
+/// whole point of this series, and with it gone the gate's OFF position is not a slower layout, it
+/// is an UNIMPLEMENTABLE one: nothing could file a name, and every reader that resolved an element
+/// by matching `page.component == component` would answer wrongly rather than slowly. A flag whose
+/// two positions are "correct" and "silently wrong" is not a flag.
+///
+/// # WHAT IT WAS, MEASURED, SO THE DECISION IS NOT TAKEN ON A RECOLLECTION
+///
+/// It shipped ON by default (`env_flag_default_on`) from the set and list collapses onward, so the
+/// OFF position was a development affordance and never a deployed configuration. And its coverage
+/// was partly an accident of test ORDER: four arms -- `resident_map_readers` x2 and
+/// `set_listing_block_reads` x2 -- passed in a full suite only because
+/// `replay_under_the_gate::the_gate_guard_restores_the_variable_even_when_an_assertion_panics` set
+/// the variable to `"0"` and never put it back. Driven both ways before the retirement: those four
+/// FAIL when run alone (6 passed, 4 failed) and PASS when the leaking arm runs first (15 of 15).
+///
+/// # AND THE STORED SIDE IS A ONE-WAY DOOR, WHICH IS A SEPARATE CLAIM
+///
+/// A store written with the gate OFF has entries that name their elements, and this binary cannot
+/// read one. It must be REFUSED rather than misread, and that is the stamp's job --
+/// `an_ungated_store_is_refused_before_it_is_served` drives it on a stored golden and reads the
+/// engine's own load-path counters: accepted 0, stale 1, and nothing served. The named decoder drops
+/// a key it has no field for SILENTLY, so the refusal is what stands between that drop and an
+/// answer.
+///
+/// The argument that a store from before a change may be refused rather than guessed at is the
+/// tree's own, at `engine/routing_range_stamp.rs:50`: "The adoption existed to keep existing
+/// deployments starting; before the first milestone there are none to keep, so the honest answer
+/// replaces the convenient one." Refusing is the honest answer; serving a store whose element names
+/// were dropped on the way in is the convenient one.
+
+/// Tuning for sampled eviction, read from the environment with defaults that mirror the
+/// established policy: sample several buckets per wanted victim, keep a bounded candidate pool
+/// across passes, and cap how far one pass may walk.
+pub(crate) fn evict_sampler_config() -> eviction_sampler::EvictionSamplerConfig {
+    fn parse(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(default)
+    }
+    eviction_sampler::EvictionSamplerConfig {
+        samples: parse("TS_EVICT_SAMPLES", 5),
+        pool_size: parse("TS_EVICT_POOL_SIZE", 64),
+        scan_turns: parse("TS_EVICT_SCAN_TURNS", 4),
+    }
+}
+
+/// Default-ON gate read: the fix is LIVE unless explicitly disabled with
+/// `=0|false|no|off`. Shipped write-path/raft fixes use this so production gets the
+/// fixed behavior by default; the env var remains only as an escape hatch.
+pub(crate) fn env_flag_default_on(name: &str) -> bool {
+    crate::env_flag::env_bool(name, true)
+}
+
+/// One durable config-log entry: the shard config `config`, effective for every WAL write with
+/// sequence strictly greater than `after_seq`. Written under single-barrier mode so WAL-tail
+/// replay re-derives config-driven eviction (feature_max_size trims) at the exact frontier the
+/// change took effect, rather than replaying with a lost/default config and resurrecting or
+/// dropping points.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(super) struct ConfigLogEntry {
+    pub after_seq: u64,
+    pub config: Config,
+}
+
+fn next_temp_counter() -> u64 {
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn unique_temp_path(kind: &str) -> PathBuf {
+    crate::scratch::unique_temp_path(kind)
+}
+
+fn sha256_hex_bytes(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+/// Configurable, reference-style temporal-compression trigger for one context node.
+///
+/// Called on the event-write path (guarded by policy, disabled by default). When a
+/// node crosses the configured raw-event count or age threshold, it folds the oldest
+/// pending window of raw events (keeping the newest `keep_recent_events` raw) into a
+/// single `ContextCompressionEvent`. Bounded to one window per call, so writes stay
+/// light; the per-node high-water mark advances in-memory. Non-destructive: raw
+/// events remain queryable/replayable (physical GC stays a separate concern).
+/// Returns true if it wrote a compression record. Entities are never touched.
+fn maybe_auto_compress_context_node(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    shard: &mut ShardState,
+    tenant_hash: u64,
+    node_hash: u64,
+    event_object_key: &str,
+    start_routing_bucket: u32,
+    end_routing_bucket: u32,
+    async_storage: bool,
+) -> bool {
+    let policy = context_compression_policy_from_env();
+    if !policy.enabled {
+        return false;
+    }
+    // FROM THE TIMELINE, NOT FROM THE SERIES, and the distinction is the whole trigger.
+    //
+    // This read `context_events()` and divided its keys by `CONTEXT_TIMELINE_FANOUT`, calling
+    // them `timeline_key`. They are not timeline keys. The write arm files the series point
+    // under `event_id_hash` and files the TIMELINE key in `context_event_timeline`, which maps
+    // timeline key -> event id. So the division was applied to a hash.
+    //
+    // WHAT THAT PRODUCED, MEASURED: 120 events on one node came out as 120 copies of time
+    // ZERO, because `event_id_hash / 1_048_576` is 0 for any hash below the fanout. The planner
+    // then takes `pending` as the events strictly newer than the watermark -- with every time 0
+    // and the watermark 0 that slice is EMPTY -- and returns None. The trigger could therefore
+    // never fire, at any event count, for any node, on any store. It was invisible because the
+    // policy also defaults off, so nothing reached this line to be wrong.
+    //
+    // `context_event_timeline` is a `BTreeMap`, so its keys come out ascending, which is what
+    // `plan_next_compression_window` requires of `event_times_sorted`.
+    let event_times: Vec<u64> = match shard.context_event_timeline.get(event_object_key) {
+        Some(timeline) => timeline
+            .keys()
+            .map(|timeline_key| timeline_key / CONTEXT_TIMELINE_FANOUT)
+            .collect(),
+        None => return false,
+    };
+    let watermark = shard
+        .context_compression_watermark()
+        .get(event_object_key)
+        .copied()
+        .unwrap_or(0);
+    let window = match plan_next_compression_window(&policy, &event_times, watermark, now_ms()) {
+        Some(window) => window,
+        None => return false,
+    };
+    // Stable compression id per (node, window) makes re-processing idempotent: the
+    // same window maps to the same timeline key and overwrites rather than duplicates.
+    let compression_id_hash =
+        stable_object_hash(&format!("compress:{node_hash}:{}:{}", window.start_ms, window.end_ms));
+    let compression_event = ContextCompressionEvent {
+        compression_id_hash,
+        node_hash,
+        source_start_ms: window.start_ms,
+        source_end_ms: window.end_ms,
+        compressed_time_ms: now_ms(),
+        summary: format!(
+            "Auto temporal compression: {} context events for node {} in window [{}, {}].",
+            window.count, node_hash, window.start_ms, window.end_ms
+        ),
+    };
+    let compression_key = context_compression_key(tenant_hash, node_hash);
+    let timeline_key = context_timeline_key(window.start_ms, compression_id_hash);
+    let routing_bucket = block_routing_bucket(&compression_key, start_routing_bucket, end_routing_bucket);
+    let mut mutated = false;
+    if let Ok(addresses) = append_timestamped_kv_blocks(
+        cache,
+        block_store,
+        shard_id,
+        "context_compression",
+        &compression_key,
+        vec![FeaturePoint {
+            timestamp_ms: timeline_key,
+            value: context_bytes(&compression_event),
+        }],
+        routing_bucket,
+        async_storage,
+        false,
+        crate::engine::state::next_block_index_for_object(
+            &shard.bucket_index,
+            routing_bucket,
+            "context_compression",
+            &compression_key,
+        ),
+    ) {
+        let series = shard
+            .context_compressions_mut()
+            .entry(std::sync::Arc::from(&compression_key[..]))
+            .or_default();
+        for (timestamp_ms, address) in addresses {
+            series.set(timestamp_ms, address);
+            mutated = true;
+        }
+    }
+    shard
+        .context_compression_watermark_mut()
+        .insert(std::sync::Arc::from(&event_object_key[..]), window.end_ms);
+    invalidate_context_record(cache, shard_id, &compression_key);
+    mutated
+}
+
+fn ttl_ms(shard: &mut ShardState, key: &str) -> i64 {
+    if remove_if_expired(shard, key) {
+        return -2;
+    }
+    if !record_exists(shard, key) {
+        return -2;
+    }
+    associated_record_keys(key)
+        .into_iter()
+        .filter_map(|record_key| shard.expires_at_ms().get(record_key.as_str()).copied())
+        .map(|expires_at| expires_at.saturating_sub(resolve_now_ms()) as i64)
+        .min()
+        .unwrap_or(-1)
+}
+
+/// The next `limit` deadlines after `cursor` that `keep` accepts, read straight out of the
+/// ordered set.
+///
+/// The cost of a round should be the cost of its window. Asking `keep` about every deadline made it
+/// the cost of the whole set instead -- about 11 ms per thousand deadlines for a window of sixteen,
+/// on every cycle. Reading from where the cursor left off asks only about the window.
+///
+/// `scan_budget` bounds the walk: a long run of keys that `keep` rejects -- every resident key,
+/// when the sweep is looking for the non-resident ones -- would otherwise still walk the set. The
+/// cursor advances regardless, so the next round resumes past them and the sweep keeps moving.
+///
+/// # TEST-ONLY. NO PRODUCTION PATH CALLS THIS, AND KEY-ORDERED EXPIRY IS REFUSED ON MEASUREMENT
+///
+/// This has **zero production callers**. Every call site is a test: measured by a scan over all
+/// 391 source files, **seven call sites across four tests** in `engine::tests::part4`, and no
+/// production caller anywhere. `the_key_ordered_expiry_window_has_no_production_callers` holds
+/// that -- with a positive control on the call-site count, so it cannot pass by scanning nothing
+/// -- and if something wires this into a live path a guard fails rather than a reviewer noticing.
+///
+/// The two counts are different questions and both are stated on purpose: four TESTS exercise it,
+/// and they do so from seven CALL SITES.
+///
+/// IT IS KEPT AS A COMPARISON POINT, NOT AS A SUPPORTED SHAPE. A reader who finds a `pub(crate)`
+/// ordered walk over `expires_at_ms` has every reason to assume key-ordered expiry is available.
+/// It is not. Walking deadlines in KEY order makes time-to-expire a function of the KEYSPACE
+/// rather than of how many keys are actually due: measured at keyspace/scan_budget rounds, so
+/// **ten expired keys sitting behind ten thousand live ones survived more than sixty rounds**.
+/// That is the measurement, and it is why the live sweep does not read this.
+///
+/// WHAT THE LIVE SWEEP READS INSTEAD is [`due_window`], over `ShardState::expiry_by_deadline`,
+/// where the keys that are due are a PREFIX -- so a round costs the number of keys that are due
+/// and stops at the first deadline in the future. `engine::tests::expiry_scale` carries the
+/// evidence, including why a bounded round-robin cursor should not replace an ordered index here.
+///
+/// IF THIS IS EVER DELETED, two of its four tests carry coverage that is NOT about this function
+/// and must be repointed at [`due_window`] rather than dropped with it:
+/// `the_default_expiry_bound_truncates_a_round_and_the_next_one_resumes`, which proves the shipped
+/// `max_expire_hot_buckets_per_round` reaches a mechanism rather than merely being set, and
+/// `a_run_of_rejected_keys_does_not_stall_the_sweep`, whose hazard [`due_window`] shares. The
+/// other two are about this cursor API, which [`due_window`] does not have, and go with it.
+pub(crate) fn expiry_window<F>(
+    deadlines: &std::collections::BTreeMap<std::sync::Arc<str>, u64>,
+    cursor: Option<&str>,
+    limit: usize,
+    scan_budget: usize,
+    keep: F,
+) -> (Vec<(String, u64)>, Option<String>)
+where
+    F: Fn(&str) -> bool,
+{
+    use std::ops::Bound::{Excluded, Unbounded};
+
+    // The probe handle allocates, and only here: this function has no live caller, and a
+    // cursor arrives as a `&str` with no handle to borrow from.
+    let lower = match cursor {
+        Some(cursor) => Excluded(std::sync::Arc::<str>::from(cursor)),
+        None => Unbounded,
+    };
+    let mut selected = Vec::new();
+    let mut walked = 0usize;
+    let mut last_seen: Option<String> = None;
+    let mut reached_the_end = true;
+    for (key, expires_at) in deadlines.range((lower, Unbounded)) {
+        if limit > 0 && selected.len() >= limit {
+            reached_the_end = false;
+            break;
+        }
+        if scan_budget > 0 && walked >= scan_budget {
+            reached_the_end = false;
+            break;
+        }
+        walked = walked.saturating_add(1);
+        // `to_string` rather than `clone`: the cursor and the selection are owned `String`s that
+        // leave this function, so they are TRANSIENT copies on a bounded walk and not resident
+        // ones. The count this change is about is resident copies.
+        last_seen = Some(key.to_string());
+        if keep(&**key) {
+            selected.push((key.to_string(), *expires_at));
+        }
+    }
+    // Resume past everything examined, not past everything taken: the keys `keep` rejected were
+    // looked at, and looking at them again next round is how a sweep fails to make progress.
+    let next_cursor = if reached_the_end { None } else { last_seen };
+    (selected, next_cursor)
+}
+
+/// How many deadlines disagree between the two expiry indexes. Zero is the invariant.
+///
+/// Exposed so a guard can assert it after a real workload: the two maps are kept in step by
+/// `set_expiry`/`clear_expiry`, and a mutation site that bypassed them would show up here rather
+/// than as keys that silently never expire.
+pub(in crate::engine) fn expiry_index_disagreements(shard: &ShardState) -> usize {
+    let mut disagreements = 0usize;
+    for (key, expires_at) in shard.expires_at_ms().iter() {
+        if !shard
+            .expiry_by_deadline
+            .contains_key(&(*expires_at, key.clone()))
+        {
+            disagreements = disagreements.saturating_add(1);
+        }
+    }
+    for ((expires_at, key), ()) in shard.expiry_by_deadline.iter() {
+        if shard.expires_at_ms().get(key) != Some(expires_at) {
+            disagreements = disagreements.saturating_add(1);
+        }
+    }
+    disagreements
+}
+
+/// Record a deadline for `key`, keeping both expiry indexes in step.
+pub(in crate::engine) fn set_expiry(shard: &mut ShardState, key: String, expires_at: u64) {
+    ensure_expiry_order(shard);
+    // ONE ALLOCATION OF THE CHARACTERS, HELD BY BOTH MAPS, AND SHARED WITH THE PAGE INDEX WHERE
+    // IT ALREADY HAS ONE. This used to be three `String`s of the same text per write -- one into
+    // this map, one into the mirror, and one more to probe the mirror on an overwrite -- and then
+    // one `Arc` allocation of characters `object_block_lookup` was frequently already holding.
+    //
+    // CORRECTION TO WHAT THIS COMMENT USED TO SAY: `Arc::from(String)` does NOT take the buffer
+    // the caller already owns. Measured at 4, 24 and 64 characters, it performs one allocation of
+    // `16 + len` and the data pointer moves every time. The COUNT claim -- three `String`s
+    // collapsing to one allocation -- held; the mechanism claim did not.
+    //
+    // Read the handle out before the mutable borrow, and fall back to allocating when the object
+    // has no blocks yet, which is the call that must allocate.
+    let existing = shard
+        .bucket_index
+        .object_block_lookup
+        .any_shared_object_key(&key);
+    let shared: std::sync::Arc<str> = existing.unwrap_or_else(|| std::sync::Arc::from(key));
+    if let Some(previous) = shard
+        .expires_at_ms_mut()
+        .insert(std::sync::Arc::clone(&shared), expires_at)
+    {
+        shard
+            .expiry_by_deadline
+            .remove(&(previous, std::sync::Arc::clone(&shared)));
+    }
+    shard.expiry_by_deadline.insert((expires_at, shared), ());
+}
+
+/// Drop any deadline for `key`. Returns whether there was one.
+pub(in crate::engine) fn clear_expiry(shard: &mut ShardState, key: &str) -> bool {
+    ensure_expiry_order(shard);
+    // `remove_entry` HANDS BACK THE HANDLE BOTH MAPS HOLD, so the tuple that probes the mirror
+    // is a move of that handle rather than a fresh allocation of the same text. The
+    // `key.to_string()` this replaces was a third copy on every removal, built only to be
+    // dropped.
+    match shard.expires_at_ms_mut().remove_entry(key) {
+        Some((shared, previous)) => {
+            shard.expiry_by_deadline.remove(&(previous, shared));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Rebuild the deadline-ordered view if a load left it empty.
+///
+/// It carries `#[serde(skip)]`, so a shard restored from a snapshot has the key-ordered map and
+/// not this one. Rebuilding on first use keeps the persisted format unchanged and costs one pass
+/// per load rather than a migration.
+pub(in crate::engine) fn ensure_expiry_order(shard: &mut ShardState) {
+    if shard.expiry_by_deadline.is_empty() && !shard.expires_at_ms().is_empty() {
+        // THIS `clone` IS THE SHARING, AND THAT IS WHY THE REBUILD NEEDS NO CARE. On an `Arc` it
+        // is a refcount bump, so a mirror rebuilt here points at the characters the key-ordered
+        // map already holds. It matters because `serde` does NOT restore sharing: each occurrence
+        // decodes its own allocation, and this map is `serde(skip)`, so what the sharing looks
+        // like after a restore is whatever this loop does rather than whatever the write path
+        // did. Spelled `key.to_string()` -- the natural thing to leave in place -- a restored
+        // shard would silently hold two copies again while a freshly written one held one.
+        // BOTH SIDES AS FIELDS. The source is behind a door now, and a door borrows the whole
+        // shard, which cannot coexist with the mutable insert into the mirror below. Reaching
+        // `u64_ledgers` directly keeps them disjoint -- and a snapshot would have been WRONG, not
+        // merely slower: a cloned map's keys are fresh allocations, so the mirror would point at
+        // copies instead of the characters the key-ordered map holds, which is the sharing this
+        // loop exists to restore.
+        let source = crate::engine::state::u64s_ref(
+            &shard.side_tables,
+            crate::engine::state::SideTable::Expiry,
+        )
+        .expect("the expiry domain is non-empty here, checked just above");
+        let pairs: Vec<((u64, crate::engine::state::ModelKey), ())> = source
+            .iter()
+            .map(|(key, expires_at)| ((*expires_at, key.clone()), ()))
+            .collect();
+        shard.expiry_by_deadline.extend(pairs);
+    }
+}
+
+/// The keys whose deadline has passed, cheapest first, up to `limit` that `keep` accepts.
+///
+/// Due keys are a PREFIX of the deadline-ordered view, so this stops at the first deadline in the
+/// future instead of walking the keyspace. `scan_budget` still bounds the walk, because `keep`
+/// can reject a long run of due keys belonging to the other class.
+pub(in crate::engine) fn due_window<F>(
+    shard: &ShardState,
+    now: u64,
+    limit: usize,
+    scan_budget: usize,
+    keep: F,
+) -> Vec<(String, u64)>
+where
+    F: Fn(&str) -> bool,
+{
+    let mut selected = Vec::new();
+    let mut walked = 0usize;
+    for ((expires_at, key), ()) in shard.expiry_by_deadline.iter() {
+        if *expires_at > now {
+            break;
+        }
+        if limit > 0 && selected.len() >= limit {
+            break;
+        }
+        if scan_budget > 0 && walked >= scan_budget {
+            break;
+        }
+        walked = walked.saturating_add(1);
+        // TRANSIENT, NOT RESIDENT. The returned `String`s leave this function and are dropped by
+        // the sweep that consumes them; the signature is left alone so no caller moves. This is
+        // one allocation per DUE key on a bounded round -- the same cost as the `String` clone it
+        // replaces -- and it is not one of the copies the footprint counts.
+        if keep(&**key) {
+            selected.push((key.to_string(), *expires_at));
+        }
+    }
+    selected
+}
+
+fn remove_if_expired(shard: &mut ShardState, key: &str) -> bool {
+    // Use the replay-aware clock: during WAL replay this resolves to the per-record leader
+    // timestamp so lazy expiry reproduces the leader's original branch. Using the real
+    // restart clock here would let a key that was live at leader-time (and thus took the
+    // "exists" branch of a logged conditional write) appear expired on recovery, silently
+    // dropping a durably-committed write and diverging the recovered state from the leader.
+    // Nothing can have expired if nothing has an expiry. Checked before anything else because
+    // this runs on every command -- 51 call sites -- and the walk below used to build four owned
+    // keys, one of them with `format!`, purely to look them up and drop them again.
+    if shard.expires_at_ms().is_empty() {
+        return false;
+    }
+
+    let now = resolve_now_ms();
+    let mut removed = false;
+
+    let expired = |shard: &ShardState, candidate: &str, now: u64| {
+        shard
+            .expires_at_ms()
+            .get(candidate)
+            .is_some_and(|expires_at| *expires_at <= now)
+    };
+
+    // The key as given. `BTreeMap<String, _>` looks up by `&str`, so this needs no owned copy.
+    if expired(shard, key, now) {
+        removed |= delete_record_exact(shard, key);
+    }
+
+    if key.starts_with("control_state:") {
+        return removed;
+    }
+
+    // The control-state families. Built into one buffer that is rewritten per family rather than
+    // a fresh `String` apiece.
+    let mut candidate = String::with_capacity("control_state:".len() + 4 + key.len());
+    for family in [
+        ControlStateFamily::Counter,
+        ControlStateFamily::Distinct,
+        ControlStateFamily::Selection,
+    ] {
+        candidate.clear();
+        candidate.push_str("control_state:");
+        candidate.push_str(control_state_family_name(family));
+        candidate.push(':');
+        candidate.push_str(key);
+        if expired(shard, &candidate, now) {
+            removed |= delete_record_exact(shard, &candidate);
+        }
+    }
+    removed
+}
+
+fn delete_record(shard: &mut ShardState, key: &str) -> bool {
+    let mut removed = false;
+    for record_key in associated_record_keys(key) {
+        removed |= delete_record_exact(shard, &record_key);
+    }
+    removed
+}
+
+fn delete_record_exact(shard: &mut ShardState, key: &str) -> bool {
+    let mut removed = false;
+    // ONE MARK AUTHORISES EVERY RECORDED CONTAINER'S DROP, and that is why the witness is minted
+    // here and handed out rather than minted inside each container's own operation.
+    //
+    // `mark_bucket_index_object_deleted` files the deletion of the OBJECT -- one record covering
+    // every model map the key appears in -- and it settles a released bucket by reading the block's
+    // address out of the model map WHILE THE MAP STILL HOLDS IT. So the mark has to run once, and
+    // before any drop. Minting inside each container would mark once per kind, which is a second
+    // record of one deletion; dropping before the mark would take the address it reads.
+    //
+    // This is the one call site in the engine where a token is threaded, and it is threaded because
+    // one record genuinely authorises several mutations. Everywhere else a recorded container's
+    // operation mints its own and the caller never sees it.
+    let (marked, deletion) =
+        storage_bucket_internals::mark_bucket_index_object_deleted_filed(shard, key);
+    removed |= marked;
+    // ONE MARK, FOUR DROPS, which is now every container kind. The witness is `Clone` precisely
+    // so that one recorded object deletion can authorise each of them; minting per kind would file
+    // four records of one deletion. The last call takes it by value because nothing follows.
+    removed |= recorded_map::drop_object::<recorded_map::HashKind>(shard, key, deletion.clone());
+    removed |= recorded_map::drop_object::<recorded_map::SetKind>(shard, key, deletion.clone());
+    removed |= recorded_map::drop_object::<recorded_map::ListKind>(shard, key, deletion.clone());
+    removed |= recorded_map::drop_object::<recorded_map::ZSetKind>(shard, key, deletion);
+    removed |= clear_expiry(shard, key);
+    removed |= shard.remove_string_row(key).is_some();
+    removed |= shard.buckets.remove(key).is_some();
+    removed |= shard.seen.remove(key).is_some();
+    if shard.features_mut().remove(key).is_some() {
+        removed = true;
+        control_rollup::feature_forget(shard, key);
+    }
+    if shard.control_state_mut().remove(key).is_some() {
+        removed = true;
+        control_rollup::forget(shard, key);
+    }
+    removed |= shard.remove_control_state_block(key).is_some();
+    removed |= shard.control_state_changes.remove(key).is_some();
+    removed |= shard.control_state_selection.remove(key).is_some();
+    removed |= shard.context_nodes_mut().remove(key).is_some();
+    removed |= shard.context_events_mut().remove(key).is_some();
+    removed |= shard.context_indexes_mut().remove(key).is_some();
+    removed |= shard.context_audits_mut().remove(key).is_some();
+    removed |= shard.context_entities_mut().remove(key).is_some();
+    removed |= shard.context_children_mut().remove(key).is_some();
+    removed |= shard.context_summaries_mut().remove(key).is_some();
+    removed |= shard.context_compressions_mut().remove(key).is_some();
+    removed
+}
+
+fn mark_bucket_index_object_deleted(shard: &mut ShardState, key: &str) -> bool {
+    // NO SHARD, NOTHING TO MARK. The ids this removes are derived from (shard, kind, key), and a
+    // state with no shard id has no bucket index built under one either.
+    let Some(shard_id) = shard.shard_id() else {
+        return false;
+    };
+    // A RELEASED bucket holds no block entries, so the walk below finds nothing to remove and the
+    // object id would stay claimed until some later reload re-derived the set. Settle it here,
+    // while the model map this reads the address out of still holds the block.
+    //
+    // Kept out of `removed`: that flag also decides whether the object-block lookup is corrected,
+    // and a released bucket's lookup entries were dropped by the release itself. There is nothing
+    // there to correct, and establishing the lookup as a side effect of a delete is not this
+    // change's to make.
+    let settled_released =
+        crate::engine::storage_bucket_internals::settle_released_bucket_object_delete(shard, key);
+    let mut removed = false;
+    let target_buckets = bucket_index_target_buckets_for_object_key(shard, key);
+    for routing_bucket in target_buckets {
+        let Some(bucket) = shard.bucket_index.bucket_map.get_mut(&routing_bucket) else {
+            continue;
+        };
+        let mut deleted_object_ids = BTreeSet::new();
+        // NAMED BEFORE THE MUTATION, for the reason at `fold_delta_block_items`.
+        let names = crate::engine::state::block_identities_in(
+            bucket,
+            &crate::engine::state::BlockKeysByPosition::from_lookup(
+                &shard.bucket_index.object_block_lookup,
+            ),
+        );
+        bucket.block_index.retain(
+            &mut shard.bucket_index.block_slab_live,
+            crate::engine::state::StaleCause::Removed,
+            |handle, block| {
+            let Some(beside) = names.get(handle) else {
+                return true;
+            };
+            if &**beside == key {
+                // THE KEY IS THIS FUNCTION'S ARGUMENT, and the match on the line above is what
+                // says this page belongs to it -- so the id is derived from the same characters
+                // it always was, read from the one place that still has them.
+                deleted_object_ids.insert(block.object_id(shard_id, key));
+                removed = true;
+                false
+            } else {
+                true
+            }
+        });
+        if !deleted_object_ids.is_empty() {
+            bucket.object_index.extend(deleted_object_ids.iter().copied());
+            bucket.set_dirty(true);
+            bucket.set_deleted(bucket.block_index.is_empty());
+            bucket.dirty_generation = bucket.dirty_generation.saturating_add(1);
+            bucket.set_meta_loaded(true);
+            bucket.set_in_memory(!bucket.block_index.is_empty());
+            // THE REPAIR AT THE REMOVAL SITE, over this bucket's own pages. A delta over the
+            // ids this delete dropped stood here and was wrong -- it left drift that the reconcile
+            // it replaced had been repairing silently. All three arms of that reconcile are kept,
+            // including the one that leaves the list alone on a bucket this delete has emptied:
+            // that is how a deleted object's id survives to be reported as a tombstone.
+            // THE PROJECTION THIS LOOP ALREADY BUILT, handed over rather than re-derived.
+            crate::engine::storage_bucket_internals::repair_object_index_against_its_blocks(
+                shard_id,
+                bucket,
+                &names,
+            );
+            crate::engine::storage_bucket_internals::classify_bucket_layout_in_place(bucket);
+            // Moved below the prune, which touches `object_index` and never this field. Nothing
+            // between them reads it.
+            bucket.deleted_object_index.extend(deleted_object_ids);
+        }
+    }
+    if removed {
+        // THIS OBJECT'S OWN ENTRIES ARE DROPPED, AND THAT IS NOW UNCONDITIONAL.
+        //
+        // The whole-shard rebuild it used to fall back to cloned every block in every bucket, so a
+        // single delete allocated in proportion to the store -- 409 allocations at 200 resident
+        // keys, 3,851 at 3,200 -- and deleting a store cost the square of its size. The fallback
+        // was kept for one case: a lookup not yet established, where there would be nothing for
+        // the cheap path to drop.
+        //
+        // THAT CASE CANNOT CARRY A LIVE PAGE, which is what makes the fallback unnecessary rather
+        // than merely expensive. All nine production sites that install a page into a bucket's map
+        // file it in the same enclosing function; the only doors that do not file have no callers
+        // at all, or none outside tests and compile out of `--lib` with zero errors. So an empty
+        // lookup means no live page is resident -- and a rebuild over no live pages files nothing.
+        // `push_object_dirty_onto_its_existing_blocks` carries the census and asserts the same
+        // invariant where it used to repair it.
+        //
+        // THE REF TOTAL'S DISJUNCT WAS ALREADY DEAD. It read
+        // `|| object_component_block_refs.is_none()`, on the reasoning that only a rebuild can
+        // lift the total from `None`. No construction route leaves it there: `impl Default for
+        // CoreIndex` starts it at `Some(0)` and the decoder assigns `Some(0)` before it files.
+        //
+        // AND DROPPING AN ENTRY THE LOOKUP DOES NOT HOLD IS A NO-OP, so the branch is not replaced
+        // by a condition -- it is replaced by nothing.
+        debug_assert!(
+            !shard.bucket_index.object_block_lookup.is_empty()
+                || !shard
+                    .bucket_index
+                    .bucket_map
+                    .values()
+                    .any(|bucket| bucket.block_index.values().any(|block| !block.deleted)),
+            "a live page is resident while the object lookup names nothing, so this delete would \
+             have rebuilt a lookup over pages nothing filed: every production site that installs \
+             a page files it in the same call"
+        );
+        for kind in storage_model_kinds() {
+            shard.bucket_index.remove_object_from_block_lookup(kind, key);
+        }
+    }
+    removed || settled_released
+}
+
+fn bucket_index_target_buckets_for_object_key(shard: &ShardState, key: &str) -> BTreeSet<u32> {
+    if shard.bucket_index.object_block_lookup.is_empty() {
+        return shard.bucket_index.bucket_map.keys().copied().collect();
+    }
+    let mut buckets = BTreeSet::new();
+    for kind in storage_model_kinds() {
+        if let Some(entry) = shard.bucket_index.object_block_refs(kind, key) {
+            buckets.extend(entry.iter().map(|block_ref| block_ref.routing_bucket));
+        }
+    }
+    buckets
+}
+
+/// Remove an element's index entry, staging the outcome, and record NOTHING in the pages.
+///
+/// THE SEVEN TYPED CONTAINER REMOVALS NO LONGER COME THROUGH HERE. They call
+/// `execute_on_shard::remove_container_element`, which appends the page that states the removal and
+/// then calls [`mark_bucket_index_block_deleted_recording`] with its address. What is left for this
+/// entry point is the removal of an element whose kind has NO page-borne membership to keep true --
+/// and the four container kinds are the only kinds that have one.
+///
+/// It is kept rather than deleted because the distinction it now draws is the thing a reader of this
+/// file needs: a removal that records nothing in the pages is correct for a string or a feature
+/// series and is a DATA LOSS for a set. A caller reaching for a remover should have to pick.
+#[cfg_attr(not(test), allow(dead_code))]
+fn mark_bucket_index_block_deleted(
+    shard: &mut ShardState,
+    shard_id: ShardId,
+    model_id: &str,
+    key: &str,
+    component: Option<&str>,
+) -> bool {
+    mark_bucket_index_block_deleted_with(shard, shard_id, model_id, key, component, true)
+}
+
+/// The same, with a say over whether an outcome is staged for the record.
+///
+/// Replay INSTALLS a removal that was already recorded; staging another from inside the install
+/// would record the recovery as a write of its own. Same shape as
+/// `upsert_bucket_index_block_with`, and the same reason.
+fn mark_bucket_index_block_deleted_with(
+    shard: &mut ShardState,
+    shard_id: ShardId,
+    model_id: &str,
+    key: &str,
+    component: Option<&str>,
+    stage: bool,
+) -> bool {
+    mark_bucket_index_block_deleted_recording(shard, shard_id, model_id, key, component, stage, None)
+}
+
+/// The same, with the PAGE THAT RECORDS THE REMOVAL.
+///
+/// # WHY A REMOVAL NOW LEAVES AN ENTRY BEHIND, WHICH IT DID NOT
+///
+/// This function's `retain` DROPS the matched entry. It always has -- three test modules say so in
+/// their headers, and `mark_bucket_index_block_deleted` is named for a mark it does not make. That
+/// was fine while the index was the only statement of membership: an element with no entry is an
+/// element that is gone, and the page it left behind was unreachable and therefore harmless.
+///
+/// It is not fine once the PAGES state membership, because a page nothing points at is a page no
+/// derivation can read. So when a tombstone page is supplied the entry is not dropped: it is
+/// REPLACED by one that points at the tombstone and carries `deleted`, which keeps the page
+/// reachable by a walk while every index reader answers exactly as before.
+///
+/// EVERY INDEX READER FILTERS `deleted`, and that is CHECKED rather than assumed:
+/// `no_index_reader_answers_from_a_tombstone_entry` drives the five readers #2025 enumerated, and all
+/// thirty-nine walks of `block_index` are enumerated with a verdict each in
+/// `container_tombstone_entry`'s header. NOTHING IN PRODUCTION SET THIS FLAG TO TRUE BEFORE THIS
+/// CHANGE -- twenty-two of the thirty-nine filter it in branches that were therefore never exercised
+/// and seventeen do not filter it at all -- so the filters are load-bearing for the first time and
+/// three walks turned out to be wrong. Those three are fixed and named in that table.
+///
+/// # THE COST, STATED BECAUSE IT IS NOT FREE
+///
+/// A removal used to FREE an entry and now retains one. The bound is ONE ENTRY PER DISTINCT ELEMENT
+/// CURRENTLY REMOVED, not one per removal: `upsert_bucket_index_block_inner`'s `retain` matches on
+/// `(object_key, model_id, component)`, so writing an element back CLEARS its tombstone as a side
+/// effect of behaviour that predates tombstones -- five add/remove cycles on one member leave one
+/// entry, which `a_re_add_clears_the_tombstone_entry_so_churn_on_one_element_does_not_accumulate`
+/// drives. `a_removal_retains_one_entry_and_nothing_yet_collects_it` measures the other half.
+///
+/// AND NOTHING YET COLLECTS ONE, which is the part it would be easy to imply otherwise.
+/// `compact_container_blocks_batched` takes its elements from the RESIDENT maps and those do not hold
+/// removed elements, so a fold round cannot see a tombstone: it neither collects one nor risks
+/// dropping one. `container_membership::may_drop_tombstones` is the rule a walk that CAN see them will
+/// have to obey, written and driven now so it cannot be added without one.
+///
+/// That is the price of the pages being authoritative at all, and it is the same price the comparison
+/// design pays in page bytes rather than entry bytes.
+///
+/// # REPLACE-THEN-INSERT, AND NOT A MUTATION IN PLACE
+///
+/// The obvious shape is to flip `deleted` and repoint `address` inside the `retain` closure. It
+/// cannot be done there: `BlockIndexMap::retain` decrements `BlockSlabLiveIndex` for the address of
+/// an entry it drops and the closure never sees `live`, so an address changed in place would leave
+/// the old slab counted live and the new one uncounted -- a slab the reclaim path could then purge
+/// while the durable index still names it. Dropping and reinserting runs both halves of that
+/// accounting through the paths that own it.
+fn mark_bucket_index_block_deleted_recording(
+    shard: &mut ShardState,
+    shard_id: ShardId,
+    model_id: &str,
+    key: &str,
+    component: Option<&str>,
+    stage: bool,
+    tombstone: Option<ElementEntry>,
+) -> bool {
+    // Removing a member IS an outcome, and it is the one a command log states worst: replay has
+    // to re-run the removal and hope the state it removes from matches. Saying "this component
+    // is gone" needs no such hope. Recorded here because every typed removal comes through.
+    //
+    // AND THE OUTCOME NOW CARRIES THE TOMBSTONE'S ADDRESS, which is what makes the removal durable
+    // in the pages ACROSS A REPLAY rather than only in the process that performed it. The tombstone
+    // page is appended before this and survives a crash like any other page; without its address in
+    // the outcome, replay would re-drop the entry, the page would be named by nothing, and a
+    // derivation after the replay would resurrect the element -- the original defect, reappearing
+    // only on the recovery path, which is where it would have been hardest to find. The field was
+    // already `Option<BlockAddress>` and already `None` here, so this spends no format.
+    if stage {
+        block_in_wal::stage_outcome(crate::wal::WalOutcomeItem {
+            kind: model_id.to_string(),
+            object_key: key.to_string(),
+            component: component.map(str::to_string),
+            object_id: stable_block_object_id(shard_id, model_id, key),
+            routing_bucket: block_routing_bucket(key, 0, u32::MAX),
+            address: tombstone.clone(),
+            value: None,
+            ttl: None,
+            deleted: true,
+            meta: true,
+        });
+    }
+    let mut removed = false;
+    // The bucket the removed entry was filed in, so the tombstone can be filed in the SAME one.
+    // `None` until a `retain` below actually matches something.
+    let mut tombstone_bucket: Option<u32> = None;
+    // Kept for the gated branch at the end, because the ungated `if let` below MOVES `tombstone`
+    // out of scope when it builds its tuple.
+    let tombstone_for_the_block_named_arm = tombstone.clone();
+    // THE BUCKET A GATED TOMBSTONE MUST BE FILED IN, read off the object's existing LIVE entry
+    // rather than recomputed.
+    //
+    // Recomputing it is a recorded defect: `block_routing_bucket(key, 0, u32::MAX)` is the form the
+    // WAL outcome uses and is a DIFFERENT number from the shard's own range, and filing a tombstone
+    // in that bucket made `runtime_report` call a live set a deleted object and made compaction
+    // refuse with an owner mismatch. Taking it from an entry cannot drift from the write path,
+    // because it IS the write path's answer read back.
+    //
+    // Computed before the mutable walk below, both to keep the borrow simple and so it describes
+    // the index as it was BEFORE this removal touched it.
+    // TAKEN FROM THE LOOKUP RATHER THAN FROM THE PAGES, AND IT IS THE SAME NUMBER.
+    //
+    // The walk asked for the lowest-numbered bucket holding a LIVE page of (kind, key), by
+    // iterating a `BTreeMap` in ascending order and taking the first match. The lookup holds
+    // exactly the live pages of that object -- `insert_object_block_lookup` returns early on a
+    // deleted one -- so the minimum routing bucket among its refs is that same bucket, without a
+    // walk over every page in the shard.
+    let tombstone_bucket_for_a_block_named_kind: Option<u32> = shard
+        .bucket_index
+        .block_refs_for(model_id, key, None)
+        .and_then(|block_refs| {
+            block_refs
+                .iter()
+                .map(|block_ref| block_ref.routing_bucket)
+                .min()
+        });
+    // THE TIE BACK TO THE WALK THIS REPLACES IS SPENT WITH THE FIELD, and what it established is
+    // why the lookup may answer for the walk at all: the minimum routing bucket among an object's
+    // refs is the lowest-numbered bucket holding a live page of it, asserted against the walk on
+    // every debug run for as long as the pages carried a key to walk by. There is no second source
+    // to compare against now, so the claim is spent rather than weakened.
+    let target_buckets = if shard.bucket_index.object_block_lookup.is_empty() {
+        shard
+            .bucket_index
+            .bucket_map
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>()
+    } else {
+        shard
+            .bucket_index
+            .block_refs_for(model_id, key, component)
+            .map(|block_refs| {
+                block_refs
+                    .iter()
+                    .map(|block_ref| block_ref.routing_bucket)
+                    .collect::<BTreeSet<_>>()
+            })
+            .unwrap_or_default()
+    };
+    for routing_bucket in target_buckets {
+        let Some(bucket) = shard.bucket_index.bucket_map.get_mut(&routing_bucket) else {
+            continue;
+        };
+        let mut bucket_removed = false;
+        let mut deleted_object_ids = BTreeSet::new();
+        // NAMED BEFORE THE MUTATION, for the reason at `fold_delta_block_items`.
+        let names = crate::engine::state::block_identities_in(
+            bucket,
+            &crate::engine::state::BlockKeysByPosition::from_lookup(
+                &shard.bucket_index.object_block_lookup,
+            ),
+        );
+        bucket.block_index.retain(
+            &mut shard.bucket_index.block_slab_live,
+            crate::engine::state::StaleCause::Removed,
+            |handle, block| {
+            // THE THIRD COMPONENT `retain` IN THE ENGINE, AND THE ONLY ONE THAT WAS NOT VACUOUS.
+            //
+            // This read `page.component.as_deref() == component`, and with every entry's name
+            // already `None` that comparison still DECIDED something, because the other side is
+            // this function's ARGUMENT and not another entry: `None == Some(member)` is false for
+            // a container and `None == None` true for the kinds that converge on the object key.
+            // So it was translated and NOT deleted as a tautology -- deleting it would widen the
+            // removal to take a container's whole page entry, and taking that entry takes every
+            // sibling member on the page with it.
+            //
+            // `component.is_none()` is that same predicate with the entry's constant folded in,
+            // so the kinds it matches are exactly the kinds it matched before: `string`,
+            // `control_state` and `context_node` converge on the object key and are removed here;
+            // a container's removal matches nothing here and is recorded by the tombstone arm at
+            // the end of this function instead.
+            let Some(beside) = names.get(handle) else {
+                return true;
+            };
+            let matches = block.model_id.as_str() == model_id
+                && &**beside == key
+                && component.is_none();
+            if matches {
+                // THE KEY IS THIS FUNCTION'S ARGUMENT and the match above is what says this page
+                // belongs to it, so the id is derived from the same characters it always was.
+                deleted_object_ids.insert(block.object_id(shard_id, key));
+                bucket_removed = true;
+                removed = true;
+                // WHERE THE TOMBSTONE ENTRY MUST GO: the bucket the live entry was actually filed
+                // in, recorded here rather than recomputed later. The first version recomputed it
+                // with `block_routing_bucket(key, 0, u32::MAX)` -- the form the WAL outcome uses,
+                // and a different number from the shard's own range -- so the tombstone landed in
+                // a bucket holding nothing else for the object, a twelve-member set was reported
+                // as a DELETED OBJECT, and a compaction round refused with an owner mismatch.
+                tombstone_bucket = Some(routing_bucket);
+                false
+            } else {
+                true
+            }
+        });
+        if bucket_removed {
+            bucket.object_index.extend(deleted_object_ids.iter().copied());
+            // A DELETED ELEMENT IS NOT A DELETED OBJECT, AND THE ID NO LONGER SAYS WHICH IS WHICH.
+            //
+            // This function removes ONE element -- the `retain` above matches on
+            // `(model_id, object_key, component)` -- and then tombstones the ids of what it
+            // removed. That was exactly right while the object id named a block: every block
+            // sharing the removed block's id had the same component and was removed with it, so
+            // no surviving block could carry it and the tombstone could not be premature.
+            //
+            // Now one id covers every element of the key. Dropping field `f0` of a
+            // twenty-five-field hash would file the hash's id here while twenty-four fields are
+            // still live, and `object_manager::runtime_report` asks
+            // `deleted_object_index.contains(page.object_id())` per block -- so all twenty-four
+            // survivors would be counted `deleted_block_ref_count` instead of hot or cold.
+            //
+            // So the tombstone is now written only at a key's LAST element, which is the same
+            // condition `remove_block_entry_from_buckets` already applies to `object_index`:
+            // `!any(|page| page.object_id() == id)` over what survived. `object_index` keeps its
+            // unconditional `extend` above deliberately -- the resident delete path keeps the id
+            // and records the deletion beside it, which is the doctrine
+            // `settle_released_bucket_object_delete` contrasts itself against.
+            //
+            // ON THE PREVIOUS IDENTITY THIS FILTER REMOVES NOTHING, and that is what makes it
+            // attributable: a surviving block could only carry a removed block's id by sharing its
+            // component, and `retain` took every such block.
+            //
+            // A TOMBSTONE ENTRY IS NOT A SURVIVING BLOCK. The filter asks whether any block still
+            // carries the id, and since a removal now leaves an entry behind, the removed element's
+            // own tombstone would answer yes -- so a key's last element would stop filing its object
+            // id here and `object_manager::runtime_report` would never call the object deleted. The
+            // question the filter means to ask is whether a LIVE block carries the id, and that is
+            // what it now asks. `a_keys_last_element_still_files_its_object_id` drives it.
+            deleted_object_ids.retain(|object_id| {
+                !bucket.block_index.iter().any(|(handle, block)| {
+                    // A TOMBSTONE ENTRY IS NOT A SURVIVING BLOCK, and a page the index cannot
+                    // name is not one either: it cannot be shown to carry the id, so it does not
+                    // keep the id claimed.
+                    !block.deleted
+                        && names.get(handle).is_some_and(|beside| {
+                            block.object_id(shard_id, beside) == *object_id
+                        })
+                })
+            });
+            bucket.deleted_object_index.extend(deleted_object_ids);
+            bucket.set_dirty(true);
+            bucket.set_deleted(bucket.block_index.is_empty());
+            bucket.dirty_generation = bucket.dirty_generation.saturating_add(1);
+            bucket.set_meta_loaded(true);
+            bucket.set_in_memory(!bucket.block_index.is_empty());
+            // THE REPAIR AT THE REMOVAL SITE, over this bucket's own pages rather than over the
+            // set this call happened to drop. See [`repair_object_index_against_its_blocks`].
+            // THE PROJECTION THIS LOOP ALREADY BUILT, handed over rather than re-derived.
+            crate::engine::storage_bucket_internals::repair_object_index_against_its_blocks(
+                shard_id,
+                bucket,
+                &names,
+            );
+            crate::engine::storage_bucket_internals::classify_bucket_layout_in_place(bucket);
+        }
+    }
+    if removed {
+        // Removes exactly the entry it deleted, instead of rebuilding the whole lookup.
+        //
+        // `rebuild_object_block_lookup` clears `object_page_lookup` and `object_component_lookup`
+        // and re-inserts one entry per block in the shard -- 58 696 of them on a 250 MB store --
+        // and this ran once per deleted block. A purge deleting five fields paid it five times.
+        // That is why deleting an identical, freshly created memory cost 41.7 ms against a 20 MB
+        // store and 385.7 ms against a 249 MB one, for provably the same closure: same four ids,
+        // same 96 records scanned, same five fields rewritten. Identical work, nine times the
+        // time, all of it spent rebuilding a lookup to the same shape it already had minus one
+        // entry.
+        //
+        // This is the exact inverse of the `insert_object_block_lookup` the block went in through,
+        // keyed on the same (model_id, object_key, component) -- which is how the upsert path
+        // has always maintained the lookup. The whole-object deleter above still rebuilds; it
+        // drops every component of a key at once, so the entry-at-a-time inverse does not apply
+        // to it unchanged.
+        shard
+            .bucket_index
+            .remove_object_block_lookup_entry(model_id, key, component);
+    }
+    // THE ENTRY THAT KEEPS THE TOMBSTONE PAGE REACHABLE, filed after the drop above rather than
+    // instead of it -- see this function's doc comment on why the two halves of the slab-live
+    // accounting cannot both run inside the `retain`.
+    //
+    // ONLY WHERE SOMETHING WAS ACTUALLY REMOVED. A removal that matched no entry removed no element,
+    // so there is nothing for a page to record: filing a tombstone for it would state a removal that
+    // never happened, and `a_removal_that_matched_nothing_writes_no_tombstone_entry` drives that.
+    // The page has already been appended by then and is simply never pointed at, which is the same
+    // orphaned-page state every superseded page is already in.
+    if let (true, Some(address), Some(component), Some(routing_bucket)) =
+        (removed, tombstone, component, tombstone_bucket)
+    {
+        crate::engine::storage_bucket_internals::insert_container_tombstone_entry(
+            shard,
+            model_id,
+            key,
+            Some(component),
+            address,
+            routing_bucket,
+        );
+    }
+    // UNDER ONE ENTRY A PAGE THE MATCH ABOVE CANNOT FIRE, AND THE PAGE WOULD BE ORPHANED.
+    //
+    // The `retain` matches `page.component.as_deref() == component`, and a page-named entry has no
+    // component, so a gated removal matches NOTHING: `removed` stays false, `tombstone_bucket` is
+    // never set, and the tombstone page -- already appended, correct and decodable -- is named by
+    // nothing at all. `a_gated_removal_leaves_a_tombstone_block_the_index_can_reach` measured that
+    // state before this branch existed: one live entry before AND after the removal, zero
+    // tombstoned, and a fold of every page the index names still holding the removed member while
+    // reporting itself COMPLETE -- because an unreachable page is never read and so is never
+    // counted as a failure.
+    //
+    // WHY THE LIVE ENTRY IS NOT DROPPED, which is the whole difference from the ungated path above.
+    // Ungated, the matched entry IS the element, so replacing it with a tombstone loses nothing.
+    // Gated, ONE entry names a page holding every member of the object, and dropping it would take
+    // the other thirty-nine with it. So the tombstone entry is ADDED BESIDE the live one, and
+    // `container_membership::derive_membership`'s fold by `append_position` is what makes the
+    // removal win: the tombstone page is the later page to mention the element.
+    //
+    // AND ONLY WHERE THE OBJECT ACTUALLY HAS AN ENTRY. The invariant the ungated path states just
+    // above -- a removal that matched nothing must not file a tombstone, because that would state a
+    // removal that never happened -- is not weakened here: `tombstone_bucket_for_a_block_named_kind` is `None`
+    // unless the object already holds a live page entry, so a removal against an object the index
+    // does not know files nothing.
+    if !removed {
+        if let (Some(address), Some(routing_bucket)) = (tombstone_for_the_block_named_arm, tombstone_bucket_for_a_block_named_kind) {
+            // THE TOMBSTONE KEEPS THE ELEMENT'S NAME EVEN THOUGH THE LIVE ENTRY DOES NOT, and the
+            // asymmetry is the point rather than an exception.
+            //
+            // A live entry under this gate is a per-PAGE fact: the page's payload already names
+            // every element on it, so the entry needs no element name and dropping it is the
+            // collapse. A tombstone is a per-ELEMENT fact -- recording WHICH element was removed is
+            // its entire content -- so a nameless one has not been made smaller, it has been made
+            // useless, in two specific ways that were both measured:
+            //
+            //   * THE SWEEP CANNOT TELL WHOSE IT IS. A re-add clears the tombstone its own element
+            //     left; keyed against a nameless tombstone it matches every tombstone of the
+            //     object, so re-adding Y clears X's and X comes back. That is a resurrection, and
+            //     `write_after_fold::a_re_add_after_a_removal_does_not_bring_the_removed_member_
+            //     back` is the arm that holds it.
+            //   * AND THE RETENTION CANNOT BE BOUNDED. `removed` is always false under this gate,
+            //     because the `retain` above looks for a live entry carrying this element's name
+            //     and a page-named entry has none -- so this arm fires on EVERY removal. Measured
+            //     with a nameless tombstone: four removals of ONE member left FOUR tombstone pages
+            //     and four entries, growing per removal issued rather than per element removed, on
+            //     what is a no-op from the client's side. With the name recorded the arm can ask
+            //     whether this element's tombstone is already filed, which is what the check below
+            //     does.
+            //
+            // SO THE NAME IS KEPT, AND IT IS KEPT OFF THE ENTRY. Both losses above are about an
+            // ELEMENT, and both are repaired by `BucketNode::tombstone_elements` -- a row per
+            // distinct element removed, filed beside the entries by
+            // `insert_container_tombstone_entry`. The gate's scope is therefore not "live entries
+            // only": NO entry names an element now, and a removal pays for its own name in a
+            // structure only removals have.
+            let already_tombstoned = component.is_some_and(|component| {
+                shard
+                    .bucket_index
+                    .bucket_map
+                    .get(&routing_bucket)
+                    .and_then(|bucket| {
+                        bucket.tombstone_element_block(
+                            key,
+                            crate::engine::storage_bucket_internals::stored_model_kind(model_id),
+                            component,
+                        )
+                    })
+                    .is_some()
+            });
+            if !already_tombstoned {
+                crate::engine::storage_bucket_internals::insert_container_tombstone_entry(
+                    shard,
+                    model_id,
+                    key,
+                    component,
+                    address,
+                    routing_bucket,
+                );
+            }
+        }
+    }
+    removed
+}
+
+fn associated_record_keys(key: &str) -> Vec<String> {
+    if key.starts_with("control_state:") {
+        return vec![key.to_string()];
+    }
+    let mut keys = Vec::with_capacity(4);
+    keys.push(key.to_string());
+    for family in [ControlStateFamily::Counter, ControlStateFamily::Distinct, ControlStateFamily::Selection] {
+        keys.push(control_state_family_key(family, key));
+    }
+    keys
+}
+
+/// Absorb one data model's block addresses into the live set, charging every address visited.
+///
+/// The set this function returns is tiny -- one entry per slab -- and the walk that fills it is
+/// the size of the CORPUS. That difference is invisible in the return value, so it is charged
+/// here, by reference: a data model added to `collect_live_block_slab_ids` has to go through this
+/// to reach `ids`, and therefore cannot be walked without being counted.
+fn absorb_live_block_slab_ids(
+    ids: &mut BTreeSet<u64>,
+    addresses_visited: &mut u64,
+    addresses: impl Iterator<Item = u64>,
+) {
+    for block_slab_id in addresses {
+        *addresses_visited += 1;
+        ids.insert(block_slab_id);
+    }
+}
+
+fn collect_live_block_slab_ids(shard: &ShardState) -> BTreeSet<u64> {
+    let mut ids = BTreeSet::new();
+    let mut visited = 0u64;
+    absorb_live_block_slab_ids(
+        &mut ids,
+        &mut visited,
+        shard.strings().values().map(|address| address.block_slab_id()),
+    );
+    for fields in shard.hashes.values() {
+        absorb_live_block_slab_ids(
+            &mut ids,
+            &mut visited,
+            fields.values().map(|address| address.block_slab_id()),
+        );
+    }
+    for members in shard.sets.values() {
+        absorb_live_block_slab_ids(
+            &mut ids,
+            &mut visited,
+            members.values().map(|address| address.block_slab_id()),
+        );
+    }
+    for elements in shard.lists.values() {
+        absorb_live_block_slab_ids(
+            &mut ids,
+            &mut visited,
+            elements.values().map(|address| address.block_slab_id()),
+        );
+    }
+    for members in shard.zsets.values() {
+        absorb_live_block_slab_ids(
+            &mut ids,
+            &mut visited,
+            members.values().map(|(_, address)| address.block_slab_id()),
+        );
+    }
+    for series in shard.features().values() {
+        absorb_live_block_slab_ids(
+            &mut ids,
+            &mut visited,
+            series.addresses().map(|address| address.block_slab_id()),
+        );
+    }
+    absorb_live_block_slab_ids(
+        &mut ids,
+        &mut visited,
+        shard
+            .context_nodes()
+            .values()
+            .map(|address| address.block_slab_id()),
+    );
+    for series in shard.context_events().values() {
+        absorb_live_block_slab_ids(
+            &mut ids,
+            &mut visited,
+            series.addresses().map(|address| address.block_slab_id()),
+        );
+    }
+    for series in shard.context_indexes().values() {
+        absorb_live_block_slab_ids(
+            &mut ids,
+            &mut visited,
+            series.addresses().map(|address| address.block_slab_id()),
+        );
+    }
+    for series in shard.context_audits().values() {
+        absorb_live_block_slab_ids(
+            &mut ids,
+            &mut visited,
+            // The slot's own accessor, as for `context_children`: same addresses, and
+            // it needs no trait in scope.
+            series
+                .owned_elements()
+                .unwrap_or(&[])
+                .iter()
+                .map(|(_, address)| address.block_slab_id()),
+        );
+    }
+    for series in shard.context_entities().values() {
+        absorb_live_block_slab_ids(
+            &mut ids,
+            &mut visited,
+            series.addresses().map(|address| address.block_slab_id()),
+        );
+    }
+    for series in shard.context_children().values() {
+        absorb_live_block_slab_ids(
+            &mut ids,
+            &mut visited,
+            // The slot's own accessor rather than the owned array's `values()`: same addresses, and
+            // it needs no trait in scope.
+            series
+                .owned_elements()
+                .unwrap_or(&[])
+                .iter()
+                .map(|(_, address)| address.block_slab_id()),
+        );
+    }
+    for series in shard.context_summaries().values() {
+        absorb_live_block_slab_ids(
+            &mut ids,
+            &mut visited,
+            // The slot's own accessor, as for `context_children`: same addresses, and
+            // it needs no trait in scope.
+            series
+                .owned_elements()
+                .unwrap_or(&[])
+                .iter()
+                .map(|(_, address)| address.block_slab_id()),
+        );
+    }
+    for series in shard.context_compressions().values() {
+        absorb_live_block_slab_ids(
+            &mut ids,
+            &mut visited,
+            // The slot's own accessor, as for `context_children`: same addresses, and
+            // it needs no trait in scope.
+            series
+                .owned_elements()
+                .unwrap_or(&[])
+                .iter()
+                .map(|(_, address)| address.block_slab_id()),
+        );
+    }
+    // control_state_pages is the block-backed control-state model and MUST be in the
+    // GC live set: it feeds both the reclaim live-slab set and the block-gc dependency plan.
+    // Omitting it let a slab holding only a control-state block be reclaimed while the index
+    // still referenced it -> DataLoss on the next read. keeps any model's live blocks
+    // counted in the slab's used_bytes so the slab is never destroyed while referenced. The
+    // sibling collect_model_live_block_entries already includes it -- the two lists had drifted.
+    absorb_live_block_slab_ids(
+        &mut ids,
+        &mut visited,
+        shard
+            .control_state_blocks()
+            .values()
+            .map(|record| record.address().block_slab_id()),
+    );
+    #[cfg(test)]
+    crate::snapshot_probe::note_live_slab_scan(visited);
+    let _ = visited;
+    ids
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_value(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    bytes: &[u8],
+    object_id: Option<u64>,
+    component: Option<&str>,
+    routing_bucket: Option<u32>,
+    async_storage: bool,
+) -> Result<ElementEntry, BlockStoreError> {
+    append_value_of_object(
+        cache,
+        block_store,
+        shard_id,
+        bytes,
+        object_id,
+        component,
+        routing_bucket,
+        async_storage,
+        0,
+    )
+}
+
+/// The same append, saying WHICH block of its object this is.
+///
+/// The ordinal is threaded all the way to `append_block_of_object`, and that matters rather than
+/// being tidier: that function stamps the record header and the returned address from the SAME
+/// value. Assigning the ordinal on the index's copy afterwards would leave the header saying 0 and
+/// the address saying N, and `decode_block_record` compares exactly those two and refuses the block
+/// with "page id mismatch" -- the one cross-check on a read that can actually fire. So the ordinal
+/// has to be an argument to the append, not a field set after it.
+///
+/// `append_value` above is this with an ordinal of 0, which is what
+/// `append_with_block_metadata` has always passed and therefore what every caller already got.
+#[allow(clippy::too_many_arguments)]
+fn append_value_of_object(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    bytes: &[u8],
+    object_id: Option<u64>,
+    component: Option<&str>,
+    routing_bucket: Option<u32>,
+    async_storage: bool,
+    block_ordinal: u32,
+) -> Result<ElementEntry, BlockStoreError> {
+    // Both arms, and every command that stores a value, reach a slab through here. The payload's
+    // own copies re-tag themselves inside -- the encode as `BlockBytes`, the carried copy as
+    // `CarriedBlock` -- so what is left under this class is the append machinery and not the bytes.
+    crate::alloc_probe::in_class(crate::alloc_probe::AllocClass::SlabAppend, || {
+        append_value_inner(
+            cache,
+            block_store,
+            shard_id,
+            bytes,
+            object_id,
+            component,
+            routing_bucket,
+            async_storage,
+            block_ordinal,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_value_inner(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    bytes: &[u8],
+    object_id: Option<u64>,
+    component: Option<&str>,
+    routing_bucket: Option<u32>,
+    async_storage: bool,
+    block_ordinal: u32,
+) -> Result<ElementEntry, BlockStoreError> {
+    if !async_storage {
+        // Carry the block in this write's record, the same as the asynchronous arm below.
+        //
+        // The record is allowed to state its results and drop the operation only when the blocks
+        // those results name survive a crash. A carried block does -- it IS the record. A
+        // synchronous write's block used to be assumed durable instead, but the single barrier
+        // acks on the WAL fsync and defers the block fsync (`defer_data_sync` in the block
+        // store's append), so at that moment the block store holds it in buffers and nowhere
+        // else. Wiping everything but the log then lost every acked write, which is what the
+        // recovery suite has been reporting.
+        //
+        // Carrying it costs the bytes twice for as long as the record lives, and no longer: the
+        // storage manager's reclaim stage moves carried blocks into the block store and drops the
+        // registration that pins the log floor.
+        if let Some(object_id) = object_id {
+            block_in_wal::stage(object_id, component, bytes);
+        }
+        return block_store.append_block_of_object(
+            bytes,
+            object_id,
+            routing_bucket,
+            block_ordinal,
+        );
+    }
+    // THE COUNTER IS NOW BOUNDED, AND IT IS REFUSED RATHER THAN WRAPPED.
+    //
+    // A hot block's "offset" is not a position, it is a ticket from a process-wide counter, and
+    // the address word gives that ticket 32 bits. Four billion hot writes in ONE process is a
+    // long run but not an impossible one, and the two things that could happen at the boundary
+    // are both worse than a refusal: wrapping hands a live block the address of an older one, and
+    // truncating does the same thing without even reaching the boundary. So the mint is checked,
+    // and a process that exhausts its tickets stops minting hot addresses instead of aliasing
+    // them. The counter is process-local and a reload starts it again at one.
+    let address = ElementEntry::try_from_parts(HOT_BLOCK_SLAB_ID, HOT_BLOCK_OFFSET.fetch_add(1, Ordering::Relaxed), bytes.len() as u64, None, object_id)?;
+    // Put the block aside for this write's record. It is often derived state rather than the
+    // command's own bytes, so the record has to carry it for a read to serve it back.
+    if let Some(object_id) = object_id {
+        block_in_wal::stage(object_id, component, bytes);
+    }
+    crate::alloc_probe::in_class(crate::alloc_probe::AllocClass::BlockBytes, || {
+        let bytes = bytes.to_vec();
+        cache.put_memory_only(
+            CacheKey::page_with_slot(
+                shard_id,
+                address.block_slab_id(),
+                address.offset(),
+                address.length(),
+                routing_bucket),
+            bytes,
+        );
+    });
+    Ok(address)
+}
+
+fn persist_control_state_block(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    shard: &mut ShardState,
+    key: &str,
+    start_routing_bucket: u32,
+    end_routing_bucket: u32,
+    async_storage: bool,
+) -> bool {
+    let Some(series) = shard.control_state().get(key) else {
+        shard.remove_control_state_block(key);
+        return false;
+    };
+    // Coalesced-persistence mode: the counter series is durable via the index snapshot
+    // (flush) + WAL replay — the same model control_state_changes/fol already use — so skip
+    // the O(series) per-write whole-series block rewrite (the write-amplification source).
+    // Gated on async_storage so the WAL actually covers between-flush increments.
+    if async_storage && shard.control_coalesce_persist {
+        return true;
+    }
+    let Ok(bytes) = serde_json::to_vec(series) else {
+        return false;
+    };
+    let object_id = stable_block_object_id(shard_id, "control_state", key);
+    let routing_bucket = block_routing_bucket(key, start_routing_bucket, end_routing_bucket);
+    if let Ok(address) = append_value(
+        cache,
+        block_store,
+        shard_id,
+        &bytes,
+        Some(object_id),
+        // The same `None` the object id was derived with, one line up: a control state IS
+        // its whole object.
+        None,
+        Some(routing_bucket),
+        async_storage,
+    ) {
+        upsert_bucket_index_block(shard, shard_id, "control_state", key, None, address.clone(), true);
+        let mut record = crate::engine::object_record::ObjectRecord::default();
+        record.set_address(&address);
+        // ONE COPY OF THE CHARACTERS -- see the note at the `strings` write. `to_string()` plus
+        // `into_boxed_str()` built a fresh copy on every call; the page index is frequently
+        // already holding one.
+        let shared = shard
+            .bucket_index
+            .object_block_lookup
+            .any_shared_object_key(key);
+        let stored = shared.unwrap_or_else(|| std::sync::Arc::from(key));
+        shard.insert_control_state_block(stored, record.into());
+        true
+    } else {
+        false
+    }
+}
+
+fn invalidate_cache_key(cache: &MultiLayerCache, key: CacheKey, memory_only: bool) {
+    // The largest class by allocation count on a value write, and it took a measurement to find
+    // out: invalidating one key costs more calls than the whole rest of the write together. The
+    // key itself is built by the caller and is not in here.
+    crate::alloc_probe::in_class(crate::alloc_probe::AllocClass::CacheInvalidation, || {
+        invalidate_cache_key_inner(cache, key, memory_only)
+    })
+}
+
+fn invalidate_cache_key_inner(cache: &MultiLayerCache, key: CacheKey, memory_only: bool) {
+    if memory_only {
+        cache.invalidate_memory_only(&key);
+    } else {
+        let _ = cache.invalidate(&key);
+    }
+}
+
+fn record_exists(shard: &ShardState, key: &str) -> bool {
+    associated_record_keys(key)
+        .iter()
+        .any(|record_key| record_exists_exact(shard, record_key))
+}
+
+fn record_exists_exact(shard: &ShardState, key: &str) -> bool {
+    // THE LOOKUP IS THE ONLY DOOR, and the second arm is gone. A whole-shard walk comparing
+    // every entry's identity stood in front of this for the case where the lookup held nothing;
+    // the decode fills the lookup now, so an object with no entry in it has no live page here. The
+    // identity is not re-compared inside the walk either -- the page was reached through that
+    // object's own ref list -- while the KIND still is, because the ref was keyed by it and a
+    // handle collision could hand back a page of another kind.
+    let bucket_index_exists = storage_model_kinds().iter().any(|kind| {
+        shard
+            .bucket_index
+            .object_block_refs(kind, key)
+            .map(|block_refs| {
+                block_refs.iter().any(|block_ref| {
+                    shard
+                        .bucket_index
+                        .bucket_map
+                        .get(&block_ref.routing_bucket)
+                        .and_then(|bucket| bucket.block_index.get(&block_ref.block_ref_key))
+                        .map(|block| !block.deleted && block.model_id.as_str() == *kind)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
+    });
+    bucket_index_exists
+        || shard.strings().contains_key(key)
+        || shard.hashes.contains_key(key)
+        || shard.sets.contains_key(key)
+        || shard.lists.contains_key(key)
+        || shard.zsets.contains_key(key)
+        || shard.buckets.contains_key(key)
+        || shard.seen.contains_key(key)
+        || shard.features().contains_key(key)
+        || shard.control_state().contains_key(key)
+        || shard.control_state_blocks().contains_key(key)
+        || shard.control_state_changes.contains_key(key)
+        || shard.control_state_selection.contains_key(key)
+        || shard.context_nodes().contains_key(key)
+        || shard.context_events().contains_key(key)
+        || shard.context_indexes().contains_key(key)
+        || shard.context_audits().contains_key(key)
+        || shard.context_entities().contains_key(key)
+        || shard.context_children().contains_key(key)
+        || shard.context_summaries().contains_key(key)
+        || shard.context_compressions().contains_key(key)
+}
+
+/// Mark every page an object ALREADY HAS as dirty, at the moment the object is marked.
+///
+/// # WHY THE DIRTINESS IS PUSHED RATHER THAN PULLED
+///
+/// A bucket is dirty when any page in it is dirty or any page's OBJECT is dirty. The second half
+/// asked a page which object it belonged to, which is the one question a page is about to stop
+/// being able to answer -- and it asked it on the write path, in a scope holding nothing but the
+/// bucket, so there was nowhere to look the answer up. Pushing at mark time moves that work to a
+/// place that already holds the shard, and leaves the bucket predicate as `any(page.dirty)`.
+///
+/// IT IS ALSO LESS WORK, not merely work moved. Pulling costs a map lookup per page on every
+/// refresh, and a refresh happens on every write. Pushing costs one lookup plus one write per page
+/// the object already has, once per mark. Marks cannot outnumber refreshes, because every mark is
+/// on a write and every write refreshes.
+///
+/// # WHAT MAKES IT EQUIVALENT, WHICH IS THE PART THAT HAD TO BE ESTABLISHED
+///
+/// The predicate iterates PAGES, so the object half only ever decided the answer for pages that
+/// EXIST. Two cases cover those:
+///
+///   * pages that exist when the object is marked -- this function marks them;
+///   * pages written after the object is marked -- the write path already sets `dirty` on the
+///     entry it constructs from its caller's intent, so they carry their own.
+///
+/// And nothing is left dirty that should not be, because both clearing paths clear pages in the
+/// SAME SCOPE they drop object keys: the dump clears every page of each cleared bucket and then
+/// drains exactly those buckets, and the per-object clear removes the key and then clears that
+/// object's pages. A load clears every page and starts the dirty set empty.
+///
+/// # THE ONE PREMISE, ASSERTED RATHER THAN ASSUMED
+///
+/// This can only find pages through the object lookup, which is derived and is empty between a
+/// decode and the rebuild that fills it. A mark in that window would find nothing. The load
+/// rebuilds before it returns the shard, so the window should not be reachable from a write --
+/// and that is a claim about control flow rather than about this function, so it is a
+/// `debug_assert` here instead of a comment. If it ever fires, a mark is reaching a shard whose
+/// lookup has not been built and this function is silently doing nothing.
+///
+/// THE KINDS ARE ITERATED because neither marking site knows the object's model, and the lookup is
+/// keyed by both. Seventeen map lookups against a set of that size, which is the same shape
+/// `bucket_index_target_buckets_for_object_key` and the delete path already use.
+pub(in crate::engine) fn push_object_dirty_onto_its_existing_blocks(
+    shard: &mut ShardState,
+    object_key: &str,
+) {
+    // A LIVE PAGE IS RESIDENT ONLY IF THE LOOKUP NAMES SOMETHING, AND THAT IS ASSERTED HERE
+    // RATHER THAN REPAIRED.
+    //
+    // # WHAT STOOD HERE AND WHY IT IS GONE
+    //
+    // A whole-shard `rebuild_object_block_lookup()` on the first mark that found the lookup
+    // unbuilt. It reads every page's object key off the entry, and it was the last production
+    // reader of that field.
+    //
+    // # THE PREMISE THAT FAILED FIRST, AND THE CENSUS THAT SETTLED IT
+    //
+    // An earlier version of this function asserted that a mark could not reach a shard holding
+    // buckets whose lookup was unbuilt, reasoning that a load rebuilds before returning the
+    // shard. TWO TESTS FIRED IT IMMEDIATELY, and the rebuild replaced the claim.
+    //
+    // Both of those tests, and the assertion, were about the wrong condition. Three successively
+    // narrower ones were measured here, each broader than the question:
+    //
+    //   * `!bucket_map.is_empty()` -- satisfied by buckets holding NO pages. Six of ten reaches
+    //     over a 107-name set were this: nothing to mark, nothing lost.
+    //   * "has pages" -- satisfied by TOMBSTONES, which a mark must not dirty. The two
+    //     non-fixture reaches were this.
+    //   * "has a LIVE page" -- the actual question. Two reaches of 97 verdicts, both hand-built
+    //     fixtures, each installing a page into `bucket_map` directly with NO filing anywhere in
+    //     the process.
+    //
+    // # AND THE CENSUS IS WHAT MAKES THAT STRUCTURAL RATHER THAN A SAMPLE
+    //
+    // Nine production sites install a page into a bucket's map, and all nine file it in the same
+    // enclosing function: `rebuild_bucket_block_ownership` (twice),
+    // `insert_container_tombstone_entry`, `upsert_bucket_index_block_inner`,
+    // `sync_bucket_index_object_blocks_with_mode`, `rebuild_bucket_first_index` (twice),
+    // `reload_released_bucket`, and `fold_delta_block_items`. The only doors that do not file are
+    // `FromIterator<(Arc<str>, BlockIndex)> for BlockIndexMap`, which has ZERO callers anywhere,
+    // and the two serde doors that drop a decoded node's page keys -- `impl Deserialize for
+    // BucketNode` and `BlockIndexMap`'s `serde(from = ..)` -- which compile out of `--lib` with
+    // zero errors, measured against a control in the same probe form that yields one.
+    //
+    // So a live page cannot enter a bucket's map in production without being filed in the same
+    // call, and the state this rebuild existed for is reachable only by writing into the map
+    // directly.
+    //
+    // # THE ASSERTION IS THE DESCRIPTION NOW, AND IT IS A BETTER ONE
+    //
+    // It was carried by one fixture that nobody re-reads; it is carried by every one of the 926
+    // tests that enter this function, on every run. That is the same oracle pattern this branch
+    // used twice already -- the ties for a substitution, the page-index agreement check for a
+    // deletion -- applied to a removal.
+    //
+    // WHAT IT CANNOT CATCH, said here because the gap is real: a tenth install site that does not
+    // file is caught only if a mark follows it. The pairing is a convention held by nine call
+    // sites rather than by a type -- there is no door that installs AND files -- and that is filed
+    // as its own design change rather than carried by a width step.
+    debug_assert!(
+        !shard.bucket_index.object_block_lookup.is_empty()
+            || !shard
+                .bucket_index
+                .bucket_map
+                .values()
+                .any(|bucket| bucket.block_index.values().any(|block| !block.deleted)),
+        "a live page is resident while the object lookup names nothing, so this mark can find no \
+         pages: every production site that installs a page files it in the same call, and this \
+         state is reachable only by writing into `bucket_map` directly"
+    );
+    // THE TWO FIELDS ARE BORROWED SEPARATELY, WHICH IS WHAT THE OLD COMMENT ASKED FOR.
+    //
+    // This collected every ref of the object into a `Vec` first, and said why: "the immutable
+    // loan on the lookup ends before the pages are taken mutably. The two are disjoint fields of
+    // one struct, but the refs borrow from one of them." The second sentence is the remedy.
+    // Disjoint fields CAN be held at once -- an immutable borrow of one beside a mutable borrow
+    // of another -- as long as they are named. What forced the copy was reaching them through
+    // `object_block_refs`, a method taking `&self`, which borrows the whole index and so collides
+    // with the mutable borrow of `bucket_map` however disjoint the fields really are.
+    //
+    // MEASURED, the cost of that copy: 51,952 bytes in ONE allocation per append on a
+    // 3,200-point series -- 3,250 refs at sixteen bytes -- built, walked once, and dropped. It
+    // was the largest single term left in an append after #2232, #2234 and #2238, and the
+    // allocation count stayed flat while it grew, which is the signature of exactly this shape:
+    // one allocation sized by the entries held.
+    //
+    // The walk itself is unchanged: the same refs, in the same order, marking the same pages.
+    let index = &mut shard.bucket_index;
+    let lookup = &index.object_block_lookup;
+    let buckets = &mut index.bucket_map;
+    for kind in storage_model_kinds() {
+        let Some(entry) = lookup.get(kind, object_key) else {
+            continue;
+        };
+        for block_ref in entry.iter() {
+            let Some(bucket) = buckets.get_mut(&block_ref.routing_bucket) else {
+                continue;
+            };
+            if let Some(block) = bucket.block_index.get_mut(&block_ref.block_ref_key) {
+                block.dirty = true;
+            }
+        }
+    }
+}
+
+fn storage_model_kinds() -> &'static [&'static str] {
+    &[
+        "string",
+        "hash",
+        "set",
+        "list",
+        "zset",
+        "feature",
+        "sequence",
+        "control_state",
+        "context_node",
+        "context_event",
+        "context_index",
+        "context_audit",
+        "context_entity",
+        "context_child",
+        "context_embedding",
+        "context_summary",
+        "context_compression",
+    ]
+}
+
+/// The invalidation a block-backed context object actually needs.
+///
+/// `invalidate_record_all` also sweeps the `hash`, `set` and `feature` record namespaces, and each
+/// of those three is `MultiLayerCache::invalidate_record`, which walks EVERY key in all three
+/// cache tiers and filters. The cost therefore grows with the cache, and a context object is never
+/// cached in any of those namespaces -- so all three walked the whole cache, found nothing, and did
+/// it again on the next write.
+///
+/// That is what made message ingest degrade with the corpus rather than stay flat. Measured on the
+/// real four-command message, growing one store:
+///
+///     corpus  1,024      4.6 ms/message  ->  7.2 ms
+///     corpus 10,240     29.1 ms/message  ->  7.9 ms      and no longer rising
+///
+/// `a_context_write_leaves_the_record_namespaces_empty` holds the premise: if a context object ever
+/// does get cached under one of those namespaces, that test fails and this narrowing is no longer
+/// safe.
+fn invalidate_context_record(cache: &MultiLayerCache, shard_id: ShardId, key: &str) {
+    let _ = cache.invalidate(&CacheKey::string(shard_id, key));
+}
+
+/// What one `invalidate_record_all` costs, counted where the cost LANDS.
+///
+/// The price of a sweep is not a constant. `MultiLayerCache::invalidate_record` chains the key
+/// sets of all three tiers -- memory, pmem, disk index -- and filters, so one call steps over the
+/// WHOLE CACHE, and `invalidate_record_all` makes two of them. A fixture that writes a corpus and
+/// never reads it back leaves those tiers nearly empty, which measures the sweep at its floor
+/// rather than at what a serving store pays.
+///
+/// So the quantity that matters is not the call count -- that is one per key and has never been
+/// in doubt -- but ENTRIES WALKED, and that is a property of the cache at the moment of the call.
+/// It is read from the three tier lengths, which are exactly the key sets the walk chains.
+///
+/// HANDED IN rather than read off a free static: a new call site has to name where its
+/// sweeps are counted before it compiles.
+///
+/// `entries_walked` costs three uncontended tier-length reads per sweep, so it sits behind
+/// `armed` and is off unless a probe turns it on. `arming_the_sweep_counter_does_not_move_the_hold`
+/// is the control for that, and it is what makes the timings below readable next to the counts.
+#[derive(Debug)]
+pub(crate) struct CacheSweepCounts {
+    armed: std::sync::atomic::AtomicBool,
+    /// `invalidate_record_all` calls.
+    pub calls: std::sync::atomic::AtomicU64,
+    /// `MultiLayerCache::invalidate_record` calls -- the walks, two per call.
+    pub sweeps: std::sync::atomic::AtomicU64,
+    /// Cache entries those walks stepped over, summed over the sweeps. Zero unless armed.
+    pub entries_walked: std::sync::atomic::AtomicU64,
+    /// Named-key invalidations: one `CacheKey`, no walk. What a sweep is narrowed TO.
+    pub named: std::sync::atomic::AtomicU64,
+    /// `invalidate_records_all_batched` calls -- ONE per round, not one per dropped key.
+    pub batched_calls: std::sync::atomic::AtomicU64,
+    /// Dropped keys those calls were handed, counted INSIDE the primitive.
+    pub keys_batched: std::sync::atomic::AtomicU64,
+    /// `MultiLayerCache::entries_for_shard` listings -- the batched pass's single walk.
+    pub listings: std::sync::atomic::AtomicU64,
+    /// Cache entries those listings stepped over, summed. Zero unless armed, and read from the
+    /// SAME three tier lengths as `entries_walked`, so the two are commensurable.
+    pub entries_listed: std::sync::atomic::AtomicU64,
+    /// Entries those listings RETURNED for the shard. This is the upper bound on the filesystem
+    /// `metadata()` calls the listing makes: `entries_for_shard` falls through to
+    /// `disk_path(&key).metadata()` for every returned entry the disk index does not hold, and
+    /// for no others. Always counted -- it is a `Vec::len()`, not a probe.
+    pub entries_returned: std::sync::atomic::AtomicU64,
+}
+
+impl CacheSweepCounts {
+    const fn zeroed() -> Self {
+        Self {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            calls: std::sync::atomic::AtomicU64::new(0),
+            sweeps: std::sync::atomic::AtomicU64::new(0),
+            entries_walked: std::sync::atomic::AtomicU64::new(0),
+            named: std::sync::atomic::AtomicU64::new(0),
+            batched_calls: std::sync::atomic::AtomicU64::new(0),
+            keys_batched: std::sync::atomic::AtomicU64::new(0),
+            listings: std::sync::atomic::AtomicU64::new(0),
+            entries_listed: std::sync::atomic::AtomicU64::new(0),
+            entries_returned: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Process-wide, so a reader resets immediately before the round it measures and the suite it
+    /// runs in is single-threaded.
+    pub(crate) fn reset(&self) {
+        for cell in [
+            &self.calls,
+            &self.sweeps,
+            &self.entries_walked,
+            &self.named,
+            &self.batched_calls,
+            &self.keys_batched,
+            &self.listings,
+            &self.entries_listed,
+            &self.entries_returned,
+        ] {
+            cell.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub(crate) fn set_armed(&self, armed: bool) {
+        self.armed
+            .store(armed, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `(calls, sweeps, entries_walked, named)`.
+    pub(crate) fn read(&self) -> (u64, u64, u64, u64) {
+        let load = |cell: &std::sync::atomic::AtomicU64| {
+            cell.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        (
+            load(&self.calls),
+            load(&self.sweeps),
+            load(&self.entries_walked),
+            load(&self.named),
+        )
+    }
+
+    fn note_call(&self) {
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `(batched_calls, keys_batched, listings, entries_listed, entries_returned)`.
+    pub(crate) fn read_batched(&self) -> (u64, u64, u64, u64, u64) {
+        let load = |cell: &std::sync::atomic::AtomicU64| {
+            cell.load(std::sync::atomic::Ordering::Relaxed)
+        };
+        (
+            load(&self.batched_calls),
+            load(&self.keys_batched),
+            load(&self.listings),
+            load(&self.entries_listed),
+            load(&self.entries_returned),
+        )
+    }
+
+    fn note_named(&self) {
+        self.named
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// One batched pass, and the number of dropped keys it was handed.
+    ///
+    /// `keys` is counted HERE, inside the primitive, so it is independent of the dropped-key
+    /// count `apply_storage_eviction` returns to its caller. The difference between the two is
+    /// the round's residual.
+    fn note_batched_call(&self, keys: u64) {
+        self.batched_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.keys_batched
+            .fetch_add(keys, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Counted immediately BEFORE the listing it describes, from the same three tier lengths
+    /// `note_sweep` reads -- so a listing and a sweep are priced in the same unit and the ratio
+    /// between them means something.
+    fn note_listing(&self, cache: &MultiLayerCache) {
+        self.listings
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.armed.load(std::sync::atomic::Ordering::Relaxed) {
+            let listed = cache
+                .item_count_for_tier(matrixcache::CacheTier::Memory)
+                .saturating_add(cache.item_count_for_tier(matrixcache::CacheTier::Pmem))
+                .saturating_add(cache.item_count_for_tier(matrixcache::CacheTier::Ssd));
+            self.entries_listed
+                .fetch_add(listed as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn note_listed_entries(&self, returned: u64) {
+        self.entries_returned
+            .fetch_add(returned, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Counted immediately BEFORE the walk it describes, so the tier lengths it reads are the
+    /// ones that walk will chain -- not the ones left after it has removed entries.
+    fn note_sweep(&self, cache: &MultiLayerCache) {
+        self.sweeps
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.armed.load(std::sync::atomic::Ordering::Relaxed) {
+            let walked = cache
+                .item_count_for_tier(matrixcache::CacheTier::Memory)
+                .saturating_add(cache.item_count_for_tier(matrixcache::CacheTier::Pmem))
+                .saturating_add(cache.item_count_for_tier(matrixcache::CacheTier::Ssd));
+            self.entries_walked
+                .fetch_add(walked as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+pub(crate) static CACHE_SWEEP_COUNTS: CacheSweepCounts = CacheSweepCounts::zeroed();
+
+/// The record namespaces a dropped key has to SWEEP for, because neither has a single cacheable
+/// key to name: a hash caches one entry per FIELD and a feature one per query window.
+///
+/// THE AUTHORITY, and both arms read it. The per-key primitive below and the batched pass both
+/// iterate this list, so a namespace added here is covered by both and cannot be covered by only
+/// one. The equivalence test enumerates from here too, rather than from a list written out beside
+/// it -- a hand-written copy goes stale and nothing fails.
+pub(crate) const SWEPT_RECORD_NAMESPACES: [&str; 2] = ["hash", "feature"];
+
+/// The record entries a dropped key can NAME instead of sweeping for, one `CacheKey` each.
+///
+/// `string` has the fixed selector "value", and a set has exactly ONE cacheable entry because
+/// `CacheKey::set_members` fixes its selector at "members" -- so naming them is equivalent to
+/// sweeping for them, and it is O(1) instead of O(cache).
+///
+/// THE AUTHORITY, again shared by both arms, for the same reason.
+fn named_record_keys(shard_id: ShardId, key: &str) -> [CacheKey; 2] {
+    [
+        CacheKey::string(shard_id, key),
+        CacheKey::set_members(shard_id, key),
+    ]
+}
+
+fn invalidate_record_all(
+    cache: &MultiLayerCache,
+    shard_id: ShardId,
+    key: &str,
+    counts: &CacheSweepCounts,
+) {
+    counts.note_call();
+    for named in named_record_keys(shard_id, key) {
+        counts.note_named();
+        let _ = cache.invalidate(&named);
+    }
+    for namespace in SWEPT_RECORD_NAMESPACES {
+        counts.note_sweep(cache);
+        let _ = cache.invalidate_record(shard_id, namespace, key);
+    }
+}
+
+/// ONE PASS OVER THE CACHE FOR A WHOLE ROUND OF DROPPED KEYS, instead of two per key.
+///
+/// BOTH LOGGED-DELETION ROUNDS USE THIS ONE BODY. `delete_drop` in `storage_lifecycle_methods.rs`
+/// (#1911) and the expiry sweep in `recovery_sweep_compact.rs` had the same per-key shape under the
+/// same `shards` write guard, and a pass that lived in only one of them would have left the other
+/// copy keeping the cost -- the way the anchor's `stats()` fallback did until one of the two was
+/// guarded and the other was not. The expiry sweep's own figures are in
+/// `what_an_expiry_rounds_cache_sweep_walks_cold_and_warm` and
+/// `one_expiry_pass_walks_the_cache_once_instead_of_twice_per_expired_key`, measured on that path
+/// rather than inherited from this one: 704,548 cache-entry visits for a 250-key round on a warm
+/// 500-object store and 44,134,298 for a 2,000-key round on a warm 4,000-object one, against 1,548
+/// and 12,048 for the one pass.
+///
+/// WHAT IT REPLACES. `invalidate_record_all` above, called once per dropped key, makes two
+/// `MultiLayerCache::invalidate_record` calls, and each of those chains the key sets of all three
+/// cache tiers and filters:
+///
+///     inner.memory.keys().chain(inner.pmem.keys()).chain(inner.disk_index.keys())
+///         .filter(|key| key.shard_id == shard_id && key.namespace == namespace && ...)
+///
+/// So N dropped keys walk the cache 2N times. #1907 measured that at 3,999 entries per dropped
+/// key on a warm 4,000-object store -- 15,996,000 entry visits for one round, inside the `shards`
+/// write guard that serving reads queue behind.
+///
+/// WHAT IT DOES INSTEAD. The swept namespaces are the same for every key in the round, so the
+/// walk does not have to be repeated: one listing of the shard's cache, one membership test per
+/// entry against the round's dropped-key set, and one `invalidate_batch` for everything that
+/// matched plus the named keys. The cache is stepped over ONCE per round rather than twice per
+/// key, and the write lock inside the cache is taken once rather than 4N times.
+///
+/// EXACTLY THE SAME SET, arm for arm. `entries_for_shard` chains the SAME three tier key sets as
+/// `invalidate_record` and filters them by shard alone, so it is a superset of what every one of
+/// the round's per-key sweeps could have matched; the predicate here re-applies the other two
+/// halves of that filter (`namespace` and `record_key`) that `invalidate_record` applies inline.
+/// `CacheEntryInfo` carries `shard_id`, `namespace`, `record_key` and `selector`, which is every
+/// field of a `CacheKey`, so the key each matched entry is rebuilt from is the key that was in
+/// the tier. Both arms take their namespaces from `SWEPT_RECORD_NAMESPACES` and their named keys
+/// from `named_record_keys`, so neither list can drift from the other. And a key the round did
+/// NOT drop is not in the set, so its entries are left cached -- which is the same thing N
+/// per-key sweeps do, and the direction that would be visible if this were wrong.
+///
+/// WHY IT STILL RUNS INSIDE THE GUARD. #1907 priced deferring it and refused: `cached_response`
+/// is cache-first and a `string` record key carries no generation, sequence or version stamp, so
+/// a reader in the window is answered with a value the shard has already deleted -- measured at 8
+/// of 533 reads. This change moves no invalidation out of the `shards` write guard; it only stops
+/// repeating the walk. `a_key_the_shard_has_dropped_is_never_still_answered_out_of_the_cache` is
+/// what holds that.
+///
+/// WHAT IT COSTS INSTEAD. `entries_for_shard` falls through to a filesystem `metadata()` for
+/// every entry it returns that the disk index does not hold, so the one pass carries C syscalls.
+/// `what_one_listing_of_the_shards_cache_costs_in_syscalls` measures C from outside the process
+/// and `one_batched_pass_walks_the_cache_once_instead_of_twice_per_dropped_key` puts it next to
+/// the entry visits it removes.
+/// GENERIC OVER THE KEY TYPE, and only because its two call sites hold their round's keys in
+/// different containers: `delete_drop` collects `Arc<str>` object keys off the live block entries,
+/// and the expiry sweep collects `String` keys out of `due_window`. Converting either one to suit
+/// the other would allocate a second copy of every key in the round for no reason. `AsRef<str>` is
+/// all this body ever asks of them -- it reads each key once, as a `&str`, to build the
+/// dropped-key set and the named cache keys -- so both callers hand it what they already have.
+fn invalidate_records_all_batched<K: AsRef<str>>(
+    cache: &MultiLayerCache,
+    shard_id: ShardId,
+    keys: &[K],
+    counts: &CacheSweepCounts,
+) -> usize {
+    if keys.is_empty() {
+        return 0;
+    }
+    counts.note_batched_call(keys.len() as u64);
+    let dropped = keys
+        .iter()
+        .map(|key| key.as_ref())
+        .collect::<std::collections::BTreeSet<&str>>();
+    let mut batch = Vec::with_capacity(keys.len().saturating_mul(2));
+    for key in keys {
+        for named in named_record_keys(shard_id, key.as_ref()) {
+            counts.note_named();
+            batch.push(named);
+        }
+    }
+    counts.note_listing(cache);
+    let listed = cache.entries_for_shard(shard_id);
+    counts.note_listed_entries(listed.len() as u64);
+    for entry in listed {
+        if SWEPT_RECORD_NAMESPACES.contains(&entry.namespace.as_str())
+            && dropped.contains(entry.record_key.as_str())
+        {
+            // THE LISTING AND THE KEY NO LONGER HOLD THE SAME TYPES, and that is deliberate
+            // on the cache side: `CacheEntryInfo` is a snapshot handed out by value, where an
+            // owned `String` is the honest type, while a `CacheKey` is built on every get and
+            // put and so holds a shared `Arc<str>` and a `Cow` that borrows for the literal
+            // selectors. Converting here pays once per swept entry, not per read.
+            batch.push(CacheKey {
+                shard_id,
+                record_key: std::sync::Arc::from(entry.record_key.as_str()),
+                namespace: std::borrow::Cow::Owned(entry.namespace),
+                selector: std::borrow::Cow::Owned(entry.selector),
+            });
+        }
+    }
+    cache.invalidate_batch(&batch).unwrap_or(0)
+}
+
+/// THE BUCKET IS AN ARGUMENT, WHICH IS WHAT THE WRITE PATH ALWAYS DID.
+///
+/// `append_value` has taken `routing_bucket: Option<u32>` since it existed, and stamped it into the
+/// address only so that this function could read it back out. `CacheKey::page_with_slot` is written
+/// by that write path and read here, so the two sides have to agree or a warm read misses -- which
+/// is a performance cliff and not a failure, so nothing would fail. They agree because BOTH sides
+/// name the bucket the same way: `block_routing_bucket(object_key, start, end)` over the range the
+/// shard is stamped with. `the_warm_page_is_found_under_the_key_the_write_path_wrote` drives one
+/// write and one read and asserts the two keys are equal rather than reasoning about it.
+///
+/// `None` is accepted and means "no bucket to key by", which is what a caller with no object key in
+/// hand passes -- a slab walk, a report over raw addresses. It was reachable before this change too,
+/// for an address that carried no bucket.
+/// `identity` NAMES THE BLOCK, AND THE CALLER HAS TO BE ABLE TO NAME IT.
+///
+/// It used to be `component: Option<&str>` beside an object recovered from `address.object_id()`
+/// with `and_then`, and that was the one `Option` on this path that could lose data rather than
+/// weaken a cache key. The in-log fallbacks below are what serve a block whose only durable copy is
+/// its WAL record; a caller that could not name the object got `None` from the `and_then` and the
+/// read fell through to MISSING for a durably acknowledged write. See [`BlockIdentity`] for why the
+/// type takes the shard, the kind and the key rather than an id: there is no value to pass that
+/// could be absent, stale, or from somewhere else.
+///
+/// THE IDENTITY IS DERIVED, NOT READ OFF THE ADDRESS, and the two agree.
+/// `engine::tests::address_footprint::the_object_id_on_a_live_block_entry_is_the_hash_of_fields_beside_it`
+/// walks every live block entry at two corpus sizes and compares the stored id to
+/// `stable_block_object_id(shard, kind, key)`: 2,524 of 2,524 and 20,632 of 20,632 agree, none
+/// differ, none absent. That measurement is what makes taking the derived value here a no-op rather
+/// than a change of behaviour, and it is why this function no longer consults the field at all.
+///
+/// THIS FUNCTION ANSWERS WITH THE BLOCK'S WHOLE PAYLOAD, which since `container_blocks` is not
+/// necessarily one element's value. `read_block_bytes` wraps it and does the selection; everything
+/// that wants the frame itself -- a rewrite, a walk, a report -- comes here.
+#[allow(clippy::too_many_arguments)]
+fn read_block_frame_bytes(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    address: &ElementEntry,
+    identity: BlockIdentity<'_>,
+    routing_bucket: Option<u32>,
+) -> Option<Vec<u8>> {
+    let cache_key = CacheKey::page_with_slot(
+        shard_id,
+        address.block_slab_id(),
+        address.offset(),
+        address.length(),
+        routing_bucket);
+    let cached = crate::alloc_probe::in_class(crate::alloc_probe::AllocClass::CacheRead, || {
+        cache.get(&cache_key)
+    });
+    if let Ok(Some(bytes)) = cached {
+        return Some(bytes);
+    }
+    // Past the cache, so this call goes to storage. Counted here rather than at each of the
+    // three fallbacks below because every one of them is a trip to the store and they must not
+    // drift apart in the tally; a cache HIT returns above and is not I/O.
+    shard_write_guard::note_block_read();
+    // Log-backed hot block (synthetic address, no block-store file): a cache miss here would read
+    // as MISSING for an acked async write. If it was spilled to a real slab on eviction, resolve
+    // the redirect and read the durable copy. On a genuine miss (never spilled, or spill failed)
+    // this falls through to the normal read below, which returns None -- the WAL still holds the
+    // value and a reload replays it.
+    if crate::wal_record::is_wal_resident(address.block_slab_id()) {
+        if let Some(real_address) = hot_block_spill::lookup_spilled(shard_id, address.offset()) {
+            if let Ok(bytes) = block_store.read(&real_address) {
+                let _ = cache.put(cache_key, bytes.clone());
+                return Some(bytes);
+            }
+        }
+        // Nothing spilled, so the value exists only in its WAL record -- which is where it has
+        // been all along. Read it back by the log id the write registered. Tried after the
+        // spill redirect because a spilled copy is a direct block-store read, while this one
+        // parses a log record.
+        if let Some(bytes) = block_in_wal::read_block(
+            block_store,
+            shard_id,
+            identity.object_id(),
+            identity.component(),
+        ) {
+            let _ = cache.put(cache_key, bytes.clone());
+            return Some(bytes);
+        }
+    }
+    if let Ok(bytes) = block_store.read(address) {
+        let _ = cache.put(cache_key, bytes.clone());
+        return Some(bytes);
+    }
+    // The block store could not answer, so try the record that carries this block.
+    //
+    // This is the same fallback the synthetic-address branch above performs, which until now was
+    // the ONLY way to reach it: the branch is entered on `is_wal_resident(address.block_slab_id)`.
+    // A synchronous write stores the real address its block-store append returned, so a read for
+    // one never entered that branch, and the copy carried in its record was registered, kept
+    // addressable, and never consulted.
+    //
+    // That is exactly the case the single barrier creates. It acks on the log fsync and defers
+    // the block fsync, so a crash can lose a block the index already names. Recovery then rebuilt
+    // the index, resolved a real address into a block that was never written, and answered None
+    // for a durably acknowledged write -- with the value sitting in the log the whole time.
+    //
+    // Ordered after the block-store read, not before it: the durable copy is the common case and
+    // a direct read, while this one resolves a log id and parses a record.
+    if let Some(bytes) = block_in_wal::read_block(
+        block_store,
+        shard_id,
+        identity.object_id(),
+        identity.component(),
+    ) {
+        let _ = cache.put(cache_key, bytes.clone());
+        return Some(bytes);
+    }
+    None
+}
+
+/// One element's value out of the block an address names.
+///
+/// # WHY `None` FOR THE COMPONENT HANDS BACK THE FRAME
+///
+/// `None` has one meaning at every call site of this function and it is not "no element in
+/// particular": it means THE BLOCK IS ITS WHOLE OBJECT -- a string, a control state, a packed
+/// timestamped series. Such a block is never framed, so returning its payload unchanged is not a
+/// fallback, it is the only correct answer. The callers that pass `None` over a block that COULD be
+/// framed are the ones that want the frame: `compaction` rewrites the bytes it was handed, and a
+/// slab walk has no object key to name an element with. Both are served by the frame and would be
+/// corrupted by a value.
+///
+/// # AND A FRAMED PAGE THAT DOES NOT HOLD THE ELEMENT ANSWERS `None`
+///
+/// Which is the same answer a missing block gives, deliberately. The index named this block for this
+/// element; if the block does not hold it then the element is not there, and that is a miss rather
+/// than an error. A CORRUPT frame answers `None` too and is counted, because the alternative --
+/// handing the framing bytes back as a value -- is the failure mode this whole module exists to make
+/// impossible, and it is exactly #2016's shape: an unreadable name becoming a real one.
+/// ONE VALUE CARRIES BOTH HALVES, WHICH IS WHY THE SELECTION BELOW CANNOT DISAGREE WITH THE READ.
+///
+/// This door asks the frame reader for a block and then picks one element out of it. Those are two
+/// questions about the same block -- which object, and which element of it -- and they were two
+/// parameters that happened to be spelled once. A [`BlockIdentity`] is the pair: the element the
+/// frame reader resolves a WAL record by is `identity.component()`, and so is the element selected
+/// out of the bytes, because there is only one place either can come from.
+fn read_block_bytes(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    address: &ElementEntry,
+    identity: BlockIdentity<'_>,
+    routing_bucket: Option<u32>,
+) -> Option<Vec<u8>> {
+    let bytes = read_block_frame_bytes(
+        cache,
+        block_store,
+        shard_id,
+        address,
+        identity,
+        routing_bucket,
+    )?;
+    let Some(component) = identity.component() else {
+        return Some(bytes);
+    };
+    match container_blocks::select_container_element(&bytes, component) {
+        container_blocks::ContainerElementRead::NotFramed => Some(bytes),
+        container_blocks::ContainerElementRead::Found(value) => Some(value),
+        // A PAGE THAT STATES THE REMOVAL HAS NO VALUE TO HAND BACK, and this funnel's contract is a
+        // value or nothing. The two are one answer HERE and two answers to the derivation, which is
+        // why they are two variants and are collapsed at the one caller that cannot use the
+        // difference rather than never distinguished.
+        container_blocks::ContainerElementRead::Absent
+        | container_blocks::ContainerElementRead::Removed => None,
+        container_blocks::ContainerElementRead::Corrupt(_) => {
+            note_corrupt_container_block();
+            None
+        }
+    }
+}
+
+/// Container pages this process could not walk.
+///
+/// A counter and not a log line: the one thing a test needs to tell apart is "the element is not in
+/// the block" from "the block could not be read", and #1989 is the recorded case of those two being
+/// the same answer. Counting the second is what lets a guard assert the first happened zero times.
+static CORRUPT_CONTAINER_BLOCKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn note_corrupt_container_block() {
+    CORRUPT_CONTAINER_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many container pages this process has failed to walk.
+pub fn corrupt_container_block_count() -> u64 {
+    CORRUPT_CONTAINER_BLOCKS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Forget the count, so a test can measure one exercise rather than the suite before it.
+pub fn reset_corrupt_container_block_count() {
+    CORRUPT_CONTAINER_BLOCKS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The block's bytes, shared rather than copied.
+///
+/// `read_block_bytes` hands back a `Vec<u8>` the cache built by copying the `Arc<[u8]>` it already
+/// holds. A caller that parses the bytes and drops them pays that memcpy and that allocation for
+/// nothing -- once per retrieval candidate on the node fetch.
+///
+/// Identical to `read_block_bytes` in every other way: same key, same lookup, same spill and log
+/// fallbacks, same promotion. It differs only in not owning the result. Callers that keep or mutate
+/// the bytes should keep using `read_block_bytes`.
+/// `component` says WHICH ELEMENT of the object this address names, and it is not optional
+/// information dressed as an `Option`: `None` means the block IS its whole object -- a string,
+/// a control state -- and `Some` names the element, exactly as `BlockIndex::component` beside
+/// this address already does. The in-log fallback below needs it because a record carries many
+/// blocks and picks one out of itself by identity; handed only the object id it answers with the
+/// FIRST block of that object, which is another element's bytes rather than a miss.
+#[allow(clippy::too_many_arguments)]
+fn read_block_shared(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    address: &ElementEntry,
+    identity: BlockIdentity<'_>,
+    routing_bucket: Option<u32>,
+) -> Option<std::sync::Arc<[u8]>> {
+    let cache_key = CacheKey::page_with_slot(
+        shard_id,
+        address.block_slab_id(),
+        address.offset(),
+        address.length(),
+        routing_bucket);
+    let cached = crate::alloc_probe::in_class(crate::alloc_probe::AllocClass::CacheRead, || {
+        cache.get_shared(&cache_key)
+    });
+    if let Ok(Some(bytes)) = cached {
+        // THE CACHE HOLDS THE FRAME, NOT THE ELEMENT. It is keyed by address, and since
+        // `container_blocks` one address can name a block holding several elements -- so the shared
+        // path has to select out of a cache HIT exactly as `read_block_bytes` selects out of a
+        // store read. Returning the hit unselected is the one way the two doors can disagree, and
+        // it would disagree only when the block is warm: a cold read would answer correctly and a
+        // second read of the same element would answer with framing bytes.
+        let Some(component) = identity.component() else {
+            return Some(bytes);
+        };
+        return match container_blocks::select_container_element(&bytes, component) {
+            container_blocks::ContainerElementRead::NotFramed => Some(bytes),
+            container_blocks::ContainerElementRead::Found(value) => Some(std::sync::Arc::from(value)),
+            // Collapsed for the same reason as the owning funnel above: no value either way.
+            container_blocks::ContainerElementRead::Absent
+            | container_blocks::ContainerElementRead::Removed => None,
+            container_blocks::ContainerElementRead::Corrupt(_) => {
+                note_corrupt_container_block();
+                None
+            }
+        };
+    }
+    // Every path below writes to the cache and hands back what it wrote, so going through
+    // `read_block_bytes` keeps the spill redirect, the in-log read and the block-store read in one
+    // place rather than duplicating three fallbacks that must not drift apart.
+    read_block_bytes(cache, block_store, shard_id, address, identity, routing_bucket)
+        .map(std::sync::Arc::from)
+}
+
+fn read_block_bytes_cold(block_store: &BlockStore, address: &ElementEntry) -> Option<Vec<u8>> {
+    block_store.read(address).ok()
+}
+
+fn dedupe_nonzero_u64_preserve_order(values: Vec<u64>) -> Vec<u64> {
+    let mut seen = HashSet::new();
+    values
+        .into_iter()
+        .filter(|value| *value != 0 && seen.insert(*value))
+        .collect()
+}
+
+fn cache_entry_routing_bucket(entry: &CacheEntryInfo) -> Option<u32> {
+    entry
+        .selector
+        .strip_prefix("slot-")?
+        .split(':')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn parse_i64(bytes: &Vec<u8>) -> Option<i64> {
+    // Parse the integer with strtoll semantics (leading-whitespace tolerant):
+    // strtoll skips leading whitespace, so a stored counter like " 5" is the valid integer 5.
+    // Rust's str::parse rejects leading whitespace; trim it (ASCII only, so we do not accept
+    // Unicode whitespace strtoll's isspace would reject). Trailing/embedded garbage still fails on
+    // both sides (checks *end != '\0'), so only the previously-erroring leading-space case
+    // changes.
+    std::str::from_utf8(bytes)
+        .ok()?
+        .trim_start_matches(|c: char| c.is_ascii_whitespace())
+        .parse()
+        .ok()
+}
+
+/// TEST-ONLY DOOR onto [`object_manager_stats`], so a probe can price it apart from the rest of
+/// `shard_stats` without widening the function's own visibility.
+#[cfg(any(test, feature = "alloc-probe"))]
+pub(crate) fn object_manager_stats_for_test(
+    shard: &ShardState,
+    start_routing_bucket: u32,
+    end_routing_bucket: u32,
+) -> ObjectManagerStats {
+    object_manager_stats(shard, start_routing_bucket, end_routing_bucket)
+}
+
+/// The dirty-bucket count when no set is needed: the flagged buckets are already the whole answer.
+///
+/// Named rather than written as a bare `flagged_dirty`, so the fast path in `object_manager_stats`
+/// states that it is returning THE ANSWER and not a lower bound on it. See the two cases set out
+/// there; both make the union equal to this count.
+fn return_dirty_bucket_count(flagged_dirty: usize) -> usize {
+    flagged_dirty
+}
+
+fn object_manager_stats(
+    shard: &ShardState,
+    start_routing_bucket: u32,
+    end_routing_bucket: u32,
+) -> ObjectManagerStats {
+    if !shard.bucket_index.bucket_map.is_empty() {
+        let (bucket_object_count, bucket_block_ref_count, bucket_dirty_object_count) =
+            if !shard.bucket_index.object_block_lookup.is_empty() {
+                (
+                    // The map is keyed by OBJECT now, so its length is the object count directly.
+                    // It used to be the length of a second map kept alongside this one, which is
+                    // the question that stopped that map from simply being deleted.
+                    shard.bucket_index.object_block_lookup.len(),
+                    // Maintained incrementally; the walk is the fallback for an index that has
+                    // been deserialized but not yet rebuilt. This runs on the heartbeat timer
+                    // under the shard read lock, so walking here shows up as write contention.
+                    shard.bucket_index.object_component_block_refs.unwrap_or_else(|| {
+                        shard
+                            .bucket_index
+                            .object_block_lookup
+                            .values()
+                            .map(crate::engine::state::BlockRefs::len)
+                            .sum::<usize>()
+                    }),
+                    shard.dirty_objects.len(),
+                )
+            } else {
+                // THE TWO IDENTITY-DEPENDENT FIGURES ARE ZERO IN THIS BRANCH, AND THEY
+                // ALWAYS WERE -- WHICH IS WHY THIS IS A TRANSLATION AND NOT A GUESS.
+                //
+                // This arm is taken when `object_block_lookup` IS EMPTY. Both figures below
+                // counted DISTINCT OBJECTS over the live pages, reading each page's object key
+                // off the entry. With the key beside the page instead, an empty lookup names no
+                // position at all, so no page has an identity and the number of distinct objects
+                // this index can name is zero.
+                //
+                // THE THIRD FIGURE NEEDS NO IDENTITY AND IS KEPT. `live_blocks.len()` counts
+                // PAGES, and `block_ref_count` below takes `.max(secondary_block_ref_count)` over
+                // it -- so the one number this arm still contributes is preserved exactly.
+                //
+                // AND THE BRANCH ITSELF IS KEPT RATHER THAN DELETED. Deleting it and always
+                // reading the lookup looks equivalent and is not: `dirty_bucket_count`'s
+                // corresponding arm, further down, adds the target buckets of every dirty object,
+                // which the page walk does not -- so a shard with dirty objects and an empty
+                // bucket index would start reporting a different count. Translating the terms
+                // that need an identity, and only those, moves no reachable answer.
+                // COUNTED, NOT COLLECTED. This built a `Vec` of every live page's reference and
+                // used it for nothing but `.len()`, so the allocation was 8 bytes a live page per
+                // stats read -- and `shard_stats` is what a node answers a stats request with, so
+                // it is paid again on every read for as long as the node is up.
+                //
+                // IT IS NOT THIS PATH'S MAIN COST, which is worth saying so the next reader does
+                // not stop here: measured by `what_one_stats_read_allocates`, one read allocates
+                // 220,745 B over a 40-page corpus and 776,311 B over a 320-page one, where this
+                // `Vec` accounts for 2,560 B of the larger figure. The rest is unattributed. What
+                // justifies removing this is that it buys nothing at any size.
+                let live_blocks = shard
+                    .bucket_index
+                    .bucket_map
+                    .values()
+                    .flat_map(|bucket| bucket.block_index.values())
+                    .filter(|block| !block.deleted)
+                    .count();
+                (0, live_blocks, 0)
+            };
+        let secondary_object_count = shard.strings().len()
+            + shard.hashes.len()
+            + shard.sets.len()
+            + shard.lists.len()
+            + shard.zsets.len()
+            + shard.features().len()
+            + shard.control_state().len()
+            + shard.control_state_changes.len()
+            + shard.context_nodes().len()
+            + shard.context_events().len()
+            + shard.context_indexes().len()
+            + shard.context_audits().len()
+            + shard.context_entities()
+            .values()
+            .map(|slot| slot.owned_element_count())
+            .sum::<usize>()
+            + shard.context_children().len()
+            + shard.context_summaries().len()
+            + shard.context_compressions().len();
+        let object_count = bucket_object_count.max(secondary_object_count);
+        let dirty_object_count = bucket_dirty_object_count.max(shard.dirty_objects.len());
+        let secondary_block_ref_count = shard.strings().len()
+            + shard.hashes.values().map(|fields| fields.len()).sum::<usize>()
+            + shard.sets.values().map(BTreeMap::len).sum::<usize>()
+            + shard.lists.values().map(BTreeMap::len).sum::<usize>()
+            + shard.zsets.values().map(BTreeMap::len).sum::<usize>()
+            + shard.features().values().map(|series| series.len()).sum::<usize>()
+            + shard.context_nodes().len()
+            + shard
+                .context_events()
+                .values()
+                .map(|slot| slot.owned_element_count())
+                .sum::<usize>()
+            + shard
+                .context_indexes()
+                .values()
+                .map(|slot| slot.owned_element_count())
+                .sum::<usize>()
+            + shard
+                .context_audits()
+                .values()
+                .map(|slot| slot.owned_element_count())
+                .sum::<usize>()
+            + shard.context_entities()
+            .values()
+            .map(|slot| slot.owned_element_count())
+            .sum::<usize>()
+            + shard
+                .context_children()
+                .values()
+                .map(|slot| slot.owned_element_count())
+                .sum::<usize>()
+            + shard
+                .context_summaries()
+                .values()
+                .map(|slot| slot.owned_element_count())
+                .sum::<usize>()
+            + shard
+                .context_compressions()
+                .values()
+                .map(|slot| slot.owned_element_count())
+                .sum::<usize>();
+        let dirty_bucket_count = if !shard.bucket_index.object_block_lookup.is_empty() {
+            // COUNTED BEFORE ANY SET IS BUILT, because in two cases the set cannot change the
+            // answer and building it is the whole allocation of this function.
+            //
+            // MEASURED: `what_one_stats_read_allocates` puts the `BTreeSet` below at 4,112 of the
+            // 5,249 bytes one stats read allocates over a 320-page store -- and the thirteen
+            // per-map sums above it at ZERO, which is worth stating because they are what this
+            // function looks like it spends its time on. A `BTreeSet` collect buffers the whole
+            // iterator before building the tree, so its cost is the bucket count whether or not
+            // the loop that follows needs it.
+            //
+            // THE TWO CASES ARE EXACT, NOT APPROXIMATE. The answer is the union of the flagged
+            // buckets with, per dirty object, every bucket holding one of its blocks. A union
+            // cannot exceed the bucket count, so if every bucket is already flagged the union IS
+            // the bucket count; and with no dirty objects the loop iterates nothing. The comment
+            // below already says the first of those is the normal case during ingest, because
+            // `mark_object_dirty` flags an object's routing bucket as it records it.
+            let bucket_total = shard.bucket_index.bucket_map.len();
+            let flagged_dirty = shard
+                .bucket_index
+                .bucket_map
+                .values()
+                .filter(|bucket| bucket.dirty())
+                .count();
+            if flagged_dirty >= bucket_total || shard.dirty_objects.is_empty() {
+                return_dirty_bucket_count(flagged_dirty)
+            } else {
+            let mut dirty_buckets = shard
+                .bucket_index
+                .bucket_map
+                .iter()
+                .filter_map(|(bucket_id, bucket)| bucket.dirty().then_some(*bucket_id))
+                .collect::<BTreeSet<_>>();
+            // THE REMAINING BUCKETS ARE FOUND BY THEIR PAGES, NOT BY THE OBJECT SET.
+            //
+            // The collect above has every bucket that is dirty in its own right. What it can miss
+            // is a bucket holding a page of some OTHER bucket's object, and that bucket's pages
+            // carry the answer: `push_object_dirty_onto_its_existing_blocks` runs at both sites
+            // that mark an object dirty, so every page of a dirty object has `page.dirty`. The
+            // invariant is pinned elsewhere in these words -- "a mark that does not reach its
+            // pages leaves the bucket reading clean" -- and
+            // `the_block_bit_answers_the_dirty_bucket_question` measures the two methods agreeing
+            // with that case isolated, rather than while every bucket happens to be dirty.
+            //
+            // THIS IS WHY THE OBJECT LOOP IS GONE. Its own comment recorded the cost: it asked,
+            // per dirty object, which buckets hold its blocks, "building a composite lookup key
+            // each time", over a set that "grows with the ingest", on the heartbeat timer under
+            // the shard read lock -- profiling showed `bucket_index_target_buckets_for_object_key`
+            // and `push_lookup_part` rising with `RwLock::write_contended`. Asking each bucket
+            // about its own pages builds no key and allocates nothing.
+            //
+            // The early exit is kept for the same reason it was there: the answer is a set of
+            // bucket ids and cannot exceed the number of buckets, so once every bucket is in it
+            // no further work can change the result.
+            if dirty_buckets.len() < bucket_total {
+                for (bucket_id, bucket) in shard.bucket_index.bucket_map.iter() {
+                    if dirty_buckets.contains(bucket_id) {
+                        continue;
+                    }
+                    if bucket.block_index.values().any(|block| block.dirty) {
+                        dirty_buckets.insert(*bucket_id);
+                        if dirty_buckets.len() >= bucket_total {
+                            break;
+                        }
+                    }
+                }
+            }
+            dirty_buckets.len()
+            }
+        } else {
+            shard
+                .bucket_index
+                .bucket_map
+                .values()
+                .filter(|bucket| {
+                    bucket.dirty()
+                        || bucket.block_index.values().any(|block| {
+                            // THE SECOND DISJUNCT IS UNREACHABLE IN THIS ARM AND IS
+                            // DROPPED, not translated.
+                            //
+                            // This arm is taken when `object_block_lookup` IS EMPTY, so no page
+                            // has an identity beside it and `dirty_objects.contains(..)` could
+                            // never be satisfied for any page here. What is left is the one term
+                            // that needs no identity: the page's own dirty bit.
+                            block.dirty
+                        })
+                })
+                .count()
+        };
+        return ObjectManagerStats {
+            object_count,
+            block_ref_count: bucket_block_ref_count.max(secondary_block_ref_count),
+            dirty_object_count,
+            dirty_bucket_count,
+            routing_bucket_count: routing_bucket_count(start_routing_bucket, end_routing_bucket),
+        };
+    }
+
+    let object_count = shard.strings().len()
+        + shard.hashes.len()
+        + shard.sets.len()
+        + shard.lists.len()
+        + shard.zsets.len()
+        + shard.features().len()
+        + shard.control_state().len()
+        + shard.context_nodes().len()
+        + shard.context_events().len()
+        + shard.context_indexes().len()
+        + shard.context_audits().len()
+        + shard.context_entities()
+            .values()
+            .map(|slot| slot.owned_element_count())
+            .sum::<usize>()
+        + shard.context_children().len()
+        + shard.context_summaries().len()
+        + shard.context_compressions().len();
+    let block_ref_count = shard.strings().len()
+        + shard.hashes.values().map(|fields| fields.len()).sum::<usize>()
+        + shard.sets.values().map(BTreeMap::len).sum::<usize>()
+        + shard.lists.values().map(BTreeMap::len).sum::<usize>()
+        + shard.zsets.values().map(BTreeMap::len).sum::<usize>()
+        + shard.features().values().map(|series| series.len()).sum::<usize>()
+        + shard.context_nodes().len()
+        + shard
+            .context_events()
+            .values()
+            .map(|slot| slot.owned_element_count())
+            .sum::<usize>()
+        + shard
+            .context_indexes()
+            .values()
+            .map(|slot| slot.owned_element_count())
+            .sum::<usize>()
+        + shard
+            .context_audits()
+            .values()
+            .map(|slot| slot.owned_element_count())
+            .sum::<usize>()
+        + shard.context_entities()
+            .values()
+            .map(|slot| slot.owned_element_count())
+            .sum::<usize>()
+        + shard
+            .context_children()
+            .values()
+            .map(|slot| slot.owned_element_count())
+            .sum::<usize>()
+        + shard
+            .context_summaries()
+            .values()
+            .map(|slot| slot.owned_element_count())
+            .sum::<usize>()
+        + shard
+            .context_compressions()
+            .values()
+            .map(|slot| slot.owned_element_count())
+            .sum::<usize>();
+    let routing_bucket_count = routing_bucket_count(start_routing_bucket, end_routing_bucket);
+    let mut dirty_buckets = shard
+        .bucket_index
+        .bucket_map
+        .iter()
+        .filter_map(|(bucket, node)| node.dirty().then_some(*bucket))
+        .collect::<BTreeSet<_>>();
+    // The buckets the dirty index already holds these objects under. This was a hash per dirty
+    // key to recompute `block_routing_bucket(key, start, end)`, which is the same function, with
+    // the same arguments, that recorded them.
+    dirty_buckets.extend(shard.dirty_objects.bucket_ids());
+    ObjectManagerStats {
+        object_count,
+        block_ref_count,
+        dirty_object_count: shard.dirty_objects.len(),
+        dirty_bucket_count: dirty_buckets.len(),
+        routing_bucket_count,
+    }
+}
+
+#[cfg(test)]
+#[path = "engine/engine_regression_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+mod flag_default_doc_tests {
+    use std::path::Path;
+
+    /// A flag's doc comment must not claim the opposite default from its code.
+    ///
+    /// Seven of them did: they called `env_flag_default_on` -- true unless the variable is
+    /// explicitly 0/false/no/off -- while their comment said "Default OFF", usually with a
+    /// reassuring "byte-identical / exactly as before" after it. A reader asking the question
+    /// that matters ("is this path actually live?") got the wrong answer, and nothing failed,
+    /// because a comment cannot fail. This reads the sources so it can.
+    #[test]
+    fn flag_docs_state_the_default_the_code_actually_has() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut wrong: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+
+        let mut files: Vec<std::path::PathBuf> = Vec::new();
+        collect_rs(&root, &mut files);
+        for file in files {
+            let Ok(text) = std::fs::read_to_string(&file) else {
+                continue;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                let trimmed = line.trim_start();
+                if !trimmed.starts_with("fn ") || !trimmed.ends_with("() -> bool {") {
+                    continue;
+                }
+                // body: up to the closing brace at the same indent
+                let mut body = String::new();
+                for next in lines.iter().skip(index + 1) {
+                    if next.trim_start() == "}" && next.len() - next.trim_start().len()
+                        == line.len() - line.trim_start().len()
+                    {
+                        break;
+                    }
+                    body.push_str(next);
+                    body.push('\n');
+                }
+                let actual_on = if body.contains("env_flag_default_on") {
+                    true
+                } else if body.contains("env_flag_on") {
+                    false
+                } else {
+                    continue;
+                };
+
+                // doc block immediately above
+                let mut doc = String::new();
+                for back in (0..index).rev() {
+                    let candidate = lines[back].trim_start();
+                    if candidate.starts_with("///") {
+                        doc.insert_str(0, &format!("{candidate}\n"));
+                    } else if candidate.starts_with("#[") {
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+                if doc.is_empty() {
+                    continue;
+                }
+                checked += 1;
+                let low = doc.to_ascii_lowercase();
+                let says_off = low.contains("default off") || low.contains("defaults off");
+                let says_on = low.contains("default on") || low.contains("defaults on");
+                let name = trimmed
+                    .trim_start_matches("fn ")
+                    .split('(')
+                    .next()
+                    .unwrap_or("?");
+                if actual_on && says_off && !says_on {
+                    wrong.push(format!(
+                        "{}::{name} documents \"default off\" but calls env_flag_default_on",
+                        file.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                }
+                if !actual_on && says_on && !says_off {
+                    wrong.push(format!(
+                        "{}::{name} documents \"default on\" but calls env_flag_on",
+                        file.file_name().unwrap_or_default().to_string_lossy()
+                    ));
+                }
+            }
+        }
+
+        assert!(checked > 0, "no documented flag functions found; the scan is broken");
+        assert!(
+            wrong.is_empty(),
+            "flag docs contradict their code ({} of {checked} checked):\n  {}",
+            wrong.len(),
+            wrong.join("\n  ")
+        );
+    }
+
+    fn collect_rs(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                collect_rs(&path, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod key_state_shape_tests {
+    use super::*;
+
+    /// The property the capture side now relies on: a field LEFT OUT and a field written as
+    /// an explicit null mean the same thing to the apply side. If that ever stops being true,
+    /// omitting the nulls silently stops tombstoning keys on reload, and evicted membership
+    /// comes back from the blocks.
+    #[test]
+    fn an_omitted_key_state_field_delete_markers_exactly_like_an_explicit_null() {
+        let mut with_null: HashMap<String, u64> = HashMap::new();
+        with_null.insert("k".to_string(), 7);
+        apply_key_state_field(&mut with_null, "k", Some(&serde_json::Value::Null));
+
+        let mut omitted: HashMap<String, u64> = HashMap::new();
+        omitted.insert("k".to_string(), 7);
+        apply_key_state_field(&mut omitted, "k", None);
+
+        assert_eq!(with_null.get("k"), None, "an explicit null must remove the entry");
+        assert_eq!(omitted.get("k"), None, "an omitted field must remove it too");
+        assert_eq!(with_null, omitted);
+
+        // Not vacuous: a PRESENT value must still be inserted, so this cannot pass on an
+        // apply that removes everything.
+        let mut present: HashMap<String, u64> = HashMap::new();
+        apply_key_state_field(&mut present, "k", Some(&serde_json::json!(9)));
+        assert_eq!(present.get("k"), Some(&9));
+    }
+
+    #[test]
+    fn a_key_in_no_map_captures_only_its_key() {
+        // The common case: an ordinary write touches a key that is in none of the twelve
+        // maps. Previously that produced twelve nulls; now it produces nothing but the key.
+        let shard = ShardState::default();
+        let blobs = capture_key_states(&shard, &["m:0".to_string()]);
+        assert_eq!(blobs.len(), 1);
+        let object = blobs[0].as_object().expect("a blob is an object");
+        assert_eq!(object.get("key").and_then(|v| v.as_str()), Some("m:0"));
+        assert_eq!(
+            object.len(),
+            1,
+            "a key in no map should carry only its own name, got {object:?}"
+        );
+    }
+}
