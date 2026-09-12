@@ -18,3 +18,43 @@ pub enum ControlStatePrecision {
 #[derive(Clone, Copy, Debug)]
 #[repr(i32)]
 pub enum ControlStateWindowUnit {
+    Second = 0,
+    Minute = 1,
+    Hour = 2,
+    Day = 3,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct ControlStateWindow {
+    pub start: i64,
+    pub end: i64,
+    pub unit: ControlStateWindowUnit,
+}
+
+impl Default for ControlStateWindow {
+    fn default() -> Self {
+        Self {
+            start: -1,
+            end: 0,
+            unit: ControlStateWindowUnit::Hour,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "proxy", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "proxy", serde(rename_all = "snake_case"))]
+pub enum ControlStateHType {
+    Count,
+    Min,
+    Max,
+    Change,
+}
+
+#[derive(Clone, Copy, Debug)]
+#[cfg_attr(feature = "proxy", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "proxy", serde(rename_all = "snake_case"))]
+pub enum ControlStateFolType {
+    First,
+    Last,
+}
