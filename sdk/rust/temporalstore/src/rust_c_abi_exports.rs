@@ -49,3 +49,55 @@ pub unsafe extern "C" fn temporalstore_rust_close(
     error: *mut *mut c_char,
 ) -> c_int {
     if handle.is_null() {
+        return 0;
+    }
+    let mut client = Box::from_raw(handle as *mut Client);
+    run_c_abi(error, || client.close())
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn temporalstore_rust_hset(
+    handle: *mut std::ffi::c_void,
+    key: *const c_char,
+    field: *const c_char,
+    value: *const c_char,
+    error: *mut *mut c_char,
+) -> c_int {
+    run_c_abi(error, || {
+        client_from_handle(handle)?.hset(
+            &cstr_arg(key, "key")?,
+            &cstr_arg(field, "field")?,
+            &cstr_arg(value, "value")?,
+        )
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn temporalstore_rust_hget(
+    handle: *mut std::ffi::c_void,
+    key: *const c_char,
+    field: *const c_char,
+    out: *mut *mut c_char,
+    error: *mut *mut c_char,
+) -> c_int {
+    run_c_abi_string(out, error, || {
+        client_from_handle(handle)?.hget(&cstr_arg(key, "key")?, &cstr_arg(field, "field")?)
+    })
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn temporalstore_rust_hgetall_json(
+    handle: *mut std::ffi::c_void,
+    key: *const c_char,
+    out: *mut *mut c_char,
+    error: *mut *mut c_char,
+) -> c_int {
+    run_c_abi_string(out, error, || {
+        let records: Vec<serde_json::Value> = client_from_handle(handle)?
+            .hgetall(&cstr_arg(key, "key")?)?
+            .into_iter()
+            .map(|(field, value)| serde_json::json!({"field": field, "value": value}))
+            .collect();
+        Ok(serde_json::json!({"ok": true, "count": records.len(), "records": records}).to_string())
+    })
+}
