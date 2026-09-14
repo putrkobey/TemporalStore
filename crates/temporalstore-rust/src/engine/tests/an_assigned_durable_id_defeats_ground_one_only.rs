@@ -171,3 +171,349 @@ const _: fn(crate::types::ShardId, &str, &str) -> u64 =
 /// `storage_bucket_internals.rs:2298` cannot be served by any id, assigned or computed. If a form
 /// taking an id is ever added, this line fails and the one unservable site becomes servable.
 const _: fn(&str, u32, u32) -> u32 = crate::engine::hashing::block_routing_bucket;
+
+/// CLAIM 2, AS A MEASUREMENT. The id carried as a FIELD lands the entry at thirty-two.
+///
+/// # EVERY MIRROR IN THIS FILE DECLARED TWO FIELDS THE LIVE ENTRY LOST TWO LEGS AGO
+///
+/// All four carried `kind: IndexItemKind` and `routing_bucket: u32` -- five bytes between them --
+/// and `65c7fc562` removed both from `BlockIndex`. NOT ONE ASSERTION MOVED WHEN THEY WERE
+/// CORRECTED, which is exactly why this is written up rather than quietly fixed: the comparison
+/// mirror held forty bytes of field against a live entry holding thirty-five, and FORTY AND
+/// THIRTY-FIVE BOTH ROUND TO FORTY, so `size_of::<mirror>() == size_of::<BlockIndex>()` went on
+/// passing while the mirror described a field set the entry did not have.
+///
+/// THIS IS THE THIRD RECORDED INSTANCE OF THAT SHAPE AND THE SECOND STILL LIVE.
+/// `entry_width_at_each_step`'s module doc records it for its own step-zero mirror and answers it
+/// with field OFFSET pins, saying in as many words that its width controls "discriminate at WORD
+/// granularity and no finer". `engine_storage_state.rs`'s address-word probe records it for itself. This file
+/// read both notes and carried the defect anyway, because nothing here reads an offset.
+///
+/// SO THE ARITHMETIC IN THIS PARAGRAPH WAS WRONG TOO, and it is the half a width cannot check. It
+/// read "one plus four plus eight plus one plus sixteen plus one plus one is thirty-two bytes of
+/// field, and thirty-two is a multiple of the alignment, so it lands there exactly". With the two
+/// retired terms gone it is eight plus one plus sixteen plus one plus one: TWENTY-SEVEN bytes of
+/// field in thirty-two, with five of slack. It lands at thirty-two by ROUNDING, not exactly --
+/// which is the same correction `engine_storage_state.rs`'s probe took for the same reason.
+///
+/// THE VERDICT IS UNCHANGED AND THAT IS NOT LUCK: thirty-two is still not twenty-four, so the
+/// proposal still reaches twenty-four only in the form where the id is the KEY OF THE HOLDING MAP
+/// and the entry carries no identity term. That form is the one Ground 2 is about, which is why
+/// this mirror is the bridge between the width claim and the refusal.
+#[allow(dead_code)]
+struct TheIdCarriedAsAFieldInstead {
+    object_id: u64,
+    model_id: StoredModelKind,
+    address: ElementEntry,
+    dirty: bool,
+    deleted: bool,
+}
+
+const _: () = assert!(size_of::<TheIdCarriedAsAFieldInstead>() == 32);
+const _: () = assert!(align_of::<TheIdCarriedAsAFieldInstead>() == 8);
+
+/// THE CONTROL FOR THAT MIRROR, and it is the control that was passing over a stale field set.
+///
+/// The mirror is the live entry with one term swapped, so it is only evidence if the UNSWAPPED
+/// mirror measures the live entry. This is the one that held forty bytes of field against the live
+/// entry's thirty-five and compared equal anyway, for the reason the claim-2 doc gives: it is
+/// asserted at WORD granularity, and the five bytes the two retired fields contributed were
+/// absorbed by the rounding.
+///
+/// IT IS STILL ASSERTED AT WORD GRANULARITY, and this file does not pretend otherwise. The
+/// stronger instrument is a field OFFSET pin, and `entry_width_at_each_step` carries it for the
+/// same structure; what this file owes is a mirror whose field list is the live one, which is now
+/// the case.
+#[allow(dead_code)]
+struct TheLiveEntryForComparison {
+    model_id: StoredModelKind,
+    address: ElementEntry,
+    dirty: bool,
+    deleted: bool,
+}
+
+const _: () = assert!(size_of::<TheLiveEntryForComparison>() == size_of::<BlockIndex>());
+const _: () = assert!(align_of::<TheLiveEntryForComparison>() == align_of::<BlockIndex>());
+
+/// THE NEGATIVE CONTROL: a mirror with one word too many must not measure the live entry, or the
+/// comparison above is not discriminating at all.
+#[allow(dead_code)]
+struct TheLiveEntryWithOneWordTooMany {
+    model_id: StoredModelKind,
+    address: ElementEntry,
+    dirty: bool,
+    deleted: bool,
+    one_word_too_many: u64,
+}
+
+const _: () = assert!(size_of::<TheLiveEntryWithOneWordTooMany>() != size_of::<BlockIndex>());
+
+/// CLAIM 6, AS ARITHMETIC. Each term of the totals, pinned where the total is written.
+///
+/// The entry with no identity term, for the per-object total below. Twenty-four -- and NINETEEN
+/// bytes of field in it, with FIVE of slack, not the zero this doc used to claim.
+///
+/// BOTH HALVES OF THAT SENTENCE WERE WRONG AND THE WIDTH WAS RIGHT. It read "Twenty-four, with the
+/// same zero slack the width module measures", and the width module measures five: its step-one
+/// row is "NINETEEN bytes of field in twenty-four, with FIVE bytes of slack", under a heading
+/// saying that reading inverts the rule this entry is governed by. This mirror carried the two
+/// retired fields on top of that, so it held twenty-four bytes of field in twenty-four and the
+/// zero claim was true OF THE MIRROR and of nothing else.
+#[allow(dead_code)]
+struct TheEntryWithNoIdentityTerm {
+    model_id: StoredModelKind,
+    address: ElementEntry,
+    dirty: bool,
+    deleted: bool,
+}
+
+const _: () = assert!(size_of::<TheEntryWithNoIdentityTerm>() == 24);
+
+/// AND THIS MIRROR IS NOW THE LIVE ENTRY, WHICH IS ASSERTED RATHER THAN LEFT TO BE NOTICED.
+///
+/// It was built to measure "the entry with no identity term" against an entry that had one. The
+/// entry has none: the identity lives once per object in `CoreIndex::object_block_lookup` and is
+/// resolved from the position the page is filed at. So the proposal's ENTRY SIDE and the shipped
+/// entry are one field set, and every arithmetic below that subtracts one from the other is zero.
+///
+/// THE MIRROR IS KEPT RATHER THAN FOLDED, AND ONLY BECAUSE THIS EQUALITY IS WRITTEN. Two
+/// declarations of one shape are two things to keep in step -- `entry_width_at_each_step` folded
+/// its step-one mirror away for exactly that reason, and `engine_storage_state.rs` has folded two probes. What
+/// keeps this one honest is that its collapse into the live type is a CHECKED claim: if either
+/// shape moves, this line fails rather than the two quietly drifting apart.
+const _: () = assert!(size_of::<TheEntryWithNoIdentityTerm>() == size_of::<BlockIndex>());
+
+/// PER ENTRY, NODE AGAINST NODE -- AND THE TWO COLUMNS HAVE MET.
+///
+/// The map arm holds the key beside the entry either way, so this is what a page costs resident.
+/// It was 48 with the identity on the entry and the proposal's side was 32; the identity left and
+/// the live element IS 32. The second assertion of this pair is the equality above.
+const _: () = assert!(size_of::<(u64, BlockIndex)>() == 32);
+const _: () = assert!(size_of::<(u64, TheEntryWithNoIdentityTerm)>() == 32);
+
+/// PER OBJECT, TOTAL AGAINST TOTAL. What a persisted key-to-id map holds for one object, payload
+/// only: one shared pointer to the characters and one id.
+const _: () = assert!(size_of::<Arc<str>>() + size_of::<u64>() == 24);
+
+/// AND THE TOTAL ITSELF, RECONSTRUCTED FROM THE TERMS RATHER THAN RESTATED AS A LITERAL.
+///
+/// Written this way so that a term whose width moves fails HERE instead of leaving a stale literal
+/// standing -- and this is the leg where one did move. The `> ` still holds and the difference does
+/// not: it was EIGHT and it is TWENTY-FOUR, because the entry side of the comparison got smaller
+/// and the map side did not.
+///
+/// THE PROPOSAL'S ENTRY SIDE IS NOW LEVEL WITH THE SHIPPED ONE, asserted twenty lines above, so
+/// its whole remaining cost is the per-object key-to-id map: one shared pointer to the characters
+/// and one id. That is the restatement -- the verdict is unchanged and the ARITHMETIC behind it is
+/// now entirely the map, where before it was the map minus an entry-side saving.
+///
+/// SO THE REFUSAL GOT STRONGER RATHER THAN WEAKER, which is worth saying because a number moving
+/// usually means the opposite. A proposal that cost eight bytes an object against a forty-byte
+/// entry costs twenty-four against a twenty-four-byte one: the saving it was partly paying for has
+/// already been taken by this change, and it was taken WITHOUT the map.
+const _: () = assert!(
+    size_of::<(u64, TheEntryWithNoIdentityTerm)>() + size_of::<Arc<str>>() + size_of::<u64>()
+        > size_of::<(u64, BlockIndex)>()
+);
+const _: () = assert!(
+    size_of::<(u64, TheEntryWithNoIdentityTerm)>() + size_of::<Arc<str>>() + size_of::<u64>()
+        - size_of::<(u64, BlockIndex)>()
+        == 24
+);
+/// AND THE DIFFERENCE IS THE MAP, EXACTLY, which is the form that cannot go stale: it says the
+/// entry sides cancel and names what is left.
+const _: () = assert!(
+    size_of::<(u64, TheEntryWithNoIdentityTerm)>() + size_of::<Arc<str>>() + size_of::<u64>()
+        - size_of::<(u64, BlockIndex)>()
+        == size_of::<Arc<str>>() + size_of::<u64>()
+);
+
+#[test]
+fn an_assigned_durable_id_is_priced_and_the_numbers_are_reconstructed_from_the_terms() {
+    // THE IDENTITY OF THE SUBJECT BEFORE ANY CONTENT CHECK.
+    assert_eq!(
+        size_of::<TheLiveEntryForComparison>(),
+        size_of::<BlockIndex>(),
+        "the comparison mirror must measure the live entry"
+    );
+
+    let today_per_object = size_of::<(u64, BlockIndex)>();
+    let proposal_entry = size_of::<(u64, TheEntryWithNoIdentityTerm)>();
+    let proposal_map = size_of::<Arc<str>>() + size_of::<u64>();
+    let proposal_per_object = proposal_entry + proposal_map;
+
+    println!("per entry, node against node      today {today_per_object:>3} B   proposal {proposal_entry:>3} B");
+    println!("  the entry alone                 today {:>3} B   proposal {:>3} B", size_of::<BlockIndex>(), size_of::<TheEntryWithNoIdentityTerm>());
+    println!("  the id carried as a FIELD instead     {:>3} B   (so 24 needs it as the map key)", size_of::<TheIdCarriedAsAFieldInstead>());
+    println!("per object, TOTAL against TOTAL   today {today_per_object:>3} B   proposal {proposal_per_object:>3} B   (map {proposal_map} B, payload only)");
+    println!("  the proposal is worse by              {:>3} B   and that is a FLOOR", proposal_per_object - today_per_object);
+
+    assert_eq!(size_of::<TheIdCarriedAsAFieldInstead>(), 32);
+    assert_eq!(size_of::<TheEntryWithNoIdentityTerm>(), 24);
+    assert!(
+        proposal_per_object > today_per_object,
+        "the per-object total is the denominator this proposal loses in"
+    );
+    // TWENTY-FOUR, NOT EIGHT, AND IT IS THE BASELINE THAT MOVED. The proposal's entry side is
+    // now identical to the shipped entry -- the identity has already left -- so what it adds is
+    // the per-object key-to-id map and only the map. The const block under claim 6 carries the
+    // reasoning and asserts the same difference as `Arc<str>` plus a `u64`.
+    assert_eq!(proposal_per_object - today_per_object, 24);
+}
+
+// =================================================================================================
+// CLAIM 7 -- THE +24 TERM IN CLAIM 6 DOES NOT APPLY, BECAUSE THE CHARACTERS ARE ALREADY OWNED
+// ELSEWHERE AND THE PLACE THAT OWNS THEM IS ALREADY WALKED BY PRODUCTION CODE.
+//
+// CLAIM 6 IS CORRECTED RATHER THAN DELETED, because the arithmetic in it is right and its PREMISE
+// was wrong, and the premise is the part a later reader would otherwise re-adopt. It priced a
+// persisted key-to-id map as NEW structure: twenty-four bytes an object that the tree would have
+// to start paying. It does not have to. The model maps own the characters today, unconditionally,
+// because that is how a record is addressed:
+//
+//   * `ShardState::strings` is `HashMap<ModelKey, ElementEntry>` at `engine_storage_state.rs:150`, and
+//     `ModelKey` is `Box<str>` at `engine_storage_state.rs:73` -- the characters, OWNED, one per object.
+//   * `RecordedMap` holds `HashMap<String, K::Elements>` at `recorded_map.rs:152`, which is the
+//     same thing for the four recorded kinds.
+//
+// So there is no container to build and no bytes to add. The identity would be READ from structure
+// that exists, not moved into structure that does not.
+//
+// AND IT IS ALREADY REACHED THIS WAY BY PRODUCTION CODE, which is what makes this a cost question
+// rather than a design question. `visit_model_live_blocks` offers every live model-map block in the
+// shard to a callback as `(kind, object_key, component, address)`, and its own doc says of the key
+// that "Every other arm's key is borrowed from the map and costs nothing" -- one arm composes a
+// key with `format!` and is the stated exception. `collect_model_live_block_entries` is that walk
+// with an always-true filter, and it takes NOTHING BUT A SHARD. The signature pin below is the
+// checkable form of that.
+//
+// SO THE CORRECTED TOTAL, with both denominators named again. Per entry, node against node: forty
+// to twenty-four. Per object, TOTAL against total at the measured one page per object: forty-eight
+// to thirty-two -- the entry sheds a sixteen-byte shared pointer per page and NOTHING is added, so
+// it is a SIXTEEN BYTE SAVING on both denominators rather than eight bytes of regression.
+//
+// WHAT THE CHARACTERS COST IS UNCHANGED BY ANY OF THIS, and saying so is what keeps the number
+// honest. They are stored twice today -- once as the model map's own key and once as the object
+// lookup's inner key -- and they would still be stored twice afterwards, because the lookup needs
+// its key to BE a key. The entry's field is a POINTER at the lookup's allocation, so what the
+// removal sheds is sixteen bytes of pointer per page and not one byte of text.
+//
+// AND THE SAVING IS CONDITIONAL ON THE READER CENSUS, WHICH IS WHERE THIS NOW LIVES OR DIES. Two
+// functions cannot take a model-map source at all, and one of them is on the write path:
+//
+//   * `block_index_written_key` through `serialize_block_index`, reached as
+//     `BlockIndexAt<'a>(&'a BucketNode)` inside a DERIVED `Serialize for CoreIndex`. Serde hands a
+//     `Serialize` impl no context, so neither the shard nor the model maps can reach that scope.
+//     Structural, not a cost.
+//   * `refresh_one_bucket_runtime_flags`, which holds only a `&mut BucketNode` and contains FIVE
+//     of the character-wanting sites -- four dirty probes and the TTL minimum. It is reached per
+//     write through `refresh_pending_bucket_runtime_flags` from `engine.rs:1062` and
+//     `stream_batch_methods.rs:567`, and that function exists precisely to refresh only the
+//     touched buckets instead of sweeping. A whole-shard model walk per bucket per write is the
+//     quadratic outcome, so this is not servable this way AT ALL rather than servable expensively.
+// =================================================================================================
+
+/// CLAIM 7, AS A TYPE. `ModelKey` IS `Arc<str>` -- a SHARED HANDLE to the characters, not an
+/// owned copy per map.
+///
+/// THIS PIN FIRED, AND IT WAS RIGHT TO. It previously read `Box<str>` and said "the characters,
+/// owned, one per object", precisely so that a `ModelKey` which stopped being an owned copy would
+/// fail here rather than leave the claim standing in prose. It did fail, on the change that made
+/// the model map share the page index's allocation instead of keeping its own -- which is the
+/// duplication the paragraph above describes as "stored twice today".
+///
+/// So the claim is restated rather than the pin relaxed: a `ModelKey` is still exactly the
+/// characters and still one per object, but the allocation is now shared rather than owned. A
+/// width pin alone would not express either version, since several unrelated things measure
+/// sixteen -- and `Box<str>` and `Arc<str>` both do.
+const _: fn(crate::engine::state::ModelKey) -> std::sync::Arc<str> = |key| key;
+
+/// CLAIM 7, AS A TYPE. A model-map-sourced identity collector exists and takes NOTHING but a shard.
+///
+/// This is what says the identity can be read from existing structure rather than new structure.
+/// If it ever needs the bucket index to answer, this line fails and claim 7 is reopened.
+const _: fn(&crate::engine::state::ShardState) -> Vec<crate::engine::storage_bucket_internals::LiveBlockEntry> =
+    crate::engine::storage_bucket_internals::collect_model_live_block_entries;
+
+/// CLAIM 7, AS ARITHMETIC -- AND IT HAS LANDED, SO IT IS WIDTHS NOW AND NOT A DIFFERENCE.
+///
+/// It read `size_of::<(u64, BlockIndex)>() - size_of::<(u64, TheEntryWithNoIdentityTerm)>() == 16`:
+/// the per-page saving from reading the identity out of existing structure instead of holding it
+/// on the entry. That is what this change did. Both sides are now the same type, so the difference
+/// is ZERO and an assertion of sixteen over it is false -- while an assertion of zero would be a
+/// comparison of a value with itself wearing the name of a saving.
+///
+/// SO THE CLAIM IS STATED AS THE TWO WIDTHS IT IS ABOUT. The element was 48 and is 32; the sixteen
+/// is the shared pointer that left, which is pinned as a term rather than as a subtraction. A
+/// reader who wants the saving reads it off the pair.
+const _: () = assert!(size_of::<(u64, BlockIndex)>() == 32);
+const _: () = assert!(size_of::<Arc<str>>() == 16);
+
+// =================================================================================================
+// CLAIM 8 -- THE BUCKET TTL GATES NOTHING OPERATIONAL, SO THE TTL HALF OF THE PER-WRITE REFRESH IS
+// NOT ON THE CORRECTNESS PATH.
+//
+// WHAT IS PINNED AND WHAT IS CITED, said first so neither is mistaken for the other. The accessor
+// signature and the width below are PINNED and fail if they move. Everything else in this claim is
+// CITED: the consumer list and the expiry path are reachable only through module-private items and
+// public report structs, so a test cannot assert membership of either. A citation is not a proof
+// and is recorded as a citation.
+//
+// THE QUESTION THIS ANSWERS. `refresh_one_bucket_runtime_flags` holds only a `&mut BucketNode` and
+// contains five of the character-wanting sites -- four dirty probes and one TTL minimum -- on the
+// per-write path. For the TTL minimum the first question is not "where does the input come from"
+// but WHAT TOLERANCE THE CONSUMER HAS, because an exact minimum needs an ordered structure per
+// object while a conservative one needs almost nothing.
+//
+// THE ANSWER IS NEITHER: IT IS A REPORTED STATISTIC. Every reader of `BucketNode::ttl_ms` is a
+// report or the serializer, CITED:
+//
+//   * `object_manager.rs:83` sets a report field; `:89` and `:154` fold it into one.
+//   * `storage_reporting.rs:347` sets a report flag bit; `:368` packs it into a report blob;
+//     `:473` copies it into a report struct.
+//   * `bucket_store.rs:101` counts it into `ttl_bucket_count`; `:134` sets a report field.
+//   * `engine_storage_state.rs:3951` serializes it, and `ttl_ms` is in `BUCKET_NODE_FIELDS` at `engine_storage_state.rs:4008`.
+//   * It is CONSTRUCTED in only one place: `storage_bucket_internals.rs:5375` and `:5378`, which
+//     is the function above.
+//
+// AND REAL EXPIRY DOES NOT READ IT. Expiry runs off `expires_at_ms` and its deadline-ordered
+// mirror `expiry_by_deadline` -- `engine.rs:4831` to `:4851` for the mutators, and
+// `recovery_sweep_compact.rs:996` for the due-key prefix scan. No expiry, eviction or serving
+// decision consults a bucket's TTL. CITED.
+//
+// NO CONSUMER DOCUMENTS IT AS LIVE. `bucket_store.rs:38` declares `pub ttl_ms: Option<u64>` on the
+// public report with no claim about freshness, and the object report's field at
+// `object_manager.rs:24` likewise. So there is no doc to correct and no promise to honour. CITED.
+//
+// WHAT THAT BUYS, AND IT IS THE CHEAPEST OF THREE. The per-write refresh can simply DROP the TTL
+// term and leave it to the full sweep, which already runs on load at `persistence.rs:375` and
+// `:536`. That REMOVES a per-write loop over a bucket's pages rather than re-sourcing it: no new
+// structure, no bytes, and no stamp. The value then goes stale between full sweeps, which is a
+// reporting-accuracy decision rather than a correctness one -- and whoever implements it owes the
+// code a statement of HOW STALE it can get and WHAT refreshes it, because that is the claim a
+// later reader will need and will not otherwise find.
+//
+// THE TWO ALTERNATIVES, PRICED SO THE CHOICE IS NOT REOPENED BLIND. Making it derived-on-read
+// would take it off the wire and buy a format stamp for a statistic. A third bucket-keyed expiry
+// mirror, maintained at the `set_expiry` chokepoint -- which has the whole shard in scope at
+// `engine.rs:4846`, so it can commit to `block_routing_bucket(key, start, end)`, the same number
+// that decides where a page lives -- is sound with a CONSERVATIVE minimum precisely because the
+// consumer is a report, so it never has to search for the next minimum on a removal. It would cost
+// about twelve bytes a bucket against a removal saving sixteen bytes a page at the in-tree p50 of
+// thirty-nine pages a bucket (`engine_storage_state.rs:1414`), so roughly two per cent of the saving. Cheap, and
+// unnecessary if the term is simply dropped.
+// =================================================================================================
+
+/// CLAIM 8, PINNED. The accessor every report consumer reads the bucket TTL through.
+///
+/// A signature pin on `ms`, which is what makes the claim "every consumer takes an `Option<u64>`
+/// out of this and nothing more" checkable at the one place they all pass through. If the accessor
+/// ever starts handing back something a consumer could act on differently, this line fails.
+const _: fn(crate::engine::state::BucketTtl) -> Option<u64> = crate::engine::state::BucketTtl::ms;
+
+/// CLAIM 8, PINNED. The width, because the cheapest option turns on costing nothing.
+///
+/// `Option<NonZeroU64>` rides the niche, so the term is one word and dropping its per-write
+/// maintenance moves no bytes at all -- which is the half of the argument that a reader would
+/// otherwise have to take on trust.
+const _: () = assert!(size_of::<crate::engine::state::BucketTtl>() == 8);

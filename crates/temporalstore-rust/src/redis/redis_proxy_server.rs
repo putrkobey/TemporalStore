@@ -25,3 +25,31 @@ pub fn serve_redis_proxy(addr: &str, proxy_addr: String, shard_id: ShardId) -> i
 }
 
 fn handle_stream(
+    mut stream: TcpStream,
+    client: &TemporalStoreClient,
+    shard_id: ShardId,
+) -> io::Result<()> {
+    let reader_stream = stream.try_clone()?;
+    let mut reader = BufReader::new(reader_stream);
+    let mut state = RedisCommandState::default();
+    while let Some(args) = read_command(&mut reader)? {
+        let response = execute_redis_command_with_state(args, shard_id, &mut state, |command| {
+            client
+                .execute(ExecuteRequest { shard_id, command })
+                .map_err(|err| err.to_string())
+                .and_then(|response| {
+                    if response.status.ok {
+                        Ok(response.response)
+                    } else {
+                        Err(format!(
+                            "{} {}",
+                            response.status.code, response.status.message
+                        ))
+                    }
+                })
+        });
+        stream.write_all(&response.encode())?;
+        stream.flush()?;
+    }
+    Ok(())
+}
