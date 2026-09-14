@@ -72,3 +72,151 @@ const OPERATOR_END: u32 = crate::DEFAULT_END_ROUTING_BUCKET;
 /// one proves it is UNREACHABLE, which is worth more: a test that shows a defect cannot be
 /// represented outlives every fixture that shows one is currently absent.
 ///
+/// rust-internal: constructs one entry, no product behaviour
+#[test]
+fn the_log_resident_fact_is_derived_from_the_address_alone() {
+    use crate::block_store::ElementEntry;
+
+    // A log-resident address: no block id. This is the shape a staged page has before a dump.
+    let in_log = ElementEntry::from_parts(42, 1_048_576, 4096, None, None);
+    assert!(
+        in_log.block_id().is_none(),
+        "VACUITY: this fixture's address must be log-resident or neither assertion says anything",
+    );
+    // And a slab-backed control, so a fixture that made every address log-resident cannot pass.
+    let in_slab = ElementEntry::from_parts(42, 1_048_576, 4096, Some(7), None);
+    assert!(in_slab.block_id().is_some(), "the control address must be slab-backed");
+
+    // The entry the tombstone path builds. It no longer carries a log-resident flag to get wrong.
+    let tombstone = BlockIndex {
+        model_id: crate::engine::storage_bucket_internals::StoredModelKind::Hash,
+        address: in_log.clone(),
+        dirty: true,
+        deleted: true,
+    };
+
+    println!(
+        "[log-resident] accessor {} on a log-resident tombstone, with no stored flag beside it",
+        tombstone.log_backed()
+    );
+
+    // THE SUBJECT: the accessor reads the address. This is the arm the old test's disagreement
+    // assertion stood on, and it is unchanged.
+    assert!(
+        tombstone.log_backed(),
+        "the accessor must read the address, which says this block is log-resident",
+    );
+
+    // THE CONTROL, and it is a REAL control now rather than a tautology. Comparing the accessor
+    // against itself would assert nothing, so the control is that the accessor DISTINGUISHES the
+    // two addresses -- a stuck `true` fails here.
+    let slab_block = BlockIndex { address: in_slab, ..tombstone.clone() };
+    assert!(
+        !slab_block.log_backed(),
+        "a slab-backed block is not log-resident, so the accessor must say so -- and an accessor \
+         that returned a constant would have passed the assertion above and fails here",
+    );
+    assert_ne!(
+        tombstone.log_backed(),
+        slab_block.log_backed(),
+        "the accessor must answer differently for the two addresses, which is what makes the arm \
+         above a measurement of the address rather than of a constant",
+    );
+}
+
+/// THE STORED SHAPE MOVES BY EXACTLY ONE KEY, AND THAT IS WHAT THE STAMP IS SPENT ON.
+///
+/// THE SUBJECT OF THIS TEST INVERTED. It asserted the key was still written, so that no stamp was
+/// needed; the key is gone now and a stamp is spent. The restatement is deliberate and is the
+/// point: a reader comparing revisions should see the claim change rather than find a passing test
+/// that quietly means something else.
+///
+/// ONE KEY REMOVED, NOTHING ADDED. The two fields this type gained are `skip`ped on the named side
+/// -- a resident entry is always a page, and the bucket already names itself -- so the stored form
+/// shrinks by one key and grows by none. That is asserted below rather than described, because the
+/// obvious fear about merging two types is that the stored form grows.
+///
+/// Asserted on the BYTES rather than on the declaration, with a planted difference, because "the
+/// key is gone" and "my comparison cannot see the key" are indistinguishable otherwise. The plant
+/// had to MOVE: it used to flip the very field being removed, so it now flips `deleted`, which
+/// survives. A plant on a field that no longer exists is not a weaker control, it is none.
+///
+/// rust-internal: serializes one entry, no product behaviour
+#[test]
+fn the_stored_entry_has_dropped_the_flag_and_gained_no_key() {
+
+    let block = BlockIndex {
+        model_id: crate::engine::storage_bucket_internals::StoredModelKind::Hash,
+        address: ElementEntry::from_parts(42, 1_048_576, 4096, Some(7), None),
+        dirty: false,
+        deleted: false,
+    };
+
+    // THROUGH THE WRAPPER, BECAUSE THE ENTRY HAS NO ENCODER OF ITS OWN. The identity used to be
+    // INJECTED here, by this fixture, because `object_key` was a serialized member a derive could
+    // only read off the entry. It is not a serialized member any more: the entry is filed under a
+    // key that spells it and the decoder reads it back out of that key. So the wrapper takes the
+    // page alone, and the two names this fixture used to hand it are asserted ABSENT below.
+    let named = crate::engine::state::BlockEntryAt { block: &block };
+    let encoded = serde_json::to_string(&named).expect("a page entry serializes");
+    println!("[log-resident] stored entry: {encoded}");
+
+    assert!(
+        !encoded.contains("\"log_backed\""),
+        "the stored key is still written, so this change did not move the shape it claims to: \
+         {encoded}",
+    );
+    // AND NOTHING ARRIVED IN ITS PLACE, AND THE TWO THE KEY RESTATED HAVE LEFT. `kind` and
+    // `routing_bucket` are `skip`ped; `object_key` and `model_id` are the key's own second and
+    // first slots and the entry stopped writing them, which is what the stamp step at 27 pays for.
+    for gained in [
+        "\"kind\"",
+        "\"routing_bucket\"",
+        "\"object_key\"",
+        "\"model_id\"",
+    ] {
+        assert!(
+            !encoded.contains(gained),
+            "{gained} reached the stored form; the named side is supposed to skip it, and every \
+             entry in every index would carry it: {encoded}",
+        );
+    }
+
+    // THE PLANTED DIFFERENCE, RE-SITED. It used to flip `log_backed` -- the field this change
+    // removes -- so it had to move onto a field that survives. If this comparison cannot see
+    // `deleted` change it cannot see a key leave either, and the assertions above would pass over
+    // anything.
+    let flipped = BlockIndex { deleted: true, ..block.clone() };
+    let flipped_encoded =
+        serde_json::to_string(&crate::engine::state::BlockEntryAt { block: &flipped })
+            .expect("serializes");
+    assert_ne!(
+        encoded, flipped_encoded,
+        "CONTROL: flipping a surviving stored field must change the bytes, or this test cannot \
+         detect a field leaving at all",
+    );
+
+    // AND THE WIDTH IS 24, WHICH IS NOT THIS MODULE'S CHANGE AND IS PINNED HERE ANYWAY.
+    //
+    // This read 56 under "the width is unchanged, so nobody reads this as a footprint change" --
+    // a pin on the width THIS module's change did not move, so that a reader could not mistake a
+    // stored-format change for a footprint one. It then read 40, because the entry stopped naming
+    // its element; it reads 24 now, because the entry stopped carrying its object identity as well.
+    // Both are different changes from this module's, the claim the pin exists to make is unaffected
+    // by either, and the number it names is not.
+    //
+    // PINNED, AND NOT BRACKETED -- which is a change from what stood here. The note read
+    // "BRACKETED, so it reads as a measurement rather than a literal adjusted until it
+    // passed", and the `!= 39` / `!= 41` partners below it did no such thing: the `assert_eq!`
+    // panics first, so they were unreachable on every change that could have fired them. What
+    // the note had RIGHT is kept, because it is why this pin is worth having at all: `cargo
+    // check` cannot see an `assert_eq!` in a test body, so this compiled clean through the
+    // whole width step and only running it said so.
+    assert_eq!(
+        24,
+        std::mem::size_of::<BlockIndex>(),
+        "the entry is {} bytes; this module's change was never a footprint change and the body \
+         says so",
+        std::mem::size_of::<BlockIndex>(),
+    );
+}
