@@ -39,3 +39,170 @@
 //! and is the key of the persistent block cache, while the response copy was memory-only with a
 //! single reader — so the response copy was the one to drop, and it was the larger of the two by the
 //! msgpack envelope. `what_the_frame_layer_saves_under_eviction` holds the before-and-after.
+//!
+//! rust-internal: measures this crate's own counters, no product behaviour
+//!
+//!   cargo test -p temporalstore-rust --lib the_payload_on_all_three_media -- --ignored --nocapture
+
+use crate::types::{Command, ExecuteRequest};
+
+const KEYS: usize = 2_000;
+const VALUE: usize = 256;
+
+fn noisy_value(index: usize, len: usize) -> Vec<u8> {
+    let mut state = (index as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(0x1234_5678_9ABC_DEF0)
+        | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state & 0xFF) as u8
+        })
+        .collect()
+}
+
+/// (label, logical, on disk, in memory)
+fn weigh(compressible: bool) -> (&'static str, u64, u64, u64) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("media-{index:06}"),
+                value: if compressible {
+                    vec![b'v'; VALUE]
+                } else {
+                    noisy_value(index, VALUE)
+                },
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    // THE CACHE FILLS ON READS. A write-only probe reports an empty cache and a vacuous memory
+    // figure, which is how the memory quadrant of the published set first came out at 0 ppm.
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet { key: format!("media-{index:06}") },
+        });
+        assert!(response.status.ok, "read {index}: {:?}", response.status);
+    }
+    let reported = engine.shard_stats(1).expect("a loaded shard reports stats");
+    let store = engine.block_store.stats();
+    let slabs = engine.block_store.slab_summary();
+    (
+        if compressible { "a run of 'v'" } else { "incompressible" },
+        store.logical_bytes_written,
+        slabs.total_known_physical_bytes,
+        reported.cache.memory_bytes,
+    )
+}
+
+fn as_x(numerator: u64, denominator: u64) -> f64 {
+    if denominator == 0 { 0.0 } else { numerator as f64 / denominator as f64 }
+}
+
+#[test]
+#[ignore = "seeds two stores and reads every key back; run by name"]
+fn the_payload_on_all_three_media() {
+    let rows = [weigh(false), weigh(true)];
+
+    println!();
+    println!("  THE PAYLOAD ON THREE MEDIA -- {KEYS} keys x {VALUE} B, one denominator");
+    println!();
+    println!(
+        "    {:<16} {:>12} {:>12} {:>8} {:>12} {:>8}",
+        "values", "logical", "on disk", "x", "in memory", "x"
+    );
+    for (label, logical, disk, memory) in &rows {
+        println!(
+            "    {:<16} {:>12} {:>12} {:>7.3}x {:>12} {:>7.3}x",
+            label,
+            logical,
+            disk,
+            as_x(*disk, *logical),
+            memory,
+            as_x(*memory, *logical),
+        );
+    }
+    println!();
+    println!("    the denominator is the SAME for every ratio: user bytes offered to the store.");
+    println!(
+        "    memory is now EXACTLY logical: one copy of the payload, charged by length. It was"
+    );
+    println!(
+        "    2.082x while the command response under the logical key held it as well as the block"
+    );
+    println!(
+        "    frame under the physical one. The response copy was memory-only, had one reader"
+    );
+    println!(
+        "    against the frame key's 25 call paths, and was the larger by the msgpack envelope."
+    );
+    println!();
+
+    // ---- NON-VACUITY. Each medium can report zero for a different reason.
+    for (label, logical, disk, memory) in &rows {
+        assert!(*logical > 0, "{label}: nothing logical was written, so every ratio is vacuous");
+        assert!(*disk > 0, "{label}: nothing reached disk");
+        assert!(
+            *memory > 0,
+            "{label}: the cache is empty, so the memory figure is vacuous -- the read-back loop is \
+             not filling it"
+        );
+    }
+
+    let (_, noise_logical, noise_disk, noise_memory) = rows[0];
+    let (_, run_logical, run_disk, run_memory) = rows[1];
+
+    // ---- THE DISK FIGURE DEPENDS ON THE DATA, which is why both fixtures run. If these ever
+    // ---- agree, one of the fixtures has stopped being what it claims and the disk column is no
+    // ---- longer a statement about compression.
+    assert!(
+        noise_disk > run_disk,
+        "incompressible values occupy {noise_disk} B on disk and a run of one byte {run_disk} B. \
+         The run must compress further, or the fixtures are not distinguishable and the disk \
+         column says nothing about compression"
+    );
+
+    // ---- THE MEMORY FIGURE DOES NOT, since #2279 made the cached payload a byte string charging
+    // ---- by length alone. Before that it differed by half the value size between these two
+    // ---- fixtures, so this equality is a property that change bought and is worth pinning.
+    assert_eq!(
+        noise_memory, run_memory,
+        "the cache holds {noise_memory} B for incompressible values and {run_memory} B for a run. \
+         Since #2279 the payload is a msgpack byte string charging by length alone, so the byte \
+         distribution must not matter -- if these differ, an element-wise encoding is back"
+    );
+
+    // ---- MEMORY NOW EQUALS LOGICAL EXACTLY, which is the headline and it moved. This asserted
+    // ---- that memory must EXCEED logical, because two cache layers held the payload: the command
+    // ---- response under the logical key and the block frame under the physical address. The
+    // ---- logical copy is gone -- it was memory-only, single-reader, and larger by the response
+    // ---- envelope -- so the cache now holds exactly one copy charged by length, and the figure
+    // ---- is 1.000x rather than 2.082x.
+    assert_eq!(
+        noise_memory, noise_logical,
+        "the cache holds {noise_memory} B for {noise_logical} B of payload, not exactly one copy. \
+         Above means a second copy or an envelope is back; below means entries are missing"
+    );
+
+    // ---- THE TWO FIXTURES OFFERED THE SAME LOGICAL BYTES, or the ratios are over different
+    // ---- populations and the table cannot be read across rows.
+    assert_eq!(
+        noise_logical, run_logical,
+        "the fixtures offered {noise_logical} B and {run_logical} B of payload. They must offer the \
+         same, or the columns are ratios over different denominators and comparing the rows is \
+         comparing two corpora"
+    );
+}
