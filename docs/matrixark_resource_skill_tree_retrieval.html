@@ -76,3 +76,82 @@ flowchart TD
   E --&gt; F[&quot;apply secondary-index filters when available&quot;]
   F --&gt; G[&quot;score child L0/L1 summary embeddings&quot;]
   G --&gt; H[&quot;keep top children for this layer&quot;]
+  H --&gt; I{&quot;leaf or enough candidates?&quot;}
+  I -- &quot;no&quot; --&gt; E
+  I -- &quot;yes&quot; --&gt; J[&quot;fetch events / entities / segments&quot;]
+  J --&gt; K[&quot;fetch resource chunks and resource facts&quot;]
+  K --&gt; L[&quot;fetch skill sections&quot;]
+  L --&gt; M[&quot;rank by semantic score + sparse score + time decay + business score&quot;]
+  M --&gt; N[&quot;question-type-aware ContextPack&quot;]
+  N --&gt; O[&quot;ContextPackAudit / replay&quot;]
+```
+
+The current Python MCP runtime reports this in every retrieve response:
+
+```json
+{
+  &quot;recall_policy&quot;: {
+    &quot;tree_traversal&quot;: {
+      &quot;enabled&quot;: true,
+      &quot;summary_embeddings&quot;: [&quot;node_l0&quot;, &quot;node_l1&quot;],
+      &quot;selected_node_count&quot;: 4,
+      &quot;selected_path_count&quot;: 4,
+      &quot;selected_leaf_count&quot;: 2,
+      &quot;fallback_to_flat&quot;: false
+    },
+    &quot;secondary_index_filter&quot;: {
+      &quot;enabled&quot;: true,
+      &quot;applied_before_embedding_scoring&quot;: true
+    }
+  }
+}
+```
+
+If a node summary embedding is missing or stale, retrieval may fall back to flat candidate scoring for correctness. That fallback must be visible as `fallback_to_flat=true`; it is not the desired steady state for production resource/skill retrieval.
+
+## How Secondary Indexes Help
+
+The query parser extracts general filters before vector scoring, for example:
+
+- `source_type:resource`
+- `source_type:skill`
+- `resource_type:pdf`
+- `resource_type:skill`
+- `unit_kind:table_rows`
+- `keyword:approval`
+- `skill_trigger:replay_evidence`
+- `skill_tool:matrixark_replay`
+- `entity_type:policy`
+- `event_type:resource_fact`
+
+These filters prune candidates before embedding similarity. The layer scan then scores fewer child folders and fewer leaf records.
+
+## And Rust Conformance Gate
+
+The shared parity runner validates both backends from ingestion through retrieval:
+
+```bash
+cd <TemporalStoreTestCorpus>
+TEMPORALSTORE_CONSUMER_REPO=/tmp/temporalstore-mcp-scale-failover \
+  python3 tools/run_matrixark_resource_skill_backend_parity.py --backends native rust
+```
+
+It verifies:
+
+- resource and skill import records
+- chunks, manifests, registries, summaries, embeddings, and secondary indexes
+- resource facts as `context_event` and `context_entity`
+- resource retrieval and skill-section retrieval
+- disabled-skill exclusion
+- cross-user isolation
+- replayable `context_pack_audit`
+- tree traversal metadata for resource and skill queries
+
+For quick local debugging:
+
+```bash
+TEMPORALSTORE_CONSUMER_REPO=/tmp/temporalstore-mcp-scale-failover \
+  python3 tools/run_matrixark_resource_skill_backend_parity.py --backends local
+```
+
+</pre></body></html>
