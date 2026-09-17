@@ -561,3 +561,566 @@ impl ProxyService {
         }
         if entries.is_empty() {
             // Nothing to buffer (e.g. pre-shaped records only) -- still a fast ack.
+            return crate::http::json_response(200, &Status::ok());
+        }
+        let server_addr = match self.context_shard_addr(shard_id) {
+            Ok(addr) => addr,
+            Err(resp) => return resp,
+        };
+        // Forward the raw store straight to the owning datanode's /execute
+        // (bypassing the proxy's command admission policy, exactly as the
+        // extract/retrieve context routes forward) so a single HashMultiSet
+        // write is the whole cost of a fast-ack ingest.
+        let request = ExecuteRequest {
+            shard_id,
+            command: Command::HashMultiSet { key, entries },
+        };
+        let body = serde_json::to_vec(&request).unwrap_or_default();
+        self.context_forward_to(&server_addr, "/execute", &body)
+    }
+
+    /// BATCHED path: build a `ContextIngestExtractRequest` and forward to the
+    /// datanode's `/context/ingest_extract` (full extraction). Used on commit /
+    /// finalize. When no messages/sources are supplied, replay the buffered
+    /// `raw_event` records for the scope and extract those.
+    pub(super) fn context_extract(&self, request: ProxyContextIngestRequest<'_>) -> (u16, Vec<u8>) {
+        self.inner
+            .context_extract_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _admitted = match self.admit_context(&request.scope, true) {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
+        let tenant_hash = context_tenant_hash(&request.scope);
+        let shard_id = self.context_shard_id(tenant_hash);
+        let session = scope_session(&request.scope);
+        let now = now_ms();
+        let server_addr = match self.context_shard_addr(shard_id) {
+            Ok(addr) => addr,
+            Err(resp) => return resp,
+        };
+
+        // Borrowed end to end: the request owns every string, so the only allocations left per
+        // message are the source id and the source slot itself.
+        let prefix = chat_id_prefix(tenant_hash, session);
+        let ids: Vec<String> = (0..request.messages.len())
+            .map(|idx| chat_id_at(&prefix, idx))
+            .collect();
+        let titles: Vec<&str> = request
+            .messages
+            .iter()
+            .map(|message| {
+                match message.title.as_deref().filter(|value| !value.is_empty()) {
+                    Some(title) => title,
+                    None if message.role.is_empty() => "message",
+                    None => message.role.as_ref(),
+                }
+            })
+            .collect();
+
+        // Declared before `sources` so a replayed buffer outlives the slice that borrows it.
+        let replayed: Vec<Value>;
+        let mut sources: Vec<SourceItem<'_>> =
+            Vec::with_capacity(request.messages.len() + request.sources.len() + request.records.len());
+        for (idx, message) in request.messages.iter().enumerate() {
+            sources.push(SourceItem::Chat(chat_source(
+                shard_id,
+                tenant_hash,
+                &ids[idx],
+                titles[idx],
+                message.content.as_ref(),
+                message.timestamp_ms.unwrap_or(now + idx as u64),
+            )));
+        }
+        for extra in request.sources.iter().chain(request.records.iter()) {
+            sources.push(SourceItem::Raw(extra));
+        }
+
+        // Commit with no inline messages: replay the buffered raw events.
+        let mut replayed_buffer = false;
+        if sources.is_empty() {
+            replayed = self.context_replay_rawlog(&server_addr, shard_id, tenant_hash, session);
+            replayed_buffer = !replayed.is_empty();
+            sources = replayed.iter().map(SourceItem::Raw).collect();
+        }
+
+        let end_time_ms = if request.end_time_ms == 0 {
+            wide_window_end(now)
+        } else {
+            request.end_time_ms
+        };
+        let payload = ExtractPayload {
+            end_time_ms,
+            max_events: request.max_events,
+            provider: request.provider.as_ref(),
+            query: &request.query,
+            shard_id,
+            sources: &sources,
+            start_time_ms: request.start_time_ms,
+            tenant_hash,
+        };
+        let body = serde_json::to_vec(&payload).unwrap_or_default();
+        let response = self.context_forward_to(&server_addr, "/context/ingest_extract", &body);
+        // Clear the buffer only after a successful replay-driven extraction.
+        if replayed_buffer && response.0 == 200 {
+            self.context_clear_rawlog(&server_addr, shard_id, tenant_hash, session);
+        }
+        response
+    }
+
+    /// Forward a `ContextRetrieveRequest` to the owning datanode.
+    pub(super) fn context_retrieve(&self, request: ProxyContextRetrieveRequest) -> (u16, Vec<u8>) {
+        self.inner
+            .context_retrieve_requests
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let _admitted = match self.admit_context(&request.scope, false) {
+            Ok(guard) => guard,
+            Err(response) => return response,
+        };
+        let tenant_hash = context_tenant_hash(&request.scope);
+        let shard_id = self.context_shard_id(tenant_hash);
+        let now = now_ms();
+        let end_time_ms = if request.end_time_ms == 0 {
+            wide_window_end(now)
+        } else {
+            request.end_time_ms
+        };
+        // Serialised from a borrowed view rather than through `json!`, which builds a whole
+        // `Value` first -- a map, a `String` for every key, a `Value::String` copy of the query and
+        // a `Value::Array` of the node hashes -- only to render it and drop it. This is the path
+        // the live hook calls on every retrieve.
+        let payload = RetrievePayload {
+            end_time_ms,
+            max_events: request.max_events,
+            node_hashes: &request.node_hashes,
+            provider: request.provider.as_ref(),
+            query: &request.query,
+            shard_id,
+            start_time_ms: request.start_time_ms,
+            tenant_hash,
+        };
+        let body = serde_json::to_vec(&payload).unwrap_or_default();
+        let server_addr = match self.context_shard_addr(shard_id) {
+            Ok(addr) => addr,
+            Err(resp) => return resp,
+        };
+        self.context_forward_to(&server_addr, "/context/retrieve", &body)
+    }
+
+    /// Read the buffered `raw_event` records (HGETALL) back into extract sources.
+    /// Forwards straight to the owning datanode (bypassing admission policy).
+    fn context_replay_rawlog(
+        &self,
+        server_addr: &str,
+        shard_id: ShardId,
+        tenant_hash: u64,
+        session: &str,
+    ) -> Vec<Value> {
+        let request = ExecuteRequest {
+            shard_id,
+            command: Command::HashGetAll {
+                key: rawlog_key(tenant_hash, session),
+            },
+        };
+        let response: ExecuteResponse = match post_json_with_options(
+            server_addr,
+            "/execute",
+            &request,
+            self.context_http_options(),
+        ) {
+            Ok(response) => response,
+            Err(_) => return Vec::new(),
+        };
+        let CommandResponse::HashEntries { mut entries } = response.response else {
+            return Vec::new();
+        };
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut sources = Vec::new();
+        for (field, value) in entries {
+            let parsed: Value = match serde_json::from_slice(&value) {
+                Ok(parsed) => parsed,
+                Err(_) => continue,
+            };
+            let body = parsed
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if body.is_empty() {
+                continue;
+            }
+            let title = parsed
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("message")
+                .to_string();
+            let timestamp_ms = parsed
+                .get("timestamp_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or_else(now_ms);
+            sources.push(source_from_fields(
+                shard_id,
+                tenant_hash,
+                format!("chat:{tenant_hash}:{session}:{field}"),
+                title,
+                body,
+                timestamp_ms,
+            ));
+        }
+        sources
+    }
+
+    /// Best-effort clear of the per-scope raw-event buffer after extraction.
+    fn context_clear_rawlog(
+        &self,
+        server_addr: &str,
+        shard_id: ShardId,
+        tenant_hash: u64,
+        session: &str,
+    ) {
+        let request = ExecuteRequest {
+            shard_id,
+            command: Command::CommonDelete {
+                key: rawlog_key(tenant_hash, session),
+            },
+        };
+        let _ = post_json_with_options::<ExecuteRequest, ExecuteResponse>(
+            server_addr,
+            "/execute",
+            &request,
+            self.context_http_options(),
+        );
+    }
+}
+
+#[cfg(test)]
+mod raw_event_record_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// The borrowed form serialises byte-for-byte what `json!` did.
+    ///
+    /// These records are stored and read back by everything downstream, so the shape is a
+    /// contract, not an implementation detail. `json!` built a whole `Value` to render it;
+    /// this asserts the cheaper path produces the identical string, including field ORDER,
+    /// which serde takes from declaration order and a `json!` object takes from its literal.
+    #[test]
+    fn a_raw_event_serialises_exactly_as_it_did_when_it_went_through_a_value() {
+        let cases: [(&str, &str, &str, u64); 4] = [
+            ("user", "message", "hello", 1_700_000_000_000),
+            ("", "", "", 0),
+            // Characters that force escaping, so this covers the encoder and not just ASCII.
+            ("assistant", "a \"quoted\" title", "line\nbreak \\ backslash", 42),
+            ("tool", "check \u{2713} and \u{1F600}", "tab\there", u64::MAX),
+        ];
+        for (role, title, body, ts) in cases {
+            let borrowed = serde_json::to_string(&RawEventRecord {
+                record_type: "raw_event",
+                role,
+                title,
+                body,
+                timestamp_ms: ts,
+            })
+            .expect("borrowed form serialises");
+
+            let through_value = json!({
+                "record_type": "raw_event",
+                "role": role,
+                "title": title,
+                "body": body,
+                "timestamp_ms": ts,
+            })
+            .to_string();
+
+            assert_eq!(
+                borrowed, through_value,
+                "the stored shape changed for role={role:?} title={title:?}
+  borrowed: {borrowed}
+  value:    {through_value}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod ingest_key_tests {
+    use super::*;
+
+    /// The hand-built keys are byte-identical to the `format!` they replaced.
+    ///
+    /// Both are ordering contracts, not cosmetics: raw events are read back in lexicographic
+    /// order and that is only arrival order while every component stays fixed width. A key that
+    /// merely looks right would reorder history.
+    /// An absent session reads as "default", and a present one is used as given.
+    ///
+    /// `scope_session` borrows now instead of returning an owned `String` -- every caller wanted a
+    /// `&str`, so the allocation existed only to be pointed at. The fallback is the part a change
+    /// like that can quietly invert, and the session lands in the buffer KEY: getting it wrong
+    /// files a scope's records under someone else's key.
+    /// The retrieve body is byte-identical to the `json!` it replaced.
+    ///
+    /// `json!` renders through a `serde_json::Map`, which is a `BTreeMap`, so its output is
+    /// key-sorted; a serde struct renders in DECLARATION order. That is why `RetrievePayload` is
+    /// declared alphabetically, and why this compares BYTES rather than parsed values: a body that
+    /// differs only in field order still parses, so a value comparison would pass while the wire
+    /// changed underneath.
+    ///
+    /// Covers both optional fields present and absent, because `skip_serializing_if` has to match
+    /// `json!` only inserting them when they were there.
+    #[test]
+    fn the_retrieve_body_is_what_json_produced() {
+        let provider = serde_json::json!({"name": "openai", "model": "x"});
+        let cases: [(Option<usize>, Option<&Value>, &[u64], &str); 4] = [
+            (None, None, &[], ""),
+            (Some(32), None, &[7, 9], "what did we decide"),
+            (None, Some(&provider), &[], "a query"),
+            (Some(1), Some(&provider), &[1, 2, 3], r#"quotes " and \ backslash"#),
+        ];
+
+        for (max_events, prov, node_hashes, query) in cases {
+            let shard_id: ShardId = 3;
+            let tenant_hash: u64 = 12_345;
+            let start_time_ms: u64 = 111;
+            let end_time_ms: u64 = 222;
+
+            let mut expected = serde_json::json!({
+                "shard_id": shard_id,
+                "tenant_hash": tenant_hash,
+                "query": query,
+                "node_hashes": node_hashes,
+                "start_time_ms": start_time_ms,
+                "end_time_ms": end_time_ms,
+            });
+            if let Some(max_events) = max_events {
+                expected["max_events"] = serde_json::json!(max_events);
+            }
+            if let Some(prov) = prov {
+                expected["provider"] = prov.clone();
+            }
+            let through_value = serde_json::to_vec(&expected).expect("the json! form serialises");
+
+            let borrowed = serde_json::to_vec(&RetrievePayload {
+                end_time_ms,
+                max_events,
+                node_hashes,
+                provider: prov,
+                query,
+                shard_id,
+                start_time_ms,
+                tenant_hash,
+            })
+            .expect("the borrowed form serialises");
+
+            assert_eq!(
+                String::from_utf8_lossy(&borrowed),
+                String::from_utf8_lossy(&through_value),
+                "the retrieve body moved for max_events={max_events:?} provider={} query={query:?}",
+                prov.is_some()
+            );
+        }
+    }
+
+    /// A message points at the body when it can, and copies only when it must.
+    ///
+    /// This is the whole point of the `Cow`: serde hands back a borrow of the request body
+    /// whenever the JSON string needs no unescaping, and an owned copy when it does. Both arms
+    /// are asserted, because a change that quietly stopped borrowing would still be CORRECT and
+    /// would give back every allocation this saved without failing anything else.
+    #[test]
+    fn a_message_borrows_the_body_unless_it_needs_unescaping() {
+        let plain = br#"{"messages":[{"role":"user","content":"plain text"}]}"#;
+        let parsed: ProxyContextIngestRequest =
+            serde_json::from_slice(plain).expect("the plain body parses");
+        assert_eq!(parsed.messages[0].content, "plain text");
+        assert!(
+            matches!(parsed.messages[0].content, Cow::Borrowed(_)),
+            "a message needing no unescaping was still copied out of the body"
+        );
+
+        let escaped = br#"{"messages":[{"role":"user","content":"a \"quoted\" and \\ backslash"}]}"#;
+        let parsed: ProxyContextIngestRequest =
+            serde_json::from_slice(escaped).expect("the escaped body parses");
+        assert_eq!(
+            parsed.messages[0].content,
+            r#"a "quoted" and \ backslash"#,
+            "an escaped message did not come back as the text it stands for"
+        );
+        assert!(
+            matches!(parsed.messages[0].content, Cow::Owned(_)),
+            "an escaped message cannot be a borrow of the body it was unescaped from"
+        );
+        // `title` is the awkward one: Option<Cow<'a, str>> with both `default` and `borrow`, so
+        // it has to borrow through the Option, own through it when unescaping is needed, and
+        // still be None when the field is absent.
+        let titled = br#"{"messages":[{"role":"user","content":"c","title":"a plain title"}]}"#;
+        let parsed: ProxyContextIngestRequest =
+            serde_json::from_slice(titled).expect("the titled body parses");
+        let title = parsed.messages[0].title.as_ref().expect("the title parsed");
+        assert_eq!(title, "a plain title");
+        assert!(
+            matches!(title, Cow::Borrowed(_)),
+            "a title needing no unescaping was still copied out of the body"
+        );
+
+        let titled = br#"{"messages":[{"role":"user","content":"c","title":"a \"quoted\" title"}]}"#;
+        let parsed: ProxyContextIngestRequest =
+            serde_json::from_slice(titled).expect("the escaped-title body parses");
+        let title = parsed.messages[0].title.as_ref().expect("the title parsed");
+        assert_eq!(title, r#"a "quoted" title"#);
+        assert!(
+            matches!(title, Cow::Owned(_)),
+            "an escaped title cannot be a borrow of the body"
+        );
+
+        let untitled = br#"{"messages":[{"role":"user","content":"c"}]}"#;
+        let parsed: ProxyContextIngestRequest =
+            serde_json::from_slice(untitled).expect("the untitled body parses");
+        assert!(
+            parsed.messages[0].title.is_none(),
+            "an absent title must stay absent, not become an empty string"
+        );
+
+        // An explicit null, which `Option` accepted before the borrowing visitor replaced it.
+        let nulled = br#"{"messages":[{"role":"user","content":"c","title":null}]}"#;
+        let parsed: ProxyContextIngestRequest =
+            serde_json::from_slice(nulled).expect("a null title parses");
+        assert!(
+            parsed.messages[0].title.is_none(),
+            "an explicit null title must still read as absent"
+        );
+    }
+    /// A chat source is byte-identical however it is built.
+    ///
+    /// The extract path renders sources straight from borrowed parts; the replay path still
+    /// builds them as `Value`s, because its strings are owned already. Both land in the same
+    /// array, so the two forms have to render identically -- and `json!` sorts its keys while a
+    /// struct renders in declaration order, which is why `ChatSource` is declared alphabetically.
+    ///
+    /// Compares BYTES: a source differing only in field order still parses, so comparing values
+    /// would pass while the wire moved. Verified to discriminate by reordering a field.
+    #[test]
+    fn a_chat_source_is_the_same_bytes_either_way() {
+        let cases: [(&str, &str, &str); 4] = [
+            ("chat:1:s:0", "user", "hello"),
+            ("chat:0:default:9", "message", ""),
+            ("chat:7:s:1", r#"a "quoted" title"#, "line\nbreak"),
+            ("chat:7:s:2", r#"back\slash"#, "tab\tsep"),
+        ];
+        for (source_id, title, body) in cases {
+            let borrowed = serde_json::to_vec(&SourceItem::Chat(chat_source(
+                3, 12_345, source_id, title, body, 1_700_000_000_000,
+            )))
+            .expect("the borrowed source serialises");
+            let owned = serde_json::to_vec(&source_from_fields(
+                3,
+                12_345,
+                source_id.to_string(),
+                title.to_string(),
+                body.to_string(),
+                1_700_000_000_000,
+            ))
+            .expect("the owned source serialises");
+            assert_eq!(
+                String::from_utf8_lossy(&borrowed),
+                String::from_utf8_lossy(&owned),
+                "a chat source moved for id={source_id}"
+            );
+        }
+    }
+
+    /// A source the caller supplied passes through untouched.
+    ///
+    /// `SourceItem` is untagged, so the `Raw` arm must render the value exactly as it arrived.
+    #[test]
+    fn a_callers_source_passes_through_untouched() {
+        let supplied = json!({
+            "source_kind": "resource",
+            "nested": {"a": [1, 2, {"b": null}]},
+            "text": "as given"
+        });
+        assert_eq!(
+            serde_json::to_vec(&SourceItem::Raw(&supplied)).expect("raw serialises"),
+            serde_json::to_vec(&supplied).expect("value serialises"),
+            "the untagged Raw arm changed the source"
+        );
+    }
+    #[test]
+    fn an_absent_session_reads_as_default() {
+        let empty = ProxyContextScope {
+            session_id: String::new(),
+            ..Default::default()
+        };
+        assert_eq!(scope_session(&empty), "default");
+
+        let named = ProxyContextScope {
+            session_id: "s-42".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(scope_session(&named), "s-42");
+
+        // And the key built from each differs, which is the reason the fallback matters.
+        assert_ne!(
+            rawlog_key(7, scope_session(&empty)),
+            rawlog_key(7, scope_session(&named)),
+            "two scopes must not share a buffer key"
+        );
+    }
+
+    /// The chat source ids are the exact bytes `format!` produced.
+    ///
+    /// These ids are stored and read back, so a build that is merely equivalent is not enough --
+    /// it has to be identical. Covers an empty session, a long one, and the u64 extremes.
+    #[test]
+    fn the_chat_source_ids_are_what_format_produced() {
+        for tenant_hash in [0u64, 1, 42, 9_999_999, u64::MAX] {
+            for session in ["default", "", "s1", "a-longer-session-id"] {
+                let prefix = chat_id_prefix(tenant_hash, session);
+                for idx in [0usize, 5, 31, 999_999] {
+                    assert_eq!(
+                        chat_id_at(&prefix, idx),
+                        format!("chat:{tenant_hash}:{session}:{idx}"),
+                        "the chat source id changed for hash={tenant_hash} session={session:?} idx={idx}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_ingest_keys_are_what_format_produced() {
+        for tenant_hash in [0u64, 1, 42, 9_999_999, u64::MAX] {
+            for session in ["default", "", "s1", "a-longer-session-id"] {
+                assert_eq!(
+                    rawlog_key(tenant_hash, session),
+                    format!("context:rawlog:{tenant_hash}:{session}"),
+                    "rawlog key changed for hash={tenant_hash} session={session:?}"
+                );
+            }
+        }
+
+        for timestamp_ms in [0u64, 1, 1_700_000_000_000, u64::MAX] {
+            for call in [0u64, 7, 99_999_999] {
+                for idx in [0usize, 5, 999_999] {
+                    let mut built = String::with_capacity(36);
+                    push_fixed_width(&mut built, timestamp_ms, 20);
+                    built.push(':');
+                    push_fixed_width(&mut built, call, 8);
+                    built.push(':');
+                    push_fixed_width(&mut built, idx as u64, 6);
+
+                    assert_eq!(
+                        built,
+                        format!("{timestamp_ms:020}:{call:08}:{idx:06}"),
+                        "ordering field changed for ts={timestamp_ms} call={call} idx={idx}"
+                    );
+                }
+            }
+        }
+
+        // A value wider than its field is NOT truncated -- `{:020}` does not truncate either,
+        // and silently dropping high digits would collapse distinct keys onto one.
+        let mut wide = String::new();
+        push_fixed_width(&mut wide, u64::MAX, 3);
+        assert_eq!(wide, u64::MAX.to_string(), "a wide value must keep every digit");
+    }
+}
