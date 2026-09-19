@@ -216,3 +216,879 @@ fn a_write_after_a_fold_files_the_same_entry_the_projection_would() {
     // second term is structurally zero -- `BlockIndex` has no name to carry -- so pairing it in
     // weakened the assertion rather than strengthening it: a wrong entry count and a constant zero
     // read as one failure, and the zero half could never contribute one. The count stands alone,
+    // compared against the distinct page count asserted just above it rather than against a
+    // literal.
+    assert_eq!(
+        1, folded_live,
+        "after the fold the projection filed {folded_live} entr(ies) over {} distinct page(s); it \
+         must file exactly one per page",
+        folded_blocks.len()
+    );
+
+    // ---- NOW A WRITE AFTER THAT DERIVATION. This is the only thing that can see the two
+    //      filers disagree: it is the write path filing beside what the projection just filed. ----
+    add(&engine, member_bytes(FIRST_BATCH));
+    let (live, blocks, written) = entry_census(&engine);
+    let durable = durable_members(&engine);
+    let listed = listed_members(&engine);
+    println!(
+        "  after one more write: {live} live entr(ies), \
+         {} distinct page(s); durable holds {}, the listing serves {}",
+        blocks.len(),
+        durable.len(),
+        listed.len()
+    );
+
+    // ---- FLOOR: THE STORE STILL HOLDS EVERYTHING, so a short listing below is about the index
+    //      and not about a store that lost the members. ----
+    let expected: std::collections::BTreeSet<Vec<u8>> =
+        (0..=FIRST_BATCH).map(member_bytes).collect();
+    assert_eq!(
+        expected, durable,
+        "the durable map holds {} of {} members after the extra write, so every number below is \
+         about a store that lost them rather than about how they are filed",
+        durable.len(),
+        expected.len()
+    );
+    // FLOOR: the object still has entries at all.
+    assert!(
+        live > 0,
+        "the object has no live entries, so 'one entry per page' below would pass over an index \
+         that filed nothing"
+    );
+
+    // ---- 1. ONE ENTRY PER DISTINCT PHYSICAL PAGE, NONE NAMING AN ELEMENT. ----
+    //
+    // Compared against the number of distinct page addresses rather than a constant, so a fixture
+    // that folds differently cannot make this vacuous.
+    assert_eq!(
+        blocks.len(),
+        live,
+        "the write path filed {live} entr(ies) for {} distinct page(s). Under this gate the page \
+         IS the identity, so a write after a derivation must converge on the page's existing entry \
+         rather than add one of its own",
+        blocks.len()
+    );
+    // THE `named == 0` ARM IS DELETED, AND ITS SUBJECT IS STILL GUARDED -- by arm 3 below.
+    //
+    // It asserted that no entry named an element after a write following a derivation, to catch
+    // the write path filing per-element identity while the projection files per-page. An entry has
+    // no field for an element name, so this could only pass.
+    //
+    // WHAT THE ARM WAS REALLY FOR SURVIVES INTACT: the consequence it was watching for is that
+    // "the two routes then spell the same page's handle differently", and the WRITTEN KEY
+    // comparison further down asserts exactly that, by comparing the write path's keys against a
+    // re-derivation's for the same pages. That arm can still fail, and it fails on the thing that
+    // matters rather than on the mechanism that used to produce it.
+
+    // ---- 2. EVERY ELEMENT READS BACK, BY MEMBERSHIP. ----
+    //
+    // THE ARM THAT CATCHES THE DANGEROUS REPAIR. Filing one entry per ELEMENT with no component
+    // makes every element of one folded page share (kind, object_key, component, address), so they
+    // collapse onto one handle and each write displaces the last -- the 39-of-40 loss, arriving by
+    // the write path. A set answering the right COUNT of the wrong members passes a count check
+    // and fails this one.
+    assert_eq!(
+        expected, listed,
+        "the listing served {} member(s) where the store holds {}. Compared as a SET rather than a \
+         count, because the loss this guards against replaces members rather than dropping them",
+        listed.len(),
+        expected.len()
+    );
+
+    // ---- 3. THE WRITTEN KEY MATCHES WHAT A DERIVATION PRODUCES FOR THE SAME PAGE. ----
+    //
+    // `block_ref_key` is stored inside the lookup refs, so two routes that spell it differently
+    // file a page under a handle the other will never compute. Re-derive and compare the keys.
+    rederive(&engine);
+    let (dlive, dpages, derived_written) = entry_census(&engine);
+    println!(
+        "  after a re-derivation: {dlive} live entr(ies), \
+         {} distinct page(s)",
+        dpages.len()
+    );
+    // FLOOR: the re-derivation produced something to compare against.
+    assert!(
+        dlive > 0 && !derived_written.is_empty(),
+        "the re-derivation filed nothing, so the key comparison below would hold vacuously"
+    );
+    assert_eq!(
+        blocks, dpages,
+        "the two routes disagree about WHICH pages are live, so comparing their written keys is \
+         comparing different populations"
+    );
+    assert_eq!(
+        derived_written, written,
+        "the write path and the projection spell this page's WRITTEN KEY differently. That key is \
+         stored inside the lookup refs, so a page filed by one route is looked up under a handle \
+         the other route never computes -- a durably acknowledged write that reads MISSING"
+    );
+}
+
+/// WHAT SUPERSEDES THE ENTRY NAMING AN ELEMENT'S PREVIOUS PAGE.
+///
+/// The repair for the spelling disagreement is to key the upsert's convergence on the ADDRESS
+/// instead of the component, because under this gate the page is the identity. This measures the
+/// case that decides whether that is sufficient on its own: a member REWRITTEN after a fold moves
+/// to a NEW page, so an address-keyed predicate matching only the new address cannot select the
+/// entry naming the OLD one. If the current component-keyed convergence is what removes it, the
+/// repair has to be handed the superseded address as well -- and the write path already reads it,
+/// to compute the ordinal.
+#[test]
+fn a_rewrite_after_a_fold_leaves_one_entry_per_block_today() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    for index in 0..FIRST_BATCH {
+        add(&engine, member_bytes(index));
+    }
+    engine
+        .compact_shard_blocks(1)
+        .expect("the fold round must succeed");
+    let (_, folded_blocks, _) = entry_census(&engine);
+    // FLOOR: the fixture folded, or "one entry per page" below is trivially true.
+    assert_eq!(
+        1,
+        folded_blocks.len(),
+        "the members resolve to {} pages after the fold, so there is no shared page to rewrite off",
+        folded_blocks.len()
+    );
+
+    // REWRITE a member that is already on the folded page.
+    add(&engine, member_bytes(0));
+    let (live, blocks, _) = entry_census(&engine);
+    let durable = durable_members(&engine);
+    let listed = listed_members(&engine);
+    println!(
+        "\n=== rewrite after a fold: {live} live entr(ies), \
+         {} distinct page(s); durable {}, listing serves {}",
+        blocks.len(),
+        durable.len(),
+        listed.len()
+    );
+
+    // FLOOR: nothing was lost, so the counts above are about filing and not about a lost store.
+    let expected: std::collections::BTreeSet<Vec<u8>> =
+        (0..FIRST_BATCH).map(member_bytes).collect();
+    assert_eq!(
+        expected, durable,
+        "the durable map holds {} of {} members after the rewrite",
+        durable.len(),
+        expected.len()
+    );
+    assert_eq!(
+        expected, listed,
+        "the listing served {} member(s) of {} after a rewrite -- compared as a SET, because a \
+         wrong-member answer has the same count as a right one",
+        listed.len(),
+        expected.len()
+    );
+
+    // THE MEASUREMENT THE REPAIR TURNS ON. One entry per distinct page means the entry naming the
+    // member's OLD page was superseded. If this holds today, it holds BECAUSE the convergence is
+    // component-keyed, and an address-keyed replacement must be given the old address too.
+    assert_eq!(
+        blocks.len(),
+        live,
+        "{live} live entr(ies) for {} distinct page(s) after a rewrite. Recorded as the state an \
+         address-keyed convergence has to reproduce: if this is one-to-one today, the superseded \
+         page's entry is being removed by the COMPONENT match, and keying on the new address alone \
+         would leave it behind naming a dead page",
+        blocks.len()
+    );
+}
+
+/// A COMPONENT-LESS KIND RELOCATING, WHICH IS WHY THE REPAIR CANNOT BE UNCONDITIONAL.
+///
+/// `String`, `ControlState` and `ContextNode` all file `component: None` with ONE page per object.
+/// For them the component-keyed convergence is exactly what supersedes a relocated page -- so a
+/// predicate keyed on the address for EVERY kind would leave a live entry naming the dead page on
+/// every one of these writes. Measured here so the repair's condition is derived from behaviour
+/// rather than from a list of kind names someone remembers.
+#[test]
+fn a_component_less_kind_rewritten_still_resolves_to_one_block() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    let key = "waf/string";
+    for round in 0..3usize {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: key.to_string(),
+                value: member_bytes(round),
+            },
+        });
+        assert!(response.status.ok, "write failed: {response:?}");
+    }
+
+    let (live, blocks) = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 loaded");
+        let named = super::BlockObjects::of(&shard.bucket_index);
+        let mut live = 0usize;
+        let mut blocks = std::collections::BTreeSet::new();
+        for bucket in shard.bucket_index.bucket_map.values() {
+            for (handle, block) in &bucket.block_index {
+                if block.deleted
+                    || block.model_id.as_str() != "string"
+                    || &**named.at(bucket.routing_bucket, *handle) != key
+                {
+                    continue;
+                }
+                live += 1;
+                blocks.insert((
+                    block.address.block_slab_id(),
+                    block.address.offset(),
+                    block.address.length(),
+                ));
+            }
+        }
+        (live, blocks)
+    };
+    println!(
+        "  a string rewritten 3 times: {live} live entr(ies), \
+         {} distinct page(s)",
+        blocks.len()
+    );
+
+    // FLOOR: the object is filed at all.
+    assert!(
+        live > 0,
+        "the string has no live entries, so the one-entry claim below would hold over nothing"
+    );
+    // THE CONTROL'S PREMISE IS NOW HELD BY THE TYPE, NOT BY THIS ASSERTION.
+    //
+    // It read `0 == named`, on the grounds that a string entry naming an element "makes it the
+    // wrong control for the repair's condition". No entry of any kind can name an element, so the
+    // premise holds for every kind by construction and this could only pass. What makes `string`
+    // the right control here is the OTHER half, asserted below: it converges on the OBJECT KEY
+    // rather than on the page, so three rewrites leave ONE live entry. That is a number this
+    // fixture can get wrong.
+    assert_eq!(
+        1, live,
+        "{live} live entries for a string rewritten three times, resolving to {} page(s). ONE is \
+         the state a component-keyed convergence produces, and it is why the address-keyed repair \
+         must apply to the gated container arm ONLY: applied here it would leave two stale entries \
+         naming dead pages",
+        blocks.len()
+    );
+}
+
+fn remove(engine: &TemporalEngine, member: Vec<u8>) {
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::SetRemove {
+            key: KEY.to_string(),
+            member,
+        },
+    });
+    assert!(response.status.ok, "removal failed: {response:?}");
+}
+
+/// This object's TOMBSTONED entries, and the ELEMENT each one is about.
+///
+/// READ FROM THE BUCKET'S TOMBSTONE ROWS. The element a removal records is a per-element fact and
+/// no longer sits on the entry, which files `None`; reading the entry here would make every arm
+/// below compare `None` against `None`.
+fn tombstones(engine: &TemporalEngine) -> Vec<Option<String>> {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 loaded");
+    let named = super::BlockObjects::of(&shard.bucket_index);
+    let mut out = Vec::new();
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for (handle, block) in &bucket.block_index {
+            if block.deleted
+                && block.model_id.as_str() == "set"
+                && &**named.at(bucket.routing_bucket, *handle) == KEY
+            {
+                out.push(
+                    bucket
+                        .tombstone_element_at(&block.address)
+                        .map(|row| row.component.to_string()),
+                );
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A REMOVAL MUST SURVIVE A RE-ADD OF A DIFFERENT MEMBER, ACROSS A STORE BOUNDARY.
+///
+/// # THE QUESTION THE GATE ACTIVATES
+///
+/// A re-add clears the tombstone its element left -- that is what bounds the retained tombstone at
+/// one entry per distinct element removed. The sweep that does it matches on the component of the
+/// entry being filed.
+///
+/// Under one entry a page, a gated removal files its tombstone with NO component (`engine.rs`'s
+/// gated removal arm passes `None`). So if the entry being filed also carries no component, the
+/// sweep's predicate matches EVERY tombstone of the object rather than one -- and a re-add of
+/// member Y would clear member X's tombstone. X's tombstone page is what makes X's removal win in
+/// `derive_membership`'s fold by append position, so clearing it can bring X BACK.
+///
+/// That is a resurrection, and presence and absence are different properties: this campaign has a
+/// recorded case where every arm asked whether a PRESENT element survives, none removed anything,
+/// and a removed member came back anyway. So this asks the absence question directly.
+///
+/// # WHY IT IS ASSERTED BY MEMBERSHIP AND ACROSS A RELOAD
+///
+/// By membership because the right COUNT with the wrong members passes a count assertion -- already
+/// caught once in this change. Across a reload because the fold that decides which page wins runs
+/// on the way in, so a live engine can answer from state the reload would rebuild differently.
+///
+/// # AND IT IS FLOORED ON THE SWEEP HAVING SOMETHING TO SWEEP
+///
+/// The tombstone is asserted to exist BEFORE the re-add. Without that, this passes by never having
+/// swept anything, which is the same shape as a guard over a path nothing reached.
+#[test]
+fn a_re_add_after_a_removal_does_not_bring_the_removed_member_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let blocks = dir.path().join("blocks");
+    let indexes = dir.path().join("indexes");
+    let victim = member_bytes(1);
+    let survivor = member_bytes(2);
+
+    let tombs_before;
+    let tombs_after;
+    {
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            &blocks,
+            &indexes,
+        );
+        load_on(&engine);
+        add(&engine, victim.clone());
+        add(&engine, survivor.clone());
+        // Folded, so the two members share a page -- the regime this gate is about. Without it
+        // each member is its own page and the shared tombstone name cannot arise.
+        engine
+            .compact_shard_blocks(1)
+            .expect("the fold round must succeed");
+
+        remove(&engine, victim.clone());
+        tombs_before = tombstones(&engine);
+
+        // ---- FLOOR: THE SWEEP HAS SOMETHING TO SWEEP. ----
+        assert!(
+            !tombs_before.is_empty(),
+            "the removal left no tombstone entry, so the re-add below cannot sweep one and this \
+             test would pass without ever reaching the state it is about"
+        );
+
+        // THE SWEEP TRIGGER: re-add the OTHER member.
+        add(&engine, survivor.clone());
+        tombs_after = tombstones(&engine);
+
+        engine.unload_shard(1);
+    }
+
+    // Its own cache directory, so nothing is answered out of a page the first engine left warm.
+    let reloaded = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache-reloaded"),
+        &blocks,
+        &indexes,
+    );
+    load_on(&reloaded);
+    let listed = listed_members(&reloaded);
+    let durable = durable_members(&reloaded);
+    println!(
+        "\n=== removal then a re-add of another member, gate on ===\n  tombstones {:?} before \
+         the re-add, {:?} after; after the reload the listing serves {} member(s), durable holds {}",
+        tombs_before,
+        tombs_after,
+        listed.len(),
+        durable.len()
+    );
+
+    // ---- FLOOR: THE OBJECT CAME BACK AT ALL. ----
+    assert!(
+        !listed.is_empty() || !durable.is_empty(),
+        "the object is empty after the reload, so 'the removed member is absent' is true for the \
+         wrong reason"
+    );
+
+    // ---- THE SURVIVOR IS STILL THERE. ----
+    assert!(
+        listed.contains(&survivor),
+        "the re-added member is NOT served after the reload, so the absence of the removed one \
+         below says nothing -- the object lost both"
+    );
+
+    // ---- AND THE REMOVED MEMBER IS STILL GONE. ----
+    assert!(
+        !listed.contains(&victim),
+        "THE REMOVED MEMBER CAME BACK. A re-add of a different member swept the tombstone that \
+         made this removal win, so a durably acknowledged removal was undone by an unrelated \
+         write. Tombstones were {:?} before the re-add and {:?} after",
+        tombs_before,
+        tombs_after
+    );
+    // The durable map is the authority, so it must agree rather than being left holding a member
+    // the listing does not serve.
+    assert!(
+        !durable.contains(&victim),
+        "the durable map still holds the removed member after the reload, so the two sources \
+         disagree about whether the removal happened"
+    );
+}
+
+const CROWD: usize = 12;
+
+/// A GATED REMOVAL FROM A FOLDED PAGE: THE MEMBER GOES, EVERY OTHER MEMBER STAYS, ACROSS A RELOAD.
+///
+/// # WHY THIS IS WRITTEN BEFORE ANY EXPECTATION IS RESTATED
+///
+/// The gated removal arm had never executed. While the write path filed each element's name,
+/// `remove_container_element`'s retain matched it, dropped the live entry and took the ungated
+/// path -- so with the gate on, the arm that keeps the page entry beside a tombstone was
+/// unreachable. The keying change files no name, the retain stops matching, and that arm now runs.
+///
+/// Two existing tests disagree with it about the entry counts. Restating them to match what the
+/// code now does would assert whatever the code does -- a tautology, the same shape as a
+/// completeness check in this tree that compared a map against an index rebuilt from that map and
+/// therefore could not fail. So the arm's correctness is established here from the INVARIANT
+/// instead: a removal must remove exactly the member named, must not disturb the others, and must
+/// survive the store.
+///
+/// Asserted by MEMBERSHIP throughout. A container answering the right count of the wrong members
+/// passes a count assertion, and presence and absence are different properties -- this campaign
+/// has a recorded case where every arm asked whether a present element survives, none removed
+/// anything, and a removed member came back.
+#[test]
+fn a_gated_removal_leaves_every_other_member_whole_across_a_reload() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let blocks = dir.path().join("blocks");
+    let indexes = dir.path().join("indexes");
+    let doomed = member_bytes(3);
+    let rewritten = member_bytes(5);
+
+    {
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            &blocks,
+            &indexes,
+        );
+        load_on(&engine);
+        for index in 0..CROWD {
+            add(&engine, member_bytes(index));
+        }
+        engine
+            .compact_shard_blocks(1)
+            .expect("the fold round must succeed");
+
+        // FLOOR: THE MEMBERS SHARE ONE PAGE. Without the fold each is its own page, the gated arm
+        // is not what runs, and this test would be about the ungated path wearing a gated label.
+        let (_, folded_blocks, _) = entry_census(&engine);
+        assert_eq!(
+            1,
+            folded_blocks.len(),
+            "the {CROWD} members resolve to {} pages after the fold, so no page holds more than \
+             one member and the removal arm under test is not the one that runs",
+            folded_blocks.len()
+        );
+
+        remove(&engine, doomed.clone());
+        // FLOOR: a tombstone was filed, so the removal reached the arm at all.
+        assert!(
+            !tombstones(&engine).is_empty(),
+            "the removal filed no tombstone, so the gated arm did not run and every assertion \
+             below would be about the ungated path"
+        );
+
+        // AND A WRITE AFTER THE REMOVAL, which is the sweep interaction: a re-add of a DIFFERENT
+        // member must not disturb the removal.
+        add(&engine, rewritten.clone());
+
+        engine.unload_shard(1);
+    }
+
+    // Its own cache directory, so every byte served came off disk through the reloaded index.
+    let reloaded = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache-reloaded"),
+        &blocks,
+        &indexes,
+    );
+    load_on(&reloaded);
+    let listed = listed_members(&reloaded);
+    let durable = durable_members(&reloaded);
+    println!(
+        "\n=== one member removed from a folded page of {CROWD}, then another re-added, then a \
+         reload ===\n  the listing serves {} member(s), the durable map holds {}",
+        listed.len(),
+        durable.len()
+    );
+
+    // ---- THE INVARIANT, STATED AS THE SET IT MUST BE. ----
+    let expected: std::collections::BTreeSet<Vec<u8>> = (0..CROWD)
+        .map(member_bytes)
+        .filter(|member| member != &doomed)
+        .collect();
+
+    // FLOOR: the object came back at all, so the absence below is not true for the wrong reason.
+    assert!(
+        !listed.is_empty(),
+        "the object is empty after the reload, so 'the removed member is absent' says nothing"
+    );
+    assert_eq!(
+        expected, listed,
+        "the listing served {} member(s) where the invariant is {}. Compared as a SET: the right \
+         count of the wrong members passes a count check",
+        listed.len(),
+        expected.len()
+    );
+    assert_eq!(
+        expected, durable,
+        "the durable map holds {} member(s) where the invariant is {}, so the two sources disagree \
+         about what the removal did",
+        durable.len(),
+        expected.len()
+    );
+    // Said twice on purpose: absence is a different property from the set comparison above, and
+    // it is the one a wrong answer here would be about.
+    assert!(
+        !listed.contains(&doomed) && !durable.contains(&doomed),
+        "THE REMOVED MEMBER IS BACK after a reload and a re-add of another member"
+    );
+    assert!(
+        listed.contains(&rewritten),
+        "the member re-added after the removal is not served, so the removal took a bystander"
+    );
+}
+
+/// AND THE RETAINED ENTRY IS BOUNDED: ONE TOMBSTONE PER DISTINCT ELEMENT REMOVED.
+///
+/// The stated retention property of the removal representation, never checked against this arm
+/// because the arm never ran. An arm that keeps the live entry AND files a tombstone could grow
+/// per removal ROUND rather than per distinct element, which is unbounded on churn.
+///
+/// Driven over repeated removals of the SAME element and over distinct ones, so "bounded" is
+/// measured against the number of distinct elements removed rather than against a constant.
+#[test]
+fn gated_removals_file_one_tombstone_per_distinct_element_and_do_not_accumulate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+    for index in 0..CROWD {
+        add(&engine, member_bytes(index));
+    }
+    engine
+        .compact_shard_blocks(1)
+        .expect("the fold round must succeed");
+
+    // FLOOR: one page, so the gated arm is what runs.
+    let (_, folded_blocks, _) = entry_census(&engine);
+    assert_eq!(1, folded_blocks.len(), "the fixture did not fold");
+
+    // THE SAME ELEMENT REMOVED SEVERAL TIMES must not file several tombstones: only the first
+    // removal removes anything.
+    remove(&engine, member_bytes(0));
+    let after_first = tombstones(&engine).len();
+    assert!(
+        after_first >= 1,
+        "the first removal filed no tombstone, so the bound below holds over nothing"
+    );
+    for _ in 0..3 {
+        remove(&engine, member_bytes(0));
+    }
+    let after_repeats = tombstones(&engine).len();
+    println!(
+        "\n=== tombstones: {after_first} after removing one member, {after_repeats} after \
+         removing the SAME member three more times"
+    );
+    assert_eq!(
+        after_first, after_repeats,
+        "repeated removals of the same member grew the tombstones from {after_first} to \
+         {after_repeats}, so the retention is per removal rather than per element removed"
+    );
+
+    // AND DISTINCT ELEMENTS: the count tracks the number of distinct members removed.
+    remove(&engine, member_bytes(1));
+    remove(&engine, member_bytes(2));
+    let after_three = tombstones(&engine).len();
+    println!("  {after_three} after removing three DISTINCT members");
+    assert!(
+        after_three <= 3,
+        "three distinct members removed left {after_three} tombstone entries, so the retention is \
+         not bounded at one per distinct element"
+    );
+    assert!(
+        after_three > after_first,
+        "removing two more distinct members did not change the tombstone count ({after_first} \
+         then {after_three}), so this arm is not recording per element and the bound above is \
+         satisfied by it recording nothing"
+    );
+
+    // AND THE SURVIVORS ARE STILL SERVED, so none of the above is bounded by having lost them.
+    let expected: std::collections::BTreeSet<Vec<u8>> = (3..CROWD).map(member_bytes).collect();
+    assert_eq!(
+        expected,
+        listed_members(&engine),
+        "after three removals the listing does not serve exactly the nine remaining members"
+    );
+}
+
+/// THE PAGE AN ELEMENT WAS ALONE ON, which is the half the landing address cannot reach.
+///
+/// `a_rewrite_after_a_fold_leaves_one_entry_per_block_today` above measures the OTHER half: a
+/// rewrite off a page SIBLINGS are still on, where the page stays live and its entry must stay
+/// with it. This one is the case that strands an entry. The member is alone on its page, the
+/// rewrite is written to a NEW address, and keyed on the landing page alone the supersede matches
+/// NO existing entry -- so the member's previous entry survives as a LIVE entry over a page
+/// nothing is on any more. Under one entry a page a live entry IS a claim of membership, so that
+/// stale entry is a phantom element: it is what served one element more than had ever been
+/// written on the kind that rewrites in place.
+///
+/// ASSERTED AS AN EXACT ONE-TO-ONE and not as a floor. `live >= pages` is satisfied by the
+/// stranding this is about, and a floor on either count passed once in this campaign over a path
+/// nothing reached -- so the fixture is first shown to have put each member on its own page and to
+/// have actually MOVED the rewritten one, and only then are the two counts compared.
+///
+/// THE MUTATION: `RecordedMap::block_an_element_vacates` returning `None` unconditionally, which is
+/// the tree before `ReplacedBlock` existed. That reddens the one-to-one assertion here and leaves
+/// the fold arm above green, which is what says the two arms are about different halves.
+#[test]
+fn a_rewrite_off_a_block_the_element_was_alone_on_retires_that_blocks_entry() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    add(&engine, member_bytes(0));
+    add(&engine, member_bytes(1));
+
+    let before = member_block(&engine, &member_bytes(0));
+    let (live_before, blocks_before, _) = entry_census(&engine);
+    // FLOOR 1: each member is on its OWN page, or there is no alone-on-a-page case to rewrite off
+    // and this test would be measuring the fold arm's situation instead.
+    assert_eq!(
+        2,
+        blocks_before.len(),
+        "the two members resolve to {} distinct page(s), so neither is alone on one",
+        blocks_before.len()
+    );
+    assert_eq!(
+        2, live_before,
+        "{live_before} live entr(ies) before the rewrite, so the index did not start one-to-one \
+         and the comparison after the rewrite would not be about the rewrite"
+    );
+
+    // REWRITE the member that is alone on its page.
+    add(&engine, member_bytes(0));
+    let after = member_block(&engine, &member_bytes(0));
+    // FLOOR 2: the rewrite actually RELOCATED. If a rewrite landed back on its own page the
+    // landing key would supersede the entry by itself and there would be nothing here to fix.
+    assert_ne!(
+        before, after,
+        "the rewrite landed back on page {before:?}, so the landing address already names the \
+         entry it supersedes and this test asserts nothing about a vacated page"
+    );
+
+    let (live, blocks, _) = entry_census(&engine);
+    let durable = durable_members(&engine);
+    let listed = listed_members(&engine);
+    println!(
+        "\n=== rewrite off a page the element was alone on: {live} live entr(ies), \
+         {} distinct page(s); vacated {before:?} -> {after:?}; durable {}, listing \
+         serves {}",
+        blocks.len(),
+        durable.len(),
+        listed.len()
+    );
+
+    // FLOOR 3: nothing was lost, so the counts are about filing and not about a damaged store.
+    let expected: std::collections::BTreeSet<Vec<u8>> = (0..2).map(member_bytes).collect();
+    assert_eq!(
+        expected, durable,
+        "the durable map holds {} of {} members after the rewrite",
+        durable.len(),
+        expected.len()
+    );
+    assert_eq!(
+        expected, listed,
+        "the listing served {} member(s) of {} after the rewrite -- compared as a SET, because a \
+         wrong-member answer has the same count as a right one",
+        listed.len(),
+        expected.len()
+    );
+
+    // THE ASSERTION UNDER TEST, COMPARED AGAINST THE OTHER SOURCE.
+    //
+    // `pages` is derived FROM the entries, so `pages.len() == live` can only ever say that no two
+    // entries share a page -- it cannot see a stale entry at all, because a stale entry raises both
+    // sides of it. MEASURED: under the mutation that arm read `3 == 3` and passed while the vacated
+    // page was still named. So the live set is compared against the pages the RESIDENT MAP says are
+    // occupied, which is an independent statement of which pages exist.
+    let occupied = occupied_blocks(&engine);
+    assert_eq!(
+        occupied, blocks,
+        "the index names {} live page(s) and the durable map holds its members on {}. The \
+         difference is an entry over a page nothing is on -- and under this gate a live entry IS a \
+         claim of membership, so it serves a member that is not there",
+        blocks.len(),
+        occupied.len()
+    );
+    assert_eq!(
+        occupied.len(),
+        live,
+        "{live} live entr(ies) for {} occupied page(s): two entries name one page, so one of them \
+         is a duplicate claim over the same bytes",
+        occupied.len()
+    );
+    assert!(
+        !blocks.contains(&before),
+        "the vacated page {before:?} is still named by a live entry. The member moved to \
+         {after:?} and nothing else was on {before:?}, so that entry stands for a page with \
+         nothing on it"
+    );
+}
+
+/// The physical page the durable map currently holds this member on.
+///
+/// READ FROM THE RESIDENT MAP and not from the index, deliberately: the index is the thing under
+/// test here, so taking the before-and-after page from it would compare two values derived from
+/// the same accessor -- a shape that has already passed over broken code in this campaign.
+fn member_block(engine: &TemporalEngine, member: &[u8]) -> (u64, u64, u64) {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 loaded");
+    let address = shard
+        .sets
+        .get(KEY)
+        .and_then(|members| members.get(member))
+        .expect("the durable map holds this member");
+    (
+        address.block_slab_id(),
+        address.offset(),
+        address.length(),
+    )
+}
+
+/// The distinct physical pages the DURABLE MAP says this object's members are on.
+///
+/// The independent half of the comparison above. The index's own page set is derived from the
+/// entries being measured, so it cannot witness an entry over an empty page; this is derived from
+/// the members instead.
+fn occupied_blocks(engine: &TemporalEngine) -> std::collections::BTreeSet<(u64, u64, u64)> {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 loaded");
+    shard
+        .sets
+        .get(KEY)
+        .map(|members| {
+            members
+                .iter()
+                .map(|(_, address)| {
+                    (
+                        address.block_slab_id(),
+                        address.offset(),
+                        address.length(),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A RE-ADD CLEARS ITS OWN TOMBSTONE AND NOT A SIBLING'S, WITH TWO REMOVALS OUTSTANDING.
+///
+/// `a_re_add_after_a_removal_does_not_bring_the_removed_member_back` above removes ONE member and
+/// re-adds a DIFFERENT one. That reaches the sweep's predicate only when the predicate is keyed on
+/// something the re-added element also matches -- so once the sweep asks "does THIS element have a
+/// tombstone" and answers no, the arm is never entered at all and an over-matching body inside it
+/// cannot be observed. MEASURED: widening the sweep's body to every tombstone of the object left
+/// all 24 arms of these three modules green.
+///
+/// SO THE SHAPE THAT REACHES IT IS TWO REMOVALS AND A RE-ADD OF ONE OF THEM. The sweep is entered,
+/// because the re-added element does have a tombstone, and a body that then takes every tombstone
+/// of the object takes the OTHER member's with it -- and that tombstone page is what makes the
+/// other removal win the fold by append position, so the other member comes back. That is the
+/// twelve-where-the-invariant-is-eleven shape, in the one sequence that can produce it.
+///
+/// FLOORED ON BOTH TOMBSTONES EXISTING FIRST, or the sweep has nothing to over-match and this
+/// passes without reaching anything. And asserted by MEMBERSHIP, not by count: a container
+/// answering the right number of the wrong members passes a count assertion, which this change has
+/// already been caught by once.
+#[test]
+fn a_re_add_clears_only_its_own_tombstone_when_two_removals_are_outstanding() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    for index in 0..FIRST_BATCH {
+        add(&engine, member_bytes(index));
+    }
+    let returning = member_bytes(1);
+    let staying_gone = member_bytes(2);
+    remove(&engine, returning.clone());
+    remove(&engine, staying_gone.clone());
+
+    // FLOOR: two distinct tombstones, each naming its own element.
+    let before = tombstones(&engine);
+    println!("\n=== two removals outstanding: tombstones {before:?}");
+    assert_eq!(
+        2,
+        before.len(),
+        "{} tombstone(s) after removing two distinct members, so the sweep below has nothing to \
+         over-match and this arm would pass without reaching it",
+        before.len()
+    );
+    let returning_component = hex::encode(&returning);
+    let staying_gone_component = hex::encode(&staying_gone);
+    assert!(
+        before.contains(&Some(returning_component.clone()))
+            && before.contains(&Some(staying_gone_component.clone())),
+        "the two tombstones name {before:?}, not the two members removed -- so they are not the \
+         two rows this arm is about"
+    );
+
+    // THE RE-ADD. Its own tombstone must go; the sibling's must stay.
+    add(&engine, returning.clone());
+
+    let after = tombstones(&engine);
+    let durable = durable_members(&engine);
+    let listed = listed_members(&engine);
+    println!(
+        "  after re-adding one: tombstones {after:?}; durable {}, listing serves {}",
+        durable.len(),
+        listed.len()
+    );
+
+    assert_eq!(
+        vec![Some(staying_gone_component.clone())],
+        after,
+        "the re-add left tombstones {after:?}. Exactly the re-added member's row should have gone \
+         and the other removal's row should still be there -- a sweep that took both has erased \
+         the record of a removal the client never undid"
+    );
+
+    // THE CONSEQUENCE, ASSERTED AS MEMBERSHIP. This is the half that says the lost tombstone is a
+    // lost REMOVAL and not merely a lost row.
+    let expected: std::collections::BTreeSet<Vec<u8>> = (0..FIRST_BATCH)
+        .map(member_bytes)
+        .filter(|member| member != &staying_gone)
+        .collect();
+    assert_eq!(
+        expected, durable,
+        "the durable map holds {:?} and should hold {:?}",
+        durable.len(),
+        expected.len()
+    );
+    assert_eq!(
+        expected, listed,
+        "the listing serves {} member(s) of an expected {} -- compared as a SET, because the \
+         resurrected member and the re-added one give the same count",
+        listed.len(),
+        expected.len()
+    );
+    assert!(
+        !listed.contains(&staying_gone),
+        "the member removed and never re-added is being served again; the re-add cleared its \
+         tombstone and the fold stopped seeing its removal"
+    );
+}
