@@ -459,3 +459,465 @@ impl RefModel {
             }
             Command::ControlStateChangeAdd {
                 key,
+                timestamp_ms,
+                value,
+                precision_ms,
+                ..
+            } => {
+                // precision_ms=None -> raw-timestamp bucket (the oracle generator uses None).
+                let bucket = precision_ms
+                    .filter(|precision| *precision > 0)
+                    .map(|precision| timestamp_ms - timestamp_ms % precision)
+                    .unwrap_or(*timestamp_ms);
+                self.control_state_changes
+                    .entry(key.clone())
+                    .or_default()
+                    .entry(bucket)
+                    .or_default()
+                    .insert(value.clone());
+            }
+            Command::CommonDelete { key } => {
+                self.strings.remove(key);
+                self.hashes.remove(key);
+                self.sets.remove(key);
+                self.features.remove(key);
+                self.sequences.remove(key);
+                self.control_state.remove(key);
+                self.control_state_changes.remove(key);
+            }
+            // CommonExpire uses a non-firing TTL in the oracle generator -> no observable effect.
+            _ => {}
+        }
+    }
+}
+
+fn gen_oracle_command(rng: &mut Rng) -> Command {
+    match rng.below(19) {
+        0 => Command::StringSet {
+            key: rng.model_key('s'),
+            value: rng.small_bytes(),
+        },
+        1 => Command::StringDelete {
+            key: rng.model_key('s'),
+        },
+        2 => Command::HashSet {
+            key: rng.model_key('h'),
+            field: rng.field(),
+            value: rng.small_bytes(),
+        },
+        3 => Command::HashDelete {
+            key: rng.model_key('h'),
+            field: rng.field(),
+        },
+        4 => Command::HashIncrBy {
+            key: rng.model_key('h'),
+            field: rng.field(),
+            increment: (rng.below(2001) as i64) - 1000,
+        },
+        5 => Command::SetAdd {
+            key: rng.model_key('e'),
+            member: rng.small_bytes(),
+        },
+        6 => Command::SetRemove {
+            key: rng.model_key('e'),
+            member: rng.small_bytes(),
+        },
+        7 | 8 => Command::FeatureAppend {
+            key: rng.model_key('f'),
+            points: (0..1 + rng.below(3))
+                .map(|_| FeaturePoint {
+                    timestamp_ms: rng.ts(),
+                    value: rng.small_bytes(),
+                })
+                .collect(),
+        },
+        11 => Command::CommonDelete { key: rng.any_key() },
+        12 => Command::SequenceAdd {
+            key: rng.model_key('q'),
+            rows: (0..1 + rng.below(3))
+                .map(|_| SequenceFeatureRow {
+                    timestamp_ms: rng.ts(),
+                    gid: rng.below(1000),
+                    action_type: rng.below(8) as u32,
+                    duration: rng.below(100) as u32,
+                    author_id: rng.below(1000),
+                })
+                .collect(),
+        },
+        13 => Command::ControlStateIncrement {
+            key: rng.model_key('c'),
+            timestamp_ms: rng.ts(),
+            amount: (rng.below(2001) as i64) - 1000,
+        },
+        14 => Command::ControlStateChangeAdd {
+            key: rng.model_key('g'),
+            timestamp_ms: rng.ts(),
+            value: rng.small_bytes(),
+            precision_ms: None,
+            ttl_ms: None,
+        },
+        15 => {
+            let (start_ms, end_ms) = adversarial_bounds(rng);
+            Command::FeatureReplace {
+                key: rng.model_key('f'),
+                start_ms,
+                end_ms,
+                points: (0..1 + rng.below(3))
+                    .map(|_| FeaturePoint {
+                        timestamp_ms: rng.ts(),
+                        value: rng.small_bytes(),
+                    })
+                    .collect(),
+            }
+        }
+        16 => Command::FeatureDelete {
+            key: rng.model_key('f'),
+        },
+        17 => Command::ControlStateIncrementWithOptions {
+            key: rng.model_key('c'),
+            timestamp_ms: rng.ts(),
+            amount: (rng.below(2001) as i64) - 1000,
+            // Sometimes bucket by precision (collapses timestamps), sometimes raw.
+            precision_ms: if rng.below(2) == 0 {
+                None
+            } else {
+                Some([2, 5, 10, 16][rng.below(4) as usize])
+            },
+            ttl_ms: None,
+        },
+        _ => Command::CommonExpire {
+            key: rng.any_key(),
+            ttl_ms: 1 << 40,
+        },
+    }
+}
+
+fn engine_read(engine: &TemporalEngine, command: Command) -> CommandResponse {
+    engine
+        .execute(ExecuteRequest {
+            shard_id: 1,
+            command,
+        })
+        .response
+}
+
+fn points_to_pairs(response: CommandResponse) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    match response {
+        CommandResponse::FeaturePoints { points } => Ok(points
+            .into_iter()
+            .map(|point| (point.timestamp_ms, point.value))
+            .collect()),
+        other => Err(format!("expected FeaturePoints, got {other:?}")),
+    }
+}
+
+// Mirror aggregate_control_state_values (product_model.rs) exactly, including 0-on-empty for
+// min/max/first/last and wrapping sum. `values` are the bucket values in timestamp-ascending order.
+fn model_cs_aggregate(values: &[i64], aggregator: &str) -> i64 {
+    match aggregator {
+        "sum" | "count" | "" => values.iter().fold(0i64, |acc, v| acc.wrapping_add(*v)),
+        "events" | "len" => values.len() as i64,
+        "min" => values.iter().copied().min().unwrap_or(0),
+        "max" => values.iter().copied().max().unwrap_or(0),
+        "first" => values.first().copied().unwrap_or(0),
+        "last" => values.last().copied().unwrap_or(0),
+        _ => values.iter().fold(0i64, |acc, v| acc.wrapping_add(*v)),
+    }
+}
+
+fn oracle_mismatch(engine: &TemporalEngine, model: &RefModel) -> Option<String> {
+    for n in 0..4 {
+        // String: exact value.
+        let key = format!("s{n}");
+        match engine_read(engine, Command::StringGet { key: key.clone() }) {
+            CommandResponse::Bytes { value } => {
+                if value != model.strings.get(&key).cloned() {
+                    return Some(format!(
+                        "string {key}: engine={value:?} model={:?}",
+                        model.strings.get(&key)
+                    ));
+                }
+            }
+            other => return Some(format!("string {key}: unexpected {other:?}")),
+        }
+
+        // Hash: same field->value set (compare sorted to ignore return order).
+        let key = format!("h{n}");
+        match engine_read(engine, Command::HashGetAll { key: key.clone() }) {
+            CommandResponse::HashEntries { mut entries } => {
+                entries.sort();
+                let expected: Vec<(String, Vec<u8>)> = model
+                    .hashes
+                    .get(&key)
+                    .map(|fields| fields.iter().map(|(f, v)| (f.clone(), v.clone())).collect())
+                    .unwrap_or_default();
+                if entries != expected {
+                    return Some(format!("hash {key}: engine={entries:?} model={expected:?}"));
+                }
+            }
+            other => return Some(format!("hash {key}: unexpected {other:?}")),
+        }
+
+        // Set: same member set (compare sorted).
+        let key = format!("e{n}");
+        match engine_read(engine, Command::SetMembers { key: key.clone() }) {
+            CommandResponse::Members { mut members } => {
+                members.sort();
+                let expected: Vec<Vec<u8>> = model
+                    .sets
+                    .get(&key)
+                    .map(|members| members.iter().cloned().collect())
+                    .unwrap_or_default();
+                if members != expected {
+                    return Some(format!("set {key}: engine={members:?} model={expected:?}"));
+                }
+            }
+            other => return Some(format!("set {key}: unexpected {other:?}")),
+        }
+
+        // Feature: all points, timestamp-ascending, exact values.
+        let key = format!("f{n}");
+        let engine_points = match points_to_pairs(engine_read(
+            engine,
+            Command::FeatureQuery {
+                key: key.clone(),
+                start_ms: 0,
+                end_ms: u64::MAX,
+                count: None,
+            },
+        )) {
+            Ok(pairs) => pairs,
+            Err(err) => return Some(format!("feature {key}: {err}")),
+        };
+        let expected: Vec<(u64, Vec<u8>)> = model
+            .features
+            .get(&key)
+            .map(|series| series.iter().map(|(t, v)| (*t, v.clone())).collect())
+            .unwrap_or_default();
+        if engine_points != expected {
+            return Some(format!(
+                "feature {key}: engine={engine_points:?} model={expected:?}"
+            ));
+        }
+
+        // Sequence: all rows, timestamp-ascending, exact.
+        let key = format!("q{n}");
+        match engine_read(
+            engine,
+            Command::SequenceQuery {
+                key: key.clone(),
+                start_ms: 0,
+                end_ms: u64::MAX,
+                count: 1_000_000,
+                filters: Vec::new(),
+            },
+        ) {
+            CommandResponse::SequenceRows { rows } => {
+                let expected: Vec<SequenceFeatureRow> = model
+                    .sequences
+                    .get(&key)
+                    .map(|series| series.values().cloned().collect())
+                    .unwrap_or_default();
+                if rows != expected {
+                    return Some(format!("sequence {key}: engine={rows:?} model={expected:?}"));
+                }
+            }
+            other => return Some(format!("sequence {key}: unexpected {other:?}")),
+        }
+
+        // Control-state increment: every aggregator over the full range. (sum is correct whether
+        // the engine takes the raw or the rollup path; min/max/first/last go through
+        // aggregate_control_state_values, so the model mirrors it exactly, incl. 0-on-empty.)
+        let key = format!("c{n}");
+        let cs_values: Vec<i64> = model
+            .control_state
+            .get(&key)
+            .map(|series| series.values().copied().collect())
+            .unwrap_or_default();
+        for aggregator in ["sum", "min", "max", "first", "last"] {
+            match engine_read(
+                engine,
+                Command::ControlStateQuery {
+                    key: key.clone(),
+                    start_ms: 0,
+                    end_ms: u64::MAX,
+                    aggregator: aggregator.to_string(),
+                },
+            ) {
+                CommandResponse::Integer { value } => {
+                    let expected = model_cs_aggregate(&cs_values, aggregator);
+                    if value != expected {
+                        return Some(format!(
+                            "control_state {aggregator} {key}: engine={value} model={expected}"
+                        ));
+                    }
+                }
+                other => {
+                    return Some(format!("control_state {key} ({aggregator}): unexpected {other:?}"))
+                }
+            }
+        }
+
+        // Control-state change: distinct-value count over the full range.
+        let key = format!("g{n}");
+        match engine_read(
+            engine,
+            Command::ControlStateQuery {
+                key: key.clone(),
+                start_ms: 0,
+                end_ms: u64::MAX,
+                aggregator: "change".to_string(),
+            },
+        ) {
+            CommandResponse::Integer { value } => {
+                let expected = model
+                    .control_state_changes
+                    .get(&key)
+                    .map(|series| {
+                        let mut unique = std::collections::BTreeSet::new();
+                        for set in series.values() {
+                            unique.extend(set.iter().cloned());
+                        }
+                        unique.len() as i64
+                    })
+                    .unwrap_or(0);
+                if value != expected {
+                    return Some(format!(
+                        "control_state change {key}: engine={value} model={expected}"
+                    ));
+                }
+            }
+            other => return Some(format!("control_state change {key}: unexpected {other:?}")),
+        }
+    }
+    None
+}
+
+fn run_one_oracle_sequence(seed: u64) -> Result<(), String> {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let mut model = RefModel::default();
+    let mut rng = Rng::new(seed);
+    let op_count = 20 + rng.below(60);
+    for _ in 0..op_count {
+        let command = gen_oracle_command(&mut rng);
+        model.apply(&command);
+        let _ = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command,
+        });
+    }
+    oracle_mismatch(&engine, &model).map_or(Ok(()), Err)
+}
+
+#[test]
+fn conformance_oracle_matches_reference_model() {
+    let count = std::env::var("CONFORMANCE_SEEDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(64);
+    let start = std::env::var("CONFORMANCE_START")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let outcome = (start..start.saturating_add(count))
+        .map(|seed| match run_one_oracle_sequence(seed) {
+            Ok(()) => Ok(()),
+            Err(msg) => Err(format!("seed {seed}: {msg}")),
+        })
+        .find(Result::is_err);
+    if let Some(Err(failure)) = outcome {
+        panic!("oracle found an engine-vs-reference-model mismatch: {failure}");
+    }
+}
+
+#[test]
+#[ignore]
+fn debug_minimize_seed() {
+    // Diagnostic tool: replays a seed command-by-command, reporting the first command after which a
+    // reload loses state (delta-minimizes a harness failure to its trigger). Set `seed` to a
+    // failing seed and run: cargo test --lib debug_minimize_seed -- --ignored --nocapture
+    let seed = 0u64;
+    let mut rng = Rng::new(seed);
+    let op_count = 20 + rng.below(50);
+    let mut commands = Vec::new();
+    for _ in 0..op_count {
+        // Mirror run_one_sequence's per-op branch selector (no-maintenance mode) so the rng stream
+        // -- and thus the replayed command sequence -- matches the harness exactly.
+        let _selector = 2 + rng.below(10);
+        commands.push(gen_command(&mut rng));
+    }
+    for prefix_len in 1..=commands.len() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocks = dir.path().join("blocks");
+        let indexes = dir.path().join("indexes");
+        let engine =
+            TemporalEngine::with_local_dirs(1 << 20, dir.path().join("a"), &blocks, &indexes);
+        engine.load_shard(1);
+        for command in &commands[..prefix_len] {
+            let _ = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: command.clone(),
+            });
+        }
+        let before = read_snapshot(&engine);
+        engine.unload_shard(1);
+        let reloaded =
+            TemporalEngine::with_local_dirs(1 << 20, dir.path().join("b"), &blocks, &indexes);
+        reloaded.load_shard(1);
+        let after = read_snapshot(&reloaded);
+        if before != after {
+            println!("FIRST BREAK at prefix_len={prefix_len}, command = {:?}", commands[prefix_len - 1]);
+            println!("full prefix:");
+            for (i, c) in commands[..prefix_len].iter().enumerate() {
+                println!("  [{i}] {c:?}");
+            }
+            for (b, a) in before.iter().zip(after.iter()).filter(|(b, a)| b != a) {
+                println!("  MISMATCH before={b}  after={a}");
+            }
+            return;
+        }
+    }
+    println!("no break found across {} prefixes", commands.len());
+}
+
+#[test]
+fn conformance_random_sequences_never_panic_and_survive_reload() {
+    // Silence the default panic hook for the duration so a deliberately-provoked panic (if any bug
+    // exists) does not spam stderr; catch_unwind still reports it with the reproducing seed.
+    let previous_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    // Default 128 seeds in the suite; a deep hunt can widen without recompiling via
+    // CONFORMANCE_SEEDS / CONFORMANCE_START (e.g. CONFORMANCE_SEEDS=4000 cargo test ...).
+    let count = std::env::var("CONFORMANCE_SEEDS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(64);
+    let start = std::env::var("CONFORMANCE_START")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    let maintenance = std::env::var("CONFORMANCE_MAINTENANCE").is_ok();
+    let outcome = (start..start.saturating_add(count))
+        .map(|seed| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_one_sequence(seed, maintenance)
+            }));
+            match result {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(msg)) => Err(format!("seed {seed}: {msg}")),
+                Err(_) => Err(format!("seed {seed}: PANICKED (no-panic invariant violated)")),
+            }
+        })
+        .find(Result::is_err);
+    std::panic::set_hook(previous_hook);
+    if let Some(Err(failure)) = outcome {
+        panic!("conformance harness found a repro: {failure}");
+    }
+}
