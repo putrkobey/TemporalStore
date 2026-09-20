@@ -444,3 +444,1787 @@ fn the_blocks_of_one_object_are_two_populations_at_both_routing_ranges() {
              {}",
             BlocksPerObject::percentile(&measured.histogram, 0.50)
         );
+    }
+    for (label, _, measured) in arms.iter().filter(|(l, _, _)| l.starts_with("mixed")) {
+        assert_eq!(
+            1,
+            BlocksPerObject::percentile(&measured.histogram, 0.50),
+            "{label}: a mixed corpus is supposed to have a p50 of one -- routed keys outnumber \
+             container objects -- and it is {}",
+            BlocksPerObject::percentile(&measured.histogram, 0.50)
+        );
+        assert!(
+            BlocksPerObject::max(&measured.histogram) >= 100,
+            "{label}: and a MAX at the container shape, which is {}",
+            BlocksPerObject::max(&measured.histogram)
+        );
+    }
+
+    // --- THE RANGE MUST NOT MOVE IT. Same shape, same corpus size, two ranges: identical. ---
+    let mut compared = 0usize;
+    for (label, end, measured) in &arms {
+        if *end != WHOLE_KEYSPACE_END {
+            continue;
+        }
+        let (_, _, other) = arms
+            .iter()
+            .find(|(l, e, _)| l == label && *e == OPERATOR_END)
+            .expect("every arm is run at both ranges");
+        compared += 1;
+        assert_eq!(
+            measured.histogram, other.histogram,
+            "{label}: the pages-per-OBJECT histogram differs between the whole keyspace and \
+             0..=1023. An object's pages route to its own key's bucket, so this distribution \
+             cannot depend on how many buckets exist -- if it does, one of the two arms is not \
+             measuring what it says"
+        );
+    }
+    assert_eq!(
+        6, compared,
+        "six shape/size pairs are supposed to be compared across the two ranges, not {compared}"
+    );
+}
+
+// =================================================================================================
+// WHAT A TABLE WOULD COST. Built for real, over a real store, and charged to the chunk column.
+// =================================================================================================
+
+/// A candidate interning table: the handle-to-name direction a read needs, and the
+/// name-to-handle direction a write needs. Both, because a table with only one of them cannot
+/// serve the engine and would price the change at half.
+#[derive(Default)]
+struct CandidateTable {
+    by_handle: Vec<Arc<str>>,
+    by_name: std::collections::HashMap<Arc<str>, u32>,
+}
+
+impl CandidateTable {
+    fn intern(&mut self, name: &Arc<str>) {
+        if self.by_name.contains_key(name) {
+            return;
+        }
+        let handle = self.by_handle.len() as u32;
+        self.by_handle.push(Arc::clone(name));
+        self.by_name.insert(Arc::clone(name), handle);
+    }
+
+    fn len(&self) -> usize {
+        self.by_handle.len()
+    }
+}
+
+/// What a table over `object_key` and a table over `component` would charge, measured.
+///
+/// TWO BYTE COLUMNS AND THEY ANSWER DIFFERENT QUESTIONS, which is a correction this measurement
+/// forced rather than a distinction planned for it. `ALLOC_CHUNK_BYTES` is CUMULATIVE: a `Vec` and a
+/// `HashMap` grown one entry at a time charge every intermediate buffer they outgrow, and a
+/// geometric growth series sums to roughly twice the final buffer. So the chunk column is what
+/// BUILDING the table costs the allocator, and refuting a table on it alone would be refuting it on
+/// a figure about twice too large. `resident_bytes` is what the table then HOLDS -- its final
+/// capacities -- and that is the steady-state cost a shipped table would carry, so that is the one
+/// the verdicts below are taken on. Both are reported.
+#[derive(Debug, Clone)]
+struct TableCost {
+    entries: usize,
+    blocks: usize,
+    chunk_bytes: u64,
+    request_bytes: u64,
+    allocations: u64,
+    resident_bytes: usize,
+}
+
+impl TableCost {
+    /// Cumulative chunk bytes a page's share of BUILDING the table cost.
+    fn chunk_per_block(&self) -> f64 {
+        if self.blocks == 0 {
+            0.0
+        } else {
+            self.chunk_bytes as f64 / self.blocks as f64
+        }
+    }
+
+    /// What the built table HOLDS, per page. The figure a verdict is taken on.
+    fn resident_per_block(&self) -> f64 {
+        if self.blocks == 0 {
+            0.0
+        } else {
+            self.resident_bytes as f64 / self.blocks as f64
+        }
+    }
+
+    fn entries_per_block(&self) -> f64 {
+        self.entries as f64 / self.blocks.max(1) as f64
+    }
+}
+
+/// What a built `CandidateTable` holds: the handle vector's capacity, and the map's.
+///
+/// The map's per-slot cost is its key and value plus hashbrown's one control byte a slot. The
+/// `Arc<str>` payloads are NOT counted -- they are clones of allocations the store already holds,
+/// which is the whole finding `block_entry_names` established, and charging them here would price
+/// the table for bytes it does not add.
+#[cfg(feature = "alloc-probe")]
+fn resident_bytes(table: &CandidateTable) -> usize {
+    let handle_side = table.by_handle.capacity() * std::mem::size_of::<Arc<str>>();
+    let map_side = table.by_name.capacity()
+        * (std::mem::size_of::<Arc<str>>() + std::mem::size_of::<u32>() + 1);
+    handle_side + map_side
+}
+
+/// The bytes a handle SAVES in the entry, per page.
+///
+/// Not 12, and the difference is the whole reason this is a constant with a comment rather than a
+/// subtraction at the call site. Swapping a 16-byte fat pointer for a 4-byte handle removes 12
+/// bytes of FIELD, but `BlockIndex` is 8-aligned and carries three flag bytes in its slack, so
+/// what the structure actually loses is a whole eight-byte step and then some of the slack. The
+/// measured steps, from the layout probe below: 88 with three names, 72 with the model spelling as
+/// one byte, 56 with the component as a two-byte ordinal as well, 48 with all three. Every one of
+/// those is SIXTEEN, not twelve.
+#[allow(dead_code)]
+const ENTRY_BYTES_A_HANDLE_SAVES: usize = 16;
+
+#[cfg(feature = "alloc-probe")]
+fn measure_object_key_table(engine: &TemporalEngine) -> TableCost {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    let mut blocks = 0usize;
+    // Collected first, so the probe charges the TABLE and not the walk that feeds it.
+    //
+    // THE NAMES COME FROM THE LOOKUP, WHICH IS WHERE THE ALLOCATION THEY MEASURE NOW LIVES. The
+    // table this prices interns shared names; the pages have none of their own, so the shared
+    // names the bucket's own lookup holds are the input, and that is the same set of `Arc`s the
+    // table would be fed in production.
+    let named = super::BlockObjects::of(&shard.bucket_index);
+    let mut names: Vec<Arc<str>> = Vec::new();
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for (handle, _block) in bucket.block_index.iter() {
+            blocks += 1;
+            names.push(Arc::clone(named.at(bucket.routing_bucket, *handle)));
+        }
+    }
+    let probe = Probe::start();
+    let mut table = CandidateTable::default();
+    for name in &names {
+        table.intern(name);
+    }
+    let counts = probe.stop();
+    let entries = table.len();
+    let resident = resident_bytes(&table);
+    // Held past the probe so nothing is freed inside the window.
+    std::hint::black_box(&table);
+    TableCost {
+        entries,
+        blocks,
+        chunk_bytes: counts.chunk_bytes,
+        request_bytes: counts.alloc_bytes,
+        allocations: counts.allocs,
+        resident_bytes: resident,
+    }
+}
+
+#[cfg(feature = "alloc-probe")]
+fn measure_component_table(engine: &TemporalEngine) -> TableCost {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    let mut blocks = 0usize;
+    let mut names: Vec<Arc<str>> = Vec::new();
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for (_, block) in bucket.block_index.iter() {
+            blocks += 1;
+            // NOTHING TO INTERN. This measured what a candidate intern table for element names
+            // would cost, over the names the entries held. The entries hold none, so the table
+            // has no input -- and the question it was pricing is settled more cheaply than it
+            // proposed: the name did not need interning, it needed removing, and `engine_storage_state.rs`'s pin
+            // records the sixteen bytes a page that recovered.
+        }
+    }
+    let probe = Probe::start();
+    let mut table = CandidateTable::default();
+    for name in &names {
+        table.intern(name);
+    }
+    let counts = probe.stop();
+    let entries = table.len();
+    let resident = resident_bytes(&table);
+    std::hint::black_box(&table);
+    TableCost {
+        entries,
+        blocks,
+        chunk_bytes: counts.chunk_bytes,
+        request_bytes: counts.alloc_bytes,
+        allocations: counts.allocs,
+        resident_bytes: resident,
+    }
+}
+
+/// A HANDLE FOR `object_key` PAYS ON ONE POPULATION AND LOSES ON THE OTHER, and the break-even is
+/// measured rather than argued.
+///
+/// The saving is 16 bytes a PAGE. The cost is one table entry per distinct OBJECT KEY, and that
+/// cost is an allocation, so it appears on the chunk column and nowhere else -- which is why this
+/// arm is `alloc-probe` gated and the counting arm above is not.
+///
+/// BOTH DIRECTIONS OF THE TABLE ARE BUILT. A `Vec<Arc<str>>` alone would serve a read and price
+/// the change at a third of what it costs; the engine also has to go name-to-handle on every
+/// write, and that is a hash map.
+#[test]
+#[ignore = "alloc-probe only, seeds six stores; run by name with --features alloc-probe"]
+#[cfg(feature = "alloc-probe")]
+fn a_handle_for_the_object_key_pays_only_above_the_measured_break_even() {
+    let mut path_lengths: Vec<usize> = Vec::new();
+    let mut rows: Vec<(String, TableCost, BlocksPerObject)> = Vec::new();
+
+    for (range_label, end) in [
+        ("whole keyspace", WHOLE_KEYSPACE_END),
+        ("operator 1023", OPERATOR_END),
+    ] {
+        for (shape, seed) in [
+            ("routed keys", 0usize),
+            ("containers of 100", 1),
+            ("mixed half and half", 2),
+        ] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            path_lengths.push(dir.path().as_os_str().len());
+            let engine = probe_engine(dir.path());
+            load_shard_over(&engine, end);
+            match seed {
+                0 => seed_routed_keys(&engine, 4_000),
+                1 => seed_container_keys(&engine, 40, 100),
+                _ => seed_mixed(&engine, 4_000),
+            }
+            let distribution = blocks_per_object(&engine);
+            let cost = measure_object_key_table(&engine);
+            rows.push((format!("{shape}, {range_label}"), cost, distribution));
+        }
+    }
+
+    assert_eq!(6, path_lengths.len());
+    for length in &path_lengths {
+        assert_eq!(path_lengths[0], *length, "the store path length moved between arms");
+    }
+
+    println!(
+        "\n=== A HANDLE FOR object_key: 16 B a page saved against one table entry per object ===\n\
+           store path length {} characters; table = Vec<Arc<str>> + HashMap<Arc<str>, u32>",
+        path_lengths[0]
+    );
+    println!(
+        "  {:<34} {:>7} {:>7} {:>6} {:>10} {:>10} {:>8} {:>8}",
+        "arm", "blocks", "entries", "p/obj", "build/pg", "resident/pg", "saved/pg", "NET/pg"
+    );
+    for (label, cost, distribution) in &rows {
+        let saved = ENTRY_BYTES_A_HANDLE_SAVES as f64;
+        let net = saved - cost.resident_per_block();
+        println!(
+            "  {label:<34} {:>7} {:>7} {:>6.2} {:>10.2} {:>10.2} {:>8.2} {:>+8.2}",
+            cost.blocks,
+            cost.entries,
+            cost.blocks as f64 / distribution.objects().max(1) as f64,
+            cost.chunk_per_block(),
+            cost.resident_per_block(),
+            saved,
+            net
+        );
+        // The chunk rule is a FLOOR, not an equality (#1969).
+        assert!(
+            cost.chunk_bytes >= cost.request_bytes,
+            "{label}: the chunk column read {} BELOW the request column {}, which cannot happen \
+             if it is reading `malloc_usable_size`",
+            cost.chunk_bytes,
+            cost.request_bytes
+        );
+        assert!(
+            cost.allocations > 0,
+            "{label}: the table was built without allocating, which reads as a probe that is not \
+             installed rather than as a free table"
+        );
+        assert!(cost.blocks > 0, "{label}: no pages, so every figure on this row is free");
+    }
+
+    // --- THE VERDICT, PER POPULATION. ---
+    let routed = rows
+        .iter()
+        .filter(|(l, _, _)| l.starts_with("routed"))
+        .collect::<Vec<_>>();
+    let containers = rows
+        .iter()
+        .filter(|(l, _, _)| l.starts_with("containers"))
+        .collect::<Vec<_>>();
+    assert_eq!(2, routed.len());
+    assert_eq!(2, containers.len());
+
+    for (label, cost, _) in &routed {
+        assert_eq!(
+            cost.entries, cost.blocks,
+            "{label}: a routed key is one page per object, so the table is supposed to hold one \
+             entry per page -- {} entries over {} pages",
+            cost.entries, cost.blocks
+        );
+        assert!(
+            cost.resident_per_block() > ENTRY_BYTES_A_HANDLE_SAVES as f64,
+            "{label}: the table holds {:.2} B a page against {} B saved, so a handle is supposed \
+             to LOSE on this population and it does not",
+            cost.resident_per_block(),
+            ENTRY_BYTES_A_HANDLE_SAVES
+        );
+    }
+    for (label, cost, _) in &containers {
+        assert!(
+            cost.entries * 50 < cost.blocks,
+            "{label}: a container object holds a hundred pages, so the table is supposed to hold \
+             far fewer entries than pages -- {} entries over {} pages",
+            cost.entries,
+            cost.blocks
+        );
+        assert!(
+            cost.resident_per_block() < ENTRY_BYTES_A_HANDLE_SAVES as f64,
+            "{label}: the table holds {:.2} B a page against {} B saved, so a handle is supposed \
+             to PAY on this population and it does not",
+            cost.resident_per_block(),
+            ENTRY_BYTES_A_HANDLE_SAVES
+        );
+    }
+
+    let break_even: f64 = {
+        // Bytes a table entry HOLDS, from the routed arm where entries == pages exactly.
+        let per_entry = routed[0].1.resident_per_block();
+        per_entry / ENTRY_BYTES_A_HANDLE_SAVES as f64
+    };
+    println!(
+        "\n  BREAK-EVEN: a table entry holds {:.2} B resident (and about {:.2} B to build, \n\
+           cumulatively), so a handle pays above {:.2} pages per object and loses below it. \n\
+           Measured p50 pages/object: routed 1, containers {}, mixed {}.",
+        routed[0].1.resident_per_block(),
+        routed[0].1.chunk_per_block(),
+        break_even,
+        BlocksPerObject::percentile(&containers[0].2.histogram, 0.50),
+        BlocksPerObject::percentile(
+            &rows
+                .iter()
+                .find(|(l, _, _)| l.starts_with("mixed"))
+                .expect("a mixed arm ran")
+                .2
+                .histogram,
+            0.50
+        ),
+    );
+    assert!(
+        break_even > 1.0,
+        "the break-even came out at {break_even:.2} pages per object, at or below one. That would \
+         mean a table entry is cheaper than the pointer it replaces even for a single-page object, \
+         and this whole verdict would be the other way round"
+    );
+}
+
+/// A HANDLE FOR `component` IS DECIDED BY HOW MANY DISTINCT NAMES THE STORE HOLDS, AND THAT IS TWO
+/// POPULATIONS TOO.
+///
+/// THIS TEST WAS WRITTEN TO REFUTE THE HANDLE OUTRIGHT and its own anti-vacuity assertion refused to
+/// let it. The reasoning was that a container key's fields are each their own page and the component
+/// is the only thing telling them apart, so distinct component names must grow with the pages. That
+/// is true WITHIN one object and false ACROSS a store: forty hashes with the same hundred field
+/// names hold 400 distinct components over 4,000 pages, because a schema repeats. The assertion
+/// fired, and the verdict is stated by population instead.
+///
+/// THE TWO POPULATIONS, and which one a real store is in depends on where the name comes from:
+///
+///   * A SCHEMA name -- a hash field -- repeats across every object of that shape, so distinct
+///     names are bounded by the schema and a handle PAYS.
+///   * A CONTENT-DERIVED name does not repeat at all. `zset_component` is
+///     `format!("{biased:016x}{}", hex::encode(member))` and `timestamped_component` is
+///     `format!("{stored_key:016x}{identity:016x}")`: the name IS the lookup key, computed from the
+///     element. One entry per page, and a handle LOSES.
+///
+/// AND THE SECOND POPULATION CANNOT BE ORDINALISED AWAY, which is the part that matters for
+/// sequencing. A content-derived name needs a per-object member-to-ordinal map to be replaced by an
+/// ordinal at all -- the same table this test prices, plus a second one to get back. Which is why
+/// the lever to reach for on that population is not the pointer: it is that those names are HEX
+/// TEXT FOR NUMBERS, measured separately, needing no table at all.
+#[test]
+#[ignore = "alloc-probe only, seeds four stores; run by name with --features alloc-probe"]
+#[cfg(feature = "alloc-probe")]
+fn a_handle_for_the_component_costs_a_table_entry_per_block() {
+    let mut path_lengths: Vec<usize> = Vec::new();
+    let mut rows: Vec<(String, TableCost, BlocksPerObject)> = Vec::new();
+
+    for (range_label, end) in [
+        ("whole keyspace", WHOLE_KEYSPACE_END),
+        ("operator 1023", OPERATOR_END),
+    ] {
+        for (shape, keys, members) in [("containers of 100", 40usize, 100usize), ("one container of 2000", 1, 2_000)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            path_lengths.push(dir.path().as_os_str().len());
+            let engine = probe_engine(dir.path());
+            load_shard_over(&engine, end);
+            seed_container_keys(&engine, keys, members);
+            let distribution = blocks_per_object(&engine);
+            distribution.report(&format!("{shape}, {range_label}"));
+            let cost = measure_component_table(&engine);
+            rows.push((format!("{shape}, {range_label}"), cost, distribution));
+        }
+    }
+
+    for length in &path_lengths {
+        assert_eq!(path_lengths[0], *length, "the store path length moved between arms");
+    }
+
+    const SAVED: f64 = ENTRY_BYTES_A_HANDLE_SAVES as f64;
+    println!(
+        "\n=== A HANDLE FOR component: {SAVED} B a page saved against one table entry per \
+           DISTINCT COMPONENT ===\n  store path length {} characters",
+        path_lengths[0]
+    );
+    println!(
+        "  {:<40} {:>7} {:>7} {:>9} {:>10} {:>11} {:>8}",
+        "arm", "blocks", "entries", "entr/page", "build/pg", "resident/pg", "NET/pg"
+    );
+    for (label, cost, _) in &rows {
+        println!(
+            "  {label:<40} {:>7} {:>7} {:>9.3} {:>10.2} {:>11.2} {:>+8.2}",
+            cost.blocks,
+            cost.entries,
+            cost.entries_per_block(),
+            cost.chunk_per_block(),
+            cost.resident_per_block(),
+            SAVED - cost.resident_per_block()
+        );
+        assert!(
+            cost.chunk_bytes >= cost.request_bytes,
+            "{label}: chunk column below request column"
+        );
+        assert!(cost.blocks > 0, "{label}: no pages measured");
+    }
+
+    // --- BOTH POPULATIONS MUST BE REACHED, or the verdict is decided by the fixture. ---
+    let schema: Vec<&(String, TableCost, BlocksPerObject)> = rows
+        .iter()
+        .filter(|(label, _, _)| label.starts_with("containers of 100"))
+        .collect();
+    let content: Vec<&(String, TableCost, BlocksPerObject)> = rows
+        .iter()
+        .filter(|(label, _, _)| label.starts_with("one container of 2000"))
+        .collect();
+    assert_eq!(2, schema.len(), "the repeated-schema arm runs at both ranges");
+    assert_eq!(2, content.len(), "the unique-name arm runs at both ranges");
+
+    // --- THE SCHEMA POPULATION: names repeat, so the table is small and the handle PAYS. ---
+    for (label, cost, _) in &schema {
+        assert!(
+            cost.entries_per_block() < 0.5,
+            "{label}: {} distinct components over {} pages. This arm exists to hold a REPEATED \
+             schema -- the same hundred field names across forty objects -- so distinct names are \
+             supposed to be far fewer than pages",
+            cost.entries,
+            cost.blocks
+        );
+        assert!(
+            cost.resident_per_block() < SAVED,
+            "{label}: the table holds {:.2} B a page against {SAVED} B saved, so a handle is \
+             supposed to PAY where the names repeat",
+            cost.resident_per_block()
+        );
+    }
+
+    // --- THE CONTENT-DERIVED POPULATION: one name per page, and the handle LOSES. ---
+    for (label, cost, _) in &content {
+        assert!(
+            cost.entries_per_block() > 0.9,
+            "{label}: {} distinct components over {} pages. This arm exists to hold names that do \
+             NOT repeat -- one container whose two thousand members are all distinct -- so the \
+             table is supposed to hold about one entry per page",
+            cost.entries,
+            cost.blocks
+        );
+        assert!(
+            cost.resident_per_block() > SAVED,
+            "{label}: the table holds {:.2} B a page against {SAVED} B saved, so a handle is \
+             supposed to LOSE where every name is distinct",
+            cost.resident_per_block()
+        );
+    }
+
+    println!(
+        "\n  VERDICT, BY POPULATION. Where a component name is a repeated SCHEMA name the table \n\
+           holds {:.2} B a page and a handle nets {:+.2}. Where it is CONTENT-DERIVED -- a zset \n\
+           member, a timestamped entry -- it holds {:.2} B a page and a handle nets {:+.2}. A \n\
+           single blended figure would hide that, and the second population is the one a \n\
+           container store is mostly made of.",
+        schema[0].1.resident_per_block(),
+        SAVED - schema[0].1.resident_per_block(),
+        content[0].1.resident_per_block(),
+        SAVED - content[0].1.resident_per_block(),
+    );
+}
+
+/// THE COMPONENT NAME IS HEX TEXT FOR NUMBERS, AND HALF OF IT CARRIES NOTHING.
+///
+/// A separate and larger term than the pointer, measured separately because it is a separate
+/// change: it needs no table, no ordinal and no map. `{biased:016x}` is sixteen characters for
+/// eight bytes and `hex::encode(member)` is exactly twice its input, so a zset member of twenty
+/// bytes becomes a fifty-six character name where twenty-eight bytes would do.
+///
+/// COUNTED OVER A REAL STORE and classified by a predicate that a hash FIELD fails -- a field is
+/// the caller's own text and is not an encoding of anything, which is what stops this reporting a
+/// saving on names that have none.
+#[test]
+#[ignore = "seeds two stores; run by name"]
+fn the_component_name_is_hex_text_for_numbers_and_that_half_is_measured() {
+    let mut rows: Vec<(String, BlocksPerObject)> = Vec::new();
+    let mut path_lengths: Vec<usize> = Vec::new();
+    for (range_label, end) in [
+        ("whole keyspace", WHOLE_KEYSPACE_END),
+        ("operator 1023", OPERATOR_END),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        path_lengths.push(dir.path().as_os_str().len());
+        let engine = probe_engine(dir.path());
+        load_shard_over(&engine, end);
+        // Sets and zsets produce hex component names; hash fields are the caller's own short
+        // text. Both, so the classifier is exercised in both directions in the same store and a
+        // predicate that matched everything would fail below.
+        seed_wide_members(&engine, 4, 100);
+        let measured = blocks_per_object(&engine);
+        measured.report(&format!("hex component census, {range_label}"));
+        rows.push((range_label.to_string(), measured));
+    }
+    for length in &path_lengths {
+        assert_eq!(path_lengths[0], *length, "the store path length moved between arms");
+    }
+
+    for (label, measured) in &rows {
+        assert!(
+            measured.component_name_bytes > 0,
+            "{label}: no component text at all, so the ratio below is free"
+        );
+        // BOTH directions of the predicate must be reached, or it is not discriminating.
+        assert!(
+            measured.hex_components > 0,
+            "{label}: the predicate classified NO component as a hex spelling, and this fixture \
+             seeds zsets and lists which produce them"
+        );
+        assert!(
+            measured.hex_component_name_bytes < measured.component_name_bytes,
+            "{label}: the predicate classified EVERY component byte as hex, and this fixture also \
+             seeds hash fields, which are the caller's own text. A predicate that matches \
+             everything is not measuring anything"
+        );
+        let hex_share =
+            measured.hex_component_name_bytes as f64 / measured.component_name_bytes as f64;
+        println!(
+            "  {label}: {:.1}% of component text is a hex spelling of numbers; storing those as \
+             bytes would halve {} B to {} B",
+            100.0 * hex_share,
+            measured.hex_component_name_bytes,
+            measured.hex_component_name_bytes / 2
+        );
+    }
+}
+
+// =================================================================================================
+// LAYOUT. What each name's handle does to the entry, and to the component level around it.
+// =================================================================================================
+
+// `mod ordinal_layout` AND `an_ordinal_does_not_cost_the_component_list_its_tag` WERE HERE.
+//
+// They measured whether replacing `ComponentBlocks`'s component NAME with a two-byte ordinal would
+// cost `ComponentList` the tag that rode the name's niche. Mirror types with `NonZeroU16`,
+// `NonZeroU32` and a plain-integer control priced the three candidates, and the answer was that an
+// ordinal makes the level smaller rather than larger.
+//
+// THE NARROWING THEY WERE CLEARING THE WAY FOR IS SUPERSEDED, AND BY A STRONGER RESULT. The field
+// is not two bytes now, it is zero: `ComponentBlocks` and `ComponentList` are deleted and an
+// object's refs hang directly off the object. Deleting the name beats narrowing it, so there is no
+// decision left for this measurement to inform.
+//
+// AND A MECHANICAL REWRITE WOULD HAVE BEEN WORSE THAN A DELETION. Two of its arms -- wrapper width
+// equals entry width, and the sentinel control equals the `NonZero` one -- still COMPILE after the
+// deletion, because both of their operands are mirror types declared in this file. They would have
+// become assertions about rustc's layout rules over types this crate does not ship: green forever,
+// measuring nothing. The two arms that lose an operand would have been repaired by substituting
+// the pinned literal 40, which makes both sides constants fixed by declarations in this same file.
+// The comment that stood at the pins said they were "pinned so a change to `BlockRefs` cannot make
+// this test vacuous" -- a guard that protects nothing once the left-hand side is local too.
+
+/// THE ENTRY IS 72 BYTES AND ITS RECONSTRUCTION IS ASSERTED, NOT ITS TOTAL.
+///
+/// A literal 72 goes stale silently the next time a field moves. What is asserted here is that the
+/// fields ACCOUNT for the number: the eight-aligned group plus one rounding of the tail.
+///
+/// AND WHAT EACH OF THE THREE NAMES WOULD BE WORTH, measured on mirrors rather than projected, so
+/// the remaining two verdicts are stated against the same arithmetic as the one that shipped.
+#[test]
+fn every_byte_of_the_entry_is_accounted_for_by_the_fields_it_holds() {
+    use std::mem::{align_of, offset_of, size_of};
+
+    let address = size_of::<crate::block_store::ElementEntry>();
+    let model = size_of::<StoredModelKind>();
+    // THE WIDTH THE KEY USED TO COST, kept as a counterfactual beside `component`'s for the
+    // same reason: the verdicts below are stated against what each of the three names WOULD be
+    // worth, and that arithmetic needs the term even though no field carries it.
+    let object_key_when_it_was_a_field = size_of::<Arc<str>>();
+    // `component` IS NO LONGER A FIELD OF THE ENTRY. The local is kept as the WIDTH THE NAME USED
+    // TO COST, because the verdicts below are stated against that arithmetic -- what each of the
+    // three names would be worth -- and it is now a counterfactual rather than a measurement.
+    let component_when_it_was_a_field = size_of::<Option<Arc<str>>>();
+    // TWO FLAG BYTES, NOT THREE, AND THE ROUNDING HID THE THIRD.
+    //
+    // This read `3usize`. The entry holds `dirty` and `deleted` and nothing else -- `log_backed`
+    // is an accessor over the address, not a field -- so the tail is two bytes. The
+    // reconstruction below went on passing anyway: a tail of three and a tail of four both round
+    // to one word, so the sum reached the same width either way. That is the same word-granularity
+    // blindness `entry_width_at_each_step` documents for its own mirror and
+    // `an_assigned_durable_id_defeats_ground_one_only` carried in four of them.
+    //
+    // SPELLED AS THE TYPES, so a flag that stops being a `bool` fails here instead of leaving a
+    // literal right by luck.
+    let flags = size_of::<bool>() + size_of::<bool>();
+
+    println!("\n=== BlockIndex, field by field ===");
+    println!("  offsets: address@{} model_id@{} dirty@{} deleted@{}",
+        offset_of!(BlockIndex, address),
+        offset_of!(BlockIndex, model_id),
+        offset_of!(BlockIndex, dirty),
+        offset_of!(BlockIndex, deleted),
+    );
+    println!(
+        "  address {address} + model_id {model} + flags {flags} = {} bytes of field in {} B \
+         (the key would have added {object_key_when_it_was_a_field} more and a name \
+          {component_when_it_was_a_field} on top of that)",
+        address + model + flags,
+        size_of::<BlockIndex>()
+    );
+
+    assert_eq!(1, model, "the model spelling is supposed to be one byte");
+    assert_eq!(8, align_of::<BlockIndex>());
+
+    // THE RECONSTRUCTION. The 8-aligned fields form the group; the model byte and the three
+    // flag bytes are the tail, and the tail is rounded once to the alignment.
+    //
+    // ONE 8-ALIGNED FIELD NOW. `component` was one of three and went at 56 -> 40; `object_key`
+    // was the second and goes at 40 -> 24; the address is what is left. The reconstruction is what
+    // proves the arithmetic rather than the comment -- if the field set and this sum part, it
+    // fails here.
+    let eight_aligned = address;
+    let tail = model + flags;
+    let round_up = |value: usize, to: usize| (value + to - 1) / to * to;
+    assert_eq!(
+        eight_aligned + round_up(tail, align_of::<BlockIndex>()),
+        size_of::<BlockIndex>(),
+        "the fields do not account for the structure: group {eight_aligned} + tail {tail} rounded \
+         to {} is not {}",
+        align_of::<BlockIndex>(),
+        size_of::<BlockIndex>()
+    );
+    // 56 AND NOT 64: the address inside the entry shed its object id, a whole eight-byte field in
+    // the eight-aligned group. The accounting above is a RECONSTRUCTION and needed no change for it
+    // -- which is the point of reconstructing rather than totalling -- but this literal did, and
+    // NOTHING BUT RUNNING IT COULD HAVE SAID SO. That sentence was already here for the 72 -> 64
+    // step and it earned itself again: a scan for `const _: () = assert!(size_of...)` does not see
+    // an `assert_eq!` in a test body, so this pin compiled clean and failed at run time.
+    // TWENTY-FOUR NOW, AND THE SENTENCE ABOVE EARNED ITSELF A FOURTH TIME. It was written for
+    // the 72 -> 64 step, repeated for 64 -> 56, again for 56 -> 40, and this is 40 -> 24: the
+    // RECONSTRUCTION above needed no change, which is the point of reconstructing rather than
+    // totalling, and this literal did. `cargo check` cannot see an `assert_eq!` in a test body,
+    // so the pin compiled clean and only running it said so.
+    assert_eq!(24, size_of::<BlockIndex>());
+    // THE `!= 39` AND `!= 41` PARTNERS THAT STOOD HERE ARE GONE. They could distinguish no
+    // case. The `assert_eq!` above panics first, so on the only change that could ever have
+    // fired them they were never reached -- and an assertion that never ran reads exactly like
+    // one that passed. The claim they reached for, that 40 is a value and not a bound, is
+    // carried by `align_of::<BlockIndex>() == 8` earlier in this function, which a width pin
+    // does NOT entail: `== 40` is equally true at align 1, 2, 4 and 8.
+
+    // The slack, which is why every step here is sixteen bytes and not twelve.
+    let slack = size_of::<BlockIndex>() - (eight_aligned + tail);
+    println!(
+        "  slack {slack} B -- the three flag bytes and the model byte share the rounding, which is \
+         why swapping a 16-byte pointer for a small field takes the STRUCTURE down a whole \
+         eight-byte step and then some"
+    );
+    assert!(slack < 8, "a slack of {slack} means a whole word is unaccounted for");
+
+    // AND THE MAP ARM, WHICH NO LONGER CARRIES THE ENTRY INLINE.
+    //
+    // This used to assert `BlockIndexMap == 8 + size_of::<BlockIndex>()` -- a handle plus an inline
+    // entry -- and that was the relation that made narrowing the entry worth a word off every
+    // `BucketNode` in the `BucketMap`. The single-page arm now holds a POINTER, so the page index is
+    // a bare container header and its width is INDEPENDENT of the entry's.
+    //
+    // WHICH MEANS THE NARROWING MEASURED ABOVE IS STILL WORTH SOMETHING, BUT SOMEWHERE ELSE: on the
+    // HEAP rather than in the node. Every boxed single-page arm and every element of every page list
+    // is sixteen bytes smaller for it. The node banked its share once, and once only, whichever of
+    // the two changes landed second.
+    //
+    // The relation is asserted in the NEGATIVE so this cannot silently become true again: an entry
+    // back inside the page index would put the width of the whole structure back on every bucket.
+    let arm = size_of::<crate::engine::state::BlockIndexMap>();
+    assert_ne!(
+        8 + size_of::<BlockIndex>(),
+        arm,
+        "the page index is {arm} B, which is a handle plus a whole entry again -- the inline arm has \
+         come back and every bucket in the map is paying the entry's width whether it holds one page \
+         or fifty"
+    );
+    assert_eq!(
+        size_of::<Vec<(u64, BlockIndex)>>(),
+        arm,
+        "the page index is {arm} B against its own page list's {} B; it is supposed to be exactly \
+         that header, with both other arms riding pointer niches",
+        size_of::<Vec<(u64, BlockIndex)>>()
+    );
+    // THE COMPARISON HAD TO MOVE OFF THE ENTRY'S WIDTH, because the entry is now exactly as wide
+    // as the arm and `arm < size_of::<BlockIndex>()` is false of two equal numbers.
+    //
+    // IT WAS NEVER THE RIGHT COMPARISON ANYWAY, which the println below already said: the arm is a
+    // bare page-list header and its width is INDEPENDENT of the entry's. What "too narrow to hold
+    // one inline" means is that it cannot hold a HANDLE AND AN ENTRY, which is what an inline
+    // single-page arm would have to carry -- so that is what is asserted. At 24 against 32 it
+    // holds, and it would hold at any entry width, which is the point: this is a claim about the
+    // representation and not an accident of two numbers meeting.
+    assert!(
+        arm < size_of::<u64>() + size_of::<BlockIndex>(),
+        "the page index is {arm} B and a handle plus one entry is {} B; the index must be too \
+         narrow to hold one inline, or the entry is back in the node",
+        size_of::<u64>() + size_of::<BlockIndex>()
+    );
+    println!(
+        "  BlockIndexMap {arm} B (a bare page-list header -- INDEPENDENT of the entry's width now), \
+         BucketNode {} B. The sixteen bytes measured above are banked on the HEAP: in every boxed \
+         arm and every list element, not in the node.",
+        size_of::<crate::engine::state::BucketNode>()
+    );
+}
+
+// =================================================================================================
+// THE READ PATH, COUNTED. A handle adds a table lookup; a one-byte discriminant does not.
+// =================================================================================================
+
+/// READING A PAGE'S MODEL SPELLING EXAMINES NO MORE ENTRIES THAN IT DID.
+///
+/// A handle into a table adds a dependent load to every resolution of a name, and no footprint
+/// measurement can see it. The spelling that SHIPPED here is not that shape: it is a discriminant
+/// in the entry and the name is a `&'static str` off the registry, so resolving it is a match on
+/// one byte and touches nothing outside the entry that was already loaded.
+///
+/// COUNTED, not timed -- a timing-ratio instrument in this tree once read 485x idle against 11x
+/// busy off identical code. `BLOCK_LOOKUP_ENTRIES_EXAMINED` is the existing counter inside
+/// `find_block`, and the claim is that reading every page's spelling adds NOTHING to it.
+#[test]
+fn resolving_a_model_spelling_examines_no_block_index_entries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine(dir.path());
+    load_shard_over(&engine, OPERATOR_END);
+    seed_container_keys(&engine, 8, 100);
+    seed_routed_keys(&engine, 200);
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+
+    crate::engine::state::reset_block_lookup_entries_examined();
+    let before = crate::engine::state::block_lookup_entries_examined();
+    let mut resolved = 0usize;
+    let mut folded = 0u64;
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for (_, block) in bucket.block_index.iter() {
+            // The resolution under test, folded so it cannot be optimised away.
+            let spelling = block.model_id.as_str();
+            folded = folded
+                .wrapping_mul(31)
+                .wrapping_add(spelling.len() as u64)
+                .wrapping_add(spelling.as_bytes()[0] as u64);
+            resolved += 1;
+        }
+    }
+    let after = crate::engine::state::block_lookup_entries_examined();
+
+    println!(
+        "\n=== resolving a model spelling ===\n  {resolved} spellings resolved, \
+         BLOCK_LOOKUP_ENTRIES_EXAMINED {before} -> {after}, checksum {folded}"
+    );
+    assert!(resolved > 0, "no spelling was resolved, so the count below is free");
+    assert_ne!(0, folded, "the fold read nothing, so the loads may have been dropped");
+    assert_eq!(
+        before, after,
+        "resolving {resolved} model spellings moved the page-lookup counter from {before} to \
+         {after}. A spelling is supposed to be a match on one byte already inside the entry; a \
+         move here means it is going through an index"
+    );
+}
+
+// =================================================================================================
+// THE LIFETIME HAZARD. Release empties a bucket's page list; reload re-derives it.
+// =================================================================================================
+
+/// A RELEASED BUCKET RELOADS EVERY PAGE'S NAMES, ELEMENT BY ELEMENT.
+///
+/// `release_bucket_blocks` empties a bucket's page list and `reload_released_bucket` re-derives it
+/// from the model maps. Anything the entry holds has to survive that or be re-derived IDENTICALLY,
+/// and a count of pages cannot show it: a reload that produced the right NUMBER of pages with one
+/// spelling wrong would pass a count and mis-attribute a page.
+///
+/// So the comparison is element by element, over the sorted triples, and the fixture is asserted
+/// to have actually released something before the comparison is made.
+#[test]
+fn a_released_bucket_reloads_every_name_element_by_element() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine(dir.path());
+    load_shard_over(&engine, OPERATOR_END);
+    // `released_model_kind_is_addressable` admits `string` and `context_node` only, so a release
+    // is only reversible for those -- which is what this fixture seeds.
+    seed_routed_keys(&engine, 400);
+
+    // A RELEASE REFUSES A DIRTY BUCKET, and a freshly written one is dirty -- releasing it while
+    // `eviction_dump_before_evict` is false would strand undumped writes with nothing to rebuild
+    // them from. So the fixture dumps through the production lifecycle, which is what clears the
+    // flag (`clear_dumped_bucket_dirty_state`).
+    let candidates: Vec<u32> = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        shard.bucket_index.bucket_map.keys().copied().collect()
+    };
+    assert!(!candidates.is_empty(), "the fixture produced no bucket to release");
+    let lifecycle = engine.apply_storage_lifecycle(crate::engine::reports::StorageLifecycleRequest {
+        shard_id: 1,
+        selected_dump_buckets: candidates.clone(),
+        max_dump_buckets_per_round: candidates.len(),
+        ..Default::default()
+    });
+    println!("\n=== release/reload ===");
+    println!("  fixture: {} candidate buckets, lifecycle ran", candidates.len());
+    std::hint::black_box(&lifecycle);
+
+    let before = block_triples(&engine);
+    assert!(!before.is_empty(), "the fixture produced no pages to release");
+
+    // DRIVEN ON THE FUNCTION ITSELF. `refused_buckets` is one number for eleven different answers,
+    // so a fixture that fails a precondition has to say WHICH one -- otherwise it reads as a
+    // release that simply had nothing to do, which is the shape that makes the comparison below
+    // pass over an empty set.
+    let outcome = {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard is loaded");
+        crate::engine::storage_bucket_internals::release_bucket_blocks(shard, &candidates)
+    };
+    println!(
+        "  released {} buckets holding {} pages, refused {}",
+        outcome.released_buckets.len(),
+        outcome.released_blocks,
+        outcome.refused_buckets
+    );
+    println!("  refusals by term: {:?}", outcome.refusals);
+    assert!(
+        outcome.released_blocks > 0,
+        "the release emptied no page list, so the reload below re-derives nothing and every \
+         assertion after it is free. {} candidates were offered; the terms they failed on are \
+         {:?}",
+        candidates.len(),
+        outcome.refusals
+    );
+    let released = outcome.released_buckets.clone();
+
+    // The released buckets really did lose their pages.
+    let during = block_triples(&engine);
+    assert!(
+        during.len() < before.len(),
+        "the release left {} pages of {} resident, so it did not empty a page list",
+        during.len(),
+        before.len()
+    );
+
+    for routing_bucket in &released {
+        let reloaded = {
+            let mut shards = engine.shards.write().expect("engine lock poisoned");
+            let shard = shards.get_mut(&1).expect("shard is loaded");
+            crate::engine::storage_bucket_internals::reload_released_bucket(
+                shard,
+                1,
+                *routing_bucket,
+            )
+        };
+        assert!(reloaded, "bucket {routing_bucket} was released and refused to reload");
+    }
+
+    let after = block_triples(&engine);
+
+    // ELEMENT BY ELEMENT, and the count is asserted too -- but only as well as, never instead of.
+    assert_eq!(
+        before.len(),
+        after.len(),
+        "the reload brought back {} pages against {} released",
+        after.len(),
+        before.len()
+    );
+    let mut compared = 0usize;
+    for (index, (left, right)) in before.iter().zip(after.iter()).enumerate() {
+        assert_eq!(
+            left, right,
+            "page {index} came back with different names: before {left:?}, after {right:?}. A \
+             count would have passed this"
+        );
+        compared += 1;
+    }
+    assert_eq!(
+        before.len(), compared,
+        "the element-by-element comparison ran over {compared} of {} pages",
+        before.len()
+    );
+    println!("  {compared} pages compared element by element, all three names identical");
+}
+
+/// Every page's three names and its address identity, sorted, so two walks are comparable.
+fn block_triples(engine: &TemporalEngine) -> Vec<(String, String, Option<String>, u64, u64)> {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    let mut triples: Vec<(String, String, Option<String>, u64, u64)> =
+        super::blocks_with_identity(&shard.bucket_index)
+            .into_iter()
+            .map(|(_, _, object_key, block)| {
+            (
+                block.model_id.as_str().to_string(),
+                object_key.to_string(),
+                None::<String>,
+                block.address.block_slab_id(),
+                block.address.offset(),
+            )
+        })
+        .collect();
+    triples.sort();
+    triples
+}
+
+// =================================================================================================
+// LOUD OR SILENT. What a spelling the registry cannot place actually does.
+// =================================================================================================
+
+/// A STORED SPELLING THE REGISTRY CANNOT PLACE IS REFUSED, AND THE REFUSAL NAMES IT.
+///
+/// THE MUTANT THIS PLANTS is the dangerous one for a narrowed field: a stored index carrying a
+/// spelling the engine does not know. Mapped onto some default variant it would file the page
+/// under a kind it does not have, and a page filed under the wrong kind is still on its slab while
+/// nothing looks for it -- silent corruption, not a red test.
+///
+/// The wire did NOT move for this change: the spelling is still written and read as a string. So
+/// the failure mode a migration would have had -- hex parsed as a length, a handle parsed as a
+/// string -- does not exist here, and what remains is exactly this one: a name with no row.
+#[test]
+fn a_stored_spelling_with_no_row_is_refused_by_name_at_the_decode() {
+    // THE REFUSAL IS ASSERTED ON THE ERROR, NOT THROUGH `should_panic`, AND THAT IS THE FIX.
+    //
+    // This was `should_panic` over an `.expect()`. `expect` renders its error with `Debug`,
+    // which ESCAPES the quotes the message puts around the model id, so the expectation
+    // carried a bare quote where the panic carried a backslashed one. The substring could
+    // never match, however right the refusal was, and this test was red on main for that
+    // reason alone -- while its twin below, which calls `stored_model_kind` directly and so
+    // reaches the expectation unescaped, passed the whole time. Reading the error here
+    // removes the question: the assertion is against the `Display` text a caller sees.
+    // PLANTED ON A REAL ENTRY AND A REAL KEY, AND THE PLANT MOVED ONTO THE KEY.
+    //
+    // It used to overwrite the entry's own `model_id`. The entry has no such field: the spelling
+    // is the composite key's LEFTMOST SLOT and the decode reads it back out of there, so a stored
+    // spelling with no row now arrives in the key -- and a plant on a field that no longer exists
+    // is not a weaker control, it is none. The key is rendered by the production renderer and only
+    // its kind slot is replaced, so this plants exactly the defect and nothing else.
+    let block = sample_entry();
+    let real_key = crate::engine::state::block_index_written_key(SAMPLE_ENTRY_OBJECT_KEY, &block);
+    let planted = real_key.replacen(block.model_id.as_str(), "not_a_model_kind", 1);
+    assert_ne!(
+        real_key, planted,
+        "the plant matched nothing in {real_key:?}, so the refusal below would be about the real \
+         spelling"
+    );
+    let stored = serde_json::from_value::<crate::engine::state::StoredBlockEntry>(
+        serde_json::to_value(&crate::engine::state::BlockEntryAt { block: &block }).expect("encode"),
+    )
+    .expect("a real entry decodes");
+    let error = stored
+        .into_parts_from_key(&planted)
+        .err()
+        .expect("a spelling with no row must be refused, not decoded")
+        .to_string();
+    assert!(
+        error.contains("no stored model kind for model id"),
+        "the decode refused with {error:?} rather than by naming the unplaceable spelling"
+    );
+    assert!(
+        error.contains("not_a_model_kind"),
+        "the refusal named no spelling: {error:?}. The message has to carry the name, or an
+         operator cannot tell which stored kind their store and this binary disagree about"
+    );
+}
+
+/// THE OBJECT [`sample_entry`] BELONGS TO, named once rather than at each encode.
+///
+/// The stored key is composed from the identity held BESIDE the page, so an arm that encodes one
+/// has to state which object it means. Same characters `sample_entry` puts on the entry.
+const SAMPLE_ENTRY_OBJECT_KEY: &str = "k";
+
+/// One page entry, for the tests that mutate a single field of a real encoding.
+fn sample_entry() -> BlockIndex {
+    BlockIndex {
+        model_id: StoredModelKind::String,
+        address: crate::block_store::ElementEntry::from_parts(1, 2, 4, Some(5), Some(6)),
+        dirty: true,
+        deleted: false,
+    }
+}
+
+/// AND THE SAME REFUSAL AT THE WRITE, which is the other direction a spelling arrives from.
+#[test]
+#[should_panic(expected = "no stored model kind for model id \"not_a_model_kind\"")]
+fn a_written_spelling_with_no_row_is_refused_by_name() {
+    crate::engine::storage_bucket_internals::stored_model_kind("not_a_model_kind");
+}
+
+/// THE TWO DERIVATIONS OF THE REPORT BYTE MUST AGREE, and they are independent.
+///
+/// `model_report_code` reads `StoredModelKind::report_code`; the registry's own guards derive their
+/// expectations from `ModelKind::report_code`. Those are two match arms generated from the same
+/// declaration, which is what makes the guards' comparison meaningful rather than a function
+/// checked against itself -- and what makes DRIFT between them possible. This pins the agreement
+/// over every live kind, and pins the retired half against the declared table.
+///
+/// It exists because a mutation run found the new accessor had no production caller at all: a
+/// second derivation nothing reached, so mutating it killed nothing. Routing the report through it
+/// fixed the reachability; this stops the two derivations diverging afterwards.
+#[test]
+fn the_two_derivations_of_the_report_byte_agree() {
+    use crate::engine::storage_bucket_internals::{
+        ModelKind, StoredModelKind as SMK, RETIRED_MODEL_REPORT_CODES,
+    };
+    let mut live = 0usize;
+    for kind in ModelKind::ALL {
+        let stored = SMK::from(*kind);
+        assert_eq!(
+            kind.report_code(),
+            stored.report_code(),
+            "the two derivations disagree for {:?}: ModelKind says {}, StoredModelKind says {}",
+            kind,
+            kind.report_code(),
+            stored.report_code()
+        );
+        assert_eq!(kind.as_str(), stored.as_str(), "and their spellings disagree for {kind:?}");
+        live += 1;
+    }
+    assert!(live >= 15, "only {live} live kinds were compared; the registry declares at least 15");
+
+    let mut retired = 0usize;
+    for (name, code) in RETIRED_MODEL_REPORT_CODES {
+        let stored = SMK::from_stored_name(name)
+            .unwrap_or_else(|| panic!("the entry's type cannot place the retired spelling {name:?}"));
+        assert!(stored.is_retired(), "{name:?} is declared retired and the entry's type says live");
+        assert_eq!(
+            *code,
+            stored.report_code(),
+            "the retired spelling {name:?} is declared as {code} and reads as {}",
+            stored.report_code()
+        );
+        retired += 1;
+    }
+    assert!(retired >= 2, "only {retired} retired spellings compared; the registry declares 2");
+
+    // AND NO TWO OF THE SEVENTEEN COLLIDE, read through the ACCESSOR rather than off the
+    // declaration. The declaration already has a const assert on its literals; that one cannot see
+    // a `report_code` whose arms stopped returning them, which is exactly the mutant that survived.
+    let mut seen: BTreeSet<u8> = BTreeSet::new();
+    for kind in SMK::ALL {
+        let code = kind.report_code();
+        assert_ne!(0, code, "{kind:?} packs as 0, the byte an empty bucket writes");
+        assert!(seen.insert(code), "two of the seventeen spellings pack as {code}");
+    }
+    assert_eq!(
+        SMK::ALL.len(),
+        seen.len(),
+        "{} spellings produced {} distinct bytes",
+        SMK::ALL.len(),
+        seen.len()
+    );
+    println!(
+        "\n=== the report byte ===\n  {live} live and {retired} retired spellings, {} distinct \
+         bytes over {} spellings, both derivations agreeing",
+        seen.len(),
+        SMK::ALL.len()
+    );
+}
+
+/// A RETIRED SPELLING STILL LOADS, which is why the entry's type covers BOTH halves of the
+/// registry rather than only the live walk's kinds.
+///
+/// `ModelKind` is the live walk's set and has no variant for a spelling no arm emits. An entry
+/// typed as that would refuse a store this engine opens TODAY: `storage_reporting` matches
+/// `"sequence"` on a live entry, and `model_report_code` has carried both retired spellings since
+/// #1970. So the entry's type is the seventeen-element set, and this drives both retired rows
+/// through a decode to prove it.
+#[test]
+fn a_retired_spelling_still_decodes_into_a_block_entry() {
+    let mut seen = 0usize;
+    for spelling in ["sequence", "context_embedding"] {
+        // THE SPELLING IS NAMED IN THE KEY, which is where a stored index carries it now. The
+        // entry has no `model_id` field, so a retired row arriving on an entry is not a state a
+        // store can be in; a retired row arriving in a page's KEY is.
+        let sample = sample_entry();
+        let real_key =
+            crate::engine::state::block_index_written_key(SAMPLE_ENTRY_OBJECT_KEY, &sample);
+        let key = real_key.replacen(sample.model_id.as_str(), spelling, 1);
+        assert_ne!(
+            real_key, key,
+            "the retired spelling was not planted into {real_key:?}, so this arm is about the \
+             live kind instead"
+        );
+        let stored = serde_json::from_value::<crate::engine::state::StoredBlockEntry>(
+            serde_json::to_value(&crate::engine::state::BlockEntryAt { block: &sample })
+                .expect("encode"),
+        )
+        .expect("a real entry decodes");
+        let (object_key, block) = stored
+            .into_parts_from_key(&key)
+            .unwrap_or_else(|err| panic!("a store carrying {spelling:?} must still load: {err}"));
+        assert_eq!(
+            SAMPLE_ENTRY_OBJECT_KEY,
+            &*object_key,
+            "the object key came back as something else beside the retired kind"
+        );
+        assert_eq!(
+            spelling,
+            block.model_id.as_str(),
+            "the spelling came back as something else"
+        );
+        assert!(
+            block.model_id.is_retired(),
+            "{spelling:?} is declared under `retired` and the entry does not say so"
+        );
+        seen += 1;
+    }
+    assert_eq!(2, seen, "both retired rows are supposed to be driven, not {seen}");
+    // The floor that ties the entry's set to the registry's two halves.
+    assert_eq!(
+        StoredModelKind::ALL.len(),
+        crate::engine::storage_bucket_internals::ModelKind::ALL.len()
+            + crate::engine::storage_bucket_internals::RETIRED_MODEL_REPORT_CODES.len(),
+        "the entry's spelling set is supposed to be exactly the registry's two halves: {} against \
+         {} live plus {} retired",
+        StoredModelKind::ALL.len(),
+        crate::engine::storage_bucket_internals::ModelKind::ALL.len(),
+        crate::engine::storage_bucket_internals::RETIRED_MODEL_REPORT_CODES.len(),
+    );
+}
+
+// =================================================================================================
+// THE CONTROL ON THE EXPLANATION. Where the mechanism predicts the effect is ABSENT.
+// =================================================================================================
+
+/// THE CONTROL: THE WIRE DID NOT MOVE, SO THE STORED BYTES MUST NOT HAVE.
+///
+/// Every claim above is about the IN-MEMORY width of a page entry. The mechanism -- a fat pointer
+/// to a string from a closed set becomes a discriminant, and the string is written as the string
+/// it always was -- predicts that the STORED encoding is byte-for-byte what it was. That is a
+/// place the effect must be ABSENT, and 0.00% is the answer that distinguishes this change from
+/// one that quietly moved the format.
+///
+/// Driven rather than asserted: an entry is encoded through the same serializers the index uses
+/// -- the NAMED one and the POSITIONAL one, because #1969 found the index log packs positionally
+/// and a field that changed shape would shift every field after it -- and the bytes are compared
+/// against the spelling recorded when the field was an `Arc<str>`.
+#[test]
+fn the_model_spelling_did_not_move_on_the_wire_and_the_entry_lost_three_steps_in_memory() {
+    // What the entry encoded to when `model_id` was an `Arc<str>`, captured at b8b12d30 by
+    // `block_entry_names::capture_the_stored_spelling_of_a_block_entry`'s shape and re-derived here
+    // from an equal-valued map so the golden is the VALUE, not this type's own impl.
+    let block = sample_entry();
+
+    // THROUGH THE WRAPPER IN ALL THREE ENCODINGS, and the msgpack pair is why the wrapper counts
+    // its fields rather than hard-coding one: `to_vec` writes the entry POSITIONALLY, so a field
+    // count or an order that moved would move these bytes and not just the named form's.
+    let at = crate::engine::state::BlockEntryAt { block: &block };
+    let named = rmp_serde::to_vec_named(&at).expect("named encode");
+    let positional = rmp_serde::to_vec(&at).expect("positional encode");
+    let json = serde_json::to_value(&at).expect("json encode");
+
+    println!(
+        "\n=== the stored spelling ===\n  named {} B, positional {} B\n  json {}",
+        named.len(),
+        positional.len(),
+        json
+    );
+
+    // THE MODEL SPELLING IS STILL A STRING ON THE WIRE -- AND IT HAS MOVED OFF THE ENTRY ONTO THE
+    // KEY, WHICH IS A CHANGE TO THIS CONTROL'S SUBJECT AND IS WRITTEN UP RATHER THAN RELAXED.
+    //
+    // The claim was "the spelling is written as the string it always was, on the entry". Half of
+    // that is unchanged: it is still a STRING and not a number, so the migration hazard this
+    // control exists for -- hex parsed as a length, a handle parsed as a string -- still does not
+    // exist. What moved is WHERE: it is the composite key's leftmost slot now, and the entry
+    // writes no copy. Asserting the old location would be asserting the change away.
+    assert!(
+        json.get("model_id").is_none(),
+        "the entry still writes its own copy of the model spelling, which the composite key \
+         already spells: {json}"
+    );
+    assert!(
+        json.get("object_key").is_none(),
+        "the entry still writes its own copy of the object key, which the composite key already \
+         spells: {json}"
+    );
+    let stored_key = crate::engine::state::block_index_written_key(SAMPLE_ENTRY_OBJECT_KEY, &block);
+    assert!(
+        stored_key.starts_with("string:"),
+        "the model spelling is supposed to be written as the string it always was, in the key's \
+         leftmost slot; the key reads {stored_key:?}"
+    );
+
+    // And it round-trips through both encoders, positionally included -- which is the encoder a
+    // shifted field would break.
+    // DECODED INTO THE STORED SHAPE, which is what the wire holds: the entry itself has no
+    // `Deserialize`, and the positional encode is exactly why that matters -- a field count or an
+    // order that moved between the two wrappers would land here and nowhere else.
+    //
+    // AND THE IDENTITY COMES FROM THE KEY, NOT FROM THE ROW. That is what makes the POSITIONAL arm
+    // worth keeping: the row is three slots now, and a field count or an order that moved would
+    // land here and nowhere else, while the object key and the kind are supplied from the one
+    // place that still has them.
+    let (named_key, from_named) =
+        rmp_serde::from_slice::<crate::engine::state::StoredBlockEntry>(&named)
+            .expect("named decode")
+            .into_parts_from_key(&stored_key)
+            .expect("the key the production renderer wrote must invert");
+    let (positional_key, from_positional) =
+        rmp_serde::from_slice::<crate::engine::state::StoredBlockEntry>(&positional)
+            .expect("positional decode")
+            .into_parts_from_key(&stored_key)
+            .expect("the key the production renderer wrote must invert");
+    for (label, key, decoded) in [
+        ("named", &named_key, &from_named),
+        ("positional", &positional_key, &from_positional),
+    ] {
+        assert_eq!(
+            block.model_id, decoded.model_id,
+            "{label}: the spelling did not survive the round trip"
+        );
+        // THE IDENTITY IS COMPARED AGAINST WHAT THE FIXTURE NAMED, not against a copy on the
+        // decoded entry. It arrives BESIDE the entry now, which is the whole of the move: the key
+        // the encoder was handed is the key the decoder hands back.
+        assert_eq!(
+            SAMPLE_ENTRY_OBJECT_KEY,
+            &**key,
+            "{label}: object_key moved across the round trip"
+        );
+        // No component on the entry, so there is no such field to survive a round trip.
+        assert_eq!(block.dirty, decoded.dirty, "{label}: dirty moved");
+        assert_eq!(block.deleted, decoded.deleted, "{label}: deleted moved");
+        // NOT a stored field any more, and this is the ONLY address property this loop checks --
+        // there is no `address` comparison beside it -- so the accessor comparison still has
+        // content: it asserts the block id's PRESENCE survives both encoders.
+        assert_eq!(
+            block.log_backed(),
+            decoded.log_backed(),
+            "{label}: the address stopped agreeing about log-residency across the round trip"
+        );
+    }
+
+    // THE ABSENT EFFECT, as THREE numbers now, because three changes have taken bytes off this entry
+    // and a single subtraction would let any of them absorb another's.
+    //
+    // The model spelling took it 88 -> 72, which is the sixteen this test was written for. The address
+    // inside it then took it 72 -> 64 by shedding its routing bucket and narrowing its block id. Then
+    // `object_id` left that address and took it 64 -> 56 -- a WHOLE eight-byte field out of the
+    // eight-aligned group, which is why it paid alone where neither narrowing did. All three are
+    // asserted separately, so none can be credited with another's bytes.
+    //
+    // AND THE WIRE IS NO LONGER UNTOUCHED, WHICH IS WHY THIS TEST IS RENAMED. It held that the stored
+    // bytes did not move AT ALL. The MODEL SPELLING still has not moved -- asserted above, written as
+    // the string it always was -- but the address inside this entry now writes its `oi` slot empty,
+    // which IS a stored move and is what the format stamp pays for -- 6, not the 4 this text first
+    // named: 4 was reserved while main held 3, main is 5 now, and a stamp may only increase. The slot is
+    // still present, because the index log packs positionally. See
+    // `per_item_byte_budget::the_stored_form_moved_in_one_slot_and_the_version_stamp_pays_for_it`,
+    // which is the tripwire for that and fired on this change.
+    // A FOURTH STEP JOINS THE CHAIN, so the last link is not asked to carry two of them.
+    //
+    // The chain was 88 -> 72 -> 64 -> `size_of`, with the final link asserted at EIGHT: the
+    // address shedding its object id. The entry then stopped naming its element, which is another
+    // sixteen, and the final link measured 24 -- so the assertion failed naming the right
+    // mechanism for the wrong arithmetic. The milestone the object id left it at is written down
+    // (56) and the new step gets its own link and its own assertion, which is what keeps each
+    // claim attributable to one change.
+    let in_memory_before = 88usize;
+    let after_the_spelling = 72usize;
+    let after_the_address_narrowing = 64usize;
+    let after_shedding_the_object_id = 56usize;
+    let after_shedding_the_element_name = 40usize;
+    let in_memory_after = std::mem::size_of::<BlockIndex>();
+    let spelling_wire_delta = 0i64;
+    println!(
+        "  in memory {in_memory_before} -> {after_the_spelling} -> {after_the_address_narrowing} \
+         -> {after_shedding_the_object_id} -> {after_shedding_the_element_name} -> \
+         {in_memory_after} B ({:.2}% in total), model spelling on the wire \
+         {spelling_wire_delta} B (0.00%)",
+        100.0 * (in_memory_before - in_memory_after) as f64 / in_memory_before as f64
+    );
+    assert_eq!(
+        16,
+        in_memory_before - after_the_spelling,
+        "the model spelling's in-memory effect is supposed to be sixteen bytes"
+    );
+    assert_eq!(
+        8,
+        after_the_spelling - after_the_address_narrowing,
+        "the address narrowing's in-memory effect is supposed to be eight bytes, and it is eight \
+         because SIX bytes of address payload left in two narrowings of which neither crosses a \
+         multiple of eight alone"
+    );
+    assert_eq!(
+        8,
+        after_the_address_narrowing - after_shedding_the_object_id,
+        "shedding the address's object id is supposed to be eight bytes, and unlike the two \
+         narrowings above it pays ALONE: it is a whole eight-byte field leaving the eight-aligned \
+         group, not a field getting smaller inside it"
+    );
+    assert_eq!(
+        16,
+        after_shedding_the_object_id - after_shedding_the_element_name,
+        "the entry giving up its element NAME is supposed to be sixteen bytes -- a fat optional \
+         pointer leaving the eight-aligned group whole, which is why it is a step of two words \
+         and not one word and some rounding. It pays alone for the same reason the object id did."
+    );
+    // A FIFTH STEP JOINS THE CHAIN, FOR THE REASON THE FOURTH DID. The comment at the top of this
+    // chain records that the final link was once asked to carry two changes at once and failed
+    // "naming the right mechanism for the wrong arithmetic". The element name's milestone is
+    // written down as 40 and the identity's departure gets its own link, so each claim stays
+    // attributable to one change.
+    assert_eq!(
+        16,
+        after_shedding_the_element_name - in_memory_after,
+        "the entry giving up its own copy of the IDENTITY is supposed to be sixteen bytes -- a fat \
+         pointer leaving the eight-aligned group whole, the same shape of step as the element name \
+         and for the same reason. Two of these in two legs is what took the entry from 56 to 24."
+    );
+    assert_eq!(
+        0, spelling_wire_delta,
+        "the model spelling is supposed to be untouched on the wire; the address's `oi` slot is a \
+         separate matter and the version stamp covers it"
+    );
+}
+
+
+// =================================================================================================
+// THE TAIL. Three bools, and what they are worth alone against what they are worth in combination.
+// =================================================================================================
+
+/// Mirrors of the entry at each combination of narrowings, so what CROSSES the alignment step is
+/// measured rather than projected. The one lesson #1969 paid for: individually most of its
+/// narrowings were worth zero and only the combination crossed.
+mod tail_layout {
+    use super::*;
+    use std::num::NonZeroU16;
+    use std::num::NonZeroU32;
+
+    /// The three flags as one byte behind masks. The shape #1968 took on `BucketNode`.
+    #[derive(Debug, Clone, Copy, Default)]
+    pub(super) struct BlockFlags(u8);
+
+    impl BlockFlags {
+        pub(super) const DIRTY: u8 = 1 << 0;
+        pub(super) const DELETED: u8 = 1 << 1;
+        pub(super) const LOG_BACKED: u8 = 1 << 2;
+
+        pub(super) fn with(self, mask: u8, value: bool) -> Self {
+            if value {
+                BlockFlags(self.0 | mask)
+            } else {
+                BlockFlags(self.0 & !mask)
+            }
+        }
+
+        pub(super) fn get(self, mask: u8) -> bool {
+            self.0 & mask != 0
+        }
+
+        pub(super) fn raw(self) -> u8 {
+            self.0
+        }
+    }
+
+    /// Today.
+    pub(super) struct A0 {
+        pub(super) object_key: Arc<str>,
+        pub(super) component: Option<Arc<str>>,
+        pub(super) address: [u64; 4],
+        pub(super) model: u8,
+        pub(super) dirty: bool,
+        pub(super) deleted: bool,
+        pub(super) log_backed: bool,
+    }
+
+    /// Today, flags packed.
+    pub(super) struct A1 {
+        pub(super) object_key: Arc<str>,
+        pub(super) component: Option<Arc<str>>,
+        pub(super) address: [u64; 4],
+        pub(super) model: u8,
+        pub(super) flags: BlockFlags,
+    }
+
+    /// Component as an ordinal.
+    pub(super) struct B0 {
+        pub(super) object_key: Arc<str>,
+        pub(super) component: Option<NonZeroU16>,
+        pub(super) address: [u64; 4],
+        pub(super) model: u8,
+        pub(super) dirty: bool,
+        pub(super) deleted: bool,
+        pub(super) log_backed: bool,
+    }
+    pub(super) struct B1 {
+        pub(super) object_key: Arc<str>,
+        pub(super) component: Option<NonZeroU16>,
+        pub(super) address: [u64; 4],
+        pub(super) model: u8,
+        pub(super) flags: BlockFlags,
+    }
+
+    /// Both names as ordinals.
+    pub(super) struct C0 {
+        pub(super) object_key: Option<NonZeroU32>,
+        pub(super) component: Option<NonZeroU16>,
+        pub(super) address: [u64; 4],
+        pub(super) model: u8,
+        pub(super) dirty: bool,
+        pub(super) deleted: bool,
+        pub(super) log_backed: bool,
+    }
+    pub(super) struct C1 {
+        pub(super) object_key: Option<NonZeroU32>,
+        pub(super) component: Option<NonZeroU16>,
+        pub(super) address: [u64; 4],
+        pub(super) model: u8,
+        pub(super) flags: BlockFlags,
+    }
+
+    /// The shape while the address was 24: both names as `Arc`s. It was TODAY until `object_id` left
+    /// the address, and it is kept as the row BEFORE that step -- exactly as `A0` is kept as the row
+    /// before the address narrowed. The module prices a STEP, and a step whose before-state has been
+    /// deleted cannot be priced.
+    pub(super) struct E0 {
+        pub(super) object_key: Arc<str>,
+        pub(super) component: Option<Arc<str>>,
+        pub(super) address: [u64; 3],
+        pub(super) model: u8,
+        pub(super) dirty: bool,
+        pub(super) deleted: bool,
+        pub(super) log_backed: bool,
+    }
+    pub(super) struct E1 {
+        pub(super) object_key: Arc<str>,
+        pub(super) component: Option<Arc<str>>,
+        pub(super) address: [u64; 3],
+        pub(super) model: u8,
+        pub(super) flags: BlockFlags,
+    }
+
+    /// TODAY: NO NAME AT ALL and the address at 16, after `object_id` stopped being a field and
+    /// became a derivation from the terms beside it, and after the object key left the entry for
+    /// the bucket's own lookup. This is the live shape and it is what the assertion below pins
+    /// against `BlockIndex`.
+    ///
+    /// ITS THREE-FLAG TAIL PREDATES THIS CHANGE AND IS NOT CORRECTED HERE. The live entry carries
+    /// two flags; this mirror carries three, because the measurement it serves is "three bools
+    /// against one flag byte" and that is the comparison the whole table is about. It is named so
+    /// a reader does not take the third as a claim about the live field set.
+    pub(super) struct F0 {
+        pub(super) address: [u64; 2],
+        pub(super) model: u8,
+        pub(super) dirty: bool,
+        pub(super) deleted: bool,
+        pub(super) log_backed: bool,
+    }
+    pub(super) struct F1 {
+        pub(super) address: [u64; 2],
+        pub(super) model: u8,
+        pub(super) flags: BlockFlags,
+    }
+
+    /// Both names as ordinals AND the address at 24, which a sibling thread owns.
+    pub(super) struct D0 {
+        pub(super) object_key: Option<NonZeroU32>,
+        pub(super) component: Option<NonZeroU16>,
+        pub(super) address: [u64; 3],
+        pub(super) model: u8,
+        pub(super) dirty: bool,
+        pub(super) deleted: bool,
+        pub(super) log_backed: bool,
+    }
+    pub(super) struct D1 {
+        pub(super) object_key: Option<NonZeroU32>,
+        pub(super) component: Option<NonZeroU16>,
+        pub(super) address: [u64; 3],
+        pub(super) model: u8,
+        pub(super) flags: BlockFlags,
+    }
+}
+
+/// PACKING THE THREE FLAGS IS WORTH NOTHING ON ITS OWN AND EIGHT BYTES IN COMBINATION.
+///
+/// THE FALSE GENERAL CLAIM THIS IS ABOUT. The comment above `BlockIndex` used to say the three flag
+/// bytes "are already inside the alignment slack and packing them would reclaim nothing". That is
+/// true of NARROWING ONE field and false of PACKING THREE, and it is exactly the claim that kept
+/// the same win unclaimed on `BucketNode` for three PRs until #1968 measured it. The comment is
+/// rewritten with this measurement beside it; what follows is the measurement.
+///
+/// Measured on mirrors at every combination, because the answer is not a property of the flags. At
+/// today's width the tail is four bytes of slack and three bools fit in it, so packing crosses
+/// nothing. Once BOTH names are ordinals the tail is what decides whether the entry lands on 40 or
+/// 48, and then the same two bytes are worth a whole eight-byte step.
+///
+/// The address arm is included because a sibling thread is taking `BlockAddress` 32 -> 24, and
+/// #1969's lesson is that a narrowing's worth is not separable from the ones landing beside it.
+#[test]
+fn packing_the_flag_bytes_is_worth_nothing_alone_and_a_step_in_combination() {
+    use std::mem::size_of;
+    use tail_layout::*;
+
+    let rows = [
+        ("names, 32 B address (before)", size_of::<A0>(), size_of::<A1>()),
+        ("names, 24 B address (before)", size_of::<E0>(), size_of::<E1>()),
+        ("names, 16 B address (TODAY)", size_of::<F0>(), size_of::<F1>()),
+        ("component ordinal, 32 B", size_of::<B0>(), size_of::<B1>()),
+        ("both names ordinals, 32 B", size_of::<C0>(), size_of::<C1>()),
+        ("both names + 24 B address", size_of::<D0>(), size_of::<D1>()),
+    ];
+    println!("\n=== the entry's tail: three bools against one flag byte ===");
+    println!("  {:<28} {:>10} {:>10} {:>8}", "combination", "3 bools", "packed", "saved");
+    let mut crossings = 0usize;
+    let mut no_ops = 0usize;
+    for (label, loose, packed) in rows {
+        let saved = loose - packed;
+        println!("  {label:<28} {loose:>10} {packed:>10} {saved:>8}");
+        if saved == 0 {
+            no_ops += 1;
+        } else {
+            crossings += 1;
+        }
+    }
+
+    // TODAY'S ARM MUST MATCH THE REAL STRUCT, or the mirrors are measuring something else.
+    //
+    // It is `F0` now, and the trail of relabellings is the point: `A0` carries a 32-byte address,
+    // `E0` a 24-byte one, and the live address is 16. This assertion is what says so each time -- it
+    // reported "the mirror of today's entry is 72 B against the real 64 B" when the address narrowed,
+    // and "64 B against the real 56 B" when `object_id` left it. Both times a mirror was naming a
+    // shape the engine no longer had, and NO COMPILER PASS CAN REACH A CLAIM OF THAT KIND: this is an
+    // `assert_eq!` in a test body, so it compiles clean and only a run can find it.
+    assert_eq!(
+        size_of::<BlockIndex>(),
+        size_of::<F0>(),
+        "the mirror of today's entry is {} B against the real {} B; every row below is then about \
+         a different structure",
+        size_of::<F0>(),
+        size_of::<BlockIndex>()
+    );
+    assert_eq!(
+        72,
+        size_of::<A0>(),
+        "`A0` is supposed to be the entry as it was before the address narrowed, and it reads {} B",
+        size_of::<A0>()
+    );
+
+    // THE TWO HALVES OF THE CLAIM. Both must hold, or the honest answer is one of them.
+    assert!(
+        no_ops > 0,
+        "packing is supposed to be worth NOTHING at some width -- that is the half of the old \
+         comment that was true -- and it saved bytes in every combination"
+    );
+    assert!(
+        crossings > 0,
+        "packing is supposed to cross the alignment step in some combination -- that is the half \
+         of the old comment that was false -- and it saved nothing anywhere"
+    );
+    assert_eq!(
+        size_of::<E0>(),
+        size_of::<E1>(),
+        "at today's width the tail has four bytes of slack and three bools fit inside it, so \
+         packing is supposed to move nothing"
+    );
+    assert!(
+        size_of::<C1>() < size_of::<C0>(),
+        "with both names as ordinals the tail decides the rounding, so packing is supposed to \
+         cross a step: {} against {}",
+        size_of::<C1>(),
+        size_of::<C0>()
+    );
+
+    // AND THE MASKS MUST NOT ALIAS. A flag read through the wrong mask is a silent wrong answer,
+    // so this feeds each mask a value set through a DIFFERENT one and requires false back.
+    let mut checked = 0usize;
+    for (name, set) in [
+        ("DIRTY", BlockFlags::DIRTY),
+        ("DELETED", BlockFlags::DELETED),
+        ("LOG_BACKED", BlockFlags::LOG_BACKED),
+    ] {
+        let flags = BlockFlags::default().with(set, true);
+        assert!(flags.get(set), "{name} set through its own mask reads false");
+        for (other_name, other) in [
+            ("DIRTY", BlockFlags::DIRTY),
+            ("DELETED", BlockFlags::DELETED),
+            ("LOG_BACKED", BlockFlags::LOG_BACKED),
+        ] {
+            if other == set {
+                continue;
+            }
+            assert!(
+                !flags.get(other),
+                "{name} was set and {other_name} reads true, so the two masks alias and a flag \
+                 read through the wrong one gives a silent wrong answer"
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(
+        6, checked,
+        "six cross-mask pairs are supposed to be checked, not {checked}; a loop that checked none \
+         would pass this test by checking nothing"
+    );
+    // The control on the control: a mask that DID alias must be caught. Planted, not assumed.
+    let aliasing = BlockFlags::default().with(BlockFlags::DIRTY | BlockFlags::DELETED, true);
+    assert!(
+        aliasing.get(BlockFlags::DELETED),
+        "the planted aliasing value must read true through the other mask, or the check above \
+         cannot fail when the masks really do alias"
+    );
+    println!(
+        "  masks: {checked} cross pairs checked, and a planted aliasing byte ({:#04b}) is \
+         recovered",
+        aliasing.raw()
+    );
+}
+
+/// AN EMPTY VALUE STILL CARRIES A LENGTH, so the zero-length tombstone is still OPEN -- and that
+/// is the opposite of what this test was written to show.
+///
+/// A design that spells `page_size == 0 indicates page is deleted` can drop the `deleted` bit
+/// entirely. The equivalent here would be `BlockAddress::length() == 0`, and the obvious way for
+/// that to be unavailable is a legitimate zero-length page: `bin/server.rs` says "An empty body
+/// still creates a zero-length object so a later GET succeeds", and `address_footprint` carries an
+/// instrument that hunts for a "live zero-length block" -- which is not something one writes for a
+/// state that cannot occur.
+///
+/// DRIVEN, AND IT REFUTED THAT. An empty string value produces a page whose length is NOT zero:
+/// the block record carries a header, so the shortest live page this route can produce is twelve
+/// bytes. The hypothesis that an empty value blocks the tombstone is wrong.
+///
+/// WHAT THAT DOES AND DOES NOT SETTLE. It bounds ONE route, not the class, and this test says so
+/// rather than concluding: `address_footprint::the_capacity_ceilings_each_narrowing_would_impose`
+/// is the instrument that asks the question over a wide fixture and prints the verdict, and it
+/// could not answer at all until this change -- #1969 took `BlockAddress` 40 -> 32 and left a
+/// hand-written payload figure of 37 beside it, so the probe aborted on an unsigned underflow
+/// before printing anything. It is `#[ignore]`d, so no gate ran it and nothing said so.
+///
+/// So the finding is: the tombstone is not blocked by the route that looked most likely to block
+/// it, and `length` lives in `BlockAddress`, which another thread owns. Handed over, not taken.
+#[test]
+fn an_empty_value_still_carries_a_length_so_the_zero_length_tombstone_is_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = probe_engine(dir.path());
+    load_shard_over(&engine, OPERATOR_END);
+    run_batch(
+        &engine,
+        vec![
+            Command::StringSet {
+                key: "empty".to_string(),
+                value: Vec::new(),
+            },
+            Command::StringSet {
+                key: "nonempty".to_string(),
+                value: vec![b'v'; 32],
+            },
+        ],
+    );
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    let mut zero_length_live = 0usize;
+    let mut nonzero_length_live = 0usize;
+    let mut deleted_blocks = 0usize;
+    let named = super::BlockObjects::of(&shard.bucket_index);
+    for bucket in shard.bucket_index.bucket_map.values() {
+        for (handle, block) in bucket.block_index.iter() {
+            if block.deleted {
+                deleted_blocks += 1;
+                continue;
+            }
+            if block.address.length() == 0 {
+                zero_length_live += 1;
+                println!(
+                    "  live zero-length page: model={} key={}",
+                    block.model_id.as_str(),
+                    named.at(bucket.routing_bucket, *handle)
+                );
+            } else {
+                nonzero_length_live += 1;
+            }
+        }
+    }
+    let empty_length = shard.string_address("empty").map(|address| address.length());
+    let nonempty_length = shard.string_address("nonempty").map(|address| address.length());
+    println!(
+        "\n=== is `deleted` derivable from a zero length? ===\n  live zero-length \
+         {zero_length_live}, live non-zero {nonzero_length_live}, delete-marked {deleted_blocks}\n  \
+         model-map lengths: empty value {empty_length:?}, 32-byte value {nonempty_length:?}"
+    );
+
+    // --- The fixture must have reached both writes, or the contrast is free. ---
+    assert_eq!(
+        2,
+        zero_length_live + nonzero_length_live,
+        "the fixture is supposed to produce exactly two live pages and produced {}",
+        zero_length_live + nonzero_length_live
+    );
+    let empty_length = empty_length.expect("the empty write must have produced a page");
+
+    // --- THE MEASURED FACT, which refutes the hypothesis this test was written for. ---
+    assert!(
+        empty_length > 0,
+        "an empty value produced a page of length {empty_length}. This test exists because a \
+         zero-length LIVE page would block the `length == 0` tombstone encoding, and the empty \
+         write is the route most likely to produce one -- if it ever does, the tombstone is \
+         unavailable and `deleted` must keep its bit"
+    );
+    assert_eq!(
+        0, zero_length_live,
+        "{zero_length_live} live pages carry length 0. On this route none should: the block record \
+         carries a header. A live zero-length page here means the tombstone encoding is blocked"
+    );
+    println!(
+        "  FINDING: the shortest live page this route produces is {empty_length} B, so an empty \
+         value does NOT block a `length == 0` tombstone. That bounds one route, not the class -- \
+         `address_footprint::the_capacity_ceilings_each_narrowing_would_impose` asks it over a \
+         wide fixture, and `length` lives in `ElementEntry`, which another thread owns."
+    );
+}
+
+// =================================================================================================
+// WHAT THE COMPONENT LEVEL COST -- ANSWERED BY DELETING IT, NOT BY THE MEASUREMENT THAT WAS HERE
+// =================================================================================================
+//
+// `FlatPageRef`, `nested_level` and `what_the_component_level_costs_at_one_component_and_at_a_
+// hundred` were here. The test priced the second level of `ObjectBlockLookup` at N=1 and at N=100,
+// in bytes and allocations, with the read path counted, and handed over a verdict: the level pays
+// at the p50 population and costs at the MAX one, "Recommend BY POPULATION".
+//
+// ITS CORRECTION OF #1967 WAS RIGHT AND IS WORTH KEEPING ON THE RECORD. #1967 had measured
+// `ComponentList` at the same 40 bytes as the `ComponentBlocks` its `One` arm held and recorded
+// that as "the level is free". This test said plainly that it is a narrower claim than it sounds:
+// what was free is the three-arm ENUM WRAPPER around one entry, and the LEVEL is the entry.
+//
+// THE VERDICT IS NOW SETTLED, AND NOT THE WAY EITHER POPULATION SUGGESTED. There was no MAX
+// population. `insert_object_block_lookup` was the only site in the crate that ever built a
+// `ComponentBlocks`, and it wrote `component: None` as a literal -- so N was always 1 and the
+// entry it held was a 24-byte `BlockRefs` behind a 16-byte `Option<Arc<str>>` holding a constant.
+// The level is deleted rather than flattened by population, which is a stronger outcome than the
+// comparison this test was set up to decide.
+//
+// WHY THIS IS PROSE AND NOT A RESTATED ARM. `nested_level` built its fixture BY HAND, with
+// `components` distinct `Some(hex)` names under one object -- a state the producer could not
+// reach even before this commit. Every arm that would survive a mechanical rewrite is the N=1 one,
+// and at N=1 the new shape makes all three tautologies: "a bisection over a list of one reads one"
+// becomes the definition of `Option::is_some`; the byte and allocation comparisons become two
+// compile-time constants compared with `<=`, since the name heap is now zero. A deletion with its
+// result recorded is honest where a green assertion over constants is not.
