@@ -675,3 +675,681 @@ pub(super) fn object_manager_runtime_report_from_entries(
     entries: &[LiveBlockEntry],
     start_routing_bucket: u32,
     end_routing_bucket: u32,
+) -> ObjectManagerRuntimeReport {
+    let ownership = bucket_object_block_ownership_report_from_entries(
+        shard_id,
+        shard,
+        entries,
+        start_routing_bucket,
+        end_routing_bucket,
+    );
+    let object_runtime = object_manager::runtime_report(shard);
+    let mut report = ObjectManagerRuntimeReport {
+        shard_id,
+        routing_bucket_count: shard.bucket_index.bucket_map.len() as u64,
+        object_count: object_runtime.live_object_count as u64,
+        block_ref_count: object_runtime.live_block_ref_count as u64,
+        hot_object_count: object_runtime.hot_object_count as u64,
+        cold_object_count: object_runtime.cold_object_count as u64,
+        mixed_residency_object_count: object_runtime.mixed_residency_object_count as u64,
+        delete_marker_object_count: object_runtime.deleted_object_count as u64,
+        dirty_object_count: object_runtime.dirty_object_count as u64,
+        loading_object_count: object_runtime.loading_object_count as u64,
+        ttl_object_count: object_runtime.ttl_object_count as u64,
+        object_block_transition_count: object_runtime.object_block_transition_count as u64,
+        dirty_bucket_count: shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .filter(|bucket| bucket.dirty())
+            .count() as u64,
+        max_dirty_generation: shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .map(|bucket| bucket.dirty_generation)
+            .max()
+            .unwrap_or_default(),
+        missing_owner_block_ref_count: ownership.missing_owner_block_ref_count,
+        owner_mismatch_block_ref_count: ownership.owner_mismatch_block_ref_count,
+        evidence: vec![
+            "runtime owns page refs in the first-class slot index".to_string(),
+            "runtime tracks dirty generations and dirty routing slots in SlotNode".to_string(),
+            "runtime validates owner refs before reporting ready".to_string(),
+            "runtime tracks hot/cold/tombstone object state and object-page ownership transitions"
+                .to_string(),
+        ],
+        ..ObjectManagerRuntimeReport::default()
+    };
+
+    for bucket in shard.bucket_index.bucket_map.values() {
+        if let Some(state) = report
+            .layout_states
+            .iter_mut()
+            .find(|state| state.state == bucket_layout_name(bucket.layout))
+        {
+            state.object_count = state
+                .object_count
+                .saturating_add(bucket.object_index.object_count() as u64);
+        } else {
+            report.layout_states.push(BucketLayoutStateCount {
+                state: bucket_layout_name(bucket.layout).to_string(),
+                object_count: bucket.object_index.object_count() as u64,
+            });
+        }
+        if bucket.meta_loaded() {
+            report.meta_object_count = report.meta_object_count.saturating_add(1);
+        }
+        match bucket.layout {
+            BucketLayoutState::Empty => {}
+            BucketLayoutState::SingleObject | BucketLayoutState::SingleBlockObject => {
+                report.object_block_count = report.object_block_count.saturating_add(1);
+            }
+            BucketLayoutState::MultiBlockObject => {
+                report.multi_block_object_count = report.multi_block_object_count.saturating_add(1);
+            }
+            BucketLayoutState::MultiObject => {}
+        }
+    }
+
+    if !ownership.first_class_index_present {
+        report
+            .blockers
+            .push("first-class slot_objects runtime index is empty".to_string());
+    }
+    if ownership.missing_owner_block_ref_count > 0 {
+        report
+            .blockers
+            .push("page refs are missing object/routing-slot ownership metadata".to_string());
+    }
+    if ownership.owner_mismatch_block_ref_count > 0 {
+        report
+            .blockers
+            .push("page refs disagree with expected object owners".to_string());
+    }
+    // Count live timestamped-kv pages (feature/sequence and the context
+    // timeline families). collect_live_block_entries already dedupes packed series
+    // pages via unique_timestamped_kv_block_addresses, so this is the packed page
+    // count. Previously this field was left at its default (0).
+    const TIMESTAMPED_KINDS: [&str; 8] = [
+        "feature",
+        "sequence",
+        "context_event",
+        "context_index",
+        "context_audit",
+        "context_child",
+        "context_summary",
+        "context_compression",
+    ];
+    report.packed_timestamped_block_count = entries
+        .iter()
+        .filter(|entry| TIMESTAMPED_KINDS.contains(&entry.kind.as_str()))
+        .count() as u64;
+    report.runtime_ready = report.blockers.is_empty();
+    report
+}
+
+pub(super) fn bucket_object_block_ownership_report(
+    shard_id: ShardId,
+    shard: &ShardState,
+    start_routing_bucket: u32,
+    end_routing_bucket: u32,
+) -> BucketObjectBlockOwnershipReport {
+    bucket_object_block_ownership_report_from_entries(
+        shard_id,
+        shard,
+        &collect_live_block_entries(shard),
+        start_routing_bucket,
+        end_routing_bucket,
+    )
+}
+
+/// The same report, from live-page entries the caller ALREADY has.
+pub(super) fn bucket_object_block_ownership_report_from_entries(
+    shard_id: ShardId,
+    shard: &ShardState,
+    entries: &[LiveBlockEntry],
+    start_routing_bucket: u32,
+    end_routing_bucket: u32,
+) -> BucketObjectBlockOwnershipReport {
+    let mut report = BucketObjectBlockOwnershipReport {
+        shard_id,
+        first_class_index_present: !shard.bucket_index.bucket_map.is_empty(),
+        derived_from_model_maps: shard.bucket_index.bucket_map.is_empty(),
+        ..BucketObjectBlockOwnershipReport::default()
+    };
+    report.block_ref_count = entries.len();
+    for entry in entries {
+        // THE FILING FIRST HERE TOO, for the reason `bucket_storage_summaries` above spells out: this
+        // report is one of the two derivations a manifest install compares, and the other is built
+        // from the restored image's own `bucket_map`. Two derivations of one quantity have to ask the
+        // same question, or a consistent dump refuses to install.
+        let routing_bucket = entry.filed_bucket().unwrap_or_else(|| {
+            block_routing_bucket(&entry.object_key, start_routing_bucket, end_routing_bucket)
+        });
+        // THE SAME OUT-OF-RANGE FILTER, AND THE SAME REASON IT IS GONE. This report skipped a page
+        // whose explicit bucket fell outside the range; a derived bucket cannot.
+        //
+        // It read `if routing_bucket < start || routing_bucket > end { continue; }` and its only
+        // possible input was an EXPLICIT bucket carried on the address -- a page whose stored bucket
+        // fell outside the range the shard was loaded on. There are no explicit buckets: the line
+        // above DERIVES the bucket as `start + FNV-1a-64(key) % (end - start + 1)`, which is inside
+        // `start..=end` by construction (and `start` itself for a degenerate range).
+        // `a_derived_bucket_is_always_inside_the_range_it_was_derived_on` drives that over many keys
+        // and several ranges rather than leaving it as arithmetic in a comment.
+        //
+        // What this removes is not a check but a HAZARD: mx#1974 measured this filter dropping a
+        // page from the index entirely when an explicit bucket sat outside the range, and bounded it
+        // by showing the engine does not produce that state. It now cannot be produced at all.
+        let expected_object_id = stable_block_object_id(
+            shard_id,
+            entry.kind.as_str(),
+            &entry.object_key,
+        );
+        let Some(bucket) = shard.bucket_index.bucket_map.get(&routing_bucket) else {
+            report.missing_owner_block_ref_count =
+                report.missing_owner_block_ref_count.saturating_add(1);
+            continue;
+        };
+        if !bucket.object_index.contains(&expected_object_id) {
+            report.owner_mismatch_block_ref_count =
+                report.owner_mismatch_block_ref_count.saturating_add(1);
+        }
+    }
+    report
+}
+
+pub(super) fn merge_last_dump_sequence(
+    mut summaries: Vec<BucketStorageSummary>,
+    manifest: &BucketDumpManifest,
+) -> Vec<BucketStorageSummary> {
+    let dumped_buckets = manifest.bucket_ids.iter().copied().collect::<BTreeSet<_>>();
+    for summary in &mut summaries {
+        if dumped_buckets.contains(&summary.routing_bucket) {
+            summary.last_dump_sequence = manifest.index_log_sequence;
+        }
+    }
+    summaries
+}
+
+pub(super) fn bucket_dump_manifest_comparable_summaries(
+    shard: &ShardState,
+    selected_buckets: &BTreeSet<u32>,
+) -> Vec<BucketStorageSummary> {
+    comparable_bucket_dump_summaries(
+        bucket_storage_summaries(shard, 0, u32::MAX)
+            .into_iter()
+            .filter(|summary| {
+                selected_buckets.is_empty() || selected_buckets.contains(&summary.routing_bucket)
+            })
+            .collect(),
+    )
+}
+
+pub(super) fn comparable_bucket_dump_summaries(
+    mut summaries: Vec<BucketStorageSummary>,
+) -> Vec<BucketStorageSummary> {
+    for summary in &mut summaries {
+        summary.dirty_object_count = 0;
+        summary.dirty_generation = 0;
+        summary.last_dump_sequence = 0;
+        summary.block_slab_ids.sort_unstable();
+        summary.block_slab_ids.dedup();
+    }
+    summaries.retain(|summary| {
+        summary.object_count > 0
+            || summary.block_ref_count > 0
+            || summary.logical_bytes > 0
+            || summary.physical_bytes > 0
+    });
+    summaries.sort_by_key(|summary| summary.routing_bucket);
+    summaries
+}
+
+pub(super) fn bucket_dump_summary_matches_current_generation(
+    manifest_summary: &BucketStorageSummary,
+    current_summary: &BucketStorageSummary,
+    manifest_bucket_fingerprints: &BTreeMap<u32, BTreeSet<String>>,
+    current_bucket_fingerprints: &BTreeMap<u32, BTreeSet<String>>,
+) -> bool {
+    let mut manifest_slabs = manifest_summary.block_slab_ids.clone();
+    manifest_slabs.sort_unstable();
+    manifest_slabs.dedup();
+    let mut current_slabs = current_summary.block_slab_ids.clone();
+    current_slabs.sort_unstable();
+    current_slabs.dedup();
+    manifest_summary.routing_bucket == current_summary.routing_bucket
+        && manifest_summary.dirty_generation == current_summary.dirty_generation
+        && manifest_summary.object_count == current_summary.object_count
+        && manifest_summary.block_ref_count == current_summary.block_ref_count
+        && manifest_summary.logical_bytes == current_summary.logical_bytes
+        && manifest_summary.physical_bytes == current_summary.physical_bytes
+        && manifest_slabs == current_slabs
+        && manifest_bucket_fingerprints.get(&manifest_summary.routing_bucket)
+            == current_bucket_fingerprints.get(&current_summary.routing_bucket)
+}
+
+/// THE SHARD IS A PARAMETER, NOT A QUESTION PUT TO THE STATE, and the reclaim plan is why.
+///
+/// Each line below carries a derived object id, so this needs a shard. An earlier version asked the
+/// STATE for it and returned an empty map when it had none, reasoning that an empty map is honest
+/// where a guessed zero is not. Both halves of that were right and the conclusion was still wrong:
+/// `storage_wal_reclaim_plan` calls this on a state produced by `decode_index_bytes` from a dump
+/// manifest, and a decoded state has never passed through `install_shard_state`, which is the only
+/// place `set_shard_id` is called. So every manifest fingerprinted as EMPTY, matched nothing, and the
+/// durable frontier never advanced -- measured as `left: 0, right: 3` in
+/// `part4::the_reclaim_plan_pairs_each_manifest_with_its_own_fingerprints`.
+///
+/// The caller knows the shard in both cases: it is planning for one. So it says so.
+///
+/// AND THE CONTENT IS ALLOWED TO MOVE, which is the question worth asking before deriving anything
+/// into a fingerprint. A fingerprint is a comparison key, so it would belong on the version stamp's
+/// side of the line IF it were ever compared against a STORED one. It is not: both sides are
+/// recomputed by this binary -- the live shard here, the manifest's decoded state there -- so a
+/// change in what the terms produce moves both sides together and compares equal. Nothing reads a
+/// fingerprint off disk.
+pub(super) fn bucket_generation_fingerprints_by_bucket(
+    shard_id: ShardId,
+    shard: &ShardState,
+) -> BTreeMap<u32, BTreeSet<String>> {
+    let mut by_bucket = BTreeMap::<u32, BTreeSet<String>>::new();
+    for entry in collect_live_block_entries(shard) {
+        let routing_bucket = entry
+            .filed_bucket()
+            .unwrap_or_else(|| bucket_for_object(&entry.object_key, 0, u32::MAX));
+        // Derived BEFORE the component moves out of the entry below: the derivation borrows the
+        // entry's own terms, and `unwrap_or_default()` takes the component by value.
+        let object_id = expected_live_block_object_id(shard_id, &entry);
+        by_bucket.entry(routing_bucket).or_default().insert(format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+            entry.kind,
+            entry.object_key,
+            entry.component.unwrap_or_default(),
+            entry.address.block_slab_id(),
+            entry.address.offset(),
+            entry.address.length(),
+            entry.address.block_id().unwrap_or_default(),
+            object_id,
+            routing_bucket,
+            entry.address.generation().unwrap_or_default(),
+            String::new()
+        ));
+    }
+    by_bucket
+}
+
+pub(super) fn collect_live_block_addresses(shard: &ShardState) -> Vec<ElementEntry> {
+    collect_live_block_entries(shard)
+        .into_iter()
+        .map(|entry| entry.address)
+        .collect()
+}
+
+/// GENERIC OVER THE SERIES AND NOT OVER ITS CONTAINER. The body asks for addresses and nothing
+/// else, so that is all the bound asks for -- see `engine::timestamped_series` for why the trait
+/// is kept to what the callers touch.
+pub(super) fn unique_timestamped_kv_block_addresses(
+    series: &impl super::timestamped_series::TimestampedSeries,
+) -> Vec<ElementEntry> {
+    // ONE COLLECTION, NOT TWO, AND NO TOTAL ORDER REQUIRED.
+    //
+    // This built a `HashSet` to dedup and then a `Vec` to sort -- two allocations per series,
+    // measured as the whole of the features arm's cost: 2.01 allocations per walked entry against
+    // 0.01 for the arms with nothing nested (`which_arm_the_last_allocation_per_entry_belongs_to`).
+    //
+    // I FIRST RECORDED THIS AS NEEDING AN `Ord` ON `ElementEntry` AND THAT WAS WRONG. The worry was
+    // real: sorting by the three keys below leaves entries that differ in `block_id` comparing
+    // Equal, so `dedup()` -- which drops only CONSECUTIVE duplicates -- can be handed `A, B, A` and
+    // keep the second `A`. A hand-written total order risks missing a field, and a missed field
+    // makes two distinct entries compare Equal, so dedup drops one: data loss on a walk that feeds
+    // rebuilds.
+    //
+    // But neither is necessary. Two FULLY equal entries necessarily agree on the three sort keys,
+    // so after sorting they are in the same contiguous group -- and deduping by the derived
+    // `PartialEq` WITHIN each group is exactly what the `HashSet` did. The comparison stays the
+    // derived one, so no field can be missed by construction.
+    //
+    // The scan is quadratic inside a group and linear overall, because a group is the set of
+    // entries sharing slab, offset AND length: in practice one, and never large enough to matter
+    // beside the sort it rides on.
+    let mut addresses = series.addresses().cloned().collect::<Vec<_>>();
+    addresses.sort_by(|left, right| {
+        left.block_slab_id()
+            .cmp(&right.block_slab_id())
+            .then(left.offset().cmp(&right.offset()))
+            .then(left.length().cmp(&right.length()))
+    });
+    let same_block = |left: &ElementEntry, right: &ElementEntry| {
+        left.block_slab_id() == right.block_slab_id()
+            && left.offset() == right.offset()
+            && left.length() == right.length()
+    };
+    let mut write = 0usize;
+    let mut group_start = 0usize;
+    for read in 0..addresses.len() {
+        // Cloning is free here and that is why this shape is available: `ElementEntry` is all
+        // inline fields -- an address word, a length, a block id and flag bits -- with nothing on
+        // the heap, so a copy costs no allocation.
+        let candidate = addresses[read].clone();
+        if write > group_start && !same_block(&addresses[write - 1], &candidate) {
+            group_start = write;
+        }
+        if addresses[group_start..write]
+            .iter()
+            .any(|kept| *kept == candidate)
+        {
+            continue;
+        }
+        addresses[write] = candidate;
+        write += 1;
+    }
+    addresses.truncate(write);
+    addresses
+}
+
+pub(super) fn timestamped_kv_series<'a>(
+    shard: &'a ShardState,
+) -> Vec<(&'static str, &'a str, std::borrow::Cow<'a, BTreeMap<u64, ElementEntry>>)> {
+    use std::borrow::Cow;
+    let mut series = Vec::new();
+    for (key, timeline) in shard.features() {
+        // MATERIALISED, because this report is written against the stored B-tree shape and the
+        // map holds the array. One allocation per series on a reporting path, not a serving one.
+        series.push(("feature", &key[..], Cow::Owned(timeline.to_btree())));
+    }
+    // Since the event rekey, context_events is keyed by EVENT ID; the timestamps live in
+    // context_event_timeline (timeline key -> event id). The validator compares index keys
+    // against the timestamps packed in pages, so it must see the TIMELINE view -- handing it
+    // the id-keyed map made every context event look like a missing indexed timestamp.
+    for (key, ids_by_time) in &shard.context_event_timeline {
+        let Some(by_id) = shard.context_events().get(key) else {
+            continue;
+        };
+        let timeline: BTreeMap<u64, ElementEntry> = ids_by_time
+            .iter()
+            .filter_map(|(timeline_key, event_id)| {
+                by_id
+                    .get(*event_id)
+                    .map(|address| (*timeline_key, address.clone()))
+            })
+            .collect();
+        series.push(("context_event", &**key, Cow::Owned(timeline)));
+    }
+    for (key, timeline) in shard.context_indexes() {
+        // MATERIALISED, for the reason given over `features` above: this report is written against
+        // the stored B-tree shape and the map holds the array. One allocation per series on a
+        // reporting path, not a serving one.
+        series.push(("context_index", &key[..], Cow::Owned(timeline.to_btree())));
+    }
+    for (key, timeline) in shard.context_audits() {
+        // Materialised, as for `features` above: the report's type is the stored B-tree and
+        // this map holds the array. A reporting path, not a serving one.
+        series.push(("context_audit", &key[..], Cow::Owned(timeline.to_btree())));
+    }
+    for (key, timeline) in shard.context_children() {
+        // Materialised, as for `features` above: the report's type is the stored B-tree and
+        // this map holds the array. A reporting path, not a serving one.
+        series.push(("context_child", &key[..], Cow::Owned(timeline.to_btree())));
+    }
+    for (key, timeline) in shard.context_summaries() {
+        // Materialised, as for `features` above: the report's type is the stored B-tree and
+        // this map holds the array. A reporting path, not a serving one.
+        series.push(("context_summary", &key[..], Cow::Owned(timeline.to_btree())));
+    }
+    for (key, timeline) in shard.context_compressions() {
+        // Materialised, as for `features` above: the report's type is the stored B-tree and
+        // this map holds the array. A reporting path, not a serving one.
+        series.push(("context_compression", &key[..], Cow::Owned(timeline.to_btree())));
+    }
+    series
+}
+
+pub(super) fn storage_feature_block_layout_report(
+    block_store: &BlockStore,
+    shard: &ShardState,
+) -> StorageFeatureBlockLayoutReport {
+    let mut report = StorageFeatureBlockLayoutReport::default();
+    let mut family_reports = BTreeMap::<String, StorageTimestampedBlockFamilyReport>::new();
+    let mut inspected_addresses = HashSet::<ElementEntry>::new();
+    for (kind, key, series) in timestamped_kv_series(shard) {
+        report.indexed_timestamped_points = report
+            .indexed_timestamped_points
+            .saturating_add(series.len());
+        if kind == "feature" {
+            report.indexed_feature_points =
+                report.indexed_feature_points.saturating_add(series.len());
+        }
+        let family = family_reports.entry(kind.to_string()).or_insert_with(|| {
+            StorageTimestampedBlockFamilyReport {
+                kind: kind.to_string(),
+                ..StorageTimestampedBlockFamilyReport::default()
+            }
+        });
+        family.indexed_points = family.indexed_points.saturating_add(series.len());
+        let mut timestamps_by_address = HashMap::<ElementEntry, BTreeSet<u64>>::new();
+        for (timestamp_ms, address) in series.iter() {
+            timestamps_by_address
+                .entry(address.clone())
+                .or_default()
+                .insert(*timestamp_ms);
+        }
+        report.unique_timestamped_block_refs = report
+            .unique_timestamped_block_refs
+            .saturating_add(timestamps_by_address.len());
+        family.unique_block_refs = family
+            .unique_block_refs
+            .saturating_add(timestamps_by_address.len());
+        if kind == "feature" {
+            report.unique_feature_block_refs = report
+                .unique_feature_block_refs
+                .saturating_add(timestamps_by_address.len());
+        }
+
+        for (address, indexed_timestamps) in timestamps_by_address {
+            inspected_addresses.insert(address.clone());
+            match block_store.read(&address) {
+                Ok(bytes) => match decode_feature_block_strict(&bytes) {
+                    PackedFeatureBlockDecode::Packed(points) => {
+                        report.packed_timestamped_blocks =
+                            report.packed_timestamped_blocks.saturating_add(1);
+                        family.packed_blocks = family.packed_blocks.saturating_add(1);
+                        if kind == "feature" {
+                            report.packed_feature_blocks =
+                                report.packed_feature_blocks.saturating_add(1);
+                        }
+                        let mut packed_timestamp_counts = BTreeMap::<u64, usize>::new();
+                        for point in &points {
+                            let count = packed_timestamp_counts
+                                .entry(point.timestamp_ms)
+                                .or_default();
+                            if *count == 1 {
+                                report.duplicate_packed_timestamps.push(
+                                    feature_block_timestamp_mismatch(
+                                        kind,
+                                        key,
+                                        point.timestamp_ms,
+                                        &address,
+                                    ),
+                                );
+                                family.mismatch_count = family.mismatch_count.saturating_add(1);
+                            }
+                            *count = (*count).saturating_add(1);
+                        }
+                        let packed_timestamps = points
+                            .into_iter()
+                            .map(|point| point.timestamp_ms)
+                            .collect::<BTreeSet<_>>();
+                        for timestamp_ms in
+                            indexed_timestamps.difference(&packed_timestamps).copied()
+                        {
+                            report.missing_indexed_timestamps.push(
+                                feature_block_timestamp_mismatch(kind, key, timestamp_ms, &address),
+                            );
+                            family.mismatch_count = family.mismatch_count.saturating_add(1);
+                        }
+                        for timestamp_ms in
+                            packed_timestamps.difference(&indexed_timestamps).copied()
+                        {
+                            report
+                                .orphan_packed_timestamps
+                                .push(feature_block_timestamp_mismatch(
+                                    kind,
+                                    key,
+                                    timestamp_ms,
+                                    &address,
+                                ));
+                            family.mismatch_count = family.mismatch_count.saturating_add(1);
+                        }
+                    }
+                    PackedFeatureBlockDecode::Corrupt(error) => {
+                        report
+                            .corrupt_packed_feature_blocks
+                            .push(feature_block_error(kind, key, &address, error));
+                        family.corrupt_blocks = family.corrupt_blocks.saturating_add(1);
+                    }
+                    PackedFeatureBlockDecode::Legacy => {
+                        report.legacy_timestamped_value_blocks =
+                            report.legacy_timestamped_value_blocks.saturating_add(1);
+                        family.legacy_value_blocks = family.legacy_value_blocks.saturating_add(1);
+                        if kind == "feature" {
+                            report.legacy_feature_value_blocks =
+                                report.legacy_feature_value_blocks.saturating_add(1);
+                        }
+                        if indexed_timestamps.len() > 1 {
+                            report.corrupt_packed_feature_blocks.push(feature_block_error(
+                                kind,
+                                key,
+                                &address,
+                                "legacy timestamped value page shared by multiple timestamps",
+                            ));
+                            family.corrupt_blocks = family.corrupt_blocks.saturating_add(1);
+                        }
+                    }
+                },
+                Err(err) => {
+                    report.corrupt_packed_feature_blocks.push(feature_block_error(
+                        kind,
+                        key,
+                        &address,
+                        err.to_string(),
+                    ));
+                    family.corrupt_blocks = family.corrupt_blocks.saturating_add(1);
+                }
+            }
+        }
+    }
+    for entry in collect_bucket_index_live_block_entries(shard) {
+        if entry.deleted || inspected_addresses.contains(&entry.address) {
+            continue;
+        }
+        if !matches!(
+            entry.kind.as_str(),
+            "feature"
+                | "sequence"
+                | "context_event"
+                | "context_index"
+                | "context_audit"
+                | "context_child"
+                | "context_summary"
+                | "context_compression"
+        ) {
+            continue;
+        }
+        let family = family_reports.entry(entry.kind.clone().to_string()).or_insert_with(|| {
+            StorageTimestampedBlockFamilyReport {
+                kind: entry.kind.clone().to_string(),
+                ..StorageTimestampedBlockFamilyReport::default()
+            }
+        });
+        report.unique_timestamped_block_refs = report.unique_timestamped_block_refs.saturating_add(1);
+        family.unique_block_refs = family.unique_block_refs.saturating_add(1);
+        if entry.kind.as_str() == "feature" {
+            report.unique_feature_block_refs = report.unique_feature_block_refs.saturating_add(1);
+        }
+        match block_store.read(&entry.address) {
+            Ok(bytes) => match decode_feature_block_strict(&bytes) {
+                PackedFeatureBlockDecode::Packed(points) => {
+                    report.packed_timestamped_blocks =
+                        report.packed_timestamped_blocks.saturating_add(1);
+                    family.packed_blocks = family.packed_blocks.saturating_add(1);
+                    if entry.kind.as_str() == "feature" {
+                        report.packed_feature_blocks = report.packed_feature_blocks.saturating_add(1);
+                    }
+                    for point in points {
+                        report
+                            .orphan_packed_timestamps
+                            .push(feature_block_timestamp_mismatch(
+                                entry.kind.as_str(),
+                                &entry.object_key,
+                                point.timestamp_ms,
+                                &entry.address,
+                            ));
+                        family.mismatch_count = family.mismatch_count.saturating_add(1);
+                    }
+                }
+                PackedFeatureBlockDecode::Corrupt(error) => {
+                    report.corrupt_packed_feature_blocks.push(feature_block_error(
+                        entry.kind.as_str(),
+                        &entry.object_key,
+                        &entry.address,
+                        error,
+                    ));
+                    family.corrupt_blocks = family.corrupt_blocks.saturating_add(1);
+                }
+                PackedFeatureBlockDecode::Legacy => {
+                    report.legacy_timestamped_value_blocks =
+                        report.legacy_timestamped_value_blocks.saturating_add(1);
+                    family.legacy_value_blocks = family.legacy_value_blocks.saturating_add(1);
+                    if entry.kind.as_str() == "feature" {
+                        report.legacy_feature_value_blocks =
+                            report.legacy_feature_value_blocks.saturating_add(1);
+                    }
+                }
+            },
+            Err(err) => {
+                report.corrupt_packed_feature_blocks.push(feature_block_error(
+                    entry.kind.as_str(),
+                    &entry.object_key,
+                    &entry.address,
+                    err.to_string(),
+                ));
+                family.corrupt_blocks = family.corrupt_blocks.saturating_add(1);
+            }
+        }
+    }
+    report.families = family_reports.into_values().collect();
+    report
+}
+
+pub(super) fn feature_block_error(
+    kind: &str,
+    key: &str,
+    address: &ElementEntry,
+    error: impl Into<String>,
+) -> StorageFeatureBlockError {
+    StorageFeatureBlockError {
+        kind: kind.to_string(),
+        key: key.to_string(),
+        block_slab_id: address.block_slab_id(),
+        offset: address.offset(),
+        length: address.length(),
+        error: error.into(),
+    }
+}
+
+pub(super) fn feature_block_timestamp_mismatch(
+    kind: &str,
+    key: &str,
+    timestamp_ms: u64,
+    address: &ElementEntry,
+) -> StorageFeatureBlockTimestampMismatch {
+    StorageFeatureBlockTimestampMismatch {
+        kind: kind.to_string(),
+        key: key.to_string(),
+        timestamp_ms,
+        block_slab_id: address.block_slab_id(),
+        offset: address.offset(),
+        length: address.length(),
+    }
+}
+
