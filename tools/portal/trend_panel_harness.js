@@ -43,3 +43,139 @@ function points(n) {
 const SERIES = mode === "absent" ? undefined : {
   interval_s: 15,
   points: mode === "short" ? points(1) : points(8),
+  covers_s: mode === "short" ? 0 : 105,
+  worker_scoped: true,
+};
+
+const OVERVIEW = {
+  status: "ok",
+  footprint: { worker: { resident_bytes: 1048576, peak_bytes: 1048576,
+                         source: "/proc/self/status", workers: 1 },
+               engine: { available: false } },
+  latency: { available: true, deadline_ms: 0, deadline_is_cooperative: true,
+             transport_request_timeout_ms: 60000, transport_io_timeout_ms: 60000,
+             bounds_a_slow_call: "transport_request_timeout_ms",
+             worst_case_single_call_ms: 60000, deadline_can_be_overrun_by_ms: 0 },
+  metrics_series: SERIES,
+  config: { skills: { budgets: { available: false } } },
+};
+
+const els = new Map();
+function makeEl(id) {
+  return {
+    id: id || "", hidden: false, textContent: "",
+    value: id === "key" ? "k-admin" : "", checked: true, className: "",
+    style: {}, dataset: {}, files: [], options: [], children: [], _html: "",
+    get innerHTML() { return this._html; },
+    set innerHTML(v) { this._html = String(v); },
+    addEventListener() {}, removeEventListener() {}, appendChild() {}, removeChild() {},
+    setAttribute() {}, getAttribute() { return null; }, closest() { return null; },
+    querySelector() { return null; }, querySelectorAll() { return []; },
+    scrollIntoView() {}, focus() {}, click() {},
+    classList: { add() {}, remove() {}, toggle() {} }
+  };
+}
+function el(id) {
+  if (!els.has(id)) { els.set(id, makeEl(id)); }
+  return els.get(id);
+}
+
+const win = {
+  document: {
+    getElementById: (id) => el(id),
+    querySelector: () => makeEl(), querySelectorAll: () => [],
+    createElement: () => makeEl(), addEventListener() {}, body: makeEl(), hidden: false
+  },
+  addEventListener() {},
+  location: { origin: "http://localhost", href: "http://localhost", reload() {} },
+  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  navigator: {},
+  setTimeout: () => 0, setInterval: () => 0, clearInterval() {},
+  Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
+  TextDecoder: function () { this.decode = (v) => Buffer.from(v || []).toString("utf8"); },
+  AbortController: function () { this.abort = () => {}; this.signal = {}; },
+  FileReader: function () {}, Blob: function () {},
+  URL: { createObjectURL: () => "", revokeObjectURL() {} },
+  fetch: (url) => {
+    const u = String(url);
+    if (u.indexOf("/v1/admin/overview") >= 0) {
+      return Promise.resolve({ ok: true, status: 200,
+                               json: () => Promise.resolve(OVERVIEW),
+                               text: () => Promise.resolve(JSON.stringify(OVERVIEW)) });
+    }
+    if (u.indexOf("/v1/admin/events") >= 0) {
+      return Promise.resolve({ ok: true, status: 200,
+                               body: { getReader: () => ({ read: () => new Promise(() => {}) }) },
+                               json: () => Promise.resolve({}), text: () => Promise.resolve("") });
+    }
+    return Promise.resolve({ ok: true, status: 200,
+                             json: () => Promise.resolve({ settings: {} }),
+                             text: () => Promise.resolve("") });
+  }
+};
+win.window = win;
+
+const names = Object.keys(win);
+const values = names.map((k) => win[k]);
+scripts.forEach((body, index) => {
+  try { new Function(...names, body)(...values); }
+  catch (e) { console.log("FAIL script " + index + " threw: " + e.message); failures += 1; }
+});
+
+setTimeout(function () {
+  const html = el("trend").innerHTML;
+  ok("the panel was drawn at all", !/Loading/.test(html), html.slice(0, 160));
+
+  if (mode === "absent") {
+    /* An older worker that does not publish a series must not render an empty chart, which would
+       read as a deployment serving nothing. */
+    ok("a missing series says so rather than drawing zero",
+       /Not available/.test(html) && !/<svg/.test(html), html.slice(0, 300));
+  } else if (mode === "short") {
+    ok("one interval is not plotted as a line", !/<svg/.test(html), html.slice(0, 300));
+    ok("and the page says what it is waiting for",
+       /needs two intervals/.test(html), html.slice(0, 300));
+    ok("it does not read as an idle deployment", !/no traffic/i.test(html), html.slice(0, 300));
+  } else {
+    const wanted = mode === "noresident" ? 3 : 4;
+    ok(wanted + " charts were drawn", (html.match(/<svg/g) || []).length === wanted,
+       html.slice(0, 400));
+    ok("each is a polyline with points",
+       (html.match(/<polyline[^>]*points="[^"]+"/g) || []).length === wanted, html.slice(0, 400));
+    ok("requests, errors and latency are all labelled",
+       /Requests/.test(html) && /Errors/.test(html) && /Mean latency/.test(html),
+       html.slice(0, 400));
+
+    if (mode === "noresident") {
+      /* A worker whose platform cannot report a size must not get a chart along the floor: an
+         empty chart reads as a worker holding no memory, which is not what "unavailable" means. */
+      ok("no footprint chart where no size can be read",
+         !/Worker resident/.test(html), html.slice(0, 600));
+    } else {
+      ok("the footprint is plotted too", /Worker resident/.test(html), html.slice(0, 600));
+      const peak = /Worker resident <span class="aux">peak ([\d.]+) MiB/.exec(html);
+      ok("in MiB, and stated as a peak", !!peak, html.slice(0, 600));
+      /* The discriminator. Levels 100..107 MiB: a peak near 107 is the level, a peak near 1 is
+         the level differenced into a rate, and both draw a perfectly plausible rising line. */
+      ok("as a LEVEL, not differenced into a rate",
+         peak && Number(peak[1]) > 100 && Number(peak[1]) < 110, peak && peak[1]);
+    }
+    ok("the peak of each series is stated", /peak /.test(html), html.slice(0, 400));
+    ok("the window is described", /intervals of 15s/.test(html), html.slice(0, 900));
+    ok("and it says whose traffic this is", /This worker only/.test(html), html.slice(0, 900));
+
+    if (mode === "gaps") {
+      /* Four of the eight latency samples are null. The line must have four vertices, not eight
+         with four of them at the floor. */
+      const latency = html.slice(html.indexOf("Mean latency"));
+      const pts = (latency.match(/points="([^"]+)"/) || ["", ""])[1].trim().split(/\s+/);
+      ok("an interval with no calls is skipped, not drawn as zero",
+         pts.length === 4, "vertices: " + pts.length + " -> " + pts.join(" "));
+    }
+  }
+
+  console.log(failures ? "\n" + failures + " failed" : "\nall ok");
+  process.exit(failures ? 1 : 0);
+}, 60);
