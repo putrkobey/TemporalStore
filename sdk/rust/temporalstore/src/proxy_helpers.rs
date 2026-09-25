@@ -63,3 +63,69 @@ pub(crate) fn proxy_timestamp_ms(occur_time_seconds: u64) -> u64 {
 
 pub(crate) fn control_state_precision_ms(precision: ControlStatePrecision) -> u64 {
     match precision {
+        ControlStatePrecision::OneSecond => 1000,
+        ControlStatePrecision::FiveSeconds => 5000,
+        ControlStatePrecision::TenSeconds => 10000,
+        ControlStatePrecision::OneMinute => 60_000,
+        ControlStatePrecision::FiveMinutes => 5 * 60_000,
+        ControlStatePrecision::TenMinutes => 10 * 60_000,
+        ControlStatePrecision::OneHour => 60 * 60_000,
+        ControlStatePrecision::OneDay => 24 * 60 * 60_000,
+        ControlStatePrecision::OneMonth => 30 * 24 * 60 * 60_000,
+    }
+}
+
+pub(crate) fn control_state_window_ms(window: ControlStateWindow) -> (u64, u64) {
+    let end = if window.end > 0 {
+        window.end as u64
+    } else {
+        proxy_timestamp_ms(0)
+    };
+    let start = if window.start >= 0 {
+        window.start as u64
+    } else {
+        end.saturating_sub(control_state_window_unit_ms(window.unit))
+    };
+    (start, end)
+}
+
+pub(crate) fn control_state_window_unit_ms(unit: ControlStateWindowUnit) -> u64 {
+    match unit {
+        ControlStateWindowUnit::Second => 1000,
+        ControlStateWindowUnit::Minute => 60_000,
+        ControlStateWindowUnit::Hour => 60 * 60_000,
+        ControlStateWindowUnit::Day => 24 * 60 * 60_000,
+    }
+}
+
+pub(crate) fn io_error(err: std::io::Error) -> Error {
+    Error {
+        code: 0,
+        message: err.to_string(),
+    }
+}
+
+pub(crate) fn parse_http_endpoint(endpoint: &str) -> Result<(String, u16, String)> {
+    let without_scheme = endpoint.strip_prefix("http://").ok_or_else(|| Error {
+        code: 0,
+        message: "Rust proxy SDK currently expects an http:// endpoint".to_string(),
+    })?;
+    let (authority, path) = without_scheme
+        .split_once('/')
+        .unwrap_or((without_scheme, ""));
+    let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
+        let port = port.parse::<u16>().map_err(|_| Error {
+            code: 0,
+            message: "invalid proxy endpoint port".to_string(),
+        })?;
+        (host.to_string(), port)
+    } else {
+        (authority.to_string(), 80)
+    };
+    let base_path = if path.is_empty() {
+        String::new()
+    } else {
+        format!("/{path}")
+    };
+    Ok((host, port, base_path))
+}
