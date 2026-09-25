@@ -18,3 +18,24 @@
 use std::sync::Once;
 
 use tracing_subscriber::EnvFilter;
+
+static INIT: Once = Once::new();
+
+/// Initialize the global tracing subscriber exactly once.
+///
+/// Reads `RUST_LOG` via [`EnvFilter`], defaulting to `info` when it is absent or
+/// invalid. Subsequent calls are no-ops, and if another component already
+/// installed a global subscriber this leaves it in place (the install is done
+/// with `try_init`, whose error is ignored).
+pub fn init() {
+    INIT.call_once(|| {
+        let filter =
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+        // `try_init` returns an error (rather than panicking) when a global
+        // subscriber is already set; ignore it so daemons can init freely.
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .with_target(true)
+            .try_init();
+    });
+}
