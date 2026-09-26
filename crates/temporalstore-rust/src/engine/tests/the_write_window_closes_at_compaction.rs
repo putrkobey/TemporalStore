@@ -80,3 +80,167 @@ fn ppm(numerator: u64, denominator: u64) -> u64 {
 
 #[test]
 fn the_write_window_closes_at_compaction() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // --- BEFORE ANY WRITE: the window is the whole lifetime, so the two agree trivially. Taken
+    // --- first because the equality after seeding is the interesting one and this says the
+    // --- starting state is not a special case.
+    let fresh = engine.shard_stats(1).expect("a loaded shard reports stats").storage.clone();
+    assert_eq!(
+        fresh.bytes_written_since_compaction, 0,
+        "a store that has written nothing must report 0 bytes in its window, and reported {}",
+        fresh.bytes_written_since_compaction
+    );
+
+    for (round, prefix) in REWRITE_ROUNDS.iter().copied().enumerate() {
+        for index in 0..prefix {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: key_of(index),
+                    value: noisy_value(index, round),
+                },
+            });
+            assert!(response.status.ok, "round {round} write {index}: {:?}", response.status);
+        }
+    }
+
+    let before = engine.shard_stats(1).expect("a loaded shard reports stats").storage.clone();
+    let store_before = engine.block_store.stats();
+
+    // --- THE WINDOW IS STILL THE WHOLE LIFETIME, because nothing has compacted yet. This is the
+    // --- fact that makes the divergence below attributable to the compaction rather than to the
+    // --- two fields having been different all along.
+    assert_eq!(
+        store_before.bytes_written, before.bytes_written_since_compaction,
+        "before the first compaction the window must be the whole lifetime: {} written against a \
+         window of {}",
+        store_before.bytes_written, before.bytes_written_since_compaction
+    );
+    assert_eq!(
+        before.lifetime_write_amplification_ppm, before.write_amplification_since_compaction_ppm,
+        "before the first compaction the two ratios must be equal, and read {} lifetime against \
+         {} windowed",
+        before.lifetime_write_amplification_ppm, before.write_amplification_since_compaction_ppm
+    );
+    assert!(
+        before.write_amplification_since_compaction_ppm > 1_000_000,
+        "the fixture rewrote {} keys over {} rounds, so write amplification must exceed 1.0x \
+         before any compaction -- it read {} ppm, and a window that is already at the floor \
+         cannot be observed falling",
+        KEYS,
+        REWRITE_ROUNDS.len(),
+        before.write_amplification_since_compaction_ppm
+    );
+
+    // --- THE COMPACTION MUST ACTUALLY RELOCATE SOMETHING, or no window opens and the assertions
+    // --- below would be testing a no-op.
+    let plan = engine.storage_lifecycle_plan(crate::StorageLifecycleRequest {
+        shard_id: 1,
+        ..crate::StorageLifecycleRequest::default()
+    });
+    let drain = crate::engine::compaction_drain_block_slab_ids(&plan.reclaim_candidates);
+    assert!(
+        !drain.is_empty(),
+        "no slab is drainable, so a compaction round cannot relocate anything and this arm would \
+         assert over a no-op"
+    );
+    let compaction = engine
+        .compact_shard_blocks_draining(1, drain.clone())
+        .expect("a compaction round over a loaded shard");
+    assert!(
+        compaction.rewritten_block_refs > 0,
+        "the compaction rewrote no block refs, so it consolidated nothing and deliberately does \
+         NOT open a window -- the fixture needs a shape the collector can act on"
+    );
+
+    let after = engine.shard_stats(1).expect("a loaded shard reports stats").storage.clone();
+    let store_after = engine.block_store.stats();
+
+    println!();
+    println!("  THE TWO WRITE RATIOS ACROSS ONE COMPACTION");
+    println!(
+        "    {:<42} {:>12} {:>12}",
+        "", "before", "after"
+    );
+    println!(
+        "    {:<42} {:>12} {:>12}",
+        "bytes_written (lifetime)", store_before.bytes_written, store_after.bytes_written
+    );
+    println!(
+        "    {:<42} {:>12} {:>12}",
+        "bytes_written_since_compaction",
+        before.bytes_written_since_compaction,
+        after.bytes_written_since_compaction
+    );
+    println!(
+        "    {:<42} {:>11.3}x {:>11.3}x",
+        "lifetime_write_amplification",
+        before.lifetime_write_amplification_ppm as f64 / 1_000_000.0,
+        after.lifetime_write_amplification_ppm as f64 / 1_000_000.0
+    );
+    println!(
+        "    {:<42} {:>11.3}x {:>11.3}x",
+        "write_amplification_since_compaction",
+        before.write_amplification_since_compaction_ppm as f64 / 1_000_000.0,
+        after.write_amplification_since_compaction_ppm as f64 / 1_000_000.0
+    );
+    println!(
+        "    the compaction itself wrote {} B and relocated {} block refs",
+        store_after.bytes_written.saturating_sub(store_before.bytes_written),
+        compaction.rewritten_block_refs
+    );
+    println!();
+
+    // --- 1. THE WINDOW OPENED. The baseline moved, so the window is now shorter than the
+    // --- lifetime. Asserted on the TERM rather than the ratio, because a term cannot be
+    // --- satisfied by a denominator that happened to move.
+    assert!(
+        after.bytes_written_since_compaction < store_after.bytes_written,
+        "after a compaction the window must be shorter than the lifetime: window {} against {} \
+         written. If these are equal the baseline was never recorded.",
+        after.bytes_written_since_compaction,
+        store_after.bytes_written
+    );
+
+    // --- 2. THE WINDOWED RATIO FELL.
+    assert!(
+        after.write_amplification_since_compaction_ppm
+            < before.write_amplification_since_compaction_ppm,
+        "the windowed ratio was expected to FALL across a compaction and went {} -> {} ppm",
+        before.write_amplification_since_compaction_ppm,
+        after.write_amplification_since_compaction_ppm
+    );
+
+    // --- 3. AND THE LIFETIME RATIO DID NOT, which is what says the two fields are still different
+    // --- quantities. A compaction writes bytes, so the lifetime figure can only hold or RISE.
+    assert!(
+        after.lifetime_write_amplification_ppm >= before.lifetime_write_amplification_ppm,
+        "the lifetime ratio fell {} -> {} ppm across a compaction. It must not: nothing resets \
+         `bytes_written`, and a compaction only adds to it. If this fell, the lifetime field was \
+         re-pointed at the window and the store's history is no longer published anywhere.",
+        before.lifetime_write_amplification_ppm,
+        after.lifetime_write_amplification_ppm
+    );
+
+    // --- 4. THE RATIO IS RE-DERIVABLE FROM ITS PUBLISHED TERMS, so a consumer need not trust it.
+    let live = after.live_block_bytes;
+    assert!(live > 0, "nothing is live, so the identity below would hold vacuously at 0 == 0");
+    assert_eq!(
+        ppm(after.bytes_written_since_compaction, live),
+        after.write_amplification_since_compaction_ppm,
+        "the published windowed ratio is not its own published terms: {} B over {} live should be \
+         {} ppm and {} was published",
+        after.bytes_written_since_compaction,
+        live,
+        ppm(after.bytes_written_since_compaction, live),
+        after.write_amplification_since_compaction_ppm
+    );
+}
