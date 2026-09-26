@@ -704,3 +704,710 @@ fn a_two_element_frame_answers_for_each_element_and_absent_for_a_third() {
     assert_eq!(4, covered, "every spelling must be covered");
 }
 
+/// A FRAME WHOSE SPELLING CANNOT NAME THE COMPONENT ASKED FOR ANSWERS ABSENT, NOT THE FIRST ITEM.
+///
+/// The second control on vacuous selection, from the other side: here the frame is well formed and
+/// the component is well formed, and they belong to different spellings. An implementation that
+/// compared strings loosely, or that fell back to the first item when it could not build a key,
+/// would serve one element's bytes for another's name -- which is the precise failure #2013 measured
+/// on the carried-page path ("the page that loses is handed the FIRST page's BYTES rather than
+/// answering missing").
+///
+/// rust-internal: exercises the page framing directly
+#[test]
+fn a_frame_asked_for_a_component_its_spelling_cannot_name_answers_absent() {
+    let member = bytes_of(16, 1);
+    // A set page: its keys are raw members and its components are hex.
+    let block = encode_container_block(ElementKeySpelling::Hex, &[(&member, member.as_slice())]);
+    // A hash-shaped component, which is not hex.
+    assert_eq!(
+        ContainerElementRead::Absent,
+        select_container_element(&block, "field-0001"),
+        "a hex-spelled page answered for a component that is not hex"
+    );
+    // And the hex component of a DIFFERENT member, which is well formed and not present.
+    let other = bytes_of(16, 2);
+    assert_eq!(
+        ContainerElementRead::Absent,
+        select_container_element(&block, &hex::encode(&other))
+    );
+    // The control that this fixture is not simply always-absent.
+    assert_eq!(
+        ContainerElementRead::Found(member.clone()),
+        select_container_element(&block, &hex::encode(&member))
+    );
+}
+
+/// A FRAME THAT CANNOT BE WALKED IS NOT MISTAKEN FOR A VALUE.
+///
+/// Eleven mutilations of one real frame. Every one of them must be refused, because the alternative
+/// -- answering `NotFramed` and handing the bytes back -- serves framing bytes as data, which is the
+/// #2016 shape one level down.
+///
+/// THE MUTATIONS ARE COUNTED AND FLOORED. A loop that built no mutants would assert nothing.
+///
+/// rust-internal: exercises the page framing directly
+#[test]
+fn a_frame_that_cannot_be_walked_is_not_mistaken_for_a_value() {
+    let key = b"field-0001".to_vec();
+    let value = bytes_of(24, 1);
+    let good = encode_container_block(ElementKeySpelling::Utf8, &[(&key, value.as_slice())]);
+    // The control: unmutilated, it is a frame and it answers.
+    assert!(matches!(
+        decode_container_block(&good),
+        ContainerBlockDecode::Framed { .. }
+    ));
+
+    let mut mutants: Vec<(&str, Vec<u8>)> = Vec::new();
+    // The spelling byte names a spelling that does not exist.
+    let mut bad_spelling = good.clone();
+    bad_spelling[CONTAINER_BLOCK_MAGIC.len()] = 99;
+    mutants.push(("unknown key spelling", bad_spelling));
+    // Truncated at every interesting boundary.
+    for cut in [
+        CONTAINER_BLOCK_MAGIC.len(),
+        CONTAINER_BLOCK_MAGIC.len() + 1,
+        CONTAINER_BLOCK_MAGIC.len() + 2,
+        CONTAINER_BLOCK_MAGIC.len() + 3,
+        good.len() - 1,
+        good.len() / 2,
+    ] {
+        mutants.push(("truncated", good[..cut].to_vec()));
+    }
+    // A trailing byte the walk does not account for.
+    let mut trailing = good.clone();
+    trailing.push(0);
+    mutants.push(("trailing byte", trailing));
+    // An item count far larger than the payload could hold.
+    let mut huge_count = good.clone();
+    huge_count[CONTAINER_BLOCK_MAGIC.len() + 1] = 0x7f;
+    mutants.push(("item count beyond the payload", huge_count));
+    // A key length that runs past the end.
+    let mut huge_key = good.clone();
+    huge_key[CONTAINER_BLOCK_MAGIC.len() + 2] = 0x7f;
+    mutants.push(("key length beyond the payload", huge_key));
+    // A value offset past the end of its key.
+    let offset_block = encode_container_block(ElementKeySpelling::Utf8, &[(&key, b"")]);
+    let mut bad_offset = offset_block.clone();
+    let last = bad_offset.len() - 1;
+    bad_offset[last] = 0x7f;
+    mutants.push(("value offset past the key", bad_offset));
+
+    let planted = mutants.len();
+    assert!(
+        planted >= 10,
+        "only {planted} mutants were planted, which is too few to claim the walk is guarded"
+    );
+    let mut refused = 0usize;
+    println!("\n=== frames that must be refused ===");
+    for (what, mutant) in mutants {
+        let verdict = decode_container_block(&mutant);
+        let is_refused = matches!(verdict, ContainerBlockDecode::Corrupt(_));
+        println!(
+            "  {:<30} {} bytes -> {}",
+            what,
+            mutant.len(),
+            if is_refused { "refused" } else { "ACCEPTED" }
+        );
+        assert!(
+            is_refused,
+            "{what} ({} bytes) was not refused: {verdict:?}",
+            mutant.len()
+        );
+        refused += 1;
+    }
+    assert_eq!(planted, refused, "every planted mutant must be refused");
+    println!("  planted {planted}, refused {refused}");
+}
+
+/// BYTES WITH NO MAGIC ARE NOT A FRAME, AND ARE NOT CORRUPT EITHER.
+///
+/// The compatibility hinge in isolation: a page written before this stage has no magic, and the
+/// answer has to be `NotFramed` so the read funnel hands the payload back. `Corrupt` here would
+/// break every stored page.
+///
+/// rust-internal: exercises the page framing directly
+#[test]
+fn bytes_with_no_magic_are_not_a_frame() {
+    let mut checked = 0usize;
+    for payload in [
+        b"".to_vec(),
+        b"a".to_vec(),
+        b"TSCPG".to_vec(),
+        b"TSFPB1\n".to_vec(),
+        bytes_of(128, 1),
+        serde_json::to_vec(&serde_json::json!({"any": "json"})).expect("json"),
+    ] {
+        assert_eq!(
+            ContainerBlockDecode::NotFramed,
+            decode_container_block(&payload),
+            "a payload of {} bytes was taken for a frame",
+            payload.len()
+        );
+        assert_eq!(
+            ContainerElementRead::NotFramed,
+            select_container_element(&payload, "field-0001")
+        );
+        checked += 1;
+    }
+    assert_eq!(6, checked);
+}
+
+// =================================================================================================
+// 4. AND THE PRODUCT STILL ANSWERS EXACTLY WHAT IT DID
+// =================================================================================================
+
+/// EVERY CONTAINER KIND WRITES A FRAMED PAGE AND READS BACK THE VALUE IT WROTE.
+///
+/// End to end through the engine's own command surface, which is the only arm that proves the write
+/// sites and the read funnel agree. The two counters are floored at zero: no write fell back to a
+/// bare page, and no read met a frame it could not walk.
+///
+/// THE STORE PATH LENGTH is printed and is one directory for the whole test, so no arm is measured
+/// against a longer path than another.
+///
+/// rust-internal: drives the engine's own command surface
+#[test]
+fn every_container_kind_reads_back_the_value_it_wrote_through_a_framed_block() {
+    // IT FETCHES THE PAGE BY COMPONENT, which is the ungated identity. Under one entry a page a
+    // live set entry carries no element name, so the fetch answers `None` and this panics BEFORE
+    // comparing any value -- the instrument fails, not the readback. That the values are whole
+    // under the gate is held by `gated_corpus_across_a_store_boundary` for all four kinds across a
+    // store boundary, by `container_blocks_are_batched::every_element_reads_back_its_own_value_
+    // after_the_fold_and_after_a_reload`, and by `container_block_ordinal::a_reloaded_container_
+    // still_reads_every_element`.
+    let dir = tempfile::tempdir().expect("tempdir");
+    println!(
+        "\n=== container kinds through the product path ===\n  store path {} characters",
+        dir.path().as_os_str().len()
+    );
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+    crate::engine::container_blocks::reset_unframed_container_write_count();
+    crate::engine::reset_corrupt_container_block_count();
+
+    let fields: Vec<(String, Vec<u8>)> = (0..4)
+        .map(|index| (format!("field-{index:04}"), bytes_of(48, index)))
+        .collect();
+    for (field, value) in &fields {
+        write(
+            &engine,
+            Command::HashSet {
+                key: "hash-key".to_string(),
+                field: field.clone(),
+                value: value.clone(),
+            },
+        );
+    }
+    for (field, value) in &fields {
+        let response = read(
+            &engine,
+            Command::HashGet {
+                key: "hash-key".to_string(),
+                field: field.clone(),
+            },
+        );
+        match response {
+            crate::types::CommandResponse::Bytes { value: got } => assert_eq!(
+                Some(value.clone()),
+                got,
+                "hash field {field} did not read back the bytes it was written with"
+            ),
+            other => panic!("expected Bytes, got {other:?}"),
+        }
+    }
+    // The whole-object door, which walks the page index and reads a page per element: the arm #2014
+    // guards, and the one that would return framing bytes if selection were skipped.
+    let entries = match read(
+        &engine,
+        Command::HashGetAll {
+            key: "hash-key".to_string(),
+        },
+    ) {
+        crate::types::CommandResponse::HashEntries { entries } => entries,
+        other => panic!("expected HashEntries, got {other:?}"),
+    };
+    assert_eq!(
+        fields.len(),
+        entries.len(),
+        "the listing answered {} entries for {} fields",
+        entries.len(),
+        fields.len()
+    );
+    for (field, value) in &fields {
+        let found = entries
+            .iter()
+            .find(|(name, _)| name == field)
+            .map(|(_, bytes)| bytes.clone());
+        assert_eq!(Some(value.clone()), found, "the listing lost field {field}");
+    }
+
+    let members: Vec<Vec<u8>> = (0..4).map(|index| bytes_of(32, index + 10)).collect();
+    for member in &members {
+        write(
+            &engine,
+            Command::SetAdd {
+                key: "set-key".to_string(),
+                member: member.clone(),
+            },
+        );
+    }
+    let listed = match read(
+        &engine,
+        Command::SetMembers {
+            key: "set-key".to_string(),
+        },
+    ) {
+        crate::types::CommandResponse::Members { members } => members,
+        other => panic!("expected Members, got {other:?}"),
+    };
+    assert_eq!(
+        members.len(),
+        listed.len(),
+        "the set listing answered {} members for {}",
+        listed.len(),
+        members.len()
+    );
+    for member in &members {
+        assert!(
+            listed.contains(member),
+            "the set listing lost a member of {} bytes",
+            member.len()
+        );
+    }
+
+    for (index, member) in members.iter().enumerate() {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ZSetAdd {
+                key: "zset-key".to_string(),
+                member: member.clone(),
+                score: index as f64,
+            },
+        });
+        assert!(response.status.ok, "a zset write failed: {response:?}");
+    }
+    let zset_members = match read(
+        &engine,
+        Command::ZSetRange {
+            key: "zset-key".to_string(),
+            start: 0,
+            stop: -1,
+            rev: false,
+        },
+    ) {
+        crate::types::CommandResponse::Members { members } => members,
+        other => panic!("expected Members, got {other:?}"),
+    };
+    // A ZSET LISTING ANSWERS INTERLEAVED MEMBER AND SCORE, so four members are eight entries. And
+    // it reads NO PAGE AT ALL -- it is served out of `shard.zsets`, which #2017 measured and used
+    // as its control. So this arm proves the zset WRITE path did not break the resident map; the
+    // zset PAGE is exercised by the reload test below, which is the only door that reads it.
+    assert_eq!(
+        members.len() * 2,
+        zset_members.len(),
+        "the zset listing answered {} entries for {} members, and it answers member and score",
+        zset_members.len(),
+        members.len()
+    );
+    for member in &members {
+        assert!(
+            zset_members.contains(member),
+            "the zset listing lost a member of {} bytes",
+            member.len()
+        );
+    }
+
+    let elements: Vec<Vec<u8>> = (0..4).map(|index| bytes_of(40, index + 20)).collect();
+    for element in &elements {
+        write(
+            &engine,
+            Command::ListPush {
+                key: "list-key".to_string(),
+                member: element.clone(),
+                left: false,
+            },
+        );
+    }
+    let ranged = match read(
+        &engine,
+        Command::ListRange {
+            key: "list-key".to_string(),
+            start: 0,
+            stop: -1,
+        },
+    ) {
+        crate::types::CommandResponse::Members { members } => members,
+        other => panic!("expected Members, got {other:?}"),
+    };
+    assert_eq!(
+        elements, ranged,
+        "the list did not read back the elements it was pushed, in order"
+    );
+
+    assert_eq!(
+        0,
+        crate::engine::container_blocks::unframed_container_write_count(),
+        "a container write stored a bare value instead of a frame"
+    );
+    assert_eq!(
+        0,
+        crate::engine::corrupt_container_block_count(),
+        "a read met a container page it could not walk"
+    );
+
+    // AND THE STORED PAGES REALLY ARE FRAMED, which nothing above this line establishes.
+    //
+    // Every value comparison in this test would pass just as well if the write path had stopped
+    // framing altogether, because an unframed page reads back exactly -- that is the compatibility
+    // design, and it is what makes the rest of this test vacuous in this one direction. So the raw
+    // page is fetched for one element of each kind and asserted to decode as a frame naming that
+    // element. Four kinds and not one: a per-kind spelling chosen wrongly at a single write site is
+    // exactly the defect the shared helper exists to prevent, and it would show only here.
+    let stored: [(&str, &str, String); 4] = [
+        ("hash", "hash-key", fields[0].0.clone()),
+        ("set", "set-key", hex::encode(&members[0])),
+        (
+            "zset",
+            "zset-key",
+            // Spelled by the engine's OWN function rather than by hand: a hand-written zset
+            // component is a second implementation of the encoding under test, and it would agree
+            // with a write path that had stopped holding the same spelling.
+            crate::engine::execute_on_shard::zset_component(&members[0]),
+        ),
+        ("list", "list-key", format!("{:016x}", 1_u64 << 63)),
+    ];
+    let mut framed_kinds = 0usize;
+    println!("  stored page shapes:");
+    for (kind, key, component) in &stored {
+        let frame = engine
+            .container_block_frame_for_test(1, kind, key, Some(component.as_str()))
+            .unwrap_or_else(|| panic!("no stored page for {kind} {key} component {component}"));
+        match crate::engine::container_blocks::decode_container_block(&frame) {
+            crate::engine::container_blocks::ContainerBlockDecode::Framed { spelling, items, .. } => {
+                assert_eq!(
+                    1,
+                    items.len(),
+                    "{kind} wrote {} items in one page, and nothing batches yet",
+                    items.len()
+                );
+                assert!(
+                    !items[0].deleted,
+                    "{kind} wrote a live element and the page says it was removed"
+                );
+                let named = crate::engine::container_blocks::component_from_element_key(
+                    spelling,
+                    &items[0].key,
+                )
+                .unwrap_or_else(|| panic!("{kind}'s page key spells no component"));
+                assert_eq!(
+                    component, &named,
+                    "{kind}'s page names element {named} where its index entry names {component}"
+                );
+                println!(
+                    "    {kind:>5}  {} bytes, spelling {spelling:?}, names {named}",
+                    frame.len()
+                );
+                framed_kinds += 1;
+            }
+            other => panic!("{kind} did not store a framed page: {other:?}"),
+        }
+    }
+    assert_eq!(
+        4, framed_kinds,
+        "only {framed_kinds} kinds stored a framed page"
+    );
+
+    println!(
+        "  hash {} fields, set {} members, zset {} members ({} listing entries), list {} elements -- all read back",
+        fields.len(),
+        members.len(),
+        members.len(),
+        zset_members.len(),
+        elements.len()
+    );
+}
+
+/// A FRAMED PAGE SURVIVES A RELOAD, WHICH IS THE ONLY DOOR THAT READS SOME OF THEM AT ALL.
+///
+/// The end-to-end test above cannot exercise a zset page, because a zset listing is served out of
+/// `shard.zsets` and reads nothing -- #2017's own control. A reload is what reads the pages: it
+/// rebuilds the resident maps out of the page index and then every subsequent read resolves an
+/// address and goes to storage.
+///
+/// SO THIS IS ALSO THE ARM THAT MATTERS MOST TO WHAT COMES NEXT. The stage after this one makes the
+/// load path rebuild those maps out of the PAGES rather than out of the index, and the page read
+/// here is the read it will build on. If the frame did not survive a reload there would be nothing
+/// to build on.
+///
+/// THE DENOMINATOR: the reloaded engine is asserted to hold the elements before anything is read
+/// through it, so a reload that came up empty would fail here rather than quietly passing every
+/// "the value is missing and so is the expectation" comparison.
+///
+/// rust-internal: drives the engine's own command surface
+#[test]
+fn a_framed_block_reads_back_after_a_reload() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let blocks = dir.path().join("blocks");
+    let indexes = dir.path().join("indexes");
+    println!(
+        "\n=== framed pages across a reload ===\n  store path {} characters",
+        dir.path().as_os_str().len()
+    );
+
+    let fields: Vec<(String, Vec<u8>)> = (0..6)
+        .map(|index| (format!("field-{index:04}"), bytes_of(64, index)))
+        .collect();
+    let members: Vec<Vec<u8>> = (0..6).map(|index| bytes_of(24, index + 100)).collect();
+    let elements: Vec<Vec<u8>> = (0..6).map(|index| bytes_of(36, index + 200)).collect();
+
+    {
+        let engine =
+            TemporalEngine::with_local_dirs(64 * 1024 * 1024, dir.path().join("cache"), &blocks, &indexes);
+        load_on(&engine);
+        crate::engine::container_blocks::reset_unframed_container_write_count();
+        for (field, value) in &fields {
+            write(
+                &engine,
+                Command::HashSet {
+                    key: "reloaded".to_string(),
+                    field: field.clone(),
+                    value: value.clone(),
+                },
+            );
+        }
+        for member in &members {
+            write(
+                &engine,
+                Command::SetAdd {
+                    key: "reloaded".to_string(),
+                    member: member.clone(),
+                },
+            );
+        }
+        for (index, member) in members.iter().enumerate() {
+            write(
+                &engine,
+                Command::ZSetAdd {
+                    key: "reloaded".to_string(),
+                    member: member.clone(),
+                    score: index as f64,
+                },
+            );
+        }
+        for element in &elements {
+            write(
+                &engine,
+                Command::ListPush {
+                    key: "reloaded".to_string(),
+                    member: element.clone(),
+                    left: false,
+                },
+            );
+        }
+        assert_eq!(
+            0,
+            crate::engine::container_blocks::unframed_container_write_count(),
+            "a container write stored a bare value instead of a frame"
+        );
+        engine.flush_shard_index(1);
+    }
+
+    // A SECOND ENGINE ON THE SAME FILES, with its own cache directory so nothing is answered out
+    // of a warm page the first engine left behind. Without that the reload would be measured
+    // against the cache rather than against storage.
+    let reloaded = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache-reloaded"),
+        &blocks,
+        &indexes,
+    );
+    crate::engine::reset_corrupt_container_block_count();
+    load_on(&reloaded);
+
+    // The denominator, before a single value is compared.
+    let hash_len = match read(
+        &reloaded,
+        Command::HashLen {
+            key: "reloaded".to_string(),
+        },
+    ) {
+        crate::types::CommandResponse::Integer { value } => value,
+        other => panic!("expected Integer, got {other:?}"),
+    };
+    assert_eq!(
+        fields.len() as i64,
+        hash_len,
+        "the reloaded shard holds {hash_len} fields where {} were written, so a per-field \
+         comparison below would be over the wrong population",
+        fields.len()
+    );
+
+    for (field, value) in &fields {
+        let got = match read(
+            &reloaded,
+            Command::HashGet {
+                key: "reloaded".to_string(),
+                field: field.clone(),
+            },
+        ) {
+            crate::types::CommandResponse::Bytes { value } => value,
+            other => panic!("expected Bytes, got {other:?}"),
+        };
+        assert_eq!(
+            Some(value.clone()),
+            got,
+            "hash field {field} did not survive the reload"
+        );
+    }
+
+    let listed = match read(
+        &reloaded,
+        Command::SetMembers {
+            key: "reloaded".to_string(),
+        },
+    ) {
+        crate::types::CommandResponse::Members { members } => members,
+        other => panic!("expected Members, got {other:?}"),
+    };
+    assert_eq!(
+        members.len(),
+        listed.len(),
+        "the reloaded set listing answered {} members for {}",
+        listed.len(),
+        members.len()
+    );
+    for member in &members {
+        assert!(
+            listed.contains(member),
+            "the reloaded set lost a member of {} bytes -- and a set listing reads ONE PAGE PER \
+             MEMBER, so this is the arm that reads a framed page off storage",
+            member.len()
+        );
+    }
+
+    let ranged = match read(
+        &reloaded,
+        Command::ListRange {
+            key: "reloaded".to_string(),
+            start: 0,
+            stop: -1,
+        },
+    ) {
+        crate::types::CommandResponse::Members { members } => members,
+        other => panic!("expected Members, got {other:?}"),
+    };
+    assert_eq!(
+        elements, ranged,
+        "the reloaded list did not read back its elements in order"
+    );
+
+    let zset_entries = match read(
+        &reloaded,
+        Command::ZSetRange {
+            key: "reloaded".to_string(),
+            start: 0,
+            stop: -1,
+            rev: false,
+        },
+    ) {
+        crate::types::CommandResponse::Members { members } => members,
+        other => panic!("expected Members, got {other:?}"),
+    };
+    for member in &members {
+        assert!(
+            zset_entries.contains(member),
+            "the reloaded zset lost a member of {} bytes",
+            member.len()
+        );
+    }
+
+    assert_eq!(
+        0,
+        crate::engine::corrupt_container_block_count(),
+        "the reload met a container page it could not walk"
+    );
+    println!(
+        "  reloaded: {} hash fields, {} set members, {} list elements, {} zset members -- all read back off storage",
+        fields.len(),
+        listed.len(),
+        ranged.len(),
+        members.len()
+    );
+}
+
+/// A PAGE WRITTEN WITHOUT A FRAME STILL READS THROUGH THE FUNNEL.
+///
+/// The compatibility claim, exercised on the product path rather than argued from the magic. No
+/// version stamp moves in this stage, and this is the whole reason that is safe: a stored page from
+/// before this change has no magic, so the funnel hands its payload back untouched.
+///
+/// HOW THE OLD SHAPE IS PRODUCED WITHOUT A TIME MACHINE: the value is appended through the block
+/// store directly, with no frame round it, and the page index is told about it the same way a write
+/// would. That is byte-for-byte what a page written before this stage looks like.
+///
+/// rust-internal: drives the engine's own command surface
+#[test]
+fn a_block_written_without_a_frame_still_reads_through_the_funnel() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+    crate::engine::reset_corrupt_container_block_count();
+
+    // A framed write first, so the fixture holds both shapes at once and the unframed read cannot
+    // pass merely because nothing in the store is framed.
+    write(
+        &engine,
+        Command::HashSet {
+            key: "mixed".to_string(),
+            field: "framed".to_string(),
+            value: b"framed-value".to_vec(),
+        },
+    );
+
+    let legacy_value = b"a value with no frame at all".to_vec();
+    let installed = engine.install_unframed_hash_block_for_test(1, "mixed", "legacy", &legacy_value);
+    assert!(
+        installed,
+        "the fixture could not install an unframed page, so this test proves nothing"
+    );
+
+    let got = match read(
+        &engine,
+        Command::HashGet {
+            key: "mixed".to_string(),
+            field: "legacy".to_string(),
+        },
+    ) {
+        crate::types::CommandResponse::Bytes { value } => value,
+        other => panic!("expected Bytes, got {other:?}"),
+    };
+    assert_eq!(
+        Some(legacy_value.clone()),
+        got,
+        "an unframed page did not read back its own bytes"
+    );
+
+    // And the framed one beside it still answers, so the two shapes coexist.
+    let framed = match read(
+        &engine,
+        Command::HashGet {
+            key: "mixed".to_string(),
+            field: "framed".to_string(),
+        },
+    ) {
+        crate::types::CommandResponse::Bytes { value } => value,
+        other => panic!("expected Bytes, got {other:?}"),
+    };
+    assert_eq!(Some(b"framed-value".to_vec()), framed);
+
+    assert_eq!(
+        0,
+        crate::engine::corrupt_container_block_count(),
+        "reading an unframed page was scored as a corrupt frame"
+    );
+    println!(
+        "\n=== both shapes in one store ===\n  unframed page {} bytes read back exactly; framed page beside it still answers",
+        legacy_value.len()
+    );
+}
