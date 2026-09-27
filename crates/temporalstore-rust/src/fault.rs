@@ -63,3 +63,69 @@ impl Drop for FaultGuard {
 }
 
 /// Reach a named point. Does nothing unless this thread has armed it.
+#[inline]
+pub fn point(name: &'static str) {
+    let action = ARMED.with(|armed| armed.borrow().get(name).cloned());
+    match action {
+        None => {}
+        Some(FaultAction::Stop) => panic!("fault point reached: {name}"),
+        Some(FaultAction::Hang(duration)) => std::thread::sleep(duration),
+    }
+}
+
+/// Whether `name` is armed on this thread. For assertions that a point was actually reachable --
+/// a crash test that never reaches its point passes while testing nothing.
+pub fn is_armed(name: &'static str) -> bool {
+    ARMED.with(|armed| armed.borrow().contains_key(name))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_point_nobody_armed_does_nothing() {
+        for _ in 0..1_000 {
+            point("wal/roll/after_rename");
+        }
+    }
+
+    #[test]
+    fn an_armed_point_stops_there() {
+        let _armed = arm("test/stop", FaultAction::Stop);
+        let outcome = std::panic::catch_unwind(|| {
+            point("test/stop");
+            "kept going"
+        });
+        assert!(outcome.is_err(), "the point should have stopped it");
+    }
+
+    #[test]
+    fn arming_ends_with_the_guard() {
+        {
+            let _armed = arm("test/scoped", FaultAction::Stop);
+            assert!(is_armed("test/scoped"));
+        }
+        assert!(!is_armed("test/scoped"), "the guard should have disarmed it");
+        point("test/scoped");
+    }
+
+    #[test]
+    fn the_guard_disarms_even_when_the_stop_unwinds() {
+        let outcome = std::panic::catch_unwind(|| {
+            let _armed = arm("test/unwind", FaultAction::Stop);
+            point("test/unwind");
+        });
+        assert!(outcome.is_err());
+        assert!(
+            !is_armed("test/unwind"),
+            "a point left armed by its own panic would stop every later test on this thread"
+        );
+    }
+
+    #[test]
+    fn one_point_being_armed_does_not_arm_another() {
+        let _armed = arm("test/one", FaultAction::Stop);
+        point("test/two");
+    }
+}
