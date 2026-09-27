@@ -21,3 +21,27 @@ impl ProxyClient {
                 ("value", serde_json::json!(value)),
                 ("value_bytes", serde_json::json!(value.as_bytes())),
                 ("occur_time", serde_json::json!(occur_time_ms / 1000)),
+                ("occur_time_ms", serde_json::json!(occur_time_ms)),
+                ("ttl", serde_json::json!(ttl_ms / 1000)),
+                ("ttl_ms", serde_json::json!(ttl_ms)),
+                (
+                    // The route parses this as `selection_type`; the argument keeps its name.
+                    "selection_type",
+                    serde_json::to_value(fol_type).map_err(json_error)?,
+                ),
+            ],
+        );
+        self.proxy_service_execute("/ProxyService/ControlStateFolSet", body)
+            .map(|_| ())
+    }
+
+    pub fn control_state_fol_query(&self, key: &str) -> Result<Option<String>> {
+        let body = self.proxy_service_body(key, &[]);
+        let response = self.proxy_service_execute("/ProxyService/ControlStateFolQuery", body)?;
+        Ok(response
+            .get("value")
+            .cloned()
+            .filter(|value| !value.is_null())
+            .map(json_byte_array_to_string))
+    }
+}
