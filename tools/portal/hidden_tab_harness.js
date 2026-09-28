@@ -112,3 +112,118 @@ function makeWorld() {
      * due timers that runs first finds none and reports a page that let go of its connection.
      * That is a false pass on exactly the behaviour this file exists to check, and it is what a
      * single `await Promise.resolve()` produced. setImmediate yields past the whole microtask
+     * queue rather than one tick of it.
+     */
+    async flush() {
+      for (let i = 0; i < 8; i += 1) {
+        await new Promise((resolve) => realSetImmediate(resolve));
+      }
+    },
+    async advance(ms) {
+      const until = now + ms;
+      await this.flush();
+      for (let guard = 0; guard < 200; guard += 1) {
+        const next = timers.filter((t) => t.at <= until).sort((a, b) => a.at - b.at)[0];
+        if (!next) { break; }
+        timers.splice(timers.indexOf(next), 1);
+        now = Math.max(now, next.at);
+        next.fn();
+        await this.flush();
+      }
+      now = until;
+    },
+  };
+}
+
+/* ---------- pick the stream this page actually runs ---------- */
+/* Two of the seven pages open their own connection and make the strip stand down for them
+   (`window.__matrixarkLive = "page"`), so "the page's live connection" is a different block of
+   code depending on which page it is. Running the strip's block on a page whose strip returns
+   immediately would check a code path that page never takes. */
+const MODE = process.argv[3] || "strip";
+
+/* Just the factory, not the block it sits in.
+ *
+ * The page's own script calls wireTabs and paints half a dozen panels as soon as it is evaluated,
+ * so running the whole block to reach one function fails on the first thing this harness has no
+ * DOM for -- and reports it as "the stream would not run", which is not what was being asked. */
+function sliceFactory(script) {
+  const at = script.indexOf("function liveStream(options)");
+  if (at === -1) { return null; }
+  let depth = 0;
+  for (let i = script.indexOf("{", at); i < script.length; i += 1) {
+    if (script[i] === "{") { depth += 1; }
+    else if (script[i] === "}") {
+      depth -= 1;
+      if (depth === 0) { return script.slice(at, i + 1); }
+    }
+  }
+  return null;
+}
+
+const src = MODE === "page"
+  ? sliceFactory(scripts.find((s) => s.includes("function liveStream(options)")) || "")
+  : scripts.find((s) => s.includes("A hidden tab holds a connection open")
+                     && s.includes("window.__matrixarkLive"));
+if (!src) {
+  console.log("FAIL the page carries no " + MODE + " stream");
+  process.exit(1);
+}
+
+(async () => {
+  const world = makeWorld();
+  const globals = {
+    document: world.doc,
+    window: world.win,
+    fetch: world.fetch,
+    AbortController: world.AbortController,
+    setTimeout: world.win.setTimeout,
+    clearTimeout: world.win.clearTimeout,
+    setInterval: world.win.setInterval,
+    clearInterval: world.win.clearInterval,
+    TextDecoder: function () { this.decode = () => ""; },
+    sessionStorage: { getItem: () => "k-test", setItem() {}, removeItem() {} },
+    localStorage: { getItem: () => "k-test", setItem() {}, removeItem() {} },
+  };
+  /* For the page stream the block only DEFINES the factory -- the page calls it from code that
+     wants far more of a DOM than this. So the factory is handed back and called here, with the
+     same options shape the page uses. */
+  const tail = MODE === "page"
+    ? "\n; return typeof liveStream === 'function' ? liveStream : null;"
+    : "";
+  let factory = null;
+  try {
+    factory = new Function(...Object.keys(globals), src + tail)(...Object.values(globals));
+  } catch (error) {
+    console.log("FAIL the " + MODE + " stream would not run: " + error.message);
+    process.exit(1);
+  }
+  if (MODE === "page") {
+    ok("the page defines its own stream", typeof factory === "function");
+    if (typeof factory !== "function") { console.log("FAILED " + failures); process.exit(1); }
+    factory({ headers: () => ({ Authorization: "Bearer k-test" }) });
+  }
+
+  await world.advance(3000);
+  const beforeHide = world.opened.length;
+  ok("the page opens a live connection", beforeHide > 0, String(beforeHide));
+
+  world.doc.hidden = true;
+  world.fire("visibilitychange", "document");
+  await world.flush();
+  ok("hiding the tab aborts the connection", world.aborted.length > 0);
+
+  const atHide = world.opened.length;
+  await world.advance(60000);
+  const whileHidden = world.opened.length - atHide;
+  ok("and it stays closed while the tab is hidden", whileHidden === 0,
+     whileHidden + " connection(s) opened while hidden -- the reconnect ignores the tab");
+
+  world.doc.hidden = false;
+  world.fire("visibilitychange", "document");
+  await world.advance(3000);
+  ok("coming back opens it again", world.opened.length > atHide + whileHidden);
+
+  console.log(failures === 0 ? "PASS" : "FAILED " + failures);
+  process.exit(failures === 0 ? 0 : 1);
+})();
