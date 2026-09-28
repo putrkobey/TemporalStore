@@ -22,3 +22,75 @@ const clockStart = page.indexOf("var liveServerMs = 0;");
 const clockBlock = page.slice(clockStart, page.indexOf("function liveStream(options)"));
 
 const parts = [
+  clockBlock,
+  slice("function liveStream(options)"),
+  "var CLOCK_SKEW_NOTICE_MS = " +
+    /var CLOCK_SKEW_NOTICE_MS = (\d+);/.exec(page)[1] + ";",
+  slice("function clockNoteHtml()"),
+  slice("  function agoText(at)"),
+  slice("  function renderFailures(list)"),
+];
+
+// A browser whose clock is `input.browserOffsetMs` away from real time.
+const REAL_NOW = 1_760_000_000_000;
+const browserNow = () => REAL_NOW + (input.browserOffsetMs || 0);
+
+const frames = input.frames || [];
+const sse = frames.map((f) => "event: status\ndata: " + JSON.stringify(f) + "\n\n").join("");
+
+const nodes = {};
+const scope = {
+  Date: { now: browserNow },
+  fetch: () => Promise.resolve({
+    ok: true,
+    body: {
+      getReader: () => {
+        let sent = false;
+        return {
+          read: () => Promise.resolve(sent
+            ? { done: true }
+            : ((sent = true), { done: false, value: sse })),
+        };
+      },
+    },
+  }),
+  TextDecoder: function () { this.decode = (v) => (v === undefined ? "" : String(v)); },
+  AbortController: function () { this.abort = () => {}; this.signal = null; },
+  document: { hidden: false, addEventListener: () => {} },
+  $: (id) => (nodes[id] = nodes[id] || { innerHTML: "" }),
+  window: { addEventListener: () => {} },
+  // A no-op: the shipped code reconnects when the reader finishes, and a real timer here turns
+  // that into a hot loop. The reconnect is not what this harness is measuring.
+  setTimeout: () => 0,
+  // The stream now registers a watchdog. Left to the real timer it keeps node alive for ever and
+  // this harness never prints -- which is how the whole suite hung the first time.
+  setInterval: () => 0,
+  clearInterval: () => {},
+  esc: (s) => String(s == null ? "" : s),
+};
+
+const names = Object.keys(scope);
+const api = new Function(...names, parts.join("\n") + `
+  return { liveStream: liveStream, agoText: agoText, clockNoteHtml: clockNoteHtml,
+           serverNowMs: serverNowMs, clockSkewMs: clockSkewMs,
+           sinceLastFrameMs: sinceLastFrameMs, renderFailures: renderFailures };
+`)(...names.map((k) => scope[k]));
+
+const before = { ago: api.agoText(input.at), skew: api.clockSkewMs() };
+api.liveStream({ onFrame: () => {}, onState: () => {}, headers: () => ({}) });
+
+setTimeout(() => {
+  process.stdout.write(JSON.stringify({
+    before,
+    after: {
+      ago: api.agoText(input.at),
+      skewMs: api.clockSkewMs(),
+      serverNowMs: api.serverNowMs(),
+      note: api.clockNoteHtml(),
+      panel: (api.renderFailures(input.failures || []),
+              (nodes.failures || { innerHTML: "" }).innerHTML),
+      emptyPanel: (api.renderFailures([]),
+                   (nodes.failures || { innerHTML: "" }).innerHTML),
+    },
+  }));
+}, 10);
