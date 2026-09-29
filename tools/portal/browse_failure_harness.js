@@ -32,3 +32,105 @@ const loadBrowseSrc = sliceBlock(start);
 
 /* The page's shared helpers are a script block of their own, emitted before the page's own
  * script. The sandbox below models what the browse region can see, so it needs them too --
+ * and it RUNS the shipped block rather than stubbing it, because a stub would let the helper
+ * change without a single test noticing. That block is where `__matrixarkWhen` is defined, which
+ * is what loadBrowse formats each row's timestamp through -- so running it covers the formatter
+ * and the three helpers beside it, and there is exactly one `win` for all of them. */
+const sharedAt = page.indexOf("Helpers every page may call");
+if (sharedAt < 0) { console.log("FAIL the shared helper block is not on this page"); process.exit(2); }
+const sharedFrom = page.lastIndexOf("<script>", sharedAt) + "<script>".length;
+const sharedTo = page.indexOf("</script>", sharedFrom);
+const win = {};
+new Function("window", page.slice(sharedFrom, sharedTo))(win);
+
+let failures = 0;
+function ok(what, condition, detail) {
+  if (condition) { console.log("ok   " + what); }
+  else { console.log("FAIL " + what + (detail ? "\n     " + detail : "")); failures += 1; }
+}
+
+const els = {};
+function el(id) {
+  if (!els[id]) { els[id] = { id: id, innerHTML: "", textContent: "" }; }
+  return els[id];
+}
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+const said = [];
+function respond(body, good) {
+  return Promise.resolve({
+    ok: good, status: good ? 200 : 500,
+    json: () => Promise.resolve(body)
+  });
+}
+
+const scope = {
+  $: el,
+  esc,
+  say: (element, text) => { element.innerHTML = text ? String(text) : ""; said.push(String(text)); },
+  conn: () => {},
+  auth: () => ({}),
+  scopeQuery: () => "user_id=alice",
+  failure: (status) => "The gateway answered " + status + ".",
+  Date, JSON, String, Number, Promise,
+  window: win,
+  fetch: (url) => {
+    const key = String(url);
+    if (key.indexOf("/v1/users") === 0) {
+      /* `empty` is a SUCCESSFUL call with nothing in it -- the state the failure message must not
+         be confused with, and the one every other mode leaves untested because they all return a
+         row. Without it, making the success path say "Not loaded." goes unnoticed. */
+      return respond({ users: failing === "empty" ? [] : [{ user_id: "alice", count: 3 }] },
+                     !(failing === "users" || failing === "both"));
+    }
+    if (key.indexOf("/v1/memories") === 0) {
+      return respond({ memories: [{ id: "m1", memory: "a note", record_type: "note" }] },
+                     !(failing === "memories" || failing === "both"));
+    }
+    return respond({}, true);
+  }
+};
+
+const names = Object.keys(scope);
+const loadBrowse = new Function(...names,
+  loadBrowseSrc + "; return loadBrowse;")(...names.map((k) => scope[k]));
+
+loadBrowse();
+
+setTimeout(() => {
+  const users = el("users").innerHTML;
+  const memories = el("memories").innerHTML;
+  const message = el("browseMsg").innerHTML;
+
+  if (failing === "users" || failing === "both") {
+    ok("a failed subject list is not left blank", users.trim().length > 0,
+       JSON.stringify(users));
+    ok("it says it did not load, not that the scope is empty",
+       /Not loaded/.test(users) && !/No subjects/.test(users), users);
+    ok("and the cause is named rather than left to be guessed",
+       message.trim().length > 0, JSON.stringify(message));
+  }
+  if (failing === "users") {
+    /* The contradiction this fixes: the other list loaded fine. */
+    ok("FLOOR: the memory list still rendered, so the two disagreed",
+       /a note/.test(memories), memories);
+  }
+  if (failing === "none") {
+    ok("a working subject list is rendered", /alice/.test(users), users);
+    ok("with no failure message", message.trim().length === 0, JSON.stringify(message));
+    ok("and no panel claims it failed to load", !/Not loaded/.test(users), users);
+  }
+  if (failing === "empty") {
+    ok("an empty scope says it is empty", /No subjects/.test(users), users);
+    ok("and does not claim the request failed", !/Not loaded/.test(users), users);
+    ok("with no error message", message.trim().length === 0, JSON.stringify(message));
+  }
+  if (failing === "memories") {
+    ok("the sibling still reports its own failure",
+       /Not loaded/.test(memories), memories);
+    ok("and the subject list is unaffected", /alice/.test(users), users);
+  }
+  console.log(failures ? "\n" + failures + " failure(s)" : "\nall ok");
+  process.exit(failures ? 1 : 0);
+}, 30);

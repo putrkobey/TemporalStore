@@ -5046,3 +5046,5051 @@ mod tests {
         replicator
             .publish_wal_entry(SharedStoreWalEntry {
                 shard_id: 1,
+                wal_index: 2,
+                command: Some(Command::StringSet {
+                    key: "after".to_string(),
+                    value: b"wal-value".to_vec(),
+                }),
+            
+                                   staged_blocks: Vec::new(),
+                                               outcomes: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let follower = test_engine(dir.path(), "follower");
+        let restored = replicator
+            .restore_index_and_blocks(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        assert_eq!(restored, vec![0]);
+        follower.load_shard(1);
+
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "before".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"snapshot-value".to_vec())
+            }
+        );
+
+        let report = replicator.replay_wal(1, 1, &follower).await.unwrap();
+        assert_eq!(
+            report,
+            ReplayReport {
+                applied: 1,
+                last_wal_index: 2,
+                offset_index_reads: 0,
+                range_bytes_read: 0,
+            }
+        );
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "after".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"wal-value".to_vec())
+            }
+        );
+    }
+
+    // A per-key delete produces a durable WAL tombstone that a fresh engine, replaying the WAL
+    // from scratch on the SAME on-disk pages/index dirs, reconstructs as a MISS -- the delete must
+    // never resurrect on recovery (the failure mode a read-time-only soft-delete would hit).
+    #[test]
+    fn delete_read_miss_survives_wal_replay_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocks = dir.path().join("blocks");
+        let indexes = dir.path().join("indexes");
+
+        let engine =
+            TemporalEngine::with_local_dirs(1 << 20, dir.path().join("cache-a"), &blocks, &indexes);
+        engine.load_shard(1);
+        for (key, value) in [("keep", b"keep-value".to_vec()), ("gone", b"gone-value".to_vec())] {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: key.to_string(),
+                    value,
+                },
+            });
+        }
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::CommonDelete {
+                key: "gone".to_string(),
+            },
+        });
+        // Read-miss immediately after delete.
+        assert_eq!(
+            engine
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "gone".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes { value: None }
+        );
+        engine.unload_shard(1);
+
+        // Fresh engine, same pages/index dirs, different cache -> genuine WAL-replay recovery.
+        let reopened =
+            TemporalEngine::with_local_dirs(1 << 20, dir.path().join("cache-b"), &blocks, &indexes);
+        reopened.load_shard(1);
+        assert_eq!(
+            reopened
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "gone".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes { value: None },
+            "deleted key must not resurrect after WAL replay"
+        );
+        assert_eq!(
+            reopened
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "keep".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"keep-value".to_vec())
+            },
+            "a co-resident key must survive recovery untouched"
+        );
+    }
+
+    // A delete applied BEFORE the checkpoint rides the published served index/pages: a follower
+    // restoring from shared storage sees the key as a miss without ever replaying a WAL tail.
+    #[tokio::test]
+    async fn delete_delete_marker_replicates_in_shared_store_base_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        for (key, value) in [("keep", b"keep-value".to_vec()), ("gone", b"gone-value".to_vec())] {
+            primary.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: key.to_string(),
+                    value,
+                },
+            });
+        }
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::CommonDelete {
+                key: "gone".to_string(),
+            },
+        });
+
+        let (_store, replicator) = test_shared_store(dir.path());
+        replicator.publish_index(1, &primary).await.unwrap();
+        replicator
+            .publish_block_slabs(1, &primary.block_store())
+            .await
+            .unwrap();
+
+        let follower = test_engine(dir.path(), "follower");
+        replicator
+            .restore_index_and_blocks(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        follower.load_shard(1);
+
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "gone".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes { value: None },
+            "the delete tombstone must replicate through the shared-store base index"
+        );
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "keep".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"keep-value".to_vec())
+            }
+        );
+    }
+
+    // A delete published as a WAL-tail entry replicates too: a follower that restored a base where
+    // the key was still live applies the tail delete on replay and then reads it as a miss.
+    #[tokio::test]
+    async fn delete_delete_marker_replicates_via_wal_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        for (key, value) in [("keep", b"keep-value".to_vec()), ("gone", b"gone-value".to_vec())] {
+            primary.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: key.to_string(),
+                    value,
+                },
+            });
+        }
+
+        let (_store, replicator) = test_shared_store(dir.path());
+        // Base captures both keys LIVE...
+        replicator.publish_index(1, &primary).await.unwrap();
+        replicator
+            .publish_block_slabs(1, &primary.block_store())
+            .await
+            .unwrap();
+        // ...then the delete arrives as a WAL-tail entry after the base.
+        replicator
+            .publish_wal_entry(SharedStoreWalEntry {
+                shard_id: 1,
+                wal_index: 2,
+                command: Some(Command::CommonDelete {
+                    key: "gone".to_string(),
+                }),
+            
+                                   staged_blocks: Vec::new(),
+                                               outcomes: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let follower = test_engine(dir.path(), "follower");
+        replicator
+            .restore_index_and_blocks(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        follower.load_shard(1);
+        // Before replay the follower still has the pre-delete value.
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "gone".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"gone-value".to_vec())
+            }
+        );
+        let report = replicator.replay_wal(1, 1, &follower).await.unwrap();
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.last_wal_index, 2);
+        // After replaying the tail delete, the key is a miss; the untouched key stays live.
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "gone".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes { value: None },
+            "the WAL-tail delete must replicate and remove the key on the follower"
+        );
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "keep".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"keep-value".to_vec())
+            }
+        );
+    }
+
+    #[cfg(feature = "matrixobject")]
+    #[tokio::test]
+    async fn matrixobject_local_lazy_restore_replays_only_wal_tail() {
+        // The node-local matrixobject backend recovers like every other shared backend:
+        // checkpoint index + lazy addresses, then ONLY the WAL tail -- not all history.
+        use crate::matrixobject_store::MatrixObjectObjectStore;
+
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "before".to_string(),
+                value: b"snapshot-value".to_vec(),
+            },
+        });
+        let store = Arc::new(
+            MatrixObjectObjectStore::with_default_options("temporalstore-shared").unwrap(),
+        );
+        let replicator = SharedStoreReplicator::new("cluster-a", store);
+        let manifest = replicator
+            .publish_checkpoint(1, 1, &primary, &primary.block_store())
+            .await
+            .unwrap();
+        assert!(!manifest.block_slabs.is_empty());
+        replicator
+            .publish_wal_entry(SharedStoreWalEntry {
+                shard_id: 1,
+                wal_index: 2,
+                command: Some(Command::StringSet {
+                    key: "after".to_string(),
+                    value: b"wal-value".to_vec(),
+                }),
+            
+                                   staged_blocks: Vec::new(),
+                                               outcomes: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let follower = test_engine(dir.path(), "follower");
+        let restored = replicator
+            .restore_index_and_block_addresses(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        assert_eq!(restored.checkpoint_wal_index, 1);
+        assert_eq!(follower.block_store().stats().shared_slab_fetches, 0);
+        follower.load_shard(1);
+        let report = replicator
+            .replay_wal(1, restored.checkpoint_wal_index, &follower)
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 1, "only the tail entry replays");
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "after".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"wal-value".to_vec())
+            }
+        );
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "before".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"snapshot-value".to_vec())
+            }
+        );
+        assert_eq!(
+            follower.block_store().stats().shared_slab_fetches,
+            1,
+            "the old key is served by exactly one on-demand slab fetch"
+        );
+    }
+
+    /// OBJECT-STORE MODE: two followers from one origin must agree, and both must serve.
+    ///
+    /// One follower proves the path works. Two prove it is deterministic: installing the same
+    /// results on two nodes that never wrote them has to land in the same place, or a read is
+    /// answered differently depending on which replica took it -- which is the failure a single
+    /// follower can never show.
+    ///
+    /// Both are also checked for SERVING rather than for shape. A node whose maps agree and whose
+    /// addresses do not resolve passes every comparison and answers nothing, which is exactly the
+    /// defect that a restored node had.
+    #[tokio::test]
+    async fn two_followers_of_one_origin_agree_and_both_serve() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "origin");
+        primary.load_shard(1);
+
+        let workload: Vec<(String, Vec<u8>)> = (0..10)
+            .map(|index| {
+                (
+                    format!("tf-{index:02}"),
+                    format!("two-followers-{index:02}").into_bytes(),
+                )
+            })
+            .collect();
+        for (key, value) in &workload {
+            let response = primary.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: key.clone(),
+                    value: value.clone(),
+                },
+            });
+            assert!(response.status.ok);
+        }
+
+        let (_store, replicator) = test_shared_store(dir.path());
+        let published: Vec<_> = primary
+            .write_ahead_log_store()
+            .scan(1, 0, u64::MAX, u64::MAX)
+            .unwrap()
+            .iter()
+            .filter_map(|(_, line)| crate::wal::decode_wal_line(line).ok())
+            .filter(|record| !record.outcomes.is_empty())
+            .collect();
+        assert!(
+            published.len() >= workload.len(),
+            "expected a record per write carrying results, got {}",
+            published.len()
+        );
+        for record in &published {
+            // Carry the blocks the results point at: a follower has its own block store, and an
+            // address alone names a place it cannot reach.
+            let mut carried = record.staged_blocks.clone();
+            if carried.is_empty() {
+                for item in &record.outcomes {
+                    if let Some(address) = item.resolved_address() {
+                        if let Ok(bytes) = primary.block_store().read(&address) {
+                            carried.push(crate::wal::StagedBlock {
+                                object_id: item.object_id,
+                                // The outcome has named its element all along; the PAGE is
+                                // what could not say so, and a read picks the page.
+                                component: item
+                                    .component
+                                    .as_deref()
+                                    .map(std::sync::Arc::from),
+                                bytes,
+                            });
+                        }
+                    }
+                }
+            }
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index: record.sequence,
+                    command: record.command.clone(),
+                    staged_blocks: carried,
+                    outcomes: record.outcomes.clone(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let mut served = Vec::new();
+        for role in ["follower-a", "follower-b"] {
+            let follower = test_engine(dir.path(), role);
+            follower.load_shard(1);
+            let before = follower.replay_installs_for_test();
+            let report = replicator.replay_wal(1, 0, &follower).await.unwrap();
+            let installed = follower.replay_installs_for_test() - before;
+            assert!(
+                report.applied > 0,
+                "{role} took nothing from the shared log"
+            );
+
+            let mut answers = Vec::new();
+            for (key, value) in &workload {
+                let response = follower.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet { key: key.clone() },
+                });
+                match response.response {
+                    CommandResponse::Bytes { value: Some(got) } => {
+                        assert_eq!(&got, value, "{role} served the wrong bytes for {key}");
+                        answers.push(got);
+                    }
+                    other => panic!("{role} could not serve {key}: {other:?}"),
+                }
+            }
+            println!("[two-followers] {role}: applied={} installed={installed}", report.applied);
+            served.push(answers);
+        }
+
+        assert_eq!(
+            served[0], served[1],
+            "the two followers answered the same reads differently"
+        );
+    }
+
+    /// RESTORATION on the live format, and the constraint it runs into.
+    ///
+    /// A restored node takes its index and pages from a checkpoint and everything after it from
+    /// the log. On the live format those tail entries carry RESULTS, and this asks whether a
+    /// restored node can install them.
+    ///
+    /// It can install the index entry. It cannot necessarily SERVE it, and that is the finding: a
+    /// result names an address in the ORIGIN's block store. Carrying the bytes in the entry does
+    /// not help, because installing an address does not write bytes into the successor's store.
+    /// Across nodes an address only means something when the SLAB is reachable -- which in shared
+    /// mode means published.
+    ///
+    /// So this asserts the whole property rather than half of it: the node serves both the
+    /// checkpointed half and the tail, and reports which path the tail took. A test that asserted
+    /// installation alone would pass on a node that cannot answer a single read.
+    #[tokio::test]
+    async fn a_restored_node_installs_the_tail_instead_of_re_running_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+
+        // Everything up to here will be covered by the checkpoint.
+        for index in 0..4 {
+            let response = primary.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("base-{index}"),
+                    value: format!("base-value-{index}").into_bytes(),
+                },
+            });
+            assert!(response.status.ok);
+        }
+        let checkpoint_through = primary
+            .write_ahead_log_store()
+            .info(1)
+            .unwrap()
+            .current_sequence;
+
+        let (_store, replicator) = test_shared_store(dir.path());
+        replicator
+            .publish_checkpoint(1, checkpoint_through, &primary, &primary.block_store())
+            .await
+            .unwrap();
+
+        // Now the TAIL: written after the checkpoint, and published with what it recorded.
+        let tail_write = primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "tail-key".to_string(),
+                value: b"tail-value".to_vec(),
+            },
+        });
+        assert!(tail_write.status.ok);
+
+        let tail = primary
+            .write_ahead_log_store()
+            .scan(1, 0, u64::MAX, u64::MAX)
+            .unwrap()
+            .iter()
+            .filter_map(|(_, line)| crate::wal::decode_wal_line(line).ok())
+            .find(|record| record.sequence > checkpoint_through && !record.outcomes.is_empty())
+            .expect("the tail write recorded what it did");
+        // Publish it the way a correct publisher must: with the BYTES the results point at.
+        // A result names an address in the primary's block store, and the follower has its own,
+        // so an entry carrying only the address gives the follower an index entry pointing at
+        // bytes it does not have -- a shard that looks whole and serves nothing.
+        let mut carried = tail.staged_blocks.clone();
+        if carried.is_empty() {
+            for item in &tail.outcomes {
+                if let Some(address) = item.resolved_address() {
+                    if let Ok(bytes) = primary.block_store().read(&address) {
+                        carried.push(crate::wal::StagedBlock {
+                            object_id: item.object_id,
+                            component: item
+                                .component
+                                .as_deref()
+                                .map(std::sync::Arc::from),
+                            bytes,
+                        });
+                    }
+                }
+            }
+        }
+        assert!(
+            !carried.is_empty(),
+            "the tail's results point at no readable block, so a follower could not serve them"
+        );
+        replicator
+            .publish_wal_entry(SharedStoreWalEntry {
+                shard_id: 1,
+                wal_index: tail.sequence,
+                command: tail.command.clone(),
+                staged_blocks: carried,
+                outcomes: tail.outcomes.clone(),
+            })
+            .await
+            .unwrap();
+
+        // A node that has never seen this shard: restore, then take the tail.
+        let follower = test_engine(dir.path(), "restored");
+        let restored = replicator
+            .restore_index_and_block_addresses(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        follower.load_shard(1);
+        let installs_before = follower.replay_installs_for_test();
+        let report = replicator
+            .replay_wal(1, restored.checkpoint_wal_index, &follower)
+            .await
+            .unwrap();
+        let installed = follower.replay_installs_for_test() - installs_before;
+
+        // Reported, not required. Installing is preferred and only possible when the tail's slab
+        // is reachable; re-running is the fallback that exists for exactly when it is not. What
+        // must hold either way is that the node SERVES what it took.
+        println!(
+            "[restore] tail applied={} installed={installed}",
+            report.applied
+        );
+        assert!(
+            report.applied > 0,
+            "the restored node took nothing from the tail at all"
+        );
+        // Read back BOTH halves: something the checkpoint carried, and something only the tail
+        // did. A restored node that serves one and not the other has half a shard.
+        for (label, key, want) in [
+            ("checkpoint", "base-0", b"base-value-0".to_vec()),
+            ("tail", "tail-key", b"tail-value".to_vec()),
+        ] {
+            let response = follower.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: key.to_string(),
+                },
+            });
+            assert_eq!(
+                response.response,
+                CommandResponse::Bytes { value: Some(want) },
+                "a restored node could not serve the {label} half"
+            );
+        }
+        println!(
+            "[restore] checkpoint through {checkpoint_through}, {installed} tail result(s) installed"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_store_lazy_restore_reads_old_block_on_demand() {
+        // On-demand lazy recovery: a fresh node with ONLY shared storage restores the
+        // served index + a slab ADDRESS map (no slab bytes), replays the WAL tail, and
+        // fetches an old (pre-checkpoint) slab ON DEMAND the first time a read needs it.
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "before".to_string(),
+                value: b"snapshot-value".to_vec(),
+            },
+        });
+
+        let (_store, replicator) = test_shared_store(dir.path());
+        // Publish a real metadata+slab checkpoint at WAL index 1, then a WAL tail entry.
+        let manifest = replicator
+            .publish_checkpoint(1, 1, &primary, &primary.block_store())
+            .await
+            .unwrap();
+        assert!(
+            !manifest.block_slabs.is_empty(),
+            "checkpoint must upload the slab bytes so a lazy owner can fetch them"
+        );
+        replicator
+            .publish_wal_entry(SharedStoreWalEntry {
+                shard_id: 1,
+                wal_index: 2,
+                command: Some(Command::StringSet {
+                    key: "after".to_string(),
+                    value: b"wal-value".to_vec(),
+                }),
+            
+                                   staged_blocks: Vec::new(),
+                                               outcomes: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        // Fresh owner: no local slabs at all.
+        let follower = test_engine(dir.path(), "follower");
+        assert!(follower.block_store().slab_ids().unwrap().is_empty());
+
+        // Lazy restore: index + address map only, NO slab bytes installed up front.
+        let restored = replicator
+            .restore_index_and_block_addresses(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        assert_eq!(restored.checkpoint_wal_index, 1);
+        assert!(
+            follower.block_store().has_shared_slab_source(),
+            "restore must attach a shared read-through source"
+        );
+        // Proof of laziness: the only local slab is the reserved (empty) append slab;
+        // the checkpoint's slab 0 was NOT installed, and nothing was fetched yet.
+        assert!(
+            !follower.block_store().slab_ids().unwrap().contains(&0),
+            "checkpoint slab 0 must not be installed eagerly"
+        );
+        assert_eq!(follower.block_store().stats().shared_slab_fetches, 0);
+
+        follower.load_shard(1);
+        // Replay only the WAL tail after the checkpoint index: applies exactly "after".
+        let report = replicator
+            .replay_wal(1, restored.checkpoint_wal_index, &follower)
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.last_wal_index, 2);
+        // The tail write did not touch any pre-checkpoint slab, so still no lazy fetch.
+        assert_eq!(follower.block_store().stats().shared_slab_fetches, 0);
+
+        // Reading the OLD key triggers exactly ONE on-demand slab fetch and is correct.
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "before".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"snapshot-value".to_vec())
+            }
+        );
+        assert_eq!(
+            follower.block_store().stats().shared_slab_fetches,
+            1,
+            "reading one old key must fetch exactly one slab on demand (not all slabs up front)"
+        );
+
+        // The fetched slab is now cached locally; a second read does NOT re-fetch.
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "before".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"snapshot-value".to_vec())
+            }
+        );
+        assert_eq!(follower.block_store().stats().shared_slab_fetches, 1);
+
+        // The WAL-tail value is served from the reserved local slab.
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "after".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"wal-value".to_vec())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn s4_publish_checkpoint_covers_every_index_referenced_slab() {
+        // S4 completeness barrier: every slab the served index references must be uploaded and
+        // recorded in the manifest before it is written, so a restore never resolves a live page
+        // to a slab absent from the checkpoint.
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        for i in 0..8 {
+            primary.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("k{i}"),
+                    value: vec![b'v'; 512],
+                },
+            });
+        }
+        let (_store, replicator) = test_shared_store(dir.path());
+        let manifest = replicator
+            .publish_checkpoint(1, 1, &primary, &primary.block_store())
+            .await
+            .unwrap();
+        let manifest_slab_ids: std::collections::BTreeSet<u64> =
+            manifest.block_slabs.iter().map(|s| s.block_slab_id).collect();
+        for referenced in primary.live_block_slab_ids(1) {
+            if referenced == u64::MAX {
+                continue;
+            }
+            assert!(
+                manifest_slab_ids.contains(&referenced),
+                "index-referenced slab {referenced} must be covered by the checkpoint manifest"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn s4_publish_checkpoint_rejects_referenced_slab_not_durable() {
+        // S4: if the served index references a slab that is NOT present as a durable/uploaded
+        // slab, publish must FAIL rather than write a manifest that would lose those pages.
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "before".to_string(),
+                value: b"snapshot-value".to_vec(),
+            },
+        });
+        // The write landed in on-disk slab 0 and the index references it.
+        assert!(primary.live_block_slab_ids(1).contains(&0));
+        // Simulate a lost/never-durable slab: remove slab 0 from disk so slab_ids() no longer
+        // enumerates it while the in-memory index still references it.
+        let slab0 = dir
+            .path()
+            .join("primary-blocks")
+            .join("block_segment_00000000000000000000.seg");
+        std::fs::remove_file(&slab0).unwrap();
+        assert!(!primary.block_store().slab_ids().unwrap().contains(&0));
+
+        let (_store, replicator) = test_shared_store(dir.path());
+        let err = replicator
+            .publish_checkpoint(1, 1, &primary, &primary.block_store())
+            .await
+            .expect_err("publish must reject a checkpoint that would drop a referenced slab");
+        assert!(
+            matches!(
+                err,
+                SharedStoreReplicationError::CheckpointSlabNotDurable {
+                    shard_id: 1,
+                    block_slab_id: 0
+                }
+            ),
+            "expected CheckpointSlabNotDurable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn s3_lazy_restore_installs_complete_sealed_slab_descriptors_before_any_fetch() {
+        // S3: after a lazy metadata restore, the sealed-slab descriptors for the checkpoint's
+        // lazily-backed slabs are installed immediately, so GC/compaction accounting is complete
+        // BEFORE the first on-demand slab fetch (previously they under-counted until a fetch).
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "before".to_string(),
+                value: b"snapshot-value".to_vec(),
+            },
+        });
+        let primary_slab = primary
+            .block_store()
+            .slab_descriptors()
+            .into_iter()
+            .find(|b| b.block_slab_id == 0)
+            .expect("primary must have a descriptor for slab 0");
+        assert!(primary_slab.logical_bytes > 0);
+
+        let (_store, replicator) = test_shared_store(dir.path());
+        let manifest = replicator
+            .publish_checkpoint(1, 1, &primary, &primary.block_store())
+            .await
+            .unwrap();
+        // The manifest carries the per-slab slab metadata.
+        let slab0 = manifest
+            .block_slabs
+            .iter()
+            .find(|s| s.block_slab_id == 0)
+            .expect("manifest must record slab 0");
+        assert_eq!(slab0.logical_bytes, primary_slab.logical_bytes);
+
+        let follower = test_engine(dir.path(), "follower");
+        replicator
+            .restore_index_and_block_addresses(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+
+        // No slab has been fetched yet...
+        assert_eq!(follower.block_store().stats().shared_slab_fetches, 0);
+        assert!(
+            !follower.block_store().slab_ids().unwrap().contains(&0),
+            "checkpoint slab 0 must not be materialized locally yet"
+        );
+        // ...but the sealed slab descriptor for slab 0 is already present and complete.
+        let follower_slab = follower
+            .block_store()
+            .slab_descriptors()
+            .into_iter()
+            .find(|b| b.block_slab_id == 0)
+            .expect("restore must install a slab descriptor for the lazily-backed slab 0");
+        assert_eq!(follower_slab.state, crate::block_store::BlockStoreSlabState::Sealed);
+        assert_eq!(follower_slab.logical_bytes, primary_slab.logical_bytes);
+        assert_eq!(follower_slab.physical_bytes, slab0.byte_size);
+        // The slab summary counts the sealed shared slab immediately (accounting is complete).
+        assert!(
+            follower.block_store().slab_summary().sealed_slabs >= 1,
+            "the sealed shared slab must be counted before any lazy fetch"
+        );
+        assert_eq!(follower.block_store().stats().shared_slab_fetches, 0);
+    }
+
+    #[tokio::test]
+    async fn shared_store_restore_before_load_auto_serves_but_load_before_restore_does_not() {
+        // Regression for the fresh-node startup ordering bug: on a fresh node the shared
+        // restore installs the served index onto the on-disk BASE only; the in-memory
+        // shard is populated from that base by `load_shard`. So the ORDER matters:
+        //   * restore THEN load  -> load reads the restored index -> node auto-serves.
+        //   * load THEN restore  -> load reads an EMPTY index -> reads return null even
+        //                           though the restore later wrote the real index to disk.
+        // A default fresh node (no join-empty, no manual /load) must use the first order.
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "before".to_string(),
+                value: b"snapshot-value".to_vec(),
+            },
+        });
+
+        let (_store, replicator) = test_shared_store(dir.path());
+        let manifest = replicator
+            .publish_checkpoint(1, 1, &primary, &primary.block_store())
+            .await
+            .unwrap();
+        assert_eq!(manifest.checkpoint_wal_index, 1);
+        // One post-checkpoint tail record so we also cover WAL-tail replay ordering.
+        replicator
+            .publish_wal_entry(SharedStoreWalEntry {
+                shard_id: 1,
+                wal_index: 2,
+                command: Some(Command::StringSet {
+                    key: "after".to_string(),
+                    value: b"wal-value".to_vec(),
+                }),
+            
+                                   staged_blocks: Vec::new(),
+                                               outcomes: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        // BUGGY order (load BEFORE restore): reproduces the old default-startup path.
+        let buggy = test_engine(dir.path(), "buggy");
+        buggy.load_shard(1); // reads an empty on-disk index into memory
+        replicator
+            .restore_index_and_block_addresses(1, &buggy, &buggy.block_store())
+            .await
+            .unwrap(); // writes the real index to DISK, but the in-memory shard is already loaded empty
+        replicator
+            .replay_wal(1, manifest.checkpoint_wal_index, &buggy)
+            .await
+            .unwrap();
+        assert_eq!(
+            buggy
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "before".to_string(),
+                    },
+                })
+                .response,
+            CommandResponse::Bytes { value: None },
+            "load-before-restore leaves the checkpoint data unreadable in memory (the bug)"
+        );
+
+        // FIXED order (restore BEFORE load): what the fixed server startup + /load now do.
+        let fixed = test_engine(dir.path(), "fixed");
+        replicator
+            .restore_index_and_block_addresses(1, &fixed, &fixed.block_store())
+            .await
+            .unwrap(); // installs the served index onto the on-disk base first
+        fixed.load_shard(1); // load now reads the restored index into memory
+        replicator
+            .replay_wal(1, manifest.checkpoint_wal_index, &fixed)
+            .await
+            .unwrap();
+        // The pre-checkpoint value is served (fetched lazily from shared storage)...
+        assert_eq!(
+            fixed
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "before".to_string(),
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"snapshot-value".to_vec()),
+            },
+            "restore-before-load must auto-serve the restored checkpoint data"
+        );
+        // ...and so is the post-checkpoint WAL-tail value.
+        assert_eq!(
+            fixed
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "after".to_string(),
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"wal-value".to_vec()),
+            },
+            "restore-before-load must also serve the replayed WAL tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_store_lazy_restore_replays_only_wal_tail() {
+        // WAL-tail replay is O(recent): applied count == number of post-checkpoint
+        // records, not the full history.
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "before".to_string(),
+                value: b"snapshot-value".to_vec(),
+            },
+        });
+
+        let (_store, replicator) = test_shared_store(dir.path());
+        let manifest = replicator
+            .publish_checkpoint(1, 1, &primary, &primary.block_store())
+            .await
+            .unwrap();
+        assert_eq!(manifest.checkpoint_wal_index, 1);
+
+        // Three post-checkpoint tail records.
+        for (wal_index, key) in [(2u64, "k2"), (3, "k3"), (4, "k4")] {
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: key.to_string(),
+                        value: key.as_bytes().to_vec(),
+                    }),
+                
+                                       staged_blocks: Vec::new(),
+                                                       outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let follower = test_engine(dir.path(), "follower");
+        let restored = replicator
+            .restore_index_and_block_addresses(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        follower.load_shard(1);
+        let report = replicator
+            .replay_wal(1, restored.checkpoint_wal_index, &follower)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.applied, 3,
+            "replay applies only the 3 post-checkpoint records, not the full history"
+        );
+        assert_eq!(report.last_wal_index, 4);
+        for key in ["k2", "k3", "k4"] {
+            assert_eq!(
+                follower
+                    .execute(ExecuteRequest {
+                        shard_id: 1,
+                        command: Command::StringGet {
+                            key: key.to_string()
+                        },
+                    })
+                    .response,
+                CommandResponse::Bytes {
+                    value: Some(key.as_bytes().to_vec())
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_store_lazy_restore_no_checkpoint_falls_back_to_full_replay() {
+        // Backward compatible: with no checkpoint published, the lazy restore reports
+        // CheckpointNotFound and the caller replays the full shared WAL from 0.
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, replicator) = test_shared_store(dir.path());
+        for (wal_index, key, value) in [
+            (1u64, "a", b"1".to_vec()),
+            (2, "b", b"2".to_vec()),
+        ] {
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: key.to_string(),
+                        value,
+                    }),
+                
+                                       staged_blocks: Vec::new(),
+                                                       outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let follower = test_engine(dir.path(), "follower");
+        follower.load_shard(1);
+        let after = match replicator
+            .restore_index_and_block_addresses(1, &follower, &follower.block_store())
+            .await
+        {
+            Err(SharedStoreReplicationError::CheckpointNotFound(_)) => 0,
+            other => panic!("expected CheckpointNotFound, got {other:?}"),
+        };
+        assert!(!follower.block_store().has_shared_slab_source());
+        let report = replicator.replay_wal(1, after, &follower).await.unwrap();
+        assert_eq!(report.applied, 2);
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "a".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"1".to_vec())
+            }
+        );
+    }
+
+    // ---- Networked matrixobject lazy data-follow ----
+    // Faithful in-process loopback server speaking the SAME `MORP1` TcpStream
+    // request/response frames MatrixObjectHttpStore speaks, so the networked
+    // lazy-recovery path is exercised end to end over real sockets (no enterprise
+    // crate needed). Each connection is served on its own thread and loops over
+    // pooled/keep-alive requests until the client drops it.
+    const MOCK_RPC_MAGIC: &[u8; 5] = b"MORP1";
+
+    fn spawn_mock_matrixobject_store() -> String {
+        use std::collections::BTreeMap;
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let uri = format!("matrixobject://{addr}");
+        let store: Arc<Mutex<BTreeMap<String, Vec<u8>>>> = Arc::default();
+
+        fn serve_conn(mut stream: TcpStream, store: Arc<Mutex<BTreeMap<String, Vec<u8>>>>) {
+            loop {
+                let mut header = [0u8; 18];
+                if stream.read_exact(&mut header).is_err() {
+                    return; // client dropped the pooled connection
+                }
+                if &header[..5] != MOCK_RPC_MAGIC {
+                    return;
+                }
+                let op = header[5];
+                let key_len = u32::from_le_bytes(header[6..10].try_into().unwrap()) as usize;
+                let value_len = u64::from_le_bytes(header[10..18].try_into().unwrap()) as usize;
+                let mut key_bytes = vec![0u8; key_len];
+                if stream.read_exact(&mut key_bytes).is_err() {
+                    return;
+                }
+                let mut value = vec![0u8; value_len];
+                if stream.read_exact(&mut value).is_err() {
+                    return;
+                }
+                let key = String::from_utf8_lossy(&key_bytes).to_string();
+                let (status, body) = {
+                    let mut map = store.lock().unwrap();
+                    match op {
+                        1 => {
+                            // PUT
+                            map.insert(key, value);
+                            (0u8, Vec::new())
+                        }
+                        2 => match map.get(&key) {
+                            // GET
+                            Some(bytes) => (0u8, bytes.clone()),
+                            None => (1u8, key.into_bytes()),
+                        },
+                        3 => {
+                            // DELETE
+                            map.remove(&key);
+                            (0u8, Vec::new())
+                        }
+                        4 => {
+                            // LIST prefix
+                            let mut keys: Vec<String> =
+                                map.keys().filter(|k| k.starts_with(&key)).cloned().collect();
+                            keys.sort();
+                            (0u8, keys.join("\n").into_bytes())
+                        }
+                        5 => {
+                            // LIST_AFTER prefix=key, after=value
+                            let after = String::from_utf8_lossy(&value).to_string();
+                            let mut keys: Vec<String> = map
+                                .keys()
+                                .filter(|k| k.starts_with(&key) && k.as_str() > after.as_str())
+                                .cloned()
+                                .collect();
+                            keys.sort();
+                            (0u8, keys.join("\n").into_bytes())
+                        }
+                        6 => {
+                            // GET_MANY: value = keys joined by '\n'
+                            let mut out = Vec::new();
+                            let mut entries = Vec::new();
+                            for k in String::from_utf8_lossy(&value)
+                                .split('\n')
+                                .filter(|k| !k.is_empty())
+                            {
+                                if let Some(bytes) = map.get(k) {
+                                    entries.push((k.to_string(), bytes.clone()));
+                                }
+                            }
+                            out.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+                            for (k, v) in entries {
+                                out.extend_from_slice(&(k.len() as u32).to_le_bytes());
+                                out.extend_from_slice(&(v.len() as u64).to_le_bytes());
+                                out.extend_from_slice(k.as_bytes());
+                                out.extend_from_slice(&v);
+                            }
+                            (0u8, out)
+                        }
+                        7 => {
+                            // PUT_MANY: value = count u32 + [key_len u32, value_len u64, key, value]*
+                            if value.len() >= 4 {
+                                let count =
+                                    u32::from_le_bytes(value[0..4].try_into().unwrap()) as usize;
+                                let mut off = 4usize;
+                                for _ in 0..count {
+                                    let kl = u32::from_le_bytes(
+                                        value[off..off + 4].try_into().unwrap(),
+                                    ) as usize;
+                                    off += 4;
+                                    let vl = u64::from_le_bytes(
+                                        value[off..off + 8].try_into().unwrap(),
+                                    ) as usize;
+                                    off += 8;
+                                    let k =
+                                        String::from_utf8_lossy(&value[off..off + kl]).to_string();
+                                    off += kl;
+                                    let v = value[off..off + vl].to_vec();
+                                    off += vl;
+                                    map.insert(k, v);
+                                }
+                            }
+                            (0u8, Vec::new())
+                        }
+                        _ => (2u8, b"unknown op".to_vec()),
+                    }
+                };
+                let mut resp = Vec::with_capacity(14 + body.len());
+                resp.extend_from_slice(MOCK_RPC_MAGIC);
+                resp.push(status);
+                resp.extend_from_slice(&(body.len() as u64).to_le_bytes());
+                resp.extend_from_slice(&body);
+                if stream.write_all(&resp).is_err() {
+                    return;
+                }
+                let _ = stream.flush();
+            }
+        }
+
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                match conn {
+                    Ok(stream) => {
+                        let store = Arc::clone(&store);
+                        std::thread::spawn(move || serve_conn(stream, store));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        uri
+    }
+
+    fn networked_replicator(
+        uri: &str,
+    ) -> (
+        Arc<MatrixObjectHttpStore>,
+        SharedStoreReplicator<MatrixObjectHttpStore>,
+    ) {
+        let store = Arc::new(MatrixObjectHttpStore::new(uri).unwrap());
+        let replicator = SharedStoreReplicator::new(TEST_CLUSTER_ID, store.clone())
+            .with_wal_append_mode(SharedStoreWalAppendMode::JsonPerKey);
+        (store, replicator)
+    }
+
+    #[tokio::test]
+    async fn matrixobject_get_blocking_round_trips_over_the_socket() {
+        // The sync accessor the lazy slab source relies on must round-trip a real
+        // object across the networked MORP1 wire, and surface NotFound for absent keys.
+        let uri = spawn_mock_matrixobject_store();
+        let store = MatrixObjectHttpStore::new(&uri).unwrap();
+        store
+            .put("k/one", Bytes::from_static(b"hello-networked"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_blocking("k/one").unwrap(),
+            Bytes::from_static(b"hello-networked")
+        );
+        assert!(matches!(
+            store.get_blocking("k/missing"),
+            Err(ObjectStoreError::NotFound(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn matrixobject_networked_lazy_restore_reads_old_block_on_demand() {
+        // Conformance lazy data-follow over the NETWORK: a fresh node with only
+        // the networked matrixobject store restores the served index + a slab ADDRESS
+        // map (no slab bytes), replays the WAL tail, and fetches an old (pre-checkpoint)
+        // slab ON DEMAND over the socket the first time a read needs it.
+        let uri = spawn_mock_matrixobject_store();
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "before".to_string(),
+                value: b"snapshot-value".to_vec(),
+            },
+        });
+
+        let (_store, replicator) = networked_replicator(&uri);
+        let manifest = replicator
+            .publish_checkpoint(1, 1, &primary, &primary.block_store())
+            .await
+            .unwrap();
+        assert!(
+            !manifest.block_slabs.is_empty(),
+            "checkpoint must upload the slab bytes so a lazy owner can fetch them"
+        );
+        replicator
+            .publish_wal_entry(SharedStoreWalEntry {
+                shard_id: 1,
+                wal_index: 2,
+                command: Some(Command::StringSet {
+                    key: "after".to_string(),
+                    value: b"wal-value".to_vec(),
+                }),
+            
+                                   staged_blocks: Vec::new(),
+                                               outcomes: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        // Fresh owner: no local slabs at all.
+        let follower = test_engine(dir.path(), "follower");
+        assert!(follower.block_store().slab_ids().unwrap().is_empty());
+
+        // Lazy restore: index + address map only, NO slab bytes installed up front.
+        let restored = replicator
+            .restore_index_and_block_addresses(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        assert_eq!(restored.checkpoint_wal_index, 1);
+        assert!(
+            follower.block_store().has_shared_slab_source(),
+            "restore must attach a networked shared read-through source"
+        );
+        assert!(
+            !follower.block_store().slab_ids().unwrap().contains(&0),
+            "checkpoint slab 0 must not be installed eagerly"
+        );
+        assert_eq!(follower.block_store().stats().shared_slab_fetches, 0);
+
+        follower.load_shard(1);
+        let report = replicator
+            .replay_wal(1, restored.checkpoint_wal_index, &follower)
+            .await
+            .unwrap();
+        assert_eq!(report.applied, 1);
+        assert_eq!(report.last_wal_index, 2);
+        assert_eq!(follower.block_store().stats().shared_slab_fetches, 0);
+
+        // Reading the OLD key triggers exactly ONE on-demand networked slab fetch.
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "before".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"snapshot-value".to_vec())
+            }
+        );
+        assert_eq!(
+            follower.block_store().stats().shared_slab_fetches,
+            1,
+            "reading one old key must fetch exactly one slab over the network (not all slabs)"
+        );
+
+        // Cached now: a second read does NOT re-fetch across the network.
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "before".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"snapshot-value".to_vec())
+            }
+        );
+        assert_eq!(follower.block_store().stats().shared_slab_fetches, 1);
+
+        // The WAL-tail value is served from the reserved local slab.
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "after".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"wal-value".to_vec())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn matrixobject_networked_lazy_restore_replays_only_wal_tail() {
+        // Networked WAL-tail replay is O(recent): applied == post-checkpoint records.
+        let uri = spawn_mock_matrixobject_store();
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "before".to_string(),
+                value: b"snapshot-value".to_vec(),
+            },
+        });
+
+        let (_store, replicator) = networked_replicator(&uri);
+        let manifest = replicator
+            .publish_checkpoint(1, 1, &primary, &primary.block_store())
+            .await
+            .unwrap();
+        assert_eq!(manifest.checkpoint_wal_index, 1);
+
+        for (wal_index, key) in [(2u64, "k2"), (3, "k3"), (4, "k4")] {
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: key.to_string(),
+                        value: key.as_bytes().to_vec(),
+                    }),
+                
+                                       staged_blocks: Vec::new(),
+                                                       outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let follower = test_engine(dir.path(), "follower");
+        let restored = replicator
+            .restore_index_and_block_addresses(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        follower.load_shard(1);
+        let report = replicator
+            .replay_wal(1, restored.checkpoint_wal_index, &follower)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.applied, 3,
+            "replay applies only the 3 post-checkpoint records, not the full history"
+        );
+        assert_eq!(report.last_wal_index, 4);
+        for key in ["k2", "k3", "k4"] {
+            assert_eq!(
+                follower
+                    .execute(ExecuteRequest {
+                        shard_id: 1,
+                        command: Command::StringGet {
+                            key: key.to_string()
+                        },
+                    })
+                    .response,
+                CommandResponse::Bytes {
+                    value: Some(key.as_bytes().to_vec())
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn matrixobject_networked_lazy_restore_no_checkpoint_falls_back_to_full_replay() {
+        // Backward compatible over the network: with no checkpoint published, the lazy
+        // restore reports CheckpointNotFound and the caller replays the full shared WAL.
+        let uri = spawn_mock_matrixobject_store();
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, replicator) = networked_replicator(&uri);
+        for (wal_index, key, value) in
+            [(1u64, "a", b"1".to_vec()), (2, "b", b"2".to_vec())]
+        {
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: key.to_string(),
+                        value,
+                    }),
+                
+                                       staged_blocks: Vec::new(),
+                                                       outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let follower = test_engine(dir.path(), "follower");
+        follower.load_shard(1);
+        let after = match replicator
+            .restore_index_and_block_addresses(1, &follower, &follower.block_store())
+            .await
+        {
+            Err(SharedStoreReplicationError::CheckpointNotFound(_)) => 0,
+            other => panic!("expected CheckpointNotFound, got {other:?}"),
+        };
+        assert!(!follower.block_store().has_shared_slab_source());
+        let report = replicator.replay_wal(1, after, &follower).await.unwrap();
+        assert_eq!(report.applied, 2);
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "a".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"1".to_vec())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_published_entry_keeps_the_blocks_its_write_produced() {
+        // A command is not always enough to rebuild what it wrote. If the shared log drops the
+        // pages, a successor replays the command and reconstructs derived state from whatever
+        // it happens to have -- which is not necessarily the bytes that were acked.
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, replicator) = test_shared_store(dir.path());
+
+        let entry = SharedStoreWalEntry {
+            shard_id: 1,
+            wal_index: 1,
+            command: Some(Command::StringSet {
+                key: "k".to_string(),
+                value: b"v".to_vec(),
+            }),
+            staged_blocks: vec![crate::wal::StagedBlock {
+                object_id: 77,
+                component: None,
+                bytes: b"derived-page-bytes".to_vec(),
+            }],
+                    outcomes: Vec::new(),
+        };
+        replicator.publish_wal_entry(entry.clone()).await.unwrap();
+
+        let loaded = replicator.load_wal_entries(1).await.unwrap();
+        assert_eq!(loaded.len(), 1);
+        let round_tripped = loaded.values().next().expect("one entry");
+        assert_eq!(
+            round_tripped.staged_blocks, entry.staged_blocks,
+            "the pages must survive the trip, not just the command"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_entry_written_before_blocks_existed_still_loads() {
+        // `staged_pages` is serde(default), so a WAL object published by an older writer -- one
+        // that never had the field -- must still deserialize rather than failing the whole
+        // replay of a shard's history.
+        // Build the legacy shape from a real entry rather than by hand, so this tests the
+        // actual serialized form instead of a guess at it: serialize, drop the field an older
+        // writer never emitted, and load what remains.
+        let entry = SharedStoreWalEntry {
+            shard_id: 1,
+            wal_index: 1,
+            command: Some(Command::StringSet {
+                key: "k".to_string(),
+                value: b"v".to_vec(),
+            }),
+            staged_blocks: Vec::new(),
+                    outcomes: Vec::new(),
+        };
+        let mut legacy = serde_json::to_value(&entry).unwrap();
+        legacy
+            .as_object_mut()
+            .expect("entry serializes to an object")
+            .remove("staged_pages");
+        assert!(
+            legacy.get("staged_pages").is_none(),
+            "the field must actually be gone for this to test anything"
+        );
+
+        let loaded: SharedStoreWalEntry = serde_json::from_value(legacy)
+            .expect("an entry without the field must still load");
+        assert!(loaded.staged_blocks.is_empty());
+        assert_eq!(loaded.command, entry.command);
+    }
+
+    #[tokio::test]
+    async fn the_async_queue_stops_growing_once_it_reaches_its_cap() {
+        // The queue depth IS the loss window: an async write acks once its entry is in memory,
+        // so whatever is queued when the process dies non-gracefully is gone. Unbounded, a slow
+        // store makes that window grow without end -- the failure gets worse the longer nobody
+        // notices. At the cap a write publishes itself instead, which bounds the loss and makes
+        // the ack latency say so.
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, replicator) = test_shared_store(dir.path());
+        let writer = replicator
+            .storage_writer(SharedStoreStorageMode::Async, 1)
+            .with_max_pending(2);
+
+        for key in ["a", "b"] {
+            let report = writer
+                .write(
+                    1,
+                    Command::StringSet {
+                        key: key.to_string(),
+                        value: b"v".to_vec(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(report.queued, "below the cap a write defers: {report:?}");
+            assert!(!report.published);
+        }
+        assert_eq!(writer.queued_len(), 2);
+        assert_eq!(writer.queue_capacity_hits(), 0);
+
+        // The third write finds the queue full and pays for its own durability.
+        let report = writer
+            .write(
+                1,
+                Command::StringSet {
+                    key: "c".to_string(),
+                    value: b"v".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(report.published, "at the cap the write publishes: {report:?}");
+        assert!(!report.queued);
+        assert_eq!(
+            writer.queued_len(),
+            2,
+            "the backlog must not have grown past the cap"
+        );
+        assert_eq!(writer.queue_capacity_hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_async_queue_still_defers_every_write() {
+        // 0 restores the previous behaviour exactly, so an operator who wants the old
+        // unbounded queue can still have it -- and the escape hatch is tested, not assumed.
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, replicator) = test_shared_store(dir.path());
+        let writer = replicator
+            .storage_writer(SharedStoreStorageMode::Async, 1)
+            .with_max_pending(0);
+
+        for key in ["a", "b", "c", "d"] {
+            let report = writer
+                .write(
+                    1,
+                    Command::StringSet {
+                        key: key.to_string(),
+                        value: b"v".to_vec(),
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(report.queued, "unbounded: every write defers: {report:?}");
+        }
+        assert_eq!(writer.queued_len(), 4);
+        assert_eq!(writer.queue_capacity_hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn bucket_dump_manifests_travel_with_the_data_to_a_new_owner() {
+        // In shared mode the data outlives the node, but the manifest describing it was only
+        // ever written to that node's local index dir. Losing the node lost the lineage for
+        // data that was still perfectly present -- the next owner could not tell what had
+        // already been dumped, so it had to treat every live generation as undumped.
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, replicator) = test_shared_store(dir.path());
+
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "k".to_string(),
+                value: b"v".to_vec(),
+            },
+        });
+        let dumped = primary.create_bucket_dump_manifest(1, Vec::new()).unwrap();
+
+        let published = replicator
+            .publish_bucket_dump_manifests(1, &primary.list_bucket_dump_manifests(1))
+            .await
+            .unwrap();
+        assert_eq!(published, 1);
+
+        // A different node: its own index dir, and no local lineage whatsoever.
+        let successor = test_engine(dir.path(), "successor");
+        successor.load_shard(1);
+        assert!(successor.list_bucket_dump_manifests(1).is_empty());
+
+        let restored = replicator
+            .restore_bucket_dump_manifests(1, &successor)
+            .await
+            .unwrap();
+        assert_eq!(restored, 1);
+
+        let inherited = successor.list_bucket_dump_manifests(1);
+        assert_eq!(inherited.len(), 1);
+        assert_eq!(inherited[0].manifest_id, dumped.manifest_id);
+        assert_eq!(
+            inherited[0].wal_sequence, dumped.wal_sequence,
+            "the reclaim watermark has to survive the move, not merely the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn restoring_bucket_dump_manifests_leaves_a_local_one_alone() {
+        // A local manifest is at least as current as a published one, and it is the file that
+        // authorizes WAL reclaim. Rewriting it on every restore would churn exactly the wrong
+        // thing, so a manifest this node already has is skipped rather than overwritten.
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, replicator) = test_shared_store(dir.path());
+
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "k".to_string(),
+                value: b"v".to_vec(),
+            },
+        });
+        primary.create_bucket_dump_manifest(1, Vec::new()).unwrap();
+        replicator
+            .publish_bucket_dump_manifests(1, &primary.list_bucket_dump_manifests(1))
+            .await
+            .unwrap();
+
+        // Restoring onto the very node that produced them writes nothing.
+        let restored = replicator
+            .restore_bucket_dump_manifests(1, &primary)
+            .await
+            .unwrap();
+        assert_eq!(restored, 0);
+        assert_eq!(primary.list_bucket_dump_manifests(1).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_store_checkpoint_rejects_corrupt_block_slab() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "k".to_string(),
+                value: b"v".to_vec(),
+            },
+        });
+
+        let (store, replicator) = test_shared_store(dir.path());
+        let manifest = replicator
+            .publish_checkpoint(1, 1, &primary, &primary.block_store())
+            .await
+            .unwrap();
+        store
+            .put(
+                &manifest.block_slabs[0].key,
+                Bytes::from_static(b"corrupt"),
+            )
+            .await
+            .unwrap();
+
+        let follower = test_engine(dir.path(), "follower");
+        assert!(matches!(
+            replicator
+                .restore_checkpoint(&manifest, &follower, &follower.block_store())
+                .await
+                .unwrap_err(),
+            SharedStoreReplicationError::ChecksumMismatch { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_store_strict_replay_rejects_wal_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, replicator) = test_shared_store(dir.path());
+        replicator
+            .publish_wal_entry(SharedStoreWalEntry {
+                shard_id: 1,
+                wal_index: 2,
+                command: Some(Command::StringSet {
+                    key: "gap".to_string(),
+                    value: b"v".to_vec(),
+                }),
+            
+                                   staged_blocks: Vec::new(),
+                                               outcomes: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let follower = test_engine(dir.path(), "follower");
+        follower.load_shard(1);
+        assert!(matches!(
+            replicator
+                .replay_wal_strict(1, 0, &follower)
+                .await
+                .unwrap_err(),
+            SharedStoreReplicationError::ReplayGap {
+                expected: 1,
+                actual: 2
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_store_sync_storage_publishes_and_cursor_replay_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, replicator) = test_shared_store(dir.path());
+        let writer = replicator.storage_writer(SharedStoreStorageMode::Sync, 1);
+
+        let report = writer
+            .write(
+                1,
+                Command::StringSet {
+                    key: "sync".to_string(),
+                    value: b"published".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            report,
+            SharedStoreWriteReport {
+                wal_index: 1,
+                published: true,
+                queued: false,
+                wal_blob_start_offset: None,
+                wal_blob_end_offset: None,
+                wal_blob_bytes_written: None,
+                wal_blob_object_length: None,
+            }
+        );
+
+        let follower = test_engine(dir.path(), "follower");
+        follower.load_shard(1);
+        let replay = replicator
+            .replay_wal_strict_with_cursor(1, &follower)
+            .await
+            .unwrap();
+        assert_eq!(
+            replay,
+            ReplayReport {
+                applied: 1,
+                last_wal_index: 1,
+                offset_index_reads: 0,
+                range_bytes_read: 0,
+            }
+        );
+        assert_eq!(
+            replicator
+                .load_replay_cursor(1)
+                .await
+                .unwrap()
+                .last_wal_index,
+            1
+        );
+        assert_eq!(
+            replicator
+                .replay_wal_strict_with_cursor(1, &follower)
+                .await
+                .unwrap(),
+            ReplayReport {
+                applied: 0,
+                last_wal_index: 1,
+                offset_index_reads: 0,
+                range_bytes_read: 0,
+            }
+        );
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "sync".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"published".to_vec())
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_store_async_storage_flushes_in_order_with_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_store, replicator) = test_shared_store(dir.path());
+        let writer = replicator.storage_writer(SharedStoreStorageMode::Async, 1);
+
+        for (key, value) in [("a", b"1".to_vec()), ("b", b"2".to_vec())] {
+            let report = writer
+                .write(
+                    1,
+                    Command::StringSet {
+                        key: key.to_string(),
+                        value,
+                    },
+                )
+                .await
+                .unwrap();
+            assert!(report.queued);
+            assert!(!report.published);
+        }
+        assert_eq!(writer.queued_len(), 2);
+
+        let follower = test_engine(dir.path(), "follower");
+        follower.load_shard(1);
+        assert_eq!(
+            replicator
+                .replay_wal_strict(1, 0, &follower)
+                .await
+                .unwrap(),
+            ReplayReport {
+                applied: 0,
+                last_wal_index: 0,
+                offset_index_reads: 0,
+                range_bytes_read: 0,
+            }
+        );
+
+        assert_eq!(
+            writer.flush_pending(1).await.unwrap(),
+            SharedStoreFlushReport {
+                flushed: 1,
+                remaining: 1,
+                last_wal_index: 1,
+                last_wal_blob_start_offset: None,
+                last_wal_blob_end_offset: None,
+                last_wal_blob_object_length: None,
+            }
+        );
+        assert_eq!(
+            replicator
+                .replay_wal_strict_with_cursor(1, &follower)
+                .await
+                .unwrap(),
+            ReplayReport {
+                applied: 1,
+                last_wal_index: 1,
+                offset_index_reads: 0,
+                range_bytes_read: 0,
+            }
+        );
+
+        assert_eq!(
+            writer.flush_pending(8).await.unwrap(),
+            SharedStoreFlushReport {
+                flushed: 1,
+                remaining: 0,
+                last_wal_index: 2,
+                last_wal_blob_start_offset: None,
+                last_wal_blob_end_offset: None,
+                last_wal_blob_object_length: None,
+            }
+        );
+        assert_eq!(
+            replicator
+                .replay_wal_strict_with_cursor(1, &follower)
+                .await
+                .unwrap(),
+            ReplayReport {
+                applied: 1,
+                last_wal_index: 2,
+                offset_index_reads: 0,
+                range_bytes_read: 0,
+            }
+        );
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "b".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"2".to_vec())
+            }
+        );
+    }
+
+    // shared-corpus: storage_disk_shared_store_persistence_parity
+    #[tokio::test]
+    async fn disk_and_shared_store_persistence_recover_through_restart_and_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        assert!(
+            primary
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: "disk-key".to_string(),
+                        value: b"disk-value".to_vec(),
+                    },
+                })
+                .status
+                .ok
+        );
+        drop(primary);
+
+        let restarted_primary = test_engine(dir.path(), "primary");
+        restarted_primary.load_shard(1);
+        assert_eq!(
+            restarted_primary
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "disk-key".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"disk-value".to_vec())
+            }
+        );
+
+        let (_store, replicator) = test_shared_store(dir.path());
+        let manifest = replicator
+            .publish_checkpoint(1, 1, &restarted_primary, &restarted_primary.block_store())
+            .await
+            .unwrap();
+        assert_eq!(manifest.checkpoint_wal_index, 1);
+        assert!(!manifest.block_slabs.is_empty());
+
+        let sync_writer = replicator.storage_writer(SharedStoreStorageMode::Sync, 2);
+        assert_eq!(
+            sync_writer
+                .write(
+                    1,
+                    Command::StringSet {
+                        key: "shared-sync".to_string(),
+                        value: b"sync-value".to_vec(),
+                    },
+                )
+                .await
+                .unwrap(),
+            SharedStoreWriteReport {
+                wal_index: 2,
+                published: true,
+                queued: false,
+                wal_blob_start_offset: None,
+                wal_blob_end_offset: None,
+                wal_blob_bytes_written: None,
+                wal_blob_object_length: None,
+            }
+        );
+
+        let async_writer = replicator.storage_writer(SharedStoreStorageMode::Async, 3);
+        assert_eq!(
+            async_writer
+                .write(
+                    1,
+                    Command::StringSet {
+                        key: "shared-async".to_string(),
+                        value: b"async-value".to_vec(),
+                    },
+                )
+                .await
+                .unwrap(),
+            SharedStoreWriteReport {
+                wal_index: 3,
+                published: false,
+                queued: true,
+                wal_blob_start_offset: None,
+                wal_blob_end_offset: None,
+                wal_blob_bytes_written: None,
+                wal_blob_object_length: None,
+            }
+        );
+        assert_eq!(
+            async_writer.flush_pending(8).await.unwrap(),
+            SharedStoreFlushReport {
+                flushed: 1,
+                remaining: 0,
+                last_wal_index: 3,
+                last_wal_blob_start_offset: None,
+                last_wal_blob_end_offset: None,
+                last_wal_blob_object_length: None,
+            }
+        );
+
+        let follower = test_engine_with_cache(dir.path(), "follower", 32);
+        replicator
+            .restore_checkpoint(&manifest, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        // Capture the baseline BEFORE load_shard: eager cache warm-on-load (default ON,
+        // MATRIXARK_EAGER_CACHE_WARM_ON_LOAD) reads the checkpointed disk-backed segments into
+        // cache during load, so the subsequent StringGet may be served from that warm cache.
+        // Counting from before load makes the assertion robust to warm-on-load either way.
+        let reads_before = follower.block_store().stats().reads;
+        follower.load_shard(1);
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "disk-key".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"disk-value".to_vec())
+            }
+        );
+        assert!(
+            follower.block_store().stats().reads > reads_before,
+            "restored follower should read checkpointed bytes from disk-backed block segments \
+             (via eager cache warm on load and/or the read)"
+        );
+
+        let replay = replicator.replay_wal_strict(1, 1, &follower).await.unwrap();
+        assert_eq!(
+            replay,
+            ReplayReport {
+                applied: 2,
+                last_wal_index: 3,
+                offset_index_reads: 0,
+                range_bytes_read: 0,
+            }
+        );
+        for (key, value) in [
+            ("shared-sync", b"sync-value".to_vec()),
+            ("shared-async", b"async-value".to_vec()),
+        ] {
+            assert_eq!(
+                follower
+                    .execute(ExecuteRequest {
+                        shard_id: 1,
+                        command: Command::StringGet {
+                            key: key.to_string()
+                        },
+                    })
+                    .response,
+                CommandResponse::Bytes { value: Some(value) }
+            );
+        }
+
+        replicator
+            .save_replay_cursor(&SharedStoreReplayCursor {
+                shard_id: 1,
+                last_wal_index: replay.last_wal_index,
+                last_replay_time_ms: now_ms(),
+            })
+            .await
+            .unwrap();
+        let gc = replicator
+            .gc_wal_before_cursor_safe(1, 5)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            gc,
+            SharedStoreReplicationError::GcBlockedByReplayCursor {
+                cursor_wal_index: 3,
+                retain_from_wal_index: 5,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_store_rejects_corrupt_wal_checksum() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, replicator) = test_shared_store(dir.path());
+        replicator
+            .publish_wal_entry(SharedStoreWalEntry {
+                shard_id: 1,
+                wal_index: 1,
+                command: Some(Command::StringSet {
+                    key: "k".to_string(),
+                    value: b"v".to_vec(),
+                }),
+            
+                                   staged_blocks: Vec::new(),
+                                               outcomes: Vec::new(),
+            })
+            .await
+            .unwrap();
+
+        let key = "cluster-a/shards/1/shared/wal/wal_00000000000000000001.json";
+        let mut object: SharedStoreWalObject =
+            serde_json::from_slice(&store.get(key).await.unwrap()).unwrap();
+        object.entry_sha256 = "bad".to_string();
+        store
+            .put(
+                key,
+                Bytes::from(serde_json::to_vec_pretty(&object).unwrap()),
+            )
+            .await
+            .unwrap();
+
+        let follower = test_engine(dir.path(), "follower");
+        follower.load_shard(1);
+        assert!(matches!(
+            replicator
+                .replay_wal_strict(1, 0, &follower)
+                .await
+                .unwrap_err(),
+            SharedStoreReplicationError::ChecksumMismatch { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn shared_store_retry_policy_retries_transient_put_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FlakyObjectStore {
+            inner: FileObjectStore::new(dir.path().join("objects")),
+            fail_puts: Mutex::new(1),
+        });
+        let replicator = SharedStoreReplicator::with_retry_policy(
+            "cluster-a",
+            store,
+            SharedStoreRetryPolicy {
+                max_attempts: 2,
+                backoff_ms: 0,
+            },
+        ).with_wal_append_mode(SharedStoreWalAppendMode::JsonPerKey);
+        replicator
+            .publish_wal_entry(SharedStoreWalEntry {
+                shard_id: 1,
+                wal_index: 1,
+                command: Some(Command::StringSet {
+                    key: "retry".to_string(),
+                    value: b"ok".to_vec(),
+                }),
+            
+                                   staged_blocks: Vec::new(),
+                                               outcomes: Vec::new(),
+            })
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn shared_store_async_flush_requeues_after_publish_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FlakyObjectStore {
+            inner: FileObjectStore::new(dir.path().join("objects")),
+            fail_puts: Mutex::new(1),
+        });
+        let replicator = SharedStoreReplicator::new(TEST_CLUSTER_ID, store)
+            .with_wal_append_mode(SharedStoreWalAppendMode::JsonPerKey);
+        let writer = replicator.storage_writer(SharedStoreStorageMode::Async, 1);
+        writer
+            .write(
+                1,
+                Command::StringSet {
+                    key: "retry-queue".to_string(),
+                    value: b"ok".to_vec(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert!(writer.flush_pending(1).await.is_err());
+        assert_eq!(writer.queued_len(), 1);
+        assert_eq!(
+            writer.flush_pending(1).await.unwrap(),
+            SharedStoreFlushReport {
+                flushed: 1,
+                remaining: 0,
+                last_wal_index: 1,
+                last_wal_blob_start_offset: None,
+                last_wal_blob_end_offset: None,
+                last_wal_blob_object_length: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_store_gc_removes_old_wal_and_checkpoint_generations() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        let (store, replicator) = test_shared_store(dir.path());
+
+        for wal_index in 1..=3 {
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: format!("k{wal_index}"),
+                        value: vec![wal_index as u8],
+                    }),
+                
+                                       staged_blocks: Vec::new(),
+                                                       outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        let wal_gc = replicator.gc_wal_before(1, 3).await.unwrap();
+        assert_eq!(wal_gc.deleted_wal_objects, 2);
+        let wal_keys = store
+            .list("cluster-a/shards/1/shared/wal/")
+            .await
+            .unwrap();
+        assert_eq!(wal_keys.len(), 1);
+        assert!(wal_keys[0].ends_with("wal_00000000000000000003.json"));
+
+        for checkpoint_wal_index in 1..=3 {
+            primary.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("checkpoint-{checkpoint_wal_index}"),
+                    value: vec![checkpoint_wal_index as u8],
+                },
+            });
+            replicator
+                .publish_checkpoint(1, checkpoint_wal_index, &primary, &primary.block_store())
+                .await
+                .unwrap();
+        }
+        let checkpoint_gc = replicator.gc_checkpoints(1, 1).await.unwrap();
+        assert_eq!(checkpoint_gc.deleted_checkpoints, 2);
+        assert_eq!(checkpoint_gc.retained_checkpoint_ids.len(), 1);
+        assert_eq!(replicator.list_checkpoints(1).await.unwrap().len(), 1);
+    }
+
+    /// WHAT CURSOR-SAFE CHECKPOINT COLLECTION ACTUALLY RETAINS.
+    ///
+    /// `gc_checkpoints_cursor_safe` carries a published guarantee -- it keeps the newest
+    /// `keep_last` generations AND the generation a persisted consumer cursor still needs -- and
+    /// had no test of any kind. A published guarantee with no test is a claim, not a behaviour.
+    ///
+    /// Four generations, `keep_last = 1`, cursor at 2. That makes the fixture discriminating: the
+    /// generation at index 2 is kept ONLY because the cursor names it, and the generation at
+    /// index 3 -- NEWER than the cursor's -- is deleted. A two-generation fixture could not tell
+    /// "kept because newest" from "kept because a consumer needs it", and would agree with
+    /// whatever it was asked.
+    ///
+    /// Asserted in both directions, because "nothing was lost" is also what a broken fixture
+    /// reports: the generations it dropped have no objects left under their prefix, and the two it
+    /// kept still do and still restore.
+    #[tokio::test]
+    async fn cursor_safe_checkpoint_collection_keeps_the_newest_and_the_cursor_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        let (store, replicator) = test_shared_store(dir.path());
+
+        for checkpoint_wal_index in 1..=4u64 {
+            primary.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("checkpoint-{checkpoint_wal_index}"),
+                    value: vec![checkpoint_wal_index as u8],
+                },
+            });
+            replicator
+                .publish_checkpoint(1, checkpoint_wal_index, &primary, &primary.block_store())
+                .await
+                .unwrap();
+        }
+
+        // REGIME FIRST. Everything below is a conclusion about a four-generation shard with a
+        // cursor in the middle of it; if the fixture never got there, the conclusions are vacuous.
+        let before = replicator.list_checkpoints(1).await.unwrap();
+        assert_eq!(
+            before.len(),
+            4,
+            "the fixture did not reach four generations, so nothing below is about a choice"
+        );
+        let generation_ids = before
+            .iter()
+            .map(|manifest| manifest.checkpoint_id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            before
+                .iter()
+                .map(|manifest| manifest.checkpoint_wal_index)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4],
+            "the generations are not ordered by the log position they cover"
+        );
+
+        replicator
+            .save_replay_cursor(&SharedStoreReplayCursor {
+                shard_id: 1,
+                last_wal_index: 2,
+                last_replay_time_ms: now_ms(),
+            })
+            .await
+            .unwrap();
+
+        let report = replicator.gc_checkpoints_cursor_safe(1, 1).await.unwrap();
+
+        // REGIME: it collected. A collection that collected nothing proves nothing.
+        assert_eq!(
+            report.deleted_checkpoints, 2,
+            "collection did not reach the regime it is being asked about"
+        );
+        assert!(
+            report.deleted_checkpoint_objects > 0,
+            "a collection that removed no objects cannot be evidence that collection works"
+        );
+
+        // THE PUBLISHED GUARANTEE, named: the generation the cursor needs is reported as retained
+        // for the cursor, not merely as surviving.
+        assert_eq!(
+            report.retained_for_cursor_wal_index,
+            Some(2),
+            "the report does not say which consumer position it retained for"
+        );
+        assert_eq!(
+            report.retained_for_cursor_checkpoint_id.as_deref(),
+            Some(generation_ids[1].as_str()),
+            "the generation retained for the cursor is not the newest one at or below it"
+        );
+
+        let mut retained = report.retained_checkpoint_ids.clone();
+        retained.sort();
+        let mut expected_retained = vec![generation_ids[1].clone(), generation_ids[3].clone()];
+        expected_retained.sort();
+        assert_eq!(
+            retained, expected_retained,
+            "retention kept a different set than the newest plus the cursor's"
+        );
+
+        // BOTH DIRECTIONS, at the object store rather than at the report. The report is the thing
+        // under test, so it cannot also be the witness.
+        for dropped in [&generation_ids[0], &generation_ids[2]] {
+            let keys = store
+                .list(&format!("cluster-a/shards/1/shared/checkpoints/{dropped}/"))
+                .await
+                .unwrap();
+            assert!(
+                keys.is_empty(),
+                "generation {dropped} was reported deleted but still has {} object(s)",
+                keys.len()
+            );
+        }
+        for kept in [&generation_ids[1], &generation_ids[3]] {
+            let keys = store
+                .list(&format!("cluster-a/shards/1/shared/checkpoints/{kept}/"))
+                .await
+                .unwrap();
+            assert!(
+                keys.iter().any(|key| key.ends_with("/manifest.json")),
+                "generation {kept} was reported retained but its manifest is gone"
+            );
+        }
+
+        // AND IT IS STILL USABLE. A surviving prefix that cannot be restored from is not a
+        // retained generation, it is litter.
+        let follower = test_engine(dir.path(), "restored");
+        let restored = replicator
+            .restore_latest_checkpoint(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.checkpoint_id, generation_ids[3],
+            "restore did not land on the newest surviving generation"
+        );
+        follower.load_shard(1);
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "checkpoint-4".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(vec![4u8])
+            },
+            "the newest surviving generation does not serve what it covered"
+        );
+    }
+
+    /// A CONSUMER AT ZERO READS AS NO CONSUMER AT ALL.
+    ///
+    /// `load_replay_cursor` answered `last_wal_index: 0` for a shard whose cursor object is ABSENT
+    /// and for a shard whose cursor object EXISTS and has never advanced, and both cursor-safe
+    /// collectors gated every protection on `last_wal_index > 0` -- so the consumer that had read
+    /// nothing, the one with the most still to read, got the treatment meant for a consumer that
+    /// does not exist. Presence is now asked separately from position.
+    ///
+    /// The RETENTION SET is not what moves here. On the checkpoint side a generation is a
+    /// complete state, so dropping older generations while `keep_last` survives costs the stuck
+    /// consumer a resume and nothing else -- asserted here by reading back a key written before
+    /// the oldest dropped generation. What moves is the REPORT: a present consumer at zero now
+    /// says so. The same blind spot on the log side is not harmless, because a log prefix is not a
+    /// complete state, and that is what the two tests below cover.
+    #[tokio::test]
+    async fn a_checkpoint_cursor_that_never_advanced_reports_as_a_present_consumer() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        let (_store, replicator) = test_shared_store(dir.path());
+
+        for checkpoint_wal_index in 1..=3u64 {
+            primary.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("stuck-{checkpoint_wal_index}"),
+                    value: vec![checkpoint_wal_index as u8],
+                },
+            });
+            replicator
+                .publish_checkpoint(1, checkpoint_wal_index, &primary, &primary.block_store())
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            replicator.list_checkpoints(1).await.unwrap().len(),
+            3,
+            "the fixture did not reach the three generations it reasons about"
+        );
+
+        // A consumer that EXISTS and has read nothing. This is a written cursor object, not a
+        // missing one.
+        replicator
+            .save_replay_cursor(&SharedStoreReplayCursor {
+                shard_id: 1,
+                last_wal_index: 0,
+                last_replay_time_ms: now_ms(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            replicator.load_replay_cursor(1).await.unwrap().last_wal_index,
+            0,
+            "the fixture did not persist a cursor that has never advanced"
+        );
+
+        let report = replicator.gc_checkpoints_cursor_safe(1, 1).await.unwrap();
+
+        assert_eq!(
+            report.deleted_checkpoints, 2,
+            "collection did not reach the regime it is being asked about"
+        );
+        assert_eq!(
+            report.retained_for_cursor_wal_index,
+            Some(0),
+            "a persisted consumer at zero still reports as an absent consumer"
+        );
+        assert_eq!(
+            report.retained_for_cursor_checkpoint_id, None,
+            "no generation sits at or below position zero, so none can be the cursor's anchor"
+        );
+
+        // The stuck consumer is not stranded: the surviving generation is a complete state and
+        // covers the keys the dropped generations covered.
+        let follower = test_engine(dir.path(), "stuck-consumer");
+        replicator
+            .restore_latest_checkpoint(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        follower.load_shard(1);
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "stuck-1".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(vec![1u8])
+            },
+            "the surviving generation does not cover what the dropped ones covered"
+        );
+    }
+
+    /// A CONSUMER THAT HAS READ NOTHING IS A CONSUMER.
+    ///
+    /// The log side is where treating a cursor at zero as an absent cursor loses data. A consumer
+    /// at position 0 has entry 1 still to read; a shard with no consumer has nothing to protect.
+    /// Those took the same branch, so the one deletion the guard existed to stop was the one it
+    /// waved through.
+    ///
+    /// Both directions, because a refusal that refused nothing reports the same way as a refusal
+    /// that worked: the error names the position, AND every log object is still there afterwards.
+    #[tokio::test]
+    async fn log_collection_refuses_to_pass_a_consumer_that_has_read_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, replicator) = test_shared_store(dir.path());
+
+        for wal_index in 1..=5u64 {
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: format!("k{wal_index}"),
+                        value: vec![wal_index as u8],
+                    }),
+                    staged_blocks: Vec::new(),
+                    outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        // REGIME FIRST: five log objects, so there is a prefix to lose.
+        let before = store
+            .list("cluster-a/shards/1/shared/wal/")
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            before, 5,
+            "the fixture did not publish the log prefix this test is about"
+        );
+
+        replicator
+            .save_replay_cursor(&SharedStoreReplayCursor {
+                shard_id: 1,
+                last_wal_index: 0,
+                last_replay_time_ms: now_ms(),
+            })
+            .await
+            .unwrap();
+
+        let refused = replicator
+            .gc_wal_before_cursor_safe(1, 4)
+            .await
+            .expect_err("a consumer at zero still needs entry 1, so retaining from 4 must refuse");
+        assert!(
+            matches!(
+                refused,
+                SharedStoreReplicationError::GcBlockedByReplayCursor {
+                    cursor_wal_index: 0,
+                    retain_from_wal_index: 4,
+                }
+            ),
+            "the refusal did not name the consumer it refused for: {refused:?}"
+        );
+
+        let after = store
+            .list("cluster-a/shards/1/shared/wal/")
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            after, before,
+            "the collection was reported as refused but deleted {} object(s) anyway",
+            before.saturating_sub(after)
+        );
+    }
+
+    /// AND THE OTHER SIDE OF IT: no consumer means no constraint.
+    ///
+    /// A guard that refused for every zero-valued cursor would also pass the test above, and
+    /// would collect nothing on any shard -- which is the state this whole area was already in.
+    /// What the fix has to do is tell an ABSENT cursor from a cursor at zero, so this asserts the
+    /// absent case still collects, and asserts it by the objects removed rather than by the
+    /// report.
+    #[tokio::test]
+    async fn log_collection_proceeds_when_no_consumer_has_ever_written_a_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, replicator) = test_shared_store(dir.path());
+
+        for wal_index in 1..=5u64 {
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: format!("k{wal_index}"),
+                        value: vec![wal_index as u8],
+                    }),
+                    staged_blocks: Vec::new(),
+                    outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .list("cluster-a/shards/1/shared/wal/")
+                .await
+                .unwrap()
+                .len(),
+            5,
+            "the fixture did not publish the log prefix this test is about"
+        );
+        assert!(
+            replicator.try_load_replay_cursor(1).await.unwrap().is_none(),
+            "the fixture wrote a cursor, so this is no longer the absent case"
+        );
+
+        let report = replicator.gc_wal_before_cursor_safe(1, 4).await.unwrap();
+
+        // REGIME: it collected. A pass that removed nothing cannot show that an absent cursor
+        // does not block.
+        assert_eq!(
+            report.deleted_wal_objects, 3,
+            "collection did not reach the regime it is being asked about"
+        );
+        assert_eq!(
+            report.retained_for_cursor_wal_index, None,
+            "an absent cursor was reported as a present consumer"
+        );
+        let remaining = store
+            .list("cluster-a/shards/1/shared/wal/")
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            2,
+            "the report and the object store disagree about what was removed"
+        );
+        assert!(
+            remaining
+                .iter()
+                .all(|key| !key.ends_with("wal_00000000000000000001.json")),
+            "the prefix the report claimed to remove is still present"
+        );
+    }
+
+    /// WITHOUT A CHECKPOINT THE SHARED LOG IS UNBOUNDED, AND THAT IS NOT A SETTING.
+    ///
+    /// A collection pass needs a complete state behind the prefix it drops. With no checkpoint
+    /// there is no such state and no prefix is safe to drop, so the pass declines and names why.
+    /// This is the more serious half of the problem: it holds with no consumer attached and no
+    /// consumer policy can change it.
+    #[tokio::test]
+    async fn collection_without_a_checkpoint_reclaims_nothing_and_names_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, replicator) = test_shared_store(dir.path());
+
+        for wal_index in 1..=5u64 {
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: format!("k{wal_index}"),
+                        value: vec![wal_index as u8],
+                    }),
+                    staged_blocks: Vec::new(),
+                    outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        assert!(
+            replicator.list_checkpoints(1).await.unwrap().is_empty(),
+            "the fixture published a checkpoint, so this is not the no-checkpoint case"
+        );
+
+        let report = replicator.collect_to_checkpoint(1, 2).await.unwrap();
+
+        assert_eq!(
+            report.blocked_reason, "no_checkpoint_to_anchor_collection",
+            "a pass that collected nothing did not say why"
+        );
+        assert_eq!(
+            report.deleted_wal_objects, 0,
+            "a pass with no state behind it deleted a log prefix anyway"
+        );
+        assert_eq!(
+            store
+                .list("cluster-a/shards/1/shared/wal/")
+                .await
+                .unwrap()
+                .len(),
+            5,
+            "the log shrank although the pass reported collecting nothing"
+        );
+    }
+
+    /// A CONSUMER AT A POSITION CAN STILL RESUME AFTER A COLLECTION BOUNDED BY THAT POSITION.
+    ///
+    /// This is the correctness property the whole collector rests on, and it is asserted in both
+    /// directions: the prefix below the consumer is GONE from the object store, and the consumer
+    /// replays the surviving tail from where it stopped and serves what the tail carried.
+    ///
+    /// The checkpoint here would have allowed a retention point of 4. The consumer sits at 2, so
+    /// clamping pulls it back to 3 -- the span the consumer has already passed and no further.
+    /// Refusing instead would have reclaimed nothing at all.
+    #[tokio::test]
+    async fn a_consumer_can_still_resume_after_a_collection_bounded_by_its_position() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        let (store, replicator) = test_shared_store(dir.path());
+
+        for wal_index in 1..=6u64 {
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: format!("k{wal_index}"),
+                        value: vec![wal_index as u8],
+                    }),
+                    staged_blocks: Vec::new(),
+                    outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "covered".to_string(),
+                value: b"by-the-checkpoint".to_vec(),
+            },
+        });
+        replicator
+            .publish_checkpoint(1, 3, &primary, &primary.block_store())
+            .await
+            .unwrap();
+        replicator
+            .save_replay_cursor(&SharedStoreReplayCursor {
+                shard_id: 1,
+                last_wal_index: 2,
+                last_replay_time_ms: now_ms(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .list("cluster-a/shards/1/shared/wal/")
+                .await
+                .unwrap()
+                .len(),
+            6,
+            "the fixture did not publish the six log objects it reasons about"
+        );
+
+        let report = replicator.collect_to_checkpoint(1, 2).await.unwrap();
+
+        // REGIME: the clamp happened and it collected. Either half missing and the conclusion
+        // below is about a different situation.
+        assert!(
+            report.clamped_to_cursor,
+            "the consumer did not hold the retention point back, so nothing here is about clamping"
+        );
+        assert_eq!(
+            report.cursor_wal_index,
+            Some(2),
+            "the pass did not read the consumer position the fixture wrote"
+        );
+        assert_eq!(
+            report.retain_from_wal_index, 3,
+            "the retention point is not the span the consumer has already passed"
+        );
+        assert_eq!(
+            report.deleted_wal_objects, 2,
+            "collection did not reach the regime it is being asked about"
+        );
+
+        // DIRECTION ONE: the prefix is really gone, not merely reported gone.
+        let remaining = store
+            .list("cluster-a/shards/1/shared/wal/")
+            .await
+            .unwrap();
+        assert_eq!(
+            remaining.len(),
+            4,
+            "the report and the object store disagree about what was removed"
+        );
+        assert!(
+            remaining
+                .iter()
+                .all(|key| !key.ends_with("wal_00000000000000000002.json")),
+            "the prefix the report claimed to remove is still present"
+        );
+
+        // DIRECTION TWO: the consumer resumes from where it stopped and serves the tail. Strict
+        // replay, because a non-strict one would walk past a hole without saying so and would
+        // pass whether or not the collection had been safe.
+        let consumer = test_engine(dir.path(), "consumer");
+        consumer.load_shard(1);
+        let replayed = replicator
+            .replay_wal_strict(1, 2, &consumer)
+            .await
+            .expect("a consumer at 2 could not resume after a collection bounded by 2");
+        assert_eq!(
+            replayed.applied, 4,
+            "the consumer did not take the whole surviving tail"
+        );
+        assert_eq!(
+            replayed.last_wal_index, 6,
+            "the consumer did not reach the end of the log"
+        );
+        assert_eq!(
+            consumer
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "k6".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(vec![6u8])
+            },
+            "the consumer replayed the tail and cannot serve it"
+        );
+    }
+
+    /// THE RESTORE PATH REFUSES A LOG WHOSE MISSING SPAN NO CHECKPOINT COVERS.
+    ///
+    /// `replay_wal` is the function all three production restore paths call, and it had no hole
+    /// check of any kind: it skipped everything at or below `after_wal_index` and applied whatever
+    /// else it found, in whatever order the object store listed it. A collected prefix therefore
+    /// came back as a truncated history with `Ok` on it.
+    ///
+    /// The fixture makes the hole in the MIDDLE of the log and names the three keys it cares
+    /// about, rather than counting them. A count passes just as well when the right NUMBER of
+    /// objects was removed from the wrong END, and that fixture would then be asserting a
+    /// refusal of something else.
+    #[tokio::test]
+    async fn the_restore_path_refuses_a_log_missing_a_span_no_checkpoint_covers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, replicator) = test_shared_store(dir.path());
+
+        for wal_index in 1..=5u64 {
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: format!("k{wal_index}"),
+                        value: vec![wal_index as u8],
+                    }),
+                    staged_blocks: Vec::new(),
+                    outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let prefix = "cluster-a/shards/1/shared/wal/";
+        let doomed = format!("{prefix}wal_00000000000000000002.json");
+
+        // REGIME, BEFORE THE DELETION: the key the fixture is about to remove exists under
+        // exactly the name the fixture uses. A mistyped key deletes nothing, and every assertion
+        // after it then describes a log with no hole in it at all.
+        let before = store.list(prefix).await.unwrap();
+        assert!(
+            before.iter().any(|key| key == &doomed),
+            "the fixture's key does not name a published object, so the deletion below is a no-op"
+        );
+        assert_eq!(
+            before.len(),
+            5,
+            "the fixture did not publish the five log objects it reasons about"
+        );
+
+        store.delete(&doomed).await.unwrap();
+
+        // REGIME, AFTER THE DELETION: the span is gone, and it is gone from the MIDDLE. Both
+        // neighbours are named, because a pass that deleted one object from the front or the back
+        // leaves the same count behind and refuses for a different reason than this test claims.
+        let after = store.list(prefix).await.unwrap();
+        assert!(
+            !after.iter().any(|key| key == &doomed),
+            "the object the fixture deleted is still present, so there is no hole to refuse"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|key| key.ends_with("wal_00000000000000000001.json")),
+            "the entry BELOW the hole went too, so this is a collected prefix and not a hole"
+        );
+        assert!(
+            after
+                .iter()
+                .any(|key| key.ends_with("wal_00000000000000000003.json")),
+            "the entry ABOVE the hole went too, so the log is merely short and has no hole"
+        );
+
+        // REGIME: nothing covers the missing span. With a checkpoint above it this would be a
+        // legitimately collected prefix, which is the case the next test is about.
+        assert!(
+            replicator.list_checkpoints(1).await.unwrap().is_empty(),
+            "a checkpoint covers the missing span, so refusing it would be wrong"
+        );
+
+        let follower = test_engine(dir.path(), "follower");
+        follower.load_shard(1);
+
+        // CONCLUSION: the shipped path refuses, and says which position it wanted.
+        let err = replicator
+            .replay_wal(1, 0, &follower)
+            .await
+            .expect_err("the shipped restore path accepted a log with a hole in it");
+        assert!(
+            matches!(
+                err,
+                SharedStoreReplicationError::ReplayGap {
+                    expected: 2,
+                    actual: 3
+                }
+            ),
+            "the refusal does not name the missing position: {err}"
+        );
+    }
+
+    /// THE REFUSAL DOES NOT COST THE ENTRIES ABOVE THE HOLE THEIR SILENCE.
+    ///
+    /// Separate block, separate conclusion: the one above says it refuses, this one says what it
+    /// did NOT do on the way. Applying 3, 4 and 5 and then refusing would leave the shard holding
+    /// writes that belong after history it does not have.
+    #[tokio::test]
+    async fn a_refused_restore_does_not_serve_the_entries_above_the_hole() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, replicator) = test_shared_store(dir.path());
+
+        for wal_index in 1..=5u64 {
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: format!("k{wal_index}"),
+                        value: vec![wal_index as u8],
+                    }),
+                    staged_blocks: Vec::new(),
+                    outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        let prefix = "cluster-a/shards/1/shared/wal/";
+        let doomed = format!("{prefix}wal_00000000000000000002.json");
+        assert!(
+            store.list(prefix).await.unwrap().iter().any(|key| key == &doomed),
+            "the fixture's key does not name a published object"
+        );
+        store.delete(&doomed).await.unwrap();
+        assert!(
+            store
+                .list(prefix)
+                .await
+                .unwrap()
+                .iter()
+                .any(|key| key.ends_with("wal_00000000000000000005.json")),
+            "the entry this test asks about is not in the log"
+        );
+
+        let follower = test_engine(dir.path(), "follower");
+        follower.load_shard(1);
+        assert!(
+            replicator.replay_wal(1, 0, &follower).await.is_err(),
+            "the restore did not refuse, so there is nothing to ask about what it applied"
+        );
+
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "k5".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes { value: None },
+            "a refused restore served an entry from above the hole"
+        );
+    }
+
+    /// AND IT DOES NOT REFUSE WHAT IT MUST NOT: A CHECKPOINT-ANCHORED COLLECTION STILL RESTORES.
+    ///
+    /// This is the other half, and it is the half a check that refuses everything would fail. The
+    /// prefix below the checkpoint is legitimately gone -- removed by the shipped collector, not
+    /// by this fixture's hand -- and a node restoring from that checkpoint must still take the
+    /// surviving tail and SERVE it.
+    ///
+    /// The collector runs for real rather than being imitated, because the property under test is
+    /// that the retention point the collector picks and the position the restore starts from are
+    /// the same number. A fixture that deleted the prefix itself would be asserting its own
+    /// arithmetic instead.
+    #[tokio::test]
+    async fn a_checkpoint_anchored_collection_leaves_a_restore_that_still_serves_the_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        let (store, replicator) = test_shared_store(dir.path());
+
+        for wal_index in 1..=6u64 {
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: format!("k{wal_index}"),
+                        value: vec![wal_index as u8],
+                    }),
+                    staged_blocks: Vec::new(),
+                    outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "covered".to_string(),
+                value: b"by-the-checkpoint".to_vec(),
+            },
+        });
+        replicator
+            .publish_checkpoint(1, 3, &primary, &primary.block_store())
+            .await
+            .unwrap();
+
+        let report = replicator.collect_to_checkpoint(1, 2).await.unwrap();
+
+        // REGIME: the collector reached the state this test is about. No consumer cursor exists,
+        // so the retention point is the checkpoint's own successor and nothing clamped it.
+        assert!(
+            !report.clamped_to_cursor,
+            "a consumer held the retention point back, so this is the clamped case and not this one"
+        );
+        assert_eq!(
+            report.checkpoint_wal_index, 3,
+            "the pass anchored on a different checkpoint than the fixture published"
+        );
+        assert_eq!(
+            report.retain_from_wal_index, 4,
+            "the retention point is not the checkpoint's successor"
+        );
+        assert_eq!(
+            report.deleted_wal_objects, 3,
+            "the collector did not remove the prefix this test needs gone"
+        );
+
+        // REGIME: and it removed it from the BOTTOM. Named keys, both directions: the last entry
+        // of the collected prefix is gone and the first entry of the surviving tail is present.
+        // The counts agree with either outcome.
+        let prefix = "cluster-a/shards/1/shared/wal/";
+        let remaining = store.list(prefix).await.unwrap();
+        assert!(
+            !remaining
+                .iter()
+                .any(|key| key.ends_with("wal_00000000000000000003.json")),
+            "the top of the collected prefix survived, so the prefix is not below the checkpoint"
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|key| key.ends_with("wal_00000000000000000004.json")),
+            "the first entry of the surviving tail was collected too, which IS a hole"
+        );
+        assert!(
+            remaining
+                .iter()
+                .any(|key| key.ends_with("wal_00000000000000000006.json")),
+            "the end of the log was collected, so the tail this test serves from is not there"
+        );
+
+        // CONCLUSION: a node that has never seen this shard restores and serves, with the prefix
+        // below the checkpoint legitimately absent.
+        let follower = test_engine(dir.path(), "follower");
+        let restored = replicator
+            .restore_index_and_block_addresses(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        assert_eq!(
+            restored.checkpoint_wal_index, 3,
+            "the restore anchored somewhere other than the checkpoint the collector used"
+        );
+        follower.load_shard(1);
+        let replayed = replicator
+            .replay_wal(1, restored.checkpoint_wal_index, &follower)
+            .await
+            .expect("the hole check refused a legitimately collected prefix");
+        assert_eq!(
+            replayed.applied, 3,
+            "the restore did not take the whole surviving tail"
+        );
+        assert_eq!(
+            replayed.last_wal_index, 6,
+            "the restore did not reach the end of the log"
+        );
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "k6".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(vec![6u8])
+            },
+            "the restore replayed the tail and cannot serve what it carried"
+        );
+    }
+
+    /// NOR DOES IT REFUSE A CONTIGUOUS LOG OF ENTRIES THAT CARRY THEIR RESULTS.
+    ///
+    /// The check this change moved into `replay_wal` came from `replay_wal_strict`, where the
+    /// expected position was advanced at the END of the loop body -- and the branch that installs
+    /// recorded outcomes ends in `continue`, so that increment was SKIPPED for every entry
+    /// carrying them. A perfectly contiguous log of such entries was refused at its second one,
+    /// naming a position that was never missing.
+    ///
+    /// Nothing caught it: `replay_wal_strict` had no production caller, and every test that
+    /// reached it published entries with `outcomes: Vec::new()`, which take the branch that did
+    /// increment. Copying that body into the shipped path would have shipped the refusal.
+    #[tokio::test]
+    async fn a_contiguous_log_of_result_carrying_entries_is_not_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        let (store, replicator) = test_shared_store(dir.path());
+
+        for index in 1..=3u64 {
+            let write = primary.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("carried-{index}"),
+                    value: format!("value-{index}").into_bytes(),
+                },
+            });
+            assert!(write.status.ok, "the fixture's own write failed");
+        }
+
+        // Take what those writes RECORDED, from the primary's own log, and republish each at a
+        // contiguous shared index. The outcomes are what put the entries on the branch this test
+        // is about; renumbering is what makes the log contiguous by construction, so a refusal
+        // below cannot be blamed on the fixture's spacing.
+        let records = primary
+            .write_ahead_log_store()
+            .scan(1, 0, u64::MAX, u64::MAX)
+            .unwrap()
+            .iter()
+            .filter_map(|(_, line)| crate::wal::decode_wal_line(line).ok())
+            .filter(|record| !record.outcomes.is_empty())
+            .collect::<Vec<_>>();
+        assert!(
+            records.len() >= 3,
+            "the fixture's writes recorded no outcomes, so nothing here takes the branch under test: {} found",
+            records.len()
+        );
+
+        for (offset, record) in records.iter().take(3).enumerate() {
+            let mut carried = record.staged_blocks.clone();
+            if carried.is_empty() {
+                for item in &record.outcomes {
+                    if let Some(address) = item.resolved_address() {
+                        if let Ok(bytes) = primary.block_store().read(&address) {
+                            carried.push(crate::wal::StagedBlock {
+                                object_id: item.object_id,
+                                component: item.component.as_deref().map(std::sync::Arc::from),
+                                bytes,
+                            });
+                        }
+                    }
+                }
+            }
+            replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index: offset as u64 + 1,
+                    command: record.command.clone(),
+                    staged_blocks: carried,
+                    outcomes: record.outcomes.clone(),
+                })
+                .await
+                .unwrap();
+        }
+
+        // REGIME: three contiguous indices, NAMED, and every one of them carrying outcomes. A
+        // count alone would pass against a log published at 1, 2 and 4.
+        let prefix = "cluster-a/shards/1/shared/wal/";
+        let published = store.list(prefix).await.unwrap();
+        for wal_index in 1..=3u64 {
+            let key = format!("{prefix}wal_{wal_index:020}.json");
+            assert!(
+                published.iter().any(|present| present == &key),
+                "the fixture did not publish a contiguous log: {key} is missing"
+            );
+        }
+        assert_eq!(
+            published.len(),
+            3,
+            "the fixture published something other than the three entries it reasons about"
+        );
+
+        let follower = test_engine(dir.path(), "follower");
+        follower.load_shard(1);
+
+        // CONCLUSION: it replays, rather than refusing at the second entry.
+        let replayed = replicator
+            .replay_wal(1, 0, &follower)
+            .await
+            .expect("a contiguous log of result-carrying entries was refused as having a hole");
+        assert_eq!(
+            replayed.applied, 3,
+            "the replay stopped short of the contiguous log it was given"
+        );
+        assert_eq!(
+            replayed.last_wal_index, 3,
+            "the replay did not reach the end of a log with nothing missing from it"
+        );
+    }
+
+    /// THE LOG IS BOUNDED BY CHECKPOINT CADENCE, SWEPT RATHER THAN ASSERTED AT ONE POINT.
+    ///
+    /// Twelve rounds, three log entries each, a checkpoint every third round, and a collection
+    /// pass per round. The control arm takes the identical workload with no collection pass, so
+    /// the claim is about the difference between two curves and not about one number.
+    ///
+    /// The bound itself is the interesting part: nine objects, which is three rounds of three
+    /// entries -- one checkpoint interval. Nothing was tuned to reach it. It falls out of where
+    /// the checkpoints are, which is what makes the log self-limiting rather than retained.
+    #[tokio::test]
+    async fn collection_bounds_the_shared_log_by_checkpoint_cadence() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        let (collected_store, collected) = test_shared_store(&dir.path().join("collected"));
+        let (control_store, control) = test_shared_store(&dir.path().join("control"));
+
+        let mut wal_index = 0u64;
+        let mut deleted_total = 0usize;
+        let mut declined_rounds = 0usize;
+        for round in 1..=12u64 {
+            for _ in 0..3 {
+                wal_index += 1;
+                let entry = SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: format!("k{wal_index}"),
+                        value: vec![wal_index as u8],
+                    }),
+                    staged_blocks: Vec::new(),
+                    outcomes: Vec::new(),
+                };
+                collected.publish_wal_entry(entry.clone()).await.unwrap();
+                control.publish_wal_entry(entry).await.unwrap();
+            }
+            let report = collected.collect_to_checkpoint(1, 2).await.unwrap();
+            deleted_total += report.deleted_wal_objects;
+            if !report.blocked_reason.is_empty() {
+                declined_rounds += 1;
+            }
+            if round % 3 == 0 {
+                primary.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: format!("round-{round}"),
+                        value: vec![round as u8],
+                    },
+                });
+                for replicator in [&collected, &control] {
+                    replicator
+                        .publish_checkpoint(1, wal_index, &primary, &primary.block_store())
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+
+        // REGIME, both halves. The control has to have published what the sweep thinks it did,
+        // and the collected arm has to have actually deleted -- a pass that reclaimed nothing
+        // would satisfy any bound for the wrong reason.
+        let control_objects = control_store
+            .list("cluster-a/shards/1/shared/wal/")
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            control_objects, 36,
+            "the uncollected arm did not grow to the 36 objects the sweep published"
+        );
+        assert!(
+            deleted_total > 0,
+            "the collected arm never deleted an object, so the bound below is vacuous"
+        );
+
+        let collected_objects = collected_store
+            .list("cluster-a/shards/1/shared/wal/")
+            .await
+            .unwrap()
+            .len();
+        println!(
+            "[collect] uncollected={control_objects} collected={collected_objects} \
+             deleted={deleted_total} declined_rounds={declined_rounds}"
+        );
+        assert_eq!(
+            collected_objects, 9,
+            "the collected log is not one checkpoint interval deep"
+        );
+        assert_eq!(
+            collected_objects + deleted_total,
+            control_objects,
+            "the objects kept plus the objects deleted do not account for the objects published"
+        );
+        // The rounds before the first checkpoint are the unbounded regime, and they have to be
+        // present or the sweep never saw it.
+        assert_eq!(
+            declined_rounds, 3,
+            "the sweep did not pass through the rounds that have no checkpoint to anchor on"
+        );
+
+        // AND THE COLLECTED ARM IS STILL WHOLE: the newest surviving generation restores and
+        // serves a key written before the oldest deleted log object.
+        let restored_node = test_engine(dir.path(), "restored");
+        collected
+            .restore_latest_checkpoint(1, &restored_node, &restored_node.block_store())
+            .await
+            .unwrap();
+        restored_node.load_shard(1);
+        assert_eq!(
+            restored_node
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "round-3".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(vec![3u8])
+            },
+            "the collected arm cannot restore what it collected the log for"
+        );
+    }
+
+    /// A CONSUMER THAT PINS THE LOG PAST ITS BOUND IS ABANDONED, NOT WAITED FOR.
+    ///
+    /// Clamping to a consumer is correct and it is also unbounded: a consumer that never advances
+    /// holds the retention point at its own position for as long as it exists, and the log grows
+    /// underneath it. That is a disk-exhaustion failure wearing a retention policy's clothes, and
+    /// the only honest end to it is to stop treating the consumer as live.
+    ///
+    /// Dropping the cursor is what "stop treating it as live" means here. It costs the consumer a
+    /// resume, not its data: the surviving generation is a complete state, and restoring from it
+    /// is the path the consumer already takes when it finds no cursor. Asserted below in both
+    /// directions -- the pin is real first, then the abandon releases it, then the abandoned
+    /// consumer still restores and serves.
+    #[tokio::test]
+    async fn a_consumer_that_pins_the_log_past_its_lag_bound_is_abandoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        let store = Arc::new(FileObjectStore::new(dir.path().join("objects")));
+        let patient = SharedStoreReplicator::new(TEST_CLUSTER_ID, store.clone())
+            .with_wal_append_mode(SharedStoreWalAppendMode::JsonPerKey);
+
+        for wal_index in 1..=20u64 {
+            patient
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: format!("k{wal_index}"),
+                        value: vec![wal_index as u8],
+                    }),
+                    staged_blocks: Vec::new(),
+                    outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "covered".to_string(),
+                value: b"by-the-checkpoint".to_vec(),
+            },
+        });
+        patient
+            .publish_checkpoint(1, 20, &primary, &primary.block_store())
+            .await
+            .unwrap();
+        patient
+            .save_replay_cursor(&SharedStoreReplayCursor {
+                shard_id: 1,
+                last_wal_index: 1,
+                last_replay_time_ms: now_ms(),
+            })
+            .await
+            .unwrap();
+
+        // REGIME: THE PIN IS REAL. With no bound configured, a consumer one entry into a
+        // twenty-entry log holds all nineteen of them. Without this the abandon below would be
+        // released from a pin that was not there.
+        let pinned = patient.collect_to_checkpoint(1, 2).await.unwrap();
+        assert!(
+            pinned.clamped_to_cursor,
+            "the consumer did not hold the retention point, so there is no pin to release"
+        );
+        assert_eq!(
+            pinned.retain_from_wal_index, 2,
+            "the retention point is not the consumer's own position"
+        );
+        let pinned_objects = store
+            .list("cluster-a/shards/1/shared/wal/")
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            pinned_objects, 19,
+            "the pin did not retain the log this test is about"
+        );
+
+        // Now the same store with a lag bound. Nineteen entries behind, bound of five.
+        let bounded = SharedStoreReplicator::new(TEST_CLUSTER_ID, store.clone())
+            .with_wal_append_mode(SharedStoreWalAppendMode::JsonPerKey)
+            .with_cursor_abandon_policy(SharedStoreCursorAbandonPolicy {
+                max_cursor_age_ms: 0,
+                max_cursor_lag_entries: 5,
+            });
+        let released = bounded.collect_to_checkpoint(1, 2).await.unwrap();
+
+        assert_eq!(
+            released.abandoned_cursor_wal_index,
+            Some(1),
+            "the pass did not abandon the consumer that was past its bound"
+        );
+        assert_eq!(
+            released.abandoned_reason, "cursor_lag_entries_above_bound",
+            "the abandon did not name the rule that fired"
+        );
+        assert!(
+            !released.clamped_to_cursor,
+            "the retention point is still held back by a consumer that was abandoned"
+        );
+        assert_eq!(
+            released.retain_from_wal_index, 21,
+            "the retention point did not move up to what the checkpoint covers"
+        );
+        assert_eq!(
+            released.deleted_wal_objects, 19,
+            "the abandon released the pin but collected nothing"
+        );
+        assert!(
+            bounded.try_load_replay_cursor(1).await.unwrap().is_none(),
+            "the cursor was reported abandoned and is still on the object store"
+        );
+        assert_eq!(
+            store
+                .list("cluster-a/shards/1/shared/wal/")
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "the report and the object store disagree about what was removed"
+        );
+
+        // NOTHING ACKED BECAME UNRECOVERABLE. The abandoned consumer restores the surviving
+        // generation and serves a key the deleted log prefix carried.
+        let abandoned_consumer = test_engine(dir.path(), "abandoned");
+        bounded
+            .restore_latest_checkpoint(1, &abandoned_consumer, &abandoned_consumer.block_store())
+            .await
+            .unwrap();
+        abandoned_consumer.load_shard(1);
+        assert_eq!(
+            abandoned_consumer
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "covered".to_string()
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"by-the-checkpoint".to_vec())
+            },
+            "an abandoned consumer cannot restore the state the log was collected against"
+        );
+    }
+
+    /// AND A CONSUMER INSIDE ITS BOUND IS NOT ABANDONED.
+    ///
+    /// A rule that abandoned every cursor would pass the test above and would make the cursor
+    /// mean nothing. The bound has to be a bound, so this asserts the near side of it: a consumer
+    /// within the allowed distance keeps its cursor AND keeps holding the retention point.
+    #[tokio::test]
+    async fn a_consumer_inside_its_lag_bound_keeps_its_cursor_and_its_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+        let store = Arc::new(FileObjectStore::new(dir.path().join("objects")));
+        let bounded = SharedStoreReplicator::new(TEST_CLUSTER_ID, store.clone())
+            .with_wal_append_mode(SharedStoreWalAppendMode::JsonPerKey)
+            .with_cursor_abandon_policy(SharedStoreCursorAbandonPolicy {
+                max_cursor_age_ms: 0,
+                max_cursor_lag_entries: 5,
+            });
+
+        for wal_index in 1..=8u64 {
+            bounded
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: format!("k{wal_index}"),
+                        value: vec![wal_index as u8],
+                    }),
+                    staged_blocks: Vec::new(),
+                    outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        primary.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "covered".to_string(),
+                value: b"by-the-checkpoint".to_vec(),
+            },
+        });
+        bounded
+            .publish_checkpoint(1, 8, &primary, &primary.block_store())
+            .await
+            .unwrap();
+        // Four entries behind a frontier of eight: inside a bound of five.
+        bounded
+            .save_replay_cursor(&SharedStoreReplayCursor {
+                shard_id: 1,
+                last_wal_index: 4,
+                last_replay_time_ms: now_ms(),
+            })
+            .await
+            .unwrap();
+
+        let report = bounded.collect_to_checkpoint(1, 2).await.unwrap();
+
+        assert_eq!(
+            report.abandoned_cursor_wal_index, None,
+            "a consumer inside its bound was abandoned"
+        );
+        assert!(
+            report.abandoned_reason.is_empty(),
+            "a consumer inside its bound was reported against a rule: {}",
+            report.abandoned_reason
+        );
+        // REGIME: it still collected, and it still clamped. Either half missing and this says
+        // nothing about a bound that was respected.
+        assert!(
+            report.clamped_to_cursor,
+            "the consumer inside its bound stopped holding the retention point"
+        );
+        assert_eq!(
+            report.retain_from_wal_index, 5,
+            "the retention point is not the span the consumer has already passed"
+        );
+        assert_eq!(
+            report.deleted_wal_objects, 4,
+            "collection did not reach the regime it is being asked about"
+        );
+        assert_eq!(
+            bounded
+                .try_load_replay_cursor(1)
+                .await
+                .unwrap()
+                .map(|cursor| cursor.last_wal_index),
+            Some(4),
+            "the cursor of a consumer inside its bound was removed"
+        );
+    }
+
+    /// THE AGE RULE NEEDS A RECORDED TIME, AND A CURSOR AT ZERO MAY NOT HAVE ONE.
+    ///
+    /// `last_replay_time_ms` is only stamped when a consumer ADVANCES, so a consumer that has
+    /// never advanced can hold a cursor whose recorded time is zero -- which would read as
+    /// infinitely old and would be abandoned by an age rule on its first pass, before it had any
+    /// chance to read. The age rule therefore declines to judge a cursor that has recorded no
+    /// time, and the distance rule is what ends that consumer's hold once the log moves past it.
+    ///
+    /// Asserted as two conclusions on the same fixture shape, so neither can borrow the other's
+    /// evidence: the age rule alone leaves the unstamped cursor alone, the distance rule alone
+    /// ends it.
+    #[tokio::test]
+    async fn the_age_rule_declines_an_unstamped_cursor_and_the_distance_rule_ends_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+
+        for (label, policy, expect_abandon) in [
+            (
+                "age-only",
+                SharedStoreCursorAbandonPolicy {
+                    max_cursor_age_ms: 1,
+                    max_cursor_lag_entries: 0,
+                },
+                false,
+            ),
+            (
+                "distance-only",
+                SharedStoreCursorAbandonPolicy {
+                    max_cursor_age_ms: 0,
+                    max_cursor_lag_entries: 5,
+                },
+                true,
+            ),
+        ] {
+            let store = Arc::new(FileObjectStore::new(dir.path().join(label)));
+            let replicator =
+                SharedStoreReplicator::new(TEST_CLUSTER_ID, store)
+            .with_wal_append_mode(SharedStoreWalAppendMode::JsonPerKey).with_cursor_abandon_policy(policy);
+            for wal_index in 1..=20u64 {
+                replicator
+                    .publish_wal_entry(SharedStoreWalEntry {
+                        shard_id: 1,
+                        wal_index,
+                        command: Some(Command::StringSet {
+                            key: format!("k{wal_index}"),
+                            value: vec![wal_index as u8],
+                        }),
+                        staged_blocks: Vec::new(),
+                        outcomes: Vec::new(),
+                    })
+                    .await
+                    .unwrap();
+            }
+            replicator
+                .publish_checkpoint(1, 20, &primary, &primary.block_store())
+                .await
+                .unwrap();
+            // A consumer that exists, has read nothing, and recorded no time for it.
+            replicator
+                .save_replay_cursor(&SharedStoreReplayCursor {
+                    shard_id: 1,
+                    last_wal_index: 0,
+                    last_replay_time_ms: 0,
+                })
+                .await
+                .unwrap();
+            assert!(
+                replicator.try_load_replay_cursor(1).await.unwrap().is_some(),
+                "{label}: the fixture did not persist the unstamped cursor it reasons about"
+            );
+
+            let report = replicator.collect_to_checkpoint(1, 2).await.unwrap();
+            assert_eq!(
+                report.abandoned_cursor_wal_index.is_some(),
+                expect_abandon,
+                "{label}: abandon decision was {:?} against an expectation of {expect_abandon}",
+                report.abandoned_cursor_wal_index
+            );
+            if expect_abandon {
+                assert_eq!(
+                    report.abandoned_reason, "cursor_lag_entries_above_bound",
+                    "{label}: the abandon did not name the rule that fired"
+                );
+                assert_eq!(
+                    report.deleted_wal_objects, 20,
+                    "{label}: the abandon released the pin but collected nothing"
+                );
+            } else {
+                assert!(
+                    report.clamped_to_cursor,
+                    "{label}: an unstamped cursor the age rule declined to judge stopped holding the retention point"
+                );
+                assert_eq!(
+                    report.deleted_wal_objects, 0,
+                    "{label}: a consumer that has read nothing had its log collected"
+                );
+            }
+        }
+    }
+
+    /// THE CHECKPOINT REFUSAL CANNOT FIRE.
+    ///
+    /// `CheckpointGcBlockedByReplayCursor` is returned only for a generation at or below the
+    /// cursor when no anchor generation was found. The anchor is the newest generation at or below
+    /// the cursor -- so the condition that reaches the refusal is the same condition that produces
+    /// an anchor, and the refusal is unreachable by construction. What protects a consumer on the
+    /// checkpoint side is RETENTION, not refusal.
+    ///
+    /// Swept over every cursor position the fixture can hold rather than asserted at one, because
+    /// the claim is about all of them. The sweep asserts its own regime: the contested positions
+    /// -- the ones with a generation at or below the cursor -- have to actually occur, or the
+    /// sweep proves nothing about them.
+    #[tokio::test]
+    async fn checkpoint_collection_protects_a_cursor_by_retention_and_never_by_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let primary = test_engine(dir.path(), "primary");
+        primary.load_shard(1);
+
+        let mut contested_positions = 0usize;
+        for cursor_position in 0..=4u64 {
+            // A fresh object store per position: collection is destructive, so one shared fixture
+            // would make every position after the first a conclusion about a different shard.
+            let (_store, replicator) = test_shared_store(
+                &dir.path().join(format!("sweep-{cursor_position}")),
+            );
+            for checkpoint_wal_index in 1..=3u64 {
+                primary.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: format!("sweep-{cursor_position}-{checkpoint_wal_index}"),
+                        value: vec![checkpoint_wal_index as u8],
+                    },
+                });
+                replicator
+                    .publish_checkpoint(1, checkpoint_wal_index, &primary, &primary.block_store())
+                    .await
+                    .unwrap();
+            }
+            let generations = replicator.list_checkpoints(1).await.unwrap();
+            assert_eq!(
+                generations.len(),
+                3,
+                "position {cursor_position} did not reach three generations"
+            );
+            replicator
+                .save_replay_cursor(&SharedStoreReplayCursor {
+                    shard_id: 1,
+                    last_wal_index: cursor_position,
+                    last_replay_time_ms: now_ms(),
+                })
+                .await
+                .unwrap();
+
+            let report = replicator
+                .gc_checkpoints_cursor_safe(1, 1)
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("cursor position {cursor_position} was refused: {err:?}")
+                });
+
+            let covered = generations
+                .iter()
+                .any(|manifest| manifest.checkpoint_wal_index <= cursor_position);
+            if covered && cursor_position > 0 {
+                contested_positions += 1;
+                assert!(
+                    report.retained_for_cursor_checkpoint_id.is_some(),
+                    "position {cursor_position} has a generation at or below it and retained none for the cursor"
+                );
+            }
+        }
+        assert!(
+            contested_positions >= 3,
+            "the sweep never entered the contested regime: {contested_positions} position(s) had a generation at or below the cursor"
+        );
+    }
+
+    #[cfg(feature = "matrixobject")]
+    #[tokio::test]
+    async fn shared_store_protobuf_append_blob_replays_matrixobject_blob() {
+        use crate::matrixobject_store::MatrixObjectObjectStore;
+        use matrixobjectstore_rs::StoreOptions;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(
+            MatrixObjectObjectStore::new(
+                "temporalstore-shared",
+                StoreOptions {
+                    // `segment_size` BECAME `slab_size` AND IS NOW `page_size`, following the
+                    // store dropping its slab tier -- the tiers are chunk > page > fragment.
+                    //
+                    // AND THAT LAST STEP IS NOT A RENAME. A slab was its own tier and bore no
+                    // relation to the chunk size; a page sits BELOW a chunk, so the store enforces
+                    // `1 <= page_size < chunk_size`. Carrying `16` and `4` across the rename
+                    // inverted that and the constructor refused with "page_size must be
+                    // 1..chunk_size", which only running it revealed.
+                    page_size: 4,
+                    max_extent_bytes: 4,
+                    chunk_size: 16,
+                    ..StoreOptions::default()
+                },
+            )
+            .unwrap(),
+        );
+        let replicator = SharedStoreReplicator::new("cluster-a", store.clone())
+            .with_wal_append_mode(SharedStoreWalAppendMode::ProtobufAppendBlob);
+
+        let mut append_receipts = Vec::new();
+        for (wal_index, key, value) in [
+            (1, "proto-a", b"one".to_vec()),
+            (2, "proto-b", b"two".to_vec()),
+        ] {
+            let receipt = replicator
+                .publish_wal_entry(SharedStoreWalEntry {
+                    shard_id: 1,
+                    wal_index,
+                    command: Some(Command::StringSet {
+                        key: key.to_string(),
+                        value,
+                    }),
+                
+                                       staged_blocks: Vec::new(),
+                                                       outcomes: Vec::new(),
+                })
+                .await
+                .unwrap();
+            append_receipts.push(receipt.expect("protobuf append blob should return offsets"));
+        }
+        assert_eq!(append_receipts[0].start_offset, 0);
+        assert_eq!(
+            append_receipts[0].end_offset,
+            append_receipts[1].start_offset
+        );
+        assert_eq!(
+            append_receipts[1].end_offset,
+            append_receipts[1].object_length
+        );
+        assert!(append_receipts[1].physical_slab_count > 1);
+
+        let blob_key = "cluster-a/shards/1/shared/wal/wal.protobuf.blob";
+        let offset_index_key = "cluster-a/shards/1/shared/wal/wal.offset_index.protobuf.blob";
+        assert_eq!(
+            store
+                .list("cluster-a/shards/1/shared/wal/")
+                .await
+                .unwrap(),
+            vec![offset_index_key.to_string(), blob_key.to_string()]
+        );
+        assert!(!store.get(blob_key).await.unwrap().is_empty());
+        assert!(!store.get(offset_index_key).await.unwrap().is_empty());
+        let offset_metadata = replicator.load_wal_offset_metadata(1).await.unwrap();
+        assert_eq!(offset_metadata.len(), append_receipts.len());
+        for (index, receipt) in append_receipts.iter().enumerate() {
+            let metadata = offset_metadata
+                .get(&(index as u64 + 1))
+                .expect("offset metadata by wal index");
+            assert_eq!(metadata.wal_blob_key, blob_key);
+            assert_eq!(metadata.wal_blob_start_offset, receipt.start_offset);
+            assert_eq!(metadata.wal_blob_end_offset, receipt.end_offset);
+            assert_eq!(metadata.wal_blob_bytes_written, receipt.bytes_written);
+        }
+        let matrixobject_blob = store
+            .inner()
+            .lock()
+            .expect("matrixobject lock poisoned")
+            .get_object("temporalstore-shared", blob_key)
+            .unwrap();
+        assert!(
+            matrixobject_blob.metadata.extents.len() > 1,
+            "protobuf WAL frames should be appended into one MatrixObject blob"
+        );
+
+        let restarted = SharedStoreReplicator::new("cluster-a", store)
+            .with_wal_append_mode(SharedStoreWalAppendMode::ProtobufAppendBlob);
+        let follower = test_engine(dir.path(), "follower");
+        follower.load_shard(1);
+        assert_eq!(
+            restarted.replay_wal_strict(1, 0, &follower).await.unwrap(),
+            ReplayReport {
+                applied: 2,
+                last_wal_index: 2,
+                offset_index_reads: 2,
+                range_bytes_read: append_receipts
+                    .iter()
+                    .map(|receipt| receipt.bytes_written)
+                    .sum(),
+            }
+        );
+        for (key, value) in [("proto-a", b"one".to_vec()), ("proto-b", b"two".to_vec())] {
+            assert_eq!(
+                follower
+                    .execute(ExecuteRequest {
+                        shard_id: 1,
+                        command: Command::StringGet {
+                            key: key.to_string()
+                        },
+                    })
+                    .response,
+                CommandResponse::Bytes { value: Some(value) }
+            );
+        }
+    }
+
+    /// R2: a durable, cross-owner single-writer fence. Proves rejection happens at the STORE
+    /// layer (a superseded stale owner cannot double-append to the shared WAL), not merely via
+    /// an in-memory load_version check.
+    #[tokio::test]
+    async fn r2_stale_load_version_writer_is_rejected_at_store_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(FileObjectStore::new(dir.path().join("objects")));
+        let shard: ShardId = 7;
+
+        // Owner A claims the shard at load_version 1 and writes successfully.
+        let repl_a = SharedStoreReplicator::new(TEST_CLUSTER_ID, store.clone()).with_fence(1, "A");
+        repl_a.acquire_shard_lease(shard, 1, "A").await.unwrap();
+        let writer_a = repl_a.storage_writer(SharedStoreStorageMode::Sync, 1);
+        writer_a
+            .write(
+                shard,
+                Command::StringSet {
+                    key: "k".to_string(),
+                    value: b"from-a".to_vec(),
+                },
+            )
+            .await
+            .expect("owner A write should succeed while it holds the lease");
+
+        // A newer owner B takes over at a strictly higher load_version 2.
+        let repl_b = SharedStoreReplicator::new(TEST_CLUSTER_ID, store.clone()).with_fence(2, "B");
+        repl_b.acquire_shard_lease(shard, 2, "B").await.unwrap();
+
+        // The stale owner A is now fenced OUT: its next WAL append is rejected at the store
+        // layer, so it cannot double-append and corrupt the shared WAL.
+        let err = writer_a
+            .write(
+                shard,
+                Command::StringSet {
+                    key: "k".to_string(),
+                    value: b"stale-a".to_vec(),
+                },
+            )
+            .await
+            .expect_err("stale owner A must be rejected after being superseded");
+        assert!(
+            matches!(err, SharedStoreReplicationError::StoreConditionFailed { .. }),
+            "expected fence rejection, got {err:?}"
+        );
+
+        // Owner B, holding the current lease, still writes fine.
+        let writer_b = repl_b.storage_writer(SharedStoreStorageMode::Sync, 2);
+        writer_b
+            .write(
+                shard,
+                Command::StringSet {
+                    key: "k".to_string(),
+                    value: b"from-b".to_vec(),
+                },
+            )
+            .await
+            .expect("current owner B write should succeed");
+
+        // A stale ownership claim (equal-or-lower load_version) cannot acquire the lease.
+        let repl_c = SharedStoreReplicator::new(TEST_CLUSTER_ID, store.clone()).with_fence(1, "C");
+        let acquire_err = repl_c
+            .acquire_shard_lease(shard, 1, "C")
+            .await
+            .expect_err("a stale load_version must not be able to acquire the lease");
+        assert!(
+            matches!(acquire_err, SharedStoreReplicationError::StaleOwnership { .. }),
+            "expected StaleOwnership, got {acquire_err:?}"
+        );
+
+        // The underlying store CAS is itself fenced: a wrong `expected` is rejected.
+        let cas_err = store
+            .compare_and_swap(
+                "leases/probe.lease",
+                Some(Bytes::from_static(b"never-written")),
+                Bytes::from_static(b"new"),
+            )
+            .await
+            .expect_err("CAS with a mismatched expected value must fail");
+        assert!(matches!(cas_err, ObjectStoreError::ConditionFailed { .. }));
+    }
+
+    #[derive(Debug)]
+    struct FlakyObjectStore {
+        inner: FileObjectStore,
+        fail_puts: Mutex<usize>,
+    }
+
+    #[async_trait]
+    impl ObjectStore for FlakyObjectStore {
+        async fn put(&self, key: &str, bytes: Bytes) -> Result<(), ObjectStoreError> {
+            {
+                let mut fail_puts = self.fail_puts.lock().expect("flaky store lock poisoned");
+                if *fail_puts > 0 {
+                    *fail_puts -= 1;
+                    return Err(ObjectStoreError::InvalidKey("injected failure".to_string()));
+                }
+            }
+            self.inner.put(key, bytes).await
+        }
+
+        async fn get(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get(key).await
+        }
+
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectStoreError> {
+            self.inner.list(prefix).await
+        }
+
+        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+            self.inner.delete(key).await
+        }
+
+        fn uri(&self, key: &str) -> String {
+            self.inner.uri(key)
+        }
+    }
+
+    // ---- Group-commit (timer-less queue-coalesced) tests --------------------------------------
+
+    /// Wraps a real `FileObjectStore` and counts durable `append_blob` barriers so a test can prove
+    /// that N concurrent sync writers were coalesced onto far fewer than N appends. Everything else
+    /// delegates straight through, so replay/recovery behave exactly as against the inner store.
+    #[derive(Debug)]
+    struct CountingObjectStore {
+        inner: FileObjectStore,
+        append_blobs: std::sync::atomic::AtomicUsize,
+        /// Every key a whole-object `get` was asked for, in order.
+        ///
+        /// Counted PER KEY rather than in total because a replay reads several different
+        /// objects, and the figure under test is how many times it reads ONE of them: the
+        /// per-shard offset index. A total would be satisfied by reading the index once
+        /// and something else N times, which is the opposite of what is being asserted.
+        gets: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl CountingObjectStore {
+        fn new(inner: FileObjectStore) -> Self {
+            Self {
+                inner,
+                append_blobs: std::sync::atomic::AtomicUsize::new(0),
+                gets: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn append_blob_count(&self) -> usize {
+            self.append_blobs.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn get_count_for(&self, key: &str) -> usize {
+            self.gets
+                .lock()
+                .expect("counting store get log poisoned")
+                .iter()
+                .filter(|seen| seen.as_str() == key)
+                .count()
+        }
+        fn reset_get_log(&self) {
+            self.gets
+                .lock()
+                .expect("counting store get log poisoned")
+                .clear();
+        }
+    }
+
+    #[async_trait]
+    impl ObjectStore for CountingObjectStore {
+        async fn put(&self, key: &str, bytes: Bytes) -> Result<(), ObjectStoreError> {
+            self.inner.put(key, bytes).await
+        }
+        async fn append_blob(
+            &self,
+            key: &str,
+            bytes: Bytes,
+        ) -> Result<AppendBlobReceipt, ObjectStoreError> {
+            self.append_blobs
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.append_blob(key, bytes).await
+        }
+        async fn get(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+            self.gets
+                .lock()
+                .expect("counting store get log poisoned")
+                .push(key.to_string());
+            self.inner.get(key).await
+        }
+        async fn get_range(
+            &self,
+            key: &str,
+            offset: u64,
+            length: u64,
+        ) -> Result<Bytes, ObjectStoreError> {
+            self.inner.get_range(key, offset, length).await
+        }
+        async fn list(&self, prefix: &str) -> Result<Vec<String>, ObjectStoreError> {
+            self.inner.list(prefix).await
+        }
+        async fn delete(&self, key: &str) -> Result<(), ObjectStoreError> {
+            self.inner.delete(key).await
+        }
+        fn uri(&self, key: &str) -> String {
+            self.inner.uri(key)
+        }
+    }
+
+    /// A replay reads the per-shard offset index ONCE, whatever the log's length.
+    ///
+    /// # WHAT THIS CATCHES, AND WHY A BYTE FIGURE COULD NOT
+    ///
+    /// The offset index is one appendable blob per shard, so a single lookup in it costs a
+    /// whole-object read plus a full decode. Replay held the decoded map already and then
+    /// asked for each record individually, paying that cost once per entry: O(n) per entry,
+    /// O(n-squared) for the replay. It was invisible to every per-entry byte figure the
+    /// shared-store report prints, because those count the RANGE read of the WAL blob --
+    /// which was correctly indexed all along -- and nothing counted the lookup.
+    ///
+    /// # TWO SIZES, BECAUSE ONE CANNOT TELL A CONSTANT FROM A LINE
+    ///
+    /// The count is asserted at two corpus sizes an order of magnitude apart. At one size
+    /// the regressed code would read the index `entries` times and this test would be
+    /// satisfied by any constant that happened to match; across two it can only pass if the
+    /// figure does not track the corpus. The assertion is an exact `1`, not a bound: a
+    /// threshold would keep passing if the per-entry load came back in a batched form.
+    #[tokio::test]
+    async fn a_replay_reads_the_offset_index_once_however_long_the_log_is() {
+        let mut counts = Vec::new();
+        for entries in [8u64, 80] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = Arc::new(CountingObjectStore::new(FileObjectStore::new(
+                dir.path().join("objects"),
+            )));
+            let replicator = SharedStoreReplicator::new(TEST_CLUSTER_ID, store.clone())
+                .with_wal_append_mode(SharedStoreWalAppendMode::ProtobufAppendBlob);
+            for wal_index in 1..=entries {
+                replicator
+                    .publish_wal_entry(SharedStoreWalEntry {
+                        shard_id: 1,
+                        wal_index,
+                        command: Some(Command::StringSet {
+                            key: format!("key-{wal_index}"),
+                            value: b"value".to_vec(),
+                        }),
+                        staged_blocks: Vec::new(),
+                        outcomes: Vec::new(),
+                    })
+                    .await
+                    .unwrap();
+            }
+
+            // Only the replay's reads are counted; publishing does its own.
+            store.reset_get_log();
+            let follower = test_engine(dir.path(), "follower");
+            follower.load_shard(1);
+            let report = replicator
+                .replay_wal_strict(1, 0, &follower)
+                .await
+                .unwrap();
+            assert_eq!(
+                report.applied, entries as usize,
+                "the replay has to reach the regime this test is about"
+            );
+            assert_eq!(report.offset_index_reads, entries as usize);
+
+            let index_key = replicator.wal_offset_index_blob_key(1);
+            counts.push((entries, store.get_count_for(&index_key)));
+        }
+        for (entries, index_gets) in &counts {
+            assert_eq!(
+                *index_gets, 1,
+                "replaying {entries} entries read the offset index {index_gets} times; it is \
+                 loaded once and the decoded records are what the loop iterates",
+            );
+        }
+    }
+
+    /// Fails EVERY `append_blob` (the shared-store durable barrier) so the group-commit failure
+    /// path can be exercised: no covered writer may be told Ok.
+    #[derive(Debug, Default)]
+    struct FailingAppendStore;
+
+    #[async_trait]
+    impl ObjectStore for FailingAppendStore {
+        async fn put(&self, _key: &str, _bytes: Bytes) -> Result<(), ObjectStoreError> {
+            Err(ObjectStoreError::InvalidKey("injected append failure".to_string()))
+        }
+        async fn append_blob(
+            &self,
+            _key: &str,
+            _bytes: Bytes,
+        ) -> Result<AppendBlobReceipt, ObjectStoreError> {
+            Err(ObjectStoreError::InvalidKey("injected append failure".to_string()))
+        }
+        async fn get(&self, key: &str) -> Result<Bytes, ObjectStoreError> {
+            Err(ObjectStoreError::NotFound(key.to_string()))
+        }
+        async fn list(&self, _prefix: &str) -> Result<Vec<String>, ObjectStoreError> {
+            Ok(Vec::new())
+        }
+        async fn delete(&self, _key: &str) -> Result<(), ObjectStoreError> {
+            Ok(())
+        }
+        fn uri(&self, key: &str) -> String {
+            key.to_string()
+        }
+    }
+
+    /// (a) Concurrent sync writers coalesce onto FAR fewer durable appends than writes, while every
+    /// write is Ok with a distinct byte range, and (b) every acked write is recoverable after a
+    /// simulated restart (fresh replicator replays the shared WAL) — proving durability.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn group_commit_coalesces_concurrent_sync_writers_and_stays_durable() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(CountingObjectStore::new(FileObjectStore::new(
+            dir.path().join("objects"),
+        )));
+        let replicator = SharedStoreReplicator::new(TEST_CLUSTER_ID, store.clone())
+            .with_wal_append_mode(SharedStoreWalAppendMode::ProtobufAppendBlob);
+        // A small commit_delay widens the batch deterministically so the spawned writers land in the
+        // same group; the coalescing itself does not depend on it (delay 0 still batches whatever
+        // accrues during one append's in-flight window).
+        let writer = Arc::new(
+            replicator
+                .storage_writer(SharedStoreStorageMode::Sync, 1)
+                .with_group_commit(true, Duration::from_millis(5)),
+        );
+
+        const WRITERS: usize = 16;
+        let mut handles = Vec::new();
+        for i in 0..WRITERS {
+            let writer = Arc::clone(&writer);
+            handles.push(tokio::spawn(async move {
+                writer
+                    .write(
+                        1,
+                        Command::StringSet {
+                            key: format!("k{i}"),
+                            value: format!("v{i}").into_bytes(),
+                        },
+                    )
+                    .await
+            }));
+        }
+        let mut reports = Vec::new();
+        for handle in handles {
+            reports.push(handle.await.unwrap().expect("every group-commit write must ack Ok"));
+        }
+
+        // Every write acked durable with a distinct, non-overlapping byte range.
+        let mut ranges: Vec<(u64, u64)> = reports
+            .iter()
+            .map(|report| {
+                (
+                    report.wal_blob_start_offset.expect("start offset"),
+                    report.wal_blob_end_offset.expect("end offset"),
+                )
+            })
+            .collect();
+        ranges.sort();
+        for pair in ranges.windows(2) {
+            assert!(
+                pair[0].1 <= pair[1].0,
+                "WAL byte ranges must not overlap: {:?} vs {:?}",
+                pair[0],
+                pair[1]
+            );
+        }
+
+        // THE proof: far fewer durable appends than writes (each round is 2 appends: WAL + offset).
+        let appends = store.append_blob_count();
+        eprintln!(
+            "group-commit: {WRITERS} concurrent sync writes coalesced onto {appends} object-store appends (WAL+offset per round)"
+        );
+        assert!(
+            appends < WRITERS,
+            "expected group commit to coalesce {WRITERS} writes onto fewer appends, saw {appends}"
+        );
+
+        // Durability: a fresh replicator (simulated restart) recovers EVERY acked write.
+        let restarted = SharedStoreReplicator::new(TEST_CLUSTER_ID, store.clone())
+            .with_wal_append_mode(SharedStoreWalAppendMode::ProtobufAppendBlob);
+        assert_eq!(
+            restarted.latest_persisted_wal_index(1).await.unwrap(),
+            WRITERS as u64
+        );
+        let follower = test_engine(dir.path(), "follower");
+        follower.load_shard(1);
+        let report = restarted.replay_wal(1, 0, &follower).await.unwrap();
+        assert_eq!(report.applied, WRITERS);
+        for i in 0..WRITERS {
+            assert_eq!(
+                follower
+                    .execute(ExecuteRequest {
+                        shard_id: 1,
+                        command: Command::StringGet { key: format!("k{i}") },
+                    })
+                    .response,
+                CommandResponse::Bytes {
+                    value: Some(format!("v{i}").into_bytes())
+                },
+                "acked write k{i} must be durable after restart"
+            );
+        }
+    }
+
+    /// (c) Fsync/append-failure path: when the covering append fails, EVERY covered writer gets an
+    /// Err — none is falsely acked — and nothing is persisted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn group_commit_append_failure_fails_all_covered_writers() {
+        let store = Arc::new(FailingAppendStore);
+        let replicator = SharedStoreReplicator::new(TEST_CLUSTER_ID, store)
+            .with_wal_append_mode(SharedStoreWalAppendMode::ProtobufAppendBlob);
+        let writer = Arc::new(
+            replicator
+                .storage_writer(SharedStoreStorageMode::Sync, 1)
+                // Widen so the writers share one (failing) barrier — proving the fan-out of the error.
+                .with_group_commit(true, Duration::from_millis(5)),
+        );
+
+        const WRITERS: usize = 8;
+        let mut handles = Vec::new();
+        for i in 0..WRITERS {
+            let writer = Arc::clone(&writer);
+            handles.push(tokio::spawn(async move {
+                writer
+                    .write(
+                        1,
+                        Command::StringSet {
+                            key: format!("k{i}"),
+                            value: b"v".to_vec(),
+                        },
+                    )
+                    .await
+            }));
+        }
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(
+                result.is_err(),
+                "a write whose covering append failed must NOT be acked Ok"
+            );
+        }
+    }
+
+    /// (d) A lone sync writer under group commit is correct and does not stall waiting for a batch:
+    /// it drains a one-entry group immediately (2 appends: WAL + offset) and is recoverable.
+    #[tokio::test]
+    async fn group_commit_single_writer_is_correct_and_immediate() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(CountingObjectStore::new(FileObjectStore::new(
+            dir.path().join("objects"),
+        )));
+        let replicator = SharedStoreReplicator::new(TEST_CLUSTER_ID, store.clone())
+            .with_wal_append_mode(SharedStoreWalAppendMode::ProtobufAppendBlob);
+        // Pure timer-less (delay 0): a lone writer must not wait on anything.
+        let writer = replicator
+            .storage_writer(SharedStoreStorageMode::Sync, 1)
+            .with_group_commit(true, Duration::ZERO);
+
+        let report = writer
+            .write(
+                1,
+                Command::StringSet {
+                    key: "solo".to_string(),
+                    value: b"value".to_vec(),
+                },
+            )
+            .await
+            .expect("lone group-commit write must ack Ok");
+        assert_eq!(report.wal_index, 1);
+        assert!(report.published);
+        assert_eq!(report.wal_blob_start_offset, Some(0));
+        // Exactly one group → one WAL append + one offset-index append.
+        assert_eq!(store.append_blob_count(), 2);
+
+        let restarted = SharedStoreReplicator::new(TEST_CLUSTER_ID, store)
+            .with_wal_append_mode(SharedStoreWalAppendMode::ProtobufAppendBlob);
+        let follower = test_engine(dir.path(), "follower");
+        follower.load_shard(1);
+        restarted.replay_wal(1, 0, &follower).await.unwrap();
+        assert_eq!(
+            follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet { key: "solo".to_string() },
+                })
+                .response,
+            CommandResponse::Bytes { value: Some(b"value".to_vec()) }
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // Object-key composition.
+    //
+    // MEASURED, not assumed. Running the whole lib gate with one key composer changed at a
+    // time: renaming the object in `index_key`, and narrowing the zero padding from 20 to 18
+    // in `block_slab_key` and in the checkpoint upload, each left all 1960 tests passing. The
+    // same padding change to `wal_key`, a swap of the two WAL blob names, and a rename of the
+    // `shared/` path segment were each caught immediately -- because the WAL family already
+    // had literal keys asserted in this module and the block-slab and index families did not.
+    // These close that difference.
+    //
+    // The hole was not visible by inspection, because a publish-then-restore round trip
+    // CANNOT see a key-format change: it moves the writer and the reader together, so the
+    // objects are simply written and read under the new name and everything agrees. Only a
+    // literal pin catches it, and what it catches is an old build's objects becoming
+    // unreachable to a new one -- a read that returns absence, not an error.
+    //
+    // The block-slab key is spelled in four independent places: `block_slab_key` here, inline
+    // in `publish_checkpoint`, in `parse_block_slab_id` which reads it back, and in
+    // `block_store::paths::slab_path` for the same slab on local disk. None can see another.
+
+    /// Every key this replicator composes, spelled out.
+    #[test]
+    fn every_composed_object_key_is_spelled_exactly_this_way() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_objects, replicator) = test_shared_store(dir.path());
+
+        assert_eq!(replicator.shard_prefix(1), "cluster-a/shards/1/shared/");
+        assert_eq!(
+            replicator.index_key(1),
+            "cluster-a/shards/1/shared/index/shard.index.json"
+        );
+        assert_eq!(
+            replicator.block_slab_prefix(1),
+            "cluster-a/shards/1/shared/block_segments/"
+        );
+        assert_eq!(
+            replicator.block_slab_key(1, 7),
+            "cluster-a/shards/1/shared/block_segments/block_segment_00000000000000000007.seg"
+        );
+        // The checkpoint upload composes the same basename under a different prefix.
+        // Both go through this helper, so a rename cannot reach only one of them --
+        // before they shared it, a padding change in the checkpoint copy survived the
+        // whole gate with `block_slab_key` already pinned.
+        assert_eq!(
+            block_slab_object_name(7),
+            "block_segment_00000000000000000007.seg"
+        );
+        assert_eq!(
+            replicator.wal_key(1, 3),
+            "cluster-a/shards/1/shared/wal/wal_00000000000000000003.json"
+        );
+        // The two WAL blobs sit in one prefix and differ only by name; asserted apart so a
+        // swap between them cannot read as a pass.
+        assert_eq!(
+            replicator.wal_blob_key(1),
+            "cluster-a/shards/1/shared/wal/wal.protobuf.blob"
+        );
+        assert_eq!(
+            replicator.wal_offset_index_blob_key(1),
+            "cluster-a/shards/1/shared/wal/wal.offset_index.protobuf.blob"
+        );
+        assert_eq!(
+            replicator.replay_cursor_key(1),
+            "cluster-a/shards/1/shared/replay_cursor.json"
+        );
+        assert_eq!(
+            replicator.checkpoints_prefix(1),
+            "cluster-a/shards/1/shared/checkpoints/"
+        );
+        assert_eq!(
+            replicator.checkpoint_prefix(1, "ckpt-a"),
+            "cluster-a/shards/1/shared/checkpoints/ckpt-a/"
+        );
+        assert_eq!(
+            replicator.checkpoint_manifest_key(1, "ckpt-a"),
+            "cluster-a/shards/1/shared/checkpoints/ckpt-a/manifest.json"
+        );
+        assert_eq!(
+            replicator.bucket_dump_prefix(1),
+            "cluster-a/shards/1/shared/slot_dumps/"
+        );
+        assert_eq!(
+            replicator.bucket_dump_manifest_key(1, "dump-a"),
+            "cluster-a/shards/1/shared/slot_dumps/dump-a.json"
+        );
+    }
+
+    /// The key `block_slab_key` writes is the key `parse_block_slab_id` reads back.
+    ///
+    /// `restore_index_and_blocks` runs these two against each other: it lists the slab prefix
+    /// and parses an id out of every key it finds. A rename of the prefix or the suffix on ONE
+    /// side alone makes that parse return `None` for every object, and the loop `continue`s
+    /// past all of them -- so the restore reports success having installed nothing at all.
+    /// Nothing raises an error on that path.
+    #[test]
+    fn the_block_slab_key_writer_and_reader_agree() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_objects, replicator) = test_shared_store(dir.path());
+
+        assert_eq!(parse_block_slab_id(&replicator.block_slab_key(1, 0)), Some(0));
+        assert_eq!(parse_block_slab_id(&replicator.block_slab_key(1, 7)), Some(7));
+        assert_eq!(
+            parse_block_slab_id(&replicator.block_slab_key(4, 1234)),
+            Some(1234)
+        );
+        // u64::MAX is exactly 20 digits, so this also pins that the padding is not truncating
+        // the widest id a slab can carry.
+        assert_eq!(
+            parse_block_slab_id(&replicator.block_slab_key(1, u64::MAX)),
+            Some(u64::MAX)
+        );
+
+        // A control: the sibling objects under the same shard must NOT parse as slabs, or the
+        // restore loop would try to install the index as though it were slab bytes.
+        assert_eq!(parse_block_slab_id(&replicator.index_key(1)), None);
+        assert_eq!(parse_block_slab_id(&replicator.replay_cursor_key(1)), None);
+    }
+
+    /// The remote object's basename and the local slab file's name are composed by two
+    /// functions that cannot see each other -- `block_slab_key` here and
+    /// `block_store::paths::slab_path` there. This drives the real block store to get the real
+    /// on-disk name rather than restating the format, so a rename applied to only one side
+    /// fails here instead of at a restore on someone's cluster.
+    #[test]
+    fn the_remote_slab_key_basename_matches_the_local_slab_file_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocks_root = dir.path().join("blocks");
+        let blocks = BlockStore::new(&blocks_root);
+        let address = blocks.append(b"one-record").unwrap();
+
+        let mut on_disk: Vec<String> = std::fs::read_dir(&blocks_root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".seg"))
+            .collect();
+        on_disk.sort();
+        assert_eq!(
+            on_disk.len(),
+            1,
+            "expected exactly one slab file on disk, found {on_disk:?}"
+        );
+
+        let (_objects, replicator) = test_shared_store(dir.path());
+        let remote = replicator.block_slab_key(1, address.block_slab_id());
+        let basename = remote.rsplit('/').next().unwrap();
+        assert_eq!(
+            basename, on_disk[0],
+            "the remote object basename and the local slab file name have drifted apart"
+        );
+    }
+
+    // -----------------------------------------------------------------------------------
+    // The corrupt-slab guard, one half at a time.
+    //
+    // MEASURED: before these existed, deleting EITHER half of the condition in
+    // `SharedPathSlabSource::fetch_slab`, and either half of the identical condition in
+    // `MatrixObjectSlabSource::fetch_slab`, left all 1960 tests passing. Nothing in the crate
+    // exercised the guard that stops a corrupt shared slab being cached and served.
+    //
+    // The condition rejects a slab whose length OR whose digest disagrees with the address the
+    // checkpoint recorded. One test that corrupts the bytes AND changes the length satisfies
+    // both halves at once, so it passes with either half deleted; these two arms each leave
+    // one half false, and the third is the control that the source serves anything at all.
+    //
+    // ONLY `SharedPathSlabSource` IS COVERED HERE. That guard is spelled three times with
+    // byte-identical bodies, once per implementation: this one (a filesystem read),
+    // `MatrixObjectSlabSource` (a networked GET, which needs a server to drive) and
+    // `MatrixObjectLocalSlabSource` (behind the `matrixobject` feature, off by default, so it
+    // is not compiled in this gate at all). Covering one copy leaves the other two free to
+    // keep a defect this one cannot have.
+
+    /// Right length, wrong bytes: only the digest half of the guard can reject this.
+    #[tokio::test]
+    async fn a_shared_slab_with_the_right_length_and_the_wrong_bytes_is_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = Arc::new(FileObjectStore::new(dir.path().join("objects")));
+        let key = "cluster-a/shards/1/shared/block_segments/slab.seg";
+        let stored = b"aaaaaaaaaaaaaaaa".to_vec();
+        let expected = b"bbbbbbbbbbbbbbbb".to_vec();
+        assert_eq!(
+            stored.len(),
+            expected.len(),
+            "the arm is only meaningful while the two lengths agree"
+        );
+        objects.put(key, Bytes::from(stored.clone())).await.unwrap();
+
+        let mut slabs = BTreeMap::new();
+        slabs.insert(
+            0_u64,
+            SharedSlabAddress {
+                key: key.to_string(),
+                byte_size: expected.len() as u64,
+                sha256: sha256_hex(&expected),
+            },
+        );
+        let source = SharedPathSlabSource::new(objects, slabs);
+
+        let err = source
+            .fetch_slab(0)
+            .expect_err("a slab whose digest does not match its address must not be served");
+        assert!(
+            matches!(err, BlockStoreError::ChecksumMismatch { .. }),
+            "expected a checksum mismatch, got {err:?}"
+        );
+    }
+
+    /// Wrong length, and a digest that matches the bytes actually stored: only the length half
+    /// of the guard can reject this.
+    #[tokio::test]
+    async fn a_shared_slab_of_the_wrong_length_is_rejected_even_when_its_digest_is_self_consistent()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = Arc::new(FileObjectStore::new(dir.path().join("objects")));
+        let key = "cluster-a/shards/1/shared/block_segments/slab.seg";
+        let stored = b"short".to_vec();
+        objects.put(key, Bytes::from(stored.clone())).await.unwrap();
+
+        let mut slabs = BTreeMap::new();
+        slabs.insert(
+            0_u64,
+            SharedSlabAddress {
+                key: key.to_string(),
+                // The digest is of the bytes that ARE there, so the digest half is false and
+                // only the length half is left to fire.
+                sha256: sha256_hex(&stored),
+                byte_size: stored.len() as u64 + 1,
+            },
+        );
+        let source = SharedPathSlabSource::new(objects, slabs);
+
+        let err = source
+            .fetch_slab(0)
+            .expect_err("a slab shorter than its address says must not be served");
+        assert!(
+            matches!(err, BlockStoreError::ChecksumMismatch { .. }),
+            "expected a checksum mismatch, got {err:?}"
+        );
+    }
+
+    /// The control for the two arms above: the same source serves a slab that matches its
+    /// address on both counts, and answers absence for one it does not hold. Without this, a
+    /// `fetch_slab` that rejected EVERYTHING would pass both arms.
+    #[tokio::test]
+    async fn a_shared_slab_matching_its_address_is_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let objects = Arc::new(FileObjectStore::new(dir.path().join("objects")));
+        let key = "cluster-a/shards/1/shared/block_segments/slab.seg";
+        let stored = b"the-actual-slab-bytes".to_vec();
+        objects.put(key, Bytes::from(stored.clone())).await.unwrap();
+
+        let mut slabs = BTreeMap::new();
+        slabs.insert(
+            0_u64,
+            SharedSlabAddress {
+                key: key.to_string(),
+                byte_size: stored.len() as u64,
+                sha256: sha256_hex(&stored),
+            },
+        );
+        let source = SharedPathSlabSource::new(objects, slabs);
+
+        assert_eq!(
+            source.fetch_slab(0).expect("a matching slab must be served"),
+            Some(stored)
+        );
+        assert_eq!(
+            source.fetch_slab(9).expect("an unknown slab is absence"),
+            None
+        );
+    }
+
+    /// A RESTORE CARRIES THE RANGE AND SERVES EVERY MEMBER, CHECKED ONE BY ONE.
+    ///
+    /// The restore door. `restore_index_and_blocks` writes an index and then the caller loads the
+    /// shard -- and a load refuses an index with no routing-range stamp, because an index names
+    /// buckets and a bucket is `start + hash(key) % (end - start + 1)`. So the range has to travel
+    /// with the published index, and this drives it end to end.
+    ///
+    /// ELEMENT BY ELEMENT, NOT BY A COUNT. A restore that served the right NUMBER of wrong values,
+    /// or that served a prefix, passes a count and fails this. Each key carries a value derived from
+    /// its own index so a swap is visible.
+    #[tokio::test]
+    async fn a_restore_carries_the_routing_range_and_serves_every_member() {
+        const MEMBERS: usize = 24;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = test_engine(dir.path(), "primary");
+        // ON THE PRODUCTION RANGE, NOT THE CONVENIENCE LOAD. `load_shard` defaults to the whole
+        // keyspace, which is also what an unstamped state answers -- so a restore that ignored the
+        // published range and fell back to a default would satisfy a stamp assertion made against
+        // it. Loading on 0..1023 here makes the published range the only way to get the right
+        // answer.
+        let response = primary.load_shard_with(crate::control::LoadShardRequest {
+            shard_id: 1,
+            table_name: "restore-door".to_string(),
+            shard_uri: "local://restore-door/1".to_string(),
+            start_routing_bucket: 0,
+            end_routing_bucket: crate::DEFAULT_END_ROUTING_BUCKET,
+            readonly: false,
+            load_version: 1,
+            local_node_id: Some(1),
+        });
+        assert!(
+            response.status.ok,
+            "the publisher must load on 0..{}: {:?}",
+            crate::DEFAULT_END_ROUTING_BUCKET,
+            response.status
+        );
+        assert_ne!(
+            crate::DEFAULT_END_ROUTING_BUCKET,
+            u32::MAX,
+            "the production range and the whole keyspace are the same value, so the stamp check \
+             below cannot distinguish a carried range from a defaulted one"
+        );
+        let expected: Vec<(String, Vec<u8>)> = (0..MEMBERS)
+            .map(|i| (format!("member-{i:04}"), format!("value-{i:04}").into_bytes()))
+            .collect();
+        for (key, value) in &expected {
+            primary.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: key.clone(),
+                    value: value.clone(),
+                },
+            });
+        }
+
+        let (store, replicator) = test_shared_store(dir.path());
+        replicator.publish_index(1, &primary).await.unwrap();
+        replicator
+            .publish_block_slabs(1, &primary.block_store())
+            .await
+            .unwrap();
+
+        // The range is published BESIDE the index, so a restoring node can be told what the
+        // buckets it is about to install mean.
+        let published: Vec<String> = store.list("").await.unwrap();
+        assert!(
+            published.iter().any(|key| key.ends_with("index/shard.routing-range.json")),
+            "no routing-range object was published beside the index; the restore below would have \
+             nothing to stamp and the load would be refused. Published: {published:?}"
+        );
+
+        let follower = test_engine(dir.path(), "follower");
+        replicator
+            .restore_index_and_blocks(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+        let response = follower.load_shard_with(crate::control::LoadShardRequest {
+            shard_id: 1,
+            table_name: "restore-door".to_string(),
+            shard_uri: "local://restore-door/1".to_string(),
+            start_routing_bucket: 0,
+            end_routing_bucket: crate::DEFAULT_END_ROUTING_BUCKET,
+            readonly: false,
+            load_version: 1,
+            local_node_id: Some(1),
+        });
+        assert!(
+            response.status.ok,
+            "the restored follower would not load on the range the store was published on: {:?}",
+            response.status
+        );
+
+        // The stamp the restore wrote, and it is the range the SOURCE was on.
+        let stamp = crate::engine::routing_range_stamp::read_routing_range_stamp(
+            &dir.path().join("follower-index"),
+            1,
+        )
+        .expect("the restore recorded the range it received");
+        assert_eq!(
+            (0, crate::DEFAULT_END_ROUTING_BUCKET),
+            (stamp.start_routing_bucket, stamp.end_routing_bucket),
+            "the restore stamped {stamp:?} rather than the range the publisher was serving on"
+        );
+
+        let mut served = 0usize;
+        for (key, value) in &expected {
+            let response = follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet { key: key.clone() },
+                })
+                .response;
+            assert_eq!(
+                CommandResponse::Bytes {
+                    value: Some(value.clone())
+                },
+                response,
+                "the restored follower served {key} as {response:?}, not the value that key was \
+                 written with. A restore that serves the right COUNT of wrong values passes a \
+                 count check and fails this one"
+            );
+            served += 1;
+        }
+        assert_eq!(
+            MEMBERS, served,
+            "checked {served} of {MEMBERS} members; a loop that exited early would leave this \
+             test asserting less than it claims"
+        );
+    }
+
+    /// A SOURCE ON ONE RANGE AND A TARGET ON ANOTHER IS REFUSED, NOT STAMPED AS AGREEING.
+    ///
+    /// THIS IS THE TEST THAT SAYS THE CARRYING CHANGE WAS WORTH MAKING. The cheap way to make a
+    /// restore load again is to stamp the TARGET's own configured range at install time. Every
+    /// restore test then passes -- and a store published on `0..1023` and restored onto a node
+    /// configured for the whole keyspace is recorded as having been built on the whole keyspace,
+    /// which it was not. Its blocks sit in buckets the stamp says nothing lives in, every record
+    /// still reads, and every block is outside every per-bucket sweep. That is the silent
+    /// mis-ranging the refusal exists to remove, moved from the upgrade path to the replication
+    /// path.
+    ///
+    /// Because the install stamps what it RECEIVED, the disagreement surfaces as the ordinary
+    /// stamp-disagrees refusal on the load: the recorded range is the publisher's and the
+    /// configured range is the target's, and those are compared before anything is decoded.
+    #[tokio::test]
+    async fn a_source_on_one_range_and_a_target_on_another_is_refused_not_reconciled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let primary = test_engine(dir.path(), "primary");
+        // The publisher serves the shard on the NARROW range.
+        let response = primary.load_shard_with(crate::control::LoadShardRequest {
+            shard_id: 1,
+            table_name: "cross-range".to_string(),
+            shard_uri: "local://cross-range/1".to_string(),
+            start_routing_bucket: 0,
+            end_routing_bucket: crate::DEFAULT_END_ROUTING_BUCKET,
+            readonly: false,
+            load_version: 1,
+            local_node_id: Some(1),
+        });
+        assert!(response.status.ok, "the publisher must load: {:?}", response.status);
+        for i in 0..8 {
+            primary.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("k{i}"),
+                    value: b"v".to_vec(),
+                },
+            });
+        }
+
+        let (_store, replicator) = test_shared_store(dir.path());
+        replicator.publish_index(1, &primary).await.unwrap();
+        replicator
+            .publish_block_slabs(1, &primary.block_store())
+            .await
+            .unwrap();
+
+        let follower = test_engine(dir.path(), "follower");
+        replicator
+            .restore_index_and_blocks(1, &follower, &follower.block_store())
+            .await
+            .unwrap();
+
+        // The stamp records the PUBLISHER's range, not the range the target is about to ask for.
+        let stamp = crate::engine::routing_range_stamp::read_routing_range_stamp(
+            &dir.path().join("follower-index"),
+            1,
+        )
+        .expect("the restore recorded a range");
+        assert_eq!(
+            (0, crate::DEFAULT_END_ROUTING_BUCKET),
+            (stamp.start_routing_bucket, stamp.end_routing_bucket),
+            "the restore stamped {stamp:?}; if it had stamped the TARGET's range instead, the \
+             refusal below could not happen and a mis-ranged restore would load silently"
+        );
+
+        // The target is configured for the WHOLE KEYSPACE, which is not what the store was built on.
+        let response = follower.load_shard_with(crate::control::LoadShardRequest {
+            shard_id: 1,
+            table_name: "cross-range".to_string(),
+            shard_uri: "local://cross-range/1".to_string(),
+            start_routing_bucket: 0,
+            end_routing_bucket: u32::MAX,
+            readonly: false,
+            load_version: 1,
+            local_node_id: Some(1),
+        });
+        println!(
+            "  published on 0..{}, restored onto a node configured for 0..{}: ok={} code={}",
+            crate::DEFAULT_END_ROUTING_BUCKET,
+            u32::MAX,
+            response.status.ok,
+            response.status.code
+        );
+        assert!(
+            !response.status.ok,
+            "a store published on 0..{} loaded on a node configured for the whole keyspace. Its \
+             blocks are filed where the narrow range put them, so every later write would go to a \
+             bucket they are not in -- readable, and outside every per-bucket sweep",
+            crate::DEFAULT_END_ROUTING_BUCKET
+        );
+        assert_eq!(
+            "routing_range_mismatch", response.status.code,
+            "refused with `{}` rather than `routing_range_mismatch`. The point of carrying the \
+             range is that a cross-range restore becomes the ORDINARY stamp disagreement, caught \
+             before the decode",
+            response.status.code
+        );
+
+        // AND THE CONTROL: the same restored store loads on the range it was published on.
+        let response = follower.load_shard_with(crate::control::LoadShardRequest {
+            shard_id: 1,
+            table_name: "cross-range".to_string(),
+            shard_uri: "local://cross-range/1".to_string(),
+            start_routing_bucket: 0,
+            end_routing_bucket: crate::DEFAULT_END_ROUTING_BUCKET,
+            readonly: false,
+            load_version: 1,
+            local_node_id: Some(1),
+        });
+        assert!(
+            response.status.ok,
+            "the restored store could not be loaded on the range it was PUBLISHED on: {:?}. A \
+             refusal that leaves no way to serve a correctly-restored store is worse than the \
+             silence it replaces",
+            response.status
+        );
+        for i in 0..8 {
+            let got = follower
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: format!("k{i}"),
+                    },
+                })
+                .response;
+            assert_eq!(
+                CommandResponse::Bytes {
+                    value: Some(b"v".to_vec())
+                },
+                got,
+                "k{i} did not come back after a correct restore: {got:?}"
+            );
+        }
+    }
+}
