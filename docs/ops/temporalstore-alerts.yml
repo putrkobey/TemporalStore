@@ -85,3 +85,266 @@ groups:
         labels:
           severity: warning
         annotations:
+          summary: TemporalStore metaserver scheduler backlog is high
+          description: "Scheduler backlog is {{ $value }}. Check autoscale/rebalance tasks, cooldowns, safe mode, and data-node lifecycle tokens."
+
+      - alert: TemporalStoreSchedulerRetriesHigh
+        expr: increase(temporalstore_meta_scheduler_executions_total{result=~"retry_later|failed"}[10m]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore metaserver scheduler retries are high
+          description: "Scheduler retries or failures are increasing. Inspect membership workflow tokens, stale heartbeats, cooldowns, and safe-mode state."
+
+      - alert: TemporalStoreProxyRouteQuarantineHigh
+        expr: temporalstore_proxy_backend_events_total{kind="continuous_backend_failure"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore proxy has quarantined or repeatedly failing backends
+          description: "Proxy continuous backend failures are non-zero. Inspect topology-version invalidation, route refresh, and backend recovery probing."
+
+      - alert: TemporalStoreProxyNotServing
+        expr: temporalstore_proxy_serving_mode{mode=~"degraded|not_serving"} > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore proxy is degraded or not serving
+          description: "Proxy serving policy is {{ $labels.mode }}. Inspect metaserver desired config version, admission policy, and backend health."
+
+      - alert: TemporalStoreDataNodeRuntimeQueueHigh
+        expr: temporalstore_data_node_runtime_queue_depth > 1000 or temporalstore_data_node_runtime_background_queue_depth > 1000
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore data-node runtime queue is high
+          description: "Data-node foreground or background queue depth is high. Inspect lifecycle load/reload/unload work, storage pressure, and Raft apply lag."
+
+      - alert: TemporalStoreLifecycleSnapshotFailures
+        expr: increase(temporalstore_data_node_lifecycle_snapshot_events_total{kind=~"save_failed|restore_failed|stale_or_incompatible"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore lifecycle snapshot persistence failure
+          description: "Lifecycle snapshot persistence or restore failed. Inspect the data-node lifecycle snapshot path before allowing restart or scale actions."
+
+      - alert: TemporalStoreBlockStoreReadErrors
+        expr: increase(temporalstore_block_store_operations_total{kind=~"read_error|checksum_error|corrupt"}[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: TemporalStore block-store read or corruption errors
+          description: "Block-store errors are visible in Prometheus. Run storage recovery/fault matrix validation and check shard/page/slot recovery reports."
+
+      - alert: TemporalStoreCacheMissPressure
+        expr: increase(temporalstore_cache_operations_total{kind="miss"}[5m]) > 10000
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore cache miss pressure is high
+          description: "Cache miss pressure is high. Inspect cache admission/eviction settings, tiny-cache pressure tests, and block-store refill latency."
+
+
+      - alert: TemporalStoreIngestionDeadLetters
+        expr: temporalstore_ingestion_dead_letters > 0 or temporalstore_ingestion_records_total{outcome="dead_letter"} > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore ingestion dead letters detected
+          description: "Dead-letter count is {{ $value }}. Inspect Kafka/Flink checkpoint state, replay idempotence, and dead-letter export."
+
+  - name: matrixark-backend-slo
+    rules:
+      - alert: MatrixArkBackendNotReady
+        expr: matrixark_backend_ready == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: MatrixArk backend is not ready
+          description: "MatrixArk backend {{ $labels.backend }} in {{ $labels.storage_mode }} reports readiness {{ $value }}. Check topology, gateway health, and storage mode."
+
+      - alert: MatrixArkBackendErrorsHigh
+        expr: increase(matrixark_backend_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: MatrixArk backend errors are increasing
+          description: "MatrixArk backend {{ $labels.backend }} has increasing command errors. Inspect conformance gateway logs and backend parity reports."
+  - name: temporalstore-cluster-control-plane
+    rules:
+      - alert: TemporalStoreLocationSafeMode
+        expr: temporalstore_meta_location_safe_mode == 1
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: TemporalStore location held in safe mode
+          description: "Location {{ $labels.location }} (tier {{ $labels.tier }}) is in safe mode, so the control plane will not act on it: no conviction, no re-placement. Inspect damage severity and abnormal resources for that location before clearing it."
+
+      - alert: TemporalStoreMetadataChangeMuted
+        expr: temporalstore_meta_change_muted == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore metadata change is muted
+          description: "Metadata change is muted, so topology edits are not flowing. Servers will keep serving the topology they last applied; check temporalstore_meta_server_applied_topology against temporalstore_meta_topology_version to see how far behind they are."
+
+      - alert: TemporalStoreClusterDamageCritical
+        expr: temporalstore_meta_damage_severity >= 2
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: TemporalStore reports critical damage for a location
+          description: "Location {{ $labels.location }} (tier {{ $labels.tier }}) reports damage severity {{ $value }}; the metric declares 2 as critical. Check abnormal resources and shard divergence for that location."
+
+      - alert: TemporalStoreClusterDamageWarning
+        expr: temporalstore_meta_damage_severity == 1
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore reports degraded damage severity for a location
+          description: "Location {{ $labels.location }} (tier {{ $labels.tier }}) has been at damage severity 1 -- the declared warning level -- for fifteen minutes. It is normal transiently and a problem when it persists."
+
+      - alert: TemporalStorePlacementShort
+        expr: temporalstore_meta_placement_short > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore cannot place every shard replica
+          description: "{{ $value }} shards could not be filled by the last topology answer, so they are serving with fewer replicas than their table asks for. Check server inventory and resource state before this becomes a durability problem."
+
+      - alert: TemporalStoreRetentionBlocked
+        expr: temporalstore_meta_retention_blocked > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore retention cannot forget dropped servers
+          description: "{{ $value }} dropped servers cannot be forgotten because they still own a shard, so retention will not advance. Long-lived here means reclaim is stuck behind an unmoved shard, not that a purge is in flight."
+
+      - alert: TemporalStoreAbnormalResources
+        expr: temporalstore_meta_abnormal_resources > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore has resources that are not serving
+          description: "{{ $value }} resources in location {{ $labels.location }} (tier {{ $labels.tier }}) are not serving. Cross-check conviction counters: a resource can be abnormal without having been convicted yet."
+
+      - alert: TemporalStoreTopologyLag
+        expr: (max(temporalstore_meta_topology_version) - min(temporalstore_meta_server_applied_topology)) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore servers are behind the current topology
+          description: "The slowest server is {{ $value }} topology versions behind the metaserver, so it is routing from a stale view of the cluster. The engine documents this exact comparison on temporalstore_meta_server_applied_topology. Check the rejected and timed_out labels on that metric."
+
+      - alert: TemporalStoreConvictionsRising
+        expr: increase(temporalstore_meta_convicted_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore failure detector is convicting resources
+          description: "{{ $value }} resources were frozen by the failure detector in the last fifteen minutes (tier {{ $labels.tier }}). Compare with temporalstore_meta_conviction_held_total: convictions held by a guard indicate the detector wanted to act and was stopped."
+
+      - alert: TemporalStoreShardDivergence
+        expr: temporalstore_meta_shard_divergence > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore shards are routed to a server not serving them
+          description: "Divergence state {{ $labels.state }} has been non-zero for ten minutes. Reads for those shards reach a server that does not hold them."
+
+      - alert: TemporalStoreMutationApplyFailures
+        expr: increase(temporalstore_meta_mutation_apply_failed_total[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore control-plane mutations are not applying
+          description: "{{ $value }} recorded mutations would not apply in the last fifteen minutes. The control plane believes it made a change that did not take effect."
+  - name: temporalstore-storage-maintenance
+    rules:
+      - alert: TemporalStoreMaintenanceNeverRan
+        expr: absent(temporalstore_storage_manager_phase_applied)
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore storage maintenance has not run on this node
+          description: "No storage-manager phase has reported, so reclaim, index GC, expiry, eviction and compaction have not run. These metrics describe the LAST cycle, so their absence means there has not been one. The cycle is reachable at POST /server/storage/manager/cycle and nothing in the node schedules it, so on a long-lived deployment the store grows unattended."
+
+      - alert: TemporalStoreMaintenancePhaseErrors
+        expr: temporalstore_storage_manager_phase_errors > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore storage maintenance phase is failing
+          description: "Phase {{ $labels.phase }} on shard {{ $labels.shard_id }} reported {{ $value }} errors in its last cycle. A phase that fails leaves its work undone while the cycle reports as having run."
+
+      - alert: TemporalStoreMaintenancePhaseDisabled
+        expr: temporalstore_storage_manager_phase_enabled == 0
+        for: 6h
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore storage maintenance phase is switched off
+          description: "Phase {{ $labels.phase }} on shard {{ $labels.shard_id }} is disabled. That is a supported choice and it is worth seeing: the work that phase does is not happening, and nothing else does it."
+  - name: temporalstore-raft-runtime-faults
+    rules:
+      - alert: TemporalStoreRaftMinorityPartitionRejections
+        expr: increase(temporalstore_raft_matrixraft_minority_partition_write_rejections[10m]) > 0
+        labels:
+          severity: critical
+        annotations:
+          summary: TemporalStore raft is rejecting writes from a minority partition
+          description: "{{ $value }} writes were rejected in the last ten minutes because this node is in a minority partition. The rejection is correct -- accepting them would risk divergence -- and it means part of the cluster cannot serve writes. Check majority and peer liveness."
+
+      - alert: TemporalStoreRaftSnapshotSendFailing
+        expr: increase(temporalstore_raft_matrixraft_peer_snapshot_send_failed[30m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore raft snapshot sends are failing
+          description: "{{ $value }} snapshot sends failed in the last thirty minutes. A follower that cannot receive a snapshot cannot catch up, and a follower that never catches up eventually pins log reclaim."
+
+      - alert: TemporalStoreRaftPeerOffline
+        expr: temporalstore_raft_matrixraft_peer_offline_timeout_reached == 1
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: TemporalStore raft peer has crossed its offline timeout
+          description: "A peer has been past its configured offline timeout for ten minutes. Unlike the stale-read gauges next to it on the dashboard, this one reading 1 is a fault rather than a protection being enforced."
+
+      - alert: TemporalStoreRaftLeaderTransferTimeouts
+        expr: increase(temporalstore_raft_matrixraft_peer_transfer_leader_timeouts[30m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore raft leader transfer is timing out
+          description: "{{ $value }} leader transfers timed out in the last thirty minutes. A transfer that cannot complete leaves leadership where it is, so a planned drain or upgrade will not move off this node."
+
+      - alert: TemporalStoreRaftLaggingFollowerReads
+        expr: increase(temporalstore_raft_matrixraft_lagging_follower_read_rejections[15m]) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: TemporalStore raft is rejecting reads from a lagging follower
+          description: "{{ $value }} follower reads were rejected for lag in the last fifteen minutes. Reads are being served correctly by refusing stale data; the follower behind them is not keeping up."
