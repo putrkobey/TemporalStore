@@ -851,3 +851,857 @@ fn the_entry_counter_recovers_a_planted_walk_exactly() {
     const PLANTED: usize = 37;
     let (_, blocks) = sorted_list(PLANTED);
     assert_eq!(PLANTED, blocks.len(), "the fixture built the wrong list");
+    let touched = counted(|| {
+        let _ = std::hint::black_box(scan_block(&blocks, &u64::MAX));
+    });
+    assert_eq!(
+        PLANTED as u64, touched,
+        "a walk of {PLANTED} entries for a handle past all of them charged {touched} entries"
+    );
+    // And the counter must move at all under the shipped door, or the production path is not the
+    // path being counted.
+    let through_the_door = counted(|| {
+        let _ = std::hint::black_box(find_block(&blocks, &u64::MAX));
+    });
+    assert!(
+        through_the_door > 0,
+        "the shipped lookup charged nothing; it is not the function being measured"
+    );
+}
+
+// =============================================================================================
+// 5. WHAT THE CONTAINER COSTS, ON ONE INSTRUMENT, BOTH SIDES
+// =============================================================================================
+
+/// THE PLANTED MARKER. Recovered exactly, or every byte figure below is noise.
+///
+/// The failure this guards against is the one that reads as good news: an instrument reporting
+/// near zero makes a shape look free.
+///
+/// rust-internal: measures the harness's own instrument, no product behaviour
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "the counting allocator is process-wide; run by name"]
+fn the_span_instrument_used_here_recovers_a_planted_megabyte_exactly() {
+    const PLANTED: usize = 1 << 20;
+    let (bytes, allocs) = span_counts(|| {
+        let marker: Vec<u8> = Vec::with_capacity(PLANTED);
+        std::hint::black_box(&marker);
+    });
+    println!("planted {PLANTED} B, instrument charged {bytes} B in {allocs} call(s)");
+    assert_eq!(PLANTED as u64, bytes, "the span instrument charged {bytes} B for {PLANTED} B");
+    assert_eq!(1, allocs, "one planted vector charged {allocs} allocations, not one");
+
+    // AND IT MUST SEE A GROWTH STEP, not only a single up-front request -- the list side of every
+    // comparison below grows in steps, and an instrument blind to `realloc` would report it free.
+    let (grow_bytes, grow_allocs) = span_counts(|| {
+        let mut marker: Vec<u8> = Vec::with_capacity(16);
+        marker.resize(16, 0u8);
+        marker.reserve_exact(PLANTED - 16);
+        std::hint::black_box(&marker);
+    });
+    println!("planted a {PLANTED} B growth, instrument charged {grow_bytes} B in {grow_allocs} call(s)");
+    assert!(
+        grow_bytes >= (PLANTED - 16) as u64,
+        "a growth to {PLANTED} B charged only {grow_bytes} B; the instrument is blind to \
+         reallocation and every stepped list below would read as free"
+    );
+}
+
+/// What a span of work charged the allocator, in bytes and in CALLS.
+///
+/// A SPAN AND NOT A CLONE, for the side that has capacity slack. `Vec::clone` takes exactly
+/// `len` capacity, so a clone of a live list reports the bytes it WOULD cost if it had been
+/// built to size -- which is precisely the slack this measurement is about. Charging the build
+/// instead counts the capacity actually taken, growth steps included, and charges the tree's
+/// nodes the same way.
+#[cfg(feature = "alloc-probe")]
+fn span_counts(body: impl FnOnce()) -> (u64, u64) {
+    let probe = Probe::start();
+    body();
+    let counts = probe.stop();
+    (counts.alloc_bytes, counts.allocs)
+}
+
+/// The same span with BOTH byte columns: what was asked for, what was served, and the call count.
+///
+/// `ALLOC_BYTES` charges `layout.size()`; `ALLOC_CHUNK_BYTES` reads `malloc_usable_size`, which is
+/// where a NEW allocation's true cost appears -- an out-of-line 112-byte payload is served a
+/// 128-byte chunk. Any comparison that trades an inline payload for a fresh allocation has to read
+/// the served column or it under-charges the side that allocates, systematically and in the
+/// direction that flatters it.
+#[cfg(feature = "alloc-probe")]
+fn span_counts_both(body: impl FnOnce()) -> (u64, u64, u64) {
+    let probe = Probe::start();
+    body();
+    let counts = probe.stop();
+    (counts.alloc_bytes, counts.chunk_bytes, counts.allocs)
+}
+
+/// WHAT THE PAGE INDEX OF A REAL STORE COSTS AS A LIST AGAINST WHAT IT COST AS A TREE.
+///
+/// BYTES AND ALLOCATIONS PER RECORD, AT TWO CORPUS SIZES, ON ONE INSTRUMENT. Both sides are built
+/// here, in one process, from the SAME pages the engine filed, at the real length distribution --
+/// so this is a before/after rather than a measurement set against an arithmetic. A published
+/// decline in this area had its sign inverted by comparing a `size_of` saving against an
+/// allocator cost; no `size_of` appears in this comparison.
+///
+/// AT THE CONFIGURED RANGE. On the default whole keyspace every bucket holds its page inline and
+/// there is no container to compare, which is the trap #1959 fell into; the range measured here
+/// is the one `docs/runtime_tuning.md` tells an operator to set, and the fixture asserts it
+/// reached the `Many` arm before reporting anything.
+///
+/// UNACCOUNTED INSERTS on the list side: `insert` also charges a per-slab live tally, which
+/// allocates and has no counterpart on the tree side. `insert_released` is the same mechanism
+/// with the accounting off, so both sides charge the container and nothing else.
+///
+/// rust-internal: measures container footprint, no product behaviour
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "seeds two stores of up to 40,000 records; run by name"]
+fn the_block_index_of_a_real_store_costs_less_as_a_list_than_as_a_tree() {
+    let mut path_lengths: Vec<usize> = Vec::new();
+    println!(
+        "  {:>8} {:>8} {:>9} {:>12} {:>12} {:>12} {:>12} {:>9}",
+        "records", "buckets", "blocks", "tree B/rec", "tree alc/rec", "list B/rec", "list alc/rec",
+        "B ratio"
+    );
+    let mut ratios: Vec<(usize, f64, f64)> = Vec::new();
+    for records in [SMALL, LARGE] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        path_lengths.push(dir.path().as_os_str().len());
+        let engine = engine_on(dir.path());
+        load_on(&engine, NARROW_END);
+        let keys = seed_routed(&engine, records);
+
+        // The pages, bucket by bucket, exactly as the engine filed them -- EACH WITH THE KEY
+        // THE BUCKET'S OWN LOOKUP NAMES IT BY. The entry carries no identity of its own, so the
+        // pair is taken from `block_identities_in`, which is the same per-bucket projection every
+        // production sweep uses. Built OUTSIDE the counted spans below, so the two container
+        // measurements are over the identical values they were before.
+        let by_bucket: Vec<Vec<(std::sync::Arc<str>, BlockIndex)>> = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            let keys = crate::engine::state::BlockKeysByPosition::from_lookup(
+                &shard.bucket_index.object_block_lookup,
+            );
+            shard
+                .bucket_index
+                .bucket_map
+                .values()
+                .map(|bucket| {
+                    let named = crate::engine::state::block_identities_in(bucket, &keys);
+                    bucket
+                        .block_index
+                        .iter()
+                        .map(|(handle, block)| {
+                            let key = named.get(handle).unwrap_or_else(|| {
+                                panic!(
+                                    "the page at handle {handle} is named by nothing beside it,                                      so this fixture cannot hand it on"
+                                )
+                            });
+                            (std::sync::Arc::clone(key), block.clone())
+                        })
+                        .collect()
+                })
+                .filter(|blocks: &Vec<(std::sync::Arc<str>, BlockIndex)>| !blocks.is_empty())
+                .collect()
+        };
+        let blocks: usize = by_bucket.iter().map(|b| b.len()).sum();
+        assert_eq!(
+            blocks,
+            keys.len(),
+            "{records}: the index holds {blocks} pages for {} written keys, so the per-record \
+             divisor below is not the fixture's",
+            keys.len()
+        );
+        let multi = by_bucket.iter().filter(|b| b.len() > 1).count();
+        assert!(
+            multi > 0,
+            "{records}: no bucket held more than one page, so there is no container to compare"
+        );
+
+        let mut trees: Vec<BTreeMap<u64, BlockIndex>> = Vec::with_capacity(by_bucket.len());
+        let (tree_bytes, tree_allocs) = span_counts(|| {
+            for bucket in &by_bucket {
+                let mut tree: BTreeMap<u64, BlockIndex> = BTreeMap::new();
+                for (object_key, block) in bucket {
+                    tree.insert(block_index_handle(object_key, block), block.clone());
+                }
+                trees.push(tree);
+            }
+        });
+
+        let mut lists: Vec<BlockIndexMap> = Vec::with_capacity(by_bucket.len());
+        let (list_bytes, list_allocs) = span_counts(|| {
+            for bucket in &by_bucket {
+                let mut list = BlockIndexMap::default();
+                for (object_key, block) in bucket {
+                    list.insert_released(object_key, block.clone());
+                }
+                lists.push(list);
+            }
+        });
+
+        assert_eq!(
+            trees.iter().map(|t| t.len()).sum::<usize>(),
+            lists.iter().map(|l| l.len()).sum::<usize>(),
+            "{records}: the two containers hold different numbers of pages"
+        );
+        assert!(
+            tree_bytes > 0 && tree_allocs > 0 && list_bytes > 0 && list_allocs > 0,
+            "{records}: the instrument charged tree {tree_bytes} B / {tree_allocs} calls and list \
+             {list_bytes} B / {list_allocs} calls; a zero reading is the instrument failing, not \
+             a container being free"
+        );
+
+        let ratio = list_bytes as f64 / tree_bytes as f64;
+        let alloc_ratio = list_allocs as f64 / tree_allocs as f64;
+        println!(
+            "  {records:>8} {:>8} {blocks:>9} {:>12.2} {:>12.4} {:>12.2} {:>12.4} {ratio:>9.3}",
+            by_bucket.len(),
+            tree_bytes as f64 / blocks as f64,
+            tree_allocs as f64 / blocks as f64,
+            list_bytes as f64 / blocks as f64,
+            list_allocs as f64 / blocks as f64
+        );
+        ratios.push((records, ratio, alloc_ratio));
+        std::hint::black_box(&trees);
+        std::hint::black_box(&lists);
+    }
+
+    let first = path_lengths[0];
+    assert!(
+        path_lengths.iter().all(|length| *length == first),
+        "the store path length moved across arms ({path_lengths:?}); allocation bytes move at \
+         about six bytes a character and the byte column would carry it"
+    );
+    println!("  store path length held at {first} characters across both arms");
+
+    for (records, ratio, alloc_ratio) in &ratios {
+        println!(
+            "  {records} records: the list charges {:.1}% of the tree's bytes and {:.2}x its \
+             allocation calls",
+            100.0 * ratio,
+            alloc_ratio
+        );
+    }
+    // THE SIGN, not a ratio target. If the list ever charges more bytes than the tree at a real
+    // corpus size, the container change does not pay and must be declined with these numbers.
+    for (records, ratio, _) in &ratios {
+        assert!(
+            *ratio < 1.0,
+            "at {records} records the list charged {ratio:.3}x the tree's bytes for the same \
+             pages; the container change does not pay"
+        );
+    }
+}
+
+/// WHAT THE GROWTH STEP IS WORTH, against `Vec`'s own doubling.
+///
+/// `Vec` doubles, which at a list of 39 leaves a capacity of 64 -- a quarter of the bytes unused,
+/// which is the same slack the tree node left. Stepping by eight caps the waste at seven entries.
+/// Both are measured on the same instrument; the shipped policy is asserted to leave less.
+///
+/// rust-internal: measures container footprint, no product behaviour
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "the counting allocator is process-wide; run by name"]
+fn the_block_list_growth_step_is_what_keeps_the_slack_off_the_measurement() {
+    println!(
+        "  {:>7} {:>14} {:>12} {:>14} {:>12} {:>9}",
+        "length", "doubling B", "doubling alc", "stepped B", "stepped alc", "B saved"
+    );
+    let mut rows = 0usize;
+    let mut worst = 0.0f64;
+    for length in [3usize, 8, 12, 20, 33, 39, 50, 65] {
+        let (object_key, blocks) = sorted_list(length);
+
+        // What `Vec`'s own growth leaves: push one at a time, no reserve.
+        let mut doubling: Vec<(u64, BlockIndex)> = Vec::new();
+        let (doubling_bytes, doubling_allocs) = span_counts(|| {
+            for entry in &blocks {
+                doubling.push(entry.clone());
+            }
+        });
+
+        let mut stepped = BlockIndexMap::default();
+        let (stepped_bytes, stepped_allocs) = span_counts(|| {
+            for (_, block) in &blocks {
+                stepped.insert_released(&object_key, block.clone());
+            }
+        });
+
+        let saved = 100.0 * (doubling_bytes as f64 - stepped_bytes as f64) / doubling_bytes as f64;
+        worst = if rows == 0 { saved } else { worst.min(saved) };
+        // THE PRICE OF THE STEP, BANDED. Stepping trades reallocation calls for capacity slack,
+        // and a step small enough reallocates on every insert -- which is the failure this band
+        // must EXCLUDE, not merely be near. `Vec`'s doubling is the cheapest any policy can be in
+        // calls, so the band is stated as a multiple of it.
+        assert!(
+            stepped_allocs <= doubling_allocs.saturating_mul(3),
+            "at {length} entries the step policy charged {stepped_allocs} allocation calls \
+             against doubling's {doubling_allocs}, more than three times; a step that \
+             reallocates on nearly every insert is not a growth policy"
+        );
+        println!(
+            "  {length:>7} {doubling_bytes:>14} {doubling_allocs:>12} {stepped_bytes:>14} \
+             {stepped_allocs:>12} {saved:>8.1}%"
+        );
+        std::hint::black_box(&doubling);
+        std::hint::black_box(&stepped);
+        rows += 1;
+    }
+    assert!(rows >= 6, "only {rows} lengths measured");
+    println!("  the step policy's worst byte saving against doubling is {worst:.1}%");
+    // NEVER BEHIND. A policy that saves at the long lengths and LOSES at the short ones is a
+    // policy that costs bytes on the corpus most buckets are in: at 4,000 records the measured
+    // p50 is 4 pages and the maximum is 8. The first spill taking two steps instead of one made
+    // a list of three cost twice what `Vec` would have, and this is what said so.
+    assert!(
+        worst >= 0.0,
+        "at its worst measured length the step policy charged {:.1}% MORE than `Vec`'s own \
+         doubling; a growth policy that loses at the short lengths loses on most buckets",
+        -worst
+    );
+
+    // THE SLACK ITSELF, off the live list rather than a clone: `Vec::clone` takes exactly `len`
+    // capacity, so a clone cannot see the thing this policy exists to bound.
+    for length in [3usize, 12, 20, 33, 39, 50, 65] {
+        let (object_key, blocks) = sorted_list(length);
+        let mut list = BlockIndexMap::default();
+        for (_, block) in &blocks {
+            list.insert_released(&object_key, block.clone());
+        }
+        let slack = match &list {
+            BlockIndexMap::Many(entries) => entries.capacity() - entries.len(),
+            other => panic!("a list of {length} took the {other:?} arm"),
+        };
+        // What `Vec`'s doubling would have left at the same length -- the value this band must
+        // EXCLUDE, or it is a band around nothing.
+        let mut doubling: Vec<(u64, BlockIndex)> = Vec::new();
+        for entry in &blocks {
+            doubling.push(entry.clone());
+        }
+        let doubling_slack = doubling.capacity() - doubling.len();
+        println!(
+            "  a live list of {length} carries {slack} unused slot(s); doubling would carry \
+             {doubling_slack}"
+        );
+        assert!(
+            slack < 4,
+            "a live list of {length} carries {slack} unused slots; the step policy is supposed to \
+             cap that below four"
+        );
+        if length >= 33 {
+            assert!(
+                doubling_slack >= 4,
+                "at {length} entries `Vec`'s own doubling would leave {doubling_slack} unused \
+                 slots, which is inside the band this policy is asserted against -- the band does \
+                 not exclude the thing it guards against"
+            );
+        }
+    }
+}
+
+/// The single-page arm holding its entry INLINE, as a MIRROR of the shape that was replaced.
+///
+/// Built from the same field types the declaration used, so the width below is a statement about
+/// that shape rather than an estimate of it. Its other two arms are the shipped ones, which is what
+/// makes the only difference between it and `BlockIndexMap` the one under discussion: whether the
+/// single page sits in the node or behind a pointer.
+#[allow(dead_code)]
+enum MirrorInlineArm {
+    Empty,
+    One(u64, BlockIndex),
+    Many(Vec<(u64, BlockIndex)>),
+}
+
+/// DID THE INLINE ENTRY STILL EARN ITS WIDTH? IT DID NOT, AND THIS IS THE OCCUPANCY WHERE IT WOULD.
+///
+/// THE TWO SIDES OF THE TRADE, AND #1964's OWN ARITHMETIC RE-DERIVED ON THIS TREE. #1964 kept the
+/// entry inline and recorded two numbers for it: "save 160.9 B on every bucket through `BucketMap`
+/// and pay 112.0 B on every single-page one, so it loses at every occupancy including the default
+/// range's 100%". Neither number is reused here -- every term in them has moved, the page entry
+/// twice -- and the second column it never read is added:
+///
+///   SAVED, per bucket, everywhere: the inline arm's width is `8 + size_of::<BlockIndex>()` and the
+///   boxed arm's is 24, and the difference is paid by every `BucketNode` in the `BucketMap`.
+///   `BucketMap` is a `BTreeMap<u32, BucketNode>` whose leaf carries eleven value slots filled or
+///   not, so the saving is multiplied by that map before it is banked. Priced with STAND-IN values
+///   of the two widths, both DERIVED from `size_of` rather than written as literals -- a
+///   `BTreeMap`'s node cost depends on nothing else about the value, and a literal would go stale
+///   the next time the entry narrows.
+///
+///   PAID, per SINGLE-PAGE bucket only: one heap allocation holding one entry, in BOTH byte
+///   columns. The served column is the one that decides; it is where a fresh allocation's rounding
+///   appears, and an inline payload has no rounding to pay.
+///
+/// SO THE ANSWER IS A CROSSOVER IN THE FRACTION OF BUCKETS HOLDING EXACTLY ONE PAGE, and what
+/// changed between #1964 and now is not the crossover but the FRACTION. #1964 measured on
+/// `load_shard`'s default of the whole `u32` routing keyspace, where every key lands in a bucket of
+/// its own by construction and the fraction is 100% for any workload. #1973 made 1023 the shipped
+/// default, where the same routed keys give 4.510% at 4,000 records and 0.000% at 40,000.
+///
+/// WHAT #1964 SAID KEPT THE ARM, AND IT IS THE HALF THAT DOES NOT INVERT: "one allocation per
+/// single-page bucket on the write path." That is still exactly one allocation. What inverted is how
+/// many buckets pay it -- a twentieth of them at the small corpus and none at the large one -- so
+/// the COST is a twentieth of what it was, and the saving is unchanged on every bucket.
+///
+/// AND THE ARM ITSELF SURVIVES. Boxing recovers the identical width dropping it would, measured, so
+/// the single-page case keeps a representation of its own; `inline_arm_trade.rs` is where dropping
+/// and boxing are separated, and it is separated on the heap rather than on the width.
+///
+/// rust-internal: measures container footprint, no product behaviour
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "the counting allocator is process-wide; run by name"]
+fn the_inline_entry_no_longer_earns_its_width_and_this_is_the_occupancy_where_it_would() {
+    // --- What the inline entry SAVED a bucket that holds one page: the whole heap cost of it. ---
+    let (object_key, blocks) = sorted_list(1);
+    let single = blocks[0].1.clone();
+    let mut listed = BlockIndexMap::default();
+    listed.insert_released(&object_key, single.clone());
+    assert!(
+        matches!(listed, BlockIndexMap::One(..)),
+        "one page did not take the single-page arm, so this comparison is not about the arm that \
+         shipped"
+    );
+    let (inline_bytes, inline_chunk, inline_allocs) = span_counts_both(|| {
+        let held =
+            MirrorInlineArm::One(block_index_handle(&object_key, &single), single.clone());
+        std::hint::black_box(&held);
+    });
+    let (listed_bytes, listed_chunk, listed_allocs) = span_counts_both(|| {
+        let mut held = BlockIndexMap::default();
+        held.insert_released(&object_key, single.clone());
+        std::hint::black_box(&held);
+    });
+    println!(
+        "\n=== the two sides of #1964's trade, re-derived ==="
+    );
+    println!(
+        "  one page held INLINE (mirror): {inline_bytes} B asked / {inline_chunk} B served in \
+         {inline_allocs} alloc(s)"
+    );
+    println!(
+        "  the same page in the SHIPPED boxed arm: {listed_bytes} B asked / {listed_chunk} B served \
+         in {listed_allocs} alloc(s)"
+    );
+    assert_eq!(
+        0, inline_allocs,
+        "the inline mirror charged {inline_allocs} allocations; the inline entry's whole case was \
+         that it charges none, and if this is not zero the comparison has no baseline"
+    );
+    assert_eq!(
+        1, listed_allocs,
+        "the boxed arm charged {listed_allocs} allocations, not the one the inline entry avoided"
+    );
+    assert_eq!(
+        size_of::<BlockIndex>() as u64,
+        listed_bytes,
+        "the boxed arm asked for {listed_bytes} B to hold a {} B entry. A box is sized for exactly \
+         its payload, and that is the whole of its advantage over a one-entry LIST, whose first \
+         block is a growth step",
+        size_of::<BlockIndex>()
+    );
+    assert!(
+        listed_chunk > listed_bytes,
+        "the box asked for {listed_bytes} B and was served {listed_chunk} B; the served column is \
+         a FLOOR strictly above the request, and an equality means it is reporting the request back"
+    );
+
+    // --- What the inline entry cost EVERY bucket: the width it added, through the bucket map. ---
+    //
+    // BOTH STAND-INS DERIVED, NOT WRITTEN. `WIDE_WORDS` and `NARROW_WORDS` are computed from
+    // `size_of`, so the next change to the page entry moves them instead of silently leaving this
+    // test pricing a node width the engine no longer has.
+    const BUCKETS: u32 = 4_096;
+    const LIST_WIDTH: usize = size_of::<BlockIndexMap>();
+    const INLINE_ARM_WIDTH: usize = size_of::<u64>() + size_of::<BlockIndex>();
+    const NODE_NOW: usize = size_of::<BucketNode>();
+    const NODE_WITH_INLINE: usize = NODE_NOW + (INLINE_ARM_WIDTH - LIST_WIDTH);
+    const WIDE_WORDS: usize = (NODE_WITH_INLINE - 8) / 8;
+    const NARROW_WORDS: usize = (NODE_NOW - 8) / 8;
+    type WideSlot = (u64, [u64; WIDE_WORDS]);
+    type NarrowSlot = (u64, [u64; NARROW_WORDS]);
+    assert_eq!(
+        NODE_WITH_INLINE,
+        size_of::<WideSlot>(),
+        "the stand-in for a node with the entry held INLINE is {} B against the {NODE_WITH_INLINE} \
+         B such a node would be; the derivation above does not reconstruct and every figure below \
+         is over the wrong width",
+        size_of::<WideSlot>()
+    );
+    assert_eq!(
+        NODE_NOW,
+        size_of::<NarrowSlot>(),
+        "the stand-in for the shipped node is {} B against the node's {NODE_NOW} B",
+        size_of::<NarrowSlot>()
+    );
+    assert!(
+        NODE_WITH_INLINE > NODE_NOW,
+        "a node with the entry held inline would be {NODE_WITH_INLINE} B against the shipped \
+         {NODE_NOW} B; if the two are equal there was no width to recover"
+    );
+
+    let mut wide: BTreeMap<u32, WideSlot> = BTreeMap::new();
+    let (wide_bytes, wide_chunk, _) = span_counts_both(|| {
+        for i in 0..BUCKETS {
+            wide.insert(i, (i as u64, [0u64; WIDE_WORDS]));
+        }
+    });
+    let mut narrow: BTreeMap<u32, NarrowSlot> = BTreeMap::new();
+    let (narrow_bytes, narrow_chunk, _) = span_counts_both(|| {
+        for i in 0..BUCKETS {
+            narrow.insert(i, (i as u64, [0u64; NARROW_WORDS]));
+        }
+    });
+    std::hint::black_box((&wide, &narrow));
+    assert!(
+        wide_chunk > narrow_chunk,
+        "a bucket map of {NODE_WITH_INLINE}-byte nodes was served {wide_chunk} B and one of \
+         {NODE_NOW}-byte nodes {narrow_chunk} B; the narrower node is supposed to be the cheaper \
+         one and this instrument cannot see the difference"
+    );
+    let saved_per_bucket = (wide_bytes - narrow_bytes) as f64 / BUCKETS as f64;
+    let saved_per_bucket_chunk = (wide_chunk - narrow_chunk) as f64 / BUCKETS as f64;
+    let paid_per_single = (listed_bytes.saturating_sub(inline_bytes)) as f64;
+    let paid_per_single_chunk = (listed_chunk.saturating_sub(inline_chunk)) as f64;
+    println!(
+        "  through the bucket map, a node of {NODE_WITH_INLINE} B costs {:.1} B asked / {:.1} B \
+         served a bucket and one of {NODE_NOW} B costs {:.1} / {:.1}",
+        wide_bytes as f64 / BUCKETS as f64,
+        wide_chunk as f64 / BUCKETS as f64,
+        narrow_bytes as f64 / BUCKETS as f64,
+        narrow_chunk as f64 / BUCKETS as f64
+    );
+    println!(
+        "  RE-DERIVED: boxing the inline entry SAVES {saved_per_bucket:.1} B asked / \
+         {saved_per_bucket_chunk:.1} B served on EVERY bucket and PAYS {paid_per_single:.1} B \
+         asked / {paid_per_single_chunk:.1} B served on every SINGLE-PAGE one"
+    );
+    println!("  #1964 recorded 160.9 B saved and 112.0 B paid, on the request column only");
+    assert!(
+        paid_per_single_chunk > 0.0,
+        "the boxed arm was served no more than the inline entry; the crossover below would be a \
+         division by a measurement that did not happen"
+    );
+    let crossover = saved_per_bucket_chunk / paid_per_single_chunk;
+    println!(
+        "  SO: boxing the entry pays in BYTES wherever fewer than {:.1}% of buckets hold exactly \
+         one page (served column)",
+        100.0 * crossover
+    );
+    println!(
+        "  MEASURED single-page fractions: 100.000% on the whole keyspace at both corpus sizes; \
+         4.510% at 4,000 records and 0.000% at 40,000 on 0..{NARROW_END} -- and 1023 is the SHIPPED \
+         default since #1973. See `inline_arm_trade.rs` for the histogram and for dropping the arm \
+         altogether priced beside these two."
+    );
+
+    // THE GUARD, AND IT IS THE CROSSOVER RATHER THAN THE VERDICT.
+    //
+    // A crossover above 100% would mean there is NO occupancy at which the inline entry pays for
+    // itself in bytes. #1964 measured exactly that and its case therefore rested entirely on the
+    // allocation column. Below 100% there IS such an occupancy, and the question becomes whether the
+    // shipped routing range is above or below it -- which is what the default decides and what is
+    // asserted here.
+    //
+    // 0.04510 is the measured single-page fraction at 4,000 records on the shipped range, and it is
+    // the WORST of the two corpus sizes for this change: at 40,000 the fraction is zero. If the
+    // crossover ever falls below it, the inline entry has started paying for itself at the shipped
+    // default -- a node that narrowed further, or a page entry that widened -- and this change
+    // should be reconsidered rather than the assertion relaxed.
+    const WORST_SHIPPED_SINGLE_BLOCK_FRACTION: f64 = 0.04510;
+    assert!(
+        crossover > WORST_SHIPPED_SINGLE_BLOCK_FRACTION,
+        "the inline entry pays for itself in bytes below {:.3}% single-page occupancy, and the \
+         shipped routing range measures {:.3}% at its worst corpus size. On this reading boxing \
+         the entry is a LOSS at the default the operator runs, and the change should be reconsidered",
+        100.0 * crossover,
+        100.0 * WORST_SHIPPED_SINGLE_BLOCK_FRACTION
+    );
+}
+
+// =============================================================================================
+// 6. THE STORED SHAPE DID NOT MOVE
+// =============================================================================================
+
+/// THE INDEX ON DISK IS BYTE FOR BYTE WHAT THE TREE WROTE.
+///
+/// `BlockIndexMap` serializes as a map of RENDERED STRING KEYS sorted by that string, and it did
+/// before this change too -- the container it walks to build that map is the only thing that
+/// moved. So an index written by a build from before #1963 loads here, and one written here loads
+/// there, and this asserts it at the byte level rather than at the "it round-trips" level.
+///
+/// WITH AN INJECTION CONTROL: one page altered must move the bytes, or a byte comparison that
+/// always passes is proving nothing.
+///
+/// rust-internal: page index wire shape, no product behaviour
+#[test]
+fn the_stored_block_index_is_byte_for_byte_what_the_tree_wrote() {
+    let (object_key, blocks) = sorted_list(24);
+
+    let mut list = BlockIndexMap::default();
+    let mut live = BlockSlabLiveIndex::default();
+    for (_, entry) in &blocks {
+        list.insert(&object_key, entry.clone(), &mut live);
+    }
+    // ONE OBJECT NAMES THE WHOLE LIST: `sorted_list` builds components of `bag`.
+    let written =
+        serde_json::to_vec(&crate::engine::state::BlockIndexNamedBy(&list, &["bag"])).expect("the page index serializes");
+    assert!(
+        written.len() > 1_000,
+        "the fixture wrote {} bytes for 24 pages; too small to be the index",
+        written.len()
+    );
+
+    // Filled in a different order, it must write the identical bytes -- which is the on-disk face
+    // of the ordering guard above.
+    let mut backwards = BlockIndexMap::default();
+    for (_, entry) in blocks.iter().rev() {
+        backwards.insert(&object_key, entry.clone(), &mut live);
+    }
+    let written_backwards =
+        serde_json::to_vec(&crate::engine::state::BlockIndexNamedBy(&backwards, &["bag"])).expect("the page index serializes");
+    assert_eq!(
+        written, written_backwards,
+        "the same pages filled in the opposite order wrote different bytes"
+    );
+
+    // And it loads back as the same walk, through the same `From<BTreeMap<String, BlockIndex>>`
+    // the stored shape has always been read by.
+    let loaded: BlockIndexMap = serde_json::from_slice(&written).expect("the page index loads");
+    assert_eq!(
+        walk(&list),
+        walk(&loaded),
+        "an index written and read back walks in a different order than the one that wrote it"
+    );
+    let rewritten =
+        serde_json::to_vec(&crate::engine::state::BlockIndexNamedBy(&loaded, &["bag"])).expect("the loaded index serializes");
+    assert_eq!(
+        written, rewritten,
+        "loading and rewriting the index changed {} bytes",
+        written.len()
+    );
+
+    // INJECTION CONTROL: a single altered page must move the bytes.
+    let mut injected = BlockIndexMap::default();
+    for (at, (_, entry)) in blocks.iter().enumerate() {
+        let mut entry = entry.clone();
+        if at == 7 {
+            entry.deleted = true;
+        }
+        injected.insert(&object_key, entry, &mut live);
+    }
+    let with_injection =
+        serde_json::to_vec(&crate::engine::state::BlockIndexNamedBy(&injected, &["bag"])).expect("the page index serializes");
+    assert_ne!(
+        written, with_injection,
+        "altering one page of twenty-four left the written bytes unchanged; this comparison \
+         cannot see a change and its passing above means nothing"
+    );
+}
+
+// =============================================================================================
+// 7. THE READ PATH, MEASURED THROUGH THE ENGINE
+// =============================================================================================
+
+/// WHAT A READ EXAMINES, THROUGH THE ENGINE'S OWN RESOLVER, AT THE CONFIGURED RANGE.
+///
+/// This change trades a tree descent for a walk, and the read path is where it is won or lost.
+/// The counter sits inside the two lookup functions production calls, so this is a reading of the
+/// path and not of a copy.
+///
+/// THROUGH `bucket_store::bucket_index_block_address`, which is the resolver
+/// `Command::StringGet` reaches through `read_bucket_index_value` once the response cache misses
+/// -- driven directly here rather than through `execute`, because a warm cache answers without
+/// resolving anything and a measurement of the read path taken on a cache hit is a measurement of
+/// the cache.
+///
+/// THE CONTROL ON THE EXPLANATION: the same resolutions on the WHOLE keyspace, where every bucket
+/// holds one page inline and no list lookup happens at all, must charge ZERO. If that arm moves,
+/// the counter is counting something other than the list lookup and the narrow figure below
+/// cannot be attributed to it.
+///
+/// rust-internal: measures the engine's own read path, no product behaviour
+#[test]
+#[ignore = "seeds two stores of 4,000 records; run by name"]
+fn a_read_examines_entries_only_where_a_block_list_exists() {
+    let mut charged: BTreeMap<u32, (u64, usize)> = BTreeMap::new();
+    for end_routing_bucket in [WIDE_END, NARROW_END] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on(&engine, end_routing_bucket);
+        let keys = seed_routed(&engine, SMALL);
+
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        reset_block_lookup_entries_examined();
+        let mut served = 0usize;
+        for key in keys.iter().take(1_000) {
+            if crate::engine::bucket_store::bucket_index_block_address(
+                shard, "string", key, None,
+            )
+            .is_some()
+            {
+                served += 1;
+            }
+        }
+        let examined = block_lookup_entries_examined();
+        assert_eq!(1_000, served, "the fixture resolved {served} of 1,000 keys");
+        charged.insert(end_routing_bucket, (examined, served));
+        println!(
+            "  0..{end_routing_bucket}: {examined} list entries examined over {served} \
+             resolutions ({:.4} a read)",
+            examined as f64 / served as f64
+        );
+    }
+
+    let (wide_examined, _) = charged[&WIDE_END];
+    let (narrow_examined, narrow_served) = charged[&NARROW_END];
+    assert_eq!(
+        0, wide_examined,
+        "on the whole keyspace every bucket holds its page inline and no list is walked, yet the \
+         counter charged {wide_examined} entries; it is counting something else"
+    );
+    assert!(
+        narrow_examined > 0,
+        "on 0..{NARROW_END} the reads examined no list entries at all, so this measurement has no \
+         subject"
+    );
+    println!(
+        "  a read on the configured range walks {:.3} list entries; on the default range it walks \
+         none, which is the control on the attribution",
+        narrow_examined as f64 / narrow_served as f64
+    );
+}
+
+// =============================================================================================
+// 8. AN INDEPENDENT RESIDUAL
+// =============================================================================================
+
+/// EVERY PAGE THE ENGINE WROTE IS IN EXACTLY ONE LIST, COUNTED FROM THE OTHER END.
+///
+/// Not the sum of the rows above: this walks the bucket index and counts distinct HANDLES, then
+/// sets that against the keys the fixture wrote. A list that lost a page to a duplicate, or held
+/// one twice, shows here as a non-zero residual with a name.
+///
+/// WITH A PLANTED MARKER: a page is removed from the index behind the engine's back and the
+/// residual must come back at exactly one, so a residual of zero is a measurement rather than an
+/// instrument that cannot count.
+///
+/// rust-internal: measures the engine's own bucket index, no product behaviour
+#[test]
+#[ignore = "seeds a store of 4,000 records; run by name"]
+fn every_written_block_sits_in_exactly_one_list_and_a_planted_loss_shows_up() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, NARROW_END);
+    let keys = seed_routed(&engine, SMALL);
+
+    let (distinct, total, listed_keys) = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        // THE KEYS COME FROM THE LOOKUP BESIDE THE PAGES, not from the pages. That is a
+        // STRONGER claim than the field read was, and deliberately: a page the lookup does not
+        // name would have been counted under its own copy of the key before, and is refused
+        // here -- which is the state `insert_object_block_lookup` exists to rule out.
+        let keys = crate::engine::state::BlockKeysByPosition::from_lookup(
+            &shard.bucket_index.object_block_lookup,
+        );
+        let mut handles = std::collections::BTreeSet::new();
+        let mut total = 0usize;
+        let mut object_keys = std::collections::BTreeSet::new();
+        for bucket in shard.bucket_index.bucket_map.values() {
+            let named = crate::engine::state::block_identities_in(bucket, &keys);
+            for (handle, _block) in &bucket.block_index {
+                handles.insert(*handle);
+                object_keys.insert(
+                    named
+                        .get(handle)
+                        .unwrap_or_else(|| {
+                            panic!("the page at handle {handle} is named by nothing beside it")
+                        })
+                        .to_string(),
+                );
+                total += 1;
+            }
+        }
+        (handles.len(), total, object_keys)
+    };
+
+    assert_eq!(
+        total, distinct,
+        "the index walks {total} entries but only {distinct} distinct handles; {} page(s) are \
+         filed twice",
+        total - distinct
+    );
+    let missing: Vec<&String> = keys.iter().filter(|key| !listed_keys.contains(*key)).collect();
+    assert!(
+        missing.is_empty(),
+        "{} written key(s) have no page in any list; the first few are {:?}",
+        missing.len(),
+        missing.iter().take(5).collect::<Vec<_>>()
+    );
+    println!("  {total} pages in {distinct} distinct handles over {} written keys; residual 0", keys.len());
+
+    // THE PLANTED LOSS. Take one page out from under the index and confirm the count above sees
+    // it -- a residual that reads zero because it cannot count is worse than none.
+    // NAMED UNDER THE READ LOCK, REMOVED UNDER THE WRITE ONE. The key is drawn from the
+    // bucket's lookup, which is a SIBLING FIELD of the bucket map -- so naming the page and
+    // taking it out cannot be one borrow, and splitting them into two phases is simpler than
+    // splitting the borrow.
+    let planted = {
+        let (routing_bucket, handle, key) = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            let keys = crate::engine::state::BlockKeysByPosition::from_lookup(
+                &shard.bucket_index.object_block_lookup,
+            );
+            let mut found = None;
+            for bucket in shard.bucket_index.bucket_map.values() {
+                if let Some((handle, block)) = bucket.block_index.iter().next() {
+                    let beside = keys
+                        .identity_of(bucket, *handle, block)
+                        .expect("the page the index holds is named beside it");
+                    found =
+                        Some((bucket.routing_bucket, *handle, beside.object_key.to_string()));
+                    break;
+                }
+            }
+            found.expect("the index held at least one page to plant a loss in")
+        };
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard is loaded");
+        let mut live = BlockSlabLiveIndex::default();
+        let bucket = shard
+            .bucket_index
+            .bucket_map
+            .get_mut(&routing_bucket)
+            .expect("the bucket named a moment ago is still there");
+        assert!(
+            bucket.block_index.remove(&handle, &mut live, crate::engine::state::StaleCause::Removed).is_some(),
+            "the planted removal took nothing out, so the count below cannot have moved"
+        );
+        key
+    };
+    let after: usize = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .map(|bucket| bucket.block_index.len())
+            .sum()
+    };
+    assert_eq!(
+        total - 1,
+        after,
+        "a planted removal of the page for {planted} moved the count from {total} to {after}; the \
+         residual instrument cannot see a lost page and its zero above says nothing"
+    );
+    println!("  the planted loss of one page for {planted} was recovered exactly");
+}

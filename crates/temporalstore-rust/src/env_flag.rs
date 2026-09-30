@@ -184,3 +184,189 @@ mod tests {
             "a fresh deployment must be created under the canonical name"
         );
 
+        // ARM 2: only the canonical one exists.
+        std::fs::create_dir_all(&canonical).expect("create canonical");
+        assert_eq!(
+            super::directory_default_preferring_canonical(&c, &p),
+            c,
+            "a store already under the canonical name must keep it"
+        );
+
+        // ARM 3: ONLY THE PREVIOUS ONE EXISTS. This is the arm the rename exists for.
+        std::fs::remove_dir_all(&canonical).expect("remove canonical");
+        std::fs::create_dir_all(&previous).expect("create previous");
+        assert_eq!(
+            super::directory_default_preferring_canonical(&c, &p),
+            p,
+            "a store created under the previous name was left unreachable: the process would come \
+             up on an empty directory with the blocks still on disk beside it"
+        );
+
+        // ARM 4: both exist -- the canonical one wins, because it is what this build writes.
+        std::fs::create_dir_all(&canonical).expect("re-create canonical");
+        assert_eq!(
+            super::directory_default_preferring_canonical(&c, &p),
+            c,
+            "with both present the canonical name must win"
+        );
+    }
+
+    use super::*;
+
+    #[test]
+    fn a_number_survives_the_whitespace_a_launcher_leaves_behind() {
+        // The failure this half of the module exists to prevent. Every one of these is an
+        // `Err` from `usize::from_str`, so a reader that skips the trim answers with its
+        // default and says nothing.
+        for written in ["64", " 64", "64 ", " 64 ", "\t64\n", "  64  "] {
+            assert_eq!(
+                Some(64usize),
+                parse_number::<usize>(written),
+                "{written:?} should read as 64"
+            );
+        }
+    }
+
+    #[test]
+    fn a_number_that_is_not_one_leaves_the_default_alone() {
+        for written in ["", "   ", "wat", "6 4", "64x", "-1"] {
+            assert_eq!(
+                None,
+                parse_number::<usize>(written),
+                "{written:?} should not parse as a usize"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_is_a_value_and_not_an_absence() {
+        // `env_usize_any` in the proxy treats 0 as "unset" and that is its decision to make.
+        // This reader does not make it for everyone: a cap of 0 that silently became the
+        // default would be the same silent discard, one layer up.
+        assert_eq!(Some(0usize), parse_number::<usize>(" 0 "));
+    }
+
+    #[test]
+    fn the_numeric_default_is_what_survives_an_unset_or_unreadable_variable() {
+        let unset = "TS_ENV_FLAG_NUMBER_NAME_THAT_IS_NEVER_SET";
+        assert_eq!(7usize, env_number(unset, 7usize));
+        assert_eq!(7u64, env_number(unset, 7u64));
+    }
+
+    #[test]
+    fn a_blank_value_is_not_a_value() {
+        let name = "TS_ENV_FLAG_BLANK_PROBE";
+        for written in ["", " ", "\t", "  \n "] {
+            std::env::set_var(name, written);
+            assert_eq!(None, env_value(name), "{written:?} should read as absent");
+        }
+        std::env::set_var(name, " codex ");
+        assert_eq!(Some(" codex ".to_string()), env_value(name),
+                   "a real value is returned as written, trimming is the caller's business");
+        std::env::remove_var(name);
+        assert_eq!(None, env_value(name));
+    }
+
+    #[test]
+    fn a_blank_newer_spelling_falls_through_to_the_older_one() {
+        // The whole point. Read with `std::env::var(..).or_else(..)` the second name is never
+        // consulted here, because the first answered Ok("").
+        let new = "TS_ENV_FLAG_CHAIN_NEW";
+        let old = "TS_ENV_FLAG_CHAIN_OLD";
+        std::env::set_var(new, "");
+        std::env::set_var(old, "2097152");
+        assert_eq!(
+            Some("2097152".to_string()),
+            env_value(new).or_else(|| env_value(old)),
+            "a blank newer spelling must not shadow the older one"
+        );
+        std::env::set_var(new, "4194304");
+        assert_eq!(Some("4194304".to_string()), env_value(new).or_else(|| env_value(old)),
+                   "and a real newer value still wins");
+        std::env::remove_var(new);
+        std::env::remove_var(old);
+    }
+
+    #[test]
+    fn a_previous_spelling_is_still_read_when_the_current_one_is_unset() {
+        // What the milestone rename would otherwise cost. Renaming a `TS_*` flag does not
+        // error: the flag stops being read, the default applies, and a deployment setting the
+        // old name quietly gets different behaviour. These three helpers are the reason it
+        // does not.
+        let current = "TS_ENV_FLAG_FIRST_CURRENT";
+        let previous = "TS_ENV_FLAG_FIRST_PREVIOUS";
+        std::env::remove_var(current);
+        std::env::remove_var(previous);
+
+        // Nothing set: the default, and NOT a zero or a false pulled out of thin air.
+        assert_eq!(9usize, env_number_first(&[current, previous], 9usize));
+        assert!(env_bool_first(&[current, previous], true));
+        assert_eq!(None, env_value_any(&[current, previous]));
+
+        // Only the previous name set -- the deployment that has not been updated. It must read
+        // the value it set, not the default.
+        std::env::set_var(previous, "4096");
+        assert_eq!(4096usize, env_number_first(&[current, previous], 9usize));
+        std::env::set_var(previous, "off");
+        assert!(!env_bool_first(&[current, previous], true));
+
+        // Both set: the current name wins.
+        std::env::set_var(current, "8192");
+        std::env::set_var(previous, "4096");
+        assert_eq!(8192usize, env_number_first(&[current, previous], 9usize));
+
+        // The current name set but BLANK must not shadow the previous one with nothing.
+        std::env::set_var(current, "  ");
+        assert_eq!(4096usize, env_number_first(&[current, previous], 9usize));
+
+        std::env::remove_var(current);
+        std::env::remove_var(previous);
+    }
+
+    #[test]
+    fn both_halves_of_the_vocabulary_are_understood() {
+        for on in ["1", "true", "yes", "on"] {
+            assert_eq!(Some(true), parse_bool(on), "{on} should read as on");
+        }
+        for off in ["0", "false", "no", "off"] {
+            assert_eq!(Some(false), parse_bool(off), "{off} should read as off");
+        }
+    }
+
+    #[test]
+    fn case_and_surrounding_space_do_not_change_the_answer() {
+        // A unit file, a heredoc and a shell export all leave these behind.
+        for written in ["On", "ON", "True", " 1", "1 ", "\tYES\n", "  on  "] {
+            assert_eq!(
+                Some(true),
+                parse_bool(written),
+                "{written:?} should read as on"
+            );
+        }
+        for written in ["Off", "OFF", "False", " 0 ", "\tNO\n"] {
+            assert_eq!(
+                Some(false),
+                parse_bool(written),
+                "{written:?} should read as off"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_value_is_not_a_request_to_turn_something_off() {
+        // The failure this module exists to prevent: a default-on flag whose value nobody can
+        // read used to come back false, so a typo silently disabled the behaviour instead of
+        // leaving it where the deployment had it.
+        for written in ["", "wat", "2", "enabled", "disable"] {
+            assert_eq!(None, parse_bool(written), "{written:?} should not parse");
+        }
+    }
+
+    #[test]
+    fn the_default_is_what_survives_an_unset_or_unreadable_variable() {
+        // A name no test sets, so this reads the unset path without racing a sibling.
+        let unset = "TS_ENV_FLAG_VOCABULARY_NAME_THAT_IS_NEVER_SET";
+        assert!(env_bool(unset, true), "unset must fall back to the default");
+        assert!(!env_bool(unset, false), "unset must fall back to the default");
+    }
+}
