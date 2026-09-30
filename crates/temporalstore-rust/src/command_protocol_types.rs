@@ -949,3 +949,2858 @@ impl ContextWire for ContextEvent {
         Some(value)
     }
 }
+
+impl ContextWire for ContextIndexRef {
+    fn encode_context_proto_value(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_varint_field(&mut out, 1, self.primary_node_hash);
+        encode_varint_field(&mut out, 2, self.primary_event_time_ms);
+        encode_varint_field(&mut out, 3, self.event_id_hash);
+        out
+    }
+
+    fn decode_context_proto_value(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = 0;
+        let mut value = Self {
+            primary_node_hash: 0,
+            primary_event_time_ms: 0,
+            event_id_hash: 0,
+        };
+        while cursor < bytes.len() {
+            let tag = decode_varint(bytes, &mut cursor)?;
+            match (tag >> 3, tag & 0x7) {
+                (1, 0) => value.primary_node_hash = decode_varint(bytes, &mut cursor)?,
+                (2, 0) => value.primary_event_time_ms = decode_varint(bytes, &mut cursor)?,
+                (3, 0) => value.event_id_hash = decode_varint(bytes, &mut cursor)?,
+                (_, wire_type) => skip_proto_field(bytes, &mut cursor, wire_type)?,
+            }
+        }
+        Some(value)
+    }
+}
+
+impl ContextWire for ContextAuditRef {
+    fn encode_context_proto_value(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_varint_field(&mut out, 1, self.node_hash);
+        encode_varint_field(&mut out, 2, self.event_time_ms);
+        encode_bytes_field(&mut out, 3, self.reason.as_bytes());
+        out
+    }
+
+    fn decode_context_proto_value(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = 0;
+        let mut value = Self {
+            node_hash: 0,
+            event_time_ms: 0,
+            reason: String::new(),
+        };
+        while cursor < bytes.len() {
+            let tag = decode_varint(bytes, &mut cursor)?;
+            match (tag >> 3, tag & 0x7) {
+                (1, 0) => value.node_hash = decode_varint(bytes, &mut cursor)?,
+                (2, 0) => value.event_time_ms = decode_varint(bytes, &mut cursor)?,
+                (3, 2) => value.reason = decode_string(bytes, &mut cursor)?,
+                (_, wire_type) => skip_proto_field(bytes, &mut cursor, wire_type)?,
+            }
+        }
+        Some(value)
+    }
+}
+
+impl ContextWire for ContextPackAudit {
+    fn encode_context_proto_value(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        // Field numbers MUST match the wire proto (context interface.proto ContextPackAudit):
+        // query_id=1, session_hash=2, request_time_ms=3, max_prompt_tokens=4,
+        // selected_tokens=5, selected_refs=6. Rust-only fields go AFTER the reserved max tag so
+        // they never shift a reserved field (previously query_hash sat at 4, shifting three
+        // fields and dropping selected_refs on cross-impl decode).
+        encode_bytes_field(&mut out, 1, self.query_id.as_bytes());
+        encode_varint_field(&mut out, 2, self.session_hash);
+        encode_varint_field(&mut out, 3, self.request_time_ms);
+        encode_varint_field(&mut out, 4, u64::from(self.max_prompt_tokens));
+        encode_varint_field(&mut out, 5, u64::from(self.selected_tokens));
+        for selected in &self.selected_refs {
+            encode_bytes_field(&mut out, 6, &selected.encode_context_proto_value());
+        }
+        // Rust-only extensions (no wire counterpart), on non-colliding tags.
+        encode_varint_field(&mut out, 9, self.query_hash);
+        for blocked in &self.blocked_refs {
+            encode_bytes_field(&mut out, 10, &blocked.encode_context_proto_value());
+        }
+        out
+    }
+
+    fn decode_context_proto_value(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = 0;
+        let mut value = Self {
+            query_id: String::new(),
+            session_hash: 0,
+            request_time_ms: 0,
+            query_hash: 0,
+            max_prompt_tokens: 0,
+            selected_tokens: 0,
+            selected_refs: Vec::new(),
+            blocked_refs: Vec::new(),
+        };
+        while cursor < bytes.len() {
+            let tag = decode_varint(bytes, &mut cursor)?;
+            match (tag >> 3, tag & 0x7) {
+                (1, 2) => value.query_id = decode_string(bytes, &mut cursor)?,
+                (2, 0) => value.session_hash = decode_varint(bytes, &mut cursor)?,
+                (3, 0) => value.request_time_ms = decode_varint(bytes, &mut cursor)?,
+                (4, 0) => {
+                    value.max_prompt_tokens =
+                        u32::try_from(decode_varint(bytes, &mut cursor)?).ok()?
+                }
+                (5, 0) => {
+                    value.selected_tokens =
+                        u32::try_from(decode_varint(bytes, &mut cursor)?).ok()?
+                }
+                (6, 2) => value
+                    .selected_refs
+                    .push(ContextAuditRef::decode_context_value(&decode_bytes(
+                        bytes,
+                        &mut cursor,
+                    )?)?),
+                (9, 0) => value.query_hash = decode_varint(bytes, &mut cursor)?,
+                (10, 2) => value
+                    .blocked_refs
+                    .push(ContextAuditRef::decode_context_value(&decode_bytes(
+                        bytes,
+                        &mut cursor,
+                    )?)?),
+                (_, wire_type) => skip_proto_field(bytes, &mut cursor, wire_type)?,
+            }
+        }
+        Some(value)
+    }
+}
+
+
+impl ContextWire for ContextEntity {
+    fn encode_context_proto_value(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_varint_field(&mut out, 1, self.entity_hash);
+        encode_varint_field(&mut out, 2, self.node_hash);
+        encode_varint_field(&mut out, 3, u64::from(self.entity_type));
+        encode_bytes_field(&mut out, 4, self.name.as_bytes());
+        encode_bytes_field(&mut out, 5, self.value.as_bytes());
+        encode_varint_field(&mut out, 6, self.updated_at_ms);
+        encode_varint_field(&mut out, 7, self.valid_from_ms);
+        encode_fixed32_field(&mut out, 8, self.confidence.to_bits());
+        for source_event_hash in &self.source_event_hashes {
+            encode_varint_field(&mut out, 9, *source_event_hash);
+        }
+        encode_vector_field(&mut out, &self.vector);
+        out
+    }
+
+    fn decode_context_proto_value(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = 0;
+        let mut value = Self {
+            entity_hash: 0,
+            node_hash: 0,
+            entity_type: 0,
+            name: String::new(),
+            value: String::new(),
+            updated_at_ms: 0,
+            valid_from_ms: 0,
+            confidence: 0.0,
+            source_event_hashes: Vec::new(),
+            vector: Vec::new(),
+        };
+        while cursor < bytes.len() {
+            let tag = decode_varint(bytes, &mut cursor)?;
+            match (tag >> 3, tag & 0x7) {
+                (1, 0) => value.entity_hash = decode_varint(bytes, &mut cursor)?,
+                (2, 0) => value.node_hash = decode_varint(bytes, &mut cursor)?,
+                (3, 0) => {
+                    value.entity_type = u32::try_from(decode_varint(bytes, &mut cursor)?).ok()?
+                }
+                (4, 2) => value.name = decode_string(bytes, &mut cursor)?,
+                (5, 2) => value.value = decode_string(bytes, &mut cursor)?,
+                (6, 0) => value.updated_at_ms = decode_varint(bytes, &mut cursor)?,
+                (7, 0) => value.valid_from_ms = decode_varint(bytes, &mut cursor)?,
+                (8, 5) => value.confidence = f32::from_bits(decode_fixed32(bytes, &mut cursor)?),
+                (9, 0) => value
+                    .source_event_hashes
+                    .push(decode_varint(bytes, &mut cursor)?),
+                (9, 2) => {
+                    let packed = decode_bytes(bytes, &mut cursor)?;
+                    let mut packed_cursor = 0;
+                    while packed_cursor < packed.len() {
+                        value
+                            .source_event_hashes
+                            .push(decode_varint(&packed, &mut packed_cursor)?);
+                    }
+                }
+                (CONTEXT_VECTOR_FIELD, 2) => {
+                    value.vector = unpack_f32_vector(decode_bytes_ref(bytes, &mut cursor)?)
+                }
+                (CONTEXT_VECTOR_INT8_FIELD, 2) => {
+                    value.vector = unpack_i8_vector(decode_bytes_ref(bytes, &mut cursor)?)
+                }
+                (CONTEXT_VECTOR_SCALED_FIELD, 2) => {
+                    value.vector = unpack_scaled_vector(decode_bytes_ref(bytes, &mut cursor)?)
+                }
+                (_, wire_type) => skip_proto_field(bytes, &mut cursor, wire_type)?,
+            }
+        }
+        Some(value)
+    }
+}
+
+impl ContextWire for ContextChildRef {
+    fn encode_context_proto_value(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_varint_field(&mut out, 1, self.parent_hash);
+        encode_varint_field(&mut out, 2, self.child_hash);
+        encode_varint_field(&mut out, 5, self.updated_at_ms);
+        out
+    }
+
+    fn decode_context_proto_value(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = 0;
+        let mut value = Self {
+            parent_hash: 0,
+            child_hash: 0,
+            updated_at_ms: 0,
+        };
+        while cursor < bytes.len() {
+            let tag = decode_varint(bytes, &mut cursor)?;
+            match (tag >> 3, tag & 0x7) {
+                (1, 0) => value.parent_hash = decode_varint(bytes, &mut cursor)?,
+                (2, 0) => value.child_hash = decode_varint(bytes, &mut cursor)?,
+                (5, 0) => value.updated_at_ms = decode_varint(bytes, &mut cursor)?,
+                (_, wire_type) => skip_proto_field(bytes, &mut cursor, wire_type)?,
+            }
+        }
+        Some(value)
+    }
+}
+
+impl ContextWire for ContextSummary {
+    fn encode_context_proto_value(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_varint_field(&mut out, 2, self.node_hash);
+        encode_varint_field(&mut out, 3, u64::from(self.level));
+        encode_bytes_field(&mut out, 4, self.text.as_bytes());
+        encode_varint_field(&mut out, 5, self.valid_from_ms);
+        encode_vector_field(&mut out, &self.vector);
+        if self.embedding_model_hash != 0 {
+            encode_varint_field(
+                &mut out,
+                CONTEXT_EMBEDDING_MODEL_FIELD,
+                self.embedding_model_hash,
+            );
+        }
+        out
+    }
+
+    fn decode_context_proto_value(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = 0;
+        let mut value = Self {
+            node_hash: 0,
+            level: 0,
+            text: String::new(),
+            valid_from_ms: 0,
+            vector: Vec::new(),
+            embedding_model_hash: 0,
+        };
+        while cursor < bytes.len() {
+            let tag = decode_varint(bytes, &mut cursor)?;
+            match (tag >> 3, tag & 0x7) {
+                (2, 0) => value.node_hash = decode_varint(bytes, &mut cursor)?,
+                (3, 0) => value.level = u32::try_from(decode_varint(bytes, &mut cursor)?).ok()?,
+                (4, 2) => value.text = decode_string(bytes, &mut cursor)?,
+                (5, 0) => value.valid_from_ms = decode_varint(bytes, &mut cursor)?,
+                (CONTEXT_VECTOR_FIELD, 2) => {
+                    value.vector = unpack_f32_vector(decode_bytes_ref(bytes, &mut cursor)?)
+                }
+                (CONTEXT_VECTOR_INT8_FIELD, 2) => {
+                    value.vector = unpack_i8_vector(decode_bytes_ref(bytes, &mut cursor)?)
+                }
+                (CONTEXT_EMBEDDING_MODEL_FIELD, 0) => {
+                    value.embedding_model_hash = decode_varint(bytes, &mut cursor)?
+                }
+                (CONTEXT_VECTOR_SCALED_FIELD, 2) => {
+                    value.vector = unpack_scaled_vector(decode_bytes_ref(bytes, &mut cursor)?)
+                }
+                (_, wire_type) => skip_proto_field(bytes, &mut cursor, wire_type)?,
+            }
+        }
+        Some(value)
+    }
+}
+
+impl ContextWire for ContextCompressionEvent {
+    fn encode_context_proto_value(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        encode_varint_field(&mut out, 1, self.compression_id_hash);
+        encode_varint_field(&mut out, 2, self.node_hash);
+        encode_varint_field(&mut out, 3, self.source_start_ms);
+        encode_varint_field(&mut out, 4, self.source_end_ms);
+        encode_varint_field(&mut out, 5, self.compressed_time_ms);
+        encode_bytes_field(&mut out, 6, self.summary.as_bytes());
+        out
+    }
+
+    fn decode_context_proto_value(bytes: &[u8]) -> Option<Self> {
+        let mut cursor = 0;
+        let mut value = Self {
+            compression_id_hash: 0,
+            node_hash: 0,
+            source_start_ms: 0,
+            source_end_ms: 0,
+            compressed_time_ms: 0,
+            summary: String::new(),
+        };
+        while cursor < bytes.len() {
+            let tag = decode_varint(bytes, &mut cursor)?;
+            match (tag >> 3, tag & 0x7) {
+                (1, 0) => value.compression_id_hash = decode_varint(bytes, &mut cursor)?,
+                (2, 0) => value.node_hash = decode_varint(bytes, &mut cursor)?,
+                (3, 0) => value.source_start_ms = decode_varint(bytes, &mut cursor)?,
+                (4, 0) => value.source_end_ms = decode_varint(bytes, &mut cursor)?,
+                (5, 0) => value.compressed_time_ms = decode_varint(bytes, &mut cursor)?,
+                (6, 2) => value.summary = decode_string(bytes, &mut cursor)?,
+                (_, wire_type) => skip_proto_field(bytes, &mut cursor, wire_type)?,
+            }
+        }
+        Some(value)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Command {
+    /// Appended by a leader when it takes office, and applied as nothing.
+    ///
+    /// A leader may not conclude that entries from an earlier term are committed just because a
+    /// majority holds them; it has to commit something of its own term first. Without that, a
+    /// node that restarts and takes office keeps whatever commit point it had, and entries above
+    /// it sit in the log unapplied until the next write happens to arrive.
+    LeaderEstablish,
+    CommonDelete {
+        key: String,
+    },
+    CommonExpire {
+        key: String,
+        ttl_ms: u64,
+    },
+    CommonTtl {
+        key: String,
+    },
+    /// Remove a key's expiry without touching its value: Redis PERSIST. Answers 1 when a
+    /// timeout was actually removed, 0 when the key is missing or already had none.
+    CommonPersist {
+        key: String,
+    },
+    CommonExists {
+        key: String,
+    },
+    StringSet {
+        key: String,
+        #[serde(with = "crate::bytes_serde")]
+        value: Vec<u8>,
+    },
+    StringSetEx {
+        key: String,
+        #[serde(with = "crate::bytes_serde")]
+        value: Vec<u8>,
+        ttl_ms: u64,
+    },
+    StringSetConditional {
+        key: String,
+        #[serde(with = "crate::bytes_serde")]
+        value: Vec<u8>,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
+        condition: StringSetCondition,
+        return_old: bool,
+        /// `SET key value KEEPTTL`: replace the value and leave the deadline where it is.
+        ///
+        /// THE THIRD OUTCOME. A value-replacing write can do one of three things to the
+        /// deadline it overwrites -- arm a new one (`ttl_ms: Some`), discard the old one
+        /// (`ttl_ms: None`), or leave it alone -- and `Option<u64>` can only spell two. That
+        /// is the same shape that made `GETEX key PERSIST` a no-op until #1665: two of the
+        /// three outcomes shared a `None` and the code read that `None` as the wrong one.
+        ///
+        /// It is a SEPARATE FIELD rather than a three-way enum replacing `ttl_ms` on purpose.
+        /// `Command` is serde-serialized into the WAL, and a replayed record written before
+        /// this field existed must keep meaning exactly what it meant when it was written.
+        /// `#[serde(default)]` gives those records `false` -- the clearing behaviour they were
+        /// recorded with. Retyping `ttl_ms` instead would default an old `{"ttl_ms": 5000}`
+        /// record to "no deadline" on replay and silently drop a deadline that was durable.
+        ///
+        /// `ttl_ms: Some(_)` together with `keep_ttl: true` is contradictory and unreachable:
+        /// `parse_set_options` refuses `EX`/`PX` beside `KEEPTTL` with a syntax error, as
+        /// Redis does. The shard treats an arming TTL as the winner if one is ever built by
+        /// hand, and says so where it does.
+        #[serde(default)]
+        keep_ttl: bool,
+    },
+    StringGet {
+        key: String,
+    },
+    StringDelete {
+        key: String,
+    },
+    HashSet {
+        key: String,
+        field: String,
+        #[serde(with = "crate::bytes_serde")]
+        value: Vec<u8>,
+    },
+    HashGet {
+        key: String,
+        field: String,
+    },
+    HashMultiGet {
+        key: String,
+        fields: Vec<String>,
+    },
+    HashMultiSet {
+        key: String,
+        #[serde(with = "crate::bytes_serde::pairs")]
+        entries: Vec<(String, Vec<u8>)>,
+    },
+    HashIncrBy {
+        key: String,
+        field: String,
+        increment: i64,
+    },
+    HashGetAll {
+        key: String,
+    },
+    HashLen {
+        key: String,
+    },
+    HashDelete {
+        key: String,
+        field: String,
+    },
+    SetAdd {
+        key: String,
+        #[serde(with = "crate::bytes_serde")]
+        member: Vec<u8>,
+    },
+    /// Upsert one member with a score. Answers 1 for a new member, 0 for a re-score.
+    ZSetAdd {
+        key: String,
+        #[serde(with = "crate::bytes_serde")]
+        member: Vec<u8>,
+        score: f64,
+    },
+    /// The member's score as its shortest string form, or nil when absent.
+    ZSetScore {
+        key: String,
+        #[serde(with = "crate::bytes_serde")]
+        member: Vec<u8>,
+    },
+    ZSetRemove {
+        key: String,
+        #[serde(with = "crate::bytes_serde")]
+        member: Vec<u8>,
+    },
+    ZSetCard {
+        key: String,
+    },
+    /// Index range in (score, member) order, Redis semantics (negatives from the tail).
+    /// Answers interleaved member/score-string pairs.
+    ZSetRange {
+        key: String,
+        start: i64,
+        stop: i64,
+        rev: bool,
+    },
+    /// Score-window range; exclusive flags implement the leading-paren syntax. Answers
+    /// interleaved member/score-string pairs.
+    ZSetRangeByScore {
+        key: String,
+        min: f64,
+        max: f64,
+        min_exclusive: bool,
+        max_exclusive: bool,
+        rev: bool,
+    },
+    /// Atomic seen-within-window check-and-mark: answers 1 when the member was already seen
+    /// inside the window (a duplicate), else marks it and answers 0. Expired entries are
+    /// swept from the front in bounded steps on every call.
+    SeenCheck {
+        key: String,
+        #[serde(with = "crate::bytes_serde")]
+        member: Vec<u8>,
+        window_ms: u64,
+    },
+    /// How many members the set currently holds (expired-but-unswept included).
+    SeenCard {
+        key: String,
+    },
+    /// Atomic take-with-refill on a token bucket: refill by elapsed time (capped at
+    /// capacity), then take `tokens` if they fit. Answers three strings -- allowed ("1"/"0"),
+    /// tokens remaining, and retry-after ms (0 when allowed).
+    BucketTake {
+        key: String,
+        tokens: f64,
+        capacity: f64,
+        refill_per_sec: f64,
+    },
+    /// The same arithmetic without taking: what a take of `tokens` WOULD answer.
+    BucketPeek {
+        key: String,
+        tokens: f64,
+        capacity: f64,
+        refill_per_sec: f64,
+    },
+    /// Add to a member's score (0 when absent), atomically under the shard lock.
+    /// Answers the new score as its shortest string form.
+    ZSetIncrBy {
+        key: String,
+        #[serde(with = "crate::bytes_serde")]
+        member: Vec<u8>,
+        increment: f64,
+    },
+    /// Pop up to `count` members off the low (min) or high end, in order.
+    /// Answers interleaved member/score-string pairs.
+    ZSetPop {
+        key: String,
+        min: bool,
+        count: u64,
+    },
+    /// The member's 0-based position in (score, member) order, tail-based when rev.
+    /// Answers the rank as a decimal string, or nil for a missing member.
+    ZSetRank {
+        key: String,
+        #[serde(with = "crate::bytes_serde")]
+        member: Vec<u8>,
+        rev: bool,
+    },
+    /// Push one element onto a list end (left = head). Answers the new length.
+    ListPush {
+        key: String,
+        #[serde(with = "crate::bytes_serde")]
+        member: Vec<u8>,
+        left: bool,
+    },
+    /// Pop one element off a list end. Answers the element, or nil for an empty/missing list.
+    ListPop {
+        key: String,
+        left: bool,
+    },
+    /// Inclusive range with Redis index semantics (negatives count from the tail).
+    ListRange {
+        key: String,
+        start: i64,
+        stop: i64,
+    },
+    ListLen {
+        key: String,
+    },
+    SetMembers {
+        key: String,
+    },
+    SetRemove {
+        key: String,
+        #[serde(with = "crate::bytes_serde")]
+        member: Vec<u8>,
+    },
+    FeatureAppend {
+        key: String,
+        points: Vec<FeaturePoint>,
+    },
+    FeatureAppendWithPolicy {
+        key: String,
+        points: Vec<FeaturePoint>,
+        policy: FeatureWritePolicy,
+    },
+    FeatureQuery {
+        key: String,
+        start_ms: u64,
+        end_ms: u64,
+        #[serde(default)]
+        count: Option<usize>,
+    },
+    FeatureQueryFiltered {
+        key: String,
+        start_ms: u64,
+        end_ms: u64,
+        #[serde(default)]
+        count: Option<usize>,
+        #[serde(default)]
+        filters: Vec<FeatureFilter>,
+    },
+    FeatureReplace {
+        key: String,
+        start_ms: u64,
+        end_ms: u64,
+        points: Vec<FeaturePoint>,
+    },
+    FeatureDelete {
+        key: String,
+    },
+    FeatureAggQuery {
+        key: String,
+        start_ms: u64,
+        end_ms: u64,
+        aggregator: String,
+        #[serde(default)]
+        count: Option<usize>,
+    },
+    SequenceAdd {
+        key: String,
+        rows: Vec<SequenceFeatureRow>,
+    },
+    SequenceQuery {
+        key: String,
+        start_ms: u64,
+        end_ms: u64,
+        count: usize,
+        #[serde(default)]
+        filters: Vec<FeatureFilter>,
+    },
+    SequenceBatchQuery {
+        queries: Vec<SequenceQuerySpec>,
+    },
+    ControlStateIncrement {
+        key: String,
+        timestamp_ms: u64,
+        amount: i64,
+    },
+    ControlStateIncrementWithOptions {
+        key: String,
+        timestamp_ms: u64,
+        amount: i64,
+        #[serde(default)]
+        precision_ms: Option<u64>,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
+    },
+    ControlStateChangeAdd {
+        key: String,
+        timestamp_ms: u64,
+        #[serde(with = "crate::bytes_serde")]
+        value: Vec<u8>,
+        #[serde(default)]
+        precision_ms: Option<u64>,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
+    },
+    ControlStateCount {
+        key: String,
+        start_ms: u64,
+        end_ms: u64,
+    },
+    ControlStateQuery {
+        key: String,
+        start_ms: u64,
+        end_ms: u64,
+        aggregator: String,
+    },
+    ControlStateDetail {
+        key: String,
+        start_ms: u64,
+        end_ms: u64,
+        #[serde(default)]
+        count: Option<usize>,
+    },
+    ControlStateSet {
+        family: ControlStateFamily,
+        key: String,
+        timestamp_ms: u64,
+        amount: i64,
+    },
+    ControlStateSetAndGet {
+        family: ControlStateFamily,
+        key: String,
+        timestamp_ms: u64,
+        amount: i64,
+        start_ms: u64,
+        end_ms: u64,
+        aggregator: String,
+    },
+    /// Full-conformance analog of the control_state `HSETANDGET` operator: an
+    /// atomic increment-then-read that additionally supports precision bucketing,
+    /// per-key TTL, and UUID idempotency (dedup within a bounded window so
+    /// at-least-once queue replays do not double-count). `aggregator` accepts the
+    /// same verbs as `ControlStateFamilyQuery`, including `change` (distinct count).
+    ControlStateSetAndGetWithOptions {
+        family: ControlStateFamily,
+        key: String,
+        timestamp_ms: u64,
+        amount: i64,
+        start_ms: u64,
+        end_ms: u64,
+        aggregator: String,
+        #[serde(default)]
+        precision_ms: Option<u64>,
+        #[serde(default)]
+        ttl_ms: Option<u64>,
+        #[serde(default)]
+        uuid: Option<String>,
+    },
+    ControlStateFamilyQuery {
+        family: ControlStateFamily,
+        key: String,
+        start_ms: u64,
+        end_ms: u64,
+        aggregator: String,
+    },
+    #[serde(alias = "control_state_fol_set")]
+    ControlStateSelectionSet {
+        key: String,
+        #[serde(with = "crate::bytes_serde")]
+        value: Vec<u8>,
+        occur_time_ms: u64,
+        ttl_ms: u64,
+        #[serde(alias = "fol_type")]
+        selection_type: ControlStateSelectionType,
+    },
+    #[serde(alias = "control_state_fol_query")]
+    ControlStateSelectionQuery {
+        key: String,
+    },
+    ControlStateManager {
+        key: String,
+        /// Optional manager op-code for `MANAGER` conformance: QUERY(2), FIELD_LIST(5),
+        /// FIELD_COUNT(6), ALL_DATA_VALUE(7). `None` / unknown returns the family summary.
+        #[serde(default)]
+        op_type: Option<String>,
+        /// Exact field keys (timestamp_ms) for QUERY; the second tuple element is unused
+        /// (kept for wire symmetry with the KvPair field_list).
+        #[serde(default)]
+        field_list: Vec<(String, String)>,
+        /// Inclusive range start for FIELD_LIST (timestamp_ms as string).
+        #[serde(default)]
+        start_offset: String,
+        /// Inclusive range end for FIELD_LIST (timestamp_ms as string).
+        #[serde(default)]
+        end_offset: String,
+        /// Select the Distinct (Cpc) family series instead of the default Counter (H) family.
+        #[serde(default, alias = "is_cpc")]
+        is_distinct: bool,
+    },
+    ControlStateDebug {
+        key: String,
+        start_ms: u64,
+        end_ms: u64,
+    },
+    /// Attach an embedding to the node it describes.
+    ///
+    /// Addressed by the node itself rather than by a hash of (tenant, owner, level). That hash
+    /// is one-way: a writer holding a node can compute it, but nothing holding the result can
+    /// get back to the node, so the vector and the record it describes could only ever be
+    /// re-associated by recomputing the hash from the owner. Naming the owner here is what lets
+    /// the vector live on the record it belongs to.
+    /// Vectors for these nodes, read from the nodes themselves.
+    ///
+    /// The counterpart of ContextSetNodeEmbedding: asking by owner is possible because the
+    /// vector lives on the owner. The retired separate rows could never answer this -- they
+    /// were keyed by a hash of (tenant, owner, level), so the caller had to already know each
+    /// owner to rebuild the key, and the reply could not say which owner it came from.
+    ContextQueryNodeEmbeddings {
+        tenant_hash: u64,
+        node_hashes: Vec<u64>,
+    },
+    /// Attachment blob store: start a multi-part upload into the engine-owned blob directory.
+    /// The full original payload of an oversized resource lives here so one TemporalStore holds
+    /// everything -- chunks stay searchable in records while the attachment itself is fetchable
+    /// again by its `temporalstore://resources/{tenant}/{content-hash}` URI.
+    ContextResourceBlobBegin {
+        tenant_hash: u64,
+    },
+    /// Append one part to a staged upload. Parts are sequential against one node.
+    ContextResourceBlobAppend {
+        tenant_hash: u64,
+        upload_token: String,
+        payload_base64: String,
+    },
+    /// Publish a staged upload: content-hash, fsync, rename into place. The resource record
+    /// that carries the returned URI is the commit point; a blob with no record is garbage the
+    /// sweep collects.
+    ContextResourceBlobCommit {
+        tenant_hash: u64,
+        upload_token: String,
+    },
+    /// Single-shot begin+append+commit for payloads that fit one request.
+    ContextResourceBlobPut {
+        tenant_hash: u64,
+        payload_base64: String,
+    },
+    /// Range-read a published blob. `length == 0` means to the end.
+    ContextResourceBlobFetch {
+        uri: String,
+        offset: u64,
+        length: u64,
+    },
+    /// Delete unreferenced blobs older than  for one tenant, plus stale staging
+    /// files. The caller supplies the referenced set from the resource records it holds.
+    ContextResourceBlobSweep {
+        tenant_hash: u64,
+        referenced_content_hashes: Vec<u64>,
+        min_age_ms: u64,
+    },
+    ContextSetNodeEmbedding {
+        tenant_hash: u64,
+        node_hash: u64,
+        model_hash: u64,
+        vector: Vec<f32>,
+        updated_at_ms: u64,
+    },
+    ContextUpsertNode {
+        tenant_hash: u64,
+        /// Boxed: ~208 bytes of a 216-byte variant, and this variant caps the enum.
+        /// Serialises identically to the unboxed field.
+        node: Box<ContextNode>,
+    },
+    ContextGetNode {
+        tenant_hash: u64,
+        node_hash: u64,
+    },
+    ContextGetNodes {
+        tenant_hash: u64,
+        node_hashes: Vec<u64>,
+    },
+    ContextWriteEvent {
+        tenant_hash: u64,
+        node_hash: u64,
+        /// Boxed: 184 bytes of a 208-byte variant, the other one capping the enum.
+        event: Box<ContextEvent>,
+        #[serde(default)]
+        first_write_only: bool,
+        #[serde(default)]
+        cold_storage: bool,
+    },
+    ContextWriteExtractedEvent {
+        tenant_hash: u64,
+        node_hash: u64,
+        /// Boxed because this field decides how wide EVERY command is.
+        ///
+        /// `Command` is as wide as its widest variant, and this variant was the widest at 288
+        /// bytes -- 184 of them this field. Every command everywhere paid for it, including a
+        /// `StringSet` carrying eight bytes. Behind a box the variant is about 112 and the enum
+        /// drops to 216, which is the next widest (`ContextUpsertNode`).
+        ///
+        /// `Box<T>` serialises exactly as `T`, so nothing on disk or on the wire changes.
+        event: Box<ContextEvent>,
+        #[serde(default)]
+        indexes: ContextExtractedEventIndexes,
+        #[serde(default)]
+        first_write_only: bool,
+        #[serde(default)]
+        cold_storage: bool,
+    },
+    ContextQueryEvents {
+        tenant_hash: u64,
+        node_hash: u64,
+        start_time_ms: u64,
+        end_time_ms: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+        #[serde(default)]
+        max_scan: Option<usize>,
+        #[serde(default)]
+        current_valid_only: bool,
+        #[serde(default)]
+        as_of_ms: u64,
+        #[serde(default)]
+        kinds: Vec<u32>,
+        #[serde(default)]
+        statuses: Vec<u32>,
+        #[serde(default)]
+        min_confidence: f32,
+        #[serde(default)]
+        min_importance: f32,
+    },
+    ContextWriteIndexRef {
+        tenant_hash: u64,
+        index_name: String,
+        index_value_hash: u64,
+        #[serde(default)]
+        scope_hash: u64,
+        event_time_ms: u64,
+        index_ref: ContextIndexRef,
+    },
+    ContextQueryIndex {
+        tenant_hash: u64,
+        index_name: String,
+        index_value_hash: u64,
+        #[serde(default)]
+        scope_hash: u64,
+        start_time_ms: u64,
+        end_time_ms: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    ContextQueryIndexIntersection {
+        tenant_hash: u64,
+        predicates: Vec<ContextIndexLookup>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    ContextWritePackAudit {
+        tenant_hash: u64,
+        audit: ContextPackAudit,
+    },
+    ContextQueryPackAudit {
+        tenant_hash: u64,
+        session_hash: u64,
+        start_time_ms: u64,
+        end_time_ms: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    ContextMarkSummaryDirty {
+        tenant_hash: u64,
+        node_hash: u64,
+        event_time_ms: u64,
+        #[serde(default)]
+        reason: u32,
+        #[serde(default)]
+        propagate_depth: u32,
+    },
+    ContextQuerySummaryDirty {
+        tenant_hash: u64,
+        node_hash: u64,
+        start_time_ms: u64,
+        end_time_ms: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    // Embedding-dirty marker trio. Fully independent of the summary-dirty trio
+    // above (key `ctx:embdirty:{tenant}:{node}`): a node can be embedding-dirty
+    // without being summary-dirty and vice-versa. Marks nodes whose semantic
+    // embedding is deferred (raw-first bulk ingest) or failed (live-path provider
+    // error) so the async embed drainer can attach vectors later. `clear` turns
+    // the mark command into a per-node clear (used by the drainer once a node is
+    // successfully embedded); the marker struct is reused only as a lightweight
+    // {node_hash, event_time_ms} carrier.
+    ContextMarkEmbeddingDirty {
+        tenant_hash: u64,
+        node_hash: u64,
+        event_time_ms: u64,
+        #[serde(default)]
+        reason: u32,
+        #[serde(default)]
+        propagate_depth: u32,
+        #[serde(default)]
+        clear: bool,
+    },
+    ContextQueryEmbeddingDirty {
+        tenant_hash: u64,
+        // node_hash == 0 means "all pending embedding-dirty nodes for this shard"
+        // (the drainer's O(pending) scan). A non-zero node_hash queries one node.
+        node_hash: u64,
+        start_time_ms: u64,
+        end_time_ms: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    ContextUpsertEntity {
+        tenant_hash: u64,
+        entity: ContextEntity,
+    },
+    ContextGetEntity {
+        tenant_hash: u64,
+        node_hash: u64,
+        entity_hash: u64,
+    },
+    ContextQueryEntities {
+        tenant_hash: u64,
+        node_hash: u64,
+        entity_hashes: Vec<u64>,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    ContextUpsertChildRef {
+        tenant_hash: u64,
+        child_ref: ContextChildRef,
+    },
+    ContextQueryChildren {
+        tenant_hash: u64,
+        parent_hash: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    ContextTraverseTree {
+        tenant_hash: u64,
+        start_node_hash: u64,
+        query_vector: Vec<f32>,
+        #[serde(default)]
+        max_depth: Option<u32>,
+        #[serde(default)]
+        top_k_per_depth: Option<usize>,
+        #[serde(default)]
+        max_children_scored_per_parent: Option<usize>,
+        #[serde(default)]
+        max_candidate_nodes: Option<usize>,
+        #[serde(default)]
+        leaf_only: bool,
+    },
+    ContextUpsertSummary {
+        tenant_hash: u64,
+        summary: ContextSummary,
+    },
+    ContextQuerySummaries {
+        tenant_hash: u64,
+        node_hash: u64,
+        level: u32,
+        as_of_ms: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    /// The newest summary VECTOR at `level` for each node, in one command.
+    ///
+    /// Retrieval scores every candidate node's summaries; per-node ContextQuerySummaries would
+    /// turn that into a command per candidate, and the whole summary payload when only the
+    /// vector is wanted. This returns exactly the scoring input, batched like ContextGetNodes.
+    ContextQuerySummaryVectors {
+        tenant_hash: u64,
+        node_hashes: Vec<u64>,
+        level: u32,
+        as_of_ms: u64,
+    },
+    ContextWriteCompressionEvent {
+        tenant_hash: u64,
+        event: ContextCompressionEvent,
+    },
+    ContextQueryCompressionEvents {
+        tenant_hash: u64,
+        node_hashes: Vec<u64>,
+        start_time_ms: u64,
+        end_time_ms: u64,
+        #[serde(default)]
+        limit: Option<usize>,
+    },
+    ContextCompressEvents {
+        tenant_hash: u64,
+        node_hash: u64,
+        source_start_ms: u64,
+        source_end_ms: u64,
+        compressed_time_ms: u64,
+        #[serde(default)]
+        max_source_events: Option<usize>,
+        #[serde(default)]
+        min_confidence: f32,
+        #[serde(default)]
+        min_importance: f32,
+    },
+    ContextQueryNodeContext {
+        tenant_hash: u64,
+        node_hash: u64,
+        #[serde(default)]
+        summary_level: Option<u32>,
+        as_of_ms: u64,
+        #[serde(default)]
+        cold_start_time_ms: u64,
+        #[serde(default)]
+        cold_end_time_ms: u64,
+        #[serde(default)]
+        compression_limit: Option<usize>,
+    },
+}
+
+/// Field number carrying the inline embedding vector on ContextEvent/Entity/Summary.
+///
+/// These three types have HAND-WRITTEN protobuf codecs; a serde field alone is invisible to
+/// them and is silently dropped on persist -- the struct is populated in memory and the value
+/// is gone by the time it reaches a page, with no error anywhere. 20 is clear of every field
+/// number the three messages already use.
+/// A node's vector, without decoding the node.
+///
+/// The traversal scores candidates on this one field. Decoding the whole record to read it
+/// allocates every string and the summary vector as well, for a candidate that usually loses.
+///
+/// Scanning continues past a match on purpose: the full decoder assigns to `vector` on each
+/// vector field it meets, so the last encoding present is the one that wins. Stopping at the
+/// first would disagree with it on any record carrying more than one.
+pub(crate) fn decode_context_node_vector(bytes: &[u8]) -> Option<Vec<f32>> {
+    let mut cursor = 0;
+    let mut found: Option<Vec<f32>> = None;
+    while cursor < bytes.len() {
+        let tag = decode_varint(bytes, &mut cursor)?;
+        match (tag >> 3, tag & 0x7) {
+            (CONTEXT_VECTOR_FIELD, 2) => {
+                found = Some(unpack_f32_vector(decode_bytes_ref(bytes, &mut cursor)?));
+            }
+            (CONTEXT_VECTOR_INT8_FIELD, 2) => {
+                found = Some(unpack_i8_vector(decode_bytes_ref(bytes, &mut cursor)?));
+            }
+            (CONTEXT_VECTOR_SCALED_FIELD, 2) => {
+                found = Some(unpack_scaled_vector(decode_bytes_ref(bytes, &mut cursor)?));
+            }
+            (_, wire_type) => skip_proto_field(bytes, &mut cursor, wire_type)?,
+        }
+    }
+    found
+}
+
+const CONTEXT_VECTOR_FIELD: u64 = 20;
+// Which model produced the inline vector, and when. Both travelled with the separate
+// embedding record; an owner carrying a vector without them cannot say whether the vector
+// is still from the model in use. Numbered above the per-record fields so they stay clear
+// of the low tags each record type assigns for itself.
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+const CONTEXT_EMBEDDING_MODEL_FIELD: u64 = 21;
+const CONTEXT_EMBEDDING_UPDATED_FIELD: u64 = 22;
+/// Uniformly-scaled integer vectors. Their own field, like the int8 form, so a decoder knows
+/// which representation it holds from the tag and a store containing several reads end to end.
+const CONTEXT_VECTOR_SCALED_FIELD: u64 = 24;
+/// Multiplier for the scaled form. Every element of every vector is scaled by the SAME constant,
+/// which is what makes the encoding rank-preserving: cosine is invariant under a uniform scale,
+/// so no two stored vectors can change places against a query. 1e4 keeps four decimal places,
+/// which on unit vectors (elements around 0.04) is ~0.1% of an element.
+const VECTOR_SCALE: f32 = 1.0e4;
+
+/// Quantized vector, self-contained: `[f32 LE scale][one i8 per dimension]`.
+///
+/// The scale rides inside the same length-delimited field rather than beside it, so each decoder
+/// needs one arm and no cross-field state -- protobuf does not order fields, and a "wait for the
+/// other half" dance in four separate loops is four chances to leave a vector empty.
+///
+/// A record carries EITHER this or `CONTEXT_VECTOR_FIELD`, never both.
+const CONTEXT_VECTOR_INT8_FIELD: u64 = 23;
+
+/// The node's copy of its L1 summary vector, in the same three representations the record's own
+/// vector has. Its own field numbers rather than a second use of 20/23/24, because a node now
+/// carries TWO vectors and protobuf tells one value from another only by its tag -- reusing the
+/// tag would make the second write overwrite the first on decode, with no error and no length
+/// mismatch to notice.
+const CONTEXT_SUMMARY_VECTOR_FIELD: u64 = 25;
+const CONTEXT_SUMMARY_VECTOR_INT8_FIELD: u64 = 26;
+const CONTEXT_SUMMARY_VECTOR_SCALED_FIELD: u64 = 27;
+/// `valid_from_ms` of the summary the copy came from, without which the copy cannot be used at
+/// all: it says which point in time the vector is the newest summary FOR.
+const CONTEXT_SUMMARY_VECTOR_VALID_FROM_FIELD: u64 = 28;
+/// Written in place of 25/26/27 when the copy is byte-equal to the record's own vector, which is
+/// what the current ingest produces: it embeds ONE text and gives the result to both the node and
+/// its L1 summary. Storing the duplicate would add a whole vector -- 4 KB at 1024 f32 dimensions,
+/// on every node -- to say something a single varint says.
+///
+/// Resolved after the decode loop, not inside it: protobuf does not order fields, so the marker
+/// can arrive before the vector it points at.
+const CONTEXT_SUMMARY_VECTOR_SAME_FIELD: u64 = 29;
+/// Which encoder produced the copy. Travels with it or the copy is the one scored vector nothing
+/// checks the encoder of.
+const CONTEXT_SUMMARY_VECTOR_MODEL_FIELD: u64 = 30;
+
+/// The three tags one vector may be written under, so a record carrying two vectors can encode
+/// and decode both through one implementation instead of two that drift apart.
+struct VectorFieldSet {
+    plain: u64,
+    int8: u64,
+    scaled: u64,
+}
+
+const OWN_VECTOR_FIELDS: VectorFieldSet = VectorFieldSet {
+    plain: CONTEXT_VECTOR_FIELD,
+    int8: CONTEXT_VECTOR_INT8_FIELD,
+    scaled: CONTEXT_VECTOR_SCALED_FIELD,
+};
+
+const NODE_SUMMARY_VECTOR_FIELDS: VectorFieldSet = VectorFieldSet {
+    plain: CONTEXT_SUMMARY_VECTOR_FIELD,
+    int8: CONTEXT_SUMMARY_VECTOR_INT8_FIELD,
+    scaled: CONTEXT_SUMMARY_VECTOR_SCALED_FIELD,
+};
+
+/// f32 vector -> packed little-endian bytes. Explicit LE, not native, so a page written on one
+/// architecture decodes on another.
+fn pack_f32_vector(vector: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vector.len() * 4);
+    for value in vector {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+/// Whether new writes store the quantized form. Default OFF; reading understands both regardless,
+/// so this can be turned on and off without stranding anything already written.
+fn vector_int8_enabled() -> bool {
+    matches!(
+        std::env::var("TS_VECTOR_INT8")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "yes" | "on"
+    )
+}
+
+/// A vector as it will read back once it has been through a page.
+///
+/// Both stored forms round -- the int8 one to a per-vector scale, the uniformly-scaled one to four
+/// decimal places -- so a vector just computed is never equal to the same vector read back. Any
+/// "has this changed?" test written against the raw value answers YES every time, and any "are
+/// these two the same vector?" test answers NO, which here would mean a second node page written
+/// on every ingest and the equal-copy marker never firing.
+///
+/// Idempotent: rounding an already-rounded value changes nothing, so this can be applied to a
+/// value of either origin.
+pub(crate) fn context_vector_as_stored(vector: &[f32]) -> Vec<f32> {
+    if vector.is_empty() {
+        return Vec::new();
+    }
+    if vector_int8_enabled() {
+        return unpack_i8_vector(&pack_i8_vector(vector));
+    }
+    if vector_scaled_enabled() {
+        return unpack_scaled_vector(&pack_scaled_vector(vector));
+    }
+    vector.to_vec()
+}
+
+/// Whether a node record carries a copy of its L1 summary's vector.
+///
+/// Default ON, and only writes consult it: a node either carries a copy or it does not, and one
+/// that does not is looked up from the summary records exactly as before. So turning this off
+/// strands nothing already written, and turning it back on needs no backfill -- the copy reappears
+/// as each node's summary is next written.
+pub(crate) fn context_node_summary_vector_enabled() -> bool {
+    !matches!(
+        std::env::var("TS_NODE_SUMMARY_VECTOR")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// Symmetric per-vector int8, scale first: `scale = max|v| / 127`, then `round(v / scale)`.
+///
+/// Measured on real BGE-M3 vectors at 1024 dims: reconstruction cosine min 0.999868 and recall@1
+/// drop 0.0000 against the same f32 vectors, at 3.98x smaller.
+fn pack_i8_vector(vector: &[f32]) -> Vec<u8> {
+    let peak = vector.iter().fold(0.0_f32, |acc, value| acc.max(value.abs()));
+    let scale = if peak == 0.0 { 0.0 } else { peak / 127.0 };
+    let mut out = Vec::with_capacity(4 + vector.len());
+    out.extend_from_slice(&scale.to_le_bytes());
+    if scale == 0.0 {
+        out.extend(std::iter::repeat(0_u8).take(vector.len()));
+        return out;
+    }
+    for value in vector {
+        let q = (value / scale).round().clamp(-127.0, 127.0) as i8;
+        out.push(q as u8);
+    }
+    out
+}
+
+/// Dequantize and RENORMALIZE.
+///
+/// A dequantized unit vector is no longer unit, and the retrieve path compares raw cosines, so
+/// returning it unnormalized would bias every affected score downward.
+fn unpack_i8_vector(bytes: &[u8]) -> Vec<f32> {
+    if bytes.len() < 4 {
+        return Vec::new();
+    }
+    let scale = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let mut out: Vec<f32> = bytes[4..]
+        .iter()
+        .map(|byte| (*byte as i8) as f32 * scale)
+        .collect();
+    let norm = out.iter().map(|value| value * value).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in out.iter_mut() {
+            *value /= norm;
+        }
+    }
+    out
+}
+
+fn unpack_f32_vector(bytes: &[u8]) -> Vec<f32> {
+    bytes
+        .chunks_exact(4)
+        .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+        .collect()
+}
+
+/// Whether new writes store the uniformly-scaled form. Default ON: it halves the bytes of a
+/// vector while leaving the ranking IDENTICAL, which the per-vector int8 form does not.
+///
+/// Measured over 713 chunks of real documentation, e5-large at 512 dims, 8 bilingual queries,
+/// scored through the normalized cosine and compared against the float ordering:
+///
+///   encoding              bytes   top-1   exact top-10 order
+///   float32               2048     8/8          8/8
+///   int8 (per-vector)      516     7/8          3/8
+///   scale=1e4 (uniform)   1024     8/8          8/8
+///
+/// Reading never consults this -- a vector is decoded by the field carrying it -- so turning it
+/// off again strands nothing. `TS_VECTOR_SCALED` opts OUT.
+fn vector_scaled_enabled() -> bool {
+    !matches!(
+        std::env::var("TS_VECTOR_SCALED")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "0" | "false" | "no" | "off"
+    )
+}
+
+/// f32 vector -> zigzag varints of `round(v * VECTOR_SCALE)`.
+///
+/// A UNIFORM multiplier, unlike the int8 form's per-vector peak. That difference is the whole
+/// point: scaling every vector by the same constant cannot reorder two of them against a query,
+/// because cosine divides the scale back out. Dividing each vector by its own peak can, and
+/// measurably does.
+fn pack_scaled_vector(vector: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vector.len() * 2);
+    for value in vector {
+        let scaled = (value * VECTOR_SCALE).round() as i64;
+        // zigzag so small negatives stay one or two bytes
+        encode_varint(&mut out, ((scaled << 1) ^ (scaled >> 63)) as u64);
+    }
+    out
+}
+
+/// How many values the encoding holds, without decoding them.
+///
+/// The varints are variable-width, so the count cannot be had from `bytes.len()`. Walking them
+/// allocates nothing, and it is what lets the vector be sized exactly rather than grown.
+fn count_scaled_vector_values(bytes: &[u8]) -> usize {
+    let mut count = 0;
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        if decode_varint(bytes, &mut cursor).is_none() {
+            break;
+        }
+        count += 1;
+    }
+    count
+}
+
+fn unpack_scaled_vector(bytes: &[u8]) -> Vec<f32> {
+    // Sized before filling. Growing from empty costs a reallocation every time the capacity
+    // doubles -- eight of them at 384 dimensions, each copying everything written so far, and this
+    // is the default storage form, so it is what a decode actually does. Counting first is a scan
+    // and no allocation.
+    //
+    // Exactly, not generously: these vectors live on records the store keeps resident, so slack
+    // capacity would be paid in memory for as long as the node is cached, not just during the
+    // decode.
+    let mut out = Vec::with_capacity(count_scaled_vector_values(bytes));
+    let mut cursor = 0;
+    while cursor < bytes.len() {
+        let Some(raw) = decode_varint(bytes, &mut cursor) else {
+            break;
+        };
+        let value = ((raw >> 1) as i64) ^ -((raw & 1) as i64);
+        out.push(value as f32 / VECTOR_SCALE);
+    }
+    out
+}
+
+fn encode_vector_field_as(out: &mut Vec<u8>, fields: &VectorFieldSet, vector: &[f32]) {
+    if vector.is_empty() {
+        return;
+    }
+    if vector_int8_enabled() {
+        encode_bytes_field(out, fields.int8, &pack_i8_vector(vector));
+        return;
+    }
+    if vector_scaled_enabled() {
+        encode_bytes_field(out, fields.scaled, &pack_scaled_vector(vector));
+        return;
+    }
+    encode_bytes_field(out, fields.plain, &pack_f32_vector(vector));
+}
+
+fn encode_vector_field(out: &mut Vec<u8>, vector: &[f32]) {
+    encode_vector_field_as(out, &OWN_VECTOR_FIELDS, vector);
+}
+
+fn encode_varint_field(out: &mut Vec<u8>, field_number: u64, value: u64) {
+    encode_varint(out, field_number << 3);
+    encode_varint(out, value);
+}
+
+fn encode_fixed32_field(out: &mut Vec<u8>, field_number: u64, value: u32) {
+    encode_varint(out, (field_number << 3) | 5);
+    out.extend(value.to_le_bytes());
+}
+
+fn encode_bytes_field(out: &mut Vec<u8>, field_number: u64, value: &[u8]) {
+    if value.is_empty() {
+        return;
+    }
+    encode_varint(out, (field_number << 3) | 2);
+    encode_varint(out, value.len() as u64);
+    out.extend(value);
+}
+
+fn encode_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        out.push((value as u8) | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+fn decode_varint(bytes: &[u8], cursor: &mut usize) -> Option<u64> {
+    let mut value = 0_u64;
+    for shift in (0..64).step_by(7) {
+        let byte = *bytes.get(*cursor)?;
+        *cursor += 1;
+        value |= u64::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn decode_fixed32(bytes: &[u8], cursor: &mut usize) -> Option<u32> {
+    let end = cursor.checked_add(4)?;
+    let slice = bytes.get(*cursor..end)?;
+    *cursor = end;
+    Some(u32::from_le_bytes(slice.try_into().ok()?))
+}
+
+/// The field's bytes, borrowed from the page rather than copied out of it.
+///
+/// A caller that reads the bytes and builds something else from them -- every `unpack_*` vector
+/// call -- has no use for an owned copy, and copying costs an allocation that is dropped at the end
+/// of the statement. Decoding is the larger half of a node fetch, and a fetch happens once per
+/// retrieval candidate, so a copy per vector field is a copy per candidate.
+fn decode_bytes_ref<'a>(bytes: &'a [u8], cursor: &mut usize) -> Option<&'a [u8]> {
+    let len = usize::try_from(decode_varint(bytes, cursor)?).ok()?;
+    let end = cursor.checked_add(len)?;
+    let slice = bytes.get(*cursor..end)?;
+    *cursor = end;
+    Some(slice)
+}
+
+/// The field's bytes, owned. For callers that keep them -- `decode_string` hands the Vec straight
+/// to `String::from_utf8`, which takes ownership, so that path is already a single allocation.
+fn decode_bytes(bytes: &[u8], cursor: &mut usize) -> Option<Vec<u8>> {
+    Some(decode_bytes_ref(bytes, cursor)?.to_vec())
+}
+
+fn decode_string(bytes: &[u8], cursor: &mut usize) -> Option<String> {
+    String::from_utf8(decode_bytes(bytes, cursor)?).ok()
+}
+
+fn skip_proto_field(bytes: &[u8], cursor: &mut usize, wire_type: u64) -> Option<()> {
+    match wire_type {
+        0 => {
+            let _ = decode_varint(bytes, cursor)?;
+        }
+        1 => *cursor = cursor.checked_add(8)?,
+        2 => {
+            let len = usize::try_from(decode_varint(bytes, cursor)?).ok()?;
+            *cursor = cursor.checked_add(len)?;
+        }
+        5 => *cursor = cursor.checked_add(4)?,
+        _ => return None,
+    }
+    (*cursor <= bytes.len()).then_some(())
+}
+
+/// Serialize an optional payload as a msgpack byte string, and read back either spelling.
+///
+/// WHY NOT `serde_bytes`: it is not in the lock, and this is a dozen lines that keeps both halves
+/// of the encode/decode pairing inside this repo -- `CachedBytes` in `command_validation` mirrors
+/// the same field and has to carry the same annotation, which is easier to keep true when the
+/// codec is visible here.
+///
+/// THE DESERIALIZER ACCEPTS THE OLD INTEGER ARRAY as well as a byte string. The entries this
+/// encodes live only in the cache's memory tier and do not survive a restart, so a mixed-encoding
+/// cache cannot actually arise -- but accepting both costs one visitor method and turns the
+/// compatibility direction into something a test can assert rather than something to reason about.
+pub(crate) mod cached_payload_bytes {
+    pub fn serialize<S>(value: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        struct AsBytes<'a>(&'a [u8]);
+        impl serde::Serialize for AsBytes<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                serializer.serialize_bytes(self.0)
+            }
+        }
+        match value {
+            Some(bytes) => serializer.serialize_some(&AsBytes(bytes)),
+            None => serializer.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct Payload;
+        impl<'de> serde::de::Visitor<'de> for Payload {
+            type Value = Vec<u8>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a byte string, or a sequence of byte-valued integers")
+            }
+            fn visit_bytes<E: serde::de::Error>(self, value: &[u8]) -> Result<Vec<u8>, E> {
+                Ok(value.to_vec())
+            }
+            fn visit_byte_buf<E: serde::de::Error>(self, value: Vec<u8>) -> Result<Vec<u8>, E> {
+                Ok(value)
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Vec<u8>, E> {
+                Ok(value.as_bytes().to_vec())
+            }
+            // THE OLD SPELLING. An array of integers is what the derive wrote before this module,
+            // and what any other msgpack producer of this shape would write.
+            fn visit_seq<A>(self, mut seq: A) -> Result<Vec<u8>, A::Error>
+            where
+                A: serde::de::SeqAccess<'de>,
+            {
+                let mut out = Vec::with_capacity(seq.size_hint().unwrap_or_default());
+                while let Some(byte) = seq.next_element::<u8>()? {
+                    out.push(byte);
+                }
+                Ok(out)
+            }
+        }
+
+        struct MaybePayload;
+        impl<'de> serde::de::Visitor<'de> for MaybePayload {
+            type Value = Option<Vec<u8>>;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("an optional payload")
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Option<Vec<u8>>, E> {
+                Ok(None)
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Option<Vec<u8>>, E> {
+                Ok(None)
+            }
+            fn visit_some<D: serde::Deserializer<'de>>(
+                self,
+                deserializer: D,
+            ) -> Result<Option<Vec<u8>>, D::Error> {
+                // `deserialize_any`, because msgpack is self-describing and the point is to accept
+                // whichever of the two spellings is present.
+                deserializer.deserialize_any(Payload).map(Some)
+            }
+        }
+        deserializer.deserialize_option(MaybePayload)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CommandResponse {
+    Empty,
+    Bytes {
+        /// Encoded as a msgpack BYTE STRING, not an array of integers.
+        ///
+        /// Left to the derive, `rmp_serde` writes a `Vec<u8>` element by element: a byte below
+        /// 0x80 is a positive fixint and costs one byte, a byte at or above it takes a uint8
+        /// marker and costs TWO. The inflation therefore depends on the payload's byte
+        /// distribution -- 1.0x for ASCII, ~1.5x for uniform random bytes, 2.0x worst case -- and
+        /// the cached response is what pays it. Measured at 2,000 keys x 1 KiB: 4,138,000 B for a
+        /// run of `b'v'` (0x76) against 5,161,820 B for incompressible noise.
+        ///
+        /// `b'v'` is below the line, where the toll is exactly zero, which is why every fixture in
+        /// this area had seen 1.0x and the toll went unpriced.
+        ///
+        /// SISTER VARIANTS STILL PAY IT. `Members` and `Values` carry bulk payloads through
+        /// `Vec<Vec<u8>>` and `Vec<Option<Vec<u8>>>`; a field-level annotation does not reach
+        /// inside a container, so they need their own wrapper and are deliberately unchanged.
+        #[serde(with = "cached_payload_bytes")]
+        value: Option<Vec<u8>>,
+    },
+    Integer {
+        value: i64,
+    },
+    Members {
+        members: Vec<Vec<u8>>,
+    },
+    Values {
+        values: Vec<Option<Vec<u8>>>,
+    },
+    HashEntries {
+        entries: Vec<(String, Vec<u8>)>,
+    },
+    FeaturePoints {
+        points: Vec<FeaturePoint>,
+    },
+    FeaturePointGroups {
+        groups: Vec<(String, Vec<FeaturePoint>)>,
+    },
+    Aggregate {
+        value: i64,
+    },
+    SequenceRows {
+        rows: Vec<SequenceFeatureRow>,
+    },
+    SequenceRowGroups {
+        groups: Vec<(String, Vec<SequenceFeatureRow>)>,
+    },
+    ContextNode {
+        object_key: String,
+        node: Option<ContextNode>,
+    },
+    ContextNodes {
+        nodes: Vec<ContextNode>,
+    },
+    ContextObjectKey {
+        object_key: String,
+    },
+    ContextExtractedEventWrite {
+        event_object_key: String,
+        index_object_keys: Vec<String>,
+        written_index_count: usize,
+    },
+    ContextEvents {
+        object_key: String,
+        events: Vec<ContextEvent>,
+    },
+    ContextIndexRefs {
+        object_key: String,
+        refs: Vec<ContextIndexRef>,
+    },
+    ContextIndexIntersection {
+        refs: Vec<ContextIndexRef>,
+        matched_index_count: usize,
+        scanned_ref_count: usize,
+        deduped_ref_count: usize,
+    },
+    ContextPackAudits {
+        object_key: String,
+        audits: Vec<ContextPackAudit>,
+    },
+    ContextSummaryDirtyNodes {
+        object_key: String,
+        nodes: Vec<ContextDirtyNode>,
+    },
+    // Response for ContextQueryEmbeddingDirty. Mirrors ContextSummaryDirtyNodes
+    // but adds a `tenant_hashes` vector parallel to `markers`: the all-pending scan
+    // (node_hash == 0) spans every tenant on the shard, so the drainer needs each
+    // marker's tenant to compute its embedding ref-hash and read its events. In the
+    // single-node per-node query `tenant_hashes` may be empty (the caller already
+    // knows the tenant it asked for).
+    ContextEmbeddingDirtyNodes {
+        object_key: String,
+        nodes: Vec<ContextDirtyNode>,
+        #[serde(default)]
+        tenant_hashes: Vec<u64>,
+    },
+    ContextEntity {
+        object_key: String,
+        entity: Option<ContextEntity>,
+    },
+    ContextEntities {
+        object_key: String,
+        entities: Vec<ContextEntity>,
+    },
+    ContextChildRefs {
+        object_key: String,
+        refs: Vec<ContextChildRef>,
+        #[serde(default)]
+        created: Option<bool>,
+    },
+    /// (node_hash, vector) pairs -- nodes with no vector of their own are omitted, so a caller
+    /// can tell "not embedded yet" from "embedded to the zero vector".
+    ContextNodeEmbeddings {
+        embeddings: Vec<(u64, Vec<f32>)>,
+    },
+    ContextTraversedNodes {
+        nodes: Vec<ContextTraversedNode>,
+        /// Children skipped by the per-parent cap before any scoring. Non-zero
+        /// means this result is bounded by the cap and not by relevance, which a
+        /// caller cannot otherwise tell from a genuinely thin tree.
+        #[serde(default)]
+        children_dropped_before_scoring: usize,
+    },
+    ContextSummaries {
+        object_key: String,
+        summaries: Vec<ContextSummary>,
+    },
+    ContextSummaryVectors {
+        vectors: Vec<ContextSummaryVector>,
+    },
+    ContextCompressionEvents {
+        object_key: String,
+        events: Vec<ContextCompressionEvent>,
+        #[serde(default)]
+        source_event_count: Option<u32>,
+        #[serde(default)]
+        truncated_source_events: Option<bool>,
+    },
+    ContextResourceBlobUpload {
+        upload_token: String,
+        bytes_total: u64,
+    },
+    ContextResourceBlobCommitted {
+        uri: String,
+        size_bytes: u64,
+        content_hash: u64,
+    },
+    ContextResourceBlobChunk {
+        payload_base64: String,
+        total_size: u64,
+        eof: bool,
+    },
+    ContextResourceBlobSwept {
+        scanned: u64,
+        deleted: u64,
+    },
+    ContextNodeContext {
+        node_exists: bool,
+        node: Option<ContextNode>,
+        overall_summary_exists: bool,
+        overall_summary: Option<ContextSummary>,
+        cold_window_summaries: Vec<ContextCompressionEvent>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecuteRequest {
+    pub shard_id: ShardId,
+    pub command: Command,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ExecuteResponse {
+    pub status: Status,
+    pub response: CommandResponse,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EventReplicationMode {
+    #[default]
+    Inherit,
+    AsyncStorage,
+    SyncStorage,
+    Raft,
+}
+
+impl EventReplicationMode {
+    pub fn requires_restart(self) -> bool {
+        false
+    }
+
+    pub fn is_explicit(self) -> bool {
+        self != Self::Inherit
+    }
+}
+
+impl ExecuteRequest {
+    pub fn with_replication_mode(
+        self,
+        replication_mode: EventReplicationMode,
+    ) -> ReplicatedExecuteRequest {
+        ReplicatedExecuteRequest {
+            shard_id: self.shard_id,
+            command: self.command,
+            replication_mode,
+        }
+    }
+
+    pub fn with_async_storage(self) -> ReplicatedExecuteRequest {
+        self.with_replication_mode(EventReplicationMode::AsyncStorage)
+    }
+
+    pub fn with_sync_storage(self) -> ReplicatedExecuteRequest {
+        self.with_replication_mode(EventReplicationMode::SyncStorage)
+    }
+
+    pub fn with_raft(self) -> ReplicatedExecuteRequest {
+        self.with_replication_mode(EventReplicationMode::Raft)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EventReplicationSelectionReport {
+    pub requested_mode: EventReplicationMode,
+    pub effective_mode: EventReplicationMode,
+    pub write_command: bool,
+    pub accepted: bool,
+    pub restart_required: bool,
+    pub reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplicatedExecuteRequest {
+    pub shard_id: ShardId,
+    pub command: Command,
+    #[serde(default)]
+    pub replication_mode: EventReplicationMode,
+}
+
+impl ReplicatedExecuteRequest {
+    pub fn new(
+        shard_id: ShardId,
+        command: Command,
+        replication_mode: EventReplicationMode,
+    ) -> Self {
+        Self {
+            shard_id,
+            command,
+            replication_mode,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplicatedCommand {
+    pub command: Command,
+    #[serde(default)]
+    pub replication_mode: EventReplicationMode,
+}
+
+impl ReplicatedCommand {
+    pub fn new(command: Command, replication_mode: EventReplicationMode) -> Self {
+        Self {
+            command,
+            replication_mode,
+        }
+    }
+
+    pub fn async_storage(command: Command) -> Self {
+        Self::new(command, EventReplicationMode::AsyncStorage)
+    }
+
+    pub fn sync_storage(command: Command) -> Self {
+        Self::new(command, EventReplicationMode::SyncStorage)
+    }
+
+    pub fn raft(command: Command) -> Self {
+        Self::new(command, EventReplicationMode::Raft)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplicatedBatchExecuteRequest {
+    pub shard_id: ShardId,
+    pub commands: Vec<ReplicatedCommand>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ReplicatedBatchExecuteResponse {
+    pub status: Status,
+    pub responses: Vec<ExecuteResponse>,
+    pub replication: Vec<EventReplicationSelectionReport>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BatchExecuteRequest {
+    pub shard_id: ShardId,
+    pub commands: Vec<Command>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BatchExecuteResponse {
+    pub status: Status,
+    pub responses: Vec<ExecuteResponse>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+
+    /// Sets TS_VECTOR_INT8 and restores it ON DROP, so a failing assertion cannot leave it set for
+    /// every test that runs after it in the same process.
+    struct Int8Flag(Option<String>);
+
+    impl Int8Flag {
+        fn on() -> Self {
+            let previous = std::env::var("TS_VECTOR_INT8").ok();
+            std::env::set_var("TS_VECTOR_INT8", "1");
+            Int8Flag(previous)
+        }
+    }
+
+    impl Drop for Int8Flag {
+        fn drop(&mut self) {
+            match self.0.take() {
+                Some(value) => std::env::set_var("TS_VECTOR_INT8", value),
+                None => std::env::remove_var("TS_VECTOR_INT8"),
+            }
+        }
+    }
+
+    /// Reading only the vector must give what reading everything gives.
+    ///
+    /// Checked across the encodings a record can actually carry, because the partial decoder
+    /// skips fields by wire type and a mistake there returns a plausible-looking vector rather
+    /// than an error. Compared against the full decoder on the same bytes -- the thing it is
+    /// standing in for -- rather than against the input vector, which would not catch a decoder
+    /// that agreed with itself.
+    #[test]
+    fn vector_only_decode_agrees_with_the_full_decode() {
+        let vector: Vec<f32> = (0..48).map(|i| (i as f32 / 48.0) - 0.5).collect();
+
+        for (label, var, value) in [
+            ("f32", "TS_VECTOR_SCALED", "0"),
+            ("scaled", "TS_VECTOR_SCALED", "1"),
+            ("int8", "TS_VECTOR_INT8", "1"),
+        ] {
+            // SAFETY: single-threaded test process.
+            unsafe { std::env::set_var(var, value) };
+            let node = int8_node(7, vector.clone());
+            let bytes = node.encode_context_proto_value();
+            unsafe { std::env::remove_var(var) };
+
+            let full = ContextNode::decode_context_proto_value(&bytes)
+                .unwrap_or_else(|| panic!("{label}: the full decode must succeed"));
+            let partial = decode_context_node_vector(&bytes)
+                .unwrap_or_else(|| panic!("{label}: the vector-only decode must find a vector"));
+
+            assert!(!full.vector.is_empty(), "{label}: the record must carry a vector");
+            assert_eq!(
+                partial, full.vector,
+                "{label}: reading only the vector disagreed with reading everything"
+            );
+        }
+    }
+
+    /// A record with no vector reports none, rather than an empty one that scores as a match.
+    #[test]
+    fn vector_only_decode_reports_absence() {
+        let node = int8_node(9, Vec::new());
+        let bytes = node.encode_context_proto_value();
+        let full = ContextNode::decode_context_proto_value(&bytes).expect("decodes");
+        assert!(full.vector.is_empty(), "the record carries no vector");
+        assert!(
+            decode_context_node_vector(&bytes).map_or(true, |v| v.is_empty()),
+            "a record with no vector must not yield one"
+        );
+    }
+
+    fn int8_node(node_hash: u64, vector: Vec<f32>) -> ContextNode {
+        ContextNode {
+            node_hash,
+            parent_hash: 0,
+            kind: 1,
+            canonical_name: "session/int8".to_string(),
+            l0: "int8 wire test".to_string(),
+            last_event_time_ms: 1_780_000_000_000,
+            vector,
+            embedding_model_hash: 0xABCD,
+            embedding_updated_at_ms: 1_780_000_000_001,
+            summary_vector: Vec::new(),
+            summary_vector_valid_from_ms: 0,
+            summary_vector_model_hash: 0,
+            status: 0,
+            l1_ref: String::new(),
+            raw_metadata_ref: String::new(),
+        }
+    }
+
+    fn int8_unit_vector(dim: usize, seed: u64) -> Vec<f32> {
+        let mut state = seed | 1;
+        let mut raw: Vec<f32> = (0..dim)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((state >> 33) as f32 / (u32::MAX as f32 / 2.0)) - 1.0
+            })
+            .collect();
+        let norm = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
+        for v in raw.iter_mut() {
+            *v /= norm;
+        }
+        raw
+    }
+
+    fn int8_cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let nb = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            0.0
+        } else {
+            dot / (na * nb)
+        }
+    }
+
+    #[test]
+    fn int8_off_round_trips_exactly() {
+        // Pins the F32 path, which is exact. It used to be reached by turning int8 off; the
+        // default write path is now the uniformly-scaled form, so this names the path it means
+        // instead of relying on it being the default.
+        std::env::remove_var("TS_VECTOR_INT8");
+        std::env::set_var("TS_VECTOR_SCALED", "0");
+        let node = int8_node(7, int8_unit_vector(128, 11));
+        let decoded = ContextNode::decode_context_proto_value(&node.encode_context_proto_value())
+            .expect("decodes");
+        std::env::remove_var("TS_VECTOR_SCALED");
+        assert_eq!(decoded.vector, node.vector, "the f32 path must be exact");
+    }
+
+    #[test]
+    fn int8_round_trip_keeps_the_vector() {
+        let _flag = Int8Flag::on();
+        let node = int8_node(8, int8_unit_vector(1024, 23));
+        let decoded = ContextNode::decode_context_proto_value(&node.encode_context_proto_value())
+            .expect("decodes");
+        assert_eq!(decoded.vector.len(), 1024, "dimension survives");
+        let cos = int8_cosine(&decoded.vector, &node.vector);
+        assert!(cos >= 0.999, "reconstruction cosine {cos} below the 0.999 bar");
+    }
+
+    #[test]
+    fn int8_is_smaller_on_the_wire() {
+        let node = int8_node(9, int8_unit_vector(1024, 31));
+        // The baseline this compares against is the f32 encoding, so both compaction gates are
+        // off for it -- otherwise "wide" is the scaled form and the ratio measures the wrong pair.
+        std::env::remove_var("TS_VECTOR_INT8");
+        std::env::set_var("TS_VECTOR_SCALED", "0");
+        let wide = node.encode_context_proto_value().len();
+        std::env::remove_var("TS_VECTOR_SCALED");
+        let narrow = {
+            let _flag = Int8Flag::on();
+            node.encode_context_proto_value().len()
+        };
+        assert!(
+            narrow * 3 < wide,
+            "expected roughly 4x smaller, got {narrow} vs {wide}"
+        );
+    }
+
+    #[test]
+    fn an_f32_record_still_decodes_while_the_flag_is_on() {
+        // Governs every record already on disk: a store written before this existed must keep
+        // reading after the flag is turned on.
+        std::env::remove_var("TS_VECTOR_INT8");
+        // The record must genuinely be an f32 one, so both compaction gates are off while it is
+        // written; the point is that a record already on disk keeps reading, not which gate wrote it.
+        std::env::set_var("TS_VECTOR_SCALED", "0");
+        let node = int8_node(10, int8_unit_vector(256, 41));
+        let legacy = node.encode_context_proto_value();
+        std::env::remove_var("TS_VECTOR_SCALED");
+        let _flag = Int8Flag::on();
+        let decoded = ContextNode::decode_context_proto_value(&legacy).expect("decodes");
+        assert_eq!(decoded.vector, node.vector, "an f32 record is unaffected by the flag");
+    }
+
+    #[test]
+    fn the_quantized_pair_round_trips_at_several_widths() {
+        // All four decoders call `unpack_i8_vector`, so the pair covers every vector-carrying type.
+        for dim in [64_usize, 384, 1024] {
+            let v = int8_unit_vector(dim, dim as u64 * 7 + 1);
+            let back = unpack_i8_vector(&pack_i8_vector(&v));
+            assert_eq!(back.len(), dim, "width {dim} survives");
+            let cos = int8_cosine(&back, &v);
+            assert!(cos >= 0.999, "width {dim}: cosine {cos} below the bar");
+        }
+    }
+
+    #[test]
+    fn an_all_zero_vector_does_not_divide_by_zero() {
+        let _flag = Int8Flag::on();
+        let node = int8_node(12, vec![0.0_f32; 64]);
+        let decoded = ContextNode::decode_context_proto_value(&node.encode_context_proto_value())
+            .expect("decodes");
+        assert_eq!(decoded.vector.len(), 64, "length survives");
+        assert!(
+            decoded.vector.iter().all(|v| v.is_finite()),
+            "a zero scale must not produce NaN or inf"
+        );
+    }
+
+    #[test]
+    fn node_carries_its_embedding_through_the_wire_codec() {
+        // The codec is hand-written, so a field added to the struct is invisible to it until
+        // someone adds the encode and decode arms by hand. A serde-only field looks correct in
+        // every test that builds a value in memory and is silently dropped the moment the value
+        // is written to a block -- which is how the first fold lost a vector.
+        let node = ContextNode {
+            node_hash: 90210,
+            parent_hash: 4,
+            kind: 2,
+            canonical_name: "session/alpha".to_string(),
+            l0: "the node summary text".to_string(),
+            last_event_time_ms: 1_780_000_000_000,
+            vector: vec![0.5, -0.25, 0.125, 1.0],
+            embedding_model_hash: 0xDEAD_BEEF,
+            embedding_updated_at_ms: 1_780_000_000_777,
+            summary_vector: Vec::new(),
+            summary_vector_valid_from_ms: 0,
+            summary_vector_model_hash: 0,
+            status: 0,
+            l1_ref: String::new(),
+            raw_metadata_ref: String::new(),
+        };
+        let decoded = ContextNode::decode_context_proto_value(&node.encode_context_proto_value())
+            .expect("a node this codec just encoded must decode");
+        assert_eq!(node.vector, decoded.vector, "vector did not survive the codec");
+        assert_eq!(node.embedding_model_hash, decoded.embedding_model_hash);
+        assert_eq!(node.embedding_updated_at_ms, decoded.embedding_updated_at_ms);
+        assert_eq!(node.node_hash, decoded.node_hash);
+        assert_eq!(node.l0, decoded.l0);
+    }
+
+    /// A node carrying a summary copy that is NOT its own vector -- an older store, whose node
+    /// was embedded from the L0 preview while its L1 summary was embedded from the fuller text.
+    fn node_with_summary_copy() -> ContextNode {
+        ContextNode {
+            node_hash: 4242,
+            parent_hash: 0,
+            kind: 1,
+            canonical_name: "session/beta".to_string(),
+            l0: "the node summary text".to_string(),
+            last_event_time_ms: 1_780_000_000_000,
+            vector: vec![0.5, -0.25, 0.125, 1.0],
+            embedding_model_hash: 0xABCD,
+            embedding_updated_at_ms: 1_780_000_000_777,
+            summary_vector: vec![-0.75, 0.375, 1.0, -0.5],
+            summary_vector_valid_from_ms: 1_780_000_000_500,
+            summary_vector_model_hash: 0x1234_5678,
+            status: 0,
+            l1_ref: String::new(),
+            raw_metadata_ref: String::new(),
+        }
+    }
+
+    #[test]
+    fn node_carries_its_summary_vector_copy_through_the_wire_codec() {
+        // Two vectors on one record, so the copy needs field numbers of its own. Reusing the
+        // record's own tags would make whichever value decoded last win, with no length mismatch
+        // and no error -- the node's L0 vector would silently become its summary's, which still
+        // scores a plausible cosine.
+        let node = node_with_summary_copy();
+        let decoded = ContextNode::decode_context_proto_value(&node.encode_context_proto_value())
+            .expect("a node this codec just encoded must decode");
+        assert_eq!(
+            node.summary_vector, decoded.summary_vector,
+            "the summary copy did not survive the codec"
+        );
+        assert_eq!(
+            node.vector, decoded.vector,
+            "the node's own vector must not be overwritten by the copy"
+        );
+        assert_eq!(
+            node.summary_vector_valid_from_ms, decoded.summary_vector_valid_from_ms,
+            "without its timestamp the copy cannot answer any query"
+        );
+        assert_eq!(
+            node.summary_vector_model_hash, decoded.summary_vector_model_hash,
+            "without its encoder stamp the copy is the one scored vector nothing checks"
+        );
+        assert_ne!(
+            decoded.summary_vector_model_hash, decoded.embedding_model_hash,
+            "the two vectors on this record carry separate stamps, not one shared field"
+        );
+    }
+
+    #[test]
+    fn a_summary_copy_without_a_timestamp_is_not_written() {
+        // A vector with no `valid_from_ms` says nothing about WHICH summary it is, so no reader
+        // can use it. Writing it would cost a whole vector per node to store an unusable value.
+        let node = ContextNode {
+            summary_vector_valid_from_ms: 0,
+            summary_vector_model_hash: 0,
+            ..node_with_summary_copy()
+        };
+        let bare = ContextNode {
+            summary_vector: Vec::new(),
+            ..node.clone()
+        };
+        assert_eq!(
+            bare.encode_context_proto_value().len(),
+            node.encode_context_proto_value().len(),
+            "a copy with no timestamp must cost exactly what no copy costs"
+        );
+        let decoded = ContextNode::decode_context_proto_value(&node.encode_context_proto_value())
+            .expect("decodes");
+        assert!(decoded.summary_vector.is_empty());
+    }
+
+    #[test]
+    fn an_equal_summary_copy_costs_one_vector_on_the_wire_and_two_in_memory() {
+        // The wire side is covered next door: an equal copy is written as a single varint marker
+        // rather than a second vector. This is the other half, and it is a different claim -- the
+        // marker is resolved on DECODE by cloning, so a node that cost one vector to store costs
+        // two to hold.
+        //
+        // The comparison is saving-against-cost, not wire-against-resident: an encoded record also
+        // carries ids and timestamps, which dominate at small widths and would make a
+        // wire-vs-resident assertion pass or fail for reasons that have nothing to do with
+        // vectors. What is comparable is the number of BYTES THE MARKER SAVES on the wire against
+        // the bytes the clone adds in memory.
+        for width in [4usize, 384, 1024] {
+            let shared: Vec<f32> = (0..width).map(|index| (index % 8) as f32 / 8.0).collect();
+            let same = ContextNode {
+                vector: shared.clone(),
+                summary_vector: shared.clone(),
+                ..node_with_summary_copy()
+            };
+            let mut differs = same.clone();
+            differs.summary_vector[0] += 0.5;
+
+            let same_len = same.encode_context_proto_value().len();
+            let differs_len = differs.encode_context_proto_value().len();
+            let wire_saving = differs_len - same_len;
+
+            let decoded = ContextNode::decode_context_proto_value(&same.encode_context_proto_value())
+                .expect("a node this test just encoded must decode");
+
+            assert_eq!(
+                decoded.vector, decoded.summary_vector,
+                "width {width}: the marker must reproduce the node's own vector"
+            );
+            assert_eq!(
+                decoded.vector, shared,
+                "width {width}: the decoded vector must be the one that was written"
+            );
+
+            let one_vector = width * std::mem::size_of::<f32>();
+            let resident = (decoded.vector.capacity() + decoded.summary_vector.capacity())
+                * std::mem::size_of::<f32>();
+
+            // If these ever share one allocation, this fails -- and that is the good outcome.
+            // Delete the assertion and record the new resident cost in the commit.
+            assert!(
+                decoded.vector.as_ptr() != decoded.summary_vector.as_ptr(),
+                "width {width}: the decoded vectors now SHARE an allocation. That is the \
+                 improvement this test exists to make visible -- remove this assertion."
+            );
+            assert!(
+                resident >= 2 * one_vector,
+                "width {width}: expected two vectors resident ({} bytes), held {resident}",
+                2 * one_vector
+            );
+            assert!(
+                wire_saving > 0,
+                "width {width}: the marker saved no wire bytes, so the encode-side optimisation \
+                 this test is the counterpart to has regressed"
+            );
+
+            eprintln!(
+                "[summary-copy] width {width}: marker saves {wire_saving} B on the wire, \
+                 clone costs {one_vector} B resident (resident total {resident} B)"
+            );
+        }
+    }
+
+    #[test]
+    fn a_summary_copy_equal_to_the_node_vector_is_not_stored_twice() {
+        // What the current ingest produces: it embeds ONE text and hands the result to both the
+        // node and its L1 summary, so the copy is byte-equal to the node's own vector. Writing
+        // it out would add a second whole vector -- 4 KB at 1024 f32 dimensions, on every node --
+        // to say something a single varint says.
+        //
+        // Asserted as a property rather than a byte budget: the cost of an equal copy must not
+        // GROW with the vector. A budget generous enough to pass at four dimensions would also
+        // pass an encoding that writes the whole thing at four dimensions and 4 KB at a
+        // production width, which is the only width that matters.
+        let mut overheads = Vec::new();
+        for width in [4usize, 256, 1024] {
+            let shared: Vec<f32> = (0..width).map(|index| (index % 8) as f32 / 8.0).collect();
+            let same = ContextNode {
+                vector: shared.clone(),
+                summary_vector: shared.clone(),
+                ..node_with_summary_copy()
+            };
+            let no_copy = ContextNode {
+                summary_vector: Vec::new(),
+                summary_vector_valid_from_ms: 0,
+                summary_vector_model_hash: 0,
+                ..same.clone()
+            };
+            let mut differs = same.clone();
+            differs.summary_vector[0] += 0.5;
+            let same_len = same.encode_context_proto_value().len();
+            let differs_len = differs.encode_context_proto_value().len();
+            let no_copy_len = no_copy.encode_context_proto_value().len();
+            assert!(
+                same_len < differs_len,
+                "width {width}: an equal copy must not be written out in full, {same_len} vs \
+                 {differs_len} bytes"
+            );
+            // ...and it must still come back. A cheaper encoding that loses the value is not
+            // cheaper, it is broken.
+            let bytes = same.encode_context_proto_value();
+            let decoded = ContextNode::decode_context_proto_value(&bytes).expect("decodes");
+            assert_eq!(
+                shared, decoded.summary_vector,
+                "width {width}: the marker must restore the copy, not leave it empty"
+            );
+            assert_eq!(
+                same.summary_vector_valid_from_ms,
+                decoded.summary_vector_valid_from_ms
+            );
+            overheads.push(same_len - no_copy_len);
+        }
+        assert!(
+            overheads.windows(2).all(|pair| pair[0] == pair[1]),
+            "an equal copy must cost the same at every width -- got {overheads:?} bytes for \
+             4, 256 and 1024 dimensions"
+        );
+    }
+
+    #[test]
+    fn the_equal_copy_marker_decodes_before_the_vector_it_names() {
+        // Protobuf does not order fields. The marker names the record's own vector, so a decoder
+        // that resolves it where it sits produces an EMPTY copy for any writer that emitted the
+        // marker first -- and an empty copy is not an error, it is a silent return to the
+        // per-node summary lookup this exists to avoid.
+        let vector = vec![0.5_f32, -0.25, 0.125, 1.0];
+        let mut bytes = Vec::new();
+        encode_varint_field(&mut bytes, 1, 4242);
+        encode_varint_field(&mut bytes, CONTEXT_SUMMARY_VECTOR_SAME_FIELD, 1);
+        encode_varint_field(
+            &mut bytes,
+            CONTEXT_SUMMARY_VECTOR_VALID_FROM_FIELD,
+            1_780_000_000_500,
+        );
+        encode_bytes_field(&mut bytes, CONTEXT_VECTOR_FIELD, &pack_f32_vector(&vector));
+        let decoded = ContextNode::decode_context_proto_value(&bytes).expect("decodes");
+        assert_eq!(
+            vector, decoded.summary_vector,
+            "the marker must be resolved after the whole record is read"
+        );
+    }
+
+    #[test]
+    fn a_summary_copy_only_answers_a_query_that_reaches_it() {
+        // The copy is the NEWEST summary. A query asking about an earlier point in time is not a
+        // miss to paper over: answering it from the copy would hand back a summary written after
+        // the moment being asked about.
+        let node = node_with_summary_copy();
+        let valid_from = node.summary_vector_valid_from_ms;
+        assert!(
+            node.summary_vector_as_of(valid_from - 1).is_none(),
+            "a query predating the copy must fall back to the summaries"
+        );
+        assert_eq!(
+            Some(node.summary_vector.as_slice()),
+            node.summary_vector_as_of(valid_from),
+            "the copy answers the instant it becomes valid"
+        );
+        assert_eq!(
+            Some(node.summary_vector.as_slice()),
+            node.summary_vector_as_of(u64::MAX)
+        );
+        // No copy at all, and a vector with no timestamp, are both "ask the summaries".
+        assert!(ContextNode {
+            summary_vector: Vec::new(),
+            ..node.clone()
+        }
+        .summary_vector_as_of(u64::MAX)
+        .is_none());
+        assert!(ContextNode {
+            summary_vector_valid_from_ms: 0,
+            summary_vector_model_hash: 0,
+            ..node.clone()
+        }
+        .summary_vector_as_of(u64::MAX)
+        .is_none());
+    }
+
+    #[test]
+    fn node_without_an_embedding_costs_nothing_on_the_wire() {
+        // Most nodes have no vector. Encoding empty/zero values anyway would grow every node
+        // block for a field the vast majority never populate.
+        let bare = ContextNode {
+            node_hash: 7,
+            parent_hash: 0,
+            kind: 0,
+            canonical_name: String::new(),
+            l0: "x".to_string(),
+            last_event_time_ms: 0,
+            vector: Vec::new(),
+            embedding_model_hash: 0,
+            embedding_updated_at_ms: 0,
+            summary_vector: Vec::new(),
+            summary_vector_valid_from_ms: 0,
+            summary_vector_model_hash: 0,
+            status: 0,
+            l1_ref: String::new(),
+            raw_metadata_ref: String::new(),
+        };
+        let with_vector = ContextNode {
+            vector: vec![1.0],
+            ..bare.clone()
+        };
+        assert!(
+            bare.encode_context_proto_value().len()
+                < with_vector.encode_context_proto_value().len(),
+            "an absent embedding must not be written"
+        );
+        let decoded = ContextNode::decode_context_proto_value(&bare.encode_context_proto_value())
+            .expect("bare node must decode");
+        assert!(decoded.vector.is_empty());
+        assert_eq!(0, decoded.embedding_model_hash);
+    }
+
+    #[test]
+    fn a_node_block_written_before_the_fold_still_decodes() {
+        // Blocks on disk predate the new tags. Decoding must ignore their absence rather than
+        // fail, and must not invent a vector.
+        let legacy = ContextNode {
+            node_hash: 11,
+            parent_hash: 1,
+            kind: 0,
+            canonical_name: "legacy".to_string(),
+            l0: "written before nodes carried vectors".to_string(),
+            last_event_time_ms: 99,
+            vector: Vec::new(),
+            embedding_model_hash: 0,
+            embedding_updated_at_ms: 0,
+            summary_vector: Vec::new(),
+            summary_vector_valid_from_ms: 0,
+            summary_vector_model_hash: 0,
+            status: 0,
+            l1_ref: String::new(),
+            raw_metadata_ref: String::new(),
+        };
+        let bytes = legacy.encode_context_proto_value();
+        let decoded =
+            ContextNode::decode_context_proto_value(&bytes).expect("legacy node must decode");
+        assert!(decoded.vector.is_empty(), "no vector may be invented");
+        assert_eq!(legacy.l0, decoded.l0);
+        assert_eq!(legacy.canonical_name, decoded.canonical_name);
+    }
+
+    #[test]
+    fn control_state_family_serde_is_pinned_to_legacy_tags() {
+        // The families were renamed H/Cpc/Fol -> Counter/Distinct/Selection, but the
+        // serialized (wire/disk) form is pinned to the historical tags so existing
+        // indexes/WAL/RESP payloads round-trip with zero migration.
+        for (tag, family) in [
+            ("h", ControlStateFamily::Counter),
+            ("cpc", ControlStateFamily::Distinct),
+            ("fol", ControlStateFamily::Selection),
+        ] {
+            let quoted = format!("\"{tag}\"");
+            assert_eq!(
+                serde_json::from_str::<ControlStateFamily>(&quoted).unwrap(),
+                family,
+                "legacy tag {tag} must deserialize to the renamed family"
+            );
+            assert_eq!(
+                serde_json::to_string(&family).unwrap(),
+                quoted,
+                "renamed family must serialize back to the legacy tag {tag}"
+            );
+        }
+    }
+
+    #[test]
+    fn control_state_selection_command_deserializes_legacy_fol_alias() {
+        // The Fol* command variant + its fol_type field were renamed; #[serde(alias)]
+        // keeps a pre-rename serialized command deserializable.
+        let legacy = r#"{"kind":"control_state_fol_set","key":"k","value":[1,2],"occur_time_ms":10,"ttl_ms":0,"fol_type":"last"}"#;
+        let command: Command = serde_json::from_str(legacy).unwrap();
+        assert!(matches!(
+            command,
+            Command::ControlStateSelectionSet {
+                selection_type: ControlStateSelectionType::Last,
+                ..
+            }
+        ));
+    }
+
+    // shared-corpus: dynamic_event_replication_mode_selection
+    #[test]
+    fn caller_can_select_event_replication_mode_with_helpers() {
+        let request = ExecuteRequest {
+            shard_id: 7,
+            command: Command::StringSet {
+                key: "caller-choice".to_string(),
+                value: b"raft".to_vec(),
+            },
+        }
+        .with_raft();
+        assert_eq!(request.replication_mode, EventReplicationMode::Raft);
+
+        let batch_command = ReplicatedCommand::sync_storage(Command::HashSet {
+            key: "caller-choice".to_string(),
+            field: "mode".to_string(),
+            value: b"sync".to_vec(),
+        });
+        assert_eq!(
+            batch_command.replication_mode,
+            EventReplicationMode::SyncStorage
+        );
+        assert!(!EventReplicationMode::AsyncStorage.requires_restart());
+        assert!(!EventReplicationMode::SyncStorage.requires_restart());
+        assert!(!EventReplicationMode::Raft.requires_restart());
+    }
+
+    #[test]
+    fn context_pack_audit_wire_matches_field_numbers() {
+        // ContextPackAudit proto: query_id=1, session_hash=2, request_time_ms=3,
+        // max_prompt_tokens=4, selected_tokens=5, selected_refs=6. Rust-only fields must NOT
+        // occupy tag 4 (query_hash previously did, shifting three reserved fields and dropping
+        // selected_refs entirely on a cross-impl decode).
+        let audit = ContextPackAudit {
+            query_id: "q".to_string(),
+            session_hash: 7,
+            request_time_ms: 8,
+            query_hash: 9999,
+            max_prompt_tokens: 4444,
+            selected_tokens: 5555,
+            selected_refs: Vec::new(),
+            blocked_refs: Vec::new(),
+        };
+        let bytes = audit.encode_context_proto_value();
+        // Collect top-level varint fields as (field_number -> value).
+        let mut cursor = 0;
+        let mut varint_fields = std::collections::HashMap::new();
+        while cursor < bytes.len() {
+            let tag = decode_varint(&bytes, &mut cursor).unwrap();
+            match tag & 0x7 {
+                0 => {
+                    let v = decode_varint(&bytes, &mut cursor).unwrap();
+                    varint_fields.insert(tag >> 3, v);
+                }
+                2 => {
+                    decode_bytes(&bytes, &mut cursor).unwrap();
+                }
+                other => panic!("unexpected wire type {other}"),
+            }
+        }
+        assert_eq!(
+            varint_fields.get(&4),
+            Some(&4444),
+            "field 4 must be max_prompt_tokens (wire proto), not the Rust-only query_hash"
+        );
+        assert_eq!(
+            varint_fields.get(&5),
+            Some(&5555),
+            "field 5 must be selected_tokens (wire proto)"
+        );
+        assert_eq!(
+            varint_fields.get(&9),
+            Some(&9999),
+            "Rust-only query_hash must live on a reserved-safe tag (9)"
+        );
+        // Encoder and decoder agree on the wire layout (round-trip).
+        let decoded = ContextPackAudit::decode_context_proto_value(&bytes).unwrap();
+        assert_eq!(decoded.max_prompt_tokens, 4444);
+        assert_eq!(decoded.selected_tokens, 5555);
+        assert_eq!(decoded.query_hash, 9999);
+    }
+
+    // shared-corpus: context_wire_model_descriptor_roundtrip
+    #[test]
+    fn context_models_round_trip_wire_payloads_and_type_alias() {
+        assert_eq!(
+            context_model_descriptors()
+                .iter()
+                .map(|descriptor| {
+                    (
+                        descriptor.name.as_str(),
+                        descriptor.model_id,
+                        descriptor.key_family.as_str(),
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![
+                ("ContextNodeModel", 9, "ctx:node"),
+                ("ContextEventModel", 10, "ctx:event"),
+                ("ContextIndexModel", 11, "ctxidx"),
+                ("ContextAuditModel", 12, "ctx:audit"),
+                ("ContextChildModel", 14, "ctx:child"),
+                ("ContextSummaryModel", 16, "ctx:summary"),
+                ("ContextCompressionModel", 17, "ctx:compress"),
+                ("ContextEntityModel", 18, "ctx:entity"),
+            ]
+        );
+        assert_eq!(
+            context_model_descriptor("ContextEventModel").map(|descriptor| descriptor.model_id),
+            Some(CONTEXT_EVENT_MODEL_ID)
+        );
+        assert_eq!(
+            context_model_descriptor("ContextSegment").map(|descriptor| descriptor.model_id),
+            Some(CONTEXT_EVENT_MODEL_ID)
+        );
+        assert_eq!(
+            context_model_descriptor("ctx:event").map(|descriptor| descriptor.model_id),
+            Some(CONTEXT_EVENT_MODEL_ID)
+        );
+        assert_eq!(
+            context_model_descriptor("10").map(|descriptor| descriptor.name),
+            Some("ContextEventModel".to_string())
+        );
+        assert_eq!(
+            context_model_descriptor("ctx:compression").map(|descriptor| descriptor.model_id),
+            Some(CONTEXT_COMPRESSION_MODEL_ID)
+        );
+        assert!(context_model_descriptor("ContextSegment")
+            .unwrap()
+            .aliases
+            .iter()
+            .any(|alias| alias == "ContextSegment"));
+
+        let node = ContextNode {
+            node_hash: 42,
+            parent_hash: 7,
+            kind: 3,
+            canonical_name: "checkout".to_string(),
+            l0: "service".to_string(),
+            status: 1,
+            last_event_time_ms: 123,
+            l1_ref: "l1".to_string(),
+            raw_metadata_ref: "raw".to_string(),
+            vector: Vec::new(),
+            embedding_model_hash: 0,
+            embedding_updated_at_ms: 0,
+            summary_vector: Vec::new(),
+            summary_vector_valid_from_ms: 0,
+            summary_vector_model_hash: 0,
+        };
+        let native_node = ContextNode {
+            status: 0,
+            l1_ref: String::new(),
+            raw_metadata_ref: String::new(),
+            vector: Vec::new(),
+            embedding_model_hash: 0,
+            embedding_updated_at_ms: 0,
+            summary_vector: Vec::new(),
+            summary_vector_valid_from_ms: 0,
+            summary_vector_model_hash: 0,
+            ..node.clone()
+        };
+        assert_eq!(
+            ContextNode::decode_context_proto_value(&node.encode_context_proto_value()),
+            Some(native_node)
+        );
+
+        let entity = ContextEntity {
+            entity_hash: 7001,
+            node_hash: 42,
+            entity_type: 1,
+            name: "gpu_purchase_request".to_string(),
+            value: "approved".to_string(),
+            updated_at_ms: 1_000,
+            valid_from_ms: 1_000,
+            confidence: 0.97,
+            source_event_hashes: vec![5, 6],
+            vector: Vec::new(),
+        };
+        assert_eq!(
+            ContextEntity::decode_context_proto_value(&entity.encode_context_proto_value()),
+            Some(entity)
+        );
+
+        let child = ContextChildRef {
+            parent_hash: 10,
+            child_hash: 20,
+            updated_at_ms: 1_000,
+        };
+        assert_eq!(
+            ContextChildRef::decode_context_proto_value(&child.encode_context_proto_value()),
+            Some(child)
+        );
+        let summary = ContextSummary {
+            node_hash: 20,
+            level: 1,
+            text: "summary".to_string(),
+            valid_from_ms: 1_000,
+            vector: Vec::new(),
+            embedding_model_hash: 0x51A7,
+        };
+        assert_eq!(
+            ContextSummary::decode_context_proto_value(&summary.encode_context_proto_value()),
+            Some(summary)
+        );
+        let compression = ContextCompressionEvent {
+            compression_id_hash: 5001,
+            node_hash: 20,
+            source_start_ms: 900,
+            source_end_ms: 1_000,
+            compressed_time_ms: 1_000,
+            summary: "compressed".to_string(),
+        };
+        assert_eq!(
+            ContextCompressionEvent::decode_context_proto_value(
+                &compression.encode_context_proto_value()
+            ),
+            Some(compression)
+        );
+
+        let event_json = br#"{
+            "event_id_hash":5,
+            "event_time_ms":1000,
+            "ingestion_time_ms":1001,
+            "kind":9,
+            "type":2,
+            "actor_hash":77,
+            "status":1,
+            "valid_until_ms":0,
+            "confidence":0.75,
+            "importance":0.5,
+            "text":"hello",
+            "source_ref":"src",
+            "related_node_hashes":[42,43],
+            "compact_attrs":[1,2,3]
+        }"#;
+        let event: ContextEvent = serde_json::from_slice(event_json).unwrap();
+        assert_eq!(event.event_type, 2);
+        assert_eq!(event.primary_time_ms(), 1001);
+        let native_event = ContextEvent {
+            ingestion_time_ms: 1001,
+            kind: 0,
+            actor_hash: 0,
+            status: 0,
+            valid_until_ms: 0,
+            source_ref: String::new(),
+            related_node_hashes: Vec::new(),
+            compact_attrs: Vec::new(),
+            ..event.clone()
+        };
+        assert_eq!(
+            ContextEvent::decode_context_proto_value(&event.encode_context_proto_value()),
+            Some(native_event)
+        );
+
+        let index = ContextIndexRef {
+            primary_node_hash: 42,
+            primary_event_time_ms: 1000,
+            event_id_hash: 5,
+        };
+        assert_eq!(
+            ContextIndexRef::decode_context_proto_value(&index.encode_context_proto_value()),
+            Some(index)
+        );
+
+        let audit_ref = ContextAuditRef {
+            node_hash: 42,
+            event_time_ms: 1000,
+            reason: "ranked".to_string(),
+        };
+        let audit = ContextPackAudit {
+            query_id: "q1".to_string(),
+            session_hash: 99,
+            request_time_ms: 2000,
+            query_hash: 111,
+            max_prompt_tokens: 4096,
+            selected_tokens: 128,
+            selected_refs: vec![audit_ref],
+            blocked_refs: Vec::new(),
+        };
+        assert_eq!(
+            ContextPackAudit::decode_context_proto_value(&audit.encode_context_proto_value()),
+            Some(audit)
+        );
+
+    }
+}
+
+#[cfg(test)]
+mod scaled_vector_tests {
+    use super::*;
+
+    fn vectors(count: usize, dims: usize) -> Vec<Vec<f32>> {
+        (0..count)
+            .map(|seed| {
+                let raw: Vec<f32> = (0..dims)
+                    .map(|i| (((i * 7 + seed * 13) as f32) * 0.37).sin() * 0.05)
+                    .collect();
+                let norm = raw.iter().map(|v| v * v).sum::<f32>().sqrt();
+                raw.into_iter().map(|v| v / norm).collect()
+            })
+            .collect()
+    }
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let an: f32 = a.iter().map(|v| v * v).sum::<f32>().sqrt();
+        let bn: f32 = b.iter().map(|v| v * v).sum::<f32>().sqrt();
+        dot / (an * bn)
+    }
+
+    fn ranking(query: &[f32], docs: &[Vec<f32>]) -> Vec<usize> {
+        let mut idx: Vec<usize> = (0..docs.len()).collect();
+        idx.sort_by(|a, b| {
+            cosine(query, &docs[*b])
+                .partial_cmp(&cosine(query, &docs[*a]))
+                .unwrap()
+        });
+        idx
+    }
+
+    #[test]
+    fn a_uniform_scale_cannot_reorder_results() {
+        // THE property this encoding was chosen for. Measured on real vectors the per-vector
+        // int8 form reproduced the exact top-10 order on 3 of 8 queries; a uniform scale is
+        // invariant because cosine divides the constant back out.
+        let docs = vectors(64, 128);
+        let query = &vectors(1, 128)[0];
+        let scaled: Vec<Vec<f32>> = docs
+            .iter()
+            .map(|v| unpack_scaled_vector(&pack_scaled_vector(v)))
+            .collect();
+        let before = ranking(query, &docs);
+        let after = ranking(query, &scaled);
+        assert_eq!(before, after, "the scaled ranking must match the float ranking");
+        // Not vacuous: the ranking must be a real permutation over distinct scores, not the
+        // identity that a broken cosine returning a constant would also produce.
+        assert_eq!(before.len(), 64);
+        assert_ne!(before, (0..64).collect::<Vec<usize>>());
+    }
+
+    #[test]
+    fn scaled_round_trip_stays_within_one_step() {
+        let vector = &vectors(1, 384)[0];
+        let restored = unpack_scaled_vector(&pack_scaled_vector(vector));
+        assert_eq!(restored.len(), vector.len());
+        assert!(restored.iter().any(|v| v.abs() > 1e-6));
+        let step = 1.0 / VECTOR_SCALE;
+        for (original, back) in vector.iter().zip(&restored) {
+            assert!(
+                (original - back).abs() <= step,
+                "{original} -> {back} moved more than one step"
+            );
+        }
+    }
+
+    #[test]
+    fn scaled_is_about_half_of_f32() {
+        let vector = &vectors(1, 512)[0];
+        let as_f32 = pack_f32_vector(vector).len();
+        let as_scaled = pack_scaled_vector(vector).len();
+        assert_eq!(as_f32, 2048);
+        // Unit-vector elements at 512 dims land near 0.04, so v*1e4 needs two varint bytes.
+        assert!(
+            as_scaled <= 1100,
+            "expected ~1024 bytes, got {as_scaled}"
+        );
+        assert!(as_f32 as f32 / as_scaled as f32 >= 1.8);
+    }
+
+    #[test]
+    fn every_earlier_representation_still_decodes() {
+        // Reads must accept whatever a store already holds, whichever gate wrote it.
+        let vector = &vectors(1, 64)[0];
+        for (field, payload) in [
+            (CONTEXT_VECTOR_FIELD, pack_f32_vector(vector)),
+            (CONTEXT_VECTOR_INT8_FIELD, pack_i8_vector(vector)),
+            (CONTEXT_VECTOR_SCALED_FIELD, pack_scaled_vector(vector)),
+        ] {
+            let mut out = Vec::new();
+            encode_bytes_field(&mut out, field, &payload);
+            let mut cursor = 0;
+            let tag = decode_varint(&out, &mut cursor).unwrap();
+            assert_eq!(tag >> 3, field);
+            let body = decode_bytes(&out, &mut cursor).unwrap();
+            let decoded = match field {
+                CONTEXT_VECTOR_FIELD => unpack_f32_vector(&body),
+                CONTEXT_VECTOR_INT8_FIELD => unpack_i8_vector(&body),
+                _ => unpack_scaled_vector(&body),
+            };
+            assert_eq!(decoded.len(), vector.len(), "field {field} lost the vector");
+        }
+    }
+
+    #[test]
+    fn the_scaled_gate_defaults_on_and_opts_out() {
+        std::env::remove_var("TS_VECTOR_SCALED");
+        assert!(vector_scaled_enabled());
+        std::env::set_var("TS_VECTOR_SCALED", "0");
+        assert!(!vector_scaled_enabled());
+        std::env::remove_var("TS_VECTOR_SCALED");
+    }
+}
