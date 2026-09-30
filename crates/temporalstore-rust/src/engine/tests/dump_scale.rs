@@ -504,3 +504,509 @@ fn repeated_dumps_do_not_accumulate_manifests_when_each_covers_the_whole_shard()
         let report = engine.run_storage_manager_cycle(round_request());
         assert!(
             report.errors.is_empty(),
+            "round {index} errored: {:?}",
+            report.errors
+        );
+        counted += usize::from(
+            report
+                .lifecycle_report
+                .as_ref()
+                .map(|lifecycle| lifecycle.dump_manifest.is_some())
+                .unwrap_or(false),
+        );
+        index += 1;
+    }
+
+    // DENOMINATOR: a run that never dumped proves nothing about the prune.
+    assert!(
+        counted >= 5,
+        "only {counted} of 10 rounds produced a dump manifest; the prune below is not being \
+         exercised"
+    );
+
+    let on_disk = engine.list_bucket_dump_manifests(1);
+    let plan = engine.bucket_dump_manifest_prune_plan(1);
+    println!(
+        "  {counted} dumps over 10 rounds -> {} manifest(s) left on disk, retained {}, prunable \
+         {}, blocked {}",
+        on_disk.len(),
+        plan.retained_manifest_ids.len(),
+        plan.prunable_manifest_ids.len(),
+        plan.blocked_manifest_ids.len()
+    );
+    assert!(
+        on_disk.len() <= 2,
+        "{counted} whole-shard dumps left {} manifests on disk; the prune is not keeping up, and \
+         every one of them embeds a whole-shard index image",
+        on_disk.len()
+    );
+}
+
+/// WHICH QUANTITY THE DUMP BUDGET SHOULD COUNT, MEASURED ON FIVE WRITE SHAPES.
+///
+/// `min_undumped_wal_records` is compared against undumped LOG RECORDS, and a batch is one log
+/// record however many objects it carries. `min_undumped_wal_bytes` is compared against
+/// `undumped_len_since_dump`. NEITHER survives a change in how the writer grouped its objects --
+/// which was not obvious, and the first version of this test asserted that the byte count did and
+/// was wrong. The same 2,000 objects of 128 bytes:
+///
+/// ```text
+///   grouping    log records   undumped bytes   dirty objects   object mutations
+///   batch 1           2,000          377,652           2,000              2,000
+///   batch 10            200           57,225           2,000              2,000
+///   batch 100            20           32,246           2,000              2,000
+///   batch 500             4           30,223           2,000              2,000
+/// ```
+///
+/// Records move 500x and bytes 12.5x, because per-record framing dominates a 128-byte write.
+///
+/// DIRTY OBJECTS is invariant there and is still the wrong quantity, which is the other half of
+/// this test: 2,000 writes to ONE key leave one dirty object and 2,000 mutations to replay, so a
+/// budget counting dirty objects would delay that shard for ever in the mirror image of the defect
+/// it fixed.
+///
+/// OBJECT MUTATIONS is invariant across all five. It is also exactly what the delay costs: replay
+/// re-applies one per mutation, and reclaim cannot drop a record until a dump covers it. It is
+/// reported as `undumped_wal_objects` and NOT yet compared against the threshold -- that is a
+/// cadence decision with a default in a new unit behind it. The direction is safe either way: a
+/// record carries at least one mutation, so the mutation count is never below the record count and
+/// switching the gate can only make it fire EARLIER.
+#[test]
+fn the_dump_budget_moves_with_batching_in_records_and_in_bytes_but_not_in_object_mutations() {
+    const RECORDS: usize = 2_000;
+
+    fn shape(engine: &TemporalEngine) -> (u64, u64, u64, usize) {
+        let plan = engine.storage_lifecycle_plan(crate::engine::reports::StorageLifecycleRequest {
+            shard_id: 1,
+            ..Default::default()
+        });
+        let undumped_bytes = engine.wal_store.undumped_len_since_dump(1);
+        let dirty = {
+            let shards = engine.shards.read().expect("shards lock poisoned");
+            shards
+                .get(&1)
+                .map(|shard| shard.dirty_objects.len())
+                .unwrap_or(0)
+        };
+        (
+            plan.undumped_wal_records,
+            undumped_bytes,
+            plan.undumped_wal_objects,
+            dirty,
+        )
+    }
+
+    fn one_batch_shape(batch: usize) -> (u64, u64, u64, usize) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = dump_engine(dir.path());
+        seed_in_batches(&engine, 1, RECORDS, batch);
+        let measured = shape(&engine);
+        println!(
+            "  {RECORDS} distinct keys, batches of {batch:<4} -> log records {:>5}, undumped \
+             bytes {:>9}, dirty objects {:>5}, object mutations {:>5}",
+            measured.0, measured.1, measured.3, measured.2
+        );
+        measured
+    }
+
+    let (records_1, bytes_1, objects_1, dirty_1) = one_batch_shape(1);
+    let (records_10, bytes_10, objects_10, dirty_10) = one_batch_shape(10);
+    let (records_100, bytes_100, objects_100, dirty_100) = one_batch_shape(100);
+    let (records_500, bytes_500, objects_500, dirty_500) = one_batch_shape(500);
+
+    // DENOMINATOR: the four arms must be the same corpus.
+    assert_eq!(
+        (dirty_1, dirty_10, dirty_100, dirty_500),
+        (RECORDS, RECORDS, RECORDS, RECORDS),
+        "the four batch arms are not the same corpus: dirty objects {dirty_1} / {dirty_10} / \
+         {dirty_100} / {dirty_500}"
+    );
+    assert!(
+        bytes_1 > 0 && objects_1 > 0,
+        "an accumulator read 0 after {RECORDS} writes (bytes {bytes_1}, objects {objects_1}), so \
+         every comparison below is vacuous"
+    );
+
+    // HALF ONE: neither quantity the budget can compare today survives batching.
+    let record_spread = records_1 as f64 / records_500.max(1) as f64;
+    let byte_spread = bytes_1.max(bytes_500) as f64 / bytes_1.min(bytes_500).max(1) as f64;
+    println!(
+        "  log records {records_1} / {records_10} / {records_100} / {records_500} = \
+         {record_spread:.1}x spread; undumped bytes {bytes_1} / {bytes_10} / {bytes_100} / \
+         {bytes_500} = {byte_spread:.2}x spread"
+    );
+    assert_eq!(
+        records_1, RECORDS as u64,
+        "one write per batch must produce one log record per object"
+    );
+    assert_eq!(
+        records_500,
+        (RECORDS / 500) as u64,
+        "a batch must be ONE log record however many objects it carries -- that is the mechanism \
+         this test is about"
+    );
+    assert!(
+        byte_spread > 2.0,
+        "undumped bytes moved only {byte_spread:.2}x across batch shapes carrying identical \
+         objects ({bytes_1} vs {bytes_500}). If per-record framing stopped dominating a small \
+         write, the byte threshold IS batching-invariant and the table in this test's doc comment \
+         is stale."
+    );
+
+    // HALF TWO, ASSERTED SEPARATELY: the mutation count does survive it.
+    println!(
+        "  object mutations {objects_1} / {objects_10} / {objects_100} / {objects_500}"
+    );
+    assert_eq!(
+        (objects_1, objects_10, objects_100, objects_500),
+        (
+            RECORDS as u64,
+            RECORDS as u64,
+            RECORDS as u64,
+            RECORDS as u64
+        ),
+        "object mutations moved with the batch shape: {objects_1} / {objects_10} / {objects_100} \
+         / {objects_500} against {RECORDS} objects written in every arm"
+    );
+
+    // HALF THREE: why the dirty-object count -- invariant above -- is still the wrong quantity.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = dump_engine(dir.path());
+    let mut written = 0usize;
+    while written < RECORDS {
+        let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+            shard_id: 1,
+            commands: vec![Command::StringSet {
+                key: "one-key".to_string(),
+                value: vec![b'v'; 128],
+            }],
+        });
+        assert!(response.status.ok, "overwrite failed: {:?}", response.status);
+        written += 1;
+    }
+    let (overwrite_records, overwrite_bytes, overwrite_objects, overwrite_dirty) = shape(&engine);
+    println!(
+        "  {RECORDS} writes to ONE key -> log records {overwrite_records}, undumped bytes \
+         {overwrite_bytes}, dirty objects {overwrite_dirty}, object mutations {overwrite_objects}"
+    );
+    assert_eq!(
+        overwrite_dirty, 1,
+        "the overwrite arm left {overwrite_dirty} dirty objects, not 1, so it is not the shape \
+         that makes a dirty-object budget wrong"
+    );
+    assert_eq!(
+        overwrite_objects, RECORDS as u64,
+        "object mutations read {overwrite_objects} after {RECORDS} writes to one key; a budget \
+         counting them would be as blind to overwrite as one counting dirty objects"
+    );
+}
+
+
+/// A LISTING REUSES THE MANIFEST IT ALREADY READ AND VERIFIED, AND NOTICES WHEN THE DIRECTORY
+/// CHANGES UNDER IT.
+///
+/// THE RULE, IN FOUR DIRECTIONS.
+///
+///   * RAISED by a listing that read a manifest file whole, parsed it whole and verified its
+///     checksum -- the same work the listing always did. Only a manifest that PASSED is kept.
+///   * LOWERED by the directory itself, not by mutation sites agreeing to cooperate. Every
+///     listing still calls `read_dir` and re-stats every entry, and an entry whose length, mtime
+///     or inode differs from the bytes the memo was built from is a MISS. This matters because
+///     the set of things that change this directory is not closed: the prune removes manifests
+///     from two sites, the detach phase from a third, and three test helpers delete manifest
+///     files directly. `a_manifest_deleted_behind_the_memos_back_stops_being_listed` below is
+///     exactly that case.
+///   * WITHDRAWN by a `read_dir` error, by an entry that cannot be stat-ed, by an entry that
+///     fails to parse or fails its checksum -- each skipped exactly as before and never kept --
+///     and by `reset_bucket_dump_manifest_io_counts`, so a probe measures one operation.
+///   * A RESTART IS COVERED because nothing is persisted. The first listing in a fresh process
+///     reads and verifies every manifest on disk, so no crash-orphaned or externally-edited
+///     manifest can be inherited across one.
+///
+/// WHICH DIRECTION IT FAILS: stale-EARLY, in every one of those cases, and stale-early costs a
+/// wasted read -- today's behaviour. It cannot fail stale-LATE unless the filesystem reports the
+/// same length, mtime AND inode for different bytes at one path, and a manifest is never
+/// rewritten in place: `persist_bucket_dump_manifest` writes temp+rename under an id containing
+/// its own creation time.
+///
+/// TWO ARMS IN ONE PROCESS ON ONE FIXTURE. "One file read" is satisfied just as well by a listing
+/// that stopped reading, or by a fixture with nothing on disk, so the control arm forces the
+/// old behaviour back on and must read one file PER LISTING -- and both arms must return the same
+/// manifests, which is what makes this a change of cost and not of meaning.
+#[test]
+fn a_listing_reuses_the_manifest_it_already_read_and_verified() {
+    const LISTINGS: usize = 8;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = dump_engine(dir.path());
+    seed_in_batches(&engine, 1, SMALL, 100);
+    engine
+        .create_bucket_dump_manifest(1, Vec::<u32>::new())
+        .expect("dump");
+
+    fn list_n_times(engine: &TemporalEngine, times: usize) -> Vec<BucketDumpManifest> {
+        let mut listed = Vec::new();
+        let mut done = 0usize;
+        while done < times {
+            listed = engine.list_bucket_dump_manifests(1);
+            done += 1;
+        }
+        listed
+    }
+
+    // CONTROL ARM: the same listings, the way they ran before the memo existed.
+    let (control_counts, control_manifests) = {
+        let _memo_off = crate::engine::bucket_dump_io::ManifestParseMemoOff::new();
+        crate::engine::reset_bucket_dump_manifest_io_counts();
+        let listed = list_n_times(&engine, LISTINGS);
+        (crate::engine::bucket_dump_manifest_io_counts(), listed)
+    };
+
+    // TREATMENT ARM, same process, same fixture.
+    crate::engine::reset_bucket_dump_manifest_io_counts();
+    let treatment_manifests = list_n_times(&engine, LISTINGS);
+    let treatment_counts = crate::engine::bucket_dump_manifest_io_counts();
+
+    println!(
+        "  control:   {} listing(s), {} file read(s) = {} B, {} checksum re-serialise(s)",
+        control_counts.dir_listings,
+        control_counts.file_reads,
+        control_counts.bytes_read,
+        control_counts.checksum_serializes
+    );
+    println!(
+        "  treatment: {} listing(s), {} file read(s) = {} B, {} checksum re-serialise(s), \
+         {} memo hit(s), COST {} owned copy/copies = {} B",
+        treatment_counts.dir_listings,
+        treatment_counts.file_reads,
+        treatment_counts.bytes_read,
+        treatment_counts.checksum_serializes,
+        treatment_counts.parse_hits,
+        treatment_counts.owned_copies,
+        treatment_counts.owned_copy_bytes
+    );
+
+    // DENOMINATOR FIRST. A control arm that did no work would make every number below a win.
+    assert_eq!(
+        control_counts.dir_listings, LISTINGS as u64,
+        "the control arm did not take the listings it was asked for ({} of {LISTINGS}); every \
+         comparison below would then be against nothing",
+        control_counts.dir_listings
+    );
+    assert_eq!(
+        control_counts.file_reads, LISTINGS as u64,
+        "the control arm must read the manifest file once per listing -- that is the behaviour \
+         this memo replaces. It read {} for {LISTINGS} listings",
+        control_counts.file_reads
+    );
+
+    // HALF ONE: the listing count is UNCHANGED. This memo does not touch control flow.
+    assert_eq!(
+        treatment_counts.dir_listings, control_counts.dir_listings,
+        "the memo changed how often the directory is listed ({} vs {}); it is meant to change \
+         what a listing costs, not how many there are",
+        treatment_counts.dir_listings, control_counts.dir_listings
+    );
+
+    // HALF TWO, ASSERTED SEPARATELY: what a listing costs.
+    assert_eq!(
+        treatment_counts.file_reads, 1,
+        "a manifest that has not changed was read {} times over {LISTINGS} listings; the memo is \
+         not being consulted",
+        treatment_counts.file_reads
+    );
+    assert_eq!(
+        (treatment_counts.parse_hits, treatment_counts.parse_misses),
+        ((LISTINGS - 1) as u64, 1),
+        "every listing after the first must be served from the memo: hits {} misses {}",
+        treatment_counts.parse_hits,
+        treatment_counts.parse_misses
+    );
+    assert!(
+        treatment_counts.bytes_read * (LISTINGS as u64) <= control_counts.bytes_read,
+        "the treatment read {} B against the control's {} B over {LISTINGS} listings",
+        treatment_counts.bytes_read,
+        control_counts.bytes_read
+    );
+
+    // HALF THREE, ASSERTED SEPARATELY: a change of COST, not of MEANING.
+    assert_eq!(
+        control_manifests, treatment_manifests,
+        "the two arms returned different manifests, so this is not the same listing done cheaper"
+    );
+    assert_eq!(
+        control_manifests.len(),
+        1,
+        "the fixture must hold exactly one manifest, or 'read once' says nothing: {}",
+        control_manifests.len()
+    );
+}
+
+/// THE MEMO NOTICES A MANIFEST THAT WAS WRITTEN, AND ONE THAT WAS DELETED BEHIND ITS BACK.
+///
+/// The second half is the one that decides whether this memo is sound. A rule that depended on
+/// every site which removes a manifest remembering to say so would already be wrong in this tree:
+/// `engine/tests/persistence_recovery_and_accounting.rs`, `engine/tests/cache_tiers_and_command_execution.rs` and `engine/tests/prune_crash_window.rs` all
+/// delete manifest files with `fs::remove_file` and tell nobody. The key is what `read_dir` and
+/// `stat` report, so none of them has to.
+#[test]
+fn a_manifest_deleted_behind_the_memos_back_stops_being_listed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = dump_engine(dir.path());
+    seed_in_batches(&engine, 1, SMALL, 100);
+    engine
+        .create_bucket_dump_manifest(1, Vec::<u32>::new())
+        .expect("first dump");
+
+    // Warm the memo, then measure everything below as a DIFFERENCE -- resetting the counters
+    // would also clear the memo, which is the one thing this test must not do.
+    let warmed = engine.list_bucket_dump_manifests(1);
+    assert_eq!(warmed.len(), 1, "fixture should hold one manifest");
+    let first_id = warmed[0].manifest_id.clone();
+
+    // A NEW MANIFEST IS SEEN, and only it is read.
+    let before = crate::engine::bucket_dump_manifest_io_counts();
+    engine
+        .create_bucket_dump_manifest(1, Vec::<u32>::new())
+        .expect("second dump");
+    let after_write = engine.list_bucket_dump_manifests(1);
+    let after = crate::engine::bucket_dump_manifest_io_counts();
+    println!(
+        "  after a second dump: {} manifest(s) listed, {} file read(s) since",
+        after_write.len(),
+        after.file_reads - before.file_reads
+    );
+    assert_eq!(
+        after_write.len(),
+        2,
+        "a manifest written while the memo was warm was not listed: {:?}",
+        after_write
+            .iter()
+            .map(|manifest| manifest.manifest_id.clone())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        after.file_reads - before.file_reads,
+        1,
+        "only the NEW manifest should have been read; {} files were",
+        after.file_reads - before.file_reads
+    );
+
+    // A MANIFEST DELETED WITH NOBODY TOLD STOPS BEING LISTED.
+    let before_delete = crate::engine::bucket_dump_manifest_io_counts();
+    fs::remove_file(bucket_dump_manifest_path(&engine.index_dir, 1, &first_id))
+        .expect("delete the older manifest behind the memo's back");
+    let after_delete = engine.list_bucket_dump_manifests(1);
+    let counts = crate::engine::bucket_dump_manifest_io_counts();
+    println!(
+        "  after deleting {first_id} directly: {} manifest(s) listed, {} file read(s) since",
+        after_delete.len(),
+        counts.file_reads - before_delete.file_reads
+    );
+    assert_eq!(
+        after_delete.len(),
+        1,
+        "a manifest deleted behind the memo's back was still served from it"
+    );
+    assert!(
+        after_delete
+            .iter()
+            .all(|manifest| manifest.manifest_id != first_id),
+        "the deleted manifest {first_id} was still listed"
+    );
+    assert_eq!(
+        counts.file_reads - before_delete.file_reads,
+        0,
+        "the surviving manifest had not changed and should not have been re-read; {} reads",
+        counts.file_reads - before_delete.file_reads
+    );
+
+    // AND IT IS NOT STILL HELD. Serving the right answer is not enough: a memo that never drops
+    // what the directory dropped keeps a whole manifest, index image and all, alive for the life
+    // of the process -- one per pruned dump, for ever.
+    let held = crate::engine::bucket_dump_manifest_memo_len();
+    println!("  manifests still held by the memo: {held}");
+    assert_eq!(
+        held, 1,
+        "the memo holds {held} manifest(s) for a directory that now contains 1; a listing that \
+         saw the whole directory must drop what the directory no longer has"
+    );
+}
+
+
+/// A MANIFEST REWRITTEN AT THE SAME PATH IS READ AGAIN, NOT SERVED FROM THE MEMO.
+///
+/// This is the branch the memo's soundness rests on, and the only one whose failure is
+/// stale-LATE: every other way it can go wrong produces an unnecessary read. A memo that keyed on
+/// the path alone -- or that looked up the entry and then served it without comparing what the
+/// filesystem now says about those bytes -- would answer with a document that is no longer on
+/// disk, and no test that only ADDS or DELETES manifests would notice.
+#[test]
+fn a_manifest_rewritten_at_the_same_path_is_read_again() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = dump_engine(dir.path());
+    seed_in_batches(&engine, 1, SMALL, 100);
+    engine
+        .create_bucket_dump_manifest(1, Vec::<u32>::new())
+        .expect("dump");
+
+    // Warm the memo on the manifest as written.
+    let warmed = engine.list_bucket_dump_manifests(1);
+    assert_eq!(warmed.len(), 1, "fixture should hold one manifest");
+    let original = warmed[0].clone();
+    let rewritten_wal_sequence = original.wal_sequence.wrapping_add(7_000_000);
+
+    // Rewrite THE SAME manifest id -- so the same path -- with different contents, checksummed
+    // the way the writer would checksum it, so the listing has no reason to reject it.
+    let mut replacement = original.clone();
+    replacement.wal_sequence = rewritten_wal_sequence;
+    replacement.checksum.clear();
+    let checksum = crate::engine::bucket_dump_io::bucket_dump_manifest_checksum_in_place(
+        &mut replacement,
+    )
+    .expect("checksum the replacement");
+    replacement.checksum = checksum;
+    engine
+        .persist_bucket_dump_manifest(&replacement)
+        .expect("rewrite the manifest at its own path");
+
+    let before = crate::engine::bucket_dump_manifest_io_counts();
+    let listed = engine.list_bucket_dump_manifests(1);
+    let after = crate::engine::bucket_dump_manifest_io_counts();
+    println!(
+        "  rewrote {} in place: listed {} manifest(s), wal_sequence {} -> {}, {} file read(s)",
+        original.manifest_id,
+        listed.len(),
+        original.wal_sequence,
+        listed.first().map(|m| m.wal_sequence).unwrap_or_default(),
+        after.file_reads - before.file_reads
+    );
+
+    // DENOMINATOR: the rewrite has to have actually changed something, or "the new value was
+    // served" is satisfied by serving the old one.
+    assert_ne!(
+        original.wal_sequence, rewritten_wal_sequence,
+        "the replacement must differ from the original or this test asserts nothing"
+    );
+    assert_eq!(
+        listed.len(),
+        1,
+        "the rewrite replaced one manifest at its own path and should still list one"
+    );
+
+    // HALF ONE: the NEW bytes are served.
+    assert_eq!(
+        listed[0].wal_sequence, rewritten_wal_sequence,
+        "the memo served a manifest that is no longer the one on disk: wal_sequence {} where the \
+         file now says {rewritten_wal_sequence}. The memo must compare what the filesystem \
+         reports about an entry, not merely find its path",
+        listed[0].wal_sequence
+    );
+
+    // HALF TWO, ASSERTED SEPARATELY: it was served by READING, which is what makes it fresh.
+    assert_eq!(
+        after.file_reads - before.file_reads,
+        1,
+        "the changed manifest should have been read again; {} files were read",
+        after.file_reads - before.file_reads
+    );
+}
