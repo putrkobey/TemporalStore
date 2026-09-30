@@ -84,3 +84,89 @@
         ]
       }
     ],
+    "postToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./scripts/temporalstore_hook_launcher.mjs PostToolUse",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "post_tool_use": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./scripts/temporalstore_hook_launcher.mjs PostToolUse",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./scripts/temporalstore_hook_launcher.mjs Stop",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "stop": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./scripts/temporalstore_hook_launcher.mjs Stop",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./scripts/temporalstore_hook_launcher.mjs PreCompact",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "preCompact": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./scripts/temporalstore_hook_launcher.mjs PreCompact",
+            "timeout": 120
+          }
+        ]
+      }
+    ],
+    "pre_compact": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node ./scripts/temporalstore_hook_launcher.mjs PreCompact",
+            "timeout": 120
+          }
+        ]
+      }
+    ]
+  }
+}
