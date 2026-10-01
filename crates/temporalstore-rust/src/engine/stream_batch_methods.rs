@@ -571,3 +571,576 @@ impl TemporalEngine {
             // buffered, no fsync (a fire-and-forget commit).
             //
             // The batch is logged as ONE crash-atomic group: all commands are appended under a
+            // single batch id and made durable by a SINGLE barrier (not a per-command fsync
+            // loop). A crash mid-batch therefore leaves an incomplete trailing batch that replay
+            // drops wholesale -- so a retry never double-applies a durable PREFIX of the batch,
+            // which for a non-idempotent / time-unspecified command (FeatureAppend occur_time=0 ->
+            // a fresh now on each apply) would otherwise duplicate points.
+            let sync = !config.async_storage && !bulk_ingest_mode();
+            // Use what the batch staged rather than discarding it. Every command here recorded
+            // what it DID; writing the commands instead left those items in the thread's buffer
+            // and put this whole path outside data-only, which is why a batch measured larger
+            // than the same writes made separately.
+            //
+            // one record carrying every item, when the items can be found again after a crash --
+            // the same rule a single write follows. Otherwise the commands go, as before.
+            let staged_outcomes = super::block_in_wal::take_outcomes();
+            let staged_blocks = super::block_in_wal::take_staged();
+            // ASKED PER RESULT, not per batch -- see `wal::every_result_can_be_found_again`. This
+            // was `sync || !staged_blocks.is_empty()`, which asked a per-result question at BATCH
+            // granularity: one carried page anywhere in the batch answered it for every result in
+            // the batch, and a measured batch left 12 of 20 acked results naming a block-store
+            // address and nothing else while the rule called the batch recoverable.
+            let recoverable =
+                crate::wal::every_result_can_be_found_again(&staged_outcomes, &staged_blocks);
+            let batch_result = if crate::wal::wal_data_only_enabled()
+                && !staged_outcomes.is_empty()
+                && recoverable
+            {
+                self.wal_store
+                    .append_batch_as_one_record(
+                        request.shard_id,
+                        staged_outcomes,
+                        staged_blocks,
+                        sync,
+                    )
+                    .map(|_| ())
+            } else {
+                self.wal_store
+                    .append_batch_atomic(request.shard_id, wal_commands, sync)
+                    .map(|_| ())
+            };
+            if let Err(err) = batch_result {
+                if sync {
+                    // A durable batch commit that failed is not durable; surface it rather than
+                    // acking undurable writes (mirrors the single-command execute path).
+                    return BatchExecuteResponse {
+                        status: Status::error(
+                            "wal_commit_failed",
+                            format!("durable WAL batch commit failed: {err}"),
+                        ),
+                        responses,
+                    };
+                } else {
+                    tracing::error!(
+                        shard_id = request.shard_id,
+                        error = %err,
+                        "async WAL batch append failed: acked writes are NOT durable and will be \
+                         lost on a crash before the next flush"
+                    );
+                }
+            }
+            // Page/index materialization stays deferred to the background dump in
+            // async and bulk modes (index_log/persist already no-op under bulk).
+            if !config.async_storage && !bulk_ingest_mode() {
+                // Anchor the served index to the WAL sequence it reflects (see the
+                // single-command path) so shard load replays only records after it. Under
+                // flat append read the O(1) cached last sequence instead of `stats()` (which
+                // rescans the whole WAL file); without it the exact `stats()` value is kept.
+                // Where this batch STARTS in the log, taken before the anchor moves.
+                //
+                // The claim stamped below has to be the bucket's OLDEST undumped write, and for a
+                // batch that is the FIRST record it appended, not the last. The anchor still
+                // holding the previous write's position is one below that first record, so
+                // `+ 1` names it -- and when some other path wrote without anchoring, the value
+                // is only lower, which retains more rather than less. A claim ABOVE a bucket's
+                // oldest undumped write is the direction that frees records it still needs.
+                let batch_first_wal_sequence = shard
+                    .applied_wal_sequence
+                    .unwrap_or_default()
+                    .saturating_add(1);
+                shard.applied_wal_sequence = Some(if self.wal_store.flat_append() {
+                    self.wal_store.cached_last_sequence(request.shard_id)
+                } else {
+                    self.wal_store.stats(request.shard_id).last_sequence
+                });
+                // The WAL half of what each bucket this batch dirtied holds over the log, stamped
+                // the way the single-command path stamps it (engine.rs, after its own append).
+                //
+                // Without it a batch-dirtied bucket reported NO CLAIM RECORDED, which the reclaim
+                // plan reads as unknown rather than as "needs nothing" -- so every such bucket
+                // landed in `missing_bucket_generations` and refused the whole plan until a dump
+                // happened to cover it. A dump is capped per round, so on a shard written through
+                // this path the two logs simply grew.
+                //
+                // Only when unset, for the same reason as the sibling: the field is the OLDEST
+                // undumped write, so a later batch into an already-dirty bucket must not move it.
+                for key in &delta_command_keys {
+                    let routing_bucket =
+                        block_routing_bucket(key, start_routing_bucket, end_routing_bucket);
+                    if let Some(bucket) = shard.bucket_index.bucket_map.get_mut(&routing_bucket) {
+                        if bucket.first_dirty_wal_sequence == 0 {
+                            bucket.first_dirty_wal_sequence = batch_first_wal_sequence;
+                        }
+                    }
+                }
+                // Append the pages this batch changed (O(delta)) to the index-log (advances
+                // the sequence + populates the delta stream). The whole-index base rewrite is
+                // deferred to the next compaction point (see the single-command execute path).
+                let (items, upsert_record) = match batch_upsert_components.as_ref() {
+                    Some(components) => (
+                        collect_upsert_index_items(
+                            shard,
+                            request.shard_id,
+                            components,
+                            start_routing_bucket,
+                            end_routing_bucket,
+                        ),
+                        true,
+                    ),
+                    None => (
+                        collect_command_index_items(
+                            shard,
+                            &delta_command_keys,
+                            start_routing_bucket,
+                            end_routing_bucket,
+                        ),
+                        false,
+                    ),
+                };
+                // Capturing serializes every entry the per-key maps hold for each key, so
+                // appending to a posting of length N serialized all N -- 99.5% of the index log
+                // on a real corpus (3.53 GB against 16 MB for the same 20,001 messages). A write
+                // that only ADDED leaves nothing to resurrect, so it is skipped there, exactly as
+                // the single-command execute path already does.
+                let mut key_states = if batch_membership_shrank {
+                    capture_key_states(shard, &delta_command_keys)
+                } else {
+                    Vec::new()
+                };
+                // Carried whether or not the shrink capture ran, for the reason the
+                // single-command path states: the gate above asks about a shrink or a deadline,
+                // and a pure add -- the write whose element the fold could not restore -- is
+                // neither.
+                key_states.extend(capture_container_element_states(
+                    shard,
+                    &batch_touched_container_elements,
+                ));
+                let appended_index_log_sequence = self
+                    .index_log_store
+                    .append_delta(
+                        request.shard_id,
+                        items,
+                        key_states,
+                        shard.applied_wal_sequence,
+                        None,
+                        upsert_record,
+                        // Non-blocking on the raft apply path (raft log is the durability
+                        // source).
+                        !raft_applying(),
+                    )
+                    .unwrap_or(0);
+                // The index-log half, and it is a SEPARATE half: the plan keeps two frontiers
+                // counted in two different sequences and requires both, so a bucket that can
+                // place itself in the WAL and not in the index log has still said nothing.
+                //
+                // `append_delta` returns 0 when it wrote nothing, which is exactly "no claim" --
+                // the same guard the single-command path uses.
+                if appended_index_log_sequence > 0 {
+                    for key in &delta_command_keys {
+                        let routing_bucket =
+                            block_routing_bucket(key, start_routing_bucket, end_routing_bucket);
+                        if let Some(bucket) =
+                            shard.bucket_index.bucket_map.get_mut(&routing_bucket)
+                        {
+                            if bucket.first_dirty_index_log_sequence == 0 {
+                                bucket.first_dirty_index_log_sequence =
+                                    appended_index_log_sequence;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        BatchExecuteResponse {
+            status: Status::ok(),
+            responses,
+        }
+    }
+
+    pub fn batch_execute_replicated(
+        &self,
+        request: ReplicatedBatchExecuteRequest,
+    ) -> ReplicatedBatchExecuteResponse {
+        let mut responses = Vec::with_capacity(request.commands.len());
+        let mut replication = Vec::with_capacity(request.commands.len());
+        for command in request.commands {
+            replication.push(
+                self.replication_selection_report(&command.command, command.replication_mode),
+            );
+            responses.push(self.execute_replicated(ReplicatedExecuteRequest {
+                shard_id: request.shard_id,
+                command: command.command,
+                replication_mode: command.replication_mode,
+            }));
+        }
+        ReplicatedBatchExecuteResponse {
+            status: Status::ok(),
+            responses,
+            replication,
+        }
+    }
+
+    pub fn batch_execute_checked(
+        &self,
+        request: CheckedBatchExecuteRequest,
+    ) -> CheckedBatchExecuteResponse {
+        if let Err(status) = self.validate_load_version(request.shard_id, request.load_version) {
+            return CheckedBatchExecuteResponse {
+                status: status.clone(),
+                response: BatchExecuteResponse {
+                    status,
+                    responses: Vec::new(),
+                },
+            };
+        }
+        let response = self.batch_execute(BatchExecuteRequest {
+            shard_id: request.shard_id,
+            commands: request.commands,
+        });
+        CheckedBatchExecuteResponse {
+            status: response.status.clone(),
+            response,
+        }
+    }
+
+    pub fn export_index_bytes(&self, shard_id: ShardId) -> Result<Vec<u8>, std::io::Error> {
+        // Route through the served-index funnel: on the delta path (and outside bulk) the
+        // authoritative index is the live in-memory shard; otherwise fall back to the base
+        // file, preserving the original missing-file -> Err contract that callers map to a
+        // dump/publish failure status.
+        self.load_served_index_bytes(shard_id)
+    }
+
+    pub fn publish_shard_index_snapshot(&self, shard_id: ShardId) -> Result<usize, Status> {
+        self.publish_shard_index_snapshot_for_keys(shard_id, Vec::<String>::new())
+    }
+
+    /// Republish the named keys' log-resident pages into the block store, and checkpoint the
+    /// served index when one is due.
+    ///
+    /// ANSWERS WITH THE SERVED-INDEX BYTES THIS CALL WROTE, which is what it always answered --
+    /// and that is now sometimes ZERO, because the checkpoint runs per published key rather than
+    /// per call. See [`crate::engine::VISIBILITY_PUBLISH_INDEX_FLUSH_INTERVAL_DEFAULT`] for the
+    /// interval and for why deferring the checkpoint loses nothing. Zero therefore means "this
+    /// call wrote no index", which covers both the publish that found nothing log-resident and
+    /// the publish whose checkpoint was deferred; it has never meant "nothing was published", and
+    /// the pages are republished either way before this returns.
+    pub fn publish_shard_index_snapshot_for_keys(
+        &self,
+        shard_id: ShardId,
+        selected_keys: impl IntoIterator<Item = String>,
+    ) -> Result<usize, Status> {
+        enum PublishTarget {
+            String { key: String },
+            Hash { key: String, field: String },
+        }
+
+        impl PublishTarget {
+            /// The OBJECT key of the page, which is the key its routing bucket is derived from.
+            ///
+            /// A hash field's page is filed under the hash's key, not under the field -- the field
+            /// is the page's COMPONENT. Reading the bucket from the field would key the cache under
+            /// a bucket nothing wrote.
+            fn object_key(&self) -> &str {
+                match self {
+                    PublishTarget::String { key } => key,
+                    PublishTarget::Hash { key, .. } => key,
+                }
+            }
+
+            /// The ELEMENT of that object, which the comment above already calls the page's
+            /// component. It was named there and then thrown away; a read that resolves
+            /// through a log record needs it to pick the right page out of the record.
+            fn component(&self) -> Option<&str> {
+                match self {
+                    PublishTarget::String { .. } => None,
+                    PublishTarget::Hash { field, .. } => Some(field),
+                }
+            }
+
+            /// The MODEL KIND, which is the third term of the object's identity.
+            ///
+            /// Named here rather than at the read because the two variants ARE the two kinds, so a
+            /// `match` at the call site would be this function written out again. The kind is not
+            /// recoverable from the key or the component: a `string` and a `hash` may share a key,
+            /// and it is the kind that tells their pages apart.
+            fn kind(&self) -> &'static str {
+                match self {
+                    PublishTarget::String { .. } => "string",
+                    PublishTarget::Hash { .. } => "hash",
+                }
+            }
+        }
+
+        let selected_keys = selected_keys
+            .into_iter()
+            .filter(|key| !key.trim().is_empty())
+            .collect::<BTreeSet<_>>();
+        let publish_all = selected_keys.is_empty();
+        let publish_targets = {
+            let shards = self.shards.read().expect("engine lock poisoned");
+            let Some(shard) = shards.get(&shard_id) else {
+                return Err(Status::error(
+                    "shard_not_loaded",
+                    "shard is not loaded on this server",
+                ));
+            };
+            if publish_all {
+                let mut publish_targets = shard
+                    .strings()
+                    .iter()
+                    .filter(|(_, slot)| crate::wal_record::is_wal_resident(slot.block_slab_id()))
+                    .map(|(key, slot)| {
+                        (PublishTarget::String { key: key.to_string() }, slot.address())
+                    })
+                    .collect::<Vec<_>>();
+                publish_targets.extend(
+                    shard
+                        .hashes
+                        .iter()
+                        .flat_map(|(key, fields)| {
+                            fields.iter().filter_map(move |(field, address)| {
+                                crate::wal_record::is_wal_resident(address.block_slab_id()).then(|| {
+                                    (
+                                        PublishTarget::Hash {
+                                            key: key.to_string(),
+                                            field: field.to_string(),
+                                        },
+                                        address.clone(),
+                                    )
+                                })
+                            })
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                publish_targets
+            } else {
+                let mut publish_targets = Vec::new();
+                for key in &selected_keys {
+                    if let Some(address) = shard.string_address(key.as_str()) {
+                        if crate::wal_record::is_wal_resident(address.block_slab_id()) {
+                            publish_targets.push((
+                                PublishTarget::String { key: key.clone() },
+                                address,
+                            ));
+                        }
+                    }
+                    if let Some(fields) = shard.hashes.get(key) {
+                        publish_targets.extend(fields.iter().filter_map(|(field, address)| {
+                            crate::wal_record::is_wal_resident(address.block_slab_id()).then(|| {
+                                (
+                                    PublishTarget::Hash {
+                                        key: key.clone(),
+                                        field: field.to_string(),
+                                    },
+                                    address.clone(),
+                                )
+                            })
+                        }));
+                    }
+                }
+                publish_targets
+            }
+        };
+        let (start_routing_bucket, end_routing_bucket) = self.shard_routing_range(shard_id);
+        let mut publish_records = Vec::with_capacity(publish_targets.len());
+        for (target, address) in publish_targets {
+            let routing_bucket = crate::engine::hashing::block_routing_bucket(
+                target.object_key(),
+                start_routing_bucket,
+                end_routing_bucket,
+            );
+            if let Some(bytes) = read_block_bytes(
+                &self.cache,
+                &self.block_store,
+                shard_id,
+                &address,
+                BlockIdentity::of(shard_id, target.kind(), target.object_key(), target.component()),
+                Some(routing_bucket),
+            ) {
+                // Derived BEFORE `target` moves into the tuple: the terms are borrowed from it.
+                let object_id =
+                    stable_block_object_id(shard_id, target.kind(), target.object_key());
+                publish_records.push((
+                    target,
+                    address.clone(),
+                    bytes,
+                    Some(object_id),
+                    Some(routing_bucket),
+                ));
+            }
+        }
+        if publish_records.is_empty() {
+            return Ok(0);
+        }
+        let append_records = publish_records
+            .iter()
+            // `publish_records` owns these bytes and outlives the append, so the store can
+            // borrow them rather than take a copy of every page being published.
+            // This republishes a block that already exists, so it keeps the id it already
+            // has. A block id is an index inside its object; handing out a fresh one here
+            // would give the object two blocks claiming the same position.
+            .map(|(_, address, bytes, object_id, routing_bucket)| {
+                (
+                    bytes.as_slice(),
+                    *object_id,
+                    *routing_bucket,
+                    address.block_id().unwrap_or_default() as u32,
+                )
+            })
+            .collect::<Vec<BlockAppendRecord>>();
+        let published_addresses = self
+            .block_store
+            .append_batch_with_block_metadata(append_records)
+            .map_err(|err| Status::error("publish_visibility_failed", err.to_string()))?;
+        let index_bytes = {
+            let mut shards = self.shards.write().expect("engine lock poisoned");
+            let Some(shard) = shards.get_mut(&shard_id) else {
+                return Err(Status::error(
+                    "shard_not_loaded",
+                    "shard is not loaded on this server",
+                ));
+            };
+            let mut published_object_keys = BTreeSet::new();
+            for ((target, original, bytes, _, _), published) in
+                publish_records.into_iter().zip(published_addresses)
+            {
+                match target {
+                    PublishTarget::String { key } => {
+                        // COMPARED AS AN ADDRESS, which is what `original` is. The row holds
+                        // more than the address now, so comparing rows would make an unrelated
+                        // field's change look like a concurrent write and skip the publish.
+                        if shard.string_address(key.as_str()) != Some(original) {
+                            continue;
+                        }
+                        let _ = self.cache.put(
+                            CacheKey::page_with_slot(
+                                shard_id,
+                                published.block_slab_id(),
+                                published.offset(),
+                                published.length(),
+                                Some(crate::engine::hashing::block_routing_bucket(
+                                    &key,
+                                    start_routing_bucket,
+                                    end_routing_bucket,
+                                )),
+                            ),
+                            bytes,
+                        );
+                        upsert_bucket_index_block(
+                            shard,
+                            shard_id,
+                            "string",
+                            &key,
+                            None,
+                            published.clone(),
+                            false,
+                        );
+                        published_object_keys.insert(key.clone());
+                        // ONE COPY OF THE CHARACTERS. `into_boxed_str` was a free move of the
+                        // caller's buffer, so converting it to a bare `Arc::from` would have
+                        // ADDED an allocation rather than removed one. Take the handle the page
+                        // index already holds, and allocate only when it has none.
+                        let shared = shard
+                            .bucket_index
+                            .object_block_lookup
+                            .any_shared_object_key(&key);
+                        let stored = shared.unwrap_or_else(|| std::sync::Arc::from(key));
+                        shard.set_string_address(stored, &published);
+                    }
+                    PublishTarget::Hash { key, field } => {
+                        let current = shard.hashes.get(&key).and_then(|fields| fields.get(&field));
+                        if current != Some(&original) {
+                            continue;
+                        }
+                        let _ = self.cache.put(
+                            CacheKey::page_with_slot(
+                                shard_id,
+                                published.block_slab_id(),
+                                published.offset(),
+                                published.length(),
+                                Some(crate::engine::hashing::block_routing_bucket(
+                                    &key,
+                                    start_routing_bucket,
+                                    end_routing_bucket,
+                                )),
+                            ),
+                            bytes,
+                        );
+                        super::recorded_map::install_element::<super::recorded_map::HashKind>(
+                            shard,
+                            shard_id,
+                            &key,
+                            Some(field.clone()),
+                            std::sync::Arc::from(&field[..]),
+                            published.clone(),
+                            false,
+                            published,
+                        );
+                        published_object_keys.insert(key.clone());
+                    }
+                }
+            }
+            // COUNTED BEFORE THE SET IS CONSUMED BY THE LOOP BELOW. These are the keys whose
+            // pages this call actually relocated -- the ones that passed the concurrent-write
+            // check above -- which is the unit the interval is counted in.
+            let published_key_count = published_object_keys.len() as u64;
+            for object_key in published_object_keys {
+                clear_published_object_dirty_state(shard, &object_key);
+            }
+            refresh_bucket_runtime_flags(shard);
+            // THE CHECKPOINT IS DUE PER PUBLISHED KEY, NOT PER PUBLISH.
+            //
+            // Re-encoding the whole served index costs about 47 bytes per RESIDENT key -- 376,012
+            // encoded bytes to publish ONE key at 8,000 keys, measured by
+            // `what_one_visibility_publish_writes_grows_with_the_store_not_the_publish`, against a
+            // figure that does not move when the named set widens 256-fold on a fixed store -- so
+            // a checkpoint per call charges the whole store to whatever the call happened to
+            // name. `publish_index_flush_countdown` spends this call's published keys against the
+            // engine's interval and only encodes when they run it out, which bounds the index
+            // bytes ONE published key can be charged instead of bounding nothing.
+            //
+            // SAFE BECAUSE THE RELOCATED ROWS ARE ALREADY DURABLE BY REPLAY, which is the same
+            // ground the write path's deferred index sync stands on. This publish does not retire
+            // the relocated blocks' registrations and does not clear any bucket's
+            // `first_dirty_wal_sequence` -- that is written to zero at exactly one site, and only
+            // by a durable dump -- so both WAL retention floors still sit below the records it
+            // rewrote, and a checkpoint that lands late, lands stale or never lands is re-derived
+            // by replaying them.
+            // `a_deferred_publish_checkpoint_still_reloads_with_the_published_values` drives that
+            // rather than asserting it.
+            //
+            // THE COUNTDOWN IS SPENT WHETHER OR NOT THE CALL IS DUE, and reloaded only on a
+            // checkpoint, so the calls between two checkpoints sum to the interval rather than
+            // resetting whenever a call happens to name one key.
+            shard.publish_index_flush_countdown = shard
+                .publish_index_flush_countdown
+                .saturating_sub(published_key_count);
+            if shard.publish_index_flush_countdown == 0 {
+                shard.publish_index_flush_countdown =
+                    self.visibility_publish_index_flush_interval();
+                Some(serialize_index(shard))
+            } else {
+                None
+            }
+        };
+        // `None` when this call's published keys did not run the countdown out -- see the
+        // countdown above. The index-log anchor goes with the index and not without it: an anchor
+        // record carries the digest and length of the index file it names, so there is nothing for
+        // it to name on a call that wrote no index.
+        let Some(index_bytes) = index_bytes else {
+            return Ok(0);
+        };
+        if !bulk_ingest_mode() {
+            // Bulk backfill defers per-record index persistence to an explicit
+            // flush_shard_index() call; skip the O(n^2) rewrite + indexlog append here.
+            self.index_log_store
+                .append_index_bytes(shard_id, &index_bytes)
+                .map_err(|err| Status::error("publish_visibility_failed", err.to_string()))?;
+            self.persist_index_bytes(shard_id, &index_bytes)
+                .map_err(|err| Status::error("publish_visibility_failed", err.to_string()))?;
+        }
+        Ok(index_bytes.len())
+    }
+}

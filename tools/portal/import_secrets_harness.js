@@ -66,3 +66,71 @@ function snapshot() {
   };
 }
 
+function reply(body) {
+  return Promise.resolve({ ok: true, status: 200, json: () => Promise.resolve(body),
+                           text: () => Promise.resolve(JSON.stringify(body)) });
+}
+
+const win = {
+  document: {
+    getElementById: (id) => el(id),
+    querySelector: () => makeEl(), querySelectorAll: () => [],
+    createElement: () => makeEl(), addEventListener() {}, body: makeEl(), hidden: false
+  },
+  addEventListener() {},
+  location: { origin: "http://localhost", href: "http://localhost", reload() {} },
+  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  navigator: {},
+  setTimeout: (fn) => { if (typeof fn === "function") { fn(); } return 0; },
+  setInterval: () => 0, clearInterval() {},
+  Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
+  TextDecoder: function () { this.decode = () => ""; },
+  AbortController: function () { this.abort = () => {}; this.signal = {}; },
+  FileReader: function () {}, Blob: function () {},
+  URL: { createObjectURL: () => "", revokeObjectURL() {} },
+  fetch: (url, opts) => {
+    const method = ((opts || {}).method || "GET").toUpperCase();
+    if (String(url).indexOf("/v1/admin/config") >= 0 && method === "POST") {
+      return reply({ status: "ok", applied: [], restart_required: ["extraction.provider"] });
+    }
+    if (String(url).indexOf("/v1/admin/config") >= 0) { return reply(snapshot()); }
+    return new Promise(() => {});
+  }
+};
+win.window = win;
+
+const names = Object.keys(win);
+const values = names.map((k) => win[k]);
+scripts.forEach((body, index) => {
+  try { new Function(...names, body)(...values); }
+  catch (e) { console.log("FAIL script " + index + " threw at load: " + e.message); failures += 1; }
+});
+
+function settle() { return new Promise((r) => setImmediate(() => setImmediate(r))); }
+async function quiet() { for (let i = 0; i < 60; i += 1) { await settle(); } }
+
+(async function () {
+  ok("the import control is wired", typeof listeners["importCfg:click"] === "function");
+
+  el("importText").value = JSON.stringify({ settings: { "extraction.model": "deepseek-chat" } });
+  listeners["importCfg:click"]({});
+  await quiet();
+
+  const said = el("importMsg").innerHTML + " " + el("importMsg").textContent;
+  ok("it still reports what it applied", /Applied 1 setting/.test(said), said);
+  ok("it says the restart is needed", /restart/.test(said), said);
+  ok("it names the secret this deployment does not have",
+     /extraction\.api_key/.test(said), said);
+  ok("it does not name the one that is set",
+     !/embedding\.api_key/.test(said), said);
+  ok("it says why the file could not carry it",
+     /never carries/.test(said), said);
+
+  console.log(failures === 0 ? "PASS" : "FAILED " + failures);
+  process.exit(failures === 0 ? 0 : 1);
+}().catch(function (err) {
+  console.log("FAILED harness threw: " + err.message);
+  process.exit(1);
+}));
