@@ -54,3 +54,173 @@
 //! The second is reported rather than quietly kept, because a green arm has two readings and this
 //! one is "nothing needs it", not "it works".
 
+/// Every `pub(super)` field of `ShardState`, as `(name, type)` with the type on one line.
+///
+/// Wrapped types are joined before matching, which is the defect this whole module exists for.
+fn shard_state_fields() -> Vec<(String, String)> {
+    let state = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("engine")
+        .join("engine_storage_state.rs");
+    let text = std::fs::read_to_string(&state).expect("engine_storage_state.rs must be readable");
+
+    // BRACE-MATCH THE STRUCT. This arm is DEFENSIVE AND CURRENTLY UNEXERCISED, and saying so is
+    // the point: a plant swapped it for the naive `find("\n}\n")` and the guard still passed, even
+    // with a doc comment carrying a braced example planted inside the body. Every brace inside a
+    // struct body is INDENTED, so only the struct's own closing brace sits at column zero and the
+    // naive query is correct for Rust's standard formatting.
+    //
+    // It stays because it costs nothing and does not depend on formatting, but it is not what
+    // fixed the wrong count -- see the field-joining below, which is.
+    let decl = text
+        .find("pub(super) struct ShardState")
+        .expect("ShardState must be declared");
+    let open = text[decl..].find('{').expect("the struct must have a body") + decl;
+    let mut depth = 0usize;
+    let mut close = open;
+    for (offset, ch) in text[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = open + offset;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(close > open, "the struct body must be brace-matched");
+
+    // Drop doc comments, line comments and attributes, so a braced example or a `#[serde(...)]`
+    // cannot contribute a field.
+    let kept: Vec<&str> = text[open..close]
+        .lines()
+        .filter(|line| {
+            let t = line.trim_start();
+            !(t.starts_with("///") || t.starts_with("//") || t.starts_with("#["))
+        })
+        .collect();
+
+    // JOIN A WRAPPED TYPE ONTO ITS NAME. `control_state_changes:` sits alone on its line with the
+    // type beneath it, and requiring one line is exactly what lost it.
+    let mut joined: Vec<String> = Vec::new();
+    for line in kept {
+        let trimmed = line.trim_end();
+        if trimmed.trim_end().ends_with(':') {
+            joined.push(trimmed.trim_end().to_string());
+            continue;
+        }
+        match joined.last_mut() {
+            Some(last) if last.ends_with(':') => {
+                last.push(' ');
+                last.push_str(trimmed.trim());
+            }
+            _ => joined.push(trimmed.to_string()),
+        }
+    }
+
+    let mut fields = Vec::new();
+    for line in joined {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("pub(super) ") else {
+            continue;
+        };
+        let Some((name, ty)) = rest.split_once(':') else {
+            continue;
+        };
+        if name.contains(' ') || name.contains('(') {
+            continue;
+        }
+        let ty = ty.trim().trim_end_matches(',').split_whitespace().collect::<Vec<_>>().join(" ");
+        if ty.is_empty() {
+            continue;
+        }
+        fields.push((name.trim().to_string(), ty));
+    }
+    fields
+}
+
+/// Whether a type's OUTERMOST key is an object key.
+fn is_object_keyed(ty: &str) -> bool {
+    for container in ["HashMap<", "BTreeMap<"] {
+        if let Some(rest) = ty.strip_prefix(container) {
+            let key = rest.split(',').next().unwrap_or("").trim();
+            return matches!(key, "ModelKey" | "Arc<str>" | "String");
+        }
+    }
+    false
+}
+
+/// Whether a type is a domain-keyed field: `HashMap<SomeDomain, Table>` whose table is object-keyed.
+fn is_domain_keyed(ty: &str) -> bool {
+    let Some(rest) = ty.strip_prefix("HashMap<") else {
+        return false;
+    };
+    let key = rest.split(',').next().unwrap_or("").trim();
+    // `SideTable` is the merged domain key: the three stored domain-keyed fields became one, so the
+    // list that was four names is two. `RollupDomain` stays because `rollups` is `serde(skip)` and
+    // did not join -- folding a skipped map into a serialized one PERSISTS it, which this campaign
+    // already paid for once at a 2.27x stored-index cost and did not pay again here.
+    const DOMAINS: [&str; 2] = ["SideTable", "RollupDomain"];
+    DOMAINS.contains(&key)
+}
+
+#[test]
+fn the_object_keyed_field_count_is_seven_and_the_query_can_see_a_wrapped_type() {
+    let fields = shard_state_fields();
+    assert!(
+        fields.len() >= 25,
+        "the field query found only {} fields, which is fewer than this struct has had at any \
+         point in the campaign -- the extraction is broken, not the struct",
+        fields.len()
+    );
+
+    let plain: Vec<&(String, String)> =
+        fields.iter().filter(|(_, ty)| is_object_keyed(ty)).collect();
+    let domain: Vec<&(String, String)> =
+        fields.iter().filter(|(_, ty)| is_domain_keyed(ty)).collect();
+
+    println!();
+    println!("  ShardState fields: {}", fields.len());
+    println!();
+    println!("  OBJECT-KEYED PLAIN ({}):", plain.len());
+    for (name, ty) in &plain {
+        println!("    {name:<28} {ty}");
+    }
+    println!();
+    println!("  DOMAIN-KEYED ({}):", domain.len());
+    for (name, ty) in &domain {
+        println!("    {name:<28} {ty}");
+    }
+    println!();
+    println!(
+        "  => object-keyed FIELDS = {} (the campaign's denominator)",
+        plain.len() + domain.len()
+    );
+
+    // THE ARM THAT MAKES THIS EVIDENCE. `control_state_changes` wraps its type onto a second
+    // source line, and the query that reported EIGHT could not see it. A guard with the same
+    // blind spot would assert a wrong number with total confidence, so the blind spot is what is
+    // checked first.
+    let names: Vec<&str> = plain.iter().map(|(n, _)| n.as_str()).collect();
+    assert!(
+        names.contains(&"control_state_changes"),
+        "the query did not find `control_state_changes`, whose type WRAPS onto a second line. \
+         That is the exact omission that made this count read 8 instead of 9, so a query that \
+         cannot see it is not measuring the population. Found: {names:?}"
+    );
+
+    assert_eq!(
+        plain.len() + domain.len(),
+        7,
+        "object-keyed field count moved. Plain: {:?}. Domain: {:?}. If a merge landed, this \
+         number is the campaign's headline and belongs in the pull request body; if it moved \
+         without one, a field was added and the denominator changed under the campaign.",
+        names,
+        domain.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>()
+    );
+    assert_eq!(plain.len(), 5, "the plain object-keyed fields changed: {names:?}");
+    assert_eq!(domain.len(), 2, "the domain-keyed fields changed");
+}

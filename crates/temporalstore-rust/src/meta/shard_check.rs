@@ -422,3 +422,427 @@ impl SingleNodeMeta {
             let state = self.inner.read().expect("meta lock poisoned");
             // A frozen shard is out of service on purpose, so its owner not
             // serving it is expected rather than divergence.
+            // The check plans after this lock is dropped, so it takes names
+            // of its own rather than borrowing ones that will not outlive it.
+            let shard_owners = serving_shard_owners(&state)
+                .into_iter()
+                .map(|(shard_id, owner)| (shard_id, owner.to_string()))
+                .collect::<BTreeMap<_, _>>();
+            let servers = state
+                .servers
+                .values()
+                .map(ObservedServer::observe)
+                .collect::<Vec<_>>();
+            let live_servers = state
+                .servers
+                .values()
+                .filter(|server| server.state == MetaEntityState::Normal)
+                .map(|server| server.server_addr.clone())
+                .collect::<BTreeSet<_>>();
+            (shard_owners, servers, live_servers)
+        };
+        let mut report = checker.check(&shard_owners, &servers, now);
+        let moves = checker.plan_moves(&mut report, &shard_owners, &live_servers);
+        self.metrics.record_divergence(&report);
+        if !report.diverged.is_empty() {
+            let mut state = self.inner.write().expect("meta lock poisoned");
+            for divergence in &report.diverged {
+                record_topology_event(
+                    &mut state,
+                    "shard_divergence_detected",
+                    format!("shard:{}", divergence.shard_id),
+                    format!(
+                        "owner={},reported_unloaded={}",
+                        divergence.server_addr, divergence.reported_unloaded
+                    ),
+                );
+            }
+        }
+        (report, moves)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn a_server_the_check_skipped_is_not_reported_as_consistent() {
+        // The check skips a server that has never reported shard states -- it
+        // `continue`s, so that server's shards are never examined. Without this
+        // reported, `diverged 0` means either "nothing diverged" or "the servers
+        // that mattered were never looked at", and nothing tells them apart.
+        let meta = SingleNodeMeta::default();
+        assert!(meta
+            .register_server(RegisterServerRequest {
+                registered_at_ms: 0,
+                numa_nodes: Vec::new(),
+                server_addr: "quiet".to_string(),
+                node_id: 1,
+                location: "rack-1".to_string(),
+                binary_version: "v1".to_string(),
+            })
+            .status
+            .ok);
+
+        let mut checker = ShardChecker::new(ShardCheckOptions::default());
+        let (report, _) = meta.check_shard_divergence(&mut checker);
+        assert!(report.diverged.is_empty());
+        assert_eq!(report.skipped_without_shard_reports.len(), 1, "{report:?}");
+
+        let exported = meta.subsystem_metrics().prometheus();
+        assert!(
+            exported.contains(
+                "temporalstore_meta_divergence_skipped{reason=\"no_shard_reports\"} 1"
+            ),
+            "a server the check never examined was not reported:\n{exported}"
+        );
+        // And the clean reason stays at zero, so the two are distinguishable.
+        assert!(
+            exported
+                .contains("temporalstore_meta_divergence_skipped{reason=\"reboot_grace\"} 0"),
+            "{exported}"
+        );
+    }
+
+    use super::*;
+
+    fn owners(pairs: &[(ShardId, &str)]) -> BTreeMap<ShardId, String> {
+        pairs
+            .iter()
+            .map(|(shard_id, addr)| (*shard_id, (*addr).to_string()))
+            .collect()
+    }
+
+    fn live(addrs: &[&str]) -> BTreeSet<String> {
+        addrs.iter().map(|addr| (*addr).to_string()).collect()
+    }
+
+    fn serving_state(shard_id: ShardId, state: &str) -> ServerShardServingState {
+        ServerShardServingState {
+            shard_id,
+            serving_state: state.to_string(),
+            worker_index: 0,
+            worker_threads: 1,
+            loaded: matches!(state, "serving" | "readonly"),
+            readonly: state == "readonly",
+            load_version: 1,
+            table_name: "ns.orders".to_string(),
+            shard_uri: String::new(),
+            start_routing_bucket: 0,
+            end_routing_bucket: u32::MAX,
+            total_records: 0,
+            storage_bytes: 0,
+            cache_memory_bytes: 0,
+            storage: ShardCanonicalStorageStats::default(),
+            block_store_bytes_written: 0,
+            wal_sequence: 0,
+            dirty_object_count: 0,
+            dirty_bucket_count: 0,
+        }
+    }
+
+    /// A healthy, reporting server that boots long before any test clock.
+    /// A server as the check sees it, built from a full record so the tests
+    /// still exercise the reduction that the round performs under the lock.
+    fn server(addr: &str, serving: &[(ShardId, &str)]) -> ObservedServer {
+        ObservedServer::observe(&server_record(addr, serving))
+    }
+
+    fn server_record(addr: &str, serving: &[(ShardId, &str)]) -> ServerMetaInfo {
+        ServerMetaInfo {
+            registered_at_ms: 0,
+            reported_record_count: 0,
+            reported_storage_bytes: 0,
+            numa_nodes: Vec::new(),
+            load_key_count: 0,
+            load_memory_bytes: 0,
+            worst_shard_state_penalty: 0,
+            freeze_reason: FreezeReason::Unspecified,
+            server_addr: addr.to_string(),
+            node_id: 1,
+            location: "rack-1".to_string(),
+            state: MetaEntityState::Normal,
+            last_heartbeat_ms: 1_000_000,
+            frozen_since_ms: 0,
+            freeze_cooldown_until_ms: 0,
+            boot_time_ms: 1,
+            reported_boot_time_ms: 1,
+            reboot_detected: false,
+            reports_shard_states: true,
+            binary_version: "test".to_string(),
+            shard_loads: Vec::new(),
+            shard_stat_loads: Vec::new(),
+            runtime_load: ServerRuntimeLoad::default(),
+            shard_states: serving
+                .iter()
+                .map(|(shard_id, state)| serving_state(*shard_id, *state))
+                .collect(),
+        }
+    }
+
+    const NOW: u64 = 1_000_000;
+
+    #[test]
+    fn a_shard_the_owner_no_longer_serves_is_detected_and_re_placed() {
+        // The owner is healthy and heartbeating; it simply stopped serving
+        // shard 2. Nothing else in the metaserver can see this.
+        let mut checker = ShardChecker::default();
+        let shard_owners = owners(&[(1, "s1"), (2, "s1"), (3, "s2")]);
+        let servers = vec![
+            server("s1", &[(1, "serving")]),
+            server("s2", &[(3, "serving")]),
+        ];
+        let mut report = checker.check(&shard_owners, &servers, NOW);
+        assert_eq!(report.diverged.len(), 1);
+        assert_eq!(report.diverged[0].shard_id, 2);
+        assert_eq!(report.diverged[0].server_addr, "s1");
+        assert!(!report.diverged[0].reported_unloaded);
+
+        let moves = checker.plan_moves(&mut report, &shard_owners, &live(&["s1", "s2"]));
+        assert_eq!(moves.len(), 1);
+        assert_eq!(moves[0].shard_id, 2);
+        assert_eq!(moves[0].to_server, "s2");
+        assert_eq!(moves[0].reason, ShardReassignmentReason::OwnerDiverged);
+    }
+
+    #[test]
+    fn a_shard_the_node_gave_up_on_diverges_immediately() {
+        // `failed` is terminal: the node is not going to serve this by waiting.
+        let mut checker = ShardChecker::default();
+        let report = checker.check(&owners(&[(1, "s1")]), &[server("s1", &[(1, "failed")])], NOW);
+        assert_eq!(report.diverged.len(), 1);
+        assert!(report.diverged[0].reported_unloaded);
+        assert_eq!(report.diverged[0].serving_state, "failed");
+        assert!(report.settling.is_empty());
+    }
+
+    #[test]
+    fn an_unloaded_shard_diverges_immediately() {
+        let mut checker = ShardChecker::default();
+        let report = checker.check(&owners(&[(1, "s1")]), &[server("s1", &[(1, "unloaded")])], NOW);
+        assert_eq!(report.diverged.len(), 1);
+        assert_eq!(report.diverged[0].serving_state, "unloaded");
+    }
+
+    #[test]
+    fn a_shard_that_is_still_loading_is_not_yanked_out_from_under_the_load() {
+        // The node is mid-load. Re-placing it now cancels work already underway
+        // and thrashes the very load the metaserver is waiting on.
+        for state in ["loading", "reloading", "queued", "running", "unloading"] {
+            let mut checker = ShardChecker::default();
+            let report =
+                checker.check(&owners(&[(1, "s1")]), &[server("s1", &[(1, state)])], NOW);
+            assert!(
+                report.diverged.is_empty(),
+                "{state} must not diverge on sight"
+            );
+            assert_eq!(report.settling, vec![1], "{state} should be waited on");
+        }
+    }
+
+    #[test]
+    fn a_readonly_shard_is_serving_and_never_diverges() {
+        // Read-only is a serving mode, not a fault: reads resolve there.
+        let mut checker = ShardChecker::default();
+        let report = checker.check(&owners(&[(1, "s1")]), &[server("s1", &[(1, "readonly")])], NOW);
+        assert!(report.diverged.is_empty());
+        assert!(report.settling.is_empty());
+    }
+
+    #[test]
+    fn a_load_that_never_finishes_eventually_diverges() {
+        let mut checker = ShardChecker::default();
+        let shard_owners = owners(&[(1, "s1")]);
+        let servers = [server("s1", &[(1, "loading")])];
+
+        // Inside the grace the metaserver keeps waiting.
+        assert!(checker.check(&shard_owners, &servers, NOW).diverged.is_empty());
+        let grace = ShardCheckOptions::default().settle_grace_ms;
+        assert!(checker
+            .check(&shard_owners, &servers, NOW + grace - 1)
+            .diverged
+            .is_empty());
+
+        // Past it, the load is not coming and the shard is re-placed.
+        let report = checker.check(&shard_owners, &servers, NOW + grace);
+        assert_eq!(report.diverged.len(), 1);
+        assert_eq!(report.diverged[0].serving_state, "loading");
+        assert!(report.settling.is_empty());
+    }
+
+    #[test]
+    fn the_settle_clock_restarts_after_the_shard_recovers() {
+        // A shard that loaded successfully and later stalls again gets a fresh
+        // grace, rather than inheriting an already-expired one.
+        let mut checker = ShardChecker::default();
+        let shard_owners = owners(&[(1, "s1")]);
+        let grace = ShardCheckOptions::default().settle_grace_ms;
+
+        checker.check(&shard_owners, &[server("s1", &[(1, "loading")])], NOW);
+        checker.check(&shard_owners, &[server("s1", &[(1, "serving")])], NOW + 1_000);
+        // Stalls again well past the original clock; the grace starts over.
+        let report = checker.check(
+            &shard_owners,
+            &[server("s1", &[(1, "loading")])],
+            NOW + grace + 2_000,
+        );
+        assert!(report.diverged.is_empty());
+        assert_eq!(report.settling, vec![1]);
+    }
+
+    #[test]
+    fn a_shard_two_workers_disagree_about_keeps_the_healthier_verdict() {
+        // Mid-handoff one worker can report `loading` while another serves it.
+        // One worker serving is enough.
+        let mut checker = ShardChecker::default();
+        let mut handoff = server_record("s1", &[(1, "loading")]);
+        handoff.shard_states.push(serving_state(1, "serving"));
+        // The healthiest verdict is picked while the server is observed, which
+        // is where the two reports are still both visible.
+        let report = checker.check(
+            &owners(&[(1, "s1")]),
+            &[ObservedServer::observe(&handoff)],
+            NOW,
+        );
+        assert!(report.diverged.is_empty());
+        assert!(report.settling.is_empty());
+    }
+
+    #[test]
+    fn a_fully_consistent_cluster_reports_nothing() {
+        let mut checker = ShardChecker::default();
+        let report = checker.check(
+            &owners(&[(1, "s1"), (2, "s2")]),
+            &[server("s1", &[(1, "serving")]), server("s2", &[(2, "serving")])],
+            NOW,
+        );
+        assert!(report.diverged.is_empty());
+        assert!(report.skipped_in_reboot_grace.is_empty());
+        assert!(report.skipped_without_shard_reports.is_empty());
+    }
+
+    #[test]
+    fn a_server_that_just_booted_is_left_alone_to_reload() {
+        // Every shard is missing because the node has not finished loading yet.
+        // Acting on that would re-place the node's entire holding on every
+        // restart -- far more damage than the restart itself.
+        let mut checker = ShardChecker::default();
+        let mut booting = server("s1", &[]);
+        booting.boot_time_ms = NOW - 5_000; // 5s old, grace is 30s
+        let report = checker.check(&owners(&[(1, "s1"), (2, "s1")]), &[booting], NOW);
+        assert!(report.diverged.is_empty());
+        assert_eq!(report.skipped_in_reboot_grace, vec!["s1"]);
+    }
+
+    #[test]
+    fn the_reboot_grace_expires() {
+        let mut checker = ShardChecker::default();
+        let mut booted = server("s1", &[]);
+        booted.boot_time_ms = NOW - 31_000; // past the 30s grace
+        let report = checker.check(&owners(&[(1, "s1")]), &[booted], NOW);
+        assert!(report.skipped_in_reboot_grace.is_empty());
+        assert_eq!(report.diverged.len(), 1);
+    }
+
+    #[test]
+    fn a_server_that_never_reports_shard_states_is_never_judged() {
+        // An old build reporting nothing is indistinguishable from one serving
+        // nothing. Guessing would re-place the whole cluster on upgrade.
+        let mut checker = ShardChecker::default();
+        let mut silent = server("s1", &[]);
+        silent.reports_shard_states = false;
+        let report = checker.check(&owners(&[(1, "s1"), (2, "s1")]), &[silent], NOW);
+        assert!(report.diverged.is_empty());
+        assert_eq!(report.skipped_without_shard_reports, vec!["s1"]);
+    }
+
+    #[test]
+    fn a_reporting_server_that_now_serves_nothing_is_judged() {
+        // Once a server has been seen reporting shard states, an empty report is
+        // real information: it dropped everything.
+        let mut checker = ShardChecker::default();
+        let report = checker.check(&owners(&[(1, "s1"), (2, "s1")]), &[server("s1", &[])], NOW);
+        assert_eq!(report.diverged.len(), 2);
+    }
+
+    #[test]
+    fn a_frozen_owner_is_not_a_divergence() {
+        // The freeze path already owns this server; its shards are unavailable,
+        // not diverged, and evacuation will move them.
+        let mut checker = ShardChecker::default();
+        let mut frozen = server("s1", &[]);
+        frozen.state = MetaEntityState::Frozen;
+        let report = checker.check(&owners(&[(1, "s1")]), &[frozen], NOW);
+        assert!(report.diverged.is_empty());
+        assert!(report.skipped_without_shard_reports.is_empty());
+    }
+
+    #[test]
+    fn an_unregistered_owner_is_not_a_divergence() {
+        // Nothing is known about this address, so nothing can be concluded.
+        let mut checker = ShardChecker::default();
+        let report = checker.check(&owners(&[(1, "ghost")]), &[server("s1", &[])], NOW);
+        assert!(report.diverged.is_empty());
+    }
+
+    #[test]
+    fn the_rate_limit_bounds_how_much_moves_per_window() {
+        // A correlated fault can make many shards look missing at once. Reacting
+        // to all of them would move more data than the fault did.
+        let mut checker = ShardChecker::new(ShardCheckOptions {
+            max_moves_per_window: 2,
+            ..ShardCheckOptions::default()
+        });
+        let shard_owners = owners(&[(1, "s1"), (2, "s1"), (3, "s1"), (4, "s1"), (5, "s1")]);
+        let servers = vec![server("s1", &[]), server("s2", &[])];
+        let mut report = checker.check(&shard_owners, &servers, NOW);
+        // The report is complete even though the action is capped.
+        assert_eq!(report.diverged.len(), 5);
+        let moves = checker.plan_moves(&mut report, &shard_owners, &live(&["s1", "s2"]));
+        assert_eq!(moves.len(), 2);
+        assert_eq!(report.rate_limited, 3);
+
+        // Still inside the same window: the budget stays spent.
+        let mut again = checker.check(&shard_owners, &servers, NOW + 1_000);
+        assert!(checker
+            .plan_moves(&mut again, &shard_owners, &live(&["s1", "s2"]))
+            .is_empty());
+
+        // A new window refills it.
+        let mut next = checker.check(&shard_owners, &servers, NOW + 61_000);
+        assert_eq!(
+            checker
+                .plan_moves(&mut next, &shard_owners, &live(&["s1", "s2"]))
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn a_divergence_with_nowhere_else_to_go_is_reported_but_not_moved() {
+        // Re-placing a shard onto the same node that just lost it achieves
+        // nothing; better to leave the route and let the node reload.
+        let mut checker = ShardChecker::default();
+        let shard_owners = owners(&[(1, "s1")]);
+        let mut report = checker.check(&shard_owners, &[server("s1", &[])], NOW);
+        assert_eq!(report.diverged.len(), 1);
+        assert!(checker
+            .plan_moves(&mut report, &shard_owners, &live(&["s1"]))
+            .is_empty());
+    }
+
+    #[test]
+    fn moves_spread_across_targets_rather_than_stacking_on_one() {
+        let mut checker = ShardChecker::default();
+        let shard_owners = owners(&[(1, "s1"), (2, "s1"), (3, "s1"), (4, "s1")]);
+        let servers = vec![server("s1", &[]), server("s2", &[]), server("s3", &[])];
+        let mut report = checker.check(&shard_owners, &servers, NOW);
+        let moves = checker.plan_moves(&mut report, &shard_owners, &live(&["s1", "s2", "s3"]));
+        assert_eq!(moves.len(), 4);
+        let targets = moves
+            .iter()
+            .map(|plan| plan.to_server.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(targets.len(), 2, "both spare servers should take load");
+    }
+}
