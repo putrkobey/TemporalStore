@@ -5439,3 +5439,5445 @@ fn what_the_block_cache_costs_per_call() {
         assert!(matches!(got, Ok(None)), "this key must not be present");
         miss_allocs += counts.allocs;
         miss_bytes += counts.alloc_bytes;
+    }
+
+    // --- storing a block -------------------------------------------------------------------
+    let mut pending: Vec<(CacheKey, Vec<u8>)> = (0..ROUNDS)
+        .map(|round| {
+            (
+                CacheKey::page_with_slot(1, 0, round * 4096, 1024, Some(7)),
+                vec![b'v'; 1024],
+            )
+        })
+        .collect();
+    let mut put_allocs = 0u64;
+    let mut put_bytes = 0u64;
+    for (key, value) in pending.drain(..) {
+        let probe = crate::alloc_probe::Probe::start();
+        let stored = cache.put(key, value);
+        let counts = probe.stop();
+        assert!(stored.is_ok(), "the put must succeed");
+        put_allocs += counts.allocs;
+        put_bytes += counts.alloc_bytes;
+    }
+
+    println!();
+    println!("  call                     allocs   bytes    (1 KB page, cache too small to hold it)");
+    println!("  CacheKey::page_with_slot {:>7.2} {:>7.0}", per(key_allocs), per(key_bytes));
+    println!("  get (misses)             {:>7.2} {:>7.0}", per(miss_allocs), per(miss_bytes));
+    println!("  put (stores + evicts)    {:>7.2} {:>7.0}", per(put_allocs), per(put_bytes));
+    println!("  ------------------------------------------");
+    println!("  sum                      {:>7.2} {:>7.0}",
+             per(key_allocs) + per(miss_allocs) + per(put_allocs),
+             per(key_bytes) + per(miss_bytes) + per(put_bytes));
+    println!();
+    println!("  The read path calls all three on every miss. Whichever dominates is where the");
+    println!("  read path's memory goes, and a page nothing will ask for again pays it for");
+    println!("  nothing.");
+
+    assert!(key_allocs + miss_allocs + put_allocs > 0, "measured nothing");
+}
+
+/// Where the 38 allocations of a block-read MISS actually go.
+///
+/// A hit costs 2 allocations and 92 bytes; a miss costs 38 and 141 KB for a 1 KB block
+/// (`what_a_block_read_costs_hit_against_miss`). On a corpus larger than the cache essentially
+/// every read misses, so the miss path is the one a deployment runs. This splits it into the
+/// three things it does -- the failed cache lookup, the block-store read, and the put that
+/// caches the result -- because each implies a different fix and 38 is too many to guess at.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib where_a_block_read_miss_allocates -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn where_a_block_read_miss_allocates() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        8 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..64 {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("attrib-{index:03}"),
+                value: vec![b'v'; 1024],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    let addresses: Vec<(Option<u32>, String, crate::block_store::ElementEntry)> = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("loaded shard");
+        let (start, end) = shard.routing_range();
+        shard
+            .strings()
+            .iter()
+            // THE KEY IS CARRIED, not dropped. The bucket beside it is derived from it, and the
+            // read now needs the same string to name the object -- so the fixture keeps what it was
+            // already reading. Owned, because the shard guard is released before the reads.
+            .map(|(key, address)| {
+                (
+                    Some(super::hashing::block_routing_bucket(key, start, end)),
+                    key.to_string(),
+                    address.address(),
+                )
+            })
+            .collect()
+    };
+    assert!(addresses.len() >= 8, "need several pages: {}", addresses.len());
+    let block_store = &engine.block_store;
+
+    const ROUNDS: u64 = 100;
+    let per = |n: u64| n as f64 / ROUNDS as f64;
+
+    // The block-store read on its own: no cache involved at all.
+    let mut store_allocs = 0u64;
+    let mut store_bytes = 0u64;
+    for round in 0..ROUNDS {
+        let (_, _, address) = &addresses[round as usize % addresses.len()];
+        let probe = crate::alloc_probe::Probe::start();
+        let got = block_store.read(address);
+        let counts = probe.stop();
+        assert!(got.is_ok(), "the page must read back from the block store");
+        store_allocs += counts.allocs;
+        store_bytes += counts.alloc_bytes;
+    }
+
+    // The whole miss, for the total these parts have to add up to.
+    let mut whole_allocs = 0u64;
+    let mut whole_bytes = 0u64;
+    for round in 0..ROUNDS {
+        let (routing_bucket, key, address) = &addresses[round as usize % addresses.len()];
+        let probe = crate::alloc_probe::Probe::start();
+        let got = super::read_block_bytes(&engine.cache, block_store, 1, address, crate::engine::hashing::BlockIdentity::of(1, "string", key, None), *routing_bucket);
+        let counts = probe.stop();
+        assert!(got.is_some(), "the page must read back");
+        whole_allocs += counts.allocs;
+        whole_bytes += counts.alloc_bytes;
+    }
+
+    println!();
+    println!("  part                          allocs/read   bytes/read");
+    println!("  block-store read alone        {:>11.2} {:>12.0}",
+             per(store_allocs), per(store_bytes));
+    println!("  whole miss (read_page_bytes)  {:>11.2} {:>12.0}",
+             per(whole_allocs), per(whole_bytes));
+    println!("  ---------------------------------------------------------");
+    println!("  cache lookup + put + key      {:>11.2} {:>12.0}",
+             per(whole_allocs) - per(store_allocs), per(whole_bytes) - per(store_bytes));
+    println!();
+    if per(store_allocs) > per(whole_allocs) - per(store_allocs) {
+        println!("  the BLOCK STORE dominates: the read itself is the cost, and caching it is cheap.");
+    } else {
+        println!("  the CACHE dominates: reading the page is cheap and storing it is not, so an");
+        println!("  admission policy that declined to cache a page nothing will ask for again");
+        println!("  would remove most of a miss.");
+    }
+
+    assert!(store_allocs > 0, "measured nothing on the block-store read");
+    assert!(whole_allocs >= store_allocs,
+            "the whole miss cannot cost less than the read it contains");
+}
+
+/// What a block read costs on a HIT against a MISS.
+///
+/// `read_block_shared` exists so the node fetch does not own a copy of the block, and on a cache
+/// hit that is exactly what happens: `get_shared` hands back an `Arc<[u8]>`. Its miss path is
+/// `read_block_bytes(..).map(Arc::from)`, and `Arc::<[u8]>::from(Vec<u8>)` allocates a second
+/// buffer and copies the block into it before dropping the Vec -- so a miss pays MORE than the
+/// owning read it delegates to, and the saving applies to hits only.
+///
+/// Whether that matters depends on the hit rate. A soak reading uniformly over 276k records
+/// measured the oldest 5,000 records and the newest 5,000 at indistinguishable latency (0.856 vs
+/// 0.864 ms), i.e. essentially always missing -- so on a corpus larger than the cache the miss
+/// path is the common one.
+///
+/// The cache clear sits OUTSIDE the measured window, so what is counted is the read alone.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_a_block_read_costs_hit_against_miss -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_a_block_read_costs_hit_against_miss() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..64 {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("page-read-{index:03}"),
+                value: vec![b'v'; 1024],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let (address, object_key, routing_bucket) = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("loaded shard");
+        let (start, end) = shard.routing_range();
+        shard
+            .strings()
+            .iter()
+            .next()
+            .map(|(key, address)| {
+                (
+                    address.clone(),
+                    key.clone(),
+                    Some(super::hashing::block_routing_bucket(key, start, end)),
+                )
+            })
+            .expect("the writes above put at least one page in the index")
+    };
+
+    let cache = &engine.cache;
+    let block_store = &engine.block_store;
+
+    // Warm once: the first read of anything touches one-off structures that would otherwise be
+    // counted against whichever arm ran first.
+    let warm = super::read_block_shared(cache, block_store, 1, &address.address(), crate::engine::hashing::BlockIdentity::of(1, "string", &object_key, None), routing_bucket)
+        .expect("the page reads back");
+    assert!(!warm.is_empty(), "an empty page would make every number below meaningless");
+
+    const ROUNDS: u64 = 100;
+
+    let mut hit_allocs = 0u64;
+    let mut hit_bytes = 0u64;
+    for _ in 0..ROUNDS {
+        let probe = crate::alloc_probe::Probe::start();
+        let got = super::read_block_shared(cache, block_store, 1, &address.address(), crate::engine::hashing::BlockIdentity::of(1, "string", &object_key, None), routing_bucket);
+        let counts = probe.stop();
+        assert!(got.is_some(), "the page must read back on the hit path");
+        hit_allocs += counts.allocs;
+        hit_bytes += counts.alloc_bytes;
+    }
+
+    // Misses the way they actually happen: a cache too small to hold the working set, read
+    // round-robin so each block has been evicted by the time it comes round again. Clearing the
+    // whole cache instead would fold the cost of rebuilding its internals into the read.
+    let small = TemporalEngine::with_local_dirs(
+        8 * 1024,
+        dir.path().join("cache-small"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    small.load_shard(1);
+    let addresses: Vec<(Option<u32>, String, crate::block_store::ElementEntry)> = {
+        let shards = small.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("loaded shard");
+        let (start, end) = shard.routing_range();
+        shard
+            .strings()
+            .iter()
+            // THE KEY IS CARRIED, not dropped. The bucket beside it is derived from it, and the
+            // read now needs the same string to name the object -- so the fixture keeps what it was
+            // already reading. Owned, because the shard guard is released before the reads.
+            .map(|(key, address)| {
+                (
+                    Some(super::hashing::block_routing_bucket(key, start, end)),
+                    key.to_string(),
+                    address.address(),
+                )
+            })
+            .collect()
+    };
+    assert!(addresses.len() >= 8, "need several pages to cycle through: {}", addresses.len());
+    let small_cache = &small.cache;
+    let small_blocks = &small.block_store;
+    for (routing_bucket, key, address) in &addresses {
+        let _ = super::read_block_shared(small_cache, small_blocks, 1, address, crate::engine::hashing::BlockIdentity::of(1, "string", key, None), *routing_bucket);
+    }
+
+    let mut miss_allocs = 0u64;
+    let mut miss_bytes = 0u64;
+    for round in 0..ROUNDS {
+        let (routing_bucket, key, address) = &addresses[round as usize % addresses.len()];
+        let probe = crate::alloc_probe::Probe::start();
+        let got = super::read_block_shared(small_cache, small_blocks, 1, address, crate::engine::hashing::BlockIdentity::of(1, "string", key, None), *routing_bucket);
+        let counts = probe.stop();
+        assert!(got.is_some(), "the page must read back on the miss path");
+        miss_allocs += counts.allocs;
+        miss_bytes += counts.alloc_bytes;
+    }
+
+    // And the owning read on a miss, for the comparison that matters: the shared read is
+    // supposed to be the cheaper of the two.
+    let mut owning_allocs = 0u64;
+    let mut owning_bytes = 0u64;
+    for round in 0..ROUNDS {
+        let (routing_bucket, key, address) = &addresses[round as usize % addresses.len()];
+        let probe = crate::alloc_probe::Probe::start();
+        let got = super::read_block_bytes(small_cache, small_blocks, 1, address, crate::engine::hashing::BlockIdentity::of(1, "string", key, None), *routing_bucket);
+        let counts = probe.stop();
+        assert!(got.is_some(), "the page must read back");
+        owning_allocs += counts.allocs;
+        owning_bytes += counts.alloc_bytes;
+    }
+
+    let per = |n: u64| n as f64 / ROUNDS as f64;
+    println!();
+    println!("  path                       allocs/read   bytes/read");
+    println!("  shared, cache hit          {:>11.2} {:>12.0}", per(hit_allocs), per(hit_bytes));
+    println!("  shared, cache miss         {:>11.2} {:>12.0}", per(miss_allocs), per(miss_bytes));
+    println!("  owning (read_page_bytes)   {:>11.2} {:>12.0}", per(owning_allocs), per(owning_bytes));
+    println!();
+    println!(
+        "  a miss costs {:+.2} allocations and {:+.0} bytes against a hit",
+        per(miss_allocs) - per(hit_allocs),
+        per(miss_bytes) - per(hit_bytes)
+    );
+    println!(
+        "  the shared read costs {:+.2} allocations and {:+.0} bytes against the OWNING read it",
+        per(miss_allocs) - per(owning_allocs),
+        per(miss_bytes) - per(owning_bytes)
+    );
+    println!("  delegates to on a miss -- the Arc::from is the difference. Positive means the");
+    println!("  zero-copy read is the more expensive one whenever the page is not already cached.");
+
+    assert!(hit_allocs > 0, "measured nothing on the hit path");
+    assert!(
+        miss_allocs > hit_allocs,
+        "a miss must cost more than a hit, or the cache was not actually cleared"
+    );
+}
+
+
+
+/// Reading the block, or decoding it: which half of a node fetch costs the 15 allocations?
+///
+/// Retrieve is 16.4 allocations per candidate and the node fetch is 15.0 of them -- the largest
+/// remaining cost on any indicator once ingest went flat. `load_context_node` is a map lookup, then
+/// `read_block_bytes`, then `context_from_bytes`. The lookup cannot be 15, so it is one of the other
+/// two, and each implies a different fix: a read that dominates asks for buffer reuse, a decode that
+/// dominates asks about the record's shape -- four Strings and two vectors per node, built whether
+/// or not the scoring pass reads them.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_the_two_halves_of_a_node_fetch_cost -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_the_two_halves_of_a_node_fetch_cost() {
+    use crate::context_workflow::{
+        ingest_extract_context, ContextExtractRequest, ContextIngestExtractRequest,
+        ContextModelProviderConfig, ContextSourceKind,
+    };
+
+    const TENANT: u64 = 5501;
+
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..80_usize {
+        let report = ingest_extract_context(
+            &engine,
+            ContextIngestExtractRequest {
+                shard_id: 1,
+                tenant_hash: TENANT,
+                sources: vec![ContextExtractRequest {
+                    shard_id: 1,
+                    tenant_hash: TENANT,
+                    source_kind: ContextSourceKind::Incident,
+                    source_id: format!("FETCH-{index:06}"),
+                    title: format!("fetch {index}"),
+                    body: format!(
+                        "{}{}",
+                        format!("entry {index} covering the depot rota "),
+                        "context payload sentence. ".repeat(40)
+                    ),
+                    timestamp_ms: 1_000 + index as u64,
+                    provider: ContextModelProviderConfig::default(),
+                }],
+                provider: ContextModelProviderConfig::default(),
+                start_time_ms: 0,
+                end_time_ms: 0,
+                max_events: 0,
+                query: String::new(),
+            },
+        );
+        assert!(report.status.ok, "grow {index}: {:?}", report.status);
+    }
+
+    // A node that exists, found the way retrieval finds one.
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("loaded shard");
+    let (object_key, address) = shard
+        .hashes
+        .iter()
+        .find_map(|(key, fields)| {
+            fields
+                .get(super::constants::CONTEXT_NODE_FIELD)
+                .map(|address| (key.clone(), address.clone()))
+        })
+        .expect("the ingest wrote at least one context node page");
+    let routing_bucket = {
+        let (start, end) = shard.routing_range();
+        Some(super::hashing::block_routing_bucket(&object_key, start, end))
+    };
+
+    let cache = &engine.cache;
+    let block_store = &engine.block_store;
+
+    // Warm: the first read of a block touches one-off structures.
+    let warm = super::read_block_bytes(cache, block_store, 1, &address, crate::engine::hashing::BlockIdentity::of(1, "hash", &object_key, Some(super::constants::CONTEXT_NODE_FIELD)), routing_bucket)
+        .expect("the page reads back");
+    assert!(!warm.is_empty(), "an empty page would make every number below meaningless");
+
+    let probe = crate::alloc_probe::Probe::start();
+    let bytes = super::read_block_bytes(cache, block_store, 1, &address, crate::engine::hashing::BlockIdentity::of(1, "hash", &object_key, Some(super::constants::CONTEXT_NODE_FIELD)), routing_bucket)
+        .expect("the page reads back");
+    let read_allocs = probe.stop().allocs;
+
+    let probe = crate::alloc_probe::Probe::start();
+    let node = super::context::context_from_bytes::<crate::types::ContextNode>(&bytes)
+        .expect("the page decodes to a node");
+    let decode_allocs = probe.stop().allocs;
+
+    println!(
+        "
+  half                         allocs
+  read_page_bytes           {read_allocs:>9}
+  context_from_bytes        {decode_allocs:>9}
+  ------------------------------------
+  together                  {:>9}   (a whole fetch measures ~15 per candidate)
+",
+        read_allocs + decode_allocs,
+    );
+
+    println!(
+        "  what the decode built, and what scoring actually reads:
+    canonical_name    {:>5} bytes
+    l0                {:>5} bytes   <- the discarded text
+    l1_ref            {:>5} bytes
+    raw_metadata_ref  {:>5} bytes
+    vector            {:>5} floats
+    summary_vector    {:>5} floats  <- the one scoring reads
+",
+        node.canonical_name.len(),
+        node.l0.len(),
+        node.l1_ref.len(),
+        node.raw_metadata_ref.len(),
+        node.vector.len(),
+        node.summary_vector.len(),
+    );
+    println!(
+        "  read >> decode => reuse the read buffer.
+  decode >> read => the record's shape is the cost, and a projection that skips fields scoring
+                    never reads is worth its complexity.
+"
+    );
+}
+
+
+/// Every context object key, byte for byte.
+///
+/// These keys are stored in the shard's model maps and in the bucket index, and every read compares
+/// one against keys already written. Building them directly instead of through `format!` saves an
+/// allocation each -- `format!` costs two, the String it returns plus one inside the formatting
+/// machinery -- but only if the bytes do not move. A changed byte here does not fail anything on its
+/// own: it makes existing records unfindable, which reads as data loss.
+#[test]
+fn context_object_keys_keep_their_exact_bytes() {
+    use super::context::*;
+
+    assert_eq!(context_node_key(81, 4242), "ctx:node:81:4242");
+    assert_eq!(context_event_key(81, 4242), "ctx:event:81:4242");
+    assert_eq!(context_audit_key(81, 4242), "ctx:audit:81:4242");
+    assert_eq!(context_dirty_key(81, 4242), "ctx:dirty:81:4242");
+    assert_eq!(context_embedding_dirty_key(81, 4242), "ctx:embdirty:81:4242");
+    assert_eq!(context_entity_key(81, 4242, 7), "ctx:entity:81:4242:7");
+    assert_eq!(context_entity_collection_key(81, 4242), "ctx:entity:81:4242");
+    assert_eq!(context_child_key(81, 4242), "ctx:child:81:4242");
+    assert_eq!(context_summary_key(81, 4242, 2), "ctx:summary:81:4242:2");
+    assert_eq!(context_compression_key(81, 4242), "ctx:compress:81:4242");
+
+    // Zero and the largest u64 both round-trip: a key builder that sized its buffer for typical
+    // values would truncate here, and truncation is exactly the silent kind of wrong.
+    assert_eq!(context_node_key(0, 0), "ctx:node:0:0");
+    assert_eq!(
+        context_node_key(u64::MAX, u64::MAX),
+        "ctx:node:18446744073709551615:18446744073709551615"
+    );
+    assert_eq!(
+        context_summary_key(u64::MAX, u64::MAX, u32::MAX),
+        "ctx:summary:18446744073709551615:18446744073709551615:4294967295"
+    );
+
+    // An entity key and its collection key share a prefix; the third part is what separates them,
+    // so one must never be mistaken for the other.
+    assert_ne!(context_entity_key(81, 4242, 7), context_entity_collection_key(81, 4242));
+
+    // Distinct inputs stay distinct across the colon: (1, 23) and (12, 3) must not collide.
+    assert_ne!(context_node_key(1, 23), context_node_key(12, 3));
+}
+
+
+/// How much resident memory is the allocator holding rather than the store?
+///
+/// A proxy measured 444.9 MB resident against 128.6 MB of live data. The only `#[global_allocator]`
+/// in this tree is the test-only counting probe, so production runs on glibc malloc with no tuning:
+/// freed chunks sit in per-thread arenas and go back to the OS only when the heap top is free or
+/// `malloc_trim` is called. Nothing here calls it and nothing caps arenas.
+///
+/// This churns allocations in the shape the decode path produces, drops them, and reads RSS three
+/// times:
+///
+///   after the churn            -> what the work cost
+///   after dropping everything  -> what the allocator kept
+///   after `malloc_trim(0)`     -> what it returns when asked
+///
+/// RSS flat on the drop and falling on the trim means the retention is the allocator's, and a trim
+/// on an existing maintenance path recovers it. RSS falling on the drop means there is nothing to
+/// fix here.
+///
+///   cargo test -p temporalstore-rust --lib how_much_resident_memory_is_the_allocator_holding -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn how_much_resident_memory_is_the_allocator_holding() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    extern "C" {
+        /// glibc: release free heap above `pad` back to the OS. Returns non-zero if it freed any.
+        fn malloc_trim(pad: usize) -> i32;
+    }
+
+    fn resident_kb() -> u64 {
+        // The same source `wal.rs` reads. Zero means unreadable, which the assertions below catch
+        // rather than quietly reporting a 0 KB result as an improvement.
+        std::fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status.lines().find_map(|line| {
+                    line.strip_prefix("VmRSS:")
+                        .and_then(|rest| rest.split_whitespace().next().map(str::to_string))
+                })
+            })
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+
+    let baseline = resident_kb();
+    assert!(baseline > 0, "could not read VmRSS, so every number below would be fiction");
+
+    // The shapes a decode produces, at a size worth measuring: byte buffers off blocks, the strings
+    // a record carries, and the float vectors. Held all at once, then dropped all at once.
+    {
+        let mut held: Vec<(Vec<u8>, String, Vec<f32>)> = Vec::with_capacity(20_000);
+        for index in 0..20_000_u32 {
+            held.push((
+                vec![(index % 251) as u8; 512],
+                format!("ctx:node:{index}:{index} a canonical name and some discarded text"),
+                vec![index as f32 / 1024.0; 384],
+            ));
+        }
+        let churned = resident_kb();
+        println!(
+            "
+  resident memory, KB
+    baseline                    {baseline:>9}
+    holding 20,000 records      {churned:>9}   (+{} KB)",
+            churned.saturating_sub(baseline),
+        );
+        assert!(
+            churned > baseline,
+            "holding 20,000 records did not raise RSS, so this probe is not measuring anything"
+        );
+    }
+
+    let dropped = resident_kb();
+    println!("    after dropping them all     {dropped:>9}   (+{} KB over baseline)",
+        dropped.saturating_sub(baseline));
+
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        let returned = unsafe { malloc_trim(0) };
+        let trimmed = resident_kb();
+        println!(
+            "    after malloc_trim(0)        {trimmed:>9}   (+{} KB over baseline, trim returned {returned})
+",
+            trimmed.saturating_sub(baseline),
+        );
+        let kept_after_drop = dropped.saturating_sub(baseline);
+        let kept_after_trim = trimmed.saturating_sub(baseline);
+        println!(
+            "  the allocator kept {kept_after_drop} KB after the drop and {kept_after_trim} KB after the trim:
+  a large fall here is memory a proxy could return on any maintenance tick, for one call.
+"
+        );
+    }
+    #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+    println!("    malloc_trim: not glibc on this target, so this half did not run\n");
+}
+
+
+/// Where do the decode's six allocations go?
+///
+/// A node fetch is ten allocations per retrieval candidate: ~3 building the cache key, 6 decoding
+/// the record, ~1 on the lookups. The key strings are a floor while `CacheKey` keeps its serialized
+/// shape. The six are the open question, and "the record's shape" is an assumption until counted.
+///
+/// Decoding the same record with one field emptied at a time names each allocation: what the count
+/// drops by is what that field costs. What does not move is not where the cost is.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_each_field_of_a_node_costs_to_decode -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_each_field_of_a_node_costs_to_decode() {
+    use crate::types::{ContextNode, ContextWire};
+
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    let full = |mutate: fn(&mut ContextNode)| {
+        let mut node = ContextNode {
+            node_hash: 4242,
+            parent_hash: 7,
+            kind: 1,
+            canonical_name: "session/a-canonical-name-of-ordinary-length".to_string(),
+            l0: "the discarded text: a sentence of the length an extract actually produces, which \
+                 the scoring pass never reads and the pack only needs for the winners"
+                .to_string(),
+            status: 0,
+            last_event_time_ms: 1_781_700_000_000,
+            l1_ref: String::new(),
+            raw_metadata_ref: String::new(),
+            vector: (0..384).map(|index| index as f32 / 1024.0).collect(),
+            embedding_model_hash: 7,
+            embedding_updated_at_ms: 1,
+            summary_vector: (0..384).map(|index| index as f32 / 512.0).collect(),
+            summary_vector_valid_from_ms: 1_781_700_000_000,
+            summary_vector_model_hash: 7,
+        };
+        mutate(&mut node);
+        node.encode_context_value()
+    };
+
+    let measure = |bytes: &[u8]| {
+        // Warm: the first decode of a shape touches one-off structures.
+        let _ = ContextNode::decode_context_value(bytes).expect("decodes");
+        let probe = crate::alloc_probe::Probe::start();
+        let node = ContextNode::decode_context_value(bytes).expect("decodes");
+        let counts = probe.stop();
+        (counts.allocs, counts.alloc_bytes, node)
+    };
+
+    let (base, base_bytes, decoded) = measure(&full(|_| {}));
+    assert!(
+        !decoded.vector.is_empty() && !decoded.canonical_name.is_empty(),
+        "the fixture must actually carry the fields whose cost is being attributed"
+    );
+
+    println!(
+        "
+  what a whole node decodes to: {base} allocations, {base_bytes} bytes
+
+  field emptied            allocs   saved   bytes saved
+"
+    );
+
+    for (label, mutate) in [
+        ("canonical_name  ", (|node: &mut ContextNode| node.canonical_name.clear()) as fn(&mut ContextNode)),
+        ("l0 (the text)   ", |node: &mut ContextNode| node.l0.clear()),
+        ("vector          ", |node: &mut ContextNode| node.vector.clear()),
+        ("summary_vector  ", |node: &mut ContextNode| node.summary_vector.clear()),
+    ] {
+        let (allocs, bytes, _) = measure(&full(mutate));
+        println!(
+            "  {label}       {allocs:>6}   {:>5}   {:>11}",
+            base.saturating_sub(allocs),
+            base_bytes.saturating_sub(bytes),
+        );
+    }
+
+    // The marker case: a summary vector equal to the node's own is written once and cloned on the
+    // way out, so it costs an allocation that no field of the encoding pays for.
+    let same = full(|node| node.summary_vector = node.vector.clone());
+    let (same_allocs, _, same_node) = measure(&same);
+    assert_eq!(
+        same_node.summary_vector, same_node.vector,
+        "the marker must still resolve to the node's own vector"
+    );
+    println!(
+        "
+  summary vector marked as the node's own: {same_allocs} allocations ({} vs a distinct one)
+  -- the clone the marker resolves to is an allocation the wire never carries.
+",
+        if same_allocs >= base { format!("+{}", same_allocs - base) } else { format!("-{}", base - same_allocs) },
+    );
+}
+
+
+/// A sized vector holds exactly what a grown one held.
+///
+/// `unpack_scaled_vector` now counts the varints and reserves before filling, instead of growing
+/// from empty -- eight reallocations at 384 dimensions, on the default storage form. That is only
+/// safe if the count agrees with the decode: too small and it grows anyway, too large and the slack
+/// is held for as long as the node is cached, and wrong in a way that stops early loses values with
+/// nothing to show for it.
+///
+/// Asserted across widths, and at the two edges where the counting walk and the decoding walk could
+/// disagree about where to stop: nothing to decode, and bytes that end mid-value.
+#[test]
+fn a_sized_vector_decodes_exactly_what_a_grown_one_did() {
+    use crate::types::{ContextNode, ContextWire};
+
+    for width in [0_usize, 1, 16, 384, 1024] {
+        let vector: Vec<f32> = (0..width).map(|index| (index as f32) / 97.0 - 3.0).collect();
+        let node = ContextNode {
+            node_hash: 11,
+            parent_hash: 0,
+            kind: 1,
+            canonical_name: "session/sized".to_string(),
+            l0: "text".to_string(),
+            status: 0,
+            last_event_time_ms: 1_781_700_000_000,
+            l1_ref: String::new(),
+            raw_metadata_ref: String::new(),
+            vector: vector.clone(),
+            embedding_model_hash: 7,
+            embedding_updated_at_ms: 1,
+            summary_vector: Vec::new(),
+            summary_vector_valid_from_ms: 0,
+            summary_vector_model_hash: 0,
+        };
+        let decoded = ContextNode::decode_context_value(&node.encode_context_value())
+            .expect("a node round-trips");
+        assert_eq!(decoded.vector.len(), width, "width {width}: length");
+        // The stored form rounds, so the values are compared as the encoding can represent them
+        // rather than bit for bit -- what must not move is which values are there and in what order.
+        for (index, (before, after)) in vector.iter().zip(decoded.vector.iter()).enumerate() {
+            assert!(
+                (before - after).abs() < 0.01,
+                "width {width}, position {index}: {before} decoded as {after}"
+            );
+        }
+        assert_eq!(
+            decoded.vector.capacity(),
+            decoded.vector.len(),
+            "width {width}: the vector must be sized exactly, or the slack is held while the node is \
+             cached"
+        );
+    }
+
+    // Bytes that end mid-value: the counting walk and the decoding walk must stop in the same
+    // place, or the reserve and the fill disagree.
+    let node = ContextNode {
+        node_hash: 12,
+        parent_hash: 0,
+        kind: 1,
+        canonical_name: String::new(),
+        l0: String::new(),
+        status: 0,
+        last_event_time_ms: 1,
+        l1_ref: String::new(),
+        raw_metadata_ref: String::new(),
+        vector: (0..64).map(|index| index as f32).collect(),
+        embedding_model_hash: 0,
+        embedding_updated_at_ms: 0,
+        summary_vector: Vec::new(),
+        summary_vector_valid_from_ms: 0,
+        summary_vector_model_hash: 0,
+    };
+    let encoded = node.encode_context_value();
+    for cut in [1_usize, encoded.len() / 3, encoded.len() / 2, encoded.len() - 1] {
+        // Whatever it makes of a truncated record, it must not panic and must not claim more values
+        // than it wrote.
+        if let Some(decoded) = ContextNode::decode_context_value(&encoded[..cut]) {
+            assert!(
+                decoded.vector.len() <= 64,
+                "a truncated record decoded {} values out of at most 64",
+                decoded.vector.len()
+            );
+        }
+    }
+}
+
+
+/// What does encoding a record cost?
+///
+/// `update` is the largest per-call cost of any api -- 192 allocations, flat in the corpus, so the
+/// cost is the call and not the store. A write encodes the record first, and every
+/// `encode_context_proto_value` starts from `Vec::new()`: the shape that made a decode eighteen
+/// allocations instead of four.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_encoding_a_record_costs -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_encoding_a_record_costs() {
+    use crate::types::{ContextNode, ContextSummary, ContextWire};
+
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    let node_with = |mutate: fn(&mut ContextNode)| {
+        let mut node = ContextNode {
+            node_hash: 4242,
+            parent_hash: 7,
+            kind: 1,
+            canonical_name: "session/a-canonical-name-of-ordinary-length".to_string(),
+            l0: "the text an extract actually produces, long enough that its length is not noise \
+                 next to the vectors it sits beside"
+                .to_string(),
+            status: 0,
+            last_event_time_ms: 1_781_700_000_000,
+            l1_ref: String::new(),
+            raw_metadata_ref: String::new(),
+            vector: (0..384).map(|index| index as f32 / 1024.0).collect(),
+            embedding_model_hash: 7,
+            embedding_updated_at_ms: 1,
+            summary_vector: (0..384).map(|index| index as f32 / 512.0).collect(),
+            summary_vector_valid_from_ms: 1_781_700_000_000,
+            summary_vector_model_hash: 7,
+        };
+        mutate(&mut node);
+        node
+    };
+
+    let measure = |node: &ContextNode| {
+        let warm = node.encode_context_value();
+        assert!(!warm.is_empty(), "an empty encoding would make this vacuous");
+        let probe = crate::alloc_probe::Probe::start();
+        let encoded = node.encode_context_value();
+        let counts = probe.stop();
+        (counts.allocs, counts.alloc_bytes, encoded.len())
+    };
+
+    let (base, base_bytes, encoded_len) = measure(&node_with(|_| {}));
+    println!(
+        "
+  encoding one node: {base} allocations, {base_bytes} bytes allocated, {encoded_len} bytes produced
+
+  field emptied            allocs   saved
+"
+    );
+    for (label, mutate) in [
+        ("canonical_name  ", (|node: &mut ContextNode| node.canonical_name.clear()) as fn(&mut ContextNode)),
+        ("l0 (the text)   ", |node: &mut ContextNode| node.l0.clear()),
+        ("vector          ", |node: &mut ContextNode| node.vector.clear()),
+        ("summary_vector  ", |node: &mut ContextNode| node.summary_vector.clear()),
+    ] {
+        let (allocs, _, _) = measure(&node_with(mutate));
+        println!("  {label}       {allocs:>6}   {:>5}", base.saturating_sub(allocs));
+    }
+
+    // The other record an ingest writes, at the same vector width.
+    let summary = ContextSummary {
+        node_hash: 4242,
+        level: 2,
+        text: "a summary of ordinary length for one turn".to_string(),
+        valid_from_ms: 1_781_700_000_000,
+        vector: (0..384).map(|index| index as f32 / 768.0).collect(),
+        embedding_model_hash: 7,
+    };
+    let warm = summary.encode_context_value();
+    assert!(!warm.is_empty());
+    let probe = crate::alloc_probe::Probe::start();
+    let encoded = summary.encode_context_value();
+    let counts = probe.stop();
+    println!(
+        "
+  encoding one summary: {} allocations, {} bytes produced
+",
+        counts.allocs,
+        encoded.len(),
+    );
+}
+
+
+/// Where do a node write's 188 allocations go?
+///
+/// `update` is the largest per-call cost of any api and it is flat in the corpus, so the cost is the
+/// call, not the store. Encoding is 9 of it, the value append 8, the post-write maintenance 27 --
+/// about a quarter. "The write path" is not an answer for the rest.
+///
+/// The read path is the precedent: a decode was assumed to cost its fields and turned out to be
+/// sixteen eighteenths two vectors grown from empty.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_a_node_write_spends_its_allocations_on -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_a_node_write_spends_its_allocations_on() {
+    use crate::context_workflow::{
+        ingest_extract_context, ContextExtractRequest, ContextIngestExtractRequest,
+        ContextModelProviderConfig, ContextSourceKind,
+    };
+
+    const TENANT: u64 = 7411;
+
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..40_usize {
+        let report = ingest_extract_context(
+            &engine,
+            ContextIngestExtractRequest {
+                shard_id: 1,
+                tenant_hash: TENANT,
+                sources: vec![ContextExtractRequest {
+                    shard_id: 1,
+                    tenant_hash: TENANT,
+                    source_kind: ContextSourceKind::Incident,
+                    source_id: format!("WRITE-{index:06}"),
+                    title: format!("write {index}"),
+                    body: format!(
+                        "{}{}",
+                        format!("entry {index} covering the depot rota "),
+                        "context payload sentence. ".repeat(40)
+                    ),
+                    timestamp_ms: 1_000 + index as u64,
+                    provider: ContextModelProviderConfig::default(),
+                }],
+                provider: ContextModelProviderConfig::default(),
+                start_time_ms: 0,
+                end_time_ms: 0,
+                max_events: 0,
+                query: String::new(),
+            },
+        );
+        assert!(report.status.ok, "grow {index}: {:?}", report.status);
+    }
+
+    let node = |hash: u64, vector_width: usize, text: &str| crate::types::ContextNode {
+        node_hash: hash,
+        parent_hash: 0,
+        kind: 1,
+        canonical_name: format!("session/write-{hash}"),
+        l0: text.to_string(),
+        status: 0,
+        last_event_time_ms: 1_781_700_000_000,
+        l1_ref: String::new(),
+        raw_metadata_ref: String::new(),
+        vector: (0..vector_width).map(|index| index as f32 / 1024.0).collect(),
+        embedding_model_hash: 7,
+        embedding_updated_at_ms: 1,
+        summary_vector: (0..vector_width).map(|index| index as f32 / 512.0).collect(),
+        summary_vector_valid_from_ms: 1_781_700_000_000,
+        summary_vector_model_hash: 7,
+    };
+
+    let long_text = "the text an extract produces, long enough that its length is not noise";
+    let mut tag = 9_000_000_u64;
+    let mut measure = |width: usize, text: &str| {
+        tag += 2;
+        // Warm on one key, measure another: the first write of a shape touches one-off structures.
+        let warm = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextUpsertNode { tenant_hash: TENANT, node: Box::new(node(tag, width, text)) },
+        });
+        assert!(warm.status.ok, "{:?}", warm.status);
+        let probe = crate::alloc_probe::Probe::start();
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextUpsertNode {
+                tenant_hash: TENANT,
+                node: Box::new(node(tag + 1, width, text)),
+            },
+        });
+        let counts = probe.stop();
+        assert!(out.status.ok, "{:?}", out.status);
+        (counts.allocs, counts.alloc_bytes)
+    };
+
+    let (full, full_bytes) = measure(384, long_text);
+    let (no_vectors, _) = measure(0, long_text);
+    let (no_text, _) = measure(384, "");
+    let (neither, _) = measure(0, "");
+
+    println!(
+        "
+  a whole node write: {full} allocations, {full_bytes} bytes
+
+  written without            allocs   saved
+    both vectors            {no_vectors:>8}   {:>5}
+    the text                {no_text:>8}   {:>5}
+    both                    {neither:>8}   {:>5}
+
+  what stays with everything stripped is the write path itself: the append, the staging, the
+  index maintenance and the log record. That floor is the thing worth attacking, and it is
+  {neither} of {full}.
+",
+        full.saturating_sub(no_vectors),
+        full.saturating_sub(no_text),
+        full.saturating_sub(neither),
+    );
+
+    // A second write of the SAME record: the change-detecting paths should short-circuit, so what
+    // remains is what a write costs even when it changes nothing.
+    let repeat = node(tag + 1, 384, long_text);
+    let warm = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::ContextUpsertNode { tenant_hash: TENANT, node: Box::new(repeat.clone()) },
+    });
+    assert!(warm.status.ok, "{:?}", warm.status);
+    let probe = crate::alloc_probe::Probe::start();
+    let out = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::ContextUpsertNode { tenant_hash: TENANT, node: Box::new(repeat) },
+    });
+    let unchanged = probe.stop().allocs;
+    assert!(out.status.ok, "{:?}", out.status);
+    println!(
+        "  rewriting a record byte-for-byte identical: {unchanged} allocations
+  -- if that is close to {full}, the write does the same work whether or not anything changed.
+"
+    );
+}
+
+
+/// What does capturing a write's key states cost?
+///
+/// A node write is 155 allocations and 144 of them are machinery: stripping both vectors and the
+/// text saves 11. `capture_key_states` runs on every write and builds a `serde_json::json!` object
+/// per touched key -- fourteen field lookups, each with a string key and a serialised value.
+///
+/// JSON on a write path is worth a number rather than a suspicion.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_capturing_a_writes_key_states_costs -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_capturing_a_writes_key_states_costs() {
+    use crate::context_workflow::{
+        ingest_extract_context, ContextExtractRequest, ContextIngestExtractRequest,
+        ContextModelProviderConfig, ContextSourceKind,
+    };
+
+    const TENANT: u64 = 7717;
+
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let mut node_hash = 0_u64;
+    for index in 0..40_usize {
+        let report = ingest_extract_context(
+            &engine,
+            ContextIngestExtractRequest {
+                shard_id: 1,
+                tenant_hash: TENANT,
+                sources: vec![ContextExtractRequest {
+                    shard_id: 1,
+                    tenant_hash: TENANT,
+                    source_kind: ContextSourceKind::Incident,
+                    source_id: format!("KS-{index:06}"),
+                    title: format!("ks {index}"),
+                    body: format!(
+                        "{}{}",
+                        format!("entry {index} covering the depot rota "),
+                        "context payload sentence. ".repeat(40)
+                    ),
+                    timestamp_ms: 1_000 + index as u64,
+                    provider: ContextModelProviderConfig::default(),
+                }],
+                provider: ContextModelProviderConfig::default(),
+                start_time_ms: 0,
+                end_time_ms: 0,
+                max_events: 0,
+                query: String::new(),
+            },
+        );
+        assert!(report.status.ok, "grow {index}: {:?}", report.status);
+        if let Some(first) = report.node_hashes.first() {
+            node_hash = *first;
+        }
+    }
+    assert!(node_hash != 0, "the ingest reported no node, so there is no real key to capture");
+
+    let key = super::context::context_node_key(TENANT, node_hash);
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("loaded shard");
+
+    let keys = vec![key.clone()];
+    // Warm: the first call of a shape touches one-off structures.
+    let warm = super::capture_key_states(shard, &keys);
+    assert_eq!(warm.len(), 1, "one key in, one blob out");
+    assert!(
+        warm[0].get("context_nodes").is_some() || warm[0].get("key").is_some(),
+        "the blob must actually describe the key, or this measures an empty object"
+    );
+
+    let probe = crate::alloc_probe::Probe::start();
+    let states = super::capture_key_states(shard, &keys);
+    let counts = probe.stop();
+    assert_eq!(states.len(), 1);
+
+    // What it costs to then serialise that blob, which is what the delta record does with it.
+    let probe = crate::alloc_probe::Probe::start();
+    let encoded = serde_json::to_vec(&states).expect("the blob serialises");
+    let encode_counts = probe.stop();
+
+    println!(
+        "
+  capturing one key's state: {} allocations, {} bytes
+  serialising it:            {} allocations, {} bytes produced
+
+  a whole node write is 155 allocations, of which 144 are machinery rather than the record.
+  this piece is {} of that machinery, and it runs once per touched key on every write.
+",
+        counts.allocs,
+        counts.alloc_bytes,
+        encode_counts.allocs,
+        encoded.len(),
+        counts.allocs,
+    );
+}
+
+
+/// Does a cached node carry its own vector twice?
+///
+/// A decoded node at 384 dimensions is 3,264 bytes and 3,072 of those are its two vectors. The wire
+/// already knows the two are often identical -- the writer marks it instead of encoding the vector
+/// twice -- and the decoder resolves the marker with a clone.
+///
+/// A clone is cheap to make and expensive to keep: these records live in the shard's maps for as
+/// long as they are cached. If the two are equal in practice, every cached node holds 1.5 KB of
+/// duplicate at 384 dimensions for nothing.
+///
+///   cargo test -p temporalstore-rust --lib does_a_cached_node_carry_its_vector_twice -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn does_a_cached_node_carry_its_vector_twice() {
+    use crate::context_workflow::{
+        ingest_extract_context, ContextExtractRequest, ContextIngestExtractRequest,
+        ContextModelProviderConfig, ContextSourceKind,
+    };
+
+    const TENANT: u64 = 8123;
+    const CORPUS: usize = 60;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    let mut hashes = Vec::new();
+    for index in 0..CORPUS {
+        let report = ingest_extract_context(
+            &engine,
+            ContextIngestExtractRequest {
+                shard_id: 1,
+                tenant_hash: TENANT,
+                sources: vec![ContextExtractRequest {
+                    shard_id: 1,
+                    tenant_hash: TENANT,
+                    source_kind: ContextSourceKind::Incident,
+                    source_id: format!("DUP-{index:06}"),
+                    title: format!("dup {index}"),
+                    body: format!(
+                        "{}{}",
+                        format!("entry {index} covering the depot rota "),
+                        "context payload sentence. ".repeat(40)
+                    ),
+                    timestamp_ms: 1_000 + index as u64,
+                    provider: ContextModelProviderConfig::default(),
+                }],
+                provider: ContextModelProviderConfig::default(),
+                start_time_ms: 0,
+                end_time_ms: 0,
+                max_events: 0,
+                query: String::new(),
+            },
+        );
+        assert!(report.status.ok, "ingest {index}: {:?}", report.status);
+        hashes.extend(report.node_hashes.iter().copied());
+    }
+    assert!(!hashes.is_empty(), "the ingest reported no nodes, so there is nothing to inspect");
+
+    let mut both_present = 0_usize;
+    let mut identical = 0_usize;
+    let mut summary_empty = 0_usize;
+    let mut vector_bytes = 0_usize;
+    let mut duplicate_bytes = 0_usize;
+    let mut width = 0_usize;
+
+    for hash in &hashes {
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextGetNode { tenant_hash: TENANT, node_hash: *hash },
+        });
+        let CommandResponse::ContextNode { node: Some(node), .. } = out.response else {
+            continue;
+        };
+        width = width.max(node.vector.len());
+        vector_bytes += node.vector.len() * 4 + node.summary_vector.len() * 4;
+        if node.summary_vector.is_empty() {
+            summary_empty += 1;
+        } else {
+            both_present += 1;
+            if node.summary_vector == node.vector {
+                identical += 1;
+                duplicate_bytes += node.summary_vector.len() * 4;
+            }
+        }
+    }
+
+    let inspected = hashes.len();
+    println!(
+        "
+  nodes inspected                     {inspected}
+  vector width                        {width}
+  carrying both vectors               {both_present}
+    of which byte-identical           {identical}
+  carrying no summary vector          {summary_empty}
+
+  vector bytes held across the corpus {vector_bytes}
+  of which duplicate                  {duplicate_bytes}
+"
+    );
+    if identical > 0 {
+        println!(
+            "  {identical} of {both_present} nodes hold the same vector twice: {} bytes each, {duplicate_bytes} across
+  this corpus. These records live in the shard's maps while cached, so that is resident memory
+  spent on a copy the wire deliberately did not make.
+",
+            duplicate_bytes / identical.max(1),
+        );
+    } else {
+        println!(
+            "  no node holds a duplicate: the two vectors differ wherever both are present, so the
+  clone the decoder makes is carrying a distinct value and there is nothing to reclaim here.
+"
+        );
+    }
+}
+
+
+/// Which piece of the write machinery holds the unaccounted allocations?
+///
+/// A node write is 155 allocations, 144 of them machinery rather than the record. Encoding is 9,
+/// the value append 8, post-write maintenance 27, the key-state capture 4 -- 48 accounted. The
+/// remaining hundred has been called "the WAL and the log" and never counted.
+///
+/// It matters beyond its own number: an add is ~1,342 allocations and roughly eight writes, so
+/// per-write machinery carries about 8x leverage on the largest api there is.
+///
+/// Switching a piece off and re-measuring attributes it without instrumenting internals. A flag
+/// that changes nothing eliminates its piece; one that moves the count names it.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib which_piece_of_the_write_machinery_costs -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn which_piece_of_the_write_machinery_costs() {
+    use crate::context_workflow::{
+        ingest_extract_context, ContextExtractRequest, ContextIngestExtractRequest,
+        ContextModelProviderConfig, ContextSourceKind,
+    };
+
+    const TENANT: u64 = 7919;
+
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    // One write, measured on a store grown by real ingests, with whatever flags are set when it
+    // runs. Each arm builds its own store so a flag cannot be observed through state another arm
+    // left behind.
+    fn one_write_costs(tag: u64) -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for index in 0..40_usize {
+            let report = ingest_extract_context(
+                &engine,
+                ContextIngestExtractRequest {
+                    shard_id: 1,
+                    tenant_hash: TENANT,
+                    sources: vec![ContextExtractRequest {
+                        shard_id: 1,
+                        tenant_hash: TENANT,
+                        source_kind: ContextSourceKind::Incident,
+                        source_id: format!("MACH-{tag}-{index:06}"),
+                        title: format!("mach {index}"),
+                        body: format!(
+                            "{}{}",
+                            format!("entry {index} covering the depot rota "),
+                            "context payload sentence. ".repeat(40)
+                        ),
+                        timestamp_ms: 1_000 + index as u64,
+                        provider: ContextModelProviderConfig::default(),
+                    }],
+                    provider: ContextModelProviderConfig::default(),
+                    start_time_ms: 0,
+                    end_time_ms: 0,
+                    max_events: 0,
+                    query: String::new(),
+                },
+            );
+            assert!(report.status.ok, "grow {index}: {:?}", report.status);
+        }
+
+        let node = |hash: u64| crate::types::ContextNode {
+            node_hash: hash,
+            parent_hash: 0,
+            kind: 1,
+            canonical_name: format!("session/mach-{hash}"),
+            l0: "the text an extract produces".to_string(),
+            status: 0,
+            last_event_time_ms: 1_781_700_000_000,
+            l1_ref: String::new(),
+            raw_metadata_ref: String::new(),
+            vector: (0..384).map(|i| i as f32 / 1024.0).collect(),
+            embedding_model_hash: 7,
+            embedding_updated_at_ms: 1,
+            summary_vector: (0..384).map(|i| i as f32 / 512.0).collect(),
+            summary_vector_valid_from_ms: 1_781_700_000_000,
+            summary_vector_model_hash: 7,
+        };
+        // Warm on one key, measure another.
+        let warm = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextUpsertNode { tenant_hash: TENANT, node: Box::new(node(9_000_000 + tag)) },
+        });
+        assert!(warm.status.ok, "{:?}", warm.status);
+        let probe = crate::alloc_probe::Probe::start();
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextUpsertNode {
+                tenant_hash: TENANT,
+                node: Box::new(node(9_500_000 + tag)),
+            },
+        });
+        let allocs = probe.stop().allocs;
+        assert!(out.status.ok, "{:?}", out.status);
+        allocs
+    }
+
+    let baseline = one_write_costs(1);
+    println!(
+        "
+  one node write, everything at its default: {baseline} allocations
+
+  piece switched off                   allocs   difference
+"
+    );
+
+    for (label, flag, value) in [
+        ("TS_WAL_PREALLOCATE=0        ", "TS_WAL_PREALLOCATE", "0"),
+        // `TS_ENGINE_CONCURRENT_COMMIT=0` was a row here. The barrier's position is a property of
+        // the engine now, not of the environment, so the variable moves nothing -- and a row
+        // reporting a delta of zero would read as "this piece is free" rather than "this row
+        // stopped measuring". `commit_under_lock_for_test` is how an engine takes the other side.
+        //  was a row here, and left for the same reason: the served index
+        // is always written in the container now, so the variable moves nothing and the row
+        // would report a delta of zero -- which reads as a free piece rather than a dead row.
+    ] {
+        std::env::set_var(flag, value);
+        let with_flag = one_write_costs(2);
+        std::env::remove_var(flag);
+        let delta = with_flag as i64 - baseline as i64;
+        println!("  {label}    {with_flag:>7}   {delta:>+10}");
+    }
+
+    println!(
+        "
+  a flag that changes nothing eliminates its piece. one that moves the count names it, and the
+  sign says which way: negative means the default is paying for something.
+"
+    );
+}
+
+
+/// Does reading a node's history scale with how much history it has?
+///
+/// `history` measures 16 allocations and flat -- but flat against the CORPUS, which is the wrong
+/// axis. Growing the store adds nodes; it does not add summaries to any one node. A history read
+/// walks one node's summaries, so the axis that matters is how many that node has, and nothing has
+/// varied it.
+///
+/// That is the shape that hid the ingest quadratic: flat in the thing being varied, proportional to
+/// the thing that is not.
+///
+/// Flat per summary is the right answer -- a read returning more must do more. Superlinear is not,
+/// and neither is a bounded `limit` still paying for everything behind it.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib does_reading_a_history_scale_with_the_history -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn does_reading_a_history_scale_with_the_history() {
+    const TENANT: u64 = 8221;
+    const NODE: u64 = 4_242_424;
+
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    println!(
+        "
+  summaries   no limit   per returned   read limit 8   bytes
+"
+    );
+
+    let mut previous_all: Option<u64> = None;
+    for count in [1_usize, 8, 64, 256] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+
+        // One node's history, written as the ingest writes it: a summary per turn, each with its
+        // own valid_from so they are distinct points in time rather than one row overwritten.
+        for turn in 0..count {
+            let out = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ContextUpsertSummary {
+                    tenant_hash: TENANT,
+                    summary: crate::types::ContextSummary {
+                        node_hash: NODE,
+                        level: 2,
+                        text: format!("summary of turn {turn}, of ordinary length for one turn"),
+                        valid_from_ms: 1_781_700_000_000 + turn as u64,
+                        vector: (0..384).map(|i| (i + turn) as f32 / 1024.0).collect(),
+                        embedding_model_hash: 7,
+                    },
+                },
+            });
+            assert!(out.status.ok, "write {turn}: {:?}", out.status);
+        }
+
+        let read = |limit: Option<usize>| {
+            let request = || ExecuteRequest {
+                shard_id: 1,
+                command: Command::ContextQuerySummaries {
+                    tenant_hash: TENANT,
+                    node_hash: NODE,
+                    level: 2,
+                    as_of_ms: 4_000_000_000_000,
+                    limit,
+                },
+            };
+            // Warm: the first read of a shape touches one-off structures.
+            let warm = engine.execute(request());
+            assert!(warm.status.ok, "{:?}", warm.status);
+            let probe = crate::alloc_probe::Probe::start();
+            let out = engine.execute(request());
+            let counts = probe.stop();
+            assert!(out.status.ok, "{:?}", out.status);
+            let returned = match out.response {
+                CommandResponse::ContextSummaries { summaries, .. } => summaries.len(),
+                other => panic!("expected summaries, got {other:?}"),
+            };
+            (counts.allocs, counts.alloc_bytes, returned)
+        };
+
+        let (all, all_bytes, returned_all) = read(None);
+        let (limited, _, returned_limited) = read(Some(8));
+        // `None` is not "unlimited": `context_limit` resolves it to the default cap, so a node with
+        // a long history cannot make one read expensive. That bound is the property worth holding.
+        let default_cap = 100;
+        assert_eq!(
+            returned_all,
+            count.min(default_cap),
+            "a read with no limit must return up to the default cap, and no more"
+        );
+        assert_eq!(
+            returned_limited,
+            count.min(8),
+            "a limited read must return the limit, not everything"
+        );
+
+        println!(
+            "  {count:>9}   {all:>8}   {:>11.2}   {limited:>12}   {all_bytes:>11}",
+            all as f64 / count.min(100) as f64,
+        );
+        if let Some(previous) = previous_all {
+            assert!(
+                all >= previous,
+                "reading more history cost less, which means this is not measuring the read"
+            );
+        }
+        previous_all = Some(all);
+    }
+
+    println!(
+        "
+  per returned flat   => the read costs what it returns, which is the right shape.
+  per returned rising => it does work proportional to the history beyond returning it.
+  limit 8 flat as the history grows => a bounded read does NOT pay for the whole history.
+  no-limit column flattening at the cap => a bare None is the default cap, not the whole history.
+"
+    );
+}
+
+
+/// Do the batch reads scale with the batch, or with something behind it?
+///
+/// `get_all` and `query embeddings` were measured against CORPUS size and looked fine. They take a
+/// batch of node hashes, and that is a different axis: a per-item cost constant in the corpus can
+/// still be superlinear in the batch. `history` just showed that measuring the wrong axis proves
+/// nothing -- it read "flat" against one that could not have shown a problem.
+///
+/// Store fixed, batch varied. Per item flat is right. Per item rising means the read does work
+/// quadratic in its own batch, which is what to find before a caller asks for a thousand.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib do_the_batch_reads_scale_with_the_batch -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn do_the_batch_reads_scale_with_the_batch() {
+    use crate::context_workflow::{
+        ingest_extract_context, ContextExtractRequest, ContextIngestExtractRequest,
+        ContextModelProviderConfig, ContextSourceKind,
+    };
+
+    const TENANT: u64 = 8419;
+
+    let canary = crate::alloc_probe::Probe::start();
+    let sink: Vec<u8> = Vec::with_capacity(8192);
+    assert!(
+        canary.stop().allocs > 0,
+        "counting allocator not installed -- rerun with `--features alloc-probe`"
+    );
+    drop(sink);
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let mut hashes = Vec::new();
+    for index in 0..320_usize {
+        let report = ingest_extract_context(
+            &engine,
+            ContextIngestExtractRequest {
+                shard_id: 1,
+                tenant_hash: TENANT,
+                sources: vec![ContextExtractRequest {
+                    shard_id: 1,
+                    tenant_hash: TENANT,
+                    source_kind: ContextSourceKind::Incident,
+                    source_id: format!("BATCH-{index:06}"),
+                    title: format!("batch {index}"),
+                    body: format!(
+                        "{}{}",
+                        format!("entry {index} covering the depot rota "),
+                        "context payload sentence. ".repeat(40)
+                    ),
+                    timestamp_ms: 1_000 + index as u64,
+                    provider: ContextModelProviderConfig::default(),
+                }],
+                provider: ContextModelProviderConfig::default(),
+                start_time_ms: 0,
+                end_time_ms: 0,
+                max_events: 0,
+                query: String::new(),
+            },
+        );
+        assert!(report.status.ok, "grow {index}: {:?}", report.status);
+        hashes.extend(report.node_hashes.iter().copied());
+    }
+    assert!(hashes.len() >= 256, "need at least 256 real nodes, got {}", hashes.len());
+
+    let measure = |command: Command| {
+        let request = || ExecuteRequest { shard_id: 1, command: command.clone() };
+        let warm = engine.execute(request());
+        assert!(warm.status.ok, "{:?}", warm.status);
+        let probe = crate::alloc_probe::Probe::start();
+        let out = engine.execute(request());
+        let counts = probe.stop();
+        assert!(out.status.ok, "{:?}", out.status);
+        counts.allocs
+    };
+
+    println!(
+        "
+  batch   get_all   per node   embeddings   per node   get_all (absent ids)
+"
+    );
+
+    for size in [1_usize, 8, 64, 256] {
+        let present: Vec<u64> = hashes.iter().copied().take(size).collect();
+        // Ids that were never written: same shape of request, nothing to find.
+        let absent: Vec<u64> = (0..size).map(|index| 77_000_000 + index as u64).collect();
+
+        let nodes = measure(Command::ContextGetNodes {
+            tenant_hash: TENANT,
+            node_hashes: present.clone(),
+        });
+        let embeddings = measure(Command::ContextQueryNodeEmbeddings {
+            tenant_hash: TENANT,
+            node_hashes: present.clone(),
+        });
+        let missing = measure(Command::ContextGetNodes {
+            tenant_hash: TENANT,
+            node_hashes: absent,
+        });
+
+        println!(
+            "  {size:>5}   {nodes:>7}   {:>8.2}   {embeddings:>10}   {:>8.2}   {missing:>20}",
+            nodes as f64 / size as f64,
+            embeddings as f64 / size as f64,
+        );
+    }
+
+    println!(
+        "
+  per node flat   => the batch costs what it returns.
+  per node rising => the read does work quadratic in its own batch size.
+  absent column tracking the present one => a stale id costs as much as a real one.
+"
+    );
+}
+
+
+/// Does a batch embeddings query answer for every node it was asked about?
+///
+/// The batch probe showed `query embeddings` at 3.80 allocations per node for a batch of 256 and
+/// 8.23 for 64. A per-item cost that halves as the batch grows is the signature of a cap rather than
+/// of amortisation, and the arm confirms it: `.take(context_limit(None))`, which is 100.
+///
+/// So a caller asking about 256 nodes is answered about 100, silently -- no error, no field saying
+/// it was truncated, and no `limit` parameter to raise, unlike `ContextQuerySummaries`.
+///
+/// This is a retrieval question before it is a cost one: a scoring pass that asks for its
+/// candidates' embeddings and receives a prefix scores the remainder as if they had none.
+#[test]
+fn a_batch_embeddings_query_answers_for_every_node_asked() {
+    use crate::context_workflow::{
+        ingest_extract_context, ContextExtractRequest, ContextIngestExtractRequest,
+        ContextModelProviderConfig, ContextSourceKind,
+    };
+
+    const TENANT: u64 = 8677;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let mut hashes = Vec::new();
+    for index in 0..160_usize {
+        let report = ingest_extract_context(
+            &engine,
+            ContextIngestExtractRequest {
+                shard_id: 1,
+                tenant_hash: TENANT,
+                sources: vec![ContextExtractRequest {
+                    shard_id: 1,
+                    tenant_hash: TENANT,
+                    source_kind: ContextSourceKind::Incident,
+                    source_id: format!("CAP-{index:06}"),
+                    title: format!("cap {index}"),
+                    body: format!(
+                        "{}{}",
+                        format!("entry {index} covering the depot rota "),
+                        "context payload sentence. ".repeat(12)
+                    ),
+                    timestamp_ms: 1_000 + index as u64,
+                    provider: ContextModelProviderConfig::default(),
+                }],
+                provider: ContextModelProviderConfig::default(),
+                start_time_ms: 0,
+                end_time_ms: 0,
+                max_events: 0,
+                query: String::new(),
+            },
+        );
+        assert!(report.status.ok, "ingest {index}: {:?}", report.status);
+        hashes.extend(report.node_hashes.iter().copied());
+    }
+    assert!(
+        hashes.len() > 100,
+        "this test needs more than the default cap of nodes to say anything, got {}",
+        hashes.len()
+    );
+
+    let answered_for = |batch: &[u64]| {
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextQueryNodeEmbeddings {
+                tenant_hash: TENANT,
+                node_hashes: batch.to_vec(),
+            },
+        });
+        assert!(out.status.ok, "{:?}", out.status);
+        match out.response {
+            CommandResponse::ContextNodeEmbeddings { embeddings, .. } => embeddings.len(),
+            other => panic!("expected embeddings, got {other:?}"),
+        }
+    };
+
+    // Below the cap, every node asked about is answered for.
+    let small: Vec<u64> = hashes.iter().copied().take(64).collect();
+    assert_eq!(answered_for(&small), 64, "a batch under the cap must answer for all of it");
+
+    // Above it, the caller is answered about a prefix -- and has no way to ask for the rest.
+    let large: Vec<u64> = hashes.iter().copied().take(160).collect();
+    let answered = answered_for(&large);
+    assert_eq!(
+        answered, 160,
+        "asked about {} nodes and answered about {answered}: the batch is truncated at the default \
+         limit with nothing telling the caller, so the nodes past it score as if they had no \
+         embedding",
+        large.len()
+    );
+}
+
+/// What hash-table resizing costs, and what pre-sizing would save.
+///
+/// An 8-hour soak shows RSS growing as a STAIRCASE rather than a line: 1.378 kB/record of quiet
+/// growth plus four jumps that together are 21% of all growth. The jumps land at 0.916, 0.893,
+/// 0.881 and 0.876 of a power of two, converging on hashbrown's 7/8 load factor -- so they are
+/// table resizes, and the freed old table is not returned to the OS.
+///
+/// This measures the same thing locally and without the OS in the way: the same entries, built
+/// incrementally versus built into a pre-sized map.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_resizing_a_shard_map_costs -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_resizing_a_shard_map_costs() {
+    use std::collections::HashMap;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet { key: "seed".into(), value: vec![b'v'; 512] },
+    });
+    assert!(response.status.ok, "seed write: {:?}", response.status);
+    let address = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("loaded shard");
+        shard.strings().values().next().map(|slot| slot.address()).expect("a written page")
+    };
+
+    // Just past a 7/8 boundary, so the incremental build pays for a resize the pre-sized one skips.
+    const ENTRIES: usize = 300_000;
+
+    let build = |capacity: Option<usize>| -> (u64, u64) {
+        let probe = crate::alloc_probe::Probe::start();
+        let mut map: HashMap<String, crate::block_store::ElementEntry> = match capacity {
+            Some(n) => HashMap::with_capacity(n),
+            None => HashMap::new(),
+        };
+        for index in 0..ENTRIES {
+            map.insert(format!("resize-{index:08}"), address.clone());
+        }
+        let counts = probe.stop();
+        std::hint::black_box(&map);
+        (counts.alloc_bytes.saturating_sub(counts.free_bytes), counts.alloc_bytes)
+    };
+
+    let (grown_live, grown_alloc) = build(None);
+    let (sized_live, sized_alloc) = build(Some(ENTRIES));
+
+    let per = |v: u64| v as f64 / ENTRIES as f64;
+    println!();
+    println!("  {ENTRIES} entries, identical keys and addresses");
+    println!("  build             live/entry   allocated/entry");
+    println!("  grown from empty  {:>8.0} B   {:>13.0} B", per(grown_live), per(grown_alloc));
+    println!("  pre-sized         {:>8.0} B   {:>13.0} B", per(sized_live), per(sized_alloc));
+    println!();
+    println!("  pre-sizing saves  {:>8.0} B/entry live   ({:+.1}%)",
+             per(grown_live) - per(sized_live),
+             100.0 * (per(grown_live) - per(sized_live)) / per(grown_live));
+    println!("  and avoids        {:>8.0} B/entry of allocation churn",
+             per(grown_alloc) - per(sized_alloc));
+    println!();
+    if per(grown_live) - per(sized_live) < 8.0 {
+        println!("  Live cost is the SAME either way: the old table is genuinely freed, so a resize");
+        println!("  leaves no permanent slack. The RSS jump the soak sees is therefore the ALLOCATOR");
+        println!("  holding freed memory rather than returning it, which is why it looks permanent");
+        println!("  from outside the process and is recoverable from inside it.");
+    } else {
+        println!("  The grown map carries permanent slack, so pre-sizing is a live-memory win.");
+    }
+    println!();
+    println!("  What pre-sizing does buy is the churn above, and the transient: during a resize");
+    println!("  BOTH tables exist at once, so the peak is higher than the plateau on either side.");
+    println!("  A node sized to its steady-state RSS can still die during a resize.");
+
+    assert!(grown_live > 0 && sized_live > 0, "measured nothing");
+}
+
+/// Is the per-record resident cost actually per-record, or is it fixed cost divided by a small
+/// corpus?
+///
+/// The figure of ~1,040 bytes per record comes from dividing live memory by 30,000 records, and
+/// only 184 of those bytes are the map entry the record lands in
+/// (`what_resizing_a_shard_map_costs`). The remaining ~850 could be per-record structure somewhere
+/// else -- or it could be the engine's fixed setup cost divided by a corpus too small to amortise
+/// it, which would make it vanish at scale rather than being anything to fix.
+///
+/// The same mistake is already on file at the other end: a 90-second run reads ~3 kB/record where
+/// an 8-hour one reads 1.38. So measure at two sizes and take the SLOPE, which is the only part
+/// that scales, and the INTERCEPT, which is what never amortises.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib is_the_per_record_cost_really_per_record -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn is_the_per_record_cost_really_per_record() {
+    let live_at = |records: u64| -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = crate::alloc_probe::Probe::start();
+        let engine = TemporalEngine::with_local_dirs(
+            16 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for index in 0..records {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("scale-{index:08}"),
+                    value: vec![b'v'; 512],
+                },
+            });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+        let counts = probe.stop();
+        std::hint::black_box(&engine);
+        counts.alloc_bytes.saturating_sub(counts.free_bytes)
+    };
+
+    // The engine is INSIDE the probe, so fixed setup cost is counted rather than excluded --
+    // that is the thing being separated out.
+    const SMALL: u64 = 30_000;
+    const LARGE: u64 = 240_000;
+
+    let small_live = live_at(SMALL);
+    let large_live = live_at(LARGE);
+
+    let small_per = small_live as f64 / SMALL as f64;
+    let large_per = large_live as f64 / LARGE as f64;
+    let slope = (large_live as f64 - small_live as f64) / (LARGE - SMALL) as f64;
+    let intercept = small_live as f64 - slope * SMALL as f64;
+
+    println!();
+    println!("  records     live total      live/record");
+    println!("  {SMALL:>7}  {:>12}  {small_per:>13.0} B", small_live);
+    println!("  {LARGE:>7}  {:>12}  {large_per:>13.0} B", large_live);
+    println!();
+    println!("  slope (the part that scales)      {slope:>9.0} B/record");
+    println!("  intercept (fixed, never amortises) {:>8.2} MB", intercept / 1024.0 / 1024.0);
+    println!();
+    println!("  a map entry costs                 {:>9} B", 184);
+    println!("  unattributed per-record structure {:>9.0} B", slope - 184.0);
+    println!();
+    if (small_per - slope).abs() > 0.25 * small_per {
+        println!("  The two per-record figures DISAGREE, so the smaller one was inflated by fixed");
+        println!("  cost divided across too few records. Only the slope is a per-record cost, and");
+        println!("  a capacity estimate must use it -- the intercept is paid once.");
+    } else {
+        println!("  The two agree, so the cost really is per-record and fixed setup is negligible");
+        println!("  at both sizes. The unattributed bytes above are real structure to find.");
+    }
+
+    assert!(small_live > 0 && large_live > 0, "measured nothing");
+}
+
+/// Which structure outside the shard index grows with the record count?
+///
+/// The per-record resident cost has a slope of ~1,026 bytes
+/// (`is_the_per_record_cost_really_per_record`), and only 184 of those are the map entry the
+/// record lands in. The other ~842 are not in `ShardState`'s other maps
+/// (`where_a_record_is_kept`), and the WAL and index-log in-memory state is keyed per SHARD rather
+/// than per record, so neither can hold a per-record cost. That leaves the block store.
+///
+/// Counts at two corpus sizes, so a structure is judged by whether it GROWS rather than by
+/// whether it is non-empty.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_grows_outside_the_shard_index -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn what_grows_outside_the_shard_index() {
+    let counts_at = |records: u64| -> (usize, usize, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            16 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for index in 0..records {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("grow-{index:08}"),
+                    value: vec![b'v'; 512],
+                },
+            });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+        let descriptors = engine.block_store.slab_descriptors().len();
+        let slabs = engine.block_store.slab_ids().map(|v| v.len()).unwrap_or(0);
+        let strings = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            shards.get(&1).expect("loaded shard").strings().len()
+        };
+        (descriptors, slabs, strings)
+    };
+
+    const SMALL: u64 = 20_000;
+    const LARGE: u64 = 160_000;
+    let (small_slab_descriptors, small_slabs, small_strings) = counts_at(SMALL);
+    let (large_slab_descriptors, large_slabs, large_strings) = counts_at(LARGE);
+
+    println!();
+    println!("  structure          at {SMALL:>7}   at {LARGE:>7}   per record   grows?");
+    let row = |name: &str, a: usize, b: usize| {
+        let per = (b as f64 - a as f64) / (LARGE - SMALL) as f64;
+        println!("  {name:16} {a:>10} {b:>12} {per:>12.4}   {}",
+                 if per > 0.01 { "yes" } else { "no" });
+        per
+    };
+    let slab_per = row("slab descriptors", small_slab_descriptors, large_slab_descriptors);
+    row("page slabs", small_slabs, large_slabs);
+    row("index entries", small_strings, large_strings);
+
+    println!();
+    println!("  A slab descriptor is on the order of 100 bytes, so at {slab_per:.4} descriptors per");
+    println!("  record it accounts for roughly {:.1} bytes of the ~842 unattributed.", slab_per * 100.0);
+    if slab_per * 100.0 < 100.0 {
+        println!("  That is nowhere near enough: the page store is NOT where the memory goes, and");
+        println!("  the remaining structure is somewhere these counts do not reach.");
+    }
+
+    assert_eq!(large_strings as u64, LARGE, "every write should be indexed");
+}
+
+/// Attribute the per-record cost by DROPPING structures and measuring what comes back.
+///
+/// Counting entries has narrowed this as far as it can: the index holds 1.00 entries per record
+/// and every other structure counted holds none (`where_a_record_is_kept`,
+/// `what_grows_outside_the_shard_index`), yet one entry measures 184 bytes against a per-record
+/// slope of ~1,026 (`what_resizing_a_shard_map_costs`,
+/// `is_the_per_record_cost_really_per_record`). Counts cannot close that -- a structure can hold
+/// one entry per record and that entry can be far bigger than the same entry built by hand.
+///
+/// So stop counting and free things: drop the shard, and whatever the allocator takes back was
+/// held by it. That is attribution by subtraction, and it cannot miss a structure the way an
+/// enumeration can.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_dropping_the_shard_gives_back -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_dropping_the_shard_gives_back() {
+    const RECORDS: u64 = 120_000;
+
+    let dir = tempfile::tempdir().unwrap();
+
+    let build = crate::alloc_probe::Probe::start();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("drop-{index:08}"),
+                value: vec![b'v'; 512],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    let built = build.stop();
+    let live_after_build = built.alloc_bytes.saturating_sub(built.free_bytes);
+
+    // Free ONLY the shard. The engine, its stores and its caches stay alive, so whatever comes
+    // back was held by the shard and nothing else.
+    let release = crate::alloc_probe::Probe::start();
+    let shard = engine.shards.write().expect("engine lock poisoned").remove(&1);
+    drop(shard);
+    let released = release.stop();
+    let freed_by_shard = released.free_bytes.saturating_sub(released.alloc_bytes);
+
+    let per = |v: u64| v as f64 / RECORDS as f64;
+    println!();
+    println!("  live after writing {RECORDS} records   {:>12} B   {:>7.0} B/record",
+             live_after_build, per(live_after_build));
+    println!("  freed by dropping the shard          {:>12} B   {:>7.0} B/record",
+             freed_by_shard, per(freed_by_shard));
+    println!("  still held by the engine             {:>12} B   {:>7.0} B/record",
+             live_after_build.saturating_sub(freed_by_shard),
+             per(live_after_build) - per(freed_by_shard));
+    println!();
+    let shard_share = 100.0 * freed_by_shard as f64 / live_after_build as f64;
+    println!("  the shard holds {shard_share:.0}% of it");
+    println!();
+    if shard_share > 60.0 {
+        println!("  So the cost IS the shard index, and one of its entries is far more expensive");
+        println!("  in place than the same entry built by hand. The difference is what to chase:");
+        println!("  the key is stored once per map, but the value carried alongside it is not the");
+        println!("  bare address a hand-built map holds.");
+    } else {
+        println!("  So the shard is NOT the holder, and the memory is in the engine's own stores");
+        println!("  despite their per-shard keying. The next cut is per store rather than per map.");
+    }
+
+    assert!(live_after_build > 0, "measured nothing");
+}
+
+/// Every place a record is kept, counted across the WHOLE shard rather than a sample of it.
+///
+/// An earlier version of this probe listed seven `ShardState` fields, found only `strings`
+/// populated, and concluded a record is held once. `ShardState` has 42 fields, so that conclusion
+/// was drawn from a sixth of the structure -- and dropping the shard frees 963 bytes per record
+/// against a 184-byte map entry (`what_dropping_the_shard_gives_back`), which a single home cannot
+/// explain.
+///
+/// So this counts every container the shard owns, including the bucket index's own per-object
+/// maps, and asserts its own extent: if a field is added to `ShardState` and not listed here, the
+/// count below stops matching the struct and the test says so rather than quietly under-reporting
+/// again.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib where_a_record_is_kept_everywhere -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+fn where_a_record_is_kept_everywhere() {
+    const RECORDS: usize = 20_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("kept-{index:08}"),
+                value: vec![b'v'; 512],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("loaded shard");
+
+    // The bucket index keeps its own per-object maps, one set per bucket, so they have to be
+    // summed across buckets rather than read off a single length.
+    let buckets = &shard.bucket_index.bucket_map;
+    let object_index: usize = buckets.values().map(|b| b.object_index.object_count()).sum();
+    let deleted_object_index: usize = buckets.values().map(|b| b.deleted_object_index.object_count()).sum();
+    let block_index: usize = buckets.values().map(|b| b.block_index.len()).sum();
+
+    let rows: Vec<(&str, usize)> = vec![
+        ("strings", shard.strings().len()),
+        ("hashes", shard.hashes.len()),
+        ("sets", shard.sets.len()),
+        ("zsets", shard.zsets.len()),
+        ("lists", shard.lists.len()),
+        ("seen", shard.seen.len()),
+        ("buckets", shard.buckets.len()),
+        ("expires_at_ms", shard.expires_at_ms().len()),
+        ("features", shard.features().len()),
+        ("feature_values", shard.feature_values().len()),
+        ("feature_rollups", shard.feature_rollups().len()),
+        ("control_state", shard.control_state().len()),
+        ("control_state_pages", shard.control_state_blocks().len()),
+        ("control_state_changes", shard.control_state_changes.len()),
+        ("control_state_selection", shard.control_state_selection.len()),
+        ("control_state_uuid", shard.control_state_uuid().len()),
+        ("control_state_rollups", shard.control_state_rollups().len()),
+        ("context_nodes", shard.context_nodes().len()),
+        ("context_events", shard.context_events().len()),
+        ("context_event_timeline", shard.context_event_timeline.len()),
+        ("context_indexes", shard.context_indexes().len()),
+        ("context_audits", shard.context_audits().len()),
+        ("context_entities", shard.context_entities().len()),
+        ("context_children", shard.context_children().len()),
+        ("context_summaries", shard.context_summaries().len()),
+        ("context_compressions", shard.context_compressions().len()),
+        ("context_dirty_index", shard.context_dirty_index.len()),
+        ("context_compression_watermark", shard.context_compression_watermark().len()),
+        ("wal_resident_pages", shard.wal_resident_blocks.len()),
+        ("buckets_pending_flag_refresh", shard.buckets_pending_flag_refresh.len()),
+        ("dirty_objects", shard.dirty_objects.len()),
+        ("bucket_recency", shard.bucket_recency.len()),
+        ("object_block_layouts", shard.object_block_layouts.len()),
+        ("bucket_index.bucket_map", buckets.len()),
+        ("bucket_index.kind_pool", shard.bucket_index.kind_pool.len()),
+        ("bucket_index.object_page_lookup", shard.bucket_index.object_block_lookup.len()),
+        ("  .object_index", object_index),
+        ("  .deleted_object_index", deleted_object_index),
+        ("  .page_index", block_index),
+    ];
+
+    // Extent, so this cannot silently under-report the way its predecessor did. The fields this
+    // probe ACCOUNTS FOR, exactly once each:
+    //
+    //   34  top-level containers, every one listed above
+    //    6  scalars that cannot hold a per-record entry (index_format_version,
+    //       control_coalesce_persist, control_distinct_sketch, applied_wal_sequence,
+    //       promote_scan_done, evict_sampler)
+    //    1  bucket_index, expanded into the 6 rows above: its own bucket_map, kind_pool and
+    //       object_page_lookup, plus the three per-object maps summed across buckets
+    //
+    // 40 NAMED FIELDS, AND THAT IS NOT THE STRUCT'S FIELD COUNT. This block read "ShardState has
+    // 42 fields", and the assert under it compared 35 + 6 + 1 against the literal 42 -- an
+    // identity between three constants written in one place, true whatever the struct does.
+    // Measured: `ShardState` has 48 fields. `expiry_by_deadline` is a container this probe does
+    // not list, and five scalars (routing_range_start, routing_range_end, routing_range_known,
+    // shard_id, shard_id_known) are not among the six named above. So the claim is stated as what
+    // it is -- the extent of THIS LIST.
+    //
+    // WHAT THESE TWO ASSERTS CAN AND CANNOT SEE, because the sentence that stood here claimed
+    // more than either delivers. It said the count "stops matching the struct" when a field is
+    // added to `ShardState` and not listed. IT CANNOT. Both asserts compare constants and a row
+    // count written in THIS function; neither side is derived from `ShardState`, so a field added
+    // to the struct moves nothing here and both asserts keep passing.
+    //
+    // The first assert is a tautology over three literals, as the note above already says of its
+    // predecessor. The second is live, but reaches one direction only: it fails when a row LEAVES
+    // the list without the constant following. That is worth keeping -- it is what caught both
+    // numbers below being wrong -- but it is not coverage of the struct.
+    //
+    // WHAT DOES CATCH A FIELD ARRIVING: `state::repack_decoded_btrees` destructures `ShardState`
+    // with every field named and no `..`, so adding one is a COMPILE error there. That is the
+    // guard this claim belongs to, and the one to cite instead of this count.
+    //
+    // BOTH CONSTANTS BELOW WERE WRONG, AND `#[ignore]` IS WHY. No branch gate runs this test, so
+    // the assert sat UNREACHABLE rather than true or false. On the commit this correction was
+    // written against, the list held 39 rows while `TOP_LEVEL_CONTAINERS + BUCKET_INDEX_ROWS`
+    // read 40 -- already failing, invisibly -- and taking the row for the merged embedding index
+    // out of the list made it 38 against the same 40. Counted from the list as it now stands:
+    // 32 top-level rows, 6 expanded out of bucket_index.
+    const TOP_LEVEL_CONTAINERS: usize = 33;
+    const NON_CONTAINER_FIELDS: usize = 6;
+    const BUCKET_INDEX_ROWS: usize = 6;
+    const NAMED_FIELDS: usize = 40;
+    assert_eq!(
+        TOP_LEVEL_CONTAINERS + NON_CONTAINER_FIELDS + 1,
+        NAMED_FIELDS,
+        "the three constants above no longer sum to the number of fields this probe names"
+    );
+    assert_eq!(
+        rows.len(),
+        TOP_LEVEL_CONTAINERS + BUCKET_INDEX_ROWS,
+        "a listed field is missing from the rows above"
+    );
+
+    // A count alone cannot see a name listed TWICE: a copy-paste that duplicates one row and
+    // drops another keeps `rows.len()` correct while the probe reads one container twice and a
+    // second one never. The row count above cannot distinguish that from a correct list, so it
+    // is ruled out separately here rather than assumed.
+    let mut listed: Vec<&str> = rows.iter().map(|(name, _)| *name).collect();
+    let listed_len = listed.len();
+    listed.sort_unstable();
+    listed.dedup();
+    assert_eq!(
+        listed.len(),
+        listed_len,
+        "a container is listed twice in the rows above, so some other one is listed not at all"
+    );
+
+    println!();
+    println!("  {RECORDS} plain string writes, every container the shard owns:");
+    println!("  structure                        entries   per record");
+    let mut homes = 0;
+    let mut total = 0.0;
+    for (name, count) in &rows {
+        let per = *count as f64 / RECORDS as f64;
+        total += per;
+        if per > 0.01 {
+            homes += 1;
+            println!("  {name:32} {count:>7} {per:>12.2}   <-- holds every record");
+        } else if *count > 0 {
+            println!("  {name:32} {count:>7} {per:>12.4}", );
+        }
+    }
+    println!("  {:32} {:>7} {total:>12.2}", "counted, per record", "");
+    println!();
+    println!("  {homes} structures hold roughly one entry per record.");
+    println!("  Dropping the shard returns 963 B/record and one map entry costs 184, so a record");
+    println!("  paying for {homes} homes is the shape of that {:.1}x -- and the fix is to keep it in", 963.0 / 184.0);
+    println!("  fewer places rather than to shrink any one of them.");
+    println!();
+    println!("  ({TOP_LEVEL_CONTAINERS} of the {NAMED_FIELDS} ShardState fields this probe names are containers and all");
+    println!("   are listed, plus {BUCKET_INDEX_ROWS} rows expanded out of bucket_index; the other {NON_CONTAINER_FIELDS} are scalars.)");
+
+    assert_eq!(shard.strings().len(), RECORDS, "every write should be in strings");
+}
+
+/// What a bounded routing-slot range would save a one-box node.
+///
+/// A record is kept in seven places (`where_a_record_is_kept_everywhere`), and four of them --
+/// the slot map, slot recency, the object index and the block index -- hold one entry per record
+/// only because each record gets its own routing slot. That happens when a shard has the default
+/// full-u32 slot range, which is what a node with no meta server to assign it one inherits: the
+/// live one-box soak node reports routing_slot_count 4,294,967,295 and a dirty slot count equal
+/// to its object count.
+///
+/// A meta-server-managed shard gets 0..1023 instead. This loads the same corpus both ways and
+/// counts, so the saving is measured rather than argued.
+///
+/// What does one bucket cost in memory? Prints.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_a_bucket_costs -- --ignored --nocapture --test-threads=1
+///
+/// At the default routing range every key gets its own bucket, so this is also "what does one
+/// stored object cost in index memory".
+///
+/// Read the MARGINAL bytes between two rows, not a single row's "B per bucket". Engine startup
+/// retains several megabytes that have nothing to do with record count -- caches and store
+/// buffers -- so a small fixture divides that fixed cost over too few buckets and reports a
+/// per-bucket figure several times the truth. Measured 2026-09-11 the rows fit
+/// `fixed + 760 B x buckets` closely, while the smallest row alone reads 2,486 B.
+///
+/// The single-OBJECT case is held inline by `ObjectIndex::One`. The single-BLOCK case is not any
+/// more: the block index's single-block arm was BOXED once the shipped routing range stopped making
+/// single-block buckets the common case, so a bucket holding one block now takes one small allocation
+/// for its block list. What remains in the per-bucket figure is the node itself plus that one list.
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_a_bucket_costs() {
+    use crate::engine::state;
+    for (name, bytes) in [
+        ("BucketNode", std::mem::size_of::<state::BucketNode>()),
+        ("  ObjectIndex", std::mem::size_of::<state::ObjectIndex>()),
+        ("  BlockIndexMap", std::mem::size_of::<state::BlockIndexMap>()),
+        ("    BlockIndex", std::mem::size_of::<state::BlockIndex>()),
+        (
+            "      ElementEntry",
+            std::mem::size_of::<crate::block_store::ElementEntry>(),
+        ),
+    ] {
+        eprintln!("  size_of::<{name}>() = {bytes}");
+    }
+    for records in [5_000usize, 20_000, 40_000, 80_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = crate::alloc_probe::Probe::start();
+        let engine = TemporalEngine::with_local_dirs(
+            16 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for index in 0..records {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("cost-{index:07}"),
+                    value: vec![b'v'; 64],
+                },
+            });
+        }
+        let counts = probe.stop();
+        let live = counts.alloc_bytes.saturating_sub(counts.free_bytes);
+        let buckets = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            shards
+                .get(&1)
+                .map(|shard| shard.bucket_index.bucket_map.len())
+                .unwrap_or(0)
+        };
+        eprintln!(
+            "  {records:>6} records -> {buckets:>6} buckets: {live:>12} live bytes, \
+             {:>8.0} B per record, {:>8.0} B per bucket",
+            live as f64 / records as f64,
+            live as f64 / buckets.max(1) as f64,
+        );
+    }
+}
+
+/// What the cheap index-GC gate SAVES, measured as two arms in ONE process. Prints.
+///
+///   cargo test --release -p temporalstore-rust --lib what_the_cheap_index_gc_gate_saves -- --ignored --nocapture
+///
+/// Two arms, differing only in the byte threshold:
+///
+///   SCAN  threshold 0        -- never missed, so the cheap skip does not fire and the gate reads
+///                               and decodes the whole index log. This is EXACTLY what every round
+///                               did before the skip existed, which is what makes it the baseline.
+///   SKIP  threshold u64::MAX -- always missed, so the gate returns on a file-length check alone.
+///
+/// Run ABBA (skip, scan, scan, skip) inside one process rather than as a before/after across two
+/// builds. This box is shared and its load moves a lot -- another session had a release build
+/// running at load 19 while this was written -- so a sequential before/after measures the box as
+/// much as the change. Interleaving inside one process gives both arms the same machine.
+///
+/// The fixture is deliberately one where the collector CANNOT fire, so the SCAN arm pays for the
+/// scan and nothing else. Both arms are asserted not to have collected, because if either did,
+/// the difference would include collection work and would not be a gate measurement at all.
+#[test]
+#[ignore]
+fn what_the_cheap_index_gc_gate_saves() {
+    for records in [4_000usize, 16_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            16 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for index in 0..records {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("gate-save-{index:06}"),
+                    value: vec![b'v'; 64],
+                },
+            });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+
+        let log_bytes = engine.index_log_store.log_len_bytes(1);
+        // Denominator: an empty index log would make both arms trivially equal and the whole
+        // comparison vacuous.
+        assert!(log_bytes > 0, "fixture wrote no index log, nothing to scan");
+
+        let plan = engine.storage_lifecycle_plan(crate::engine::reports::StorageLifecycleRequest {
+            shard_id: 1,
+            ..crate::engine::reports::StorageLifecycleRequest::default()
+        });
+        let wal_plan = engine.storage_wal_reclaim_plan(1, Vec::new(), Vec::new());
+
+        // Time ONLY the gate, with both plans hoisted out. Timing the enclosing periodic call
+        // would bury the difference under `storage_lifecycle_plan`, which dominates it and which
+        // this change does not touch.
+        let arm = |threshold: u64| -> (f64, bool) {
+            let request = crate::engine::reports::StorageManagerCycleRequest {
+                shard_id: 1,
+                index_gc_index_log_bytes_threshold: threshold,
+                index_gc_max_entries_per_round:
+                    crate::engine::reports::DEFAULT_INDEX_GC_MAX_ENTRIES_PER_ROUND,
+                ..crate::engine::reports::StorageManagerCycleRequest::default()
+            };
+            let started = std::time::Instant::now();
+            let mut applied = false;
+            for _ in 0..5 {
+                let report = engine.storage_index_gc_report(&plan, &wal_plan, None, &request);
+                applied |= report.applied;
+            }
+            (started.elapsed().as_micros() as f64 / 5.0 / 1000.0, applied)
+        };
+
+        let (skip_a, applied_1) = arm(u64::MAX);
+        let (scan_a, applied_2) = arm(0);
+        let (scan_b, applied_3) = arm(0);
+        let (skip_b, applied_4) = arm(u64::MAX);
+        let skip_ms = (skip_a + skip_b) / 2.0;
+        let scan_ms = (scan_a + scan_b) / 2.0;
+
+        assert!(
+            !(applied_1 || applied_2 || applied_3 || applied_4),
+            "fixture let the collector fire; this probe measures the GATE only",
+        );
+
+        eprintln!(
+            "  [gate-save] {records:>6} records, log {log_bytes:>9} B -> scan {scan_ms:>7.2} ms \
+(arms {scan_a:>6.2}/{scan_b:>6.2})  skip {skip_ms:>7.2} ms (arms {skip_a:>6.2}/{skip_b:>6.2})  \
+saved {:>7.2} ms per round",
+            scan_ms - skip_ms,
+        );
+    }
+}
+
+/// Building the WAL reclaim plan must not get dearer for every dump manifest that is retained.
+///
+/// `bucket_generation_fingerprints_by_bucket` walks every live block in the shard. The plan used
+/// to call it once per retained manifest, EAGERLY, before knowing whether any bucket would consult
+/// them -- so the plan's cost scaled with how many manifests happened to be retained, a quantity
+/// that has nothing to do with what the round was asked to do.
+///
+/// The fingerprints are now computed on first use, and a manifest that carries no summary for a
+/// bucket is skipped before it is fingerprinted at all. This pins that: quadrupling the manifest
+/// count must not multiply the live-block scan volume.
+#[test]
+fn fingerprinting_does_not_scale_with_the_manifest_count() {
+    let scan_volume_for = |manifest_count: usize| -> (u64, usize) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            16 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for round in 0..manifest_count {
+            // Write between manifests so each one lands on a distinct index-log sequence: the
+            // manifest id is {shard}-{sequence}-{ms}, and two built back to back inside one
+            // millisecond with no write between them would collide.
+            for index in 0..64 {
+                let response = engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: format!("fp-{round:03}-{index:04}"),
+                        value: vec![b'v'; 64],
+                    },
+                });
+                assert!(response.status.ok, "write: {:?}", response.status);
+            }
+            let _ = engine.create_bucket_dump_manifest(1, Vec::new());
+        }
+        let manifests = engine.list_bucket_dump_manifests(1).len();
+
+        crate::engine::reset_live_block_scan_entries();
+        let _ = engine.storage_wal_reclaim_plan(1, Vec::new(), Vec::new());
+        (crate::engine::live_block_scan_entries(), manifests)
+    };
+
+    let (few_volume, few_manifests) = scan_volume_for(2);
+    let (many_volume, many_manifests) = scan_volume_for(8);
+
+    // Denominators. Without these, a fixture that retained one manifest either way -- or that
+    // scanned nothing -- would satisfy the ratio below while measuring nothing at all.
+    assert!(
+        many_manifests > few_manifests,
+        "fixture did not actually retain more manifests: {few_manifests} then {many_manifests}",
+    );
+    assert!(
+        few_volume > 0 && many_volume > 0,
+        "the plan scanned no live pages, so this measures nothing: {few_volume} then {many_volume}",
+    );
+
+    // The 8-manifest shard also holds 4x the records, so its per-plan walk is legitimately
+    // larger. What must NOT happen is the walk multiplying by the MANIFEST count on top of that.
+    // Normalise by records to separate the two.
+    let few_per_record = few_volume as f64 / (2 * 64) as f64;
+    let many_per_record = many_volume as f64 / (8 * 64) as f64;
+    eprintln!(
+        "  {few_manifests} manifests -> {few_volume} entries ({few_per_record:.1}/record); \
+{many_manifests} manifests -> {many_volume} entries ({many_per_record:.1}/record)",
+    );
+    assert!(
+        many_per_record <= few_per_record * 1.5,
+        "the WAL reclaim plan's scan volume grew with the manifest count: \
+{few_manifests} manifests = {few_per_record:.1} entries/record, \
+{many_manifests} manifests = {many_per_record:.1} entries/record",
+    );
+}
+
+/// The object-lifecycle snapshot walks the shard ONCE, not three times.
+///
+/// It derives three things from the live-block set -- block ownership validation, the object
+/// lifecycle report, and the per-slab live-ref counts -- and used to call
+/// `collect_live_block_entries` separately for each. That materializes every live block in the
+/// shard into a fresh Vec, so the call cost 3x the shard, measured by `what_each_plan_call_walks`
+/// as the largest single piece of `apply_storage_lifecycle` (itself 12x).
+///
+/// All three read the SAME `&ShardState` under ONE read lock with nothing mutating between them,
+/// so one walk can serve all three. This pins that. It is deliberately an exact equality rather
+/// than a bound: the number should be the live block count, and a second walk creeping back in is
+/// exactly what this exists to catch.
+#[test]
+fn the_object_lifecycle_snapshot_walks_the_shard_once() {
+    const RECORDS: usize = 1_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("once-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let live_blocks: u64 = engine
+        .bucket_storage_summaries(1)
+        .iter()
+        .map(|summary| summary.block_ref_count as u64)
+        .sum();
+    // Denominator: with no live blocks every walk count is 0 and the equality below would hold
+    // for a shard that stored nothing.
+    assert!(live_blocks > 0, "fixture stored no live pages, so this measures nothing");
+
+    crate::engine::reset_live_block_scan_entries();
+    let report = engine.storage_object_lifecycle_snapshot(1);
+    let walked = crate::engine::live_block_scan_entries();
+
+    // The snapshot must still SAY something -- a call that returned an empty report would walk
+    // once trivially and pass.
+    assert!(
+        report.live_block_refs > 0 || report.live_object_ids > 0,
+        "the snapshot reported nothing, so the walk it did was not the real one: {report:?}",
+    );
+
+    assert_eq!(
+        walked, live_blocks,
+        "storage_object_lifecycle_snapshot materialized {walked} live-page entries for a shard \
+holding {live_blocks} live pages -- that is {:.1} walks, and it should be exactly one. Its three \
+consumers (ownership validation, the lifecycle report, the per-slab ref counts) share one walk; \
+if a fourth consumer was added, give it the slice rather than its own scan.",
+        walked as f64 / live_blocks as f64,
+    );
+}
+
+/// `apply_storage_lifecycle` walks the shard TWELVE times. Which of its pieces? Prints.
+///
+///   cargo test --release -p temporalstore-rust --lib what_apply_storage_lifecycle_walks -- --ignored --nocapture
+///
+/// `what_each_plan_call_walks` measures the calls a round makes and finds one that dominates:
+/// `bucket_storage_summaries` 1.0x, `storage_wal_reclaim_plan` 2.0x, `storage_lifecycle_plan`
+/// 2.0x, `create_bucket_dump_manifest` 2.0x -- and `apply_storage_lifecycle` 12.0x. That single
+/// call is most of `reclaim_wal`'s 16x, and it is NOT the manifest fingerprinting an earlier
+/// attempt blamed (making that lazy left the stage figure unchanged).
+///
+/// Its pieces are mostly gated by request flags, so they can be subtracted one at a time through
+/// the public API rather than by reading the body and guessing which ones walk.
+///
+/// CAVEAT, the same one that made an earlier table misleading: a flag whose work would not have
+/// happened anyway contributes 0, and that zero means "this row measured nothing", not "this piece
+/// does not walk". The all-on row's own walk count is printed so the deltas can be read against
+/// something, and a delta of 0 should be treated as unproven rather than as evidence of absence.
+///
+/// Every arm builds a FRESH shard: `apply_storage_lifecycle` mutates (it dumps, writes manifests
+/// and clears dirty state), so reusing one engine would measure a different store each time.
+#[test]
+#[ignore]
+fn what_apply_storage_lifecycle_walks() {
+    const RECORDS: usize = 4_000;
+
+    let walks_for = |request: crate::engine::reports::StorageLifecycleRequest| -> (u64, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            16 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for index in 0..RECORDS {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("applylc-{index:06}"),
+                    value: vec![b'v'; 64],
+                },
+            });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+        let live_blocks: u64 = engine
+            .bucket_storage_summaries(1)
+            .iter()
+            .map(|summary| summary.block_ref_count as u64)
+            .sum();
+        crate::engine::reset_live_block_scan_entries();
+        let _ = engine.apply_storage_lifecycle(request);
+        (crate::engine::live_block_scan_entries(), live_blocks)
+    };
+
+    let all_on = || crate::engine::reports::StorageLifecycleRequest {
+        shard_id: 1,
+        purge_delayed_destroy: true,
+        prune_bucket_dump_manifests: true,
+        roll_forward_bucket_dump_installs: true,
+        ..crate::engine::reports::StorageLifecycleRequest::default()
+    };
+
+    let (baseline, live_blocks) = walks_for(all_on());
+    assert!(live_blocks > 0, "fixture stored no live pages");
+    assert!(baseline > 0, "apply_storage_lifecycle walked nothing; this attributes nothing");
+    eprintln!(
+        "  [apply-lc] everything on                        {baseline:>8} entries = {:>5.1}x the shard \
+({live_blocks} live pages)",
+        baseline as f64 / live_blocks as f64,
+    );
+
+    for (name, request) in [
+        (
+            "without purge_delayed_destroy",
+            crate::engine::reports::StorageLifecycleRequest { purge_delayed_destroy: false, ..all_on() },
+        ),
+        (
+            "without prune_bucket_dump_manifests",
+            crate::engine::reports::StorageLifecycleRequest { prune_bucket_dump_manifests: false, ..all_on() },
+        ),
+        (
+            "without roll_forward_bucket_dump_installs",
+            crate::engine::reports::StorageLifecycleRequest { roll_forward_bucket_dump_installs: false, ..all_on() },
+        ),
+        (
+            "with warm_cache",
+            crate::engine::reports::StorageLifecycleRequest { warm_cache: true, ..all_on() },
+        ),
+        (
+            "with invalidate_cache",
+            crate::engine::reports::StorageLifecycleRequest { invalidate_cache: true, ..all_on() },
+        ),
+    ] {
+        let (without, _) = walks_for(request);
+        let delta = baseline as i64 - without as i64;
+        eprintln!(
+            "  [apply-lc] {name:<40} {without:>8} entries (delta {delta:>+8}, {:>+5.1}x){}",
+            delta as f64 / live_blocks as f64,
+            if delta == 0 { "   <- 0: unproven, not evidence of absence" } else { "" },
+        );
+    }
+}
+
+/// A compaction round's preamble shares one walk between its live-block consumers.
+///
+/// Before any budget is consulted, the stage builds several whole-shard reports under the shard
+/// WRITE lock, so every read and write on the shard queues behind them. Three of those reports
+/// take the same live-block set -- ownership validation, the compaction utility report, and the
+/// object lifecycle report -- and each used to call `collect_live_block_entries` for its own copy.
+///
+/// Measured at 4,000 objects, one round walked 9.0x the shard when each report walked for itself.
+/// Sharing one walk across the three took it to 7.0x; giving `object_manager_runtime_report` the
+/// same slice -- and stopping its tail from walking again purely to COUNT eight kinds of entry --
+/// took it to 4.0x.
+///
+/// THOSE THREE NUMBERS WERE ALL TWO LOW. They were taken with a counter charged only in
+/// `collect_live_block_entries`, and this round makes two whole-shard passes that go around it:
+/// `rebuild_bucket_block_ownership` and `rebuild_bucket_first_index` both call
+/// `collect_model_live_block_entries` directly. The sharing work was real and the progression is
+/// real; the absolute numbers were 11.0x, 9.0x and 6.0x. The bound below now sits between 6 and
+/// 9, so losing any of that sharing still fails it. The per-site split is PRINTED above the
+/// assertion, so the next person reading a moved bound sees which site moved it.
+///
+/// It is a BOUND and not an equality, unlike `the_object_lifecycle_snapshot_walks_the_shard_once`.
+/// That one owns every walk in its function and can name the exact number; this round also walks
+/// for the relocation work itself, which is legitimately outside what these changes control.
+/// Pinning the total exactly would make this test fail for unrelated reasons.
+#[test]
+fn a_compaction_round_shares_one_walk_across_its_live_block_consumers() {
+    const RECORDS: usize = 1_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("share-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let live_blocks: u64 = engine
+        .bucket_storage_summaries(1)
+        .iter()
+        .map(|summary| summary.block_ref_count as u64)
+        .sum();
+    assert!(live_blocks > 0, "fixture stored no live pages, so this measures nothing");
+
+    crate::engine::reset_live_block_scan_entries();
+    crate::engine::reset_live_block_scan_sites();
+    let report = engine.compact_shard_blocks_with_budgets(1, u64::MAX, usize::MAX);
+    let walked = crate::engine::live_block_scan_entries();
+    let sites = crate::engine::live_block_scan_sites_snapshot();
+    assert!(report.is_ok(), "compaction failed: {report:?}");
+    eprintln!("  [compaction] {walked} entries for {live_blocks} live pages, {} site(s)", sites.len());
+    for (site, entries) in &sites {
+        eprintln!("    {:>5.1}x  {site}", *entries as f64 / live_blocks as f64);
+    }
+
+    // Denominator: a round that did no walking at all would satisfy any upper bound.
+    assert!(
+        walked > 0,
+        "the compaction round materialized nothing, so the bound below measures nothing",
+    );
+
+    let multiple = walked as f64 / live_blocks as f64;
+    assert!(
+        multiple <= 7.0,
+        "a compaction round walked {multiple:.1}x the shard ({walked} entries for {live_blocks} \
+live pages) from {} site(s). Its ownership validation, utility report, object lifecycle report \
+and object-manager report all share ONE `collect_live_page_entries`: 11.0x when each walked for \
+itself, 9.0x with three sharing, 6.0x with all four, the last two of the six being the bucket \
+ownership and first-index rebuilds. If a new preamble report needs the live-page set, pass it \
+the existing slice rather than calling `collect_live_page_entries` again -- the split printed \
+above names whichever site moved this.",
+        sites.len(),
+    );
+}
+
+/// The fixture both maintenance-flush measurements use: a shard whose records are all due.
+///
+/// `RECORDS` is small on purpose. What is being counted is how many index encodes land inside the
+/// guarded region, and that is one per round whatever the shard holds; a bigger fixture would only
+/// make the BYTES bigger, and the byte figure is here to say the encode is not free, not to be
+/// compared against a threshold.
+#[cfg(test)]
+fn expired_shard_for_flush_measurement(
+    dir: &std::path::Path,
+    records: usize,
+) -> TemporalEngine {
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.join("cache"),
+        dir.join("blocks"),
+        dir.join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..records {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSetEx {
+                key: format!("expire-{index:06}"),
+                value: vec![b'v'; 64],
+                ttl_ms: 1,
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    // The deadlines are in the past before the sweep asks, so the round has real work.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    engine
+}
+
+/// Run one expiry sweep on `engine` and report what the served-index encode did.
+#[cfg(test)]
+fn measured_expiry_sweep(
+    engine: &TemporalEngine,
+    records: usize,
+) -> (crate::engine::IndexEncodeCounts, usize) {
+    crate::engine::reset_index_encode_counts();
+    let report = engine
+        .sweep_expired_records_with_request(ShardExpirySweepRequest {
+            shard_id: 1,
+            load_cold_buckets: true,
+            max_hot_buckets_per_round: records,
+            max_cold_buckets_per_round: records,
+            ..ShardExpirySweepRequest::default()
+        })
+        .expect("expiry sweep must succeed");
+    (
+        crate::engine::index_encode_counts(),
+        report.expired_records_removed,
+    )
+}
+
+/// THE GUARD: the expiry sweep never encodes the served index inside the shard write guard --
+/// and, since the checkpoint became a delta, never encodes it at all.
+///
+/// The sweep's own work is bounded -- `expiry_scan_budget` caps what a round looks at, so a round
+/// costs the same on a shard of four thousand keys as on one of four hundred thousand. The flush
+/// that followed it was not: encoding the served index runs the WHOLE shard through serde and then
+/// zstd, and it ran while the shard-table write lock was still held, so every read and every write
+/// on that shard queued behind a cost that scales with the store.
+///
+/// TWO SEPARATE CLAIMS LIVE HERE, and the second one swallowed the first. Moving that encode out
+/// of the guarded region changed WHO WAITED for it. Making the checkpoint a delta of the keys the
+/// round removed (`ExpiryIndexCheckpoint::Delta`) removed the encode itself, so today the shipped
+/// round encodes ZERO bytes of served index. A guard asserting only "nothing encoded under the
+/// guard" would now pass for the newer reason and stop testing the older one -- so the arm that
+/// still writes a whole index, after the drop, is kept and asserted on its own.
+///
+/// Counted, not timed. This box is shared, and a build running next door moves wall-clock by an
+/// order of magnitude without moving both arms of a comparison equally. A COUNT of encodes inside
+/// the guarded region is the same number under any load.
+///
+/// THREE arms, ONE process, the same fixture:
+///   * WHOLE + UNDER THE LOCK -- where the flush used to be. The positive control: the counter
+///     has to produce a non-zero number inside the region, or every zero below is a broken
+///     counter rather than a shortened hold.
+///   * WHOLE + AFTER THE DROP -- the claim the region change made, still standing on its own
+///     subject: an encode this size happens, and none of it lands inside the guard.
+///   * SHIPPED -- delta checkpoint: no served-index encode happens anywhere in the round.
+/// All three must expire the same records, which is what stops this from being satisfied by a
+/// sweep that did nothing.
+#[test]
+fn the_expiry_sweep_flush_waits_for_the_write_guard_to_drop() {
+    const RECORDS: usize = 200;
+
+    let control_dir = tempfile::tempdir().unwrap();
+    let control_engine = expired_shard_for_flush_measurement(control_dir.path(), RECORDS);
+    control_engine.flush_whole_expiry_index_for_test();
+    control_engine.flush_expiry_index_under_lock_for_test();
+    let (control, control_removed) = measured_expiry_sweep(&control_engine, RECORDS);
+
+    let whole_dir = tempfile::tempdir().unwrap();
+    let whole_engine = expired_shard_for_flush_measurement(whole_dir.path(), RECORDS);
+    whole_engine.flush_whole_expiry_index_for_test();
+    let (whole, whole_removed) = measured_expiry_sweep(&whole_engine, RECORDS);
+
+    let shipped_dir = tempfile::tempdir().unwrap();
+    let shipped_engine = expired_shard_for_flush_measurement(shipped_dir.path(), RECORDS);
+    let (shipped, shipped_removed) = measured_expiry_sweep(&shipped_engine, RECORDS);
+
+    eprintln!(
+        "[expiry flush] whole index, under the lock: {} encode(s) / {} bytes under the guard, \
+{} / {} total, {control_removed} records expired",
+        control.encodes_under_guard,
+        control.encode_bytes_under_guard,
+        control.encodes_total,
+        control.encode_bytes_total,
+    );
+    eprintln!(
+        "[expiry flush] whole index, after the drop: {} encode(s) / {} bytes under the guard, \
+{} / {} total, {whole_removed} records expired",
+        whole.encodes_under_guard,
+        whole.encode_bytes_under_guard,
+        whole.encodes_total,
+        whole.encode_bytes_total,
+    );
+    eprintln!(
+        "[expiry flush] shipped (delta checkpoint): {} encode(s) / {} bytes under the guard, \
+{} / {} total, {shipped_removed} records expired",
+        shipped.encodes_under_guard,
+        shipped.encode_bytes_under_guard,
+        shipped.encodes_total,
+        shipped.encode_bytes_total,
+    );
+
+    // DENOMINATORS FIRST. A sweep that expired nothing, or expired something and never reached a
+    // flush, satisfies "no encode under the guard" by not running the path at all.
+    assert!(
+        control_removed > 0 && whole_removed > 0 && shipped_removed > 0,
+        "an arm expired no records ({control_removed} / {whole_removed} / {shipped_removed}), so \
+its flush never ran and nothing below is measuring the sweep",
+    );
+    assert_eq!(
+        control_removed, shipped_removed,
+        "the arms must do the same work for their encode counts to be comparable",
+    );
+    assert_eq!(
+        whole_removed, shipped_removed,
+        "the arms must do the same work for their encode counts to be comparable",
+    );
+    assert!(
+        whole.encodes_total > 0 && whole.encode_bytes_total > 0,
+        "the whole-index arm encoded no served index at all ({} encodes, {} bytes), so it is not \
+the flush that moved out of the region -- it is the flush that vanished, and this arm has stopped \
+being a subject for the claim below",
+        whole.encodes_total,
+        whole.encode_bytes_total,
+    );
+
+    // POSITIVE CONTROL: the counter can see a flush inside the region, because here is one.
+    assert!(
+        control.encodes_under_guard > 0 && control.encode_bytes_under_guard > 0,
+        "the control arm flushes inside the guarded region and the counter saw nothing ({} \
+encodes, {} bytes). The measurement is broken, not the code under it: every assertion below \
+would pass against an engine that had stopped counting entirely",
+        control.encodes_under_guard,
+        control.encode_bytes_under_guard,
+    );
+
+    // THE ASSERTION THE REGION CHANGE MADE, on the arm that still has something to move.
+    assert_eq!(
+        whole.encodes_under_guard, 0,
+        "the expiry sweep encoded the served index {} time(s) ({} bytes) while still holding the \
+shard-table write guard. The encode scales with the STORE while the round's own work is bounded, \
+so every reader and writer on this shard queues behind it. Take a stamped clone under the guard \
+and flush after it drops -- `apply_storage_eviction` is the worked example. If a new step needs \
+the shard itself rather than the snapshot, say why here rather than widening the region",
+        whole.encodes_under_guard,
+        whole.encode_bytes_under_guard,
+    );
+    assert_eq!(
+        whole.encode_bytes_under_guard, 0,
+        "no encode was counted inside the guarded region but {} bytes were, which means the two \
+tallies have come apart",
+        whole.encode_bytes_under_guard,
+    );
+
+    // THE ASSERTION THE DELTA CHECKPOINT MADE: the shipped round does not encode a served index
+    // anywhere. `an_expiry_round_persists_what_changed` is what says the thing it writes instead
+    // is proportional to the round rather than to the shard.
+    assert_eq!(
+        shipped.encodes_total, 0,
+        "the shipped expiry round encoded the served index {} time(s) ({} bytes). A round that \
+removed a handful of keys re-encoded the whole shard, which is why its cost tracked live keys \
+rather than due ones. It is supposed to append an index-log DELTA naming what it removed \
+(`ExpiryIndexCheckpoint::Delta`); the whole-index arm above is measurement scaffolding, not a \
+production path",
+        shipped.encodes_total,
+        shipped.encode_bytes_total,
+    );
+    assert_eq!(
+        shipped.encodes_under_guard, 0,
+        "no encode was counted in total but {} landed inside the guarded region, which means the \
+two tallies have come apart",
+        shipped.encodes_under_guard,
+    );
+
+    // And the sweep still did its job in the arm that ships: the keys are gone.
+    for index in 0..RECORDS {
+        let get = shipped_engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: format!("expire-{index:06}"),
+            },
+        });
+        assert!(
+            matches!(get.response, CommandResponse::Bytes { value: None }),
+            "expire-{index:06} survived a sweep that reported it removed: {:?}",
+            get.response,
+        );
+    }
+}
+
+/// A shard whose live blocks are all OUT of cache, so a warm-up has something to read.
+#[cfg(test)]
+fn cold_shard_for_warmup_measurement(dir: &std::path::Path, records: usize) -> TemporalEngine {
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.join("cache"),
+        dir.join("blocks"),
+        dir.join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..records {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("warm-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    // Without this every block is already resident and the warm-up reads NOTHING -- the arms
+    // below would both report zero reads and agree for the wrong reason.
+    let _ = engine.cache.invalidate_shard(1);
+    engine
+}
+
+#[cfg(test)]
+fn measured_cache_warmup(
+    engine: &TemporalEngine,
+) -> (crate::engine::MaintenanceBlockReadCounts, usize) {
+    crate::engine::reset_maintenance_block_read_counts();
+    let report = engine.storage_cache_warmup_report(1, Vec::<u32>::new());
+    (
+        crate::engine::maintenance_block_read_counts(),
+        report.warmed_block_refs,
+    )
+}
+
+/// The cache warm-up reads its blocks AFTER the shard-table read guard drops.
+///
+/// A read guard is the easy one to leave in place, because it admits other readers and so does
+/// not look like exclusion. It is: it excludes every WRITER on the shard for as long as it is
+/// held, and this stage held it across one block-store read and one cache insert per live block,
+/// with no per-round budget anywhere in it. The work under the guard scaled with the STORE while
+/// the round that calls it is bounded, which is the same shape #1620 found on the write side.
+///
+/// TWO arms, ONE process, the same fixture:
+///   * UNDER THE GUARD -- where the reads used to be. The positive control: the counter has to
+///     produce a non-zero number inside the region, or the zero below is a broken counter rather
+///     than a shortened hold.
+///   * SHIPPED -- the addresses are chosen under the guard, the reads happen after it drops.
+/// Both arms must warm the same blocks, which is what stops this from being satisfied by a
+/// warm-up that did nothing.
+#[test]
+fn the_cache_warmup_reads_blocks_after_the_shard_guard_drops() {
+    const RECORDS: usize = 200;
+
+    let control_dir = tempfile::tempdir().unwrap();
+    let control_engine = cold_shard_for_warmup_measurement(control_dir.path(), RECORDS);
+    control_engine.warm_cache_under_shard_guard_for_test();
+    let (control, control_warmed) = measured_cache_warmup(&control_engine);
+
+    let shipped_dir = tempfile::tempdir().unwrap();
+    let shipped_engine = cold_shard_for_warmup_measurement(shipped_dir.path(), RECORDS);
+    let (shipped, shipped_warmed) = measured_cache_warmup(&shipped_engine);
+
+    eprintln!(
+        "[cache warmup] under the guard: {} of {} page read(s) under the guard, \
+{control_warmed} page refs warmed",
+        control.block_reads_under_guard, control.block_reads_total,
+    );
+    eprintln!(
+        "[cache warmup] shipped:         {} of {} page read(s) under the guard, \
+{shipped_warmed} page refs warmed",
+        shipped.block_reads_under_guard, shipped.block_reads_total,
+    );
+
+    // DENOMINATORS FIRST. A warm-up that warmed nothing, or that found every block already
+    // cached, satisfies "no read under the guard" by never reaching a read.
+    assert!(
+        control_warmed > 0 && shipped_warmed > 0,
+        "an arm warmed no page refs ({control_warmed} / {shipped_warmed}), so the loop below the \
+guard never ran and nothing here is measuring the warm-up",
+    );
+    assert_eq!(
+        control_warmed, shipped_warmed,
+        "the arms must warm the same pages for their read counts to be comparable",
+    );
+    assert!(
+        control.block_reads_total > 0 && shipped.block_reads_total > 0,
+        "an arm read no pages off the block store at all ({} / {}), so the fixture was already \
+cached and neither arm is a subject for the claim below",
+        control.block_reads_total,
+        shipped.block_reads_total,
+    );
+    assert_eq!(
+        control.block_reads_total, shipped.block_reads_total,
+        "the arms read a different number of pages ({} vs {}), so the counts are not comparable",
+        control.block_reads_total, shipped.block_reads_total,
+    );
+
+    // POSITIVE CONTROL: the counter can see a read inside the region, because here is one.
+    assert_eq!(
+        control.block_reads_under_guard, control.block_reads_total,
+        "the control arm reads every page inside the guarded region and the counter saw {} of \
+{}. The measurement is broken, not the code under it: the assertion below would pass against an \
+engine that had stopped counting entirely",
+        control.block_reads_under_guard, control.block_reads_total,
+    );
+
+    // THE ASSERTION THE REGION CHANGE MADE.
+    assert_eq!(
+        shipped.block_reads_under_guard, 0,
+        "the cache warm-up read {} of {} pages off the block store while still holding the \
+shard-table read guard. A read guard excludes every writer, so a warm of the whole shard stops \
+all writes on it for the length of the I/O -- and the warm-up has no per-round budget, so that \
+length grows with the store. Collect the addresses under the guard, drop it, then read: \
+`collect_live_page_entries` already materializes the whole set, and nothing in the loop touches \
+the shard. If a new step genuinely needs the shard itself, say why here rather than widening the \
+region",
+        shipped.block_reads_under_guard,
+        shipped.block_reads_total,
+    );
+}
+
+/// THE OTHER HALF OF THE ANSWER: compaction's flush is still inside its guarded region, and that
+/// is deliberate.
+///
+/// This asserts the CURRENT state rather than an improvement, which is unusual and is the point.
+/// Compaction's flush is the same shape as the expiry sweep's -- encode the whole index, write two
+/// files -- so the next person to read the two side by side will see an obvious omission. It is
+/// not one. A relocation is recorded in no log: compaction does not advance
+/// `applied_wal_sequence` and emits no WAL record, so the durable index is the ONLY place the new
+/// block addresses exist. Drop the guard before writing it and `storage_lifecycle_plan` can, in
+/// that window, derive stale slabs from the volatile index -- which already excludes the slabs the
+/// round just vacated -- and reclaim them while the durable index still names them. A crash there
+/// loses data with no replay to recover it, which is exactly the failure the partial-failure
+/// handler in that function exists to prevent.
+///
+/// If this test ever fails because the encode moved out, the change is not an optimisation: read
+/// the note at the flush before deciding what to do about the red.
+#[test]
+fn the_compaction_flush_stays_inside_its_write_guard() {
+    const RECORDS: usize = 200;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("compact-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    crate::engine::reset_index_encode_counts();
+    let report = engine
+        .compact_shard_blocks_with_budgets(1, u64::MAX, usize::MAX)
+        .expect("compaction round must succeed");
+    let counts = crate::engine::index_encode_counts();
+
+    eprintln!(
+        "[compaction flush] {} encode(s) / {} bytes under the guard, {} / {} total, {} page refs \
+rewritten",
+        counts.encodes_under_guard,
+        counts.encode_bytes_under_guard,
+        counts.encodes_total,
+        counts.encode_bytes_total,
+        report.rewritten_block_refs,
+    );
+
+    // Denominator: a round that published no index says nothing about where the publish happened.
+    assert!(
+        counts.encodes_total > 0,
+        "the compaction round encoded no served index, so this measures nothing",
+    );
+    assert!(
+        counts.encodes_under_guard > 0 && counts.encode_bytes_under_guard > 0,
+        "compaction's served-index flush is no longer inside its write guard ({} encodes, {} \
+bytes). Read the note at that flush before treating this as a win: the relocations it publishes \
+are in NO log, so a concurrent storage cycle reclaiming the vacated slabs in the window this \
+opens is unrecoverable durable loss",
+        counts.encodes_under_guard,
+        counts.encode_bytes_under_guard,
+    );
+}
+
+/// What does COMPACTION's preamble walk, piece by piece? Prints.
+///
+///   cargo test --release -p temporalstore-rust --lib what_the_compaction_preamble_walks -- --ignored --nocapture
+///
+/// `compact_shard_blocks_with_budgets` takes the shard WRITE lock and then, before any budget is
+/// consulted, builds six reports. A round's WORK is bounded and resumable -- `compaction_rounds`
+/// continues a round a budget cut short -- but this preamble is not: it runs in full every time
+/// the stage runs, and every read and write on the shard queues behind it.
+///
+/// Measured here the same way `what_each_plan_call_walks` measures the lifecycle path, because
+/// the fix that worked there (#1586: one walk shared by three consumers of the same immutable
+/// `&ShardState`) is only worth attempting here if these pieces are walking the same way.
+///
+/// Each row resets the live-block counter, makes ONE call, and reports what it materialized as a
+/// multiple of the shard's live block count. All of these take `&ShardState` and mutate nothing,
+/// so they can be measured in any order under a single read lock.
+#[test]
+#[ignore]
+fn what_the_compaction_preamble_walks() {
+    const RECORDS: usize = 4_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("preamble-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let live_blocks: u64 = engine
+        .bucket_storage_summaries(1)
+        .iter()
+        .map(|summary| summary.block_ref_count as u64)
+        .sum();
+    assert!(live_blocks > 0, "fixture stored no live pages");
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 is loaded");
+
+    let mut total = 0u64;
+    let mut report = |label: &str, walked: u64| {
+        eprintln!(
+            "  [preamble] {label:<38} {walked:>8} entries = {:>5.1}x the shard",
+            walked as f64 / live_blocks as f64,
+        );
+    };
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = engine.validate_shard_block_ownership(1, shard);
+    let walked = crate::engine::live_block_scan_entries();
+    total += walked;
+    report("validate_shard_block_ownership", walked);
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = crate::engine::collect_live_block_slab_ids(shard);
+    let walked = crate::engine::live_block_scan_entries();
+    total += walked;
+    report("collect_live_block_slab_ids", walked);
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = crate::engine::compaction::compaction_utility_report(&engine.block_store, shard);
+    let walked = crate::engine::live_block_scan_entries();
+    total += walked;
+    report("compaction_utility_report", walked);
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = crate::engine::storage_reporting::storage_object_lifecycle_report(1, shard);
+    let walked = crate::engine::live_block_scan_entries();
+    total += walked;
+    report("storage_object_lifecycle_report", walked);
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = crate::engine::compaction::compaction_model_layout_reports(&engine.block_store, shard);
+    let walked = crate::engine::live_block_scan_entries();
+    total += walked;
+    report("compaction_model_layout_reports", walked);
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = crate::engine::storage_reporting::object_manager_runtime_report(1, shard, 0, u32::MAX);
+    let walked = crate::engine::live_block_scan_entries();
+    total += walked;
+    report("object_manager_runtime_report", walked);
+
+    // Split that 2.0x between its two callees rather than inferring which one walks. It calls
+    // exactly these two, and `object_manager::runtime_report` iterates `bucket_index.bucket_map`
+    // directly rather than the live-block set -- so it SHOULD contribute nothing here, and if it
+    // does the assumption is wrong. These two rows are not added to the total above; they are a
+    // breakdown OF it.
+    crate::engine::reset_live_block_scan_entries();
+    let _ = crate::engine::storage_reporting::bucket_object_block_ownership_report(
+        1, shard, 0, u32::MAX,
+    );
+    report(
+        "  of which: bucket_object_page_ownership",
+        crate::engine::live_block_scan_entries(),
+    );
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = crate::engine::object_manager::runtime_report(shard);
+    report(
+        "  of which: object_manager::runtime_report",
+        crate::engine::live_block_scan_entries(),
+    );
+
+    eprintln!(
+        "  [preamble] {:<38} {total:>8} entries = {:>5.1}x the shard ({live_blocks} live pages)",
+        "SUM OF STANDALONE CALLS",
+        total as f64 / live_blocks as f64,
+    );
+    assert!(total > 0, "the preamble walked nothing; this attributes nothing");
+
+    // THE NUMBER A HOIST ACTUALLY MOVES.
+    //
+    // The rows above call each report on its own, and each one walks for itself by design -- the
+    // `_from_entries` refactors keep a standalone wrapper precisely so callers with nothing to
+    // share are unaffected. So those rows do NOT change when the preamble starts sharing a walk,
+    // and reading them for that would show a fix doing nothing.
+    //
+    // What changes is the real call, where the sharing happens. Measured last because it takes the
+    // shard WRITE lock and mutates.
+    drop(shards);
+    crate::engine::reset_live_block_scan_entries();
+    let compaction = engine.compact_shard_blocks_with_budgets(1, u64::MAX, usize::MAX);
+    let walked = crate::engine::live_block_scan_entries();
+    assert!(compaction.is_ok(), "compaction failed: {compaction:?}");
+    eprintln!(
+        "  [preamble] {:<38} {walked:>8} entries = {:>5.1}x the shard   <- the real one",
+        "compact_shard_blocks_with_budgets",
+        walked as f64 / live_blocks as f64,
+    );
+    assert!(
+        walked > 0,
+        "the compaction round walked nothing, so this measured nothing",
+    );
+}
+
+/// What does ONE write cost in durability barriers, and where do they land? Prints.
+///
+///   cargo test --release -p temporalstore-rust --lib what_a_write_costs_in_barriers -- --ignored --nocapture
+///
+/// "COMMAND BATCHING" IS THE WRONG AXIS FOR THIS LOG, and an earlier note used it anyway.
+///
+/// A record here states its RESULTS, not the operation that produced them: `outcomes` carry an
+/// address and, where no block backs the state, the bytes themselves, plus a `meta` flag. The
+/// `command` field is an `Option` and is ABSENT by default -- `TS_WAL_DATA_ONLY` is on -- so
+/// "batch N commands into one record" describes a log this is not.
+///
+/// What is worth separating is these two, because only one of them is a sync question:
+///
+///   * GROUP COMMIT -- many appends, one fsync. `engine_wal_group_commit` implements it: a waiter
+///     whose `durable_seq` already covers its required sequence returns without syncing, so
+///     concurrent writers share one barrier.
+///   * RECORD AGGREGATION -- many writes' results in ONE record, and therefore one barrier. That
+///     is a record-shape question. The design being followed aggregates its log items this way,
+///     which is where the earlier note's framing came from.
+///
+/// Group commit only helps when writers OVERLAP. A single-threaded writer waits for nobody, so it
+/// cannot share a barrier with anyone, and the per-write cost is whatever one write takes on its
+/// own. That is the case this measures, because it is the one the ingest path actually runs.
+///
+/// `durability_metrics` counts barriers BY SITE, so this says which sync is paid rather than just
+/// how many. Read the per-write column: a value near 1.0 for a site means every single write pays
+/// that barrier.
+#[test]
+#[ignore]
+fn what_a_write_costs_in_barriers() {
+    for records in [500usize, 2_000] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            16 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+
+        // Reset AFTER load_shard: opening the store takes barriers of its own, and counting those
+        // against the writes would overstate the per-write cost on the smaller fixture.
+        crate::durability_metrics::reset();
+        let started = std::time::Instant::now();
+        for index in 0..records {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("barrier-{index:06}"),
+                    value: vec![b'v'; 64],
+                },
+            });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+        let elapsed_ms = started.elapsed().as_micros() as f64 / 1000.0;
+        let counts = crate::durability_metrics::snapshot();
+        let total: u64 = counts.values().copied().sum();
+
+        // Denominator: a run that took no barriers at all would make every ratio below zero and
+        // say nothing about what a write costs.
+        assert!(
+            total > 0,
+            "no durability barriers were recorded, so this measures nothing",
+        );
+
+        eprintln!(
+            "  [barriers] {records:>5} writes in {elapsed_ms:>8.1} ms -> {total:>6} barriers = \
+{:>5.2} per write",
+            total as f64 / records as f64,
+        );
+        for (site, count) in counts {
+            eprintln!(
+                "  [barriers]          {site:<38} {count:>6} = {:>5.2} per write",
+                count as f64 / records as f64,
+            );
+        }
+    }
+}
+
+/// A bucket written to AFTER the dump captured it must stay dirty.
+///
+/// `clear_dumped_bucket_dirty_state` compares each bucket's CURRENT derived generation against the
+/// one the manifest captured, and skips clearing any bucket whose generation moved. That fresh
+/// read is the whole safety property: a bucket dirtied between the dump and the clear still holds
+/// undumped writes, so it must remain dirty for the next dump.
+///
+/// It is also the kind of walk that looks redundant. `who_walks_the_shard` shows
+/// `bucket_storage_summaries` entered three times in one `apply_storage_lifecycle`, and sharing one
+/// snapshot across them would make `captured` and `current` equal BY CONSTRUCTION -- the comparison
+/// would always pass, the bucket would be cleared, and its writes would never be dumped. Reclaim
+/// could then advance past records still needed: silent loss, found on a later restart.
+///
+/// This pins it. The write lands between the manifest and the clear, which is exactly the window
+/// a shared snapshot would erase.
+#[test]
+fn a_bucket_written_after_the_dump_stays_dirty() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..64 {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("dumped-{index:04}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let manifest = engine
+        .create_bucket_dump_manifest(1, Vec::new())
+        .expect("manifest should be created");
+    // Denominator: a manifest naming no buckets would make the clear a no-op and the assertion
+    // below vacuous.
+    assert!(
+        !manifest.bucket_ids.is_empty(),
+        "the dump captured no buckets, so this measures nothing",
+    );
+
+    // THE WINDOW. This write lands after the dump captured its bucket and before the clear runs.
+    let late = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "dumped-0000".to_string(),
+            value: vec![b'w'; 96],
+        },
+    });
+    assert!(late.status.ok, "late write: {:?}", late.status);
+
+    let late_bucket = engine
+        .bucket_storage_summaries(1)
+        .into_iter()
+        .find(|summary| summary.dirty_object_count > 0)
+        .map(|summary| summary.routing_bucket);
+    assert!(
+        late_bucket.is_some(),
+        "the late write left no dirty bucket, so the clear below has nothing to get wrong",
+    );
+
+    engine.clear_dumped_bucket_dirty_state(1, &manifest);
+
+    let still_dirty = engine
+        .bucket_storage_summaries(1)
+        .into_iter()
+        .any(|summary| summary.dirty_object_count > 0);
+    assert!(
+        still_dirty,
+        "every bucket was cleared, including one written to AFTER the dump captured it. That \
+bucket's writes are now in no manifest and it will never be dumped, so reclaim may advance past \
+records that are still needed. The freshness of the `current` read in \
+`clear_dumped_bucket_dirty_state` is what prevents this -- it must not be fed a snapshot taken \
+before the dump.",
+    );
+}
+
+/// A RATCHET on how many times one call may walk the shard's live blocks.
+///
+/// The rule this enforces: within one call, a given consumer group scans the live-block set ONCE.
+/// Where a group already shares a walk, adding a consumer must reuse the slice rather than add a
+/// scan; where a walk is irreducible, this test records WHY so the number is not filed down by
+/// someone who has not read the reason.
+///
+/// `apply_storage_lifecycle` on a shard WITH WORK TO DO is the worst case in the engine and sits
+/// at SEVEN:
+///
+///   3  bucket_storage_summaries          IRREDUCIBLE ON A ROUND WITH WORK, and this fixture is
+///                                        one: it writes 1,000 records and every slot is dirty.
+///                                        The plan's, the manifest's, and the dirty-state clear's.
+///                                        #1607 proves the third must stay FRESH -- it compares
+///                                        current generations against what the manifest captured,
+///                                        so a shared snapshot makes both sides equal by
+///                                        construction, clears a bucket holding undumped writes,
+///                                        and reclaim may then advance past records still needed.
+///                                        Sharing the other two is SAFE but a bad trade: the
+///                                        manifest would record generations older than the index
+///                                        it embeds, so the bucket is re-dumped next round -- a
+///                                        whole-shard dump to save one walk.
+///
+///                                        A FOURTH reason kept the PLAN's walk alive and was not
+///                                        written here until now: `StorageLifecyclePlan`
+///                                        .bucket_summaries is an OUTPUT field, so the plan walked
+///                                        the shard to populate a report even when it needed
+///                                        nothing from it. That reason is now spent. The walk is
+///                                        CONDITIONAL on the dirty index being non-empty, the
+///                                        field is an `Option` so a round that skipped it is
+///                                        distinguishable from one that found nothing, and an
+///                                        IDLE round takes none of these three.
+///
+///                                        So SEVEN is the worst case, not the only case. An idle
+///                                        round is THREE, pinned separately by
+///                                        `an_idle_round_does_not_walk_the_live_blocks_to_populate_a_report`
+///                                        at 8,000 and 80,000 records. Do not raise this number to
+///                                        cover an idle regression -- that test is where an idle
+///                                        round is measured, and it asserts the dirty half at
+///                                        SEVEN too, so the two cannot drift apart silently.
+///   1  storage_object_lifecycle_snapshot ALREADY SHARED by three consumers (#1586).
+///   1  the four sampling snapshots       ALREADY SHARED by four consumers (#1609).
+///   1  the dump's lifecycle report       IRREDUCIBLE. It walks the DECODED MANIFEST INDEX
+///                                        (`&dump_index_state`), not the live shard -- different
+///                                        data, so it cannot share a live-shard walk.
+///
+/// THE SEVENTH IS GONE, AND IT WAS THE ONE NAMED AS THE REMAINING CANDIDATE:
+/// `collect_live_block_addresses` via `storage_reclaim_slab_reports`. That function builds the
+/// per-slab live/stale tally the reclaim planner reads, and it read `live_page_refs` and
+/// `live_physical_bytes` by materializing every live block in the shard. Both are now maintained on
+/// the index's own mutation path and read in O(slabs). The walk is not shared, deferred or
+/// sampled -- it is not performed. See `the_maintained_slab_live_tally_matches_the_walk` for the
+/// drift check that holds the maintained figure to the walk it replaced.
+///
+/// If this fails HIGH, a new walk was added: give it the existing slice. If it fails LOW, a walk
+/// was removed -- lower the constant and say which one, in the commit.
+#[test]
+fn one_call_walks_the_live_blocks_a_known_number_of_times() {
+    const RECORDS: usize = 1_000;
+    const EXPECTED_MULTIPLE: u64 = 6;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("ratchet-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let live_blocks: u64 = engine
+        .bucket_storage_summaries(1)
+        .iter()
+        .map(|summary| summary.block_ref_count as u64)
+        .sum();
+    // Denominator: with no live blocks every walk materializes nothing and any multiple holds.
+    assert!(live_blocks > 0, "fixture stored no live pages, so this measures nothing");
+
+    crate::engine::reset_live_block_scan_entries();
+    crate::engine::reset_live_block_scan_sites();
+    let _ = engine.apply_storage_lifecycle(crate::engine::reports::StorageLifecycleRequest {
+        shard_id: 1,
+        purge_delayed_destroy: true,
+        prune_bucket_dump_manifests: true,
+        roll_forward_bucket_dump_installs: true,
+        ..crate::engine::reports::StorageLifecycleRequest::default()
+    });
+    let walked = crate::engine::live_block_scan_entries();
+    let sites = crate::engine::live_block_scan_sites_snapshot();
+
+    let multiple = walked / live_blocks.max(1);
+    if multiple != EXPECTED_MULTIPLE {
+        let mut rows: Vec<(&String, &u64)> = sites.iter().collect();
+        rows.sort_by(|left, right| right.1.cmp(left.1));
+        let breakdown = rows
+            .iter()
+            .map(|(site, entries)| {
+                format!("\n    {:>5.1}x  {site}", **entries as f64 / live_blocks as f64)
+            })
+            .collect::<String>();
+        panic!(
+            "one `apply_storage_lifecycle` walked the live pages {multiple}x, expected \
+{EXPECTED_MULTIPLE}x ({walked} entries for {live_blocks} live pages). Per site:{breakdown}\n  Higher means a new walk was added -- pass it the slice the call already has. Lower means one was \
+removed -- lower EXPECTED_MULTIPLE and name it in the commit. Three of the seven are irreducible \
+and the doc above says why; do not file the constant down without reading it."
+        );
+    }
+}
+
+/// WHO walks the shard, by source location. Prints.
+///
+///   cargo test --release -p temporalstore-rust --lib who_walks_the_shard -- --ignored --nocapture
+///
+/// `what_each_plan_call_walks` measures `apply_storage_lifecycle` at 10.0x the shard while every
+/// one of its callees sums to 6.0x. Four walks are inside the body, and no probe row can reach
+/// them -- each row can only call a function from outside, which is exactly what the missing four
+/// are not.
+///
+/// `collect_live_block_entries` is `#[track_caller]`, so it records the source location that asked.
+/// This prints that tally for one call, which names the four directly instead of inferring them.
+///
+/// Read it as "file:line -> entries materialized". A line appearing with N times the shard's live
+/// block count was entered N times.
+#[test]
+#[ignore]
+fn who_walks_the_shard() {
+    const RECORDS: usize = 4_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("whowalks-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    let live_blocks: u64 = engine
+        .bucket_storage_summaries(1)
+        .iter()
+        .map(|summary| summary.block_ref_count as u64)
+        .sum();
+    assert!(live_blocks > 0, "fixture stored no live pages");
+
+    crate::engine::reset_live_block_scan_entries();
+    crate::engine::reset_live_block_scan_sites();
+    let _ = engine.apply_storage_lifecycle(crate::engine::reports::StorageLifecycleRequest {
+        shard_id: 1,
+        purge_delayed_destroy: true,
+        prune_bucket_dump_manifests: true,
+        roll_forward_bucket_dump_installs: true,
+        ..crate::engine::reports::StorageLifecycleRequest::default()
+    });
+    let total = crate::engine::live_block_scan_entries();
+    let sites = crate::engine::live_block_scan_sites_snapshot();
+
+    assert!(total > 0, "apply_storage_lifecycle walked nothing; this attributes nothing");
+    assert!(
+        !sites.is_empty(),
+        "the per-site tally is empty while the total is {total}; the tracking is not wired",
+    );
+
+    eprintln!(
+        "  [who] apply_storage_lifecycle -> {total} entries = {:>4.1}x the shard ({live_blocks} live pages)",
+        total as f64 / live_blocks as f64,
+    );
+    let mut rows: Vec<(&String, &u64)> = sites.iter().collect();
+    rows.sort_by(|left, right| right.1.cmp(left.1));
+    for (site, entries) in rows {
+        eprintln!(
+            "  [who]   {:>5.1}x  {entries:>8}  {site}",
+            *entries as f64 / live_blocks as f64,
+        );
+    }
+
+    // The tally must ACCOUNT for the total, or it is attributing something else.
+    let summed: u64 = sites.values().copied().sum();
+    assert_eq!(
+        summed, total,
+        "per-site entries {summed} do not sum to the total {total}",
+    );
+}
+
+/// What does each individual plan call WALK? Prints.
+///
+///   cargo test --release -p temporalstore-rust --lib what_each_plan_call_walks -- --ignored --nocapture
+///
+/// `which_stages_walk_every_live_block` attributes a round's 35x live-block walk to two stages --
+/// `reclaim_index` 18x and `reclaim_wal` 16x -- but not to the CALLS inside them. An earlier
+/// attempt to explain reclaim_wal's 16x as per-manifest fingerprinting was arithmetic on an
+/// assumed manifest count, and measurement refuted it: making that fingerprinting lazy left the
+/// stage figure completely unchanged, because the fixture holds almost no manifests.
+///
+/// So this measures the pieces directly rather than inferring them. Each entry resets the
+/// live-block counter, makes ONE call, and reports what that call materialized, as a multiple of
+/// the shard's live block count.
+///
+/// Read-only calls come first. `create_bucket_dump_manifest` and `apply_storage_lifecycle`
+/// MUTATE (they dump, write manifests and clear dirty state), so they are measured last and in
+/// that order -- re-running this probe's earlier rows after them would measure a different shard.
+#[test]
+#[ignore]
+fn what_each_plan_call_walks() {
+    const RECORDS: usize = 4_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("percall-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let live_blocks: u64 = engine
+        .bucket_storage_summaries(1)
+        .iter()
+        .map(|summary| summary.block_ref_count as u64)
+        .sum();
+    assert!(live_blocks > 0, "fixture stored no live pages");
+
+    let lifecycle_request = || crate::engine::reports::StorageLifecycleRequest {
+        shard_id: 1,
+        purge_delayed_destroy: true,
+        prune_bucket_dump_manifests: true,
+        roll_forward_bucket_dump_installs: true,
+        ..crate::engine::reports::StorageLifecycleRequest::default()
+    };
+
+    let mut report = |label: &str, walked: u64| {
+        eprintln!(
+            "  [per-call] {label:<34} {walked:>8} entries = {:>5.1}x the shard",
+            walked as f64 / live_blocks as f64,
+        );
+    };
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = engine.bucket_storage_summaries(1);
+    report("bucket_storage_summaries", crate::engine::live_block_scan_entries());
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = engine.storage_wal_reclaim_plan(1, Vec::new(), Vec::new());
+    report("storage_wal_reclaim_plan", crate::engine::live_block_scan_entries());
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = engine.storage_lifecycle_plan(lifecycle_request());
+    report("storage_lifecycle_plan", crate::engine::live_block_scan_entries());
+
+    // Split that 2.0x across the three calls it makes. `bucket_storage_summaries` is measured
+    // above at 1.0x, so ONE of the other two carries the second walk -- and neither is an obvious
+    // candidate: `live_block_slab_ids` walks the model maps (which this counter cannot see) and
+    // `storage_reclaim_slab_reports` is documented as a header walk of the block store. Measured
+    // rather than reasoned about, because reasoning about this counter has been wrong before:
+    // `object_manager_runtime_report`'s second walk turned out to be a bare expression at the end
+    // of the function that every grep had missed.
+    //
+    // These rows are a breakdown OF the row above, not additions to the total.
+    crate::engine::reset_live_block_scan_entries();
+    let _ = engine.live_block_slab_ids(1);
+    report("  of which: live_block_slab_ids", crate::engine::live_block_scan_entries());
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = engine.storage_reclaim_slab_reports(1);
+    report(
+        "  of which: storage_reclaim_slab_reports",
+        crate::engine::live_block_scan_entries(),
+    );
+
+    // The unconditional pieces of `apply_storage_lifecycle`. None of them is gated by a request
+    // flag -- `what_apply_storage_lifecycle_walks` subtracts every flag and moves nothing -- so
+    // they have to be measured directly rather than by toggling the request.
+    crate::engine::reset_live_block_scan_entries();
+    let _ = engine.storage_object_lifecycle_snapshot(1);
+    report("storage_object_lifecycle_snapshot", crate::engine::live_block_scan_entries());
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = engine.bucket_dump_manifest_prune_plan_with_follower_cursors(1, Vec::new());
+    report("bucket_dump_manifest_prune_plan", crate::engine::live_block_scan_entries());
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = engine.bucket_dump_install_roll_forward_reports(1);
+    report("bucket_dump_install_roll_forward_reports", crate::engine::live_block_scan_entries());
+
+    crate::engine::reset_live_block_scan_entries();
+    let _ = engine.storage_cache_warmup_report(1, Vec::new());
+    report("storage_cache_warmup_report", crate::engine::live_block_scan_entries());
+
+    // The rest of `apply_storage_lifecycle`'s callees. After #1586 it is 10.0x and the pieces
+    // measured above account for roughly six of that, so about four are still unnamed. Every
+    // previous hoist in this chain was found by closing exactly this kind of gap between a
+    // parent's total and the sum of its children.
+    crate::engine::reset_live_block_scan_entries();
+    let _ = engine.bucket_dump_manifest_prune_plan_with_follower_cursors(1, Vec::new());
+    report("manifest_prune_plan (again, post-fix)", crate::engine::live_block_scan_entries());
+
+    // MUTATING from here.
+    crate::engine::reset_live_block_scan_entries();
+    let _ = engine.roll_forward_bucket_dump_installs(1);
+    report("roll_forward_bucket_dump_installs (mutates)", crate::engine::live_block_scan_entries());
+
+    // EVERY MUTATING CALL GETS ITS OWN SHARD.
+    //
+    // These were measured in sequence against the one engine above, and that silently changed the
+    // answer: `create_bucket_dump_manifest` and `clear_dumped_bucket_dirty_state` clear the dirty
+    // buckets, so the `apply_storage_lifecycle` row that followed them skipped the dump it would
+    // otherwise do and read 7.0x instead of 10.0x. The number moved because of the probe, not
+    // because of the code.
+    //
+    // A fresh fixture per mutating call is the only way these rows mean what they say. It costs a
+    // rebuild each, which is why the read-only rows above still share one engine -- they cannot
+    // disturb each other.
+    let mutating_walk = |label: &str, run: &dyn Fn(&TemporalEngine)| {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            16 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        for index in 0..RECORDS {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("percall-{index:06}"),
+                    value: vec![b'v'; 64],
+                },
+            });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+        let blocks: u64 = engine
+            .bucket_storage_summaries(1)
+            .iter()
+            .map(|summary| summary.block_ref_count as u64)
+            .sum();
+        crate::engine::reset_live_block_scan_entries();
+        run(&engine);
+        let walked = crate::engine::live_block_scan_entries();
+        eprintln!(
+            "  [per-call] {label:<40} {walked:>8} entries = {:>5.1}x the shard",
+            walked as f64 / blocks.max(1) as f64,
+        );
+    };
+
+    mutating_walk("create_bucket_dump_manifest", &|engine| {
+        let _ = engine.create_bucket_dump_manifest(1, Vec::new());
+    });
+    mutating_walk("purge_delayed_destroy_slabs", &|engine| {
+        let _ = engine.block_store.purge_delayed_destroy_slabs_with_report();
+    });
+    mutating_walk("clear_dumped_bucket_dirty_state", &|engine| {
+        if let Ok(manifest) = engine.create_bucket_dump_manifest(1, Vec::new()) {
+            // The manifest creation itself walks, so reset again and time only the clear.
+            crate::engine::reset_live_block_scan_entries();
+            engine.clear_dumped_bucket_dirty_state(1, &manifest);
+        } else {
+            eprintln!("  [per-call] (no manifest created; the row below measures nothing)");
+        }
+    });
+    mutating_walk("apply_bucket_dump_manifest_prune", &|engine| {
+        let _ = engine.apply_bucket_dump_manifest_prune_with_follower_cursors(1, Vec::new());
+    });
+    mutating_walk("apply_storage_lifecycle", &|engine| {
+        let _ = engine.apply_storage_lifecycle(crate::engine::reports::StorageLifecycleRequest {
+            shard_id: 1,
+            purge_delayed_destroy: true,
+            prune_bucket_dump_manifests: true,
+            roll_forward_bucket_dump_installs: true,
+            ..crate::engine::reports::StorageLifecycleRequest::default()
+        });
+    });
+
+    eprintln!("  [per-call] shard holds {live_blocks} live pages");
+}
+
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_a_bounded_bucket_range_saves -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_a_bounded_bucket_range_saves() {
+    const RECORDS: usize = 40_000;
+
+    let run = |end_routing_bucket: u32| -> (usize, usize, usize, usize, u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = crate::alloc_probe::Probe::start();
+        let engine = TemporalEngine::with_local_dirs(
+            16 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        let load = engine.load_shard_with(crate::control::LoadShardRequest {
+            shard_id: 1,
+            load_version: 0,
+            local_node_id: Some(1),
+            shard_uri: "local://shard/1".to_string(),
+            start_routing_bucket: 0,
+            end_routing_bucket,
+            readonly: false,
+            table_name: String::new(),
+        });
+        assert!(load.status.ok, "load: {:?}", load.status);
+        for index in 0..RECORDS {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("slot-{index:08}"),
+                    value: vec![b'v'; 512],
+                },
+            });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+        let counts = probe.stop();
+        let live = counts.alloc_bytes.saturating_sub(counts.free_bytes);
+
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("loaded shard");
+        let buckets = &shard.bucket_index.bucket_map;
+        let objects: usize = buckets.values().map(|b| b.object_index.object_count()).sum();
+        let blocks: usize = buckets.values().map(|b| b.block_index.len()).sum();
+        (buckets.len(), shard.bucket_recency.len(), objects, blocks, live)
+    };
+
+    let (wide_buckets, wide_recency, wide_objects, wide_blocks, wide_live) = run(u32::MAX);
+    let (narrow_buckets, narrow_recency, narrow_objects, narrow_blocks, narrow_live) = run(1023);
+
+    let per = |v: u64| v as f64 / RECORDS as f64;
+    println!();
+    println!("  {RECORDS} records, same corpus, two slot ranges");
+    println!("  structure            0..u32::MAX      0..1023");
+    println!("  slot map          {wide_buckets:>13} {narrow_buckets:>12}");
+    println!("  slot recency      {wide_recency:>13} {narrow_recency:>12}");
+    println!("  object index      {wide_objects:>13} {narrow_objects:>12}");
+    println!("  page index        {wide_blocks:>13} {narrow_blocks:>12}");
+    println!();
+    println!("  live memory       {:>11.0} B {:>10.0} B  per record",
+             per(wide_live), per(narrow_live));
+    println!("  bounding the range saves {:>6.0} B/record  ({:+.1}%)",
+             per(wide_live) - per(narrow_live),
+             100.0 * (per(wide_live) - per(narrow_live)) / per(wide_live));
+    println!();
+    println!("  The object and page indexes still hold one entry per record either way -- an");
+    println!("  object has to be findable. What collapses is the PER-SLOT overhead: one slot");
+    println!("  node per record becomes one per 1024 records, and slot recency with it.");
+
+    assert!(narrow_buckets <= 1024, "a bounded range must not exceed its slot count");
+    assert_eq!(wide_objects, RECORDS, "every record should be indexed either way");
+    assert_eq!(narrow_objects, RECORDS, "every record should be indexed either way");
+}
+
+/// Does a bounded slot range make writes CHEAPER, or only smaller?
+///
+/// Bounding a one-box shard's routing-slot range saves 244 B/record of live memory
+/// (`what_a_bounded_bucket_range_saves`) by collapsing four per-record homes into two. Whether it
+/// also makes a write faster is a separate question: fewer live entries does not by itself mean
+/// less work per write, and the two arms could allocate identically and just retain differently.
+///
+/// Counted rather than timed, because a count says the same thing on a loaded machine and this
+/// box swings by 5-30% run to run.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib does_a_bounded_bucket_range_make_writes_cheaper -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn does_a_bounded_bucket_range_make_writes_cheaper() {
+    const RECORDS: u64 = 40_000;
+
+    // Interleaved would be better still, but these two arms cannot share a process without
+    // sharing an engine, so they run in sequence with the SAME corpus and the same key shape.
+    let arm = |end_routing_bucket: u32| -> (f64, f64, f64) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            16 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        let load = engine.load_shard_with(crate::control::LoadShardRequest {
+            shard_id: 1,
+            load_version: 0,
+            local_node_id: Some(1),
+            shard_uri: "local://shard/1".to_string(),
+            start_routing_bucket: 0,
+            end_routing_bucket,
+            readonly: false,
+            table_name: String::new(),
+        });
+        assert!(load.status.ok, "load: {:?}", load.status);
+
+        // Measure the STEADY state: the first writes build fixed structure, so counting from
+        // empty would charge one arm for setup the other also pays.
+        for index in 0..RECORDS / 4 {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("warm-{index:08}"),
+                    value: vec![b'v'; 512],
+                },
+            });
+            assert!(response.status.ok, "warm {index}: {:?}", response.status);
+        }
+        let probe = crate::alloc_probe::Probe::start();
+        for index in 0..RECORDS {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("cost-{index:08}"),
+                    value: vec![b'v'; 512],
+                },
+            });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+        let counts = probe.stop();
+        let n = RECORDS as f64;
+        (
+            counts.allocs as f64 / n,
+            counts.alloc_bytes as f64 / n,
+            counts.alloc_bytes.saturating_sub(counts.free_bytes) as f64 / n,
+        )
+    };
+
+    let (wide_ops, wide_bytes, wide_live) = arm(u32::MAX);
+    let (narrow_ops, narrow_bytes, narrow_live) = arm(1023);
+
+    println!();
+    println!("  steady-state cost of one write, {RECORDS} writes after a warm-up");
+    println!("  slot range        allocations   allocated B   live B");
+    println!("  0..u32::MAX      {wide_ops:>12.1} {wide_bytes:>13.0} {wide_live:>8.0}");
+    println!("  0..1023          {narrow_ops:>12.1} {narrow_bytes:>13.0} {narrow_live:>8.0}");
+    println!();
+    println!("  bounding the range changes a write by {:+.1} allocations ({:+.1}%)",
+             narrow_ops - wide_ops, 100.0 * (narrow_ops - wide_ops) / wide_ops);
+    println!("  and {:+.0} allocated bytes ({:+.1}%)",
+             narrow_bytes - wide_bytes, 100.0 * (narrow_bytes - wide_bytes) / wide_bytes);
+    println!();
+    if narrow_ops < wide_ops * 0.97 {
+        println!("  So it is a LATENCY win as well as a footprint one: the per-slot work a write");
+        println!("  does is real work, not just retained bytes.");
+    } else if narrow_ops > wide_ops * 1.03 {
+        println!("  Writes cost MORE with a bounded range -- slots now hold many objects each, so");
+        println!("  the per-slot structures a write touches are bigger. That is a real trade and");
+        println!("  the footprint saving is not free.");
+    } else {
+        println!("  Writes cost the SAME. The saving is purely retained memory, so it raises the");
+        println!("  ceiling without moving latency either way -- worth taking, but do not expect");
+        println!("  it to show up in a latency chart.");
+    }
+
+    assert!(wide_ops > 0.0 && narrow_ops > 0.0, "measured nothing");
+}
+
+/// What each of the seven homes actually costs, by freeing them one at a time.
+///
+/// A record is kept in seven places (`where_a_record_is_kept_everywhere`) and the shard holds 963
+/// B/record in total (`what_dropping_the_shard_gives_back`), but a count says nothing about which
+/// home is expensive -- a structure holding one small entry per record and one holding a fat entry
+/// per record look identical when counted.
+///
+/// So free them one at a time and watch what the allocator takes back. Order matters and is fixed
+/// here: dropping a structure that owns its keys frees those keys, so whichever runs first is
+/// credited with them. That is called out per row rather than hidden.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_each_home_costs -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_each_home_costs() {
+    const RECORDS: u64 = 60_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("home-{index:08}"),
+                value: vec![b'v'; 512],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let mut shards = engine.shards.write().expect("engine lock poisoned");
+    let shard = shards.get_mut(&1).expect("loaded shard");
+
+    // Captures nothing, so it does not fight the closures below for the shard borrow.
+    let freed_by = |f: &mut dyn FnMut()| -> f64 {
+        let probe = crate::alloc_probe::Probe::start();
+        f();
+        let counts = probe.stop();
+        counts.free_bytes.saturating_sub(counts.alloc_bytes) as f64 / RECORDS as f64
+    };
+
+    // Least entangled first: these own nothing the others need.
+    let mut freed_rows: Vec<(&str, f64)> = Vec::new();
+    let per = freed_by(&mut || shard.bucket_recency.clear());
+    freed_rows.push(("bucket_recency", per));
+    let per = freed_by(&mut || shard.dirty_objects.clear());
+    freed_rows.push(("dirty_objects", per));
+    let per = freed_by(&mut || shard.bucket_index.object_block_lookup.clear());
+    freed_rows.push(("bucket_index.object_page_lookup", per));
+    let per = freed_by(&mut || {
+        for bucket in shard.bucket_index.bucket_map.values_mut() {
+            bucket.object_index.clear();
+        }
+    });
+    freed_rows.push(("bucket_map .object_index", per));
+    let per = freed_by(&mut || shard.bucket_index.bucket_map.clear());
+    freed_rows.push(("bucket_map (the rest)", per));
+    let per = freed_by(&mut || shard.strings_mut().clear());
+    freed_rows.push(("strings", per));
+
+    println!();
+    println!("  {RECORDS} records, each home freed in turn");
+    println!("  home                              freed B/record");
+    let mut total = 0.0;
+    for (label, per) in &freed_rows {
+        total += per;
+        println!("  {label:34} {per:>10.0}");
+    }
+    println!("  ----------------------------------------------");
+    println!("  {:34} {total:>10.0}", "accounted for");
+    println!("  {:34} {:>10}", "the shard holds (measured separately)", 963);
+    println!();
+    println!("  Two things keep the rows below the total, and neither is an error:");
+    println!("   - `clear()` drops entries but KEEPS the table, by design, so a row is credited");
+    println!("     with its entries and not with its capacity. The shortfall above is mostly");
+    println!("     retained tables.");
+    println!("   - a row reading 0 can be correct rather than broken: a HashMap<u32, u64> has no");
+    println!("     per-entry heap at all, and ObjectIndex is inline while a slot holds one object.");
+    println!();
+    println!("  Order is fixed and matters: a structure that owns its keys frees them, so an");
+    println!("  earlier row is credited with anything a later row merely borrowed. The page index");
+    println!("  is not freed separately because it goes with the slot map it lives in -- which is");
+    println!("  why the slot map is the largest row and why bounding the slot range only recovers");
+    println!("  the per-slot part of it, not the per-object part.");
+
+    assert!(total > 0.0, "measured nothing");
+}
+
+// `would_an_inline_component_pay` WAS HERE, AND THE QUESTION IT HELD OPEN IS ANSWERED.
+//
+// It asked whether specialising `ObjectBlockRefs::by_component` for the one-component case would
+// pay -- an inline `One`/`Many` enum in place of the outer `Vec`, mirroring what `BlockRefs`
+// already did for the inner list. It was deliberately left undone pending a measurement, because
+// inline was 56 bytes against a `Vec` header's 24 and the byte comparison alone was a wash, so it
+// measured both halves: how many components an object really has, and what the two shapes cost in
+// allocations as well as bytes.
+//
+// IT WAS DONE, AND THEN SUPERSEDED BY A STRONGER RESULT. The specialisation shipped --
+// `ComponentList` was exactly that enum -- and it is now deleted along with `ComponentBlocks` and
+// `ObjectBlockRefs`, because the thing the list was holding was a caller-supplied element name and
+// there is no longer a name to hold. An object maps straight to its `BlockRefs`. Removing the
+// level beats inlining it, so there is no comparison left to run.
+//
+// ITS MOTIVATION IS WHAT PAID OFF AND IS KEPT ON THE RECORD: the object block lookup cost
+// 238 B/record (`what_each_home_costs`), second only to the slot map, and unlike the slot map it
+// did not shrink when the slot range was bounded because it is keyed per object either way. That
+// per-object cost is now 24 bytes of `BlockRefs` where it was 40 of `ObjectBlockRefs` over 40 of
+// `ComponentList` over 40 of `ComponentBlocks`.
+//
+// It would not have reported any of this itself. Its sole assertion was `objects > 0` after 20,000
+// writes whose responses were already checked one by one, so it could not fail; and it carried
+// both `#[ignore]` and `#[cfg(feature = "alloc-probe")]`, so the ordinary gate never ran it.
+
+/// What one write actually spends, split into the part that copies the payload and the part that
+/// does not.
+///
+/// A write allocates ~40.7 kB and frees 97% of it to store a 512-byte value
+/// (`does_a_bounded_bucket_range_make_writes_cheaper`), an eighty-fold amplification, and that churn
+/// is the write path's latency rather than anything retained. Whether to attack the copying or the
+/// bookkeeping depends on which one it is, and a single value size cannot tell them apart.
+///
+/// So measure across value sizes and take the slope and the intercept: the slope is what each
+/// payload byte costs to move, the intercept is what a write costs before it has moved any.
+///
+/// Counted rather than timed -- this box swings 5-30% run to run and a count says the same thing
+/// under load.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_one_write_spends -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_one_write_spends() {
+    const WRITES: u64 = 8_000;
+    const WARM: u64 = 2_000;
+    const SIZES: [usize; 9] = [64, 128, 192, 256, 384, 512, 1024, 4096, 16384];
+
+    let arm = |payload: usize| -> (f64, f64) {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            16 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        // Warm first: the opening writes build fixed structure every arm would otherwise be
+        // charged for, and it is the steady-state write being measured.
+        for index in 0..WARM {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("warm-{index:08}"),
+                    value: vec![b'v'; payload],
+                },
+            });
+            assert!(response.status.ok, "warm {index}: {:?}", response.status);
+        }
+        let probe = crate::alloc_probe::Probe::start();
+        for index in 0..WRITES {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("cost-{index:08}"),
+                    value: vec![b'v'; payload],
+                },
+            });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+        let counts = probe.stop();
+        let n = WRITES as f64;
+        (counts.allocs as f64 / n, counts.alloc_bytes as f64 / n)
+    };
+
+    let measured: Vec<(usize, f64, f64)> =
+        SIZES.iter().map(|&s| { let (a, b) = arm(s); (s, a, b) }).collect();
+
+    println!();
+    println!("  value size   allocations/write   allocated B/write   amplification");
+    for (size, allocs, bytes) in &measured {
+        println!("  {size:>10} {allocs:>18.1} {bytes:>19.0} {:>15.1}x",
+                 bytes / *size as f64);
+    }
+
+    // Segment slopes, NOT one fit across everything. A single least-squares line over this
+    // data reports an intercept that describes no part of it -- the cost is piecewise, and
+    // averaging across a step hides the step, which is the interesting part.
+    println!();
+    println!("  segment                 B per payload byte");
+    let mut step: Option<(usize, usize, f64)> = None;
+    for pair in measured.windows(2) {
+        let (lo, _, lo_bytes) = pair[0];
+        let (hi, _, hi_bytes) = pair[1];
+        let per = (hi_bytes - lo_bytes) / (hi - lo) as f64;
+        println!("  {lo:>6} -> {hi:<6} {per:>26.1}");
+        if per > 20.0 && step.is_none() {
+            step = Some((lo, hi, hi_bytes - lo_bytes));
+        }
+    }
+
+    let alloc_spread = measured.iter().map(|m| m.1).fold(f64::MIN, f64::max)
+        - measured.iter().map(|m| m.1).fold(f64::MAX, f64::min);
+
+    println!();
+    println!("  allocation COUNT spread over the whole range  {alloc_spread:>8.1}");
+    println!();
+    if let Some((lo, hi, jump)) = step {
+        println!("  There is a STEP between {lo} and {hi} bytes worth {jump:.0} B per write, and");
+        println!("  the segments on either side of it are flat. That is a threshold being crossed,");
+        println!("  not a cost that scales -- so the number to quote for a write is which SIDE of");
+        println!("  the threshold it falls on, and a single slope through both is meaningless.");
+    } else {
+        println!("  No step: the cost is smooth across the range and a single slope describes it.");
+    }
+    println!();
+    let smallest = measured.first().expect("a measurement").2;
+    let largest = measured.last().expect("a measurement").2;
+    println!("  Even so, the shape of the whole is clear: {smallest:.0} B to store 64 bytes and");
+    println!("  {largest:.0} B to store 16384. The value is a minority of what a write allocates at");
+    println!("  every size measured, so shrinking values cannot move write cost -- compression and");
+    println!("  tighter encodings buy disk, not latency.");
+    if alloc_spread < 20.0 {
+        println!();
+        println!("  And the allocation COUNT barely moves across the whole range, so a write performs");
+        println!("  a fixed number of steps and only the bytes they carry change.");
+    }
+
+    assert_eq!(measured.len(), SIZES.len(), "every size should be measured");
+    assert!(measured.iter().all(|m| m.2 > 0.0), "measured nothing");
+}
+
+/// Does the write path's compressor have to be rebuilt for every record?
+///
+/// Write cost is flat at ~2 B per payload byte on both sides of a sharp step between 192 and 256
+/// bytes worth 32,535 B per write (`what_one_write_spends`). 256 is
+/// `BLOCK_RECORD_COMPRESSION_MIN_BYTES`, and the encoder above it is `zstd::stream::encode_all`,
+/// which builds a compressor, uses it once and drops it. Records in the soak corpus average 1,244
+/// bytes, so essentially every real write is above the threshold and pays this.
+///
+/// The zstd crate also exposes a compressor that can be held and reused. This measures whether
+/// reuse actually recovers the step or whether the cost is inherent to compressing at all --
+/// worth knowing before proposing to restructure a write path around it.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_rebuilding_the_compressor_costs -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_rebuilding_the_compressor_costs() {
+    const CALLS: u64 = 4_000;
+    // 1244 B is the soak corpus average; 512 is the probe size used elsewhere in this file.
+    const SIZES: [usize; 2] = [512, 1244];
+    const LEVEL: i32 = 3;
+
+    for size in SIZES {
+        // Not a uniform byte: an all-identical buffer compresses to almost nothing and would
+        // flatter both arms equally while making the ratio meaningless.
+        let payload: Vec<u8> = (0..size).map(|i| ((i * 7 + (i >> 3)) % 251) as u8).collect();
+
+        let probe = crate::alloc_probe::Probe::start();
+        let mut fresh_total = 0usize;
+        for _ in 0..CALLS {
+            let out = zstd::stream::encode_all(std::io::Cursor::new(&payload), LEVEL)
+                .expect("compress");
+            fresh_total += out.len();
+        }
+        let fresh = probe.stop();
+
+        let probe = crate::alloc_probe::Probe::start();
+        let mut held = zstd::bulk::Compressor::new(LEVEL).expect("compressor");
+        let mut held_total = 0usize;
+        for _ in 0..CALLS {
+            let out = held.compress(&payload).expect("compress");
+            held_total += out.len();
+        }
+        let reused = probe.stop();
+
+        let per = |v: u64| v as f64 / CALLS as f64;
+        println!();
+        println!("  payload {size} B, zstd level {LEVEL}");
+        println!("  arm                  allocations/call   allocated B/call   output B");
+        println!("  rebuilt each call  {:>18.1} {:>18.0} {:>10.0}",
+                 per(fresh.allocs), per(fresh.alloc_bytes), fresh_total as f64 / CALLS as f64);
+        println!("  held and reused    {:>18.1} {:>18.0} {:>10.0}",
+                 per(reused.allocs), per(reused.alloc_bytes), held_total as f64 / CALLS as f64);
+        println!("  reuse saves        {:>18.1} {:>18.0}",
+                 per(fresh.allocs) - per(reused.allocs),
+                 per(fresh.alloc_bytes) - per(reused.alloc_bytes));
+        // NOT an equality check on the compressed bytes. The two calls frame a zstd stream
+        // differently, so their outputs differ in size -- asserting they match fails, and the
+        // useful property is that each still decodes back to exactly what went in.
+        let fresh_once = zstd::stream::encode_all(std::io::Cursor::new(&payload), LEVEL)
+            .expect("compress");
+        let held_once = held.compress(&payload).expect("compress");
+        for (label, blob) in [("rebuilt", &fresh_once), ("reused", &held_once)] {
+            let back = zstd::stream::decode_all(std::io::Cursor::new(blob)).expect("decompress");
+            assert_eq!(back, payload, "{label} arm must round-trip");
+        }
+        println!("  output differs by       {:>18} B  (reused is {})",
+                 fresh_once.len() as i64 - held_once.len() as i64,
+                 if held_once.len() < fresh_once.len() { "smaller" } else { "larger" });
+    }
+
+    println!();
+    println!("  The two arms do NOT produce identical bytes -- they frame the stream differently,");
+    println!("  and the reused one is smaller. Both decode back to exactly the input, which is the");
+    println!("  property that matters; an equality assertion on the compressed bytes fails here and");
+    println!("  saying so is the point, because the saving is real and the sameness was assumed.");
+    println!();
+    println!("  What it does NOT settle: the write path holds no obvious place to keep a");
+    println!("  compressor, and one held across threads needs a lock or a thread-local. That is a");
+    println!("  design question, and this measures only the size of the prize.");
+}
+
+/// How badly does a 1,000-record measurement mislead, and where does it stop?
+///
+/// The embedding-storage guidance rests on a datanode holding 1,000 records in 27.0 MB -- 27 kB
+/// per record -- and concludes a 384-dim vector is 7.1% of resident memory. An eight-hour run
+/// over 5.76M records measures the same node at 1.59 kB per record, seventeen times smaller, so
+/// one of those numbers cannot be used for capacity and it is worth knowing which and by how much.
+///
+/// A single corpus size cannot answer it: fixed setup divided by a small corpus looks exactly like
+/// a large per-record cost. This walks 1k -> 1M and reports both the naive per-record figure and
+/// the MARGINAL cost between sizes, which is the only part that scales.
+///
+///   cargo test --features alloc-probe -p temporalstore-rust --lib what_a_thousand_records_hides -- --ignored --nocapture --test-threads=1
+#[test]
+#[ignore]
+#[cfg(feature = "alloc-probe")]
+fn what_a_thousand_records_hides() {
+    const SIZES: [u64; 4] = [1_000, 10_000, 100_000, 1_000_000];
+    const VECTOR_DIMS: usize = 384;
+
+    // Live bytes and allocations for `records` writes, engine construction INCLUDED so that the
+    // fixed cost a small corpus hides is inside the measurement rather than excluded from it.
+    let arm = |records: u64, with_vector: bool| -> (f64, f64) {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = crate::alloc_probe::Probe::start();
+        let engine = TemporalEngine::with_local_dirs(
+            16 * 1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        let vector: Vec<f32> = if with_vector {
+            (0..VECTOR_DIMS).map(|i| (i as f32) * 0.001).collect()
+        } else {
+            Vec::new()
+        };
+        for index in 0..records {
+            let node = crate::types::ContextNode {
+                node_hash: 1_000_000 + index,
+                parent_hash: 0,
+                kind: 1,
+                canonical_name: format!("scale-{index:08}"),
+                l0: String::new(),
+                status: 0,
+                last_event_time_ms: 1_780_000_000_000,
+                l1_ref: String::new(),
+                raw_metadata_ref: String::new(),
+                vector: vector.clone(),
+                embedding_model_hash: 909,
+                embedding_updated_at_ms: 1_780_000_000_000,
+                summary_vector: Vec::new(),
+                summary_vector_valid_from_ms: 0,
+                summary_vector_model_hash: 0,
+            };
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ContextUpsertNode { tenant_hash: 7, node: Box::new(node) },
+            });
+            assert!(response.status.ok, "write {index}: {:?}", response.status);
+        }
+        let counts = probe.stop();
+        std::hint::black_box(&engine);
+        let live = counts.alloc_bytes.saturating_sub(counts.free_bytes) as f64;
+        (live, counts.allocs as f64 / records as f64)
+    };
+
+    println!();
+    println!("  records      live total    live/record   marginal/record   allocs/write");
+    let mut prev: Option<(u64, f64)> = None;
+    let mut rows: Vec<(u64, f64, f64)> = Vec::new();
+    for size in SIZES {
+        let (live, allocs) = arm(size, true);
+        let per = live / size as f64;
+        let marginal = match prev {
+            Some((psize, plive)) => (live - plive) / (size - psize) as f64,
+            None => f64::NAN,
+        };
+        if marginal.is_nan() {
+            println!("  {size:>8} {live:>14.0} {per:>14.0} B {:>17} {allocs:>14.1}", "--");
+        } else {
+            println!("  {size:>8} {live:>14.0} {per:>14.0} B {marginal:>15.0} B {allocs:>14.1}");
+        }
+        rows.push((size, per, marginal));
+        prev = Some((size, live));
+    }
+
+    let naive = rows[0].1;
+    let settled = rows[rows.len() - 1].2;
+    println!();
+    println!("  at {:>9} records a record looks like {naive:.0} B", SIZES[0]);
+    println!("  the marginal cost at {:>4} records is    {settled:.0} B", SIZES[SIZES.len()-1]);
+    println!("  the small figure overstates by         {:.1}x", naive / settled);
+    println!();
+
+    // Does the vector show up in RESIDENT memory at all? Same corpus, no vector.
+    const CHECK_AT: u64 = 100_000;
+    let (with_vec, _) = arm(CHECK_AT, true);
+    let (no_vec, _) = arm(CHECK_AT, false);
+    let saved = (with_vec - no_vec) / CHECK_AT as f64;
+    let vector_bytes = (VECTOR_DIMS * 4) as f64;
+    println!("  a {VECTOR_DIMS}-dim vector is {vector_bytes:.0} B on the wire");
+    println!("  removing it saves {saved:>6.1} B/record resident  ({:.1}% of the vector)",
+             100.0 * saved / vector_bytes);
+    println!();
+    if saved < vector_bytes * 0.1 {
+        println!("  So the vector is NOT resident. Quoting it as a percentage of a per-record RSS");
+        println!("  figure invites the wrong inference -- shrinking vectors moves durable bytes and");
+        println!("  read bandwidth, and moves resident memory by approximately nothing.");
+    } else {
+        println!("  The vector IS a real share of resident memory and shrinking it moves RSS.");
+    }
+
+    assert!(rows.iter().all(|r| r.1 > 0.0), "measured nothing");
+}
+
+/// Dropping emptied buckets must not walk every bucket.
+///
+/// `sync_bucket_index_object_blocks` ended with `bucket_map.retain(..)` to drop buckets it had
+/// emptied. `dirty` is true for a write, so that ran on every one, and at the default routing-slot
+/// range the map holds a bucket per record -- O(corpus) per command. Profiling a degraded node put
+/// 94.2% of self time in that one retain, and an 8-hour run went 7 ms -> 105 ms per message.
+///
+/// Two properties, and the test needs BOTH: the cost must not grow with the store, and the
+/// emptied buckets must still be gone. Either alone is satisfiable by a wrong change -- never
+/// dropping anything is flat, and walking everything is correct.
+///
+///   cargo test -p temporalstore-rust --lib emptied_buckets_are_dropped_without_walking_the_map -- --nocapture
+/// A bounded compaction round stops at its budget, RESUMES onto the same slab, and the rounds
+/// together still move every block.
+///
+/// The resume is what makes bounding work at all. A round rolls a fresh slab and relocates onto
+/// it; rolling AGAIN while a round is unfinished would re-move everything the last round moved,
+/// because those blocks would no longer be on the newest slab. A budget without a resume shuffles
+/// the same blocks and the tail never moves.
+///
+/// Note what "finished" means here, because it is not what it first appears: compaction relocates
+/// every live block BY DESIGN, so a completed compaction is followed by another that moves them
+/// all again. A round is finished when it left nothing behind for want of budget, which is what
+/// `pages_left_by_budget` reports.
+///
+/// Two controls. Every value must still read after EACH round -- a partial compaction that loses
+/// a block is the risk bounding introduces -- and the unbounded round must finish in ONE, which is
+/// what keeps the default behaviour of every store small enough for the real budget.
+#[test]
+fn a_bounded_compaction_round_resumes_instead_of_rolling_again() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        4 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    const KEYS: u64 = 40;
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("bounded-{index}"),
+                value: vec![b'v'; 256],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let reads_all_hold = |stage: &str| {
+        for index in 0..KEYS {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: format!("bounded-{index}"),
+                },
+            });
+            assert_eq!(
+                response.response,
+                CommandResponse::Bytes {
+                    value: Some(vec![b'v'; 256])
+                },
+                "{stage}: bounded-{index} did not read back"
+            );
+        }
+    };
+
+    // A tiny budget: several rounds before one finishes.
+    let mut rounds = 0;
+    let mut slabs_filled = std::collections::BTreeSet::new();
+    let mut relocated = 0usize;
+    loop {
+        let report = engine
+            .compact_shard_blocks_with_budget(1, 300)
+            .expect("a bounded round succeeds");
+        rounds += 1;
+        relocated += report.rewritten_block_refs;
+        slabs_filled.insert(report.compacted_block_slab_id);
+        reads_all_hold(&format!("after round {rounds}"));
+        if report.blocks_left_by_budget == 0 {
+            break;
+        }
+        assert!(rounds < 100, "the rounds are not converging: {rounds} of them");
+    }
+
+    assert!(
+        rounds > 2,
+        "a 300-byte budget should have taken several rounds, took {rounds}"
+    );
+    assert_eq!(
+        slabs_filled.len(),
+        1,
+        "every round of ONE compaction must fill the SAME slab; rolling again each round is what \
+         re-moves the previous round's work: {slabs_filled:?}"
+    );
+    assert!(
+        relocated >= KEYS as usize,
+        "the rounds together must move at least every key's page, moved {relocated}"
+    );
+
+    // The control: with the real budget a compaction finishes in one round, leaving nothing
+    // behind. This is what keeps every existing assertion about a single compaction true.
+    let whole = engine
+        .compact_shard_blocks(1)
+        .expect("an unbounded round succeeds");
+    assert_eq!(
+        whole.blocks_left_by_budget, 0,
+        "the shipped budget must finish a store this size in one round"
+    );
+    reads_all_hold("after the unbounded round");
+}
+
+#[test]
+fn emptied_buckets_are_dropped_without_walking_the_map() {
+    use crate::types::ContextNode;
+
+    fn node(nid: u64) -> Box<ContextNode> {
+        Box::new(ContextNode {
+            node_hash: nid, parent_hash: 0, kind: 1,
+            canonical_name: format!("session/turn/{nid}"),
+            l0: "body".to_string(), status: 0,
+            last_event_time_ms: 1_780_000_000_000,
+            l1_ref: String::new(), raw_metadata_ref: String::new(),
+            vector: Vec::new(), embedding_model_hash: 0, embedding_updated_at_ms: 0,
+            summary_vector: Vec::new(), summary_vector_valid_from_ms: 0,
+            summary_vector_model_hash: 0,
+        })
+    }
+
+    // --- correctness: a bucket emptied by a delete must not survive -----------------------
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        4 * 1024 * 1024, dir.path().join("cache"),
+        dir.path().join("blocks"), dir.path().join("indexes"));
+    engine.load_shard(1);
+    for index in 0..200u64 {
+        let r = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet { key: format!("drop-{index}"), value: vec![b'v'; 64] },
+        });
+        assert!(r.status.ok, "write: {:?}", r.status);
+    }
+    let before = {
+        let shards = engine.shards.read().expect("lock");
+        shards.get(&1).expect("shard").bucket_index.bucket_map.len()
+    };
+    for index in 0..200u64 {
+        let r = engine.execute(ExecuteRequest {
+            shard_id: 1, command: Command::StringDelete { key: format!("drop-{index}") } });
+        assert!(r.status.ok, "delete: {:?}", r.status);
+    }
+    let (after, empties) = {
+        let shards = engine.shards.read().expect("lock");
+        let map = &shards.get(&1).expect("shard").bucket_index.bucket_map;
+        let empties = map
+            .values()
+            .filter(|b| b.block_index.is_empty() && b.object_index.is_empty())
+            .count();
+        (map.len(), empties)
+    };
+    println!();
+    println!("  buckets after 200 writes: {before}, after deleting all: {after} ({empties} empty)");
+    assert!(before > 0, "the writes should have created buckets");
+    assert_eq!(
+        empties, 0,
+        "an emptied bucket survived in bucket_map: {empties} of {after} hold nothing"
+    );
+
+    // --- the shape: per-write cost must not grow with the store --------------------------
+    // The batch a real message sends. An upsert ALONE does not reproduce this -- the first
+    // version of this test used one, passed on the unfixed code, and guarded nothing. The
+    // removals that reach the whole-map walk come from the event and index-ref writes.
+    let per_write_us = |corpus: u64| -> f64 {
+        use crate::types::{ContextEvent, ContextIndexRef};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            4 * 1024 * 1024, dir.path().join("cache"),
+            dir.path().join("blocks"), dir.path().join("indexes"));
+        engine.load_shard(1);
+        let msg = |nid: u64| vec![
+            Command::ContextUpsertNode { tenant_hash: 7, node: node(nid) },
+            Command::ContextWriteEvent {
+                tenant_hash: 7, node_hash: nid, first_write_only: true, cold_storage: false,
+                event: Box::new(ContextEvent {
+                    event_id_hash: nid, event_time_ms: 1_780_000_000_000,
+                    ingestion_time_ms: 1_780_000_000_000, kind: 1, event_type: 1,
+                    actor_hash: 42, status: 1, valid_until_ms: 0, confidence: 1.0,
+                    importance: 1.0, text: "body".to_string(),
+                    source_ref: format!("msg-{nid}"), related_node_hashes: Vec::new(),
+                    compact_attrs: Vec::new(), vector: Vec::new(),
+                }),
+            },
+            Command::ContextWriteIndexRef {
+                tenant_hash: 7, index_name: "source".to_string(),
+                index_value_hash: nid % 100_000, scope_hash: 0,
+                event_time_ms: 1_780_000_000_000,
+                index_ref: ContextIndexRef {
+                    primary_node_hash: nid, primary_event_time_ms: 1_780_000_000_000,
+                    event_id_hash: nid,
+                },
+            },
+        ];
+        let mut nid = 5_000_000u64;
+        for _ in 0..corpus {
+            nid += 1;
+            engine.batch_execute(crate::types::BatchExecuteRequest {
+                shard_id: 1, commands: msg(nid) });
+        }
+        const N: u64 = 300;
+        let t0 = std::time::Instant::now();
+        for _ in 0..N {
+            nid += 1;
+            engine.batch_execute(crate::types::BatchExecuteRequest {
+                shard_id: 1, commands: msg(nid) });
+        }
+        t0.elapsed().as_micros() as f64 / N as f64
+    };
+    let small = per_write_us(2_000);
+    let large = per_write_us(20_000);
+    let growth = large / small;
+    println!("  per-write: {small:.0} us at 2k -> {large:.0} us at 20k  ({growth:.2}x)");
+    // Generous: the defect measured 2.97x over this range and 15x over a real run. Anything
+    // under 2x is not the walk coming back; timing on a shared machine is not tighter than this.
+    assert!(
+        growth < 2.0,
+        "per-write cost grew {growth:.2}x from a 2k to a 20k corpus. This asserts a RATIO and \n         cannot say what caused it: the by-name drop this test was written for is intact \n         (storage_bucket_internals.rs, `Drop buckets this call emptied -- BY NAME`), and \n         the growth reproduces at load 5 and at load 15 alike, so it is neither that walk \n         nor machine noise. Look for other per-write work that scales with the corpus."
+    );
+}
+
+/// The two expiry indexes agree after a workload that touches every path that writes one.
+///
+/// `expires_at_ms` (key-ordered, for the point lookup `ttl_ms` needs) and `expiry_by_deadline`
+/// (deadline-ordered, so the due keys are a prefix) hold the same facts twice. They are kept in
+/// step by `set_expiry`/`clear_expiry`, and a mutation site that bypassed those would leave keys
+/// that silently never expire -- the failure mode is invisible from outside, which is why this
+/// asserts the invariant directly rather than asserting on behaviour that happens to depend on it.
+///
+/// The workload is chosen to hit each kind of write: a fresh deadline, a deadline REPLACED by a
+/// second set (the case where the old entry must be removed from the ordered view, not just
+/// overwritten in the map), a deadline removed by a persist without one, and a key deleted
+/// outright.
+#[test]
+fn the_two_expiry_indexes_agree() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+
+    for index in 0..200usize {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSetEx {
+                key: format!("agree-{index:04}"),
+                value: b"v".to_vec(),
+                ttl_ms: 60_000,
+            },
+        });
+    }
+    // Replace the deadline on half of them: the old (deadline, key) entry has to go.
+    for index in 0..100usize {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSetEx {
+                key: format!("agree-{index:04}"),
+                value: b"v2".to_vec(),
+                ttl_ms: 120_000,
+            },
+        });
+    }
+    // Drop the deadline entirely by writing without one.
+    for index in 100..150usize {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("agree-{index:04}"),
+                value: b"v3".to_vec(),
+            },
+        });
+    }
+    // And delete some outright.
+    for index in 150..200usize {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::CommonDelete {
+                key: format!("agree-{index:04}"),
+            },
+        });
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 is loaded");
+    // The denominator: an empty index agrees with an empty index, and proves nothing.
+    assert!(
+        !shard.expires_at_ms().is_empty(),
+        "no deadlines survived the workload, so agreement here is vacuous"
+    );
+    assert_eq!(
+        crate::engine::expiry_index_disagreements(shard),
+        0,
+        "the key-ordered and deadline-ordered expiry indexes disagree: {} deadlines vs {} ordered \
+         entries -- a write path is bypassing set_expiry/clear_expiry",
+        shard.expires_at_ms().len(),
+        shard.expiry_by_deadline.len(),
+    );
+}
+
+/// A cycle request with every stage OFF except prepare.
+///
+/// Compaction rolls a slab of its own when it starts a round, and reclaim can destroy one, so a
+/// round with every stage enabled could change the slab set for a reason that has nothing to do
+/// with prepare -- and the roll assertions below would still pass with the prepare body deleted.
+/// Turning the rest off is what makes a roll attributable to the stage the test names.
+#[cfg(test)]
+fn only_prepare_may_roll() -> StorageManagerCycleRequest {
+    StorageManagerCycleRequest {
+        enable_wal_reclaim: false,
+        enable_evict: false,
+        enable_expire: false,
+        enable_block_reclaim: false,
+        enable_block_compaction: false,
+        enable_index_gc: false,
+        ..StorageManagerCycleRequest::default()
+    }
+}
+
+/// The maintenance round's own fixture for the prepare stage: a shard whose active data slab is
+/// already at `target`, so the stage has work and a round that does nothing is a failure rather
+/// than a shrug.
+///
+/// Returns the engine, its temp dir (which must outlive it) and the slab id the writes filled.
+#[cfg(test)]
+fn shard_with_a_full_data_slab(
+    target: u64,
+) -> (TemporalEngine, tempfile::TempDir, u64) {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let mut written = 0usize;
+    while !engine
+        .block_store()
+        .needs_slab_preparation_with_target(target)
+    {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("prepare-{written:06}"),
+                value: vec![b'p'; 512],
+            },
+        });
+        assert!(response.status.ok, "write {written}: {:?}", response.status);
+        written += 1;
+        assert!(
+            written < 20_000,
+            "wrote {written} records without reaching a {target}-byte slab target",
+        );
+    }
+    let filled = engine
+        .block_store()
+        .slab_ids()
+        .expect("slab ids")
+        .into_iter()
+        .max()
+        .expect("the writes created at least one slab");
+    (engine, dir, filled)
+}
+
+/// The prepare stage pre-allocates the next data slab, instead of only reporting that it did.
+///
+/// `run_storage_manager_once` has rolled here since the stage was written. This driver -- the one
+/// the data-node worker and the embedded proxy both run -- had a prepare stage whose body was a
+/// report and nothing else, so on those deployments every slab boundary was paid for inline by
+/// one unlucky client append.
+///
+/// THE HALVES ARE ASSERTED SEPARATELY. A round can roll a slab and not say so, and it can name a
+/// slab it did not roll; a single combined check passes on either of those.
+#[test]
+fn the_prepare_stage_rolls_the_next_data_slab() {
+    const TARGET: u64 = 64 * 1024;
+    let (engine, _dir, filled) = shard_with_a_full_data_slab(TARGET);
+
+    // DENOMINATOR: the stage has work. Without this a store that never reached the target would
+    // make "no roll" the correct answer and the assertions below vacuous.
+    assert!(
+        engine
+            .block_store()
+            .needs_slab_preparation_with_target(TARGET),
+        "the fixture did not fill a slab to the target, so prepare has nothing to do",
+    );
+
+    let report = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        enable_prepare: true,
+        prepare_slab_target_bytes: TARGET,
+        ..only_prepare_may_roll()
+    });
+
+    // HALF ONE: a slab was actually rolled.
+    let after = engine
+        .block_store()
+        .slab_ids()
+        .expect("slab ids")
+        .into_iter()
+        .max()
+        .expect("slabs exist");
+    assert!(
+        after > filled,
+        "the round left the store on slab {after} with the active slab already at the \
+{TARGET}-byte target: prepare rolled nothing, so the next client append pays for the roll",
+    );
+    assert!(
+        !engine
+            .block_store()
+            .needs_slab_preparation_with_target(TARGET),
+        "the active slab is still at target after prepare ran",
+    );
+
+    // HALF TWO: the round SAYS which slab it rolled to. A stage that acts silently cannot be
+    // read by an operator, and `applied` on this stage only ever meant "the stage ran".
+    let prepare = report
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "prepare")
+        .expect("the round reports a prepare stage");
+    assert_eq!(
+        prepare.prepared_block_slab_id,
+        Some(after),
+        "the prepare stage rolled to slab {after} and reported {:?}",
+        prepare.prepared_block_slab_id,
+    );
+    assert!(prepare.applied, "prepare reported applied=false while rolling a slab");
+    assert!(
+        report.errors.is_empty(),
+        "prepare reported errors: {:?}",
+        report.errors,
+    );
+}
+
+/// Prepare is a no-op while the active slab has room, and says so.
+///
+/// Without this the fix above could be "roll on every round", which would mint an empty slab per
+/// cycle forever -- a worse failure than the one it replaces, and one that the roll assertion
+/// alone would not catch.
+#[test]
+fn the_prepare_stage_does_not_roll_a_slab_with_room() {
+    const TARGET: u64 = 64 * 1024;
+    let (engine, _dir, filled) = shard_with_a_full_data_slab(TARGET);
+    // Roll once, so the active slab is fresh and empty.
+    let first = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        enable_prepare: true,
+        prepare_slab_target_bytes: TARGET,
+        ..only_prepare_may_roll()
+    });
+    // DENOMINATOR: the first round DID roll, so the second round's "no roll" is a decision about
+    // a fresh slab and not a store that never reached the target at all.
+    let rolled = first
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "prepare")
+        .and_then(|stage| stage.prepared_block_slab_id);
+    assert!(
+        rolled.is_some() && rolled > Some(filled),
+        "the first round did not roll, so this measures nothing (filled {filled}, rolled {rolled:?})",
+    );
+
+    let before = engine.block_store().slab_ids().expect("slab ids").len();
+    let second = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        enable_prepare: true,
+        prepare_slab_target_bytes: TARGET,
+        ..only_prepare_may_roll()
+    });
+    let after = engine.block_store().slab_ids().expect("slab ids").len();
+    assert_eq!(
+        after, before,
+        "a second round rolled again on a slab with room: prepare mints an empty slab per cycle",
+    );
+    let prepare = second
+        .stages
+        .iter()
+        .find(|stage| stage.stage == "prepare")
+        .expect("the round reports a prepare stage");
+    assert_eq!(
+        prepare.prepared_block_slab_id, None,
+        "prepare reported a roll it did not perform",
+    );
+}
+
+/// A round that is not allowed to prepare does not roll, at either of the two switches.
+///
+/// `enable_prepare: false` is the operator switch; `dry_run` is the "tell me what you would do"
+/// one. Both are asserted here because they are separate conditions in the stage and a single
+/// combined check would pass with either of them broken.
+#[test]
+fn a_disabled_or_dry_run_prepare_stage_rolls_nothing() {
+    const TARGET: u64 = 64 * 1024;
+
+    let (engine, _dir, filled) = shard_with_a_full_data_slab(TARGET);
+    // DENOMINATOR, stated once for both arms: this store IS at target, so an enabled round here
+    // would roll.
+    assert!(
+        engine
+            .block_store()
+            .needs_slab_preparation_with_target(TARGET),
+        "the fixture did not fill a slab, so neither arm below is refusing anything",
+    );
+
+    let disabled = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        enable_prepare: false,
+        prepare_slab_target_bytes: TARGET,
+        ..only_prepare_may_roll()
+    });
+    let after_disabled = engine
+        .block_store()
+        .slab_ids()
+        .expect("slab ids")
+        .into_iter()
+        .max()
+        .expect("slabs exist");
+    assert_eq!(
+        after_disabled, filled,
+        "a round with prepare disabled rolled a slab anyway",
+    );
+    assert_eq!(
+        disabled
+            .stages
+            .iter()
+            .find(|stage| stage.stage == "prepare")
+            .and_then(|stage| stage.prepared_block_slab_id),
+        None,
+    );
+
+    let dry = engine.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        enable_prepare: true,
+        dry_run: true,
+        prepare_slab_target_bytes: TARGET,
+        ..only_prepare_may_roll()
+    });
+    let after_dry = engine
+        .block_store()
+        .slab_ids()
+        .expect("slab ids")
+        .into_iter()
+        .max()
+        .expect("slabs exist");
+    assert_eq!(after_dry, filled, "a dry run rolled a slab");
+    assert_eq!(
+        dry.stages
+            .iter()
+            .find(|stage| stage.stage == "prepare")
+            .and_then(|stage| stage.prepared_block_slab_id),
+        None,
+    );
+}
+
+/// Walks of the shard's live-block set per maintenance round, on a SETTLED shard and on the same
+/// shard with ONE dirty bucket. Set from measurement by
+/// `an_idle_round_does_not_walk_the_live_blocks_to_populate_a_report`, which prints the per-site
+/// breakdown when either moves.
+///
+/// BOTH FELL BY ONE, and it is the same walk in each: `collect_live_block_addresses` via
+/// `storage_reclaim_slab_reports`. That function builds the per-slab live/stale tally the reclaim
+/// planner reads, and it filled `live_page_refs` and `live_physical_bytes` by materialising every
+/// live block in the shard. Both are now maintained on the index's own mutation path and read in
+/// O(slabs), so the walk is not shared or deferred -- it is not performed. It fell on BOTH halves
+/// because that report is taken whether or not the round has work, which is exactly why the idle
+/// half is measured separately.
+const EXPECTED_IDLE_MULTIPLE: u64 = 2;
+const EXPECTED_DIRTY_MULTIPLE: u64 = 6;
+
+/// What one round walked, at one corpus size.
+struct RoundWalkMeasurement {
+    records: usize,
+    live_blocks: u64,
+    idle_multiple: u64,
+    dirty_multiple: u64,
+    idle_breakdown: String,
+    dirty_breakdown: String,
+}
+
+/// An IDLE round must not walk the shard's live blocks to populate a report field.
+///
+/// `storage_lifecycle_plan` opened with `bucket_storage_summaries`, which materialises every live
+/// block in the shard. Until #1709 that walk was load-bearing for dump selection. It is not any
+/// more: `dirty_object_count` on a summary is populated from exactly one place --
+/// `shard.dirty_objects.bucket_counts()` -- so "no bucket has a dirty object" and "the dirty index
+/// is empty" are the SAME predicate, and the second is answered without touching the live set.
+///
+/// What kept the walk alive was the report: `StorageLifecyclePlan.bucket_summaries` is an OUTPUT
+/// field, so the shard was walked every round to fill a vector that every consumer reduces to a
+/// count or a sum.
+///
+/// Measured at TWO scales, and each half asserted SEPARATELY -- a combined assertion lets one
+/// scale or one half carry the other. The dirty half is what shows the conditional does NOT fire
+/// when there is work; without it, "never walks" would pass this test just as well as
+/// "walks only when it must".
+#[test]
+fn an_idle_round_does_not_walk_the_live_blocks_to_populate_a_report() {
+    let small = measure_round_walks(8_000);
+    let large = measure_round_walks(80_000);
+
+    for measurement in [&small, &large] {
+        eprintln!(
+            "{} records ({} live pages): idle {}x, one dirty bucket {}x",
+            measurement.records,
+            measurement.live_blocks,
+            measurement.idle_multiple,
+            measurement.dirty_multiple,
+        );
+    }
+
+    // Each half, at each scale, asserted on its own.
+    for measurement in [&small, &large] {
+        assert_eq!(
+            measurement.idle_multiple, EXPECTED_IDLE_MULTIPLE,
+            "{} records, IDLE round: walked the live pages {}x, expected {EXPECTED_IDLE_MULTIPLE}x \
+({} live pages). Per site:{}\n  An idle round must not walk the shard to fill a report field. \
+Higher means a walk came back; lower means one more was removed -- lower the constant and name it.",
+            measurement.records,
+            measurement.idle_multiple,
+            measurement.live_blocks,
+            measurement.idle_breakdown,
+        );
+    }
+    for measurement in [&small, &large] {
+        assert_eq!(
+            measurement.dirty_multiple, EXPECTED_DIRTY_MULTIPLE,
+            "{} records, ONE DIRTY BUCKET: walked the live pages {}x, expected \
+{EXPECTED_DIRTY_MULTIPLE}x ({} live pages). Per site:{}\n  A round with work must still take its \
+walks. If this fell to the idle number, the conditional is firing when it must not, and a plan \
+that did not look is being reported as a plan that found nothing.",
+            measurement.records,
+            measurement.dirty_multiple,
+            measurement.live_blocks,
+            measurement.dirty_breakdown,
+        );
+    }
+
+    // The two halves must DIFFER. Both constants could be set to the same number and every
+    // assertion above would still pass while the conditional never fired at all.
+    for measurement in [&small, &large] {
+        assert!(
+            measurement.dirty_multiple > measurement.idle_multiple,
+            "{} records: the idle round and the dirty round walked the shard the same number of \
+times ({}x), so nothing here distinguishes a conditional that fires from one that does not.",
+            measurement.records,
+            measurement.idle_multiple,
+        );
+    }
+}
+
+/// Settle a shard of `records`, then measure one idle round and one round with a single dirty
+/// bucket. Every denominator this measurement rests on is asserted here, before the numbers are
+/// returned.
+fn measure_round_walks(records: usize) -> RoundWalkMeasurement {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..records {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("idle-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    let request = || crate::engine::reports::StorageLifecycleRequest {
+        shard_id: 1,
+        purge_delayed_destroy: true,
+        prune_bucket_dump_manifests: true,
+        roll_forward_bucket_dump_installs: true,
+        ..crate::engine::reports::StorageLifecycleRequest::default()
+    };
+
+    // SETTLE. The first round dumps the dirty buckets; a LATER round can still select a dump with
+    // no bucket dirty at all, because `dump_refreshes_a_vacated_slab` asks for one while the
+    // newest manifest still names a slab compaction has emptied. That is deliberate and
+    // terminating -- but it means "wrote records, ran one round" is NOT an idle shard, and a
+    // conditional tested there would never fire while appearing to pass.
+    let mut settled = false;
+    for _ in 0..16 {
+        let plan = engine.storage_lifecycle_plan(request());
+        if plan.selected_dump_buckets.is_empty() && plan.dirty_buckets.is_empty() {
+            settled = true;
+            break;
+        }
+        let _ = engine.apply_storage_lifecycle(request());
+    }
+    assert!(
+        settled,
+        "{records} records: the shard never settled in 16 rounds, so the idle measurement would be \
+taken on a shard that still has work to do. Nothing below is evidence until this holds."
+    );
+
+    // ---- DENOMINATORS ----
+    let summaries = engine.bucket_storage_summaries(1);
+    assert!(
+        !summaries.is_empty(),
+        "{records} records: no bucket summaries at all -- the fixture stored nothing"
+    );
+    let live_blocks: u64 = summaries
+        .iter()
+        .map(|summary| summary.block_ref_count as u64)
+        .sum();
+    assert!(
+        live_blocks > 0,
+        "{records} records: the shard holds no live pages, so every walk materialises nothing and \
+any walk count holds vacuously"
+    );
+    let dirty_now: u64 = summaries
+        .iter()
+        .map(|summary| summary.dirty_object_count)
+        .sum();
+    assert_eq!(
+        dirty_now, 0,
+        "{records} records: the dirty index is NOT empty after settling, so the idle branch under \
+test is not the branch that runs"
+    );
+
+    let breakdown = |label: &str, sites: &std::collections::BTreeMap<String, u64>| {
+        let mut rows: Vec<(&String, &u64)> = sites.iter().collect();
+        rows.sort_by(|left, right| right.1.cmp(left.1));
+        rows.iter()
+            .map(|(site, entries)| {
+                format!(
+                    "\n    {label}  {:>5.1}x  {site}",
+                    **entries as f64 / live_blocks as f64
+                )
+            })
+            .collect::<String>()
+    };
+
+    // ---- IDLE ROUND ----
+    crate::engine::reset_live_block_scan_entries();
+    crate::engine::reset_live_block_scan_sites();
+    let (plan_builds_before, _) = crate::engine::storage_plan_build_counts();
+    let idle_report = engine.apply_storage_lifecycle(request());
+    let idle_walked = crate::engine::live_block_scan_entries();
+    let idle_sites = crate::engine::live_block_scan_sites_snapshot();
+    let (plan_builds_after, _) = crate::engine::storage_plan_build_counts();
+    assert!(
+        plan_builds_after > plan_builds_before,
+        "{records} records: no plan was built, so the idle round did not run and a walk count of \
+zero would mean nothing"
+    );
+    assert_eq!(idle_report.shard_id, 1);
+
+    // ---- ONE DIRTY BUCKET. The conditional must NOT fire. ----
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "idle-dirty-one".to_string(),
+            value: vec![b'v'; 64],
+        },
+    });
+    assert!(response.status.ok, "dirty write: {:?}", response.status);
+    let dirty_buckets_now = engine.storage_lifecycle_plan(request()).dirty_buckets.len();
+    assert_eq!(
+        dirty_buckets_now, 1,
+        "{records} records: expected exactly one dirty bucket for the not-idle half; got \
+{dirty_buckets_now}. The halves must differ in the dirty index and in nothing else."
+    );
+
+    crate::engine::reset_live_block_scan_entries();
+    crate::engine::reset_live_block_scan_sites();
+    let dirty_report = engine.apply_storage_lifecycle(request());
+    let dirty_walked = crate::engine::live_block_scan_entries();
+    let dirty_sites = crate::engine::live_block_scan_sites_snapshot();
+    assert_eq!(dirty_report.shard_id, 1);
+
+    RoundWalkMeasurement {
+        records,
+        live_blocks,
+        idle_multiple: idle_walked / live_blocks.max(1),
+        dirty_multiple: dirty_walked / live_blocks.max(1),
+        idle_breakdown: breakdown("idle ", &idle_sites),
+        dirty_breakdown: breakdown("dirty", &dirty_sites),
+    }
+}
+
+
+/// A compaction round that fails PARTWAY must keep its resume anchor.
+///
+/// A round rolls a fresh slab and relocates live blocks onto it, and `compaction_rounds` records
+/// which slab it is filling so the next round CONTINUES onto that slab instead of rolling again.
+/// Rolling again while a round is unfinished re-moves everything the unfinished round moved --
+/// the blocks it relocated are no longer on the newest slab -- so the rounds shuffle instead of
+/// progressing.
+///
+/// The anchor used to be written only on the success path. The partial-failure handler returned
+/// before reaching it, so a round that rolled a slab, moved some blocks and then failed recorded
+/// nothing: the next round read no anchor, rolled a SECOND slab, and re-moved every block the
+/// failed round had already moved. Repeated work and one extra slab per failure, not data loss,
+/// which is why it went unnoticed.
+///
+/// The only way a round fails partway in production is the block read returning `None` -- a torn
+/// or missing block -- so this drives `fail_compaction_block_read_after_for_test`, the `cfg(test)`
+/// seam in front of that read. Without the seam this behaviour has no trigger and cannot be
+/// characterized at all.
+///
+/// Two numbers, asserted SEPARATELY, because they fail for different reasons: the slab count says
+/// whether a second slab was rolled, and the relocated-block count says whether already-moved
+/// blocks were moved again. A fix that addressed only one of them would pass the other.
+#[test]
+fn a_compaction_round_that_fails_partway_keeps_its_resume_anchor() {
+    const RECORDS: usize = 32;
+    const RELOCATIONS_BEFORE_FAILURE: usize = 8;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("anchor-{index:04}"),
+                value: vec![b'v'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    // THE DENOMINATOR. Every count below is a share of this, and a fixture that stored too few
+    // live blocks to fail partway would make the whole test vacuous -- the round would either
+    // finish or fail on its first block, and neither exercises resuming.
+    let live_blocks: usize = engine
+        .bucket_storage_summaries(1)
+        .iter()
+        .map(|summary| summary.block_ref_count as usize)
+        .sum();
+    assert!(
+        live_blocks > RELOCATIONS_BEFORE_FAILURE,
+        "fixture holds {live_blocks} live page refs, which is not more than the \
+         {RELOCATIONS_BEFORE_FAILURE} relocations the round is told to survive -- the round \
+         would not fail PARTWAY and this test would prove nothing",
+    );
+
+    let slabs_at_start = engine
+        .block_store
+        .slab_ids()
+        .expect("slab ids readable")
+        .len();
+
+    // ROUND ONE: roll a slab, move `RELOCATIONS_BEFORE_FAILURE` blocks, then fail the next read.
+    crate::engine::compaction::fail_compaction_block_read_after_for_test(Some(
+        RELOCATIONS_BEFORE_FAILURE,
+    ));
+    let first_round = engine.compact_shard_blocks_with_budgets(1, u64::MAX, usize::MAX);
+    crate::engine::compaction::fail_compaction_block_read_after_for_test(None);
+
+    // PROOF THE TREATMENT RAN. A round that succeeded, or failed for some other reason, would
+    // make every number below meaningless -- and a passing assertion about a round that never
+    // failed is exactly the shape this test exists to avoid.
+    let failure = first_round.expect_err("the seam must make round one fail partway");
+    assert_eq!(
+        failure.code, "block_compaction_failed",
+        "round one failed for the wrong reason: {failure:?}",
+    );
+
+    let slabs_after_failed_round = engine
+        .block_store
+        .slab_ids()
+        .expect("slab ids readable")
+        .len();
+    assert_eq!(
+        slabs_after_failed_round,
+        slabs_at_start + 1,
+        "round one should have rolled exactly one slab",
+    );
+
+    // The anchor itself. Checked directly as well as through its consequences, so a failure says
+    // WHICH of the two broke.
+    let anchored = engine
+        .compaction_rounds
+        .read()
+        .expect("compaction round lock poisoned")
+        .get(&1)
+        .copied();
+    assert!(
+        anchored.is_some(),
+        "a round that failed partway left no resume anchor, so the next round will roll again",
+    );
+
+    // ROUND TWO: unarmed. It must CONTINUE the failed round.
+    let second_round = engine
+        .compact_shard_blocks_with_budgets(1, u64::MAX, usize::MAX)
+        .expect("round two runs to completion");
+
+    // NUMBER ONE -- slabs. Resuming rolls nothing; starting fresh rolls a second slab.
+    let slabs_after_second_round = engine
+        .block_store
+        .slab_ids()
+        .expect("slab ids readable")
+        .len();
+    assert_eq!(
+        slabs_after_second_round, slabs_after_failed_round,
+        "round two rolled another slab instead of resuming onto the one round one was filling \
+         ({slabs_at_start} at start, {slabs_after_failed_round} after the failed round, \
+         {slabs_after_second_round} after round two)",
+    );
+
+    // NUMBER TWO -- relocations. Resuming moves only what round one did not reach; starting
+    // fresh re-moves everything, because nothing sits on the newly rolled slab yet.
+    assert_eq!(
+        second_round.rewritten_block_refs,
+        live_blocks - RELOCATIONS_BEFORE_FAILURE,
+        "round two relocated {} of {live_blocks} live page refs; resuming should have moved only \
+         the {} round one never reached, and re-moving all {live_blocks} means it rolled fresh",
+        second_round.rewritten_block_refs,
+        live_blocks - RELOCATIONS_BEFORE_FAILURE,
+    );
+
+    // A round that relocated everything CLOSES, so the next one starts fresh. The anchor is a
+    // resume marker, not a permanent one, and leaving it set would stall compaction on this slab.
+    assert!(
+        engine
+            .compaction_rounds
+            .read()
+            .expect("compaction round lock poisoned")
+            .get(&1)
+            .is_none(),
+        "a round that finished its work must close, so the next round rolls a fresh slab",
+    );
+}
