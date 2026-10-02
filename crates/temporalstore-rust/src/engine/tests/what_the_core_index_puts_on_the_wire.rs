@@ -394,3 +394,400 @@ fn the_stored_block_key_is_not_self_delimiting_so_no_parser_can_invert_it() {
 
     // TWO DIFFERENT IDENTITIES, ONE KEY. The separator is a bare colon and both the object key and
     // the component may contain one, so the boundary between them is not recoverable.
+    let colon_in_the_object = block_ref_key_from_parts("string", "a:b", None, 0, 0, 0, 0, 0);
+    let colon_in_the_component = block_ref_key_from_parts("string", "a", Some("b:"), 0, 0, 0, 0, 0);
+    println!("object `a:b`, no component -> {colon_in_the_object}");
+    println!("object `a`, component `b:` -> {colon_in_the_component}");
+    assert_eq!(
+        colon_in_the_object, colon_in_the_component,
+        "two different identities must collide for the format to be shown ambiguous"
+    );
+
+    // THE CONTROL, and without it the collision above proves nothing about the FORMAT: two
+    // identities that differ in a way the format DOES delimit must produce different keys, or the
+    // builder would simply be returning a constant.
+    let plainly_different = block_ref_key_from_parts("string", "a", None, 0, 0, 0, 0, 0);
+    assert_ne!(
+        plainly_different, colon_in_the_object,
+        "the builder must distinguish identities it can delimit, or the collision is vacuous"
+    );
+
+    // AND THE NUMERIC TAIL IS DELIMITED, which is why a right-anchored parse works TODAY while
+    // every component is absent. Asserted so that the narrow availability of that parse is
+    // recorded as a property being relied on rather than a guarantee.
+    let later_generation = block_ref_key_from_parts("string", "a:b", None, 0, 0, 0, 0, 1);
+    assert_ne!(
+        later_generation, colon_in_the_object,
+        "the trailing terms are positional and do distinguish"
+    );
+}
+
+
+/// A DECODE FILES EVERY LIVE PAGE INTO THE OBJECT LOOKUP, INSTEAD OF LEAVING IT TO A LATER WALK.
+///
+/// # WHY THE DECODER HAS TO BE THE ONE THAT DOES IT
+///
+/// `object_block_lookup` is keyed by (kind, object key) and valued by the
+/// `(routing_bucket, handle)` of each of that object's pages. It is not written, and it was
+/// rebuilt after every load by `rebuild_object_block_lookup`, which walks the decoded entries and
+/// reads the identity off each one. That walk is exactly what stops working when the entry carries
+/// no identity -- so the filing moves to the one pass that has both the identity and the handle in
+/// scope, which is the decode itself.
+///
+/// # THE THREE CLAIMS, AND THE CONTROL THAT MAKES THEM MEAN ANYTHING
+///
+/// The decoded lookup must name each LIVE page by the handle the decoded map filed it under; the
+/// derived ref total must be established at that count; and the DELETED page must be absent --
+/// `insert_object_block_lookup` returns early on one, and without that third claim the first two
+/// would be equally true of a decoder that filed everything it saw.
+///
+/// THE HANDLES ARE COMPARED AGAINST THE DECODED MAP'S OWN KEYS, not against handles recomputed
+/// here. A lookup ref that names a handle the map does not hold is a ref pointing at nothing,
+/// which is the failure a counter-assigned handle produced on this structure once already.
+#[test]
+fn a_decode_files_every_block_into_the_object_lookup() {
+    use crate::block_store::ElementEntry;
+    use crate::engine::state::BlockIndex;
+    use crate::engine::storage_bucket_internals::stored_model_kind;
+
+    const KIND: &str = "set";
+    const LIVE_OBJECT: &str = "live-object";
+    const DEAD_OBJECT: &str = "dead-object";
+
+    // THE `object` PARAMETER IS GONE, NOT RENAMED `_object`. The entry has no field for it, and a
+    // caller that still tries to name an object through this builder should stop compiling rather
+    // than be ignored -- the treatment `entry_count_versus_block_count::block_at` took for its own
+    // dead `component` argument. The object each page belongs to is named where it is filed.
+    fn block(slab: u64, offset: u64, deleted: bool) -> BlockIndex {
+        BlockIndex {
+            model_id: stored_model_kind(KIND),
+            address: ElementEntry::from_parts(slab, offset, 16, Some(offset / 16 + 1), None),
+            dirty: false,
+            deleted,
+        }
+    }
+
+    let mut index = CoreIndex::default();
+    for routing_bucket in [3u32, 11u32] {
+        let mut node = BucketNode::default();
+        node.routing_bucket = routing_bucket;
+        node.set_meta_loaded(true);
+        node.set_in_memory(true);
+        index.bucket_map.insert(routing_bucket, node);
+    }
+    let placed: Vec<(u32, Arc<str>, BlockIndex)> = vec![
+        (3, Arc::from(LIVE_OBJECT), block(1, 0, false)),
+        (3, Arc::from(LIVE_OBJECT), block(1, 16, false)),
+        (11, Arc::from(DEAD_OBJECT), block(2, 0, true)),
+    ];
+    {
+        let CoreIndex {
+            bucket_map,
+            block_slab_live,
+            ..
+        } = &mut index;
+        for (routing_bucket, object_key, entry) in &placed {
+            let node = bucket_map
+                .get_mut(routing_bucket)
+                .expect("the bucket was just inserted");
+            node.insert_block(object_key, entry.clone(), block_slab_live);
+        }
+    }
+
+    // THE WRITING INDEX FILES ITS LOOKUP, WHICH IS WHAT CHANGED HERE AND WHY.
+    //
+    // This fixture used to leave the lookup empty and assert that it was, under "the subject is
+    // the decode, so the lookup going in is empty". That premise was about the WRONG index. The
+    // decode builds a fresh `CoreIndex` in its own visitor and fills the lookup from the page keys
+    // it reads, so what the ENCODING index held was never a term in the claim -- while an encode
+    // taken with no lookup is now refused outright, because the stored key is composed from the
+    // identity held beside each page and there was none.
+    //
+    // So the fixture files what a placement files, and the claim is restated where it belongs:
+    // the lookup is `skip_serializing`, so it must not be IN the bytes, and the decoded index must
+    // still have one. Those two together are the subject; the writer's own state is not.
+    for (routing_bucket, object_key, entry) in &placed {
+        let handle = crate::engine::state::block_index_handle(object_key, entry);
+        index.insert_object_block_lookup(*routing_bucket, handle, object_key, entry);
+    }
+
+    // AND THE DELETED PAGE IS NAMED BY A TOMBSTONE ROW, WHICH IS ITS OWN SOURCE AND NOT THE
+    // LOOKUP.
+    //
+    // `insert_object_block_lookup` returns early on a deleted page, so a tombstone is never in the
+    // lookup at all -- the structure beside it that states which object it belonged to is this
+    // bucket's own row, keyed by the page triple. The single producer of a tombstone entry
+    // (`register_block_tombstone_entry`) files one in the same call as the entry and
+    // `debug_assert!`s that an element was named, so a deleted page with no row is a state
+    // production does not reach. This fixture now files what that producer files.
+    for (routing_bucket, object_key, entry) in &placed {
+        if entry.deleted {
+            let bucket = index
+                .bucket_map
+                .get_mut(routing_bucket)
+                .expect("the bucket holding the tombstone was just inserted");
+            bucket.record_tombstone_element(
+                object_key,
+                stored_model_kind(KIND),
+                "the-removed-member",
+                &entry.address,
+            );
+        }
+    }
+
+    let encoded = serde_json::to_string(&index).expect("a core index serializes");
+    assert!(
+        !encoded.contains("object_block_lookup"),
+        "the lookup is `skip_serializing`, so an index that HAS one must still not write it -- \
+         otherwise the decode below is reading a stored copy rather than rebuilding: {encoded}"
+    );
+    let decoded: CoreIndex = serde_json::from_str(&encoded).expect("a core index deserializes");
+
+    // CLAIM ONE: every live page is named, by the handle the decoded map holds it under.
+    let filed: std::collections::BTreeSet<(u32, u64)> = decoded
+        .block_refs_for(KIND, LIVE_OBJECT, None)
+        .expect("the live object must be in the decoded lookup")
+        .iter()
+        .map(|block_ref| (block_ref.routing_bucket, block_ref.block_ref_key))
+        .collect();
+    let held: std::collections::BTreeSet<(u32, u64)> = decoded
+        .bucket_map
+        .iter()
+        .flat_map(|(routing_bucket, node)| {
+            node.block_index
+                .iter()
+                .filter(|(_, block)| !block.deleted)
+                .map(move |(handle, _)| (*routing_bucket, *handle))
+        })
+        .collect();
+    assert_eq!(
+        2,
+        held.len(),
+        "the decoded map must hold the two live pages, or this comparison has nothing in it"
+    );
+    assert_eq!(
+        held, filed,
+        "every live page the decoded map holds must be named by the decoded lookup, at the same \
+         handle"
+    );
+
+    // CLAIM TWO: the derived total is established, at the count of refs filed.
+    assert_eq!(
+        Some(2),
+        decoded.object_component_block_refs,
+        "the decode must establish the ref total at what it filed"
+    );
+
+    // CLAIM THREE, THE CONTROL: the deleted page is NOT filed, so the two claims above are about
+    // what the filing rule admits rather than about everything the decoder saw.
+    assert!(
+        decoded.block_refs_for(KIND, DEAD_OBJECT, None).is_none(),
+        "a deleted page must not reach the lookup, or the claims above hold of any decoder at all"
+    );
+}
+
+/// A DELETED PAGE'S IDENTITY IS IN THE BUCKET'S TOMBSTONE ROW, AND THAT ROW COMPOSES THE SAME
+/// STORED KEY THE ENTRY DOES.
+///
+/// # WHY THIS IS THE MISSING HALF OF THE PRE-VERIFICATION
+///
+/// The encode-side check that the identity held BESIDE a page agrees with the identity held ON it
+/// drew on one source, the object lookup, and a tombstone is never in that lookup --
+/// `insert_object_block_lookup` returns early on a deleted page. So the check skipped every
+/// deleted page, and it was measured skipping them: over the hundred dump tests it compared
+/// 1,998,922 pages and NONE of them was deleted, while the encoder was reached by deleted pages
+/// under `tombstone` and `container_tombstone`. A swap from check to source cannot be called
+/// pre-verified on a class the check never looked at.
+///
+/// # SO THE SECOND SOURCE IS ASSERTED HERE, DIRECTLY
+///
+/// This builds one bucket holding a LIVE page and a DELETED one of the same object, files both
+/// through the index's own `insert_object_block_lookup` -- so the exclusion of the deleted page is
+/// the production rule and not a fixture's choice -- and asserts three things: the lookup names
+/// one of the two, the bucket's tombstone row names the other, and the row composes exactly the
+/// stored key the encode wrote for it.
+///
+/// THE FIRST ASSERTION IS THE CONTROL. Without it a tombstone could be in the lookup after all,
+/// and the row would be a second copy of an identity already available rather than the only one.
+#[test]
+fn the_identity_beside_a_deleted_block_is_its_tombstone_row_and_it_composes_the_same_stored_key() {
+    use crate::block_store::ElementEntry;
+    use crate::engine::state::BlockIndex;
+    use crate::engine::storage_bucket_internals::stored_model_kind;
+
+    const SLAB: u64 = 3;
+    const LIVE_OFFSET: u64 = 0;
+    const DEAD_OFFSET: u64 = 64;
+    const LENGTH: u64 = 27;
+    const OBJECT: &str = "an-object";
+    const KIND: &str = "set";
+    const ELEMENT: &str = "m0";
+
+    let mut index = CoreIndex::default();
+    let mut node = BucketNode::default();
+    node.routing_bucket = 7;
+    node.set_meta_loaded(true);
+    node.set_in_memory(true);
+    index.bucket_map.insert(7, node);
+
+    let live = BlockIndex {
+        model_id: stored_model_kind(KIND),
+        address: ElementEntry::from_parts(SLAB, LIVE_OFFSET, LENGTH, Some(1), None),
+        dirty: false,
+        deleted: false,
+    };
+    let dead = BlockIndex {
+        model_id: stored_model_kind(KIND),
+        address: ElementEntry::from_parts(SLAB, DEAD_OFFSET, LENGTH, Some(2), None),
+        dirty: true,
+        deleted: true,
+    };
+
+    let (live_handle, dead_handle) = {
+        let CoreIndex {
+            bucket_map,
+            block_slab_live,
+            ..
+        } = &mut index;
+        let node = bucket_map.get_mut(&7).expect("the bucket was just inserted");
+        // ONE KEY FOR BOTH PAGES, WHICH IS WHAT THE FIXTURE MEANT. The two differ in their
+        // address and their `deleted` bit; they are the same object by construction, so passing
+        // the literal twice says that, where reading one copy off each page did not.
+        let object_key: std::sync::Arc<str> = std::sync::Arc::from(OBJECT);
+        let live_handle = node.insert_block(&object_key, live.clone(), block_slab_live);
+        let dead_handle = node.insert_block(&object_key, dead.clone(), block_slab_live);
+        // The SAME handle the two pages were filed with, which is what the production path
+        // now does: the row clones a handle rather than minting from the characters.
+        node.record_tombstone_element(
+            &object_key,
+            stored_model_kind(KIND),
+            ELEMENT,
+            &dead.address,
+        );
+        (live_handle, dead_handle)
+    };
+    assert_ne!(
+        live_handle, dead_handle,
+        "two pages at different offsets must file under different handles, or this bucket holds one page"
+    );
+
+    let object: Arc<str> = Arc::from(OBJECT);
+    index.insert_object_block_lookup(7, live_handle, &object, &live);
+    index.insert_object_block_lookup(7, dead_handle, &object, &dead);
+
+    // THE CONTROL: the lookup holds the live page and REFUSES the deleted one.
+    let refs = index
+        .block_refs_for(KIND, OBJECT, None)
+        .expect("the live page files a ref");
+    assert_eq!(
+        1,
+        refs.len(),
+        "a deleted page must not reach the lookup, or the tombstone row is not the only source"
+    );
+    assert_eq!(
+        live_handle, refs[0].block_ref_key,
+        "the one ref must be the LIVE page's"
+    );
+
+    // AND THE ROW HOLDS THE DELETED PAGE'S IDENTITY.
+    let row_key = {
+        let node = index.bucket_map.get(&7).expect("the bucket is still there");
+        let row = node
+            .tombstone_element_at(&dead.address)
+            .expect("the removal filed a row against the deleted page");
+        crate::index_log::block_ref_key_from_parts(
+            row.model_id.as_str(),
+            &row.object_key,
+            None,
+            dead.address.block_slab_id(),
+            dead.address.offset(),
+            dead.address.length(),
+            dead.address.block_id().unwrap_or_default(),
+            dead.address.generation().unwrap_or_default(),
+        )
+    };
+
+    let encoded = serde_json::to_value(&index).expect("a core index serializes");
+    let blocks = encoded
+        .get("bucket_map")
+        .and_then(|buckets| buckets.get("7"))
+        .and_then(|node| node.get("page_index"))
+        .and_then(|blocks| blocks.as_object())
+        .expect("the bucket writes a page index")
+        .clone();
+
+    assert_eq!(
+        2,
+        blocks.len(),
+        "the encode must write BOTH pages, or the deleted one is not on the wire at all: {:?}",
+        blocks.keys().collect::<Vec<_>>()
+    );
+    assert!(
+        blocks.contains_key(&row_key),
+        "the key the TOMBSTONE ROW composes must be one the encode wrote, or the row is not a \
+         source for this page: row composed {row_key}, encode wrote {:?}",
+        blocks.keys().collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn the_legacy_spelling_of_the_one_wire_field_still_loads_and_an_unknown_one_does_not() {
+    // WHY THIS SITS BESIDE THE GUARD RATHER THAN ONLY IN ANOTHER MODULE.
+    //
+    // The one wire field carries `alias = "slots"`, and a HAND-WRITTEN `Deserialize` -- which is
+    // the change this file exists to make safe -- is precisely the edit that drops a legacy alias
+    // with no other symptom: everything still compiles, the round trip above still passes, because
+    // a round trip only ever writes the CURRENT spelling and reads it back.
+    //
+    // `core_index_loads_legacy_bucket_page_field_names` does cover this today. Relying on it means
+    // the guard that sits beside the impl does not assert the thing the impl is most likely to
+    // break, so the coverage is restated here where the destructuring and the key set already are.
+    //
+    // THE CONTROL IS THE WHOLE TEST, AND WITHOUT IT THIS ASSERTS NOTHING. The field is
+    // `#[serde(default)]`, so an index whose top-level key the decoder does not recognise decodes
+    // SUCCESSFULLY, with an empty map and no error. "It decoded" is therefore true of any input at
+    // all. The discriminating pair is: the legacy spelling must come back POPULATED, and an
+    // unrecognised spelling must come back EMPTY. Only the two together say the alias is doing
+    // work.
+    //
+    // AND THE BUCKETS ARE TAKEN FROM A REAL ENCODE rather than hand-written as JSON, so this test
+    // does not carry its own copy of the node's stored shape -- a copy that would go stale the
+    // first time the node's own encoder moved, and would then be testing a shape nothing writes.
+    let index = an_index_with_every_field_populated();
+    let encoded = serde_json::to_value(&index).expect("a core index serializes");
+    let mut fields = encoded
+        .as_object()
+        .expect("a core index encodes as a map")
+        .clone();
+    let buckets = fields
+        .remove("bucket_map")
+        .expect("the one wire field is written under its current spelling");
+    assert!(
+        fields.is_empty(),
+        "nothing else is on the wire, so nothing else needs re-spelling here: {:?}",
+        fields.keys().collect::<Vec<_>>()
+    );
+
+    // THE LEGACY SPELLING. An index written before the field was renamed is keyed `slots`.
+    let mut legacy = serde_json::Map::new();
+    legacy.insert("slots".to_string(), buckets.clone());
+    let from_legacy: CoreIndex = serde_json::from_value(serde_json::Value::Object(legacy))
+        .expect("an index keyed with the legacy spelling must still decode");
+    assert_eq!(
+        from_legacy.bucket_map.len(),
+        index.bucket_map.len(),
+        "the legacy spelling must still load the bucket map, not quietly default it"
+    );
+
+    // THE CONTROL. A spelling the decoder knows nothing about must be IGNORED -- which is what
+    // makes the assertion above a statement about the alias rather than about `default`.
+    let mut unknown = serde_json::Map::new();
+    unknown.insert("slotz".to_string(), buckets);
+    let from_unknown: CoreIndex = serde_json::from_value(serde_json::Value::Object(unknown))
+        .expect("an unrecognised key is ignored, which is what lets a newer index load into an older engine");
+    assert!(
+        from_unknown.bucket_map.is_empty(),
+        "an unrecognised spelling must leave the map at its default; if this were populated the \
+         test above would pass whatever the alias did"
+    );
+}

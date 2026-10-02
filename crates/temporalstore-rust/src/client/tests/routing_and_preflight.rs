@@ -496,3 +496,501 @@ fn table_typed_methods_and_pipeline_match_client_shape() {
     pipeline.hget("pk", "pf");
     let response = pipeline.sync().unwrap();
     assert_eq!(response.responses.len(), 2);
+    assert_eq!(
+        response.responses[1].response,
+        CommandResponse::Bytes {
+            value: Some(b"pv".to_vec())
+        }
+    );
+}
+
+#[test]
+fn direct_client_refreshes_cached_route_after_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let server_addr = free_local_addr();
+    let meta_addr = free_local_addr();
+    let engine_for_server = engine.clone();
+    let server_addr_for_listener = server_addr.clone();
+    std::thread::spawn(move || {
+        serve(&server_addr_for_listener, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/execute") => {
+                    let req = parse_json::<ExecuteRequest>(&request.body).unwrap();
+                    json_response(200, &engine_for_server.execute(req))
+                }
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+    let live_server = server_addr.clone();
+    let meta_addr_for_listener = meta_addr.clone();
+    std::thread::spawn(move || {
+        serve(&meta_addr_for_listener, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/shards/1") => json_response(
+                    200,
+                    &GetShardResponse {
+                        status: Status::ok(),
+                        location: Some(ShardLocation {
+                            registered_at_ms: 0,
+                            preferred_location: String::new(),
+                            state: crate::meta::MetaEntityState::Normal,
+                            shard_id: 1,
+                            server_addr: live_server.clone(),
+                            latest_snapshot: None,
+                        }),
+                    },
+                ),
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+    wait_for_http(&meta_addr);
+
+    let client = TemporalStoreClient::with_options(ClientOptions {
+        proxy_addr: "127.0.0.1:1".to_string(),
+        meta_addr: Some(meta_addr.clone()),
+        route_cache_ttl_ms: 60_000,
+        connect_timeout_ms: 50,
+        io_timeout_ms: 200,
+        ..ClientOptions::default()
+    });
+    client
+        .inner
+        .routes
+        .write()
+        .unwrap()
+        .insert(1, CachedRoute::for_shard(1, "127.0.0.1:1", "test_insert"));
+    let table = client.open_table("ns", "tbl", TableOptions::default());
+    table.set("k", b"v".to_vec()).unwrap();
+    assert_eq!(table.get("k").unwrap(), Some(b"v".to_vec()));
+    let stats = client.stats();
+    assert_eq!(stats.backend_errors, 1);
+    assert_eq!(stats.backend_error_streak, 0);
+    assert_eq!(stats.backend_successes_after_error, 1);
+}
+
+#[test]
+fn table_write_refreshes_topology_after_meta_changed_without_write_retry_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let stale_addr = free_local_addr();
+    let live_addr = free_local_addr();
+    let meta_addr = free_local_addr();
+    let stale_attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let stale_attempts_for_server = stale_attempts.clone();
+    let stale_addr_for_listener = stale_addr.clone();
+    std::thread::spawn(move || {
+        serve(&stale_addr_for_listener, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/execute") => {
+                    stale_attempts_for_server.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    json_response(
+                        200,
+                        &ExecuteResponse {
+                            status: Status::error("meta_changed", "route moved"),
+                            response: CommandResponse::Empty,
+                        },
+                    )
+                }
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+
+    let engine_for_live = engine.clone();
+    let live_addr_for_listener = live_addr.clone();
+    std::thread::spawn(move || {
+        serve(&live_addr_for_listener, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/execute") => {
+                    let req = parse_json::<ExecuteRequest>(&request.body).unwrap();
+                    json_response(200, &engine_for_live.execute(req))
+                }
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+
+    let live_addr_for_meta = live_addr.clone();
+    let meta_addr_for_listener = meta_addr.clone();
+    std::thread::spawn(move || {
+        serve(&meta_addr_for_listener, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/tables/topology") => json_response(
+                    200,
+                    &TableTopologyResponse {
+                        status: Status::ok(),
+                        table: Some(TableMetaInfo {
+                            table_id: 7,
+                            namespace: "ns".to_string(),
+                            table_name: "tbl".to_string(),
+                            state: crate::meta::MetaEntityState::Normal,
+                            topology_version: 2,
+                            first_shard_id: 1,
+                            shard_count: 1,
+                            replica_count: 1,
+                            partition_version: 0,
+                            serving_options: crate::meta::TableServingOptions::default(),
+                        }),
+                        shards: vec![TableShard {
+                            load_version: 0,
+                            shard_id: 1,
+                            start_bucket: 0,
+                            end_bucket: u64::MAX,
+                            primary: Some(live_addr_for_meta.clone()),
+                            replicas: vec![live_addr_for_meta.clone()],
+                            primary_endpoint: None,
+                            replica_endpoints: Vec::new(),
+                        }],
+                        unchanged: false,
+                    },
+                ),
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+    wait_for_http(&stale_addr);
+    wait_for_http(&live_addr);
+    wait_for_http(&meta_addr);
+
+    let client = TemporalStoreClient::with_options(ClientOptions {
+        proxy_addr: "127.0.0.1:1".to_string(),
+        meta_addr: Some(meta_addr.clone()),
+        route_cache_ttl_ms: 60_000,
+        max_write_retries: 0,
+        retry_backoff_ms: 0,
+        ..ClientOptions::default()
+    });
+    let table = client.open_table(
+        "ns",
+        "tbl",
+        TableOptions {
+            first_shard_id: 1,
+            shard_count: 1,
+            max_write_retries: 0,
+            retry_backoff_ms: 0,
+            ..TableOptions::default()
+        },
+    );
+    client.insert_cached_route_for_test(1, stale_addr);
+
+    table.set("k", b"v".to_vec()).unwrap();
+    assert_eq!(table.get("k").unwrap(), Some(b"v".to_vec()));
+    assert_eq!(stale_attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert_eq!(
+        client.topology_cache_report().routes[0].primary_addr,
+        live_addr
+    );
+}
+
+#[test]
+fn the_execute_counters_survive_the_move_off_the_stats_lock() {
+    // These are counted in atomics and added back when the stats are read. Nothing else checks
+    // that the adding-back happens, and if it stopped they would read zero forever -- the counter
+    // still incrementing, the report still answering, and the number simply always 0.
+    let client = TemporalStoreClient::new("127.0.0.1:1");
+    let table = client.open_table("ns", "tbl", TableOptions::default());
+
+    assert_eq!(client.stats().execute_requests, 0, "nothing executed yet");
+    assert_eq!(client.stats().batch_execute_requests, 0);
+
+    // There is no backend, so these fail -- but the count is taken before the attempt, which is
+    // what makes a failing execute countable at all.
+    let _ = table.execute(Command::StringGet {
+        key: "k".to_string(),
+    });
+    let _ = table.execute(Command::StringGet {
+        key: "k2".to_string(),
+    });
+    assert_eq!(
+        client.stats().execute_requests,
+        2,
+        "two executes must be reported -- zero here means the atomic is no longer folded into          the stats the report reads"
+    );
+
+    let _ = table.batch_execute(vec![Command::StringGet {
+        key: "k".to_string(),
+    }]);
+    assert_eq!(
+        client.stats().batch_execute_requests,
+        1,
+        "batch executes are counted separately and must be folded in too"
+    );
+    assert_eq!(
+        client.stats().execute_requests,
+        2,
+        "a batch must not be counted as a plain execute as well"
+    );
+}
+
+#[test]
+fn a_split_table_routes_keys_over_its_new_shard_count() {
+    // `shard_id_for_key` reads the table's options through the per-thread snapshot. A table that
+    // is re-synced after a split has more shards, and a handle taken before that must pick the
+    // change up: routing over the old count sends keys to a shard that no longer owns them, and
+    // nothing fails while it happens.
+    let client = TemporalStoreClient::new("127.0.0.1:1");
+    let table = client.open_table(
+        "ns",
+        "tbl",
+        TableOptions {
+            shard_count: 4,
+            first_shard_id: 100,
+            ..TableOptions::default()
+        },
+    );
+
+    // Spread keys over the four shards and remember where they landed.
+    let before: Vec<_> = (0..32)
+        .map(|i| table.shard_id_for_key(&format!("k{i}")))
+        .collect();
+    assert!(
+        before.iter().any(|shard| *shard >= 100 && *shard < 104),
+        "keys must land inside the four shards the table was opened with"
+    );
+    assert!(
+        before.iter().all(|shard| *shard < 104),
+        "no key may land outside them: {before:?}"
+    );
+
+    // The split: same table, eight shards. Same thread, so the snapshot taken above is in hand.
+    let _resynced = client.open_table(
+        "ns",
+        "tbl",
+        TableOptions {
+            shard_count: 8,
+            first_shard_id: 100,
+            ..TableOptions::default()
+        },
+    );
+
+    let after: Vec<_> = (0..32)
+        .map(|i| table.shard_id_for_key(&format!("k{i}")))
+        .collect();
+    assert!(
+        after.iter().any(|shard| *shard >= 104),
+        "after the split some key must route into the new shards -- none here means this handle          is still hashing over the four it was opened with: {after:?}"
+    );
+}
+
+#[test]
+fn a_table_opened_after_a_lookup_is_still_found() {
+    // Table lookups read a per-thread snapshot of the open-table map, refreshed only when the
+    // version moves. A thread that has already looked one up holds a snapshot; if opening a table
+    // does not move the version, that thread never sees the new table and every request for it
+    // takes the miss path to the metaserver instead.
+    let client = TemporalStoreClient::new("127.0.0.1:1");
+    let _first = client.open_table("ns", "a", TableOptions::default());
+    assert!(
+        client.cached_table("ns", "a").is_some(),
+        "the table just opened is in the cache"
+    );
+
+    // Same thread, so the snapshot taken above is the one in hand.
+    let _second = client.open_table("ns", "b", TableOptions::default());
+    assert!(
+        client.cached_table("ns", "b").is_some(),
+        "a table opened after this thread cached a snapshot must still be found -- a miss here          means the open did not move the version"
+    );
+
+    // And closing must reach it too, or a closed table keeps being served from a stale snapshot.
+    let first = client.cached_table("ns", "a").expect("still open");
+    client.close_table(&first).expect("close");
+    assert!(
+        client.cached_table("ns", "a").is_none(),
+        "a closed table must leave the snapshot too"
+    );
+    assert!(
+        client.cached_table("ns", "b").is_some(),
+        "closing one table must not drop the other"
+    );
+}
+
+#[test]
+fn the_backend_failure_count_tracks_the_map_it_stands_in_for() {
+    // The route lookup skips the failure-map lock when this count is zero, so the count is only
+    // safe while it equals the map's length. Every mutation goes through `with_backend_failures`
+    // for that reason; this fails if a path is ever added that does not.
+    let client = TemporalStoreClient::new("127.0.0.1:1");
+    assert_eq!(
+        client.backend_failure_entries_for_test(),
+        0,
+        "a fresh client has recorded no failures"
+    );
+
+    client.insert_backend_failure_for_test("10.0.0.1:7", 50, 10, 3);
+    assert_eq!(
+        client.backend_failure_entries_for_test(),
+        1,
+        "an inserted failure must be visible to the fast path, or the lookup skips a check it          should have made"
+    );
+
+    client.insert_backend_failure_for_test("10.0.0.2:7", 50, 10, 1);
+    assert_eq!(client.backend_failure_entries_for_test(), 2);
+
+    client.record_backend_success("10.0.0.1:7");
+    assert_eq!(
+        client.backend_failure_entries_for_test(),
+        1,
+        "clearing one address must not clear the count for the other"
+    );
+
+    client.record_backend_success("10.0.0.2:7");
+    assert_eq!(
+        client.backend_failure_entries_for_test(),
+        0,
+        "with the map empty again the lookup may go back to skipping the lock"
+    );
+}
+
+#[test]
+fn client_backend_pool_skips_cached_route_after_continuous_failure_threshold() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    let server_addr = free_local_addr();
+    let meta_addr = free_local_addr();
+    let engine_for_server = engine.clone();
+    let server_addr_for_listener = server_addr.clone();
+    std::thread::spawn(move || {
+        serve(&server_addr_for_listener, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/execute") => {
+                    let req = parse_json::<ExecuteRequest>(&request.body).unwrap();
+                    json_response(200, &engine_for_server.execute(req))
+                }
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+    let live_server = server_addr.clone();
+    let meta_addr_for_listener = meta_addr.clone();
+    std::thread::spawn(move || {
+        serve(&meta_addr_for_listener, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("GET", "/shards/1") => json_response(
+                    200,
+                    &GetShardResponse {
+                        status: Status::ok(),
+                        location: Some(ShardLocation {
+                            registered_at_ms: 0,
+                            preferred_location: String::new(),
+                            state: crate::meta::MetaEntityState::Normal,
+                            shard_id: 1,
+                            server_addr: live_server.clone(),
+                            latest_snapshot: None,
+                        }),
+                    },
+                ),
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+    wait_for_http(&meta_addr);
+
+    let bad_server = "127.0.0.1:1".to_string();
+    let client = TemporalStoreClient::with_options(ClientOptions {
+        proxy_addr: bad_server.clone(),
+        meta_addr: Some(meta_addr.clone()),
+        route_cache_ttl_ms: 60_000,
+        connect_timeout_ms: 50,
+        io_timeout_ms: 200,
+        ..ClientOptions::default()
+    });
+    client.inner.routes.write().unwrap().insert(
+        1,
+        CachedRoute::for_shard(1, bad_server.clone(), "test_insert"),
+    );
+    client.insert_backend_failure_for_test(bad_server, 20, 10, 3);
+
+    let table = client.open_table(
+        "ns",
+        "tbl",
+        TableOptions {
+            continuous_failed_time_ms: 0,
+            ..TableOptions::default()
+        },
+    );
+    table.set("k", b"v".to_vec()).unwrap();
+    assert_eq!(table.get("k").unwrap(), Some(b"v".to_vec()));
+
+    let stats = client.stats();
+    assert_eq!(stats.backend_errors, 0);
+    assert_eq!(stats.route_cache_hits, 1);
+    assert!(stats.route_refreshes >= 1);
+    assert_eq!(stats.continuous_backend_failures, 1);
+}
+
+#[test]
+fn client_opens_table_from_metaserver_topology() {
+    let meta_addr = free_local_addr();
+    let meta_addr_for_listener = meta_addr.clone();
+    std::thread::spawn(move || {
+        serve(&meta_addr_for_listener, move |request| {
+            match (request.method.as_str(), request.path.as_str()) {
+                ("POST", "/tables/topology") => json_response(
+                    200,
+                    &TableTopologyResponse {
+                        status: Status::ok(),
+                        table: Some(crate::meta::TableMetaInfo {
+                            table_id: 1,
+                            namespace: "ns".to_string(),
+                            table_name: "tbl".to_string(),
+                            state: crate::meta::MetaEntityState::Normal,
+                            topology_version: 7,
+                            first_shard_id: 10,
+                            shard_count: 4,
+                            replica_count: 1,
+                            partition_version: 0,
+                            serving_options: crate::meta::TableServingOptions::default(),
+                        }),
+                        shards: Vec::new(),
+                        unchanged: false,
+                    },
+                ),
+                _ => json_response(404, &Status::error("not_found", "not found")),
+            }
+        })
+        .unwrap();
+    });
+    wait_for_http(&meta_addr);
+
+    let client = TemporalStoreClient::with_options(ClientOptions {
+        meta_addr: Some(meta_addr.clone()),
+        drop_percent: 17,
+        ..ClientOptions::default()
+    });
+    let table = client.open_table_from_meta("ns", "tbl").unwrap();
+    assert_eq!(table.namespace(), "ns");
+    assert_eq!(table.table_name(), "tbl");
+    assert_eq!(table.options().drop_percent, 17);
+    let routed = table.shard_id_for_key("routing-key");
+    assert!((10..14).contains(&routed));
+}
+
