@@ -2098,3 +2098,8407 @@ pub fn block_ref_key_parts(key: &str) -> Result<BlockRefKeyParts<'_>, BlockRefKe
                 cut = found;
             }
             None => {
+                return Err(refuse(
+                    "it holds fewer than seven separators, so it cannot be the eight-slot \
+                     composite the page index is keyed by",
+                ))
+            }
+        }
+    }
+    let head = &key[..at[5]];
+    let (kind, object_key) = head.split_once(':').ok_or_else(|| {
+        refuse(
+            "its head holds no separator, so there is no slot in it for a kind and an object key \
+             both",
+        )
+    })?;
+    let numeric = |text: &str, which: &'static str| {
+        canonical_decimal(text).ok_or(BlockRefKeyUnparsable { key: key.to_string(), because: which })
+    };
+    Ok(BlockRefKeyParts {
+        kind,
+        object_key,
+        component: &key[at[5] + 1..at[4]],
+        block_slab_id: numeric(
+            &key[at[4] + 1..at[3]],
+            "its slab id slot is not a decimal in the spelling the renderer writes",
+        )?,
+        offset: numeric(
+            &key[at[3] + 1..at[2]],
+            "its offset slot is not a decimal in the spelling the renderer writes",
+        )?,
+        length: numeric(
+            &key[at[2] + 1..at[1]],
+            "its length slot is not a decimal in the spelling the renderer writes",
+        )?,
+        block_id: numeric(
+            &key[at[1] + 1..at[0]],
+            "its block id slot is not a decimal in the spelling the renderer writes",
+        )?,
+        generation: numeric(
+            &key[at[0] + 1..],
+            "its generation slot is not a decimal in the spelling the renderer writes",
+        )?,
+    })
+}
+
+// ---------------------------------------------------------------------------------------------
+// WHAT THIS STORE READS OFF DISK, COUNTED WHERE THE READING HAPPENS.
+//
+// `IndexLogStats::bytes_read` counts what a read HANDS BACK -- the records inside the window a
+// caller asked for. That is a useful number and it is not this one. The load-path fold reads
+// whole PIECES and hands back RECORDS, and it fed neither counter at all: #1936 measured a
+// 200,000-record restore reading 8,119,256 bytes off this store's pieces in 1,069 reads while
+// `index_log_store().stats()` answered `bytes_read: 0`. Measured again here at 2,000 and 8,000
+// records, the fold read 163,236 and 655,236 bytes -- the whole log, both times -- against a
+// store that reported zero.
+//
+// A READER WITH NO COUNTER CONTRIBUTES ZERO TO EVERY REPORT, WHICH IS INDISTINGUISHABLE FROM A
+// READER DOING NO WORK. That is how 965,415,651 bytes -- 95% of a restore -- survived every
+// previous measurement of that path.
+//
+// Process-wide rather than per-store, and deliberately: pieces are read from free functions that
+// hold no store (`last_sequence_at`, `index_log_segment_span_of`), so charging a store would mean
+// threading one through the whole read side to buy a number that is already obtainable. The
+// thread-local beside it is what a single restore wants, because a restore runs on one thread
+// while the suite does not.
+// ---------------------------------------------------------------------------------------------
+
+static INDEX_LOG_PIECE_BYTES_READ: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+static INDEX_LOG_PIECE_READS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+thread_local! {
+    static INDEX_LOG_PIECE_BYTES_READ_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static INDEX_LOG_PIECE_READS_HERE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Bytes and read calls this PROCESS has made against index-log pieces since it started.
+pub fn index_log_piece_read_counts() -> (u64, u64) {
+    (
+        INDEX_LOG_PIECE_BYTES_READ.load(std::sync::atomic::Ordering::Relaxed),
+        INDEX_LOG_PIECE_READS.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
+/// Bytes and read calls THIS THREAD has made against index-log pieces since it started.
+///
+/// A restore runs on one thread; the suite runs many at once. Measuring a restore against the
+/// process counter reads another test's reads as this one's.
+pub fn index_log_piece_read_counts_on_this_thread() -> (u64, u64) {
+    (
+        INDEX_LOG_PIECE_BYTES_READ_HERE.with(|bytes| bytes.get()),
+        INDEX_LOG_PIECE_READS_HERE.with(|reads| reads.get()),
+    )
+}
+
+/// What one span of reading against index-log pieces cost, published when it goes out of scope.
+///
+/// Held mutably by the [`CountedIndexLogFile`] it is passed to, so the handle cannot outlive it
+/// and A NEW READ OF A PIECE CANNOT BE WRITTEN WITHOUT A TALLY TO HAND OVER.
+pub(crate) struct IndexLogReadTally {
+    bytes: u64,
+    reads: u64,
+}
+
+impl IndexLogReadTally {
+    fn start() -> Self {
+        Self { bytes: 0, reads: 0 }
+    }
+}
+
+impl Drop for IndexLogReadTally {
+    fn drop(&mut self) {
+        if self.reads == 0 {
+            return;
+        }
+        INDEX_LOG_PIECE_BYTES_READ
+            .fetch_add(self.bytes, std::sync::atomic::Ordering::Relaxed);
+        INDEX_LOG_PIECE_READS.fetch_add(self.reads, std::sync::atomic::Ordering::Relaxed);
+        INDEX_LOG_PIECE_BYTES_READ_HERE.with(|bytes| bytes.set(bytes.get() + self.bytes));
+        INDEX_LOG_PIECE_READS_HERE.with(|reads| reads.set(reads.get() + self.reads));
+    }
+}
+
+/// A readable handle on one piece of an index log, which charges every byte the kernel hands it.
+///
+/// This is the only thing [`open_index_log_read`] and [`open_index_log_repair`] return, and they
+/// are the only way this module opens a piece to read it -- so the counting is not a call site
+/// anyone has to remember. `std::fs::File` is deliberately NOT imported into this module any
+/// more: a new read written the old way does not compile.
+pub(crate) struct CountedIndexLogFile<'a> {
+    file: std::fs::File,
+    tally: &'a mut IndexLogReadTally,
+}
+
+impl CountedIndexLogFile<'_> {
+    fn metadata(&self) -> std::io::Result<std::fs::Metadata> {
+        self.file.metadata()
+    }
+
+    fn set_len(&self, len: u64) -> std::io::Result<()> {
+        self.file.set_len(len)
+    }
+
+    fn sync_all(&self) -> std::io::Result<()> {
+        self.file.sync_all()
+    }
+}
+
+impl Read for CountedIndexLogFile<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let read = self.file.read(buf)?;
+        self.tally.bytes += read as u64;
+        self.tally.reads += 1;
+        Ok(read)
+    }
+}
+
+impl Seek for CountedIndexLogFile<'_> {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.file.seek(pos)
+    }
+}
+
+/// Open a piece of an index log for reading, and count what comes off it.
+///
+/// Every read-side open in this module goes through here or [`open_index_log_repair`], which is
+/// what makes a total takeable at all: the handle this returns is the only readable one, and a
+/// new read of a piece cannot be written without a tally to pass.
+fn open_index_log_read<'a>(
+    path: &Path,
+    tally: &'a mut IndexLogReadTally,
+) -> std::io::Result<CountedIndexLogFile<'a>> {
+    Ok(CountedIndexLogFile {
+        file: std::fs::File::open(path)?,
+        tally,
+    })
+}
+
+/// Open the piece being written, for the tail trim that reads it and then truncates it.
+///
+/// Read-WRITE, and still one of the read side's opens: the bytes it reads are charged like any
+/// other, or the counter would stop seeing this branch the moment a torn tail appeared.
+fn open_index_log_repair<'a>(
+    path: &Path,
+    tally: &'a mut IndexLogReadTally,
+) -> std::io::Result<CountedIndexLogFile<'a>> {
+    Ok(CountedIndexLogFile {
+        file: OpenOptions::new().read(true).write(true).open(path)?,
+        tally,
+    })
+}
+
+/// Exactly `len` bytes from `at` in a piece, through the one handle the read side uses.
+///
+/// The planted-marker control for the piece counter needs a read whose byte count IT decided, and
+/// the counted handle is private to this module.
+#[cfg(test)]
+pub(crate) fn read_index_log_piece_for_test(
+    path: &Path,
+    at: u64,
+    len: usize,
+) -> std::io::Result<Vec<u8>> {
+    let mut tally = IndexLogReadTally::start();
+    let mut file = open_index_log_read(path, &mut tally)?;
+    file.seek(SeekFrom::Start(at))?;
+    let mut bytes = vec![0u8; len];
+    let mut filled = 0usize;
+    while filled < len {
+        match file.read(&mut bytes[filled..]) {
+            Ok(0) => break,
+            Ok(read) => filled += read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    bytes.truncate(filled);
+    Ok(bytes)
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexLogStats {
+    pub writes: u64,
+    pub reads: u64,
+    pub scans: u64,
+    pub bytes_written: u64,
+    /// Bytes of RECORDS this store has handed back, which is not what it read off disk.
+    ///
+    /// The two came apart badly enough to hide a restore: see
+    /// [`index_log_piece_read_counts`], which is charged inside the read itself and is the
+    /// number to use for what a path COSTS. This one stays what it has always been, because a
+    /// caller reporting how much record data it received is asking a real question -- it is
+    /// simply a different one.
+    pub bytes_read: u64,
+    /// Records this store has read back and handed to a decoder.
+    ///
+    /// Beside `bytes_read`, which is the same work measured the other way. Both are what makes a
+    /// claim about what a round COSTS checkable without a clock: a guard that asserts a bound on
+    /// milliseconds asserts something about the machine, and this box cannot hold one still.
+    #[serde(default)]
+    pub records_read: u64,
+    pub last_sequence: u64,
+}
+
+/// What the index-GC gate needs, and what answering it cost.
+///
+/// The gate decides on a REMOVABLE-RECORD RATIO, which is two counts. Getting them by scanning
+/// and decoding the whole log made the maintenance round O(log size) even after reclaim itself
+/// stopped being -- the cost moved from the collector to the thing that decides whether to
+/// collect. Every one of these numbers except the last two is arithmetic on piece NAMES plus the
+/// one piece being written.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexLogGateSummary {
+    pub shard_id: ShardId,
+    /// The retain floor the counts below were taken against.
+    pub retain_from_sequence: u64,
+    /// On-disk bytes of the whole log: one `stat` per piece, nothing opened.
+    pub bytes: u64,
+    /// How many records the log holds.
+    pub records: usize,
+    /// How many of them sit below the floor.
+    pub removable_records: usize,
+    /// Files the log is in, the one being written included. This is what the gate now costs.
+    pub pieces: usize,
+    /// How many of those were answered from the NAME alone -- every sealed one.
+    pub pieces_named: usize,
+    /// Bytes read and decoded: the piece being written, and nothing else. Bounded by the rolling
+    /// threshold, not by the log.
+    pub bytes_decoded: u64,
+    /// Records read and decoded, bounded the same way.
+    pub records_decoded: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexLogGcReport {
+    pub shard_id: ShardId,
+    pub retain_from_sequence: u64,
+    #[serde(default)]
+    pub max_entries_per_round: usize,
+    pub records_before: usize,
+    pub records_after: usize,
+    pub records_removed: usize,
+    #[serde(default)]
+    pub removable_records_before_budget: usize,
+    #[serde(default)]
+    pub budget_exhausted: bool,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    /// On-disk bytes the sweep found reclaimable, whether or not it rewrote the log for them.
+    #[serde(default)]
+    pub reclaimable_bytes: u64,
+    /// The sweep read the log, decided what was reclaimable, and did NOT rewrite it -- because
+    /// nothing was reclaimable, or too little was to be worth the barrier. Distinguishes a log
+    /// that had nothing to give from one that was rewritten and gave nothing, which otherwise
+    /// look identical: both report zero records removed and the same bytes before and after.
+    #[serde(default)]
+    pub rewrite_skipped: bool,
+    /// Bytes the round COPIED: what it wrote into the replacement for the piece being written.
+    ///
+    /// This is what a round costs. The collector used to rewrite every record it retained, so
+    /// this number was the size of everything it KEPT, and a round that removed less copied
+    /// more. Earlier pieces are now unlinked instead, and nothing in them is read or copied, so
+    /// this is bounded by the piece being written however deep the log is.
+    #[serde(default)]
+    pub bytes_copied: u64,
+    /// Whole pieces of the log this round unlinked.
+    #[serde(default)]
+    pub dropped_segments: usize,
+    /// What those pieces held on disk.
+    #[serde(default)]
+    pub dropped_segment_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct LocalIndexLogStore {
+    inner: Arc<Mutex<IndexLogInner>>,
+    /// One barrier gate per shard log, so appends that arrive while an fsync is in flight ride it
+    /// instead of queueing to take an identical one.
+    flush_gates: Arc<crate::flush_gate::FlushRegistry>,
+}
+
+#[derive(Debug)]
+struct IndexLogInner {
+    root: PathBuf,
+    stats: IndexLogStats,
+    last_sequence_by_shard: HashMap<ShardId, u64>,
+    /// MANIFEST-CONFORMANCE FOLD: the index-log byte length recorded at the last catalog dump, per
+    /// shard. `undumped_len_since_dump` subtracts this from the current on-disk length to get the
+    /// undumped gap that drives the threshold-dump cadence. Reset to 0
+    /// on process restart, so the first post-restart cycle may dump once -- harmless (a dump only
+    /// materializes durable state that is already recoverable).
+    last_dumped_len_by_shard: HashMap<ShardId, u64>,
+    /// When the last catalog dump of a shard completed. Read by `ms_since_catalog_dump` to hold
+    /// the next dump off until the minimum interval has passed.
+    ///
+    /// An `Instant`, not a wall clock, because the question is "how long since", and a wall
+    /// clock that steps backwards would hold a dump off for as long as the step, while one that
+    /// steps forward would release it early. A shard never dumped in this process has no entry,
+    /// and no entry means no floor: the first dump after a restart is never delayed.
+    last_dumped_at_by_shard: HashMap<ShardId, std::time::Instant>,
+    // Set only by Default: the store owns its minted scratch directory, and the last
+    // clone's drop removes it. Never set for a caller-supplied root.
+    scratch: Option<std::sync::Arc<crate::scratch::ScratchDirGuard>>,
+    /// Whether the log directory is known to exist, so an append need not ask again.
+    ///
+    /// `new` creates it. This records whether that SUCCEEDED, so the one case the per-append
+    /// `create_dir_all` genuinely covered -- a root `new` could not make, whose creation the
+    /// constructor discards because it cannot return an error -- is still retried, once, by the
+    /// first append instead of by every append.
+    ///
+    /// It is never set back to false, and that is deliberate. An append whose directory has
+    /// gone must FAIL, not re-create it: re-creating it turns "someone removed the log
+    /// directory" into "the log quietly began again, empty", which is lost durable state
+    /// wearing the costume of resilience. `an_append_fails_loudly_when_the_log_directory_is_
+    /// removed_underneath_it` is that behaviour, asserted.
+    root_created: bool,
+    /// The buffer a delta append encodes its payload into, kept between appends.
+    ///
+    /// The encode used to start from an empty vector every time and grow it by doubling to the
+    /// size of the record. Reusing one buffer leaves a steady stream of appends allocating
+    /// nothing here after the first few, which is the arrangement the write-ahead log's
+    /// `encode_scratch` already had. Held on `inner` rather than in a thread-local because the
+    /// append holds this lock across the encode anyway, so there is no contention to avoid and
+    /// no second place for it to live.
+    encode_scratch: Vec<u8>,
+    /// The buffer that payload is FRAMED into, kept for the same reason.
+    ///
+    /// Separate from the one above because the frame is built from the payload, so the two are
+    /// alive at the same moment.
+    frame_scratch: Vec<u8>,
+}
+
+/// The largest scratch buffer worth keeping between appends.
+///
+/// The buffers grow to the largest record this store has encoded and would otherwise hold that
+/// capacity for the life of the process. Past this they are dropped instead. Same ceiling, and
+/// the same reason, as `MAX_ENCODE_SCRATCH_BYTES` in the write-ahead encoder.
+const MAX_INDEX_ENCODE_SCRATCH_BYTES: usize = 1024 * 1024;
+
+impl IndexLogInner {
+    /// Make the log directory if `new` could not, and then never ask again.
+    ///
+    /// `new` already created it, and NOTHING IN THIS TREE REMOVES IT UNDER A LIVE STORE: the
+    /// scratch guard's drop runs when the last clone is gone, the scratch sweep keeps every
+    /// directory whose owning process is still alive (its own included), and the crash
+    /// harness removes the directory from a SEPARATE process, after the writer has aborted and
+    /// before the next one constructs its store. So the `create_dir_all` this replaces asked
+    /// the kernel, on every single append, a question whose answer it already had -- 10,001
+    /// `EEXIST` mkdirs in 10,002 at the measured size.
+    ///
+    /// If the directory IS gone, this no longer puts it back: the append's own `open` fails
+    /// with the directory named in the error. That is the intended direction. See the note on
+    /// `root_created`.
+    fn ensure_root(&mut self) -> Result<(), IndexLogError> {
+        if self.root_created {
+            return Ok(());
+        }
+        #[cfg(test)]
+        probe::APPEND_ROOT_CREATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        fs::create_dir_all(&self.root)?;
+        self.root_created = true;
+        Ok(())
+    }
+}
+
+fn indexlog_enabled() -> bool {
+    // The index-log is the delta served-index's durable per-write delta stream: the
+    // load-time fold reconstructs the served index (at the original page addresses) from
+    // these records, so it must be written in ALL builds, not just tests. It is kept
+    // bounded by GC-at-compaction, which truncates every delta already folded into the
+    // durably-rewritten base snapshot (retain-from-anchor). Always on.
+    true
+}
+
+fn bulk_ingest_mode() -> bool {
+    crate::engine::bulk_ingest_mode()
+}
+
+/// Defer the ack-path index-log fsync (WAL replay is the durable recovery source). This is the
+/// single-barrier default; restored to a synchronous fsync only under the TS_WAL_LEGACY_RECOVERY
+/// escape hatch (whose delta-fold recovery trusts the durable delta).
+fn indexlog_wal_only_sync() -> bool {
+    // See `block_store::block_wal_single_barrier`: one reader, in `engine`, so the three barriers
+    // this hatch controls cannot end up disagreeing about whether it is set.
+    !crate::engine::wal_legacy_recovery()
+}
+
+/// MANIFEST-CONFORMANCE FOLD, always on: the slab catalog is folded into the index-log
+/// anchor at a threshold dump, and the per-write slab-manifest file is no longer the catalog's
+/// source of truth (it is reconstructed on load from the durable pages plus the folded anchor).
+/// `TS_INDEX_CATALOG_FOLD` used to be able to skip all of it. It shipped dark (the flip once
+/// broke proxy tests), then defaulted on once the upsert-delta and single-barrier work landed,
+/// and nothing ever selected the off position again -- the five tests that exercise the fold
+/// pinned it ON rather than off. The threshold dump is also what lets the embedded (proxy)
+/// engine reclaim its index-log and WAL at all, so the off side disabled reclaim entirely.
+///
+/// The off side's compatibility claim still holds and is not conditional on anything: an anchor
+/// whose `slabs` is empty serializes with no `zones` key, byte-identical to a pre-fold MetaItem.
+/// `meta_item_without_zones_serializes_byte_identically_to_pre_fold` asserts exactly that.
+///
+/// How many bytes a threshold dump may WRITE for each byte it RELEASES.
+///
+/// A dump's cost is the whole served index; its release is the index log accrued since the
+/// previous dump. Against a constant accrual threshold those two quantities have nothing to do
+/// with each other, so bytes written per byte released is linear in the store: measured at 9.89
+/// on a 20,000-record store and 84.23 on a 200,000-record one, for the same 4,000 records of work
+/// in both. Requiring the accrual to reach `base_index / INDEX_DUMP_BASE_FRACTION_DIVISOR` before
+/// a threshold dump fires bounds that figure at the divisor, whatever the store holds.
+///
+/// It is bought with index-log footprint. Between dumps the log may now stand at
+/// `base_index / divisor` rather than at the configured floor -- 12.5% of the base index on top
+/// of it at 8 -- and it still returns to its floor at every dump. That is the trade: the store's
+/// steady-state disk grows by an eighth, and the bytes it writes to hold that bound stop growing
+/// with it.
+///
+/// A constant rather than a deployment knob. It is a dimensionless ratio, it is the same at every
+/// size by construction, and the deployment already sets the FLOOR through
+/// `TS_INDEX_DUMP_WAL_GAP_BYTES`.
+///
+/// # WHY 8, AND WHY THE EXPRESSION STAYS A DIVISION OF THE BASE INDEX
+///
+/// Chosen on measurement rather than inherited. `index_write_amplification` drives this divisor
+/// across a sweep and prices the WRITE side; `index_recovery_cost` recovers the same five stores
+/// at the budget's high-water mark -- the worst moment a crash can pick -- and prices the READ
+/// side. At 4,000 objects on the shipped routing range `0..1023`, physical bytes throughout:
+///
+/// ```text
+///   divisor      b        a    index log    base read    WAL read    NAMED read    wall
+///         2  1.3563    3.810      143,669      286,242     763,392     1,193,303  1671 ms
+///         4  1.2125    5.715       61,768      243,537     566,784       872,089   405 ms
+///         8  1.1159    9.658       28,807      223,389     493,056       745,252   252 ms
+///        16  1.0609   17.511       14,409      213,124     468,480       696,013   249 ms
+///        32  1.0347   30.083        7,245      208,503     443,904       659,652   228 ms
+/// ```
+///
+/// The two sides are RECIPROCAL in `b - 1`. `a = b/(b-1)` is about `divisor + 1`, and the index
+/// log a recovery reads is `(b - 1)` times the base index -- read WHOLE, because the default load
+/// path's `latest_slab_catalog` walks every record to find the last one carrying a catalog, and
+/// the piece-name decline buys nothing in a post-sweep state (measured: the sweep has already
+/// dropped every piece the base reflects, so there is no piece left to decline). A looser budget
+/// also dumps less often, which leaves a longer unreflected write-ahead tail, so the replay term
+/// moves with the same threshold -- and that is the one term in a restore that is superlinear in
+/// its own size (`restore_large_scale`: 89% of what a 200,000-record restart reads, 6.70x per
+/// stored record for a 10x store).
+///
+/// So neither direction is free and the sweep identifies no interior optimum on its own -- the two
+/// costs are in different units, one paid continuously and one per restart, and no measurement
+/// fixes the exchange rate between them. What the measurement DOES decide is both ends:
+///
+/// - TIGHTER IS A BAD TRADE. 8 -> 16 costs 81% more bytes written per byte logged (9.658 ->
+///   17.511) and takes 6.6% off what a recovery reads (745,252 -> 696,013 B). The first is paid on
+///   every write for as long as the store is up; the second once per restart.
+/// - LOOSER PAST `b = 2` CANNOT BE EXPRESSED HERE, AND SHOULD NOT BE. `b = 1 + 1/divisor` for
+///   integer `divisor >= 1` confines `b` to `(1, 2]`, so `a >= 2` structurally; reaching
+///   `a <= 1.25` needs `b = 5`, a threshold FOUR TIMES the base index. At the measured 0.1255
+///   share that is a 32-fold increase in both the whole-log read and the unreflected tail -- a
+///   recovery that reads several times the store it is recovering. A multiplier, a rational or a
+///   configured byte value would each reach it; none of them should.
+/// - LOOSER WITHIN REACH IS ARGUABLE AND NOT FORCED. 8 -> 4 buys 41% off `a` for 17% more recovery
+///   read. It is the only move this measurement leaves open, and it would spend the budget on a
+///   read that is currently UNBOUNDED rather than on one that is minimal: the catalog walk needs
+///   one record and reads the whole log for it. Bounding that read is the prerequisite for
+///   revisiting this constant, not a reason to move it first.
+///
+/// AND THAT IS WHY THE FORM STAYS A DIVISION. Every budget the evidence supports lies in
+/// `(1, 2]`, which a division of the base index expresses exactly; a multiplier or a rational
+/// would only widen the reachable range into the region the recovery measurement refuses. A
+/// configured byte value would give up the property every figure above depends on -- the threshold
+/// is a FRACTION of the base index, so `b`, `a` and the recovery's index-log term are the same at
+/// every store size, measured at 0.1290 and 0.1255 of the base index across a 5.2x corpus.
+pub const INDEX_DUMP_BASE_FRACTION_DIVISOR: u64 = 8;
+
+/// The accrual a threshold dump must have to show for itself: the configured floor, raised so a
+/// dump never writes more than `divisor` bytes of base index per byte of index log it releases.
+///
+/// `configured_threshold_bytes` is a FLOOR and never a ceiling. A store whose base index is
+/// smaller than `divisor * configured_threshold_bytes` keeps exactly the cadence it has today --
+/// the relative term can only ever make a dump wait for MORE to release, never fire earlier -- so
+/// nothing below the crossover changes behaviour at all.
+///
+/// A zero configured floor DISABLES threshold dumping: `should_dump_index_catalog` refuses every
+/// undumped length against it, `u64::MAX` included, which is how an operator pins dumps to
+/// compaction and unload only. The relative term is a `max` against a quantity that grows without
+/// bound, so it would silently switch threshold dumping back ON for exactly the largest stores --
+/// the ones an operator who set a zero was most likely protecting. A zero in either position
+/// therefore returns the configured value unchanged and leaves the caller the decision it had.
+pub fn effective_index_dump_threshold_bytes(
+    configured_threshold_bytes: u64,
+    base_index_bytes: u64,
+    divisor: u64,
+) -> u64 {
+    if configured_threshold_bytes == 0 || divisor == 0 {
+        return configured_threshold_bytes;
+    }
+    configured_threshold_bytes.max(base_index_bytes / divisor)
+}
+
+/// Threshold decision for the background catalog/index dump, mirroring this design
+/// index-meta dump gate (the dump-delay check compares the undumped
+/// WAL length against the 1 MiB gap). `undumped_bytes` is the served-index-log growth since
+/// the last dumped watermark; when it crosses `gap_bytes` the dump fires. A zero gap disables
+/// the cadence (never dump on threshold) so an operator can pin dumps to compaction/unload only.
+pub fn should_dump_index_catalog(undumped_bytes: u64, gap_bytes: u64) -> bool {
+    gap_bytes > 0 && undumped_bytes >= gap_bytes
+}
+
+/// The threshold decision above, with a floor on how often it may say yes.
+///
+/// `ms_since_dump` is `None` for a shard this process has never dumped, which is not a dump
+/// "0 ms ago" -- it is no dump at all, and nothing to wait behind. Getting that backwards would
+/// silence the first dump after every restart for the length of the interval, on exactly the
+/// engine that has the most to reclaim.
+///
+/// A zero interval is no floor at all, so the byte gap alone decides. That is what a test which
+/// is not exercising the timer passes, and it says so by passing it.
+pub fn should_dump_index_catalog_now(
+    undumped_bytes: u64,
+    gap_bytes: u64,
+    ms_since_dump: Option<u64>,
+    min_interval_ms: u64,
+) -> bool {
+    if !should_dump_index_catalog(undumped_bytes, gap_bytes) {
+        return false;
+    }
+    match ms_since_dump {
+        Some(elapsed) => elapsed >= min_interval_ms,
+        None => true,
+    }
+}
+
+impl LocalIndexLogStore {
+    /// On-disk byte length of a shard's index-log file (0 if absent). Used as the "undumped
+    /// length" signal for the threshold-dump cadence: the growth of this file since the last
+    /// dumped watermark is the undumped-length signal.
+    pub fn log_len_bytes(&self, shard_id: ShardId) -> u64 {
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        // Every piece, not just the one being written. After a roll the active piece is the
+        // NEWEST and smallest part of the log, so reporting its length as the log's length makes
+        // a log SHRINK as it grows -- and the dump cadence that reads this would stop firing
+        // exactly when there is most to dump.
+        index_log_total_bytes(&inner.root, shard_id)
+    }
+
+    /// Undumped index-log length for a shard: the on-disk byte growth since the last catalog
+    /// dump (`mark_catalog_dumped`). This is the native analog of this design
+    /// the undumped WAL length, and is the signal compared against `index_dump_wal_gap_bytes`
+    /// to decide a threshold dump. A shard never dumped this process (or freshly restarted)
+    /// reports the whole current length.
+    /// Milliseconds since this shard's last catalog dump, or `None` if it has not dumped in
+    /// this process. Feeds `should_dump_index_catalog_now`'s interval check.
+    pub fn ms_since_catalog_dump(&self, shard_id: ShardId) -> Option<u64> {
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        inner
+            .last_dumped_at_by_shard
+            .get(&shard_id)
+            .map(|at| at.elapsed().as_millis() as u64)
+    }
+
+    pub fn undumped_len_since_dump(&self, shard_id: ShardId) -> u64 {
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        let current = index_log_total_bytes(&inner.root, shard_id);
+        let dumped = inner
+            .last_dumped_len_by_shard
+            .get(&shard_id)
+            .copied()
+            .unwrap_or(0);
+        current.saturating_sub(dumped)
+    }
+
+    /// Record that a catalog dump captured the shard's index-log up to its current on-disk
+    /// length, resetting the undumped gap to 0. Called by the engine ONLY after the dump's base
+    /// index + folded anchor are durably written, so the watermark never advances past
+    /// non-durable state (restart-during-dump re-dumps rather than skipping).
+    pub fn mark_catalog_dumped(&self, shard_id: ShardId) {
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        let current = index_log_total_bytes(&inner.root, shard_id);
+        inner.last_dumped_len_by_shard.insert(shard_id, current);
+        // Stamped in the same call as the length, so the two halves of the cadence -- how much
+        // has accumulated, and how long ago -- can never disagree about which dump they describe.
+        inner
+            .last_dumped_at_by_shard
+            .insert(shard_id, std::time::Instant::now());
+    }
+
+    /// The most recent `MetaItem` anchor carrying a folded slab catalog, or `None` if no
+    /// anchor with a non-empty `slabs` list has been written. Used on load (gate on) to seed the
+    /// block-store slab catalog from the folded anchor when the slab-manifest file is absent.
+    pub fn latest_slab_catalog(&self, shard_id: ShardId) -> Result<Option<MetaItem>, IndexLogError> {
+        // The LAST matching record wins, so this cannot stop early -- but it never needed to
+        // hold the records it walks past. It kept every record in the log, with every item each
+        // one carries, to take one field out of one of them.
+        let mut latest = None;
+        self.for_each_delta_record(shard_id, 0, |record| {
+            if let Some(meta) = record.meta {
+                if !meta.slabs.is_empty() {
+                    latest = Some(meta);
+                }
+            }
+        })?;
+        Ok(latest)
+    }
+
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        let root = root.into();
+        // The RESULT, not `let _`. This is the store's one directory creation; every append
+        // then trusts it rather than repeating it. Keeping the answer is what lets an append
+        // skip the `mkdir` + `statx` pair while still retrying the one case that mattered.
+        let root_created = fs::create_dir_all(&root).is_ok();
+        Self {
+            inner: Arc::new(Mutex::new(IndexLogInner {
+                root,
+                stats: IndexLogStats::default(),
+                last_sequence_by_shard: HashMap::new(),
+                last_dumped_len_by_shard: HashMap::new(),
+                last_dumped_at_by_shard: HashMap::new(),
+                scratch: None,
+                root_created,
+                encode_scratch: Vec::new(),
+                frame_scratch: Vec::new(),
+            })),
+            flush_gates: Arc::new(crate::flush_gate::FlushRegistry::default()),
+        }
+    }
+
+    /// Append an index record, PARSING the bytes into a value first.
+    ///
+    /// Prefer [`append_index_bytes`](Self::append_index_bytes), which splices the already
+    /// serialized bytes into the record instead. This one parses the whole index into a
+    /// `serde_json::Value` and then re-encodes it, so a multi-megabyte index is walked twice
+    /// more per append -- measured at 2.31 MB for a 2,000-key shard. It remains for callers
+    /// that genuinely need the parsed record back; every engine caller writes an index it has
+    /// just serialized and discards the result, so they all take the splicing path.
+    pub fn append_json(
+        &self,
+        shard_id: ShardId,
+        index_bytes: &[u8],
+    ) -> Result<IndexLogRecord, IndexLogError> {
+        // Bulk backfill: skip the replay-log append entirely (deferred to a
+        // single flush of the served index). Removes the per-record fsync bomb.
+        if bulk_ingest_mode() || !indexlog_enabled() {
+            return Ok(IndexLogRecord {
+                shard_id,
+                sequence: 0,
+                index: serde_json::Value::Null,
+            });
+        }
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        inner.ensure_root()?;
+        let last_sequence = match inner.last_sequence_by_shard.get(&shard_id).copied() {
+            Some(sequence) => sequence,
+            None => {
+                let sequence = last_sequence_at(&inner.root, shard_id)?;
+                inner.last_sequence_by_shard.insert(shard_id, sequence);
+                sequence
+            }
+        };
+        // Seal the piece being written if this record would take it past the rolling threshold,
+        // so reclaim has whole pieces to unlink instead of a file to rewrite. The check is a
+        // stat; the piece is walked once per ROLL, never once per append -- re-reading the file
+        // to answer "is this piece full" on every write is the cost the write-ahead log had to
+        // take back out.
+        //
+        // AFTER the sequence probe above, not before it. That probe is what trims a tail a crash
+        // left half-written, and only the piece being written is ever trimmed -- so rolling first
+        // would seal the torn bytes into a piece nothing trims again, and the piece's recorded
+        // end would be taken from the last record before them.
+        // ONE probe, for both questions. This resolves which file the shard's log is being
+        // written to and how long it is; the roll needs the length, the open needs the name,
+        // and asking separately is what made the append probe the same path twice per record.
+        let (mut active, active_len) = active_index_log(&inner.root, shard_id);
+        if roll_index_log_segment_at(&inner.root, shard_id, &active, active_len)? {
+            // Re-resolve ONLY here. The seal RENAMES the piece away, and that rename is the one
+            // event that can change which name the next record belongs under -- so the answer is
+            // taken again exactly when it has been invalidated, and never cached past it. A roll
+            // is 1 append in 1,000 at the rolling default, so this costs nothing per record.
+            active = active_index_log(&inner.root, shard_id).0;
+        }
+        let next_sequence = last_sequence.saturating_add(1);
+        let record = IndexLogRecord {
+            shard_id,
+            sequence: next_sequence,
+            index: serde_json::from_slice(index_bytes)?,
+        };
+        // Frame the record with a length + SHA-256 digest (crate::log_framing) so a later
+        // value-preserving bit-flip in this committed line is detected on read.
+        let bytes =
+            crate::log_framing::encode_record(&encode_index_payload(&record, INDEX_LOG_SHAPE_WHOLE)?);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&active)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        // Ack-path index-log append. Under the single-barrier default defer this fsync (bytes
+        // still written): the WAL is the durable recovery source and replay rebuilds the
+        // served index, so the replay-log checkpoint need not be crash-durable per write.
+        if !indexlog_wal_only_sync() {
+            file.sync_data()?;
+        }
+        inner.stats.writes += 1;
+        #[cfg(test)]
+        probe::APPENDS_COMPLETED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        inner.stats.bytes_written += bytes.len() as u64;
+        inner.stats.last_sequence = next_sequence;
+        inner.last_sequence_by_shard.insert(shard_id, next_sequence);
+        Ok(record)
+    }
+
+    pub fn append_index_bytes(
+        &self,
+        shard_id: ShardId,
+        index_bytes: &[u8],
+    ) -> Result<u64, IndexLogError> {
+        if bulk_ingest_mode() || !indexlog_enabled() {
+            return Ok(0);
+        }
+        // This once asserted the bytes parse as JSON, from when this appender spliced the whole
+        // index into the record. It no longer does -- it writes a digest and a length, and never
+        // looks inside -- so the JSON demand was a precondition that outlived its reason, and it
+        // fires the moment the index is written in its binary container. Assert what this code
+        // actually needs: that it was handed an index at all, in either format a reader accepts.
+        debug_assert!(
+            crate::engine::bytes_look_like_served_index(index_bytes),
+            "index-log anchor was handed {} bytes that are not a served index in any known format",
+            index_bytes.len()
+        );
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        inner.ensure_root()?;
+        let last_sequence = match inner.last_sequence_by_shard.get(&shard_id).copied() {
+            Some(sequence) => sequence,
+            None => {
+                let sequence = last_sequence_at(&inner.root, shard_id)?;
+                inner.last_sequence_by_shard.insert(shard_id, sequence);
+                sequence
+            }
+        };
+        // Seal the piece being written if this record would take it past the rolling threshold,
+        // so reclaim has whole pieces to unlink instead of a file to rewrite. The check is a
+        // stat; the piece is walked once per ROLL, never once per append -- re-reading the file
+        // to answer "is this piece full" on every write is the cost the write-ahead log had to
+        // take back out.
+        //
+        // AFTER the sequence probe above, not before it. That probe is what trims a tail a crash
+        // left half-written, and only the piece being written is ever trimmed -- so rolling first
+        // would seal the torn bytes into a piece nothing trims again, and the piece's recorded
+        // end would be taken from the last record before them.
+        // ONE probe, for both questions. This resolves which file the shard's log is being
+        // written to and how long it is; the roll needs the length, the open needs the name,
+        // and asking separately is what made the append probe the same path twice per record.
+        let (mut active, active_len) = active_index_log(&inner.root, shard_id);
+        if roll_index_log_segment_at(&inner.root, shard_id, &active, active_len)? {
+            // Re-resolve ONLY here. The seal RENAMES the piece away, and that rename is the one
+            // event that can change which name the next record belongs under -- so the answer is
+            // taken again exactly when it has been invalidated, and never cached past it. A roll
+            // is 1 append in 1,000 at the rolling default, so this costs nothing per record.
+            active = active_index_log(&inner.root, shard_id).0;
+        }
+        let next_sequence = last_sequence.saturating_add(1);
+        // Record WHICH index this checkpoint anchors, not a second copy of it.
+        //
+        // This used to splice the whole served index into the record -- 2.31 MB for a 2,000-key
+        // shard, written again here after it had just been written to the index file. Nothing
+        // ever read it back: every path that reconstructs a shard decodes the index FILE or a
+        // dump manifest, and the log's own readers take only `sequence` (the tail scan and the
+        // GC anchor probe) or raw bytes (the debug stream). Removing the payload and running
+        // the reload, recovery-sweep, storage-lifecycle, dump, index-format, load-index and
+        // anchor suites changed nothing -- 77 tests, all still green.
+        //
+        // The digest keeps what the copy was actually good for: an anchor can still be checked
+        // against the index file it claims to describe. `append_json` still embeds the whole
+        // index for any caller that wants the record to carry it.
+        let digest = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(index_bytes);
+            hasher.finalize().to_vec()
+        };
+        let index_len = index_bytes.len();
+        let anchor = IndexAnchorRecord {
+            shard_id,
+            sequence: next_sequence,
+            index_sha256: digest,
+            index_len: index_len as u64,
+        };
+        let bytes = crate::log_framing::encode_record(&encode_index_payload(
+            &anchor,
+            INDEX_LOG_SHAPE_ANCHOR,
+        )?);
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&active)?;
+        file.write_all(&bytes)?;
+        file.flush()?;
+        // Ack-path index-log append. Under the single-barrier default defer this fsync (bytes
+        // still written): the WAL is the durable recovery source and replay rebuilds the
+        // served index, so the replay-log checkpoint need not be crash-durable per write.
+        if !indexlog_wal_only_sync() {
+            file.sync_data()?;
+        }
+        inner.stats.writes += 1;
+        #[cfg(test)]
+        probe::APPENDS_COMPLETED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        inner.stats.bytes_written += bytes.len() as u64;
+        inner.stats.last_sequence = next_sequence;
+        inner.last_sequence_by_shard.insert(shard_id, next_sequence);
+        Ok(next_sequence)
+    }
+
+    /// Append one O(delta) served-index record: the page/object items a single write
+    /// touched, optionally carrying a compaction anchor. Unlike `append_json`, this never
+    /// serializes the whole index -- the appended bytes are proportional to the change,
+    /// which is what turns the per-write served-index persist cost from O(store) into
+    /// O(delta). Returns the assigned monotonic sequence.
+    ///
+    /// `durable` controls the fsync, and WHAT IT IS AT THE SHIPPED DEFAULT IS PER CALL SITE.
+    /// There are exactly FOUR in the library, and they do not agree:
+    ///
+    /// | call site | expression | at the shipped default |
+    /// |---|---|---|
+    /// | `engine.rs` single-command ack | `!raft_applying() && !wal_single_barrier()` | **false** |
+    /// | `engine/recovery_sweep_compact.rs` expiry flush | `!raft_applying() && !wal_single_barrier()` | **false** |
+    /// | `engine/stream_batch_methods.rs` batch ack | `!raft_applying()` | **true** |
+    /// | `engine/engine_persistence.rs` threshold catalog dump | `true` | **true** |
+    ///
+    /// `wal_single_barrier()` is `!wal_legacy_recovery()`, which reads `TS_WAL_LEGACY_RECOVERY`,
+    /// off by default -- so the two expressions carrying that term evaluate false, and the raft
+    /// term is what defers them on the apply path instead. The single-command ack therefore
+    /// defers, because the WAL barrier has already committed before this is reached. The BATCH
+    /// ack does not: its expression never had the `wal_single_barrier()` term, so on every
+    /// single-node batch write it takes the barrier. And the dump passes a literal `true`, which
+    /// is the point of a dump -- step 4 of `dump_index_catalog` advances the dumped watermark on
+    /// the strength of this record being durable.
+    ///
+    /// # THIS DOC HAS NOW BEEN WRONG TWICE, IN OPPOSITE DIRECTIONS
+    ///
+    /// It first claimed the normal path fsync'd and only raft deferred. That was corrected to
+    /// "under the shipped default no production caller passes `true`", over "both callers", and
+    /// THAT IS ALSO WRONG -- the correction is mine and it is the worse of the two, because a
+    /// reader who checks it finds a literal `true` at the second call site down.
+    ///
+    /// Two separate errors produced it. "Both callers" was a count taken from a grep: there are
+    /// four, and only two compute the expression quoted. And "no caller passes `true`" read the
+    /// term `!wal_single_barrier()` as though every call site carried it.
+    ///
+    /// The caller count here is the COMPILER's, not a grep's. `append_delta`'s `durable`
+    /// parameter was removed and `cargo check --lib` run: four arity errors, the four rows above.
+    /// A grep over the same tree reports 89 call sites and 28 that look like production -- the
+    /// rest are inside `#[cfg(test)]` functions of the measurement modules, which a grep cannot
+    /// see and the compiler does not compile.
+    ///
+    /// Either way the record is WRITTEN and flushed to the OS at every one of the four, so the
+    /// served-index stream is the same shape regardless, and a tail lost from a deferred one is
+    /// rebuilt by replay.
+    ///
+    /// The consumer-aware GC never truncates such a tail: its retain floor is
+    /// `min(durable frontier, slowest cursor) + 1`, which
+    /// `the_index_log_retain_floor_never_passes_the_durable_frontier` asserts rather than leaving
+    /// to this sentence.
+    pub fn append_delta(
+        &self,
+        shard_id: ShardId,
+        items: Vec<IndexItem>,
+        key_states: Vec<serde_json::Value>,
+        applied_wal_sequence: Option<u64>,
+        meta: Option<MetaItem>,
+        upsert: bool,
+        durable: bool,
+    ) -> Result<u64, IndexLogError> {
+        // The single and the batch write paths are two live callers of this, which is exactly the
+        // pair a charge at one call site would have split: an exploratory scope placed at the
+        // single-command site read ZERO on a batch ingest. Here both are counted, and the
+        // disabled-log return below is inside the class so a store with the log off reports a
+        // measured zero rather than an absent one.
+        crate::alloc_probe::in_class(crate::alloc_probe::AllocClass::IndexLogDelta, || {
+            self.append_delta_inner(
+                shard_id,
+                items,
+                key_states,
+                applied_wal_sequence,
+                meta,
+                upsert,
+                durable,
+            )
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn append_delta_inner(
+        &self,
+        shard_id: ShardId,
+        items: Vec<IndexItem>,
+        key_states: Vec<serde_json::Value>,
+        applied_wal_sequence: Option<u64>,
+        meta: Option<MetaItem>,
+        upsert: bool,
+        durable: bool,
+    ) -> Result<u64, IndexLogError> {
+        if bulk_ingest_mode() || !indexlog_enabled() {
+            return Ok(0);
+        }
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        inner.ensure_root()?;
+        let last_sequence = match inner.last_sequence_by_shard.get(&shard_id).copied() {
+            Some(sequence) => sequence,
+            None => {
+                let sequence = last_sequence_at(&inner.root, shard_id)?;
+                inner.last_sequence_by_shard.insert(shard_id, sequence);
+                sequence
+            }
+        };
+        // Seal the piece being written if this record would take it past the rolling threshold,
+        // so reclaim has whole pieces to unlink instead of a file to rewrite. The check is a
+        // stat; the piece is walked once per ROLL, never once per append -- re-reading the file
+        // to answer "is this piece full" on every write is the cost the write-ahead log had to
+        // take back out.
+        //
+        // AFTER the sequence probe above, not before it. That probe is what trims a tail a crash
+        // left half-written, and only the piece being written is ever trimmed -- so rolling first
+        // would seal the torn bytes into a piece nothing trims again, and the piece's recorded
+        // end would be taken from the last record before them.
+        // ONE probe, for both questions. This resolves which file the shard's log is being
+        // written to and how long it is; the roll needs the length, the open needs the name,
+        // and asking separately is what made the append probe the same path twice per record.
+        let (mut active, active_len) = active_index_log(&inner.root, shard_id);
+        if roll_index_log_segment_at(&inner.root, shard_id, &active, active_len)? {
+            // Re-resolve ONLY here. The seal RENAMES the piece away, and that rename is the one
+            // event that can change which name the next record belongs under -- so the answer is
+            // taken again exactly when it has been invalidated, and never cached past it. A roll
+            // is 1 append in 1,000 at the rolling default, so this costs nothing per record.
+            active = active_index_log(&inner.root, shard_id).0;
+        }
+        let next_sequence = last_sequence.saturating_add(1);
+        // Do not write what the item already says. Each item carries `object_id` and
+        // `routing_bucket`, and the address it points at repeats both -- 18 bytes of a 142-byte
+        // item. `restore_address_repeats` at the decode site puts them back.
+        let mut items = items;
+        for item in items.iter_mut() {
+            item.strip_block_ref_key_repeat();
+            item.strip_size_repeat();
+            // The address first, because it is stripped against the item's id, and the item's
+            // id is what goes next.
+            item.strip_address_repeats();
+            item.strip_object_id_repeat(shard_id);
+        }
+        // Hoist the object key when every item names the same one, and blank the copies.
+        //
+        // LAST, after the strips above. `strip_block_ref_key_repeat` DERIVES the page handle from
+        // the item's own fields and `object_key` is one of them, so blanking the key first would
+        // derive a different handle and the strip would decline -- costing more than this saves.
+        let shared_object_key = match items.split_first() {
+            Some((first, rest)) if rest.iter().all(|item| item.object_key == first.object_key) => {
+                Some(first.object_key.to_string())
+            }
+            _ => None,
+        };
+        if shared_object_key.is_some() {
+            let blank = empty_object_key();
+            for item in items.iter_mut() {
+                item.object_key = blank.clone();
+            }
+        }
+        let record = IndexDeltaRecord {
+            shard_id,
+            sequence: next_sequence,
+            items,
+            meta,
+            applied_wal_sequence,
+            key_states,
+            upsert,
+            shared_object_key,
+        };
+        // Frame the delta record with a length + SHA-256 digest (crate::log_framing) so a
+        // value-preserving bit-flip (e.g. a flipped `deleted` flag or page address) in this
+        // committed line is detected on read rather than replayed as truth on recovery.
+        // Both buffers are taken off `inner` and put back below, because the framing borrows one
+        // while the other is still being read and `inner` is needed either side.
+        //
+        // A failed append puts them back holding WHATEVER THEY HELD -- a partial encode, or the
+        // previous record's frame -- and that is safe because both writers CLEAR before they
+        // write, so no byte of a failed or an earlier record can reach the next one. What must
+        // not happen is LOSING them, which would leave the next append allocating from nothing.
+        let mut payload = std::mem::take(&mut inner.encode_scratch);
+        let mut bytes = std::mem::take(&mut inner.frame_scratch);
+        // Encode, frame and write inside one closure so that EVERY way out of it -- including the
+        // three I/O failures -- passes through the restore below. A `?` here would drop the two
+        // buffers on the floor and leave `inner` holding empty ones, so the next append would
+        // allocate from nothing: not a correctness bug, but exactly the cost this removes,
+        // reappearing after the first transient write error and never going away.
+        let written = (|payload: &mut Vec<u8>, bytes: &mut Vec<u8>| -> Result<std::fs::File, IndexLogError> {
+            encode_index_payload_into(&record, INDEX_LOG_SHAPE_DELTA, payload)?;
+            crate::log_framing::encode_record_into(payload, bytes);
+            let mut file = OpenOptions::new().create(true).append(true).open(&active)?;
+            file.write_all(bytes)?;
+            file.flush()?;
+            Ok(file)
+        })(&mut payload, &mut bytes);
+        let written_len = bytes.len() as u64;
+        // A buffer that grew to hold one enormous record does not keep that capacity for the life
+        // of the process; past the ceiling it is dropped and the next append starts again.
+        if payload.capacity() > MAX_INDEX_ENCODE_SCRATCH_BYTES {
+            payload = Vec::new();
+        }
+        if bytes.capacity() > MAX_INDEX_ENCODE_SCRATCH_BYTES {
+            bytes = Vec::new();
+        }
+        inner.encode_scratch = payload;
+        inner.frame_scratch = bytes;
+        let mut file = written?;
+        inner.stats.writes += 1;
+        #[cfg(test)]
+        probe::APPENDS_COMPLETED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        inner.stats.bytes_written += written_len;
+        inner.stats.last_sequence = next_sequence;
+        inner.last_sequence_by_shard.insert(shard_id, next_sequence);
+        // The bytes are in the file and the bookkeeping is done, so claim a barrier and then let
+        // the lock go before taking it. Holding the lock across the fsync meant writers could
+        // never reach the barrier together, so each paid for one that would have covered all of
+        // them.
+        let barrier = durable.then(|| {
+            let gate = self.flush_gates.gate((shard_id as u64, 0));
+            let ticket = gate.register_write();
+            (gate, ticket)
+        });
+        drop(inner);
+        if let Some((gate, ticket)) = barrier {
+            gate.await_durable(ticket, || {
+                crate::durability_metrics::record_barrier("engine_index_log_append");
+                file.sync_data()
+            })?;
+        }
+        Ok(next_sequence)
+    }
+
+    /// Read every delta record for a shard in log order. Records at or before
+    /// `retain_after_sequence` (the base snapshot's anchor) are skipped, so replay applies
+    /// only the suffix the base does not already reflect. Legacy whole-index
+    /// (`IndexLogRecord`) lines are ignored here -- they are not delta records.
+    pub fn read_delta_records(
+        &self,
+        shard_id: ShardId,
+        retain_after_sequence: u64,
+    ) -> Result<Vec<IndexDeltaRecord>, IndexLogError> {
+        let mut records = Vec::new();
+        self.for_each_delta_record(shard_id, retain_after_sequence, |record| {
+            records.push(record);
+        })?;
+        Ok(records)
+    }
+
+    /// The same walk, handing each record over instead of collecting them.
+    ///
+    /// The file was already read a frame at a time, so what a caller held was never the FILE --
+    /// it was every record the file DECODES to, which is the larger of the two and lives until
+    /// the caller drops the vector. A caller that folds the records into one answer has no use
+    /// for that, and the folding caller here runs on the load path, which is when a store can
+    /// least afford to hold the log twice over.
+    ///
+    /// `read_delta_records` keeps its shape on top of this, so a caller that genuinely wants all
+    /// of them -- the tests that assert what a log holds -- is unchanged.
+    pub fn for_each_delta_record(
+        &self,
+        shard_id: ShardId,
+        retain_after_sequence: u64,
+        take: impl FnMut(IndexDeltaRecord),
+    ) -> Result<(), IndexLogError> {
+        // Anchor 0 declines nothing, so this opens every piece exactly as it always has. Every
+        // caller but the load-path fold asks about the LOG ITSELF -- what it holds, what its
+        // newest catalog is -- and no base anchor makes any part of that answer redundant.
+        self.for_each_delta_record_above_anchor(shard_id, retain_after_sequence, 0, take)
+    }
+
+    /// The same walk, declining WHOLE PIECES the dumped base already reflects, from their names.
+    ///
+    /// The load-path fold in `fold_index_log_deltas` hands every record it is given to the same
+    /// test: a record whose `applied_wal_sequence` is at or below the base's anchor is already
+    /// in the base, so folding it again would change nothing. That test was applied AFTER the
+    /// frame had been read off the disk, the payload decoded and every stripped repeat put back
+    /// -- so a restore whose base reflects the entire log still paid for the entire log.
+    ///
+    /// A sealed piece's name already carries the one number that test reads: `max_applied_wal`,
+    /// the highest anchor any record in it carries. When that is at or below `base_anchor`,
+    /// EVERY record in the piece fails the same test, so the piece can be passed over unopened.
+    ///
+    /// WHAT THE NAME PINS, AND WHY THAT IS ENOUGH HERE.
+    ///
+    /// - `max_applied_wal` is a max over the records' own anchors, taken at SEAL time by
+    ///   [`index_log_segment_span_of`], after a complete append. A record carrying NO anchor
+    ///   does not take part in that max at all: one carrying something the fold would apply
+    ///   makes the whole name [`INDEX_SEGMENT_UNREFLECTED`], and one carrying nothing leaves
+    ///   the max where it was. The load-path test is [`delta_record_is_reflected_by`], which
+    ///   asks those same two questions of the same record, so the two agree about it. That
+    ///   agreement is what makes the piece-level test equivalent to the per-record one.
+    ///
+    ///   THIS BULLET OUTLIVED WHAT IT DESCRIBED, AND IS KEPT AS THE RECORD OF HOW. It used to
+    ///   read "A record carrying NO anchor contributes 0 to that max -- and the load-path test
+    ///   reads a missing anchor as 0 in exactly the same way (`applied_wal_sequence
+    ///   .unwrap_or(0)`), so the two agree about it." Both halves stopped being true, one at a
+    ///   time. #1842 stopped the SEAL from reading a missing anchor as 0, because a piece of
+    ///   nothing but anchor-less deltas named 0 and the post-dump sweep unlinked it unread. The
+    ///   fold went on reading it as 0 for longer -- so a piece held open by #1842 precisely to
+    ///   save an anchor-less record handed that record to a fold that dropped it one line
+    ///   later, and the sentence above still said the two agreed. The agreement is a property
+    ///   of the predicate both sides now call, not of this paragraph.
+    /// - [`INDEX_SEGMENT_UNREFLECTED`] is excluded EXPLICITLY rather than left to the `<=`. It
+    ///   is `u64::MAX`, so the comparison would already decline to fire for any real anchor --
+    ///   but "already" is a property of the anchors a deployment happens to reach, not of this
+    ///   code, and the one value that means "no base reflects this" must not be reachable by
+    ///   arithmetic on the boundary.
+    /// - Nothing renames, copies or appends to a sealed piece. The only writer of a sealed name
+    ///   is the `fs::rename` in [`roll_index_log_segment_at`], which renames the piece being
+    ///   WRITTEN to a name computed from a fresh walk of it; the two index-GC rewrites both
+    ///   target [`index_log_path`], the active piece, which has no numbers in its name and is
+    ///   never declined here. So a piece's name and its contents are fixed together.
+    /// - The piece being written is never declined: it has no sealed name, so
+    ///   [`sealed_index_log_span`] answers `None` for it and the walk reads it whole. The tail
+    ///   of the log -- the part no dump can have reflected -- is therefore always read.
+    ///
+    /// WHICH WAY A WRONG ANSWER FAILS. Declining a piece that still holds a record the fold
+    /// would have applied is SILENT DATA LOSS: an eviction or removal recorded only in that
+    /// delta is recovered from neither the delta nor the write-ahead log, and the load reports
+    /// success. Reading a piece that could have been declined is merely slow. Only one of those
+    /// two is observable, so the tests attack that one: they assert the RECORDS THE FOLD HANDS
+    /// BACK are identical with the decline and without it, and take the saving as a separate
+    /// half.
+    ///
+    /// WHAT IS GIVEN UP. A declined piece is not checked for sequence continuity, because it is
+    /// not read. The watermark is still carried across it from its name, so a hole ON a piece
+    /// boundary is still refused; a hole INSIDE a declined piece is not. That is a strictly
+    /// smaller concession than the one this project has already made: the post-dump sweep
+    /// UNLINKS a piece on the same predicate ([`drop_reflected_index_segments`]), so a piece
+    /// this fold declines to read is a piece reclaim would delete unread.
+    pub fn for_each_delta_record_above_anchor(
+        &self,
+        shard_id: ShardId,
+        retain_after_sequence: u64,
+        base_anchor: u64,
+        mut take: impl FnMut(IndexDeltaRecord),
+    ) -> Result<(), IndexLogError> {
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        // Every piece of the log, oldest first. A log that has never rolled is one file, and this
+        // is then the single path this fold has always read.
+        //
+        // `last_sequence` is carried ACROSS the pieces, not reset per piece: the continuity check
+        // below is what refuses a holed delta stream, and per-piece it would stop seeing a hole
+        // that falls on a boundary -- which is the only new place a hole can appear.
+        let mut last_sequence = 0_u64;
+        // ONE tally for the whole fold, borrowed by each piece's handle in turn and published
+        // when the fold returns. This is the reader #1936 named and did not fix.
+        let mut tally = IndexLogReadTally::start();
+        for path in index_log_segment_paths(&inner.root, shard_id) {
+            // From the NAME, before the `exists` probe and before the open, so a declined piece
+            // costs neither. `sealed_index_log_span` parses the path string and touches no
+            // filesystem, and the enumeration handed the path over already.
+            if let Some(span) = sealed_index_log_span(&path, shard_id) {
+                if piece_is_reflected_by(span, base_anchor) {
+                    #[cfg(test)]
+                    probe::FOLD_PIECES_DECLINED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    // Carry the continuity watermark ACROSS the declined piece, from its name.
+                    // Leaving it behind would put the next piece's first record up against a
+                    // watermark from before this one, which is a WEAKER check than the walk has
+                    // today -- it would pass a record that repeats a sequence inside the piece
+                    // just declined. `end` is one past the last sequence the piece held when it
+                    // was sealed. `max` rather than assignment, and no new refusal: a name that
+                    // somehow ran backwards must not turn a load that succeeds today into one
+                    // that fails.
+                    last_sequence = last_sequence.max(span.end.saturating_sub(1));
+                    continue;
+                }
+            }
+            if !path.exists() {
+                continue;
+            }
+            let mut reader = BufReader::new(open_index_log_read(&path, &mut tally)?);
+            // Read by FRAME, not by line. A record's payload may be binary, and a binary payload
+            // may contain 0x0A -- a reader splitting on newlines would cut such a record in half
+            // and, being `lines()`, would also demand it be valid UTF-8. `read_frame` takes the
+            // length the frame declares instead, and reads text-framed and legacy unframed
+            // records unchanged, so one loop reads every shape the log has ever held. Streaming
+            // rather than reading the file whole keeps memory bounded by the largest record.
+            while let Some((_, payload)) = crate::log_framing::read_frame(&mut reader)? {
+                // Before the `continue` below, not after it: a frame this walk passes over is
+                // still a frame this walk read off the disk, and that is what the probe counts.
+                #[cfg(test)]
+                probe::FOLD_FRAMES_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    continue;
+                }
+                let payload = payload.as_slice();
+                // PROPAGATE decode/parse failures instead of silently skipping the line. Silently
+                // dropping an unparseable interior delta record and continuing the fold advances
+                // the reconstructed anchor past it, so an eviction/removal recorded ONLY in that
+                // delta (not the WAL) is recovered from neither source = silent loss / dangling
+                // ref. `decode_line` also verifies the per-record integrity envelope, so a
+                // value-preserving bit-flip surfaces here as `Corruption`.
+                // Skip only a payload that SAYS it is the other shape. Anything else -- an
+                // unrecognised shape, a truncated container -- goes to the decoder and is
+                // reported, because a sweep that quietly skips what it cannot read is how
+                // committed corruption becomes silent data loss.
+                if index_payload_shape(payload) == Some(INDEX_LOG_SHAPE_WHOLE) {
+                    continue;
+                }
+                let mut record: IndexDeltaRecord = decode_index_payload(payload)?;
+                // Put back what the writer left out because the item already stated it. A record
+                // written before that stripping carries both already, and this leaves those
+                // alone. The hoisted key FIRST: everything below derives from the item's own
+                // fields and `object_key` is one of them.
+                if let Some(shared) = record.shared_object_key.as_deref() {
+                    // Converted ONCE for the record, not once per item: every item in a
+                    // hoisted record carries the same key, so they share one allocation.
+                    let shared: std::sync::Arc<str> = std::sync::Arc::from(shared);
+                    for item in record.items.iter_mut() {
+                        item.object_key = shared.clone();
+                    }
+                }
+                for item in record.items.iter_mut() {
+                    // The item's id first: the address is restored FROM it.
+                    item.restore_object_id_repeat(record.shard_id);
+                    item.restore_address_repeats();
+                    item.restore_block_ref_key_repeat();
+                    item.restore_size_repeat();
+                }
+                // Enforce delta sequence-continuity: sequences are assigned strictly
+                // monotonically across ALL appended records (whole-index and delta share one
+                // counter), reclaim only ever removes a leading prefix, and pieces are read in
+                // log order -- so each record's sequence must be strictly greater than the
+                // previous one, boundaries included. A drop below or a duplicate means a lost /
+                // reordered / corrupted record, or pieces read out of order; refuse rather than
+                // fold a holed delta stream.
+                if record.sequence <= last_sequence {
+                    return Err(IndexLogError::Corruption(format!(
+                        "index-log delta sequence continuity violation: record sequence {} is not greater than previous {}",
+                        record.sequence, last_sequence
+                    )));
+                }
+                last_sequence = record.sequence;
+                // A whole-index IndexLogRecord also deserializes into IndexDeltaRecord (its
+                // `index` field is ignored, leaving the delta fields empty). Only keep records
+                // that carry a delta payload OR a WAL anchor (an anchor-only record still
+                // advances the reconstructed watermark on load).
+                if record.items.is_empty()
+                    && record.meta.is_none()
+                    && record.key_states.is_empty()
+                    && record.applied_wal_sequence.is_none()
+                {
+                    continue;
+                }
+                if record.sequence > retain_after_sequence {
+                    take(record);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Raw bytes of the log at `offset`.
+    ///
+    /// `offset` is a position in the LOG, not in whichever piece holds it: the pieces are read
+    /// back to back, so a window that starts in one continues into the next rather than stopping
+    /// at a boundary the caller cannot see.
+    pub fn read_range(
+        &self,
+        shard_id: ShardId,
+        offset: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, IndexLogError> {
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut at = 0_u64;
+        let mut tally = IndexLogReadTally::start();
+        for path in index_log_segment_paths(&inner.root, shard_id) {
+            if bytes.len() as u64 >= size {
+                break;
+            }
+            let length = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            if length == 0 {
+                continue;
+            }
+            // A piece that ends before the window starts holds nothing the caller asked for, and
+            // skipping it costs a stat rather than a read.
+            if at.saturating_add(length) <= offset {
+                at = at.saturating_add(length);
+                continue;
+            }
+            let start_in_piece = offset.saturating_sub(at);
+            let want = size.saturating_sub(bytes.len() as u64);
+            let mut file = open_index_log_read(&path, &mut tally)?;
+            file.seek(SeekFrom::Start(start_in_piece))?;
+            file.take(want).read_to_end(&mut bytes)?;
+            at = at.saturating_add(length);
+        }
+        inner.stats.reads += 1;
+        inner.stats.bytes_read += bytes.len() as u64;
+        Ok(bytes)
+    }
+
+    /// The records in the window. Says nothing about whether the window was exhausted, which
+    /// is why anything reporting completeness to a caller wants `scan_bounded` instead.
+    pub fn scan(
+        &self,
+        shard_id: ShardId,
+        start_offset: u64,
+        end_offset: u64,
+        max_bytes: u64,
+    ) -> Result<Vec<(u64, Vec<u8>)>, IndexLogError> {
+        self.scan_bounded(shard_id, start_offset, end_offset, max_bytes)
+            .map(|(records, _)| records)
+    }
+
+    /// The records in the window, and whether `max_bytes` cut the scan short.
+    ///
+    /// The walk below stops for two unrelated reasons: the window ended, or the byte budget ran
+    /// out. Returning only the records conflates them, and a caller that cannot tell them apart
+    /// reports a truncated read as a complete one.
+    pub fn scan_bounded(
+        &self,
+        shard_id: ShardId,
+        start_offset: u64,
+        end_offset: u64,
+        max_bytes: u64,
+    ) -> Result<(Vec<(u64, Vec<u8>)>, bool), IndexLogError> {
+        self.scan_collect(shard_id, start_offset, end_offset, max_bytes, |offset, raw| {
+            (offset, raw)
+        })
+    }
+
+    /// How many records the log holds, without building them.
+    ///
+    /// The caller that wanted this asked `scan(.., u64::MAX, u64::MAX)` and took `.len()` of the
+    /// result, so it read the whole log into a vector to learn how many records were in it --
+    /// on the plan path of every maintenance round.
+    ///
+    /// The same walk, projecting to `()`. A zero-sized element costs nothing per record, so peak
+    /// memory is one record rather than all of them, and the count cannot drift from what a scan
+    /// would have returned because it IS the scan. The write-ahead log store has the twin of
+    /// this, for the same caller.
+    pub fn record_count(&self, shard_id: ShardId) -> Result<usize, IndexLogError> {
+        self.scan_collect(shard_id, 0, u64::MAX, u64::MAX, |_offset, _raw| ())
+            .map(|(records, _truncated)| records.len())
+    }
+
+    /// The one walk every scan of this log shares, so they cannot drift about what a window
+    /// contains. Mirrors `scan_collect` on the write-ahead log store.
+    fn scan_collect<T>(
+        &self,
+        shard_id: ShardId,
+        start_offset: u64,
+        end_offset: u64,
+        max_bytes: u64,
+        mut take: impl FnMut(u64, Vec<u8>) -> T,
+    ) -> Result<(Vec<T>, bool), IndexLogError> {
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        let segments = index_log_segment_paths(&inner.root, shard_id)
+            .into_iter()
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        if segments.is_empty() {
+            inner.stats.scans += 1;
+            return Ok((Vec::new(), false));
+        }
+        let _ = last_sequence_at(&inner.root, shard_id)?;
+        // A record's position is where it sits in the LOG, counted across the pieces in order --
+        // not an offset into whichever file holds it, which would mean nothing to a caller once
+        // there is more than one.
+        let mut offset = 0_u64;
+        let mut total = 0;
+        let mut truncated = false;
+        let mut records = Vec::new();
+        let mut tally = IndexLogReadTally::start();
+
+        'segments: for path in segments {
+            let length = path.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+            if offset.saturating_add(length) <= start_offset {
+                offset = offset.saturating_add(length);
+                continue;
+            }
+            let mut file = open_index_log_read(&path, &mut tally)?;
+            let skip = start_offset.saturating_sub(offset);
+            file.seek(SeekFrom::Start(skip))?;
+            offset = offset.saturating_add(skip);
+            let mut reader = BufReader::new(file);
+
+            // Walk by RECORD, not by newline. What this returns is each record's raw framed
+            // bytes -- the caller ships them onward untouched -- so the walk has to agree with
+            // the writer about where a record ends. A newline scan decides that from a delimiter
+            // a binary payload may itself contain, and would hand the caller half a record that
+            // still looks like a whole one. The write-ahead log walks its own records with this
+            // same reader, for this same reason.
+            while let Some(raw) = crate::log_framing::read_raw_record(&mut reader)? {
+                let read = raw.len() as u64;
+                let next_offset = offset.saturating_add(read);
+                if next_offset > end_offset {
+                    break 'segments;
+                }
+                if total + read > max_bytes {
+                    // Out of budget with the window not yet walked: there is more to read.
+                    truncated = true;
+                    break 'segments;
+                }
+                records.push(take(offset, raw));
+                offset = next_offset;
+                total += read;
+            }
+        }
+        inner.stats.scans += 1;
+        inner.stats.bytes_read += total;
+        inner.stats.records_read += records.len() as u64;
+        Ok((records, truncated))
+    }
+
+    /// Answer the index-GC gate from the piece NAMES plus the piece being written.
+    ///
+    /// The gate wants three numbers -- the log's size, how many records it holds, and how many of
+    /// them sit below a retain floor -- and used to get the last two by scanning the whole log and
+    /// decoding every record. That is the cost `drop_covered_index_segments` stopped paying: a
+    /// sealed piece's name already carries `start`, `end` and its highest WAL anchor, so
+    ///
+    /// - the piece holds `end - start` records, because sequences are assigned `last + 1` with no
+    ///   holes -- the same arithmetic a round already reports its removals with, so the gate and the
+    ///   collector cannot disagree about a piece;
+    /// - the records in it below a floor are `min(end, floor) - start`, saturating, for exactly the
+    ///   same reason: contiguity makes a count out of a subtraction, and a floor at or under
+    ///   `start` leaves none.
+    ///
+    /// Only the piece being WRITTEN has no numbers in its name, so only that one is opened. It is
+    /// at most the rolling threshold (64 KiB shipped), whatever the log has grown to, which is
+    /// what makes this cost the number of PIECES rather than the number of records.
+    ///
+    /// THE ONE SHAPE THIS DOES NOT BOUND, said plainly rather than left to be discovered: a log
+    /// that has never rolled is ONE piece and that piece is the whole log, so this decodes all of
+    /// it -- exactly what the old gate did, no better and no worse. `TS_INDEX_LOG_SEGMENT_BYTES=0`
+    /// and any store written before pieces are that shape. The bound is on the ROLLED log, and a
+    /// guard asserting it has to say how many pieces its fixture actually had.
+    ///
+    /// Infallible on purpose. This is a GC-pressure metric, not the recovery path: a corrupt frame
+    /// in the piece being written stops the walk and leaves the sealed pieces counted, where
+    /// returning an error would have the caller read the whole log as EMPTY -- which reads as a
+    /// log with nothing to collect rather than as a log that could not be measured. Replay is
+    /// where a corrupt record is surfaced, and it still surfaces it.
+    pub fn gate_summary(
+        &self,
+        shard_id: ShardId,
+        retain_from_sequence: u64,
+    ) -> IndexLogGateSummary {
+        let mut inner = self.inner.lock().expect("index log lock poisoned");
+        let root = inner.root.clone();
+        let active = index_log_path(&root, shard_id);
+        let mut summary = IndexLogGateSummary {
+            shard_id,
+            retain_from_sequence,
+            ..IndexLogGateSummary::default()
+        };
+        let mut tally = IndexLogReadTally::start();
+        for path in index_log_segment_paths(&root, shard_id) {
+            // A `stat`, and for a sealed piece that is the whole of it. A piece that has just been
+            // unlinked out from under this walk is simply not counted, the same way
+            // `index_log_total_bytes` does not count it.
+            let Ok(metadata) = path.metadata() else {
+                continue;
+            };
+            summary.pieces += 1;
+            summary.bytes = summary.bytes.saturating_add(metadata.len());
+            if path != active {
+                let Some(span) = sealed_index_log_span(&path, shard_id) else {
+                    continue;
+                };
+                summary.pieces_named += 1;
+                let held = span.end.saturating_sub(span.start);
+                let removable = span.end.min(retain_from_sequence).saturating_sub(span.start);
+                summary.records = summary.records.saturating_add(held as usize);
+                summary.removable_records = summary
+                    .removable_records
+                    .saturating_add(removable as usize);
+                continue;
+            }
+            let Ok(file) = open_index_log_read(&path, &mut tally) else {
+                continue;
+            };
+            let mut reader = BufReader::new(file);
+            // By FRAME, not by newline, for the reason every other walk of this log gives: a
+            // binary payload may contain the delimiter a newline scan would stop at.
+            while let Ok(Some((frame_bytes, payload))) = crate::log_framing::read_frame(&mut reader)
+            {
+                summary.bytes_decoded = summary.bytes_decoded.saturating_add(frame_bytes as u64);
+                if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    continue;
+                }
+                summary.records_decoded += 1;
+                summary.records += 1;
+                // Through the index log's own decoder, and only the HEAD of the record: two shapes
+                // share this log and both carry a sequence. A record that will not decode is
+                // COUNTED but not called removable, which is what the scan this replaces did -- it
+                // makes the ratio smaller, so it can only ever decline a round, never fire one.
+                if let Ok(head) = decode_index_payload::<IndexRecordHead>(&payload) {
+                    if head.sequence < retain_from_sequence {
+                        summary.removable_records += 1;
+                    }
+                }
+            }
+        }
+        inner.stats.scans += 1;
+        inner.stats.bytes_read += summary.bytes_decoded;
+        inner.stats.records_read += summary.records_decoded as u64;
+        summary
+    }
+
+    /// How many files this shard's log is in, the one being written included.
+    pub fn piece_count(&self, shard_id: ShardId) -> usize {
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        index_log_segment_paths(&inner.root, shard_id)
+            .into_iter()
+            .filter(|path| path.exists())
+            .count()
+    }
+
+    pub fn gc_before_sequence(
+        &self,
+        shard_id: ShardId,
+        retain_from_sequence: u64,
+    ) -> Result<IndexLogGcReport, IndexLogError> {
+        self.gc_before_sequence_limited(shard_id, retain_from_sequence, 0)
+    }
+
+    pub fn gc_before_sequence_limited(
+        &self,
+        shard_id: ShardId,
+        retain_from_sequence: u64,
+        // The bound applies to the REWRITE of the piece being written, which is the only part of
+        // a round that copies anything. Whole earlier pieces are unlinked, and that is not work a
+        // round needs protecting from: a stat and an unlink each, whatever they hold.
+        //
+        // It used to bound the whole round, and bounding the whole round cost MORE: the round
+        // rewrote what it retained, so removing fewer records meant copying more of them --
+        // 40,000 records were 357 ms in one unlimited round against 492 ms limited to 200. That
+        // inversion is what the pieces remove; see
+        // `reclaim_costs_what_it_removes_not_what_it_keeps`.
+        max_entries_per_round: usize,
+    ) -> Result<IndexLogGcReport, IndexLogError> {
+        #[cfg(test)]
+        probe::SWEEP_ENTRIES_BUDGETED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Taken here and held to the end of the function -- past the walk, past the rewrite,
+        // past the barrier and the rename. It is the same lock `append_json` takes, so for as
+        // long as a sweep runs the shard's index log accepts no record. What bounds that hold is
+        // therefore what bounds the sweep, and `max_entries_per_round` is not it: see the note
+        // on the parameter above.
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        // AFTER the guard, so it drops BEFORE it: the release reading is taken while the lock is
+        // still held. `a_sweep_holds_the_lock_every_append_needs` reads the two.
+        #[cfg(test)]
+        let _lock_span = probe::SweepLockSpan::new();
+        fs::create_dir_all(&inner.root)?;
+        let root = inner.root.clone();
+        let path = index_log_path(&root, shard_id);
+        if !index_log_segment_paths(&root, shard_id)
+            .iter()
+            .any(|piece| piece.exists())
+        {
+            return Ok(IndexLogGcReport {
+                shard_id,
+                retain_from_sequence,
+                max_entries_per_round,
+                ..IndexLogGcReport::default()
+            });
+        }
+
+        let bytes_before = index_log_total_bytes(&root, shard_id);
+        // Whole earlier pieces first. A piece whose sequences all sit below the floor is unlinked
+        // without being opened, so what it HELD costs nothing -- which is the point: this round
+        // used to pay for every record it kept.
+        let (dropped_segments, dropped_segment_bytes, dropped_records) =
+            drop_covered_index_segments(&root, shard_id, retain_from_sequence)?;
+
+        let _ = last_sequence_at(&root, shard_id)?;
+        let mut records_before = 0usize;
+        let mut removed_this_round = 0usize;
+        let mut removable_records_before_budget = 0usize;
+        let mut retained = Vec::new();
+        let mut reclaimable_bytes = 0u64;
+        if path.exists() {
+            let mut tally = IndexLogReadTally::start();
+            // By frame, not by line: see the fold path above.
+            let mut reader = BufReader::new(open_index_log_read(&path, &mut tally)?);
+            while let Some((frame_bytes, payload)) = crate::log_framing::read_frame(&mut reader)? {
+                if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    continue;
+                }
+                records_before += 1;
+                #[cfg(test)]
+                probe::SWEEP_FRAMES_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Preserve the exact on-disk payload for retained records so a delta record is
+                // not silently re-encoded as a whole-index record (which would drop its
+                // items/meta). Decode verifies the integrity envelope; the retained raw payload
+                // is re-framed on write-out below.
+                let record: IndexRecordHead = decode_index_payload(&payload)?;
+                if record.sequence < retain_from_sequence {
+                    removable_records_before_budget =
+                        removable_records_before_budget.saturating_add(1);
+                }
+                if record.sequence >= retain_from_sequence
+                    || (max_entries_per_round > 0 && removed_this_round >= max_entries_per_round)
+                {
+                    retained.push(payload);
+                } else {
+                    removed_this_round = removed_this_round.saturating_add(1);
+                    reclaimable_bytes = reclaimable_bytes.saturating_add(frame_bytes as u64);
+                    #[cfg(test)]
+                    probe::note_sweep_removed(shard_id, record.sequence);
+                }
+            }
+        }
+
+        // Nothing in the piece being written is reclaimable, which is the ordinary case once the
+        // log rolls: the removable prefix lives in the pieces that were just unlinked. Rewriting
+        // the piece would write it back byte for byte and take a barrier to do it.
+        let mut bytes_copied = 0u64;
+        let rewrite_skipped = removed_this_round == 0;
+        if !rewrite_skipped {
+            let temp_path = path.with_extension("gc.tmp");
+            {
+                // A WRITE, not a read: spelled in full because `File` is no longer in this
+                // module's namespace, which is what stops a read being written uncounted.
+                let mut temp = std::fs::File::create(&temp_path)?;
+                for payload in &retained {
+                    let framed = crate::log_framing::encode_record(payload);
+                    bytes_copied = bytes_copied.saturating_add(framed.len() as u64);
+                    #[cfg(test)]
+                    probe::SWEEP_FRAMES_COPIED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    temp.write_all(&framed)?;
+                }
+                temp.flush()?;
+                crate::durability_metrics::record_barrier("engine_index_log_gc");
+                temp.sync_all()?;
+            }
+            fs::rename(&temp_path, &path)?;
+            sync_parent_dir(&path)?;
+        }
+        let bytes_after = index_log_total_bytes(&root, shard_id);
+        let removed_from_active = records_before.saturating_sub(retained.len());
+        Ok(IndexLogGcReport {
+            shard_id,
+            retain_from_sequence,
+            max_entries_per_round,
+            records_before: dropped_records.saturating_add(records_before),
+            records_after: retained.len(),
+            records_removed: dropped_records.saturating_add(removed_from_active),
+            removable_records_before_budget: dropped_records
+                .saturating_add(removable_records_before_budget),
+            budget_exhausted: max_entries_per_round > 0
+                && removable_records_before_budget > max_entries_per_round,
+            bytes_before,
+            bytes_after,
+            reclaimable_bytes: dropped_segment_bytes.saturating_add(reclaimable_bytes),
+            rewrite_skipped,
+            bytes_copied,
+            dropped_segments,
+            dropped_segment_bytes,
+        })
+    }
+
+    /// Remove every record a completed catalog dump has made redundant, deciding retention per
+    /// record on CONTENT rather than on log position alone.
+    ///
+    /// A dump durably materializes the base served index at WAL anchor `wal_anchor` and then
+    /// appends its folded catalog anchor, which lands at index-log sequence `meta_sequence`.
+    /// Everything the base reflects -- records whose own WAL anchor is at or below `wal_anchor`
+    /// -- is redundant on load (the fold skips them), so it goes. Two kinds of record sit below
+    /// `meta_sequence` yet must SURVIVE:
+    ///
+    /// - a delta a concurrent writer appended between the dump's serialization and its anchor
+    ///   append: its WAL anchor is above `wal_anchor`, so the base does not reflect it, and
+    ///   removing it would lose an eviction/removal that lives only in the delta stream;
+    /// - a record carrying NO anchor that still holds items, a meta item or key-states. The
+    ///   fold applies those whatever the anchor says, so nothing shows the base reflects them.
+    ///   A legacy whole-index line also carries no anchor, but holds nothing the fold applies
+    ///   and is read by no load path, so it IS treated as reflected and removed. Reading a
+    ///   missing anchor as 0 made the two indistinguishable, and 0 is at or below every
+    ///   anchor -- so every anchor-less record was removed, the content-bearing ones included.
+    ///
+    /// The folded catalog anchor itself is at `meta_sequence`, above the removal window, so the
+    /// load-time catalog seed always survives. Position (`sequence < meta_sequence`) still
+    /// bounds the sweep so a record appended AFTER the dump with a stale-looking anchor is never
+    /// touched.
+    /// `min_reclaimable_bytes` is the least the sweep must be able to reclaim before it will
+    /// rewrite the log. Below it -- and always when nothing at all is reclaimable -- the log is
+    /// left exactly as it is and the report says so.
+    ///
+    /// NO PER-ROUND ENTRY BUDGET, DELIBERATELY, and it is the sweep a background thread drives
+    /// once a second while its budgeted sibling runs when an operator asks. Both halves of that
+    /// are measured; [`POST_DUMP_SWEEP_ENTRY_BUDGET`] is the long form, and the short one is that
+    /// a budget would bound neither the walk nor the lock this holds, and would make the rewrite
+    /// copy more. What bounds this round is the rolling threshold: pieces below the floor are
+    /// unlinked by name and never opened, so only the piece being written is walked.
+    pub fn gc_reflected_before_anchor(
+        &self,
+        shard_id: ShardId,
+        wal_anchor: u64,
+        meta_sequence: u64,
+        min_reclaimable_bytes: u64,
+    ) -> Result<IndexLogGcReport, IndexLogError> {
+        #[cfg(test)]
+        probe::SWEEP_ENTRIES_POST_DUMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Held to the end of the function, exactly as the budgeted sweep holds it, and for the
+        // same reason: this is the lock `append_json` takes.
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        #[cfg(test)]
+        let _lock_span = probe::SweepLockSpan::new();
+        fs::create_dir_all(&inner.root)?;
+        let root = inner.root.clone();
+        let path = index_log_path(&root, shard_id);
+        if !index_log_segment_paths(&root, shard_id)
+            .iter()
+            .any(|piece| piece.exists())
+        {
+            return Ok(IndexLogGcReport {
+                shard_id,
+                retain_from_sequence: meta_sequence,
+                ..IndexLogGcReport::default()
+            });
+        }
+
+        let bytes_before = index_log_total_bytes(&root, shard_id);
+        // Whole earlier pieces first, and unconditionally: the threshold below exists to decline
+        // a REWRITE that copies almost everything to reclaim almost nothing, and an unlink copies
+        // nothing at all. A piece only goes when its name says every record in it is both below
+        // the position bound and reflected by the base the dump wrote.
+        let (dropped_segments, dropped_segment_bytes, dropped_records) =
+            drop_reflected_index_segments(&root, shard_id, wal_anchor, meta_sequence)?;
+
+        let _ = last_sequence_at(&root, shard_id)?;
+        let mut records_before = 0usize;
+        let mut retained = Vec::new();
+        // `read_frame` hands back how many bytes the record OCCUPIED, which this loop used to
+        // discard. It is the exact on-disk size of what a rewrite would drop, so the threshold
+        // below is measured in the same bytes the file is measured in rather than in payloads.
+        let mut reclaimable_bytes = 0u64;
+        if path.exists() {
+            let mut tally = IndexLogReadTally::start();
+            // By frame, not by line: see the fold path above.
+            let mut reader = BufReader::new(open_index_log_read(&path, &mut tally)?);
+            while let Some((frame_bytes, payload)) = crate::log_framing::read_frame(&mut reader)? {
+                if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    continue;
+                }
+                records_before += 1;
+                #[cfg(test)]
+                probe::SWEEP_FRAMES_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                // Decode verifies the integrity envelope; the retained raw payload is re-framed
+                // on write-out below, so a retained delta record keeps its exact on-disk bytes.
+                let probe: IndexRecordHead = decode_index_payload(&payload)?;
+                // THREE clauses, not two: below the position bound, AND the base PROVABLY
+                // reflects it. `unwrap_or(0)` was not a proof -- it read a missing anchor as
+                // anchor 0, which is at or below every anchor, so every anchor-less record was
+                // classified reflected and removed. That is right for the legacy whole-index
+                // lines named above and wrong for a DELTA that carries no anchor:
+                // `for_each_delta_record` still folds its items and key-states, so removing it
+                // loses exactly the eviction the fold would have applied. The expiry sweep
+                // writes such a record whenever it reaches its checkpoint while
+                // `shard.applied_wal_sequence` is still `None` -- no items, and every tombstone
+                // of the round in its key-states.
+                //
+                // The missing clause is the FOLD'S OWN predicate, asked of the same record, so
+                // the sweep and the walk cannot drift about which records matter. It costs a
+                // second decode only for an anchor-less record, which is the rare one.
+                let reflected = match probe.applied_wal_sequence {
+                    Some(anchor) => anchor <= wal_anchor,
+                    None => !delta_record_carries_content(&payload)?,
+                };
+                if probe.sequence >= meta_sequence || !reflected {
+                    retained.push(payload);
+                } else {
+                    reclaimable_bytes = reclaimable_bytes.saturating_add(frame_bytes as u64);
+                    #[cfg(test)]
+                    crate::index_log::probe::note_sweep_removed(shard_id, probe.sequence);
+                }
+            }
+        }
+
+        // Rewriting while retaining every record writes the file back byte for byte, so the
+        // barrier and the rename buy nothing at all -- that half is arithmetic, not policy. The
+        // threshold is the policy: a rewrite that reclaims a handful of bytes still costs a full
+        // read, a full write and an fsync, and the post-dump sweep runs on every dump.
+        let removable = records_before.saturating_sub(retained.len());
+        if removable == 0 || reclaimable_bytes < min_reclaimable_bytes {
+            let bytes_after = index_log_total_bytes(&root, shard_id);
+            return Ok(IndexLogGcReport {
+                shard_id,
+                retain_from_sequence: meta_sequence,
+                records_before: dropped_records.saturating_add(records_before),
+                records_after: records_before,
+                records_removed: dropped_records,
+                removable_records_before_budget: dropped_records.saturating_add(removable),
+                bytes_before,
+                bytes_after,
+                reclaimable_bytes: dropped_segment_bytes.saturating_add(reclaimable_bytes),
+                rewrite_skipped: true,
+                bytes_copied: 0,
+                dropped_segments,
+                dropped_segment_bytes,
+                ..IndexLogGcReport::default()
+            });
+        }
+
+        let temp_path = path.with_extension("gc.tmp");
+        let mut bytes_copied = 0u64;
+        {
+            // A WRITE, not a read. See the note on the other rewrite.
+            let mut temp = std::fs::File::create(&temp_path)?;
+            for payload in &retained {
+                let framed = crate::log_framing::encode_record(payload);
+                bytes_copied = bytes_copied.saturating_add(framed.len() as u64);
+                #[cfg(test)]
+                crate::index_log::probe::SWEEP_FRAMES_COPIED
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                temp.write_all(&framed)?;
+            }
+            temp.flush()?;
+            crate::durability_metrics::record_barrier("engine_index_log_gc");
+            temp.sync_all()?;
+        }
+        fs::rename(&temp_path, &path)?;
+        sync_parent_dir(&path)?;
+        let bytes_after = index_log_total_bytes(&root, shard_id);
+        Ok(IndexLogGcReport {
+            shard_id,
+            retain_from_sequence: meta_sequence,
+            // NOT a bare zero. See the constant: an entry budget bounds neither this round's read
+            // nor its lock hold, and setting one here would only make the rewrite copy more.
+            max_entries_per_round: POST_DUMP_SWEEP_ENTRY_BUDGET,
+            records_before: dropped_records.saturating_add(records_before),
+            records_after: retained.len(),
+            records_removed: dropped_records.saturating_add(removable),
+            removable_records_before_budget: dropped_records.saturating_add(removable),
+            budget_exhausted: false,
+            bytes_before,
+            bytes_after,
+            reclaimable_bytes: dropped_segment_bytes.saturating_add(reclaimable_bytes),
+            rewrite_skipped: false,
+            bytes_copied,
+            dropped_segments,
+            dropped_segment_bytes,
+        })
+    }
+
+    pub fn stats(&self, shard_id: ShardId) -> IndexLogStats {
+        let inner = self.inner.lock().expect("index log lock poisoned");
+        IndexLogStats {
+            last_sequence: last_sequence_at(&inner.root, shard_id).unwrap_or_default(),
+            ..inner.stats
+        }
+    }
+}
+
+impl Default for LocalIndexLogStore {
+    fn default() -> Self {
+        let scratch = crate::scratch::owned_scratch_dir("index-logs");
+        let store = Self::new(scratch.path());
+        store
+            .inner
+            .lock()
+            .expect("index log lock poisoned")
+            .scratch = Some(scratch);
+        store
+    }
+}
+
+/// The suffix an index log is written with.
+///
+/// Its records are binary -- the same framing the write-ahead log uses, a frame magic then a
+/// payload -- and have been since the log stopped encoding JSON. A store written before this
+/// carries the older name, which claimed a format it no longer held.
+const INDEX_LOG_SUFFIX: &str = "bin";
+
+/// What the same file used to be called. Still read, never written.
+///
+/// Dropping it rather than keeping it would find no index log where one exists, which reads as an
+/// empty log rather than an error -- and an empty index log is a silently emptier shard.
+const LEGACY_INDEX_LOG_SUFFIX: &str = "jsonl";
+
+fn index_log_path(root: &Path, shard_id: ShardId) -> PathBuf {
+    // Counted here as well as in `active_index_log`, and BEFORE the branches, so the probe is
+    // "how many times was the active piece resolved, by any route" rather than "by the new
+    // route". A change that put the append back on this function would otherwise read as free.
+    #[cfg(test)]
+    probe::APPEND_PATH_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let renamed = root.join(format!("shard-{shard_id}.indexlog.{INDEX_LOG_SUFFIX}"));
+    if renamed.exists() {
+        return renamed;
+    }
+    // An existing store keeps the name it already has, so one shard's log is never split across
+    // two names. A store with neither is new, and starts under the current one.
+    let legacy = root.join(format!("shard-{shard_id}.indexlog.{LEGACY_INDEX_LOG_SUFFIX}"));
+    if legacy.exists() {
+        return legacy;
+    }
+    renamed
+}
+
+/// The file the shard's log is being written to, AND how many bytes are in it, in ONE probe.
+///
+/// [`index_log_path`] answers the first question with `exists()`, and the roll then asked
+/// `metadata()` for the second -- of the same path, a syscall later. `Path::exists()` IS
+/// `metadata().is_ok()`, so the existence answer was already inside the length answer and the
+/// append was buying it twice. This asks once and returns both.
+///
+/// The three-way answer is [`index_log_path`]'s, unchanged: the current name when it is there,
+/// the legacy name when only that is, and the current name when neither is -- so one shard's
+/// log is still never split across two names.
+///
+/// A length of 0 means an empty file OR no file, and both are "nothing to seal", which is the
+/// only thing the caller asks the length for.
+fn active_index_log(root: &Path, shard_id: ShardId) -> (PathBuf, u64) {
+    #[cfg(test)]
+    probe::APPEND_PATH_PROBES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let renamed = root.join(format!("shard-{shard_id}.indexlog.{INDEX_LOG_SUFFIX}"));
+    if let Ok(metadata) = fs::metadata(&renamed) {
+        return (renamed, metadata.len());
+    }
+    let legacy = root.join(format!("shard-{shard_id}.indexlog.{LEGACY_INDEX_LOG_SUFFIX}"));
+    if let Ok(metadata) = fs::metadata(&legacy) {
+        return (legacy, metadata.len());
+    }
+    (renamed, 0)
+}
+
+fn last_sequence_at(root: &Path, shard_id: ShardId) -> Result<u64, IndexLogError> {
+    // A sealed piece SAYS what its last sequence is, in its name. It was sealed after a complete
+    // append, so the number is authoritative -- and reading the piece back to learn it would make
+    // every sequence probe cost the log's whole history again, which is the cost the pieces exist
+    // to remove.
+    let mut last = 0_u64;
+    for piece in index_log_segment_paths(root, shard_id) {
+        if let Some(span) = sealed_index_log_span(&piece, shard_id) {
+            last = last.max(span.end.saturating_sub(1));
+        }
+    }
+    let path = index_log_path(root, shard_id);
+    if !path.exists() {
+        return Ok(last);
+    }
+    // Only the piece being written can have a torn tail: a sealed piece was made durable and
+    // renamed after a whole record landed, and nothing appends to it afterwards. So this trims
+    // the active piece, exactly as it trimmed the single file before there were pieces.
+    let mut tally = IndexLogReadTally::start();
+    let mut reader = BufReader::new(open_index_log_repair(&path, &mut tally)?);
+    let mut good_offset = 0_u64;
+    loop {
+        // By FRAME, not by newline. This function truncates: it trims the file back to the
+        // last whole record. A newline scan decides where records end by looking for a
+        // delimiter, which a binary payload may legitimately contain -- so it would find an
+        // end that is not one, call the remainder torn, and set_len durable records away.
+        // `read_frame` takes the length the record declares, and still reads text-framed and
+        // legacy unframed records, so what counts as "whole" no longer depends on the payload
+        // encoding. Mirrors wal.rs::last_wal_sequence_at.
+        match crate::log_framing::read_frame(&mut reader) {
+            // A complete record. Whitespace-only filler advances the good offset without
+            // being parsed, exactly as the newline scan did.
+            Ok(Some((consumed, payload))) => {
+                good_offset = good_offset.saturating_add(consumed as u64);
+                if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    continue;
+                }
+                // A COMPLETE record that fails to parse is committed corruption, not a torn
+                // tail. Treating it as end-of-log would set_len the file down to the last
+                // parseable record -- silently dropping durable index-log records after the
+                // corrupt one AND rewinding the sequence counter (the next append reuses a
+                // sequence that durable dump manifests already cite). Surface it as an error;
+                // index-log replay returns DataLoss on a hole or digest mismatch, never trims.
+                let record = decode_index_payload::<IndexRecordHead>(&payload)?;
+                last = last.max(record.sequence);
+            }
+            // Nothing further, or fewer bytes than the record declares: a crash mid-append.
+            // That tail is what `good_offset` trims below.
+            Ok(None) => break,
+            // A whole record whose digest does not match its payload: committed damage.
+            Err(err) => return Err(IndexLogError::Corruption(err.0)),
+        }
+    }
+    // Back out of the reader to truncate through the same handle: the bytes it read are
+    // already charged, and taking a second descriptor to do this is what made the write-ahead
+    // log's tail repair count one open where two happened.
+    let file = reader.into_inner();
+    if good_offset < file.metadata()?.len() {
+        file.set_len(good_offset)?;
+        crate::durability_metrics::record_barrier("engine_index_log_seq_probe");
+        file.sync_all()?;
+        sync_parent_dir(&path)?;
+    }
+    Ok(last)
+}
+
+/// TS_INDEX_LOG_SEGMENT_BYTES: roll the index log into a new piece once the one being written
+/// passes this many bytes.
+///
+/// Zero never rolls, which is one file -- the shape every store written before this has, and the
+/// shape this code still reads.
+///
+/// Rolling is what makes reclaim cost what it REMOVES. One file per shard has to be reclaimed by
+/// reading it and rewriting every record it keeps, so a round that removes little copies almost
+/// everything: 40,000 records took 357 ms in one unlimited round against 492 ms limited to 200 --
+/// bounding the round made it DEARER, because the bound is on what it removes and the cost is on
+/// what it retains. In pieces the removal is an unlink: a stat and a `remove_file`, whatever the
+/// piece holds, and nothing is read or copied.
+///
+/// **Default 64 KiB**, chosen against the gate that lets this log grow rather than by feel. Index
+/// GC fires at `DEFAULT_INDEX_GC_INDEX_LOG_BYTES_THRESHOLD`, 768 KiB, and only when at least 40%
+/// of the records are removable -- so the log a round actually meets is about 768 KiB with a
+/// removable prefix of about 300 KiB. A round can only unlink pieces that lie WHOLLY inside that
+/// prefix, so the piece size is the granularity of reclaim:
+///
+/// | piece | pieces in 768 KiB | unlinked from a 40% prefix |
+/// |---|---|---|
+/// | 256 KiB (the write-ahead log's) | 3 | 1 -- a third of the log |
+/// | 64 KiB | 12 | 4 -- 87% of what is removable |
+/// | 8 KiB | 96 | 38 -- 99%, and 96 names per shard |
+///
+/// 64 KiB is where the granularity stops being the limit and the file count has not yet started
+/// to be one. The write-ahead log's 256 KiB is larger because it is pinned to its preallocation
+/// chunk, which this log does not have.
+fn index_log_segment_bytes() -> u64 {
+    if let Some(threshold) = INDEX_SEGMENT_BYTES_OVERRIDE.with(|value| value.get()) {
+        return threshold;
+    }
+    std::env::var("TS_INDEX_LOG_SEGMENT_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(DEFAULT_INDEX_LOG_SEGMENT_BYTES)
+}
+
+/// Rolling threshold when nothing sets one. See [`index_log_segment_bytes`].
+pub const DEFAULT_INDEX_LOG_SEGMENT_BYTES: u64 = 64 * 1024;
+
+/// The per-round entry budget the post-dump sweep applies: NONE, deliberately.
+///
+/// [`LocalIndexLogStore::gc_reflected_before_anchor`] takes no `max_entries_per_round` parameter
+/// and has no budget test in its record loop. This is the value its report carries, so a reader
+/// of an `IndexLogGcReport` off that path sees the absence stated rather than inferred -- and so
+/// a third sweep cannot pick up a bare literal without meeting the reason for it.
+///
+/// WHAT `0` MEANS, READ FROM THE CONSUMER. The only code that consumes this quantity is
+/// [`LocalIndexLogStore::gc_before_sequence_limited`], which guards it as
+/// `max_entries_per_round > 0 && removed_this_round >= max_entries_per_round`, and the
+/// `budget_exhausted` term, guarded the same way. `0` is therefore "no budget" and not "use the
+/// default" -- `the_default_entry_budget_belongs_to_the_path_that_runs_when_asked` drives the
+/// consumer at this value and asserts it removes everything it can.
+///
+/// WHY THIS PATH HAS NONE, AND WHY MATCHING THE OTHER PATH'S 256 WOULD BE A PESSIMISATION.
+/// An entry budget is not a bound on the work of either sweep. When the budget is reached the
+/// record is pushed onto `retained` and the loop CONTINUES, so the budget:
+///
+/// - does not bound what the round READS -- both loops read the piece being written to its end;
+/// - does not bound how long the round holds `inner`, which is the lock `append_json` takes;
+/// - bounds what the round REMOVES, and so makes the rewrite copy MORE, not less.
+///
+/// Measured in counts in `index_log_sweep_bound::an_entry_budget_copies_more_and_reads_exactly_as_much`:
+/// the same log, budgeted at 256, reads the identical number of frames, removes fewer records
+/// and copies strictly more bytes than the same round with no budget at all. The note on
+/// `gc_before_sequence_limited`'s parameter records the same inversion in milliseconds at 40,000
+/// records, from the shape that preceded piece unlinking.
+///
+/// WHAT DOES BOUND THIS SWEEP is [`DEFAULT_INDEX_LOG_SEGMENT_BYTES`]. Sealed pieces below the
+/// floor are unlinked by NAME without being opened, so the walk and the rewrite see only the
+/// piece being written -- at most the rolling threshold, whatever the store holds. That is a
+/// bound on what a round READS, which is the kind this engine has very few of.
+///
+/// AND THE CADENCES ARE THE OTHER WAY ROUND FROM THE BOUNDS. This unbudgeted sweep is the one
+/// the embedded proxy's background thread drives once a second
+/// (`MATRIXARK_RUST_PROXY_LOG_RECLAIM_INTERVAL_MS`); the budgeted one is reached from
+/// `run_storage_manager_cycle`, which in that proxy is a request op that runs when asked.
+/// Counted at both entry points in
+/// `index_log_sweep_bound::each_production_driver_reaches_exactly_one_of_the_two_sweeps`.
+pub(crate) const POST_DUMP_SWEEP_ENTRY_BUDGET: usize = 0;
+
+thread_local! {
+    /// Per-thread override of the rolling threshold.
+    ///
+    /// Per thread, not per process: appending happens on the calling thread, and a test that set
+    /// a process-wide threshold would make every other test running beside it roll too.
+    static INDEX_SEGMENT_BYTES_OVERRIDE: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Set the rolling threshold for THIS THREAD. The environment variable is the supported way to
+/// set it; this exists so a test can roll without disturbing anything running beside it.
+pub fn set_index_log_segment_bytes_for_test(threshold: Option<u64>) {
+    INDEX_SEGMENT_BYTES_OVERRIDE.with(|value| value.set(threshold));
+}
+
+/// What a sealed piece of the index log holds -- read from its NAME, not from the file.
+///
+/// Reclaim decides entirely from these three numbers, so deciding costs a `read_dir` entry rather
+/// than a pass over the piece. They are written when the piece is sealed, which happens after a
+/// complete append, so each one is final.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexSegmentSpan {
+    /// The first sequence in the piece.
+    start: u64,
+    /// One PAST the last sequence in the piece: the piece holds `start..end`.
+    ///
+    /// NOT the record count, though it used to be. Sequences are assigned `last + 1` with no
+    /// holes, but the post-dump sweep rewrites the piece being WRITTEN and keeps an interior
+    /// subset of it, so once that piece is sealed its span is wider than its contents. `end -
+    /// start` is therefore an UPPER BOUND on how many records the piece holds -- see the note on
+    /// the two sweeps that report it.
+    end: u64,
+    /// The highest WAL anchor the dumped base must reach before this whole piece is reflected.
+    ///
+    /// Normally the highest anchor any record in the piece carries. [`INDEX_SEGMENT_UNREFLECTED`]
+    /// when some record in the piece carries NO anchor and still carries content the fold would
+    /// apply: no dump reflects such a record, so no anchor makes the piece droppable and the
+    /// piece must say so in the one number the sweep reads.
+    max_applied_wal: u64,
+}
+
+/// The anchor a piece names when nothing can prove the dumped base reflects it.
+///
+/// A SATURATED anchor rather than a fourth field in the name, and the difference is a
+/// compatibility window. `max_applied_wal` has exactly one consumer -- the `>` in
+/// [`drop_reflected_index_segments`] -- and `u64::MAX` is 20 digits, which is what `{:020}`
+/// already writes, so the name keeps its shape, its length and its three-field parse. A binary
+/// that predates this reads the name, finds the piece, folds it, and asks the SAME comparison,
+/// so it declines to unlink it too. A fourth field would instead make the piece fail
+/// [`sealed_index_log_span`]'s `if parts.next().is_some()` check on such a binary, and a piece
+/// that does not parse is not stale -- it is INVISIBLE, which loses more than the hole this
+/// closes. The saturation is safe in the other direction as well: a piece that named this by
+/// some other route is merely retained.
+const INDEX_SEGMENT_UNREFLECTED: u64 = u64::MAX;
+
+fn sealed_index_log_path(root: &Path, shard_id: ShardId, span: IndexSegmentSpan) -> PathBuf {
+    // Zero-padded so the names sort into log order, which is the order the pieces are read in.
+    root.join(format!(
+        "shard-{shard_id}.indexlog.{:020}-{:020}-{:020}.{INDEX_LOG_SUFFIX}",
+        span.start, span.end, span.max_applied_wal
+    ))
+}
+
+/// Whether this file is a sealed piece of the given shard's index log, and what it holds.
+///
+/// The piece being written has no numbers in its name, so it is not one of these.
+fn sealed_index_log_span(path: &Path, shard_id: ShardId) -> Option<IndexSegmentSpan> {
+    let name = path.file_name()?.to_str()?;
+    let middle = name.strip_prefix(&format!("shard-{shard_id}.indexlog."))?;
+    // Either suffix is a piece of the log. A store part-way through the rename holds both, and
+    // reading only one of them would silently skip whichever half it did not recognise.
+    let middle = middle
+        .strip_suffix(&format!(".{INDEX_LOG_SUFFIX}"))
+        .or_else(|| middle.strip_suffix(&format!(".{LEGACY_INDEX_LOG_SUFFIX}")))?;
+    let mut parts = middle.split('-');
+    let start = parts.next()?.parse().ok()?;
+    let end = parts.next()?.parse().ok()?;
+    let max_applied_wal = parts.next()?.parse().ok()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(IndexSegmentSpan {
+        start,
+        end,
+        max_applied_wal,
+    })
+}
+
+/// Every file that makes up a shard's index log, oldest first, with the one being written last.
+///
+/// A log that has never rolled is one file, and this returns just that -- the same path the rest
+/// of the code has always used, which is what makes a store written before pieces still load.
+/// Whether a base at `base_anchor` already reflects every record in this sealed piece.
+///
+/// The same comparison [`drop_reflected_index_segments`] makes before it UNLINKS a piece, minus
+/// that sweep's position bound, which is about where reclaim may cut the log rather than about
+/// what a base holds. A base at anchor 0 is no base at all -- an absent or empty dump -- and
+/// reflects nothing, which is why the whole predicate is off there rather than comparing
+/// against 0.
+fn piece_is_reflected_by(span: IndexSegmentSpan, base_anchor: u64) -> bool {
+    base_anchor > 0
+        && span.max_applied_wal != INDEX_SEGMENT_UNREFLECTED
+        && span.max_applied_wal <= base_anchor
+}
+
+/// Does a base snapshot anchored at `base_anchor` PROVABLY already hold this delta record?
+///
+/// The load-path fold's own test. It lives here, beside [`piece_is_reflected_by`] and the record
+/// walk in [`LocalIndexLogStore::gc_reflected_before_anchor`], because the three ask ONE
+/// question of three different views of the same record -- a whole piece from its name, a raw
+/// payload, a decoded record -- and a fourth copy is how the first three came apart.
+///
+/// A MISSING ANCHOR IS NOT ANCHOR 0. `applied_wal_sequence.unwrap_or(0)` made one, and 0 is at
+/// or below every anchor, so an anchor-less record compared as older than everything, was
+/// classified reflected, and was dropped. #1832 took that reading out of the record walk and
+/// #1842 out of the piece name; the fold was the third site and kept it longest -- long enough
+/// that #1842's fix, which holds such a piece OPEN so the fold can see the record, delivered it
+/// to a fold that skipped it.
+///
+/// So an anchor-less record is reflected by nothing UNLESS it carries nothing the fold would
+/// apply. The content-less shapes -- the legacy whole-index line, and the checkpoint that
+/// records no key -- stay reflected, which is what the post-dump sweep exists to reclaim.
+///
+/// THE FOLD NEVER MEETS A CONTENT-LESS RECORD, AND THE BRANCH IS STILL LOAD-BEARING.
+/// [`LocalIndexLogStore::for_each_delta_record_above_anchor`] drops such a record before any
+/// caller sees it ("only keep records that carry a delta payload OR a WAL anchor"), so via the
+/// fold that arm is unreachable -- a FOURTH spelling of this same question, and one that agrees
+/// with this one. The arm answers for the OTHER two callers, which read raw payloads off the
+/// disk and do meet the legacy line. Writing it as anything else would make the walk, the sweep
+/// and the piece name disagree again, which is how this started.
+///
+/// WHICH WAY A WRONG ANSWER FAILS. Answering `true` about a record the fold would have applied
+/// is SILENT DATA LOSS: the removal or eviction it describes lives only in the delta, so it is
+/// recovered from neither the delta nor the write-ahead log, and the load reports success.
+/// Answering `false` about a record the base already holds costs a re-apply of something
+/// already applied. Only one of those is observable, so the tests attack that one.
+pub(crate) fn delta_record_is_reflected_by(record: &IndexDeltaRecord, base_anchor: u64) -> bool {
+    // A base that anchors nowhere reflects nothing, whatever the record says -- the same first
+    // clause `piece_is_reflected_by` opens with.
+    let reflected = base_anchor > 0
+        && match record.applied_wal_sequence {
+            Some(anchor) => anchor <= base_anchor,
+            None => !delta_record_carries_content_of(record),
+        };
+    #[cfg(test)]
+    probe::note_fold_decision(record, base_anchor, reflected);
+    reflected
+}
+
+fn index_log_segment_paths(root: &Path, shard_id: ShardId) -> Vec<PathBuf> {
+    #[cfg(test)]
+    probe::DIR_LISTINGS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut sealed = fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter_map(|path| sealed_index_log_span(&path, shard_id).map(|span| (span.start, path)))
+        .collect::<Vec<_>>();
+    sealed.sort_by_key(|(start, _)| *start);
+    let mut paths = sealed.into_iter().map(|(_, path)| path).collect::<Vec<_>>();
+    paths.push(index_log_path(root, shard_id));
+    #[cfg(test)]
+    probe::PIECE_PATHS.fetch_add(paths.len() as u64, std::sync::atomic::Ordering::Relaxed);
+    paths
+}
+
+/// Bytes of every piece of this shard's index log, sealed pieces included.
+fn index_log_total_bytes(root: &Path, shard_id: ShardId) -> u64 {
+    index_log_segment_paths(root, shard_id)
+        .into_iter()
+        .filter_map(|path| path.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+/// What the piece being written holds, by walking it.
+///
+/// Called once per ROLL -- the piece is at most the rolling threshold, and this runs once in the
+/// thousands of appends that fill it. Deliberately NOT called per append: the write-ahead log
+/// opened its file and read its header on every write to answer a question of the same shape,
+/// which was 8,240 bytes and an open per record before it was taken back out.
+///
+/// `None` when the piece holds no record at all, which is nothing to seal.
+fn index_log_segment_span_of(path: &Path) -> Result<Option<IndexSegmentSpan>, IndexLogError> {
+    let mut tally = IndexLogReadTally::start();
+    let mut reader = BufReader::new(open_index_log_read(path, &mut tally)?);
+    let mut first = None;
+    let mut last = 0_u64;
+    let mut max_applied_wal = 0_u64;
+    // A MISSING anchor is not anchor 0. `unwrap_or(0)` made one, and 0 loses every max it takes
+    // part in, so an anchor-less record was invisible in the name: a piece of nothing but
+    // anchor-less deltas named 0 -- at or below every anchor -- and a single anchored record
+    // beside them hid them behind ITS anchor. Either way the post-dump sweep unlinked the piece
+    // whole, WITHOUT READING IT, which is past the point where #1832's record walk can save it.
+    //
+    // The question asked here is the walk's own predicate (`delta_record_carries_content`), of
+    // the same record, so the seal and the walk cannot drift about which records matter. It is
+    // asked only of an anchor-less record, and only at a ROLL -- which already reads every frame
+    // in the piece -- so it costs a second decode of the rare record, once per thousands of
+    // appends. Deciding the same question by reading the piece at SWEEP time instead was measured
+    // at 95.261 ms against 0.014 ms for the name, over 14 pieces holding 917,718 bytes.
+    let mut unreflected = false;
+    while let Some((_, payload)) = crate::log_framing::read_frame(&mut reader)? {
+        if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+            continue;
+        }
+        let head: IndexRecordHead = decode_index_payload(&payload)?;
+        first.get_or_insert(head.sequence);
+        last = last.max(head.sequence);
+        match head.applied_wal_sequence {
+            Some(anchor) => max_applied_wal = max_applied_wal.max(anchor),
+            // A whole-index line carries no anchor either, and carries nothing the fold applies.
+            // It answers false here, so the legacy shape this sweep exists to reclaim keeps
+            // naming its real anchor and keeps being droppable.
+            None => unreflected = unreflected || delta_record_carries_content(&payload)?,
+        }
+    }
+    Ok(first.map(|start| IndexSegmentSpan {
+        start,
+        end: last.saturating_add(1),
+        max_applied_wal: if unreflected {
+            INDEX_SEGMENT_UNREFLECTED
+        } else {
+            max_applied_wal
+        },
+    }))
+}
+
+/// Seal the piece being written and start a fresh one, if it has grown past the threshold.
+///
+/// Called with the append lock held, before the append opens the file -- so no handle is left
+/// pointing at a piece across the rename, and the record about to be written lands in the new
+/// piece rather than growing the one just sealed.
+fn roll_index_log_segment_if_due(root: &Path, shard_id: ShardId) -> Result<bool, IndexLogError> {
+    let (path, length) = active_index_log(root, shard_id);
+    roll_index_log_segment_at(root, shard_id, &path, length)
+}
+
+/// The roll, given a piece the caller has ALREADY resolved and measured.
+///
+/// The append resolves the piece anyway -- it is about to open it -- so handing the answer in
+/// removes the probe this function used to make for itself. Neither the name nor the length is
+/// remembered across appends: each append resolves once, under the lock, and uses that answer
+/// for both the roll decision and the open.
+fn roll_index_log_segment_at(
+    root: &Path,
+    shard_id: ShardId,
+    path: &Path,
+    length: u64,
+) -> Result<bool, IndexLogError> {
+    let threshold = index_log_segment_bytes();
+    if threshold == 0 {
+        return Ok(false);
+    }
+    if length < threshold {
+        return Ok(false);
+    }
+    let Some(span) = index_log_segment_span_of(path)? else {
+        return Ok(false);
+    };
+
+    // Make the piece durable BEFORE sealing it. Index-log appends defer their fsync under the
+    // single-barrier default, so the piece can hold bytes no barrier has covered -- and the next
+    // barrier opens the piece being written, which after this rename is a different file. Sealing
+    // first would leave those bytes with no barrier that ever covers them, on a write that has
+    // already been acked.
+    {
+        let file = OpenOptions::new().write(true).open(path)?;
+        crate::durability_metrics::record_barrier("engine_index_log_seal");
+        file.sync_all()?;
+    }
+
+    // Seal by rename: atomic, so the piece is either being written or sealed, never neither. The
+    // next append finds no file under the active name and creates an empty one.
+    let sealed = sealed_index_log_path(root, shard_id, span);
+    fs::rename(path, &sealed)?;
+    sync_parent_dir(&sealed)?;
+    Ok(true)
+}
+
+/// Drop whole pieces that hold nothing at or above the retain floor.
+///
+/// A piece's name says the sequence one past its last record, so a piece is below the floor when
+/// that number is at or below it -- decided without opening the file. Stops at the first piece
+/// that still holds something: the pieces are in order, so everything after it does too.
+///
+/// Returns how many pieces went, what they held on disk, and an UPPER BOUND on how many records
+/// they held. The bound, not the count: see the note on the `records` line below.
+fn drop_covered_index_segments(
+    root: &Path,
+    shard_id: ShardId,
+    retain_from_sequence: u64,
+) -> Result<(usize, u64, usize), IndexLogError> {
+    let active = index_log_path(root, shard_id);
+    let mut dropped = 0usize;
+    let mut freed = 0u64;
+    let mut records = 0usize;
+    for path in index_log_segment_paths(root, shard_id) {
+        if path == active {
+            continue;
+        }
+        let Some(span) = sealed_index_log_span(&path, shard_id) else {
+            continue;
+        };
+        if span.end > retain_from_sequence {
+            break;
+        }
+        freed = freed.saturating_add(path.metadata().map(|meta| meta.len()).unwrap_or(0));
+        // AN UPPER BOUND, NOT THE COUNT, and the difference reaches Prometheus.
+        //
+        // Sequences are assigned with no holes, so the span WAS the record count. #1832 put holes
+        // in: the post-dump sweep rewrites the piece being written and keeps an interior subset
+        // of it, by design, so a piece sealed after such a rewrite spans more sequences than it
+        // holds records. This number therefore never understates what went and can overstate it,
+        // and it surfaces as the `index_log_records_removed` reclaim metric -- which is told the
+        // same thing at its own call site rather than being left to imply exactness.
+        //
+        // Counting exactly means opening every piece being unlinked. Measured over 14 pieces
+        // holding 917,718 bytes -- 64 KiB each, the rolling default -- a framing walk that counts
+        // records without parsing any of them took 17.033 ms against 0.014 ms for the names: a
+        // reclaim round would pay roughly a thousand times its present cost to make a reported
+        // number exact, on the path whose whole point is that a piece goes by `stat` and
+        // `unlink`. So the number stays a bound and says so.
+        records = records.saturating_add(span.end.saturating_sub(span.start) as usize);
+        fs::remove_file(&path)?;
+        dropped += 1;
+    }
+    // Once after the loop, not once per file. The write-ahead log's reclaim does the same.
+    if dropped > 0 {
+        sync_parent_dir(&active)?;
+    }
+    Ok((dropped, freed, records))
+}
+
+/// Drop whole pieces a completed catalog dump has made redundant.
+///
+/// Two conditions, and a piece's name carries both: every sequence in it is below the sweep's
+/// position bound, and the anchor it names is one the dumped base already reflects.
+/// Anything unclear leaves the piece alone -- unlinking a piece that still holds the only record
+/// of an eviction cannot be undone.
+///
+/// The named anchor is [`INDEX_SEGMENT_UNREFLECTED`] when the piece holds a record no dump can
+/// reflect, which no `wal_anchor` is above, so such a piece is never unlinked here. That is the
+/// whole of this function's part in it: the name is made to carry the answer at SEAL time, where
+/// the piece is being read anyway, rather than read again here per round.
+///
+/// The record count returned is the same UPPER BOUND `drop_covered_index_segments` returns, for
+/// the same reason and at the same measured cost -- the note there is the long form.
+fn drop_reflected_index_segments(
+    root: &Path,
+    shard_id: ShardId,
+    wal_anchor: u64,
+    meta_sequence: u64,
+) -> Result<(usize, u64, usize), IndexLogError> {
+    let active = index_log_path(root, shard_id);
+    let mut dropped = 0usize;
+    let mut freed = 0u64;
+    let mut records = 0usize;
+    for path in index_log_segment_paths(root, shard_id) {
+        if path == active {
+            continue;
+        }
+        let Some(span) = sealed_index_log_span(&path, shard_id) else {
+            continue;
+        };
+        if span.end > meta_sequence || span.max_applied_wal > wal_anchor {
+            break;
+        }
+        freed = freed.saturating_add(path.metadata().map(|meta| meta.len()).unwrap_or(0));
+        // The upper bound, not the count. See `drop_covered_index_segments`.
+        records = records.saturating_add(span.end.saturating_sub(span.start) as usize);
+        fs::remove_file(&path)?;
+        dropped += 1;
+    }
+    if dropped > 0 {
+        sync_parent_dir(&active)?;
+    }
+    Ok((dropped, freed, records))
+}
+
+/// Whether this payload holds anything [`LocalIndexLogStore::for_each_delta_record`] would fold.
+///
+/// The same three content fields that walk decides on, read from the same decode, so the sweep
+/// and the load-time fold cannot disagree about which records are worth keeping. `applied_wal_
+/// sequence` is deliberately NOT one of the terms here: the only caller asks this question of a
+/// record that has none, so testing it would be a clause that can never fire.
+///
+/// A payload that SAYS it is a whole-index record is answered without decoding it -- no load path
+/// reads one, which is the whole reason the sweep may remove it.
+fn delta_record_carries_content(payload: &[u8]) -> Result<bool, IndexLogError> {
+    if index_payload_shape(payload) == Some(INDEX_LOG_SHAPE_WHOLE) {
+        return Ok(false);
+    }
+    // A legacy whole-index line carries no container to say so, and decodes here into an
+    // IndexDeltaRecord with every delta field empty -- which is the same answer, reached by
+    // reading it rather than by trusting a byte that is not there.
+    let record: IndexDeltaRecord = decode_index_payload(payload)?;
+    Ok(delta_record_carries_content_of(&record))
+}
+
+/// The same question asked of a record that is ALREADY DECODED, which is how the load-path fold
+/// meets it. Split out of [`delta_record_carries_content`] rather than written twice: the sweep
+/// reads raw payloads and the fold reads records, and "what the fold would apply" has to mean
+/// the same thing to both or the two drift about which records matter.
+pub(crate) fn delta_record_carries_content_of(record: &IndexDeltaRecord) -> bool {
+    !record.items.is_empty() || record.meta.is_some() || !record.key_states.is_empty()
+}
+
+fn sync_parent_dir(path: &Path) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        // A DIRECTORY handle, opened only to `fsync` it: no byte is ever read through it, so
+        // it takes no tally. Spelled in full for the same reason the two creates above are.
+        if let Ok(dir) = std::fs::File::open(parent) {
+            crate::durability_metrics::record_barrier("engine_index_log_dir");
+            dir.sync_all()?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "index_log_scale.rs"]
+mod index_log_scale;
+
+#[cfg(test)]
+#[path = "index_log_sweep_bound.rs"]
+mod index_log_sweep_bound;
+
+#[cfg(test)]
+#[path = "index_log_read_bytes.rs"]
+mod index_log_read_bytes;
+
+#[cfg(test)]
+mod tests {
+    /// The splicing appender and the parsing one must produce the SAME record bytes.
+    ///
+    /// The engine's index-log appends were routed to the splicing path to stop re-parsing and
+    /// re-encoding a multi-megabyte index on every append. That is only safe while the two
+    /// produce identical bytes, which holds because `IndexLogRecord` declares its fields in
+    /// exactly the order the splice writes them. This test fails if either side drifts.
+    /// The two appenders now differ ON PURPOSE: `append_index_bytes` writes a constant-size
+    /// anchor, `append_json` embeds the whole index for callers that want the record to carry
+    /// it. This pins that difference, so neither silently becomes the other.
+    #[test]
+    fn the_anchor_appender_writes_far_less_than_the_embedding_one() {
+        let anchor_dir = tempfile::tempdir().unwrap();
+        let embed_dir = tempfile::tempdir().unwrap();
+        let anchoring = LocalIndexLogStore::new(anchor_dir.path());
+        let embedding = LocalIndexLogStore::new(embed_dir.path());
+        // An index big enough that copying it is obviously different from naming it.
+        let mut index = br#"{"index_format_version":3,"strings":{"#.to_vec();
+        for i in 0..500 {
+            if i > 0 {
+                index.push(b',');
+            }
+            index.extend_from_slice(format!("\"k{i:04}\":{{\"page_slab_id\":{i}}}").as_bytes());
+        }
+        index.extend_from_slice(b"}}");
+
+        anchoring.append_index_bytes(11, &index).unwrap();
+        embedding.append_json(11, &index).unwrap();
+
+        let anchor_bytes = std::fs::read(index_log_path(anchor_dir.path(), 11)).unwrap();
+        let embed_bytes = std::fs::read(index_log_path(embed_dir.path(), 11)).unwrap();
+        assert!(
+            anchor_bytes.len() < 250,
+            "the anchor record should be constant-size (got {})",
+            anchor_bytes.len()
+        );
+        // That the embedding appender carries the index was asserted by BYTE COUNT, which
+        // was an assumption about the encoding rather than about the record: the container
+        // spells a 500-key index in fewer bytes than its JSON does, so the comparison broke
+        // while the property it meant to check still held. Decode the record and look.
+        let embed_payload = crate::log_framing::next_frame(&embed_bytes)
+            .unwrap()
+            .expect("the embedding record is one whole frame")
+            .1;
+        let embedded: IndexLogRecord = decode_index_payload(embed_payload).unwrap();
+        assert_eq!(
+            embedded
+                .index
+                .get("strings")
+                .and_then(|strings| strings.as_object())
+                .map(|strings| strings.len()),
+            Some(500),
+            "the embedding appender still carries the whole index"
+        );
+        assert!(
+            embed_bytes.len() > anchor_bytes.len() * 20,
+            "anchoring must be dramatically smaller than embedding ({} vs {})",
+            anchor_bytes.len(),
+            embed_bytes.len()
+        );
+    }
+
+    use super::*;
+
+    /// A removed log directory must STOP an append, not be quietly rebuilt under it.
+    ///
+    /// The per-append `create_dir_all` this replaced made the directory again and the append
+    /// then created an empty log beside it, so "someone removed the log directory" arrived as
+    /// "the shard's log began again, empty" -- every delta before it gone, with a success
+    /// returned to the caller. Nothing in this tree removes the directory under a live store
+    /// (the scratch guard's drop runs when the last clone is gone, the scratch sweep keeps
+    /// every directory whose owner is alive, and the crash harness removes it from a separate
+    /// process), so this is not a case an append has to recover from -- it is one an append
+    /// has to REPORT.
+    #[test]
+    fn an_append_fails_loudly_when_the_log_directory_is_removed_underneath_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("indexlogs");
+        let store = LocalIndexLogStore::new(&root);
+        let item = IndexItem {
+            kind: IndexItemKind::Block,
+            routing_bucket: 0,
+            block_ref_key: "k".to_string(),
+            object_key: "k".into(),
+            model_id: "m".to_string(),
+            object_id: 1,
+            // ADDRESS-LESS BY DESIGN: this fixture measures a floor, so it stays at
+            // the floor. An address would take the row from one nil to a six-slot
+            // array -- bigger, not smaller -- and the size it stated was never
+            // restored, because there was no address to derive it from.
+            entry: None,
+            deleted: false,
+        };
+        store
+            .append_delta(3, vec![item.clone()], Vec::new(), None, None, false, false)
+            .expect("the first append must land");
+        // THE DENOMINATOR: there is a log here to lose. Without this the removal below could be
+        // removing an empty directory and the assertions would hold vacuously.
+        assert!(
+            index_log_path(&root, 3).exists(),
+            "the first append wrote no log, so there is nothing for this test to protect"
+        );
+
+        std::fs::remove_dir_all(&root).expect("remove the log directory underneath the store");
+        let result = store.append_delta(3, vec![item], Vec::new(), None, None, false, false);
+        // FIRST, and reading nothing from `result`: the directory must still be gone. A mutant
+        // that puts it back fails here whatever it returns to the caller.
+        assert!(
+            !root.exists(),
+            "the append re-created the log directory -- a removed log would silently start again \
+             empty, which is lost durable state dressed as resilience"
+        );
+        // Second: and it must say so.
+        assert!(
+            result.is_err(),
+            "the append reported success with no log directory to write into"
+        );
+    }
+
+    /// A root `new` could not make is made ONCE, by the first append -- and not again.
+    ///
+    /// `new` creates the log directory and cannot report a failure: it returns `Self`. So it
+    /// keeps the ANSWER instead, and an append trusts it. This pins both halves of that: the
+    /// one case the removed per-append `create_dir_all` genuinely covered is still covered, and
+    /// covering it does not put the per-append cost back.
+    #[test]
+    fn a_root_new_could_not_create_is_made_by_the_first_append_and_not_the_second() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("indexlogs");
+        // A FILE where the directory belongs, so `new`'s own creation cannot succeed.
+        std::fs::write(&root, b"in the way").unwrap();
+        let store = LocalIndexLogStore::new(&root);
+        std::fs::remove_file(&root).expect("take the obstruction away again");
+        // THE DENOMINATOR: nothing has created the directory, so the append below is genuinely
+        // the first thing that can.
+        assert!(
+            !root.exists(),
+            "the fixture left a root behind -- the first append has nothing to create"
+        );
+
+        probe::reset();
+        store
+            .append_json(4, b"{\"a\":1}")
+            .expect("the first append must make the root that `new` could not");
+        // Half one: it made it, and said so.
+        assert_eq!(
+            probe::append_root_creates(),
+            1,
+            "the first append made the log directory {} times, expected once",
+            probe::append_root_creates()
+        );
+        assert!(root.is_dir(), "the first append did not make the log directory");
+
+        // Half two, ORDERED after it: the second append does NOT ask again. This is the whole
+        // per-append cost the change removes, asserted on the one path that still pays it once.
+        store.append_json(4, b"{\"a\":2}").expect("the second append must land");
+        assert_eq!(
+            probe::append_root_creates(),
+            1,
+            "the log directory was created {} times over two appends -- the per-append \
+             create_dir_all is back",
+            probe::append_root_creates()
+        );
+    }
+
+    /// Sealing a legacy-named piece moves the next record onto the CURRENT name.
+    ///
+    /// An append resolves the active piece once and uses that answer for both the roll and the
+    /// open. The rename inside the roll is the one event that changes which name the next record
+    /// belongs under, so the answer is taken again there and only there. Without that, the
+    /// record would be written back to the name the roll had just sealed away -- re-creating it,
+    /// and splitting one shard's log across two names, which is exactly what `index_log_path`
+    /// exists to prevent.
+    #[test]
+    fn a_roll_of_a_legacy_named_log_puts_the_next_record_on_the_current_name() {
+        struct Threshold;
+        impl Drop for Threshold {
+            fn drop(&mut self) {
+                set_index_log_segment_bytes_for_test(None);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let shard: ShardId = 77;
+        let store = LocalIndexLogStore::new(dir.path());
+        let current = dir
+            .path()
+            .join(format!("shard-{shard}.indexlog.{INDEX_LOG_SUFFIX}"));
+        let legacy = dir
+            .path()
+            .join(format!("shard-{shard}.indexlog.{LEGACY_INDEX_LOG_SUFFIX}"));
+
+        store
+            .append_json(shard, b"{\"a\":1}")
+            .expect("seed the log under the current name");
+        std::fs::rename(&current, &legacy).expect("give the log the name an older store carries");
+        // THE DENOMINATOR: from here the active piece really is the legacy-named one, and it
+        // really does hold a record. Both halves below are vacuous without it.
+        assert!(
+            legacy.exists() && !current.exists(),
+            "the fixture did not produce a legacy-named active log"
+        );
+        let legacy_len = legacy.metadata().unwrap().len();
+        assert!(legacy_len > 0, "the legacy-named log is empty");
+
+        // A threshold the legacy piece is already over, so the next append rolls it.
+        set_index_log_segment_bytes_for_test(Some(legacy_len));
+        let _threshold = Threshold;
+        store
+            .append_json(shard, b"{\"a\":2}")
+            .expect("the append that rolls must still land");
+
+        // Half one: the record went onto the current name.
+        assert!(
+            current.exists(),
+            "after sealing the legacy piece the next record did not land on the current name"
+        );
+        // Half two, ORDERED after it and reading none of its values: the sealed piece did not
+        // come back under the name it was sealed from.
+        assert!(
+            !legacy.exists(),
+            "the legacy name was re-created after the roll -- one shard's log is now split \
+             across two names, and only one of them is ever read"
+        );
+    }
+
+    #[test]
+    fn default_store_scratch_dir_dies_with_the_last_clone() {
+        let store = LocalIndexLogStore::default();
+        let root = store.inner.lock().unwrap().root.clone();
+        assert!(root.exists(), "Default must create its scratch dir");
+        let clone = store.clone();
+        drop(store);
+        assert!(root.exists(), "a live clone must keep the scratch dir");
+        drop(clone);
+        assert!(!root.exists(), "the last clone's drop must remove the scratch dir");
+    }
+
+    #[test]
+    fn gc_before_sequence_rewrites_index_log_with_retained_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        for value in [1, 2, 3] {
+            store
+                .append_json(5, format!("{{\"value\":{value}}}").as_bytes())
+                .unwrap();
+        }
+
+        let report = store.gc_before_sequence(5, 2).unwrap();
+        assert_eq!(report.records_before, 3);
+        assert_eq!(report.records_after, 2);
+        assert_eq!(report.records_removed, 1);
+        assert_eq!(store.stats(5).last_sequence, 3);
+        let reopened = LocalIndexLogStore::new(dir.path());
+        assert_eq!(reopened.stats(5).last_sequence, 3);
+        assert_eq!(reopened.scan(5, 0, u64::MAX, u64::MAX).unwrap().len(), 2);
+        store.append_json(5, b"{\"value\":4}").unwrap();
+        assert_eq!(store.stats(5).last_sequence, 4);
+    }
+
+    /// A checkpoint record ANCHORS an index; it does not carry a second copy of it.
+    #[test]
+    fn append_index_bytes_writes_an_anchor_that_identifies_the_index_without_embedding_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        let index = b"{\"value\":1}";
+        let sequence = store.append_index_bytes(5, index).unwrap();
+        assert_eq!(sequence, 1);
+        let rows = store.scan(5, 0, u64::MAX, u64::MAX).unwrap();
+        assert_eq!(rows.len(), 1);
+        let payload = crate::log_framing::decode_line(&rows[0].1).unwrap();
+
+        // It says it is an anchor, and the tail scan still reads its sequence -- the scan
+        // takes the first two elements of any row, and an anchor puts the same two first.
+        assert_eq!(index_payload_shape(payload), Some(INDEX_LOG_SHAPE_ANCHOR));
+        let head: IndexRecordHead = decode_index_payload(payload).unwrap();
+        assert_eq!(head.shard_id, 5);
+        assert_eq!(head.sequence, 1);
+
+        // And it identifies exactly the index it anchors, by digest and length.
+        let anchor: IndexAnchorRecord = decode_index_payload(payload).unwrap();
+        let expected = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            hasher.update(index);
+            hasher.finalize().to_vec()
+        };
+        assert_eq!(anchor.index_sha256, expected);
+        assert_eq!(anchor.index_len, index.len() as u64);
+        assert!(
+            !payload
+                .windows(index.len())
+                .any(|window| window == index),
+            "the index itself must not be copied into the log"
+        );
+        assert!(
+            payload.len() < 64,
+            "a row anchor is the digest and two numbers, not 160 bytes of JSON (got {} bytes)",
+            payload.len()
+        );
+    }
+
+    #[test]
+    fn corrupt_tail_is_truncated_and_append_resumes_after_last_valid_index_log_sequence() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        store.append_json(5, b"{\"value\":1}").unwrap();
+        store.append_json(5, b"{\"value\":2}").unwrap();
+        {
+            let mut file = OpenOptions::new()
+                .append(true)
+                .open(index_log_path(dir.path(), 5))
+                .unwrap();
+            file.write_all(b"{\"shard_id\":5,\"sequence\":3").unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let reopened = LocalIndexLogStore::new(dir.path());
+        assert_eq!(reopened.stats(5).last_sequence, 2);
+        assert_eq!(reopened.scan(5, 0, u64::MAX, u64::MAX).unwrap().len(), 2);
+        let record = reopened.append_json(5, b"{\"value\":3}").unwrap();
+        assert_eq!(record.sequence, 3);
+        assert_eq!(reopened.scan(5, 0, u64::MAX, u64::MAX).unwrap().len(), 3);
+    }
+
+
+    /// Split a log file into its records, whatever shape they are in.
+    ///
+    /// Tests that rewrite a log -- to corrupt one record, or to reorder them -- used to split
+    /// on newlines. A record may now hold one, so they walk frames instead. Splitting on
+    /// newlines here would silently produce fragments that are not records, and the tests
+    /// would then "pass" while exercising nothing.
+    fn split_records(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at < bytes.len() {
+            match crate::log_framing::next_frame(&bytes[at..]) {
+                Ok(Some((consumed, _))) => {
+                    out.push(bytes[at..at + consumed].to_vec());
+                    at += consumed;
+                }
+                _ => break,
+            }
+        }
+        out
+    }
+
+    /// A well-formed record whose payload cannot be decoded: committed corruption rather than
+    /// a torn tail. Framed the way the writer frames, so what fails is the DECODE -- which is
+    /// the thing these tests are about. A raw text splice would fail the frame check instead,
+    /// and would stop being a record at all once records stopped being lines.
+    fn undecodable_record() -> Vec<u8> {
+        crate::log_framing::encode_record(b"corrupt-not-a-record")
+    }
+
+    /// Encode the way the writer did BEFORE rows: a map, with absent fields left out.
+    ///
+    /// The decoder still takes this shape, and these tests are what keeps that true. A row cannot
+    /// express a partial item -- that is the point of a row -- so a test about what happens to an
+    /// absent field has to write the shape that could leave one out.
+    fn encode_as_map<T: serde::Serialize>(record: &T, shape: u8) -> Vec<u8> {
+        let mut packed = Vec::new();
+        let mut serializer = rmp_serde::Serializer::new(&mut packed).with_struct_map();
+        serde::Serialize::serialize(record, &mut serializer).expect("map encode");
+        let mut out = vec![index_container_byte(INDEX_LOG_CODEC_MSGPACK, shape)];
+        out.extend_from_slice(&packed);
+        out
+    }
+
+    fn block_item(bucket: u32, key: &str, deleted: bool) -> IndexItem {
+        IndexItem {
+            kind: IndexItemKind::Block,
+            routing_bucket: bucket,
+            block_ref_key: key.to_string(),
+            object_key: key.into(),
+            model_id: "m".to_string(),
+            object_id: 1,
+            // ADDRESS-LESS BY DESIGN: this fixture measures a floor, so it stays at
+            // the floor. An address would take the row from one nil to a six-slot
+            // array -- bigger, not smaller -- and the size it stated was never
+            // restored, because there was no address to derive it from.
+            entry: None,
+            deleted,
+        }
+    }
+
+    /// WHAT A BASE ANCHOR REFLECTS, AT EVERY CORNER, AS A TABLE.
+    ///
+    /// [`super::delta_record_is_reflected_by`] is the one test the load-path fold, the post-dump
+    /// record walk and the piece name all ask, so every corner of it is a corner of all three.
+    /// Each row is written from the INVARIANT -- a record is reflected only when the base
+    /// PROVABLY already holds it -- rather than read off the implementation.
+    ///
+    /// The two rows about a base anchor of 0 are the ones that look redundant and are not: the
+    /// `<=` alone would answer them correctly only for the anchors a deployment happens to
+    /// reach, and "no base has been written yet" must not be a number the comparison can reason
+    /// about. The last row is the legacy whole-index line, which the post-dump sweep exists to
+    /// reclaim: it carries no anchor AND nothing the fold would apply, and it must stay
+    /// reflected or that sweep stops being able to drop anything.
+    #[test]
+    fn what_a_base_anchor_reflects_at_every_corner() {
+        // (what it is, the record's anchor, items, meta, key-states, the base anchor, reflected)
+        let cases: &[(&str, Option<u64>, bool, bool, bool, u64, bool)] = &[
+            ("a base anchored nowhere reflects no anchored record", Some(1), true, false, false, 0, false),
+            ("a base anchored nowhere reflects no anchor-less record either", None, false, false, false, 0, false),
+            ("an anchor BELOW the base is in the base", Some(4), true, false, false, 5, true),
+            ("an anchor AT the base is in the base", Some(5), true, false, false, 5, true),
+            ("an anchor ABOVE the base is not", Some(6), true, false, false, 5, false),
+            ("no anchor, page items: no base reflects it", None, true, false, false, 5, false),
+            ("no anchor, a folded catalog: no base reflects it", None, false, true, false, 5, false),
+            ("no anchor, key-states: no base reflects it", None, false, false, true, 5, false),
+            ("no anchor and nothing at all: the legacy whole-index shape", None, false, false, false, 5, true),
+        ];
+        // VACUITY FLOOR, before the rows are read: a table asking for one answer throughout is
+        // passed by a predicate that returns a constant.
+        let yes = cases.iter().filter(|case| case.6).count();
+        assert!(
+            yes > 0 && yes < cases.len(),
+            "the table asks for `true` {yes} times out of {}, so a constant passes it",
+            cases.len()
+        );
+
+        let mut wrong = Vec::new();
+        for (what, anchor, items, meta, key_states, base_anchor, reflected) in cases {
+            let record = IndexDeltaRecord {
+                shard_id: 1,
+                sequence: 1,
+                items: if *items {
+                    vec![block_item(0, "tenant/1/object/0", false)]
+                } else {
+                    Vec::new()
+                },
+                meta: if *meta { Some(MetaItem::default()) } else { None },
+                applied_wal_sequence: *anchor,
+                upsert: false,
+                key_states: if *key_states {
+                    vec![serde_json::json!({ "key": "tenant/1/object/0" })]
+                } else {
+                    Vec::new()
+                },
+                shared_object_key: None,
+            };
+            let answer = super::delta_record_is_reflected_by(&record, *base_anchor);
+            if answer != *reflected {
+                wrong.push(format!(
+                    "base {base_anchor}, {what}: reflected={answer}, must be {reflected}"
+                ));
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} of {} rows answer wrongly:\n  {}",
+            wrong.len(),
+            cases.len(),
+            wrong.join("\n  ")
+        );
+    }
+
+    /// An object id that is the hash of the row's own fields is not written, and comes back.
+    ///
+    /// It is `stable_block_object_id` of the shard, the model and the key -- and a row carries the
+    /// last two while the record carries the shard. Nine bytes restating a hash of fields sitting
+    /// beside it.
+    ///
+    /// The COMPONENT was a term of that hash until #2019 and is not one now. The row still carries
+    /// it as its own field; what it no longer does is contribute to this id.
+    #[test]
+    fn a_row_does_not_write_the_object_id_it_can_derive() {
+        let shard_id: ShardId = 7;
+        let mut derivable = block_item(3, "tenant/1/object/9", false);
+        derivable.object_id = crate::engine::hashing::stable_block_object_id(
+            shard_id,
+            &derivable.model_id,
+            &derivable.object_key,
+        );
+
+        let mut stripped = derivable.clone();
+        stripped.strip_object_id_repeat(shard_id);
+        assert_eq!(stripped.object_id, 0, "a derivable id is not written");
+        stripped.restore_object_id_repeat(shard_id);
+        assert_eq!(
+            stripped.object_id, derivable.object_id,
+            "and it comes back as what it was"
+        );
+
+        // An id that is NOT the hash of this row is kept, because a reader could not put it
+        // back. Being wrong here costs bytes, not correctness.
+        let mut foreign = derivable.clone();
+        foreign.object_id = derivable.object_id ^ 0xFFFF;
+        let kept = foreign.clone();
+        foreign.strip_object_id_repeat(shard_id);
+        assert_eq!(
+            foreign.object_id, kept.object_id,
+            "an id that cannot be derived stays in the row"
+        );
+    }
+
+    #[test]
+    fn a_delta_record_written_with_the_old_field_names_still_loads() {
+        // The record-level names are short now. `items` and `meta` are NOT among them: whole-index
+        // and delta records are told apart on read by the PRESENCE of those two keys, so renaming
+        // them breaks record-type detection rather than just the labels.
+        let legacy = serde_json::json!({
+            "shard_id": 7,
+            "sequence": 3,
+            "items": [],
+            "applied_wal_sequence": 11,
+            "upsert": true,
+            "key_states": [{"key": "m:0"}]
+        });
+        let record: IndexDeltaRecord =
+            serde_json::from_value(legacy).expect("a legacy delta record must load");
+        assert_eq!(record.shard_id, 7);
+        assert_eq!(record.sequence, 3);
+        assert_eq!(record.applied_wal_sequence, Some(11));
+        assert!(record.upsert);
+        assert_eq!(record.key_states.len(), 1);
+    }
+
+    #[test]
+    fn a_delta_record_still_announces_itself_by_its_items_key() {
+        // The property the discriminator depends on: a written delta record carries a literal
+        // `items` key, which is how a reader tells it from a whole-index line.
+        let record = IndexDeltaRecord {
+            shard_id: 7,
+            sequence: 1,
+            items: vec![block_item(1, "a", false)],
+            meta: None,
+            applied_wal_sequence: Some(2),
+            upsert: true,
+            key_states: Vec::new(),
+            shared_object_key: None,
+        };
+        let encoded = serde_json::to_string(&record).unwrap();
+        assert!(encoded.contains("\"items\""), "the discriminator must survive: {encoded}");
+        // And the long record-level spellings are gone from the written form.
+        for gone in ["shard_id", "applied_wal_sequence", "key_states"] {
+            assert!(!encoded.contains(gone), "{gone} should not be written any more");
+        }
+        // Not vacuous: it still round-trips with its values.
+        let back: IndexDeltaRecord = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(back.shard_id, 7);
+        assert_eq!(back.applied_wal_sequence, Some(2));
+    }
+
+    #[test]
+    fn append_delta_grows_log_by_only_the_changed_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        let seq1 = store
+            .append_delta(7, vec![block_item(1, "a", false)], Vec::new(), None, None, false, true)
+            .unwrap();
+        assert_eq!(seq1, 1);
+        let seq2 = store
+            .append_delta(7, vec![block_item(1, "b", false)], Vec::new(), None, None, false, true)
+            .unwrap();
+        assert_eq!(seq2, 2);
+        // The two single-item deltas together are far smaller than a whole-index blob
+        // would be, and each append wrote only its own item.
+        let records = store.read_delta_records(7, 0).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].items.len(), 1);
+        assert_eq!(records[1].items[0].block_ref_key, "b");
+        // The sequence tail is readable across a reopen even though the log now holds
+        // delta records rather than whole-index records.
+        let reopened = LocalIndexLogStore::new(dir.path());
+        assert_eq!(reopened.stats(7).last_sequence, 2);
+    }
+
+    /// The slab catalog is the LAST record that carries one, and nothing after it clears it.
+    ///
+    /// The fold keeps a running answer instead of every record it walks past, so three things
+    /// an ordering change can break are pinned here: a later catalog must WIN; a later record
+    /// carrying a meta with NO slabs must not replace it; and a log whose only meta carries no
+    /// slabs must answer None rather than that meta.
+    ///
+    /// The second and third are what make this more than one assertion. Writing it with only a
+    /// catalog-less record after the catalogs let a fold that kept "the last meta, slabs or not"
+    /// pass -- the record had no meta at all, so the wrong rule never fired.
+    #[test]
+    fn the_slab_catalog_is_the_last_record_that_carries_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+
+        let catalog = |slab: u64| MetaItem {
+            version: 1,
+            start_wal_sequence: 1,
+            timestamp_ms: 1,
+            slab_version: 1,
+            slabs: vec![SlabCatalogEntry {
+                block_slab_id: slab,
+                state: SlabCatalogState::Active,
+                physical_bytes: 1,
+                logical_bytes: 1,
+                created_unix_ms: None,
+                updated_unix_ms: None,
+                first_block_id: None,
+                last_block_id: None,
+                version: 1,
+            }],
+        };
+        // A meta that carries no slabs. An anchor looks like this whenever the fold is off.
+        let slabless = MetaItem {
+            version: 2,
+            start_wal_sequence: 2,
+            timestamp_ms: 2,
+            slab_version: 0,
+            slabs: Vec::new(),
+        };
+
+        store
+            .append_delta(4, Vec::new(), Vec::new(), None, Some(catalog(11)), false, true)
+            .unwrap();
+        store
+            .append_delta(4, Vec::new(), Vec::new(), None, Some(catalog(22)), false, true)
+            .unwrap();
+        // A meta AFTER the catalogs that carries none of its own.
+        store
+            .append_delta(4, Vec::new(), Vec::new(), None, Some(slabless.clone()), false, true)
+            .unwrap();
+        // And a record with no meta at all.
+        store
+            .append_delta(4, vec![block_item(1, "later", false)], Vec::new(), None, None, false, true)
+            .unwrap();
+
+        let found = store.latest_slab_catalog(4).unwrap().expect("a catalog");
+        assert_eq!(
+            found.slabs.first().map(|slab| slab.block_slab_id),
+            Some(22),
+            "the last record CARRYING a catalog wins, and neither record after it clears it"
+        );
+
+        // A log whose only meta carries no slabs has no catalog to find. This is the control:
+        // a fold that kept the last meta whether or not it held slabs passes the assertion
+        // above and fails here.
+        store
+            .append_delta(5, Vec::new(), Vec::new(), None, Some(slabless), false, true)
+            .unwrap();
+        assert!(
+            store.latest_slab_catalog(5).unwrap().is_none(),
+            "a meta carrying no slabs is not a catalog"
+        );
+    }
+
+    #[test]
+    fn read_delta_records_skips_anchor_and_ignores_whole_index_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        // A legacy whole-index record and a delta record share the log file.
+        store.append_json(9, b"{\"value\":1}").unwrap();
+        let anchor_seq = store
+            .append_delta(9, vec![block_item(1, "a", false)], Vec::new(), None, None, false, true)
+            .unwrap();
+        store
+            .append_delta(9, vec![block_item(1, "b", false)], Vec::new(), None, None, false, true)
+            .unwrap();
+        // Only delta records are returned; the whole-index line is ignored.
+        let all = store.read_delta_records(9, 0).unwrap();
+        assert_eq!(all.len(), 2);
+        // Retaining after the first delta's sequence yields only the later delta.
+        let suffix = store.read_delta_records(9, anchor_seq).unwrap();
+        assert_eq!(suffix.len(), 1);
+        assert_eq!(suffix[0].items[0].block_ref_key, "b");
+    }
+
+    #[test]
+    fn append_delta_meta_anchor_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        store
+            .append_delta(3, vec![block_item(1, "a", false)], Vec::new(), None, None, false, true)
+            .unwrap();
+        let meta = MetaItem {
+            version: 1,
+            start_wal_sequence: 42,
+            timestamp_ms: 100,
+            ..MetaItem::default()
+        };
+        store.append_delta(3, Vec::new(), Vec::new(), None, Some(meta), false, true).unwrap();
+        let records = store.read_delta_records(3, 0).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].meta.as_ref().unwrap().start_wal_sequence, 42);
+    }
+
+    /// The sweep only rewrites the log when the rewrite is worth taking.
+    ///
+    /// The middle pair carries the weight: the SAME log, with the same records reclaimable, is
+    /// left alone one byte above what it can give and rewritten at exactly what it can give.
+    /// Without that pairing, "it did not rewrite" could just as well mean "there was nothing to
+    /// remove" -- which is the last state, and is asserted on its own terms -- and "enough"
+    /// could quietly mean "more than enough", which a mutation to a strict comparison survived
+    /// until those two thresholds sat either side of the boundary.
+    ///
+    /// The first two states are proved by the log itself and not only by the report: a rewrite
+    /// there removes three of four records, so the surviving count and the byte total say
+    /// plainly whether it happened. The third cannot be proved that way -- a rewrite retaining
+    /// every record writes the file back byte for byte -- which is why the field exists.
+    #[test]
+    fn a_sweep_rewrites_the_log_only_when_the_rewrite_is_worth_taking() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        for key in ["a", "b", "c"] {
+            store
+                .append_delta(9, vec![block_item(1, key, false)], Vec::new(), Some(2), None, false, true)
+                .unwrap();
+        }
+        let meta_sequence = store
+            .append_delta(9, Vec::new(), Vec::new(), Some(2), Some(MetaItem::default()), false, true)
+            .unwrap();
+
+        // 1. Reclaimable, but nowhere near a megabyte of it: the log is left exactly as it is.
+        let held = store
+            .gc_reflected_before_anchor(9, 2, meta_sequence, 1 << 20)
+            .unwrap();
+        assert!(held.rewrite_skipped, "a sweep this small must not rewrite the log");
+        assert_eq!(held.records_removed, 0);
+        assert_eq!(
+            held.removable_records_before_budget, 3,
+            "and it must still report what it COULD have removed, or the skip is unreadable"
+        );
+        assert!(
+            held.reclaimable_bytes > 0,
+            "the bytes it declined to reclaim are the reason it declined"
+        );
+        assert_eq!(held.bytes_after, held.bytes_before);
+        assert_eq!(
+            store.read_delta_records(9, 0).unwrap().len(),
+            4,
+            "every record is still there"
+        );
+
+        // 1b. One byte more than it can reclaim is still too much to ask: the near side of the
+        //     boundary, without which "enough" could quietly mean "strictly more than enough".
+        let short = store
+            .gc_reflected_before_anchor(9, 2, meta_sequence, held.reclaimable_bytes + 1)
+            .unwrap();
+        assert!(
+            short.rewrite_skipped,
+            "one byte short of the threshold is short of the threshold"
+        );
+
+        // 2. The same log, the same records reclaimable, and a threshold it meets EXACTLY: it
+        //    rewrites. Reaching the threshold is enough; it does not have to be exceeded.
+        let swept = store
+            .gc_reflected_before_anchor(9, 2, meta_sequence, held.reclaimable_bytes)
+            .unwrap();
+        assert!(
+            !swept.rewrite_skipped,
+            "a sweep that meets the threshold exactly must rewrite"
+        );
+        assert_eq!(swept.records_removed, 3);
+        assert!(swept.bytes_after < swept.bytes_before);
+        assert_eq!(
+            swept.reclaimable_bytes, held.reclaimable_bytes,
+            "the same log offers the same bytes either way -- only the decision changed"
+        );
+        assert_eq!(store.read_delta_records(9, 0).unwrap().len(), 1);
+
+        // 3. Nothing left to reclaim: skipped even with the threshold turned off, because a
+        //    rewrite that retains every record writes the file back byte for byte.
+        let empty = store.gc_reflected_before_anchor(9, 2, meta_sequence, 0).unwrap();
+        assert!(
+            empty.rewrite_skipped,
+            "a sweep with nothing to remove must not take a barrier for it"
+        );
+        assert_eq!(empty.removable_records_before_budget, 0);
+        assert_eq!(empty.reclaimable_bytes, 0);
+    }
+
+    #[test]
+    fn gc_reflected_before_anchor_keeps_unreflected_deltas_and_the_catalog_anchor() {
+        // Content-based post-dump sweep: records whose WAL anchor the durable base already
+        // reflects go; a delta a concurrent writer landed with a HIGHER anchor survives even
+        // though it sits below the catalog anchor in the log, and the anchor record itself
+        // (the load-time catalog seed) survives its own sweep.
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        // seq 1: legacy whole-index line (no anchor; read by no load path -> reflected).
+        store.append_json(7, b"{\"value\":1}").unwrap();
+        // seq 2: delta reflected by the dump (WAL anchor 2 <= dump anchor 2).
+        store
+            .append_delta(7, vec![block_item(1, "covered", false)], Vec::new(), Some(2), None, false, true)
+            .unwrap();
+        // seq 3: concurrent delta landed after the dump serialized (WAL anchor 5 > 2).
+        store
+            .append_delta(7, vec![block_item(1, "racing", false)], Vec::new(), Some(5), None, false, true)
+            .unwrap();
+        // seq 4: the dump's folded catalog anchor.
+        let meta = MetaItem {
+            version: 1,
+            start_wal_sequence: 2,
+            timestamp_ms: 100,
+            ..MetaItem::default()
+        };
+        let meta_sequence = store
+            .append_delta(7, Vec::new(), Vec::new(), Some(2), Some(meta), false, true)
+            .unwrap();
+
+        let report = store.gc_reflected_before_anchor(7, 2, meta_sequence, 0).unwrap();
+        assert_eq!(report.records_before, 4);
+        assert_eq!(report.records_removed, 2, "the whole-index line and the covered delta go");
+        assert!(report.bytes_after < report.bytes_before);
+
+        let survivors = store.read_delta_records(7, 0).unwrap();
+        assert_eq!(survivors.len(), 2);
+        assert_eq!(
+            survivors[0].items[0].block_ref_key, "racing",
+            "the unreflected concurrent delta must survive the sweep"
+        );
+        assert!(
+            survivors[1].meta.is_some(),
+            "the folded catalog anchor must survive the sweep"
+        );
+        // Sequence continuity: the next append lands above the anchor record.
+        let next = store
+            .append_delta(7, vec![block_item(1, "later", false)], Vec::new(), Some(6), None, false, true)
+            .unwrap();
+        assert_eq!(next, meta_sequence + 1);
+    }
+
+    /// An anchor-less delta that still carries content must SURVIVE the post-dump sweep.
+    ///
+    /// The sweep read a missing anchor as anchor 0 and 0 is at or below every anchor, so a delta
+    /// written while `shard.applied_wal_sequence` was still `None` -- which is what the expiry
+    /// round writes when it reaches its checkpoint under WAL replay -- was removed although the
+    /// dumped base reflects none of it. Its key-states are the only record of those expiries in
+    /// the delta stream, so the fold would then restore what the round deleted.
+    ///
+    /// Both halves are asserted separately: the content-bearing anchor-less record stays, AND
+    /// the reflected record still goes. Asserting only the first would pass just as well against
+    /// a sweep that had stopped removing anything at all.
+    #[test]
+    fn an_anchor_less_delta_that_carries_content_survives_the_post_dump_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        // seq 1: reflected by the dump (anchor 2 <= dump anchor 2). Must GO.
+        store
+            .append_delta(3, vec![block_item(1, "covered", false)], Vec::new(), Some(2), None, false, true)
+            .unwrap();
+        // seq 2: no anchor at all, and it carries page items. Must STAY.
+        store
+            .append_delta(3, vec![block_item(1, "anchorless", false)], Vec::new(), None, None, false, true)
+            .unwrap();
+        // seq 3: no anchor, no items -- key-states only, which is the shape the expiry round
+        // writes. Must STAY: those key-states are the tombstones.
+        store
+            .append_delta(
+                3,
+                Vec::new(),
+                vec![serde_json::json!({"key": "expired"})],
+                None,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        // seq 4: the dump's folded catalog anchor, above the removal window.
+        let meta_sequence = store
+            .append_delta(3, Vec::new(), Vec::new(), Some(2), Some(MetaItem::default()), false, true)
+            .unwrap();
+
+        let report = store.gc_reflected_before_anchor(3, 2, meta_sequence, 0).unwrap();
+        // The denominator, with a floor: a sweep over an empty log would pass everything below.
+        assert_eq!(report.records_before, 4, "denominator: {report:?}");
+        assert_eq!(
+            report.records_removed, 1,
+            "only the reflected record may go: {report:?}"
+        );
+        assert_eq!(report.records_after, 3, "{report:?}");
+
+        let survivors = store.read_delta_records(3, 0).unwrap();
+        assert_eq!(survivors.len(), 3, "{survivors:?}");
+        // HALF ONE: the anchor-less record carrying items is still there.
+        assert!(
+            survivors
+                .iter()
+                .any(|record| record.items.iter().any(|item| item.block_ref_key == "anchorless")),
+            "an anchor-less delta carrying items was swept: {survivors:?}"
+        );
+        // HALF TWO: the anchor-less record carrying only key-states is still there.
+        assert!(
+            survivors
+                .iter()
+                .any(|record| !record.key_states.is_empty()),
+            "an anchor-less delta carrying key-states was swept: {survivors:?}"
+        );
+        // HALF THREE, the control: the reflected record really did go, so this is not a sweep
+        // that has simply stopped sweeping.
+        assert!(
+            !survivors
+                .iter()
+                .any(|record| record.items.iter().any(|item| item.block_ref_key == "covered")),
+            "the reflected delta must still be removed: {survivors:?}"
+        );
+    }
+
+    /// The positive control for the clause above: an anchor-less record that carries NOTHING the
+    /// fold would apply is still removed, in both spellings a whole-index record has.
+    #[test]
+    fn an_anchor_less_record_with_no_content_is_still_swept() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        // seq 1: a whole-index line, which is anchor-less by construction.
+        store.append_json(8, b"{\"value\":1}").unwrap();
+        // seq 2: a delta record with no anchor and no content.
+        store
+            .append_delta(8, Vec::new(), Vec::new(), None, None, false, true)
+            .unwrap();
+        // seq 3: the catalog anchor.
+        let meta_sequence = store
+            .append_delta(8, Vec::new(), Vec::new(), Some(1), Some(MetaItem::default()), false, true)
+            .unwrap();
+
+        let report = store.gc_reflected_before_anchor(8, 1, meta_sequence, 0).unwrap();
+        assert_eq!(report.records_before, 3, "denominator: {report:?}");
+        assert_eq!(
+            report.records_removed, 2,
+            "an anchor-less record holding nothing the fold applies must still go: {report:?}"
+        );
+        assert_eq!(report.records_after, 1, "{report:?}");
+    }
+
+    /// THE INSTRUMENT. A sealed piece made only of anchor-less deltas is unlinked WHOLE.
+    ///
+    /// #1832 fixed this reasoning inside the record walk: `applied_wal_sequence.unwrap_or(0)`
+    /// read a missing anchor as anchor 0, which is at or below every anchor, so an anchor-less
+    /// record was classified reflected and removed. The piece NAME is built from a max over the
+    /// same `unwrap_or(0)`, so a piece holding nothing but anchor-less deltas names 0 -- and the
+    /// post-dump sweep unlinks it without ever opening it, which the record walk can no longer
+    /// reach to save.
+    ///
+    /// The records here are the shape the expiry round writes when it reaches its checkpoint
+    /// under WAL replay: no items, key-states only, no anchor. Those key-states are the only
+    /// description of the round's deletions in the delta stream.
+    #[test]
+    fn a_sealed_piece_of_anchor_less_deltas_is_unlinked_without_being_read() {
+        let _rolling = roll_at(0);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        // 24 expiry-shape checkpoints: no items, no anchor, one key-state each.
+        const ROUNDS: usize = 24;
+        for round in 0..ROUNDS {
+            store
+                .append_delta(
+                    3,
+                    Vec::new(),
+                    vec![serde_json::json!({ "key": format!("expired-{round:03}") })],
+                    None,
+                    None,
+                    false,
+                    true,
+                )
+                .unwrap();
+        }
+        // Seal them into pieces: roll at the length they already occupy, so the next append
+        // starts a fresh piece and everything written so far is sealed behind it.
+        let active_len = index_log_path(dir.path(), 3)
+            .metadata()
+            .unwrap()
+            .len();
+        assert!(active_len > 0, "fixture wrote nothing");
+        set_index_log_segment_bytes_for_test(Some(active_len));
+        // The dump's folded catalog anchor, which lands in the new active piece.
+        let meta_sequence = store
+            .append_delta(
+                3,
+                Vec::new(),
+                Vec::new(),
+                Some(9),
+                Some(MetaItem::default()),
+                false,
+                true,
+            )
+            .unwrap();
+
+        // DENOMINATOR, with a vacuity floor: there must be a sealed piece for this to be about
+        // anything, and it must name anchor 0.
+        let sealed: Vec<IndexSegmentSpan> = index_log_segment_paths(dir.path(), 3)
+            .iter()
+            .filter_map(|path| sealed_index_log_span(path, 3))
+            .collect();
+        assert_eq!(sealed.len(), 1, "fixture must seal exactly one piece: {sealed:?}");
+        // Not one record in the piece carries an anchor, so a max over `unwrap_or(0)` named it
+        // 0 -- at or below every anchor, which is what made it look reflected. It must now name
+        // the saturated anchor instead.
+        assert_eq!(
+            sealed[0].max_applied_wal, INDEX_SEGMENT_UNREFLECTED,
+            "a piece of nothing but anchor-less content must name an anchor no dump reaches: \
+             {sealed:?}"
+        );
+
+        let report = store.gc_reflected_before_anchor(3, 9, meta_sequence, 0).unwrap();
+
+        let survivors = store.read_delta_records(3, 0).unwrap();
+        let tombstones = survivors
+            .iter()
+            .filter(|record| !record.key_states.is_empty())
+            .count();
+        // HALF ONE: every expiry checkpoint is still there. The dumped base reflects none of
+        // them -- they carry no anchor at all -- so none of them may go.
+        assert_eq!(
+            tombstones, ROUNDS,
+            "a sealed piece of anchor-less expiry checkpoints was unlinked whole: \
+             {tombstones} of {ROUNDS} survive, report {report:?}"
+        );
+        // HALF TWO, asserted separately: the sweep still reports honestly about what it did.
+        // A sweep that had simply stopped removing anything would pass half one alone.
+        assert_eq!(
+            report.dropped_segments, 0,
+            "no piece here is provably reflected: {report:?}"
+        );
+    }
+
+    /// The positive control for the instrument above: a sealed piece that IS provably reflected
+    /// is still unlinked whole, and still without being read.
+    ///
+    /// Without this, a sweep that had stopped dropping pieces at all would pass the test above.
+    #[test]
+    fn a_sealed_piece_the_dump_reflects_is_still_unlinked_whole() {
+        let _rolling = roll_at(0);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        const RECORDS: usize = 12;
+        for value in 0..RECORDS {
+            store
+                .append_delta(
+                    4,
+                    vec![block_item(1, &format!("covered-{value:03}"), false)],
+                    Vec::new(),
+                    Some(2),
+                    None,
+                    false,
+                    true,
+                )
+                .unwrap();
+        }
+        let active_len = index_log_path(dir.path(), 4).metadata().unwrap().len();
+        set_index_log_segment_bytes_for_test(Some(active_len));
+        let meta_sequence = store
+            .append_delta(
+                4,
+                Vec::new(),
+                Vec::new(),
+                Some(2),
+                Some(MetaItem::default()),
+                false,
+                true,
+            )
+            .unwrap();
+        let sealed: Vec<IndexSegmentSpan> = index_log_segment_paths(dir.path(), 4)
+            .iter()
+            .filter_map(|path| sealed_index_log_span(path, 4))
+            .collect();
+        assert_eq!(sealed.len(), 1, "fixture must seal exactly one piece: {sealed:?}");
+        assert_eq!(sealed[0].max_applied_wal, 2, "{sealed:?}");
+
+        let report = store.gc_reflected_before_anchor(4, 2, meta_sequence, 0).unwrap();
+        assert_eq!(
+            report.dropped_segments, 1,
+            "a piece every record of which the dump reflects must still go: {report:?}"
+        );
+        let survivors = store.read_delta_records(4, 0).unwrap();
+        assert!(
+            !survivors
+                .iter()
+                .any(|record| record.items.iter().any(|item| item.block_ref_key.starts_with("covered-"))),
+            "the reflected piece was kept: {survivors:?}"
+        );
+    }
+
+    /// The piece NAME cannot see an anchor-less record that shares a piece with anchored ones.
+    ///
+    /// This is why "never unlink a piece whose name says 0" does not close the hole. The name
+    /// carries a MAX over `unwrap_or(0)`, and 0 loses every max it takes part in -- so a single
+    /// anchored record anywhere in the piece hides every anchor-less one beside it, and the piece
+    /// names a number the dump reflects.
+    #[test]
+    fn an_anchor_less_record_is_hidden_by_any_anchored_record_in_the_same_piece() {
+        let _rolling = roll_at(0);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        // PIECE ONE: reflected through and through. The control -- it must still go.
+        store
+            .append_delta(6, vec![block_item(1, "alone", false)], Vec::new(), Some(2), None, false, true)
+            .unwrap();
+        let first_len = index_log_path(dir.path(), 6).metadata().unwrap().len();
+        set_index_log_segment_bytes_for_test(Some(first_len));
+        // PIECE TWO: an anchored record AND an anchor-less one carrying the round's tombstones.
+        store
+            .append_delta(6, vec![block_item(1, "mixed", false)], Vec::new(), Some(2), None, false, true)
+            .unwrap();
+        set_index_log_segment_bytes_for_test(Some(0));
+        store
+            .append_delta(
+                6,
+                Vec::new(),
+                vec![serde_json::json!({ "key": "hidden-tombstone" })],
+                None,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        let second_len = index_log_path(dir.path(), 6).metadata().unwrap().len();
+        set_index_log_segment_bytes_for_test(Some(second_len));
+        let meta_sequence = store
+            .append_delta(6, Vec::new(), Vec::new(), Some(2), Some(MetaItem::default()), false, true)
+            .unwrap();
+
+        let sealed: Vec<IndexSegmentSpan> = index_log_segment_paths(dir.path(), 6)
+            .iter()
+            .filter_map(|path| sealed_index_log_span(path, 6))
+            .collect();
+        assert_eq!(sealed.len(), 2, "fixture must seal two pieces: {sealed:?}");
+        // THE FIXTURE'S WHOLE POINT. The mixed piece holds one record anchored at 2, so a max
+        // over `unwrap_or(0)` named the piece 2 -- a number this very dump reflects, identical to
+        // the name of the piece beside it that really IS reflected. Nothing about that name said
+        // an anchor-less record was in there, which is why "decline to unlink a piece naming 0"
+        // does not reach this: the piece does not name 0.
+        assert_eq!(
+            sealed[0].max_applied_wal, 2,
+            "fixture: the reflected piece names the anchor the dump reaches: {sealed:?}"
+        );
+        assert_eq!(
+            sealed[1].max_applied_wal, INDEX_SEGMENT_UNREFLECTED,
+            "a piece holding an anchor-less record must say so however many anchored records \
+             sit beside it: {sealed:?}"
+        );
+
+        let report = store.gc_reflected_before_anchor(6, 2, meta_sequence, 0).unwrap();
+        let survivors = store.read_delta_records(6, 0).unwrap();
+        // HALF ONE: the hidden tombstone survives.
+        assert!(
+            survivors.iter().any(|record| !record.key_states.is_empty()),
+            "an anchor-less record sharing a piece with an anchored one was unlinked: \
+             {survivors:?}, report {report:?}"
+        );
+        // HALF TWO, separately: the piece that really is reflected still goes, so this is not a
+        // sweep that has stopped unlinking.
+        assert_eq!(
+            report.dropped_segments, 1,
+            "exactly the provably reflected piece may go: {report:?}"
+        );
+        assert!(
+            !survivors
+                .iter()
+                .any(|record| record.items.iter().any(|item| item.block_ref_key == "alone")),
+            "the reflected piece was kept: {survivors:?}"
+        );
+    }
+
+    /// The name a piece gets when nothing can reflect it is one an OLDER binary still parses.
+    ///
+    /// This is the whole argument for saturating the existing field instead of adding a fourth
+    /// one. A fourth field fails `sealed_index_log_span`'s "no more parts" check on a binary that
+    /// predates it, and a piece whose name does not parse is not stale -- it is absent from
+    /// `index_log_segment_paths`, so it is neither read, nor folded, nor reclaimed. This asserts
+    /// the shape the old parser requires: the same three fields, each the same width.
+    #[test]
+    fn an_unreflectable_piece_keeps_the_name_shape_an_older_binary_parses() {
+        let _rolling = roll_at(0);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        store
+            .append_delta(
+                2,
+                Vec::new(),
+                vec![serde_json::json!({ "key": "tombstone" })],
+                None,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        let len = index_log_path(dir.path(), 2).metadata().unwrap().len();
+        set_index_log_segment_bytes_for_test(Some(len));
+        store
+            .append_delta(2, Vec::new(), Vec::new(), Some(4), None, false, true)
+            .unwrap();
+
+        let sealed: Vec<PathBuf> = index_log_segment_paths(dir.path(), 2)
+            .into_iter()
+            .filter(|path| sealed_index_log_span(path, 2).is_some())
+            .collect();
+        assert_eq!(sealed.len(), 1, "fixture must seal one piece: {sealed:?}");
+        let name = sealed[0].file_name().unwrap().to_str().unwrap().to_string();
+        let middle = name
+            .strip_prefix("shard-2.indexlog.")
+            .and_then(|rest| rest.strip_suffix(&format!(".{INDEX_LOG_SUFFIX}")))
+            .unwrap_or_else(|| panic!("unexpected piece name: {name}"));
+        let fields: Vec<&str> = middle.split('-').collect();
+        // HALF ONE: the shape the old parser requires -- three fields, each 20 digits.
+        assert_eq!(fields.len(), 3, "a fourth field would make this piece invisible: {name}");
+        assert!(
+            fields.iter().all(|field| field.len() == 20 && field.bytes().all(|b| b.is_ascii_digit())),
+            "every field must stay a 20-digit number: {name}"
+        );
+        // HALF TWO, asserted separately: the field actually carries the saturated anchor, so an
+        // old binary asking `max_applied_wal > wal_anchor` declines to unlink it exactly as the
+        // new one does. Half one would pass just as well against a piece named with a real
+        // anchor, which is the bug.
+        let span = sealed_index_log_span(&sealed[0], 2).unwrap();
+        assert_eq!(
+            span.max_applied_wal, INDEX_SEGMENT_UNREFLECTED,
+            "an unreflectable piece must name the saturated anchor: {name}"
+        );
+        assert_eq!(fields[2], format!("{:020}", u64::MAX), "{name}");
+    }
+
+    /// How many pieces in a store name anchor 0, and what "never unlink a piece naming 0" costs.
+    ///
+    /// Printed with its denominator. The answer decides whether the cheap conservative sweep is
+    /// a fix or a refusal to reclaim: a whole-index record carries no anchor BY CONSTRUCTION, so
+    /// a log written in that shape names 0 in every piece -- and that shape is exactly the
+    /// legacy one the sweep exists to reclaim.
+    #[test]
+    fn how_many_sealed_pieces_name_anchor_zero() {
+        // Enough records that both shapes roll several times at the 64 KiB default -- a shape
+        // that seals no piece measures nothing, which the floor below enforces rather than
+        // prints.
+        const RECORDS: usize = 6_000;
+        let mut reported = 0usize;
+        for (label, anchored) in [("anchored deltas", true), ("whole-index records", false)] {
+            let _rolling = roll_at(DEFAULT_INDEX_LOG_SEGMENT_BYTES);
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalIndexLogStore::new(dir.path());
+            for value in 0..RECORDS {
+                if anchored {
+                    store
+                        .append_delta(
+                            5,
+                            vec![block_item(1, &format!("k{value:04}"), false)],
+                            Vec::new(),
+                            Some(value as u64 + 1),
+                            None,
+                            false,
+                            true,
+                        )
+                        .unwrap();
+                } else {
+                    store
+                        .append_json(5, format!("{{\"value\":{value}}}").as_bytes())
+                        .unwrap();
+                }
+            }
+            let sealed: Vec<IndexSegmentSpan> = index_log_segment_paths(dir.path(), 5)
+                .iter()
+                .filter_map(|path| sealed_index_log_span(path, 5))
+                .collect();
+            let naming_zero = sealed
+                .iter()
+                .filter(|span| span.max_applied_wal == 0)
+                .count();
+            assert!(
+                sealed.len() >= 2,
+                "{label}: the shape must seal pieces or this measures nothing: {}",
+                sealed.len()
+            );
+            println!(
+                "  {label:<22} {naming_zero:>4} of {:>4} sealed pieces name anchor 0",
+                sealed.len()
+            );
+            if anchored {
+                assert_eq!(
+                    naming_zero, 0,
+                    "{label}: an anchored log should name no piece 0"
+                );
+            } else {
+                assert_eq!(
+                    naming_zero,
+                    sealed.len(),
+                    "{label}: every whole-index piece names 0, so declining to unlink a piece \
+                     naming 0 declines to reclaim this shape at all"
+                );
+            }
+            reported += 1;
+        }
+        assert_eq!(reported, 2, "both shapes must be measured");
+    }
+
+    /// What it costs to DECIDE a piece by reading it, at the size pieces actually reach.
+    ///
+    /// Three routes to the same decision, measured on 64 KiB pieces -- the rolling default:
+    /// the name alone (a `stat`), a framing walk that counts records without parsing any of
+    /// them, and a full decode of every payload. The framing walk is what an exact dropped-record
+    /// count would cost; the full decode is what deciding reflectedness by reading would cost.
+    #[test]
+    fn what_it_costs_to_decide_a_piece_by_reading_it() {
+        let _rolling = roll_at(DEFAULT_INDEX_LOG_SEGMENT_BYTES);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        const RECORDS: usize = 20_000;
+        for value in 0..RECORDS {
+            store
+                .append_delta(
+                    5,
+                    vec![block_item(1, &format!("k{value:05}"), false)],
+                    Vec::new(),
+                    Some(value as u64 + 1),
+                    None,
+                    false,
+                    true,
+                )
+                .unwrap();
+        }
+        let pieces: Vec<PathBuf> = index_log_segment_paths(dir.path(), 5)
+            .into_iter()
+            .filter(|path| sealed_index_log_span(path, 5).is_some())
+            .collect();
+        assert!(pieces.len() >= 8, "too few pieces to measure: {}", pieces.len());
+        let bytes: u64 = pieces
+            .iter()
+            .filter_map(|path| path.metadata().ok())
+            .map(|meta| meta.len())
+            .sum();
+
+        let at = std::time::Instant::now();
+        let mut named = 0usize;
+        for path in &pieces {
+            if sealed_index_log_span(path, 5).is_some() {
+                named += 1;
+            }
+        }
+        let name_ms = at.elapsed().as_secs_f64() * 1000.0;
+
+        let at = std::time::Instant::now();
+        let mut framed = 0usize;
+        let mut tally = IndexLogReadTally::start();
+        for path in &pieces {
+            let mut reader = BufReader::new(open_index_log_read(path, &mut tally).unwrap());
+            while let Some((_, payload)) = crate::log_framing::read_frame(&mut reader).unwrap() {
+                if !payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    framed += 1;
+                }
+            }
+        }
+        let frame_ms = at.elapsed().as_secs_f64() * 1000.0;
+
+        let at = std::time::Instant::now();
+        let mut decoded = 0usize;
+        let mut tally = IndexLogReadTally::start();
+        for path in &pieces {
+            let mut reader = BufReader::new(open_index_log_read(path, &mut tally).unwrap());
+            while let Some((_, payload)) = crate::log_framing::read_frame(&mut reader).unwrap() {
+                if payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    continue;
+                }
+                let head: IndexRecordHead = decode_index_payload(&payload).unwrap();
+                if head.applied_wal_sequence.is_none() {
+                    let _ = delta_record_carries_content(&payload).unwrap();
+                }
+                decoded += 1;
+            }
+        }
+        let decode_ms = at.elapsed().as_secs_f64() * 1000.0;
+
+        println!(
+            "\n  {} pieces, {bytes} bytes, {framed} records\n  \
+             name-only {name_ms:>8.3} ms   framing {frame_ms:>8.3} ms   \
+             full decode {decode_ms:>8.3} ms",
+            pieces.len()
+        );
+        assert_eq!(named, pieces.len(), "the name route must decide every piece");
+        assert_eq!(framed, decoded, "the two reading routes must see the same records");
+        assert!(framed > 0, "vacuity floor: nothing was read");
+    }
+
+    /// A dropped piece reports its sequence SPAN, which is an upper bound on what it held.
+    ///
+    /// The span was the record count while sequences had no holes. #1832's fix puts holes in: the
+    /// post-dump sweep rewrites the piece being written and keeps an INTERIOR subset of it, so
+    /// once that piece is sealed its span is wider than its contents. The number reaches
+    /// Prometheus as `index_log_records_removed`.
+    ///
+    /// Counting exactly costs opening every piece being unlinked -- 17.033 ms against 0.014 ms
+    /// over 14 pieces of 917,718 bytes, measured by the test above -- on the one path whose
+    /// design is that a piece goes by `stat` and `unlink`. So the bound is kept and published as
+    /// a bound, and this pins it: visible, one-directional, and impossible to quietly widen.
+    #[test]
+    fn a_dropped_piece_reports_its_sequence_span_as_an_upper_bound() {
+        let _rolling = roll_at(0);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        // Three reflected records the post-dump sweep will remove from the middle of the piece,
+        // between two that carry no anchor and so must stay.
+        store
+            .append_delta(
+                7,
+                Vec::new(),
+                vec![serde_json::json!({ "key": "first" })],
+                None,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        for value in 0..3 {
+            store
+                .append_delta(
+                    7,
+                    vec![block_item(1, &format!("reflected-{value}"), false)],
+                    Vec::new(),
+                    Some(2),
+                    None,
+                    false,
+                    true,
+                )
+                .unwrap();
+        }
+        store
+            .append_delta(
+                7,
+                Vec::new(),
+                vec![serde_json::json!({ "key": "last" })],
+                None,
+                None,
+                false,
+                true,
+            )
+            .unwrap();
+        let meta_sequence = store
+            .append_delta(7, Vec::new(), Vec::new(), Some(2), Some(MetaItem::default()), false, true)
+            .unwrap();
+
+        // The sweep takes the interior three, leaving holes in the piece being written.
+        let swept = store.gc_reflected_before_anchor(7, 2, meta_sequence, 0).unwrap();
+        assert_eq!(swept.records_removed, 3, "fixture: {swept:?}");
+        let held = store.record_count(7).unwrap();
+        assert_eq!(held, 3, "fixture: three records survive the sweep");
+
+        // Seal the holed piece.
+        set_index_log_segment_bytes_for_test(Some(1));
+        assert!(
+            roll_index_log_segment_if_due(dir.path(), 7).unwrap(),
+            "fixture must seal the piece"
+        );
+        let sealed: Vec<IndexSegmentSpan> = index_log_segment_paths(dir.path(), 7)
+            .iter()
+            .filter_map(|path| sealed_index_log_span(path, 7))
+            .collect();
+        assert_eq!(sealed.len(), 1, "{sealed:?}");
+        // The span is WIDER than the piece: that difference is the over-report.
+        assert_eq!(
+            sealed[0].end.saturating_sub(sealed[0].start),
+            6,
+            "fixture: the span still spells the removed records: {sealed:?}"
+        );
+
+        // Drop the whole piece and read what the round says it removed.
+        let report = store
+            .gc_before_sequence_limited(7, sealed[0].end, 0)
+            .unwrap();
+        assert_eq!(
+            report.dropped_segments, 1,
+            "fixture: the piece must be dropped whole: {report:?}"
+        );
+        // HALF ONE, and FIRST because it is the property the metric is read for: the bound is an
+        // UPPER one. It may exceed what the piece held; it may never fall short. A round that
+        // reported nothing at all would satisfy half two's shape in some other fixture and would
+        // die right here.
+        assert!(
+            report.records_removed >= held,
+            "a reclaim count must never understate what went: {} < {held}, {report:?}",
+            report.records_removed
+        );
+        assert!(
+            report.records_removed > held,
+            "fixture: this piece must actually be over-reported, or the bound is untested \
+             here: {} vs {held}",
+            report.records_removed
+        );
+        // HALF TWO, asserted separately and reached only when half one holds: the number is the
+        // SPAN exactly, which is what makes the bound a stated one rather than a vague promise.
+        assert_eq!(
+            report.records_removed,
+            sealed[0].end.saturating_sub(sealed[0].start) as usize,
+            "the round reports the piece's sequence span: {report:?}"
+        );
+        println!(
+            "  dropped piece: span {} records, held {held}, over-reported by {}",
+            report.records_removed,
+            report.records_removed - held
+        );
+    }
+
+    #[test]
+    fn interior_corruption_is_fatal_not_silent_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        for i in 1..=4 {
+            store
+                .append_json(5, format!("{{\"value\":{i}}}").as_bytes())
+                .unwrap();
+        }
+        drop(store);
+        // Corrupt the 2nd record IN PLACE, keeping it newline-terminated with records 3 & 4
+        // intact after it. A newline-terminated line that fails to parse is committed
+        // corruption, not a torn tail.
+        let path = index_log_path(dir.path(), 5);
+        let contents = std::fs::read(&path).unwrap();
+        let mut records = split_records(&contents);
+        assert_eq!(records.len(), 4);
+        records[1] = undecodable_record();
+        std::fs::write(&path, records.concat()).unwrap();
+        // scan drives last_sequence_at, which must surface interior corruption as an error
+        // rather than silently truncating records 3 & 4 and rewinding the sequence counter
+        // (which durable dump manifests reference via index_log_sequence).
+        let reopened = LocalIndexLogStore::new(dir.path());
+        assert!(
+            reopened.scan(5, 0, u64::MAX, u64::MAX).is_err(),
+            "interior index-log corruption must be fatal, not silently truncated"
+        );
+    }
+
+    #[test]
+    fn read_delta_records_propagates_interior_delta_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        for key in ["a", "b", "c"] {
+            store
+                .append_delta(5, vec![block_item(1, key, false)], Vec::new(), Some(1), None, false, true)
+                .unwrap();
+        }
+        drop(store);
+        // Corrupt the 2nd delta record in place, keeping it newline-terminated with the 3rd
+        // intact after it. Previously read_delta_records `if let Ok(..)` SILENTLY SKIPPED such
+        // a line and folded on -- losing a removal/eviction recorded only in that delta. It
+        // must now propagate the error and abort.
+        let path = index_log_path(dir.path(), 5);
+        let contents = std::fs::read(&path).unwrap();
+        let mut records = split_records(&contents);
+        assert_eq!(records.len(), 3);
+        records[1] = undecodable_record();
+        std::fs::write(&path, records.concat()).unwrap();
+        let reopened = LocalIndexLogStore::new(dir.path());
+        assert!(
+            reopened.read_delta_records(5, 0).is_err(),
+            "an interior delta record that fails to decode must abort, not be silently skipped"
+        );
+    }
+
+    #[test]
+    fn read_delta_records_enforces_sequence_continuity() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        for (index, key) in ["a", "b", "c"].iter().enumerate() {
+            store
+                .append_delta(
+                    5,
+                    vec![block_item(1, key, false)],
+                    Vec::new(),
+                    Some(index as u64 + 1),
+                    None,
+                    false,
+                    true,
+                )
+                .unwrap();
+        }
+        drop(store);
+        // Reorder the (valid, framed) records so their sequences read 1, 3, 2 -- a continuity
+        // violation that means a record was lost/reordered. Each line is individually valid
+        // (correct digest), so this exercises the sequence-continuity guard, not the checksum.
+        let path = index_log_path(dir.path(), 5);
+        let contents = std::fs::read(&path).unwrap();
+        let records = split_records(&contents);
+        assert_eq!(records.len(), 3);
+        let reordered: Vec<u8> = [0usize, 2, 1]
+            .iter()
+            .flat_map(|index| records[*index].clone())
+            .collect();
+        std::fs::write(&path, reordered).unwrap();
+        let reopened = LocalIndexLogStore::new(dir.path());
+        match reopened.read_delta_records(5, 0) {
+            Err(IndexLogError::Corruption(_)) => {}
+            other => panic!("out-of-order delta sequences must be a Corruption error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_index_item_written_with_the_old_field_names_still_loads() {
+        // The names are short now because they repeat once per ITEM for the life of the log.
+        // Every record already on disk spells them out, so each short name keeps its old
+        // spelling as an alias -- including `routing_slot`, which was itself a rename.
+        let legacy = serde_json::json!({
+            "kind": "page",
+            "routing_slot": 545210715_u32,
+            "page_ref_key": "string:m:0::0:0:126:0:0",
+            "object_key": "m:0",
+            "model_id": "string",
+            "object_id": 122110326161599232_u64,
+            "page_id": 0,
+            "size": 126,
+            "in_log": false,
+            "deleted": false
+        });
+        // THE SLOT, read where it now lives. `size` is not a field any more -- it is derived
+        // from the address -- so the alias this test exists for is asserted on the wire struct
+        // the conversion reads. That observes the stored value directly, where the old form
+        // could have been satisfied by a derivation that happened to agree.
+        let wire: IndexItemWire =
+            serde_json::from_value(legacy.clone()).expect("a legacy item must load as a wire row");
+        assert_eq!(wire.size, 126, "the legacy `size` key must still reach the wire row");
+
+        let item: IndexItem = serde_json::from_value(legacy).expect("a legacy item must load");
+        assert_eq!(item.routing_bucket, 545210715);
+        assert_eq!(item.object_key.as_ref(), "m:0");
+        assert_eq!(item.object_id, 122110326161599232);
+        // The row carries no address, so there is no payload to derive a size from -- which is
+        // the state this legacy row describes rather than a loss.
+        assert!(item.entry.is_none(), "a legacy row with no address has no payload");
+        assert!(!item.deleted);
+    }
+
+    /// The old `page_id` key must still land in the renamed `block_id` field.
+    ///
+    /// The guard above spells `page_id` in its fixture, but it writes 0 there and never reads
+    /// the field back -- and every field here carries `serde(default)`, so it fills in the same
+    /// 0 whether the alias survives or not. Dropping `alias = "page_id"` leaves that guard
+    /// passing. This one asserts a value that is NOT the default, so the alias is what makes it
+    /// pass, which is the property the rename to `block_id` now rests on.
+    #[test]
+    fn the_old_page_id_key_still_loads_into_the_renamed_block_id_field() {
+        let legacy = serde_json::json!({
+            "kind": "page",
+            "routing_slot": 545210715_u32,
+            "page_ref_key": "string:m:0::0:0:126:0:0",
+            "object_key": "m:0",
+            "model_id": "string",
+            "object_id": 122110326161599232_u64,
+            "page_id": 4242,
+            "size": 126,
+            "in_log": false,
+            "deleted": false
+        });
+        assert_ne!(
+            4242, u64::default(),
+            "the fixture value must not be the serde default, or this cannot fail"
+        );
+        // READ AT THE WIRE, because the renamed field is no longer a field: `block_id` is
+        // derived from the address now. The subject of this test is the KEY MAPPING, and the
+        // wire row is where that mapping lands, so this asserts it without a conversion in
+        // between.
+        let wire: IndexItemWire =
+            serde_json::from_value(legacy.clone()).expect("a legacy item must load as a wire row");
+        assert_eq!(
+            wire.block_id, 4242,
+            "the old `page_id` key must still reach the renamed `block_id` slot"
+        );
+        // And the conversion still accepts the row.
+        let item: IndexItem = serde_json::from_value(legacy).expect("a legacy item must load");
+        assert!(
+            item.entry.is_none(),
+            "this legacy row carries no address, so it has no payload"
+        );
+    }
+
+    #[test]
+    fn an_index_item_costs_far_less_than_its_field_names_used_to() {
+        // Field names were 65.3% of a measured 859-byte index-log record: they are written once
+        // per item, forever, and cost more than the addresses they label.
+        let item = IndexItem {
+            kind: IndexItemKind::Block,
+            routing_bucket: 545210715,
+            block_ref_key: "string:m:0::0:0:126:0:0".to_string(),
+            object_key: "m:0".into(),
+            model_id: "string".to_string(),
+            object_id: 122110326161599232,
+            // ADDRESS-LESS BY DESIGN: this fixture measures a floor, so it stays at
+            // the floor. An address would take the row from one nil to a six-slot
+            // array -- bigger, not smaller -- and the size it stated was never
+            // restored, because there was no address to derive it from.
+            entry: None,
+            deleted: false,
+        };
+        let encoded = serde_json::to_string(&item).unwrap();
+        // Not vacuous: the item must still carry its values, so assert the payload is present
+        // before asserting the envelope is small.
+        assert!(encoded.contains("545210715"));
+        assert!(encoded.contains("m:0"));
+        assert!(encoded.contains("122110326161599232"));
+        // The long spellings must be gone from the WRITTEN form.
+        for gone in ["routing_slot", "page_ref_key", "object_key", "model_id", "object_id"] {
+            assert!(!encoded.contains(gone), "{gone} should not be written any more");
+        }
+        assert!(
+            encoded.len() < 150,
+            "expected a compact item, got {} bytes: {encoded}",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn meta_item_without_zones_serializes_byte_identically_to_pre_fold() {
+        // Pre-fold compatibility invariant: an anchor whose `slabs` is empty must serialize with
+        // NO `zones` key and NO
+        // `slab_version` beyond what a pre-fold MetaItem produced. `slab_version` defaults to 0
+        // and is not skipped, so it appears; assert the value carries only the legacy three
+        // fields plus a zero slab_version and no zones array.
+        let meta = MetaItem {
+            version: 7,
+            start_wal_sequence: 11,
+            timestamp_ms: 22,
+            ..MetaItem::default()
+        };
+        let value = serde_json::to_value(&meta).unwrap();
+        let object = value.as_object().unwrap();
+        // Every field is written now, empty or not: a row is read by position, so a field that
+        // disappears when it is empty moves every field behind it. An empty slab list costs one
+        // byte and keeps the position of everything after it.
+        assert_eq!(
+            object.get("zones").expect("the slab list is always written"),
+            &serde_json::json!([]),
+            "an empty slab list is written, not skipped"
+        );
+        assert_eq!(object.get("version").unwrap(), 7);
+        assert_eq!(object.get("start_wal_sequence").unwrap(), 11);
+        assert_eq!(object.get("timestamp_ms").unwrap(), 22);
+        // Present, not skipped, and spelled the new way. The `unwrap` IS the presence
+        // check: a key that stopped being written fails here rather than reading as an
+        // absent zero, which is the shape that lets a renamed key pass unnoticed.
+        assert_eq!(object.get("slab_version").unwrap(), 0);
+        assert!(
+            object.get("zone_version").is_none(),
+            "the retired spelling is a read alias now, not something written"
+        );
+        // And it round-trips.
+        let back: MetaItem = serde_json::from_value(value).unwrap();
+        assert_eq!(back, meta);
+    }
+
+    #[test]
+    fn meta_item_slab_catalog_round_trips_through_the_delta_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        let meta = MetaItem {
+            version: 1,
+            start_wal_sequence: 5,
+            timestamp_ms: 100,
+            slab_version: 3,
+            slabs: vec![
+                SlabCatalogEntry {
+                    block_slab_id: 0,
+                    state: SlabCatalogState::Sealed,
+                    physical_bytes: 4096,
+                    logical_bytes: 4000,
+                    created_unix_ms: Some(10),
+                    updated_unix_ms: Some(20),
+                    first_block_id: Some(0),
+                    last_block_id: Some(9),
+                    version: 3,
+                },
+                SlabCatalogEntry {
+                    block_slab_id: 1,
+                    state: SlabCatalogState::Active,
+                    physical_bytes: 512,
+                    logical_bytes: 512,
+                    created_unix_ms: Some(30),
+                    updated_unix_ms: Some(30),
+                    first_block_id: Some(10),
+                    last_block_id: Some(10),
+                    version: 3,
+                },
+            ],
+        };
+        store
+            .append_delta(4, Vec::new(), Vec::new(), Some(5), Some(meta.clone()), false, true)
+            .unwrap();
+        // A reopen reads the folded catalog back exactly, and latest_slab_catalog finds it.
+        let reopened = LocalIndexLogStore::new(dir.path());
+        let recovered = reopened.latest_slab_catalog(4).unwrap().unwrap();
+        assert_eq!(recovered, meta);
+        assert_eq!(recovered.slabs.len(), 2);
+        assert_eq!(recovered.slabs[0].state, SlabCatalogState::Sealed);
+        assert_eq!(recovered.slabs[1].block_slab_id, 1);
+    }
+
+    #[test]
+    fn latest_slab_catalog_prefers_the_newest_anchor_and_ignores_empty_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        let older = MetaItem {
+            version: 1,
+            start_wal_sequence: 1,
+            timestamp_ms: 1,
+            slab_version: 1,
+            slabs: vec![SlabCatalogEntry {
+                block_slab_id: 0,
+                state: SlabCatalogState::Active,
+                physical_bytes: 1,
+                logical_bytes: 1,
+                created_unix_ms: None,
+                updated_unix_ms: None,
+                first_block_id: None,
+                last_block_id: None,
+                version: 1,
+            }],
+        };
+        let newer = MetaItem {
+            version: 2,
+            start_wal_sequence: 9,
+            timestamp_ms: 9,
+            slab_version: 2,
+            slabs: vec![SlabCatalogEntry {
+                block_slab_id: 0,
+                state: SlabCatalogState::Sealed,
+                physical_bytes: 2,
+                logical_bytes: 2,
+                created_unix_ms: None,
+                updated_unix_ms: None,
+                first_block_id: None,
+                last_block_id: None,
+                version: 2,
+            }],
+        };
+        store
+            .append_delta(6, Vec::new(), Vec::new(), Some(1), Some(older), false, true)
+            .unwrap();
+        // An anchor with no slabs between them must not shadow the folded catalog.
+        store
+            .append_delta(6, Vec::new(), Vec::new(), Some(5), Some(MetaItem::default()), false, true)
+            .unwrap();
+        store
+            .append_delta(6, Vec::new(), Vec::new(), Some(9), Some(newer.clone()), false, true)
+            .unwrap();
+        assert_eq!(store.latest_slab_catalog(6).unwrap().unwrap(), newer);
+    }
+
+    /// The interval holds a second dump off, and a shard that has never dumped is not held.
+    ///
+    /// Both halves matter and neither alone is enough. A rule that only checked the gap would
+    /// satisfy "fires when enough has accumulated"; a rule that treated "never dumped" as
+    /// "dumped just now" would satisfy "holds a second dump off" while silencing the FIRST dump
+    /// of every restart -- the case with the most to reclaim and the one no interval should
+    /// ever cover.
+    #[test]
+    fn the_dump_interval_holds_off_a_second_dump_but_never_the_first() {
+        // Never dumped: no floor to wait behind, however long the interval.
+        assert!(should_dump_index_catalog_now(4096, 1024, None, 60_000));
+        // Dumped recently: the gap is crossed and the dump still waits.
+        assert!(!should_dump_index_catalog_now(4096, 1024, Some(200), 1_500));
+        // Waited long enough: it fires. The boundary itself counts as waited.
+        assert!(should_dump_index_catalog_now(4096, 1024, Some(1_500), 1_500));
+        assert!(should_dump_index_catalog_now(4096, 1024, Some(9_000), 1_500));
+        // A zero interval is no floor -- the gap alone decides, in both directions.
+        assert!(should_dump_index_catalog_now(4096, 1024, Some(0), 0));
+        assert!(!should_dump_index_catalog_now(512, 1024, Some(0), 0));
+        // And the interval never SUBSTITUTES for the gap: waiting is not accumulating.
+        assert!(!should_dump_index_catalog_now(512, 1024, Some(9_000), 1_500));
+    }
+
+    /// A record whose items share one object key writes it once, and reads back identical.
+    ///
+    /// All four corners, because three of them are the ways this could be wrong rather than
+    /// merely unhelpful:
+    ///
+    /// - items that SHARE a key: hoisted, and every item gets it back
+    /// - items that share the EMPTY key: hoisted as `Some("")` and restored as empty, which is
+    ///   why this is a record-level key and not a "same as the previous item" marker -- that
+    ///   marker cannot tell a repeat from a genuinely empty key
+    /// - items that DIFFER: not hoisted, every key written and returned unchanged
+    /// - a single item: hoisted (it trivially agrees with itself) and restored
+    ///
+    /// The round-trip goes through the real writer and the real reader, so it also proves the
+    /// ORDER holds: `page_ref_key` is derived from `object_key` among other fields, so a reader
+    /// that restored the key after the handle would put back a handle derived against an empty
+    /// key.
+    #[test]
+    fn a_record_whose_items_share_an_object_key_writes_it_once() {
+        // Carries an ADDRESS, so `page_ref_key` is really derived from `object_key` and the
+        // restore ORDER is exercised. With no address the derive returns early and a reader that
+        // restored the key too late would still pass -- which is what the first version of this
+        // test did.
+        // THE PARAMETER THAT VARIED THE FIXTURE IS NOW AN OFFSET, NOT AN ELEMENT NAME. These
+        // items were distinguished only by their component, and nothing can carry one: with the
+        // name gone the four cases below would have built runs of IDENTICAL rows, and a fixture
+        // parameter that varies nothing is how a case list stops testing what it names. The
+        // offset is in the handle derivation, so it varies the thing the round trip is about.
+        fn item(key: &str, offset: u64) -> IndexItem {
+            let address = crate::block_store::ElementEntry::from_parts(
+                7,
+                offset,
+                832,
+                None,
+                None,
+            );
+            let block_ref_key = block_ref_key_from_parts(
+                "feature",
+                key,
+                None,
+                address.block_slab_id(),
+                address.offset(),
+                address.length(),
+                address.block_id().unwrap_or_default(),
+                address.generation().unwrap_or_default(),
+            );
+            IndexItem {
+                kind: IndexItemKind::Block,
+                routing_bucket: 1024,
+                block_ref_key,
+                object_key: key.into(),
+                model_id: "feature".to_string(),
+                object_id: 0,
+                // The three slots this used to state were its own derivation; the codec
+                // computes them where they are written.
+                entry: Some(address),
+                deleted: false,
+            }
+        }
+
+        let cases: Vec<(&str, Vec<IndexItem>)> = vec![
+            ("shared", vec![item("ctx:event:41", 4096), item("ctx:event:41", 8192), item("ctx:event:41", 12288)]),
+            ("shared-empty", vec![item("", 4096), item("", 8192)]),
+            ("differing", vec![item("ctx:event:41", 4096), item("ctx:event:99", 8192)]),
+            ("single", vec![item("ctx:event:41", 4096)]),
+        ];
+
+        for (label, items) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalIndexLogStore::new(dir.path());
+            let expected: Vec<String> = items.iter().map(|item| item.object_key.clone()).map(|v| v.to_string()).collect();
+            let expected_handles: Vec<String> =
+                items.iter().map(|item| item.block_ref_key.clone()).collect();
+            store
+                .append_delta(11, items.clone(), Vec::new(), Some(1), None, false, true)
+                .unwrap();
+
+            let read = store.read_delta_records(11, 0).unwrap();
+            assert_eq!(read.len(), 1, "{label}: expected one record");
+            let back: Vec<String> = read[0].items.iter().map(|item| item.object_key.clone()).map(|v| v.to_string()).collect();
+            assert_eq!(back, expected, "{label}: object keys did not round-trip");
+            // The derived handle too: it is derived FROM the object key, so a key restored after
+            // it would have produced a handle derived against an empty key.
+            let handles: Vec<String> =
+                read[0].items.iter().map(|item| item.block_ref_key.clone()).collect();
+            assert_eq!(handles, expected_handles, "{label}: page handles did not round-trip");
+
+            let distinct = expected.iter().collect::<std::collections::BTreeSet<_>>().len();
+            let hoisted = read[0].shared_object_key.is_some();
+            assert_eq!(
+                hoisted,
+                distinct == 1,
+                "{label}: hoisted={hoisted} with {distinct} distinct key(s)"
+            );
+        }
+    }
+
+    /// What hoisting the key is worth, on a record shaped like a timestamped write.
+    #[test]
+    fn hoisting_a_shared_object_key_shrinks_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        let items: Vec<IndexItem> = (0..32)
+            .map(|index| IndexItem {
+                kind: IndexItemKind::Block,
+                routing_bucket: 1024,
+                block_ref_key: String::new(),
+                object_key: "ctx:event:41:tenant-7".into(),
+                model_id: "feature".to_string(),
+                // THE ROWS ARE IDENTICAL NOW, AND THAT IS HONEST FOR THIS FIXTURE. They were
+                // distinguished only by a component, which no row can carry. This arm measures a
+                // per-row FLOOR -- address-less, handle-less, by design -- so a run of identical
+                // rows is the floor it is about rather than a weakened case.
+                object_id: 0,
+                // ADDRESS-LESS BY DESIGN: this fixture measures a floor, so it stays at
+                // the floor. An address would take the row from one nil to a six-slot
+                // array -- bigger, not smaller -- and the size it stated was never
+                // restored, because there was no address to derive it from.
+                entry: None,
+                deleted: false,
+            })
+            .collect();
+
+        let mut hoisted = items.clone();
+        let shared = hoisted[0].object_key.clone();
+        for item in hoisted.iter_mut() {
+            item.object_key = empty_object_key();
+        }
+        let before = encode_index_payload(
+            &IndexDeltaRecord {
+                shard_id: 11,
+                sequence: 1,
+                items,
+                meta: None,
+                applied_wal_sequence: Some(1),
+                upsert: true,
+                key_states: Vec::new(),
+                shared_object_key: None,
+            },
+            INDEX_LOG_SHAPE_DELTA,
+        )
+        .unwrap()
+        .len();
+        let after = encode_index_payload(
+            &IndexDeltaRecord {
+                shard_id: 11,
+                sequence: 1,
+                items: hoisted,
+                meta: None,
+                applied_wal_sequence: Some(1),
+                upsert: true,
+                key_states: Vec::new(),
+                shared_object_key: Some(shared.to_string()),
+            },
+            INDEX_LOG_SHAPE_DELTA,
+        )
+        .unwrap()
+        .len();
+        eprintln!(
+            "\n  32 items sharing one object key: {before} B -> {after} B ({:.1}% smaller)\n",
+            100.0 * (before - after) as f64 / before as f64
+        );
+        assert!(after < before, "hoisting must shrink the record: {before} -> {after}");
+        let _ = &store;
+    }
+
+    #[test]
+    fn should_dump_index_catalog_fires_only_past_the_gap() {
+        assert!(!should_dump_index_catalog(0, 1024));
+        assert!(!should_dump_index_catalog(1023, 1024));
+        assert!(should_dump_index_catalog(1024, 1024));
+        assert!(should_dump_index_catalog(4096, 1024));
+        // A zero gap disables the threshold cadence entirely.
+        assert!(!should_dump_index_catalog(u64::MAX, 0));
+    }
+
+    /// Set the rolling threshold for this test and put it back afterwards.
+    ///
+    /// The override is per THREAD, and with `--test-threads=1` every test in this binary runs on
+    /// the same one -- so a test that set it and walked away would decide how every test after it
+    /// rolls. Restored on drop, so a panicking assertion restores it too.
+    struct RollingThreshold;
+
+    impl Drop for RollingThreshold {
+        fn drop(&mut self) {
+            set_index_log_segment_bytes_for_test(None);
+        }
+    }
+
+    fn roll_at(bytes: u64) -> RollingThreshold {
+        set_index_log_segment_bytes_for_test(Some(bytes));
+        RollingThreshold
+    }
+
+    /// Reclaim costs what it REMOVES, not what it KEEPS.
+    ///
+    /// This log used to be one file per shard, and the collector reclaimed it by reading the file
+    /// and rewriting every record it retained. The cost was therefore on the survivors, which
+    /// inverts the thing reclaim is for: a round that removed LESS copied MORE. Measured on the
+    /// shape this replaces -- 2,000 records took 22.7 ms in one unlimited round against 29.0 ms
+    /// limited to 200, and 40,000 took 356.7 ms against 492.0 ms -- and the bounded round left the
+    /// rest of the work for later rounds that were dearer still. Every caller passed 0 because
+    /// unbounded was the cheap option.
+    ///
+    /// The log now rolls into pieces and a round unlinks whole pieces, so what it removes is never
+    /// read and never copied. What a round copies is the piece being WRITTEN, whatever the log
+    /// retains -- which is the assertion below, and the one that fails if the collector goes back
+    /// to rewriting its survivors.
+    ///
+    /// Asserted on bytes rather than on time: bytes are what makes it true, and they do not depend
+    /// on the machine or on what else is running on it.
+    #[test]
+    fn reclaim_costs_what_it_removes_not_what_it_keeps() {
+        let piece = 8 * 1024u64;
+        let _rolling = roll_at(piece);
+        let records = 8_000usize;
+
+        // Three rounds on three copies of the same log, at three retain floors: one that removes
+        // everything it can, one that removes most of it, and one that removes a sliver off the
+        // front and keeps the rest. The sliver is the case the old shape was worst at -- it kept
+        // the most, and the old cost was on what was kept.
+        let mut rounds = Vec::new();
+        for retain_from in [records as u64, (records * 9 / 10) as u64, (records / 10) as u64] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalIndexLogStore::new(dir.path());
+            for value in 0..records {
+                store
+                    .append_json(5, format!("{{\"value\":{value}}}").as_bytes())
+                    .unwrap();
+            }
+            let written = store.log_len_bytes(5);
+            let pieces = index_log_segment_paths(dir.path(), 5).len();
+            // Sequences run 1..=records, and a record goes when its sequence is below the floor.
+            let report = store.gc_before_sequence_limited(5, retain_from, 0).unwrap();
+
+            // A round that unlinks whole pieces is cheap in exactly the way a round that unlinks
+            // too many is. Say what it must not lose, beside what it must not cost: every record
+            // AT OR ABOVE the floor is still there afterwards.
+            let survivors = store
+                .scan(5, 0, u64::MAX, u64::MAX)
+                .unwrap()
+                .into_iter()
+                .filter_map(|(_, raw)| {
+                    let payload = crate::log_framing::decode_line(&raw).ok()?;
+                    decode_index_payload::<IndexRecordHead>(payload).ok()
+                })
+                .map(|head| head.sequence)
+                .collect::<std::collections::HashSet<_>>();
+            let lost = (retain_from..=records as u64)
+                .filter(|sequence| !survivors.contains(sequence))
+                .count();
+            assert_eq!(
+                lost, 0,
+                "reclaiming to {retain_from} lost {lost} record(s) it had to keep"
+            );
+
+            // What a round REPORTS removed is now taken from the unlinked pieces' names rather
+            // than from reading them, so it is arithmetic on numbers written at seal time -- and
+            // arithmetic that is one out reads as a cheaper round rather than as an error. Pin it
+            // against the sequences that are actually gone.
+            let gone = (1..=records as u64)
+                .filter(|sequence| !survivors.contains(sequence))
+                .count();
+            assert_eq!(
+                report.records_removed, gone,
+                "reclaiming to {retain_from}: the round reported {} removed, {gone} are gone",
+                report.records_removed
+            );
+
+            rounds.push((written, pieces, report));
+        }
+
+        let (all_written, all_pieces, remove_all) = &rounds[0];
+        let (_, most_pieces, remove_most) = &rounds[1];
+        let (_, sliver_pieces, remove_sliver) = &rounds[2];
+
+        // THE DENOMINATOR, first. Every bound below is "no more than one piece", which says
+        // nothing at all about a log that IS one piece -- so print what the log actually was.
+        assert!(
+            *all_written > piece * 6,
+            "the log must be many pieces deep or the bounds below are vacuous: wrote \
+             {all_written} B in {all_pieces} piece(s), piece size {piece} B"
+        );
+        assert!(
+            *all_pieces >= 6 && *most_pieces >= 6 && *sliver_pieces >= 6,
+            "every log must have rolled: {all_pieces}, {most_pieces}, {sliver_pieces} piece(s)"
+        );
+        assert!(
+            remove_all.dropped_segments >= 1
+                && remove_most.dropped_segments >= 1
+                && remove_sliver.dropped_segments >= 1,
+            "every round must have had whole pieces to unlink ({}, {}, {})",
+            remove_all.dropped_segments,
+            remove_most.dropped_segments,
+            remove_sliver.dropped_segments
+        );
+
+        // What a round COPIES is bounded by the piece being written, however much it retains.
+        // Under the shape this replaces the last round below copied nine tenths of the log.
+        for (label, report) in [
+            ("removing all", remove_all),
+            ("removing most", remove_most),
+            ("removing a sliver", remove_sliver),
+        ] {
+            assert!(
+                report.bytes_copied <= piece,
+                "{label}: the round retained {} B and copied {} B of them; the collector is \
+                 rewriting what it keeps again (piece size {piece} B, {all_written} B written)",
+                report.bytes_after,
+                report.bytes_copied
+            );
+        }
+
+        // RECLAIMING LESS MUST NOT COST MORE. This is the inversion itself: the sliver round
+        // removes a ninth of what the other removes, and used to copy nine times as much.
+        assert!(
+            remove_sliver.bytes_copied <= remove_most.bytes_copied.saturating_add(piece),
+            "the round that removes LESS copied MORE ({} B against {} B) -- the inversion is back",
+            remove_sliver.bytes_copied,
+            remove_most.bytes_copied
+        );
+
+        // The rewrite is still there and still does its job: a floor that lands INSIDE the piece
+        // being written rewrites that piece, and only that piece.
+        assert!(
+            remove_all.bytes_copied > 0,
+            "a floor inside the active piece must still rewrite it"
+        );
+        assert!(
+            remove_all.bytes_after * 8 < remove_all.bytes_before,
+            "removing everything it can must shrink the log: {} B -> {} B",
+            remove_all.bytes_before,
+            remove_all.bytes_after
+        );
+        assert!(
+            remove_all.records_removed * 10 > records * 9,
+            "the round must report what the unlinked pieces held: {} of {records}",
+            remove_all.records_removed
+        );
+        assert_eq!(
+            remove_all.records_after, 1,
+            "the piece being written keeps exactly the record above the floor"
+        );
+    }
+
+    /// The gate's counts come from the piece NAMES and agree with reading every record.
+    ///
+    /// `gate_summary` is only worth having if it answers the same question the whole-log scan it
+    /// replaces answered. Two halves, and both are needed:
+    ///
+    /// - AGREEMENT. The counts are checked against the scan-and-decode this replaces, run here
+    ///   over the same log. Filename arithmetic that is one out reads as a cheaper gate rather
+    ///   than as an error, which is the way this fails silently.
+    /// - COST. What it decodes is bounded by ONE piece, and does not grow when the log does. The
+    ///   second log is three times the first; if the bound tracked records it would be three
+    ///   times as much.
+    #[test]
+    fn the_gate_reads_piece_names_not_every_record() {
+        let piece = 8 * 1024u64;
+        let _rolling = roll_at(piece);
+        // A record is roughly 120 B here, so the small log is about 60 pieces and the large one
+        // about 180. Both are far enough past `piece` that "no more than one piece" says something.
+        let small = 4_000usize;
+        let large = 12_000usize;
+
+        /// The shape this replaces, run here as the thing to agree with: the whole log into a
+        /// vector, then a decode of every record to count the ones below the floor.
+        fn by_reading_every_record(
+            store: &LocalIndexLogStore,
+            shard_id: ShardId,
+            floor: u64,
+        ) -> (usize, usize, u64) {
+            let records = store.scan(shard_id, 0, u64::MAX, u64::MAX).unwrap();
+            let bytes = records.iter().map(|(_, raw)| raw.len() as u64).sum::<u64>();
+            let removable = records
+                .iter()
+                .filter_map(|(_, raw)| {
+                    let payload = crate::log_framing::decode_line(raw).ok()?;
+                    decode_index_payload::<IndexRecordHead>(payload).ok()
+                })
+                .filter(|head| head.sequence < floor)
+                .count();
+            (records.len(), removable, bytes)
+        }
+
+        let mut arms = Vec::new();
+        for records in [small, large] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = LocalIndexLogStore::new(dir.path());
+            for value in 0..records {
+                store
+                    .append_json(
+                        7,
+                        format!("{{\"value\":{value},\"pad\":\"{}\"}}", "v".repeat(48)).as_bytes(),
+                    )
+                    .unwrap();
+            }
+            // Sequences run 1..=records, so a floor at 60% leaves `floor - 1` below it -- a
+            // removable ratio of neither nothing nor everything, which is where an off-by-a-piece
+            // shows up.
+            let floor = (records * 6 / 10) as u64;
+            let written = store.log_len_bytes(7);
+            let pieces = store.piece_count(7);
+            let gate = store.gate_summary(7, floor);
+            let (scanned_records, scanned_removable, scanned_bytes) =
+                by_reading_every_record(&store, 7, floor);
+
+            // THE DENOMINATORS, before any bound that mentions a piece. "No more than one piece"
+            // is vacuously true of a log that IS one piece, and "did not grow" is vacuous if the
+            // two logs are the same size.
+            assert!(
+                pieces >= 20 && written > piece * 20,
+                "the log must be many pieces deep or every bound below is vacuous: {records} \
+                 records, {written} B in {pieces} piece(s), piece size {piece} B"
+            );
+            assert_eq!(
+                gate.pieces, pieces,
+                "the gate must have walked every piece: {} of {pieces}",
+                gate.pieces
+            );
+            assert_eq!(
+                gate.pieces_named,
+                pieces - 1,
+                "every piece but the one being written must be answered from its NAME: {} named \
+                 of {pieces}",
+                gate.pieces_named
+            );
+
+            // AGREEMENT with reading every record, and with the arithmetic said out loud.
+            assert_eq!(
+                (gate.records, gate.removable_records),
+                (scanned_records, scanned_removable),
+                "the gate disagrees with a full scan of the same log ({records} records, floor \
+                 {floor}): names say {}/{} records/removable, reading says \
+                 {scanned_records}/{scanned_removable}",
+                gate.records,
+                gate.removable_records
+            );
+            assert_eq!(
+                (gate.records, gate.removable_records),
+                (records, floor as usize - 1),
+                "sequences run 1..={records} and the floor is {floor}, so the log holds {records} \
+                 records of which {} are below it",
+                floor - 1
+            );
+            assert_eq!(
+                (gate.bytes, gate.bytes.min(scanned_bytes)),
+                (written, scanned_bytes),
+                "the gate's byte count must be the log's on-disk length ({written} B) and must \
+                 not be under what the records themselves occupy ({scanned_bytes} B), got {}",
+                gate.bytes
+            );
+
+            // COST. What it decoded is the piece being written, and nothing else.
+            assert!(
+                gate.bytes_decoded <= piece,
+                "the gate decoded {} B of a {written} B log ({records} records, {pieces} pieces); \
+                 it is reading the whole log again (piece size {piece} B)",
+                gate.bytes_decoded
+            );
+            assert!(
+                gate.bytes_decoded * 4 < written && gate.records_decoded * 4 < records,
+                "the gate decoded {} B / {} records of a {written} B / {records} record log in \
+                 {pieces} pieces -- at this piece count one piece is a twentieth of the log, so \
+                 anything near a quarter of it is a whole-log walk",
+                gate.bytes_decoded,
+                gate.records_decoded
+            );
+            arms.push((records, written, pieces, gate));
+        }
+
+        let (_, small_written, small_pieces, small_gate) = arms[0];
+        let (_, large_written, large_pieces, large_gate) = arms[1];
+
+        // THE DENOMINATOR for "did not grow": the second log really is much bigger, in bytes,
+        // records and pieces. Without this the comparison below could pass on two equal logs.
+        assert!(
+            large_written > small_written * 2
+                && large_gate.records > small_gate.records * 2
+                && large_pieces > small_pieces * 2,
+            "the two log sizes must differ or the bound below is vacuous: {small_written} B / \
+             {} records / {small_pieces} pieces against {large_written} B / {} records / \
+             {large_pieces} pieces",
+            small_gate.records,
+            large_gate.records
+        );
+        // The log tripled and what the gate decoded did not. The bound is one piece either way,
+        // which is the whole claim: the cost is a property of the PIECE SIZE, not of the log.
+        assert!(
+            large_gate.bytes_decoded <= small_gate.bytes_decoded.saturating_add(piece),
+            "the gate's cost grew with the LOG: {} B / {} records decoded on a {small_written} B \
+             log against {} B / {} records on a {large_written} B one -- it tracks records again",
+            small_gate.bytes_decoded,
+            small_gate.records_decoded,
+            large_gate.bytes_decoded,
+            large_gate.records_decoded
+        );
+    }
+
+    /// What a reclaim round COSTS, measured both ways in one binary.
+    ///
+    /// `#[ignore]`d: it is a measurement, not a guard, and it writes a quarter of a million
+    /// records. Run it with
+    /// `cargo test -p temporalstore-rust --lib measure_reclaim_cost_shape -- --ignored --nocapture`.
+    ///
+    /// Both arms run here rather than across two builds, because the rolling threshold is the
+    /// only difference between them: zero is one file per shard, which is byte for byte the shape
+    /// this replaces. The PIECES column is the proof the treatment actually ran -- one piece in
+    /// the first arm, many in the second -- so an arm that silently failed to roll cannot be read
+    /// as a win.
+    #[test]
+    #[ignore]
+    fn measure_reclaim_cost_shape() {
+        // Enough to clear the 768 KiB byte threshold that gates index GC, so the round being
+        // measured is the size of round that actually happens.
+        let records = 40_000usize;
+        println!(
+            "\n  {:<16} {:>9} {:>7} {:>13} {:>11} {:>11} {:>9}",
+            "shape", "retained", "pieces", "log before", "copied", "unlinked", "ms"
+        );
+        for (label, threshold) in [
+            ("one file", 0u64),
+            ("64 KiB pieces", DEFAULT_INDEX_LOG_SEGMENT_BYTES),
+        ] {
+            for retained_percent in [10usize, 40, 60, 90, 99] {
+                let _rolling = roll_at(threshold);
+                let dir = tempfile::tempdir().unwrap();
+                let store = LocalIndexLogStore::new(dir.path());
+                for value in 0..records {
+                    store
+                        .append_json(5, format!("{{\"value\":{value}}}").as_bytes())
+                        .unwrap();
+                }
+                let pieces = index_log_segment_paths(dir.path(), 5).len();
+                let retain_from = (records * (100 - retained_percent) / 100) as u64;
+                let at = std::time::Instant::now();
+                let report = store.gc_before_sequence_limited(5, retain_from, 0).unwrap();
+                let ms = at.elapsed().as_secs_f64() * 1000.0;
+                println!(
+                    "  {label:<16} {:>8}% {pieces:>7} {:>13} {:>11} {:>11} {ms:>9.1}",
+                    retained_percent,
+                    report.bytes_before,
+                    report.bytes_copied,
+                    report.dropped_segment_bytes,
+                );
+            }
+        }
+    }
+
+    /// A log written before there were pieces still loads, still folds, and still reclaims.
+    ///
+    /// One file per shard is what every existing store holds, and dropping that shape would find
+    /// no index log where one exists -- which reads as an EMPTY log rather than an error, and an
+    /// empty index log is a silently emptier shard.
+    #[test]
+    fn a_log_written_as_one_file_still_reads_and_reclaims() {
+        let dir = tempfile::tempdir().unwrap();
+        let records = 2_000usize;
+        {
+            // Never rolling is the shape of a store written before this.
+            let _never = roll_at(0);
+            let store = LocalIndexLogStore::new(dir.path());
+            for value in 0..records {
+                store
+                    .append_json(5, format!("{{\"value\":{value}}}").as_bytes())
+                    .unwrap();
+            }
+            assert_eq!(
+                index_log_segment_paths(dir.path(), 5).len(),
+                1,
+                "the fixture must be ONE file, or this proves nothing about the old shape"
+            );
+            assert!(index_log_path(dir.path(), 5).exists());
+        }
+
+        let _rolling = roll_at(16 * 1024);
+        let store = LocalIndexLogStore::new(dir.path());
+        assert_eq!(store.stats(5).last_sequence, records as u64);
+        assert_eq!(store.record_count(5).unwrap(), records);
+
+        // It still reclaims: there is no piece to unlink, so the rewrite does the whole job,
+        // exactly as it did before.
+        let report = store.gc_before_sequence_limited(5, records as u64, 0).unwrap();
+        assert_eq!(report.dropped_segments, 0, "a one-file log has no piece to drop");
+        assert_eq!(report.records_removed, records - 1);
+        assert!(report.bytes_copied > 0, "the single file was rewritten");
+        assert_eq!(store.record_count(5).unwrap(), 1);
+    }
+
+    /// The fold crosses a piece boundary, with both record shapes on either side of it.
+    ///
+    /// The log holds two shapes -- whole-index records and deltas -- sharing one sequence counter.
+    /// A boundary that split or reordered them would surface as a hole in the delta stream, which
+    /// the fold's continuity check refuses, or as a record read as the wrong shape.
+    #[test]
+    fn the_fold_crosses_piece_boundaries_with_both_record_shapes() {
+        let _rolling = roll_at(8 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        let mut expected = Vec::new();
+        for index in 0..400usize {
+            if index % 25 == 24 {
+                // A whole-index record shares this log and is not a delta.
+                store
+                    .append_json(6, format!("{{\"value\":{index}}}").as_bytes())
+                    .unwrap();
+            } else {
+                let sequence = store
+                    .append_delta(
+                        6,
+                        vec![block_item(1, &format!("tenant/1/object/{index:06}"), false)],
+                        Vec::new(),
+                        Some(index as u64 + 1),
+                        None,
+                        false,
+                        false,
+                    )
+                    .unwrap();
+                expected.push(sequence);
+            }
+        }
+
+        let pieces = index_log_segment_paths(dir.path(), 6).len();
+        assert!(
+            pieces >= 3,
+            "the log must have rolled or this crosses no boundary (got {pieces} piece(s))"
+        );
+        let folded = store.read_delta_records(6, 0).unwrap();
+        assert_eq!(
+            folded.iter().map(|record| record.sequence).collect::<Vec<_>>(),
+            expected,
+            "every delta record, in log order, across the piece boundaries"
+        );
+        assert_eq!(
+            folded[0].items[0].object_key.as_ref(), "tenant/1/object/000000",
+            "an item survives the boundary with its fields put back"
+        );
+        assert_eq!(store.record_count(6).unwrap(), 400, "both shapes are still counted");
+        assert_eq!(store.stats(6).last_sequence, 400);
+        // The raw stream reads back across the boundary too: the debug read is addressed by
+        // position in the LOG, not in whichever piece holds it.
+        let head = store.read_range(6, 0, u64::MAX).unwrap();
+        assert_eq!(
+            head.len() as u64,
+            store.log_len_bytes(6),
+            "reading the whole log must not stop at the first boundary"
+        );
+    }
+
+    /// The post-dump sweep unlinks whole pieces the dumped base already reflects, and keeps every
+    /// record it does not.
+    ///
+    /// This sweep decides on CONTENT, not position alone: a delta appended between the dump's
+    /// serialization and its anchor carries a WAL anchor the base does not reflect, and removing
+    /// it would lose an eviction that lives only in the delta stream. A piece's name carries the
+    /// highest anchor in it, so a piece goes only when all of it is reflected.
+    #[test]
+    fn the_post_dump_sweep_unlinks_pieces_the_base_reflects() {
+        let piece = 16 * 1024u64;
+        let _rolling = roll_at(piece);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        let total = 1_200usize;
+        for index in 0..total {
+            store
+                .append_delta(
+                    7,
+                    vec![block_item(1, &format!("tenant/1/object/{index:06}"), false)],
+                    Vec::new(),
+                    // Anchor == sequence, so "reflected" and "below the bound" move together and
+                    // the piece boundary is the only thing deciding what survives.
+                    Some(index as u64 + 1),
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap();
+        }
+        let pieces_before = index_log_segment_paths(dir.path(), 7).len();
+        assert!(
+            pieces_before >= 4,
+            "the log must be several pieces deep (got {pieces_before})"
+        );
+
+        // A dump that materialised the base through WAL anchor 600, anchored at index sequence 900.
+        let report = store.gc_reflected_before_anchor(7, 600, 900, 0).unwrap();
+        assert!(
+            report.dropped_segments >= 1,
+            "whole pieces the base reflects must be unlinked, not rewritten"
+        );
+        assert!(
+            report.bytes_copied <= piece,
+            "the sweep copied {} B; it must copy no more than the piece being written ({piece} B)",
+            report.bytes_copied
+        );
+        assert!(
+            report.bytes_after < report.bytes_before,
+            "the log must actually shrink: {} B -> {} B",
+            report.bytes_before,
+            report.bytes_after
+        );
+
+        let survivors = store
+            .read_delta_records(7, 0)
+            .unwrap()
+            .into_iter()
+            .map(|record| record.sequence)
+            .collect::<std::collections::HashSet<_>>();
+        let lost = (601..=total as u64)
+            .filter(|sequence| !survivors.contains(sequence))
+            .count();
+        assert_eq!(
+            lost, 0,
+            "every record the dumped base does not reflect must survive the sweep"
+        );
+    }
+
+    /// Concurrent appends to one shard's index log must SHARE durability barriers.
+    ///
+    /// An fsync makes every byte already in the file durable, so a barrier taken while other
+    /// writers are queued behind it covers them too. This held the store lock across the fsync,
+    /// so writers could not reach the barrier together and each paid for one of its own -- the
+    /// same shape the raft node log had.
+    #[test]
+    fn concurrent_index_log_appends_share_barriers() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(LocalIndexLogStore::new(dir.path()));
+        let writers = 16usize;
+        let each = 8usize;
+        // Release the threads together, so they genuinely overlap rather than trickling through
+        // one at a time and each finding no barrier to ride.
+        let start = std::sync::Arc::new(std::sync::Barrier::new(writers));
+
+        crate::durability_metrics::reset();
+        let handles: Vec<_> = (0..writers)
+            .map(|writer| {
+                let store = std::sync::Arc::clone(&store);
+                let start = std::sync::Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    for index in 0..each {
+                        store
+                            .append_delta(
+                                4,
+                                vec![block_item(1, &format!("k-{writer}-{index}"), false)],
+                                Vec::new(),
+                                None,
+                                None,
+                                false,
+                                true,
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+
+        let appends = (writers * each) as u64;
+        let barriers = crate::durability_metrics::snapshot()
+            .get("engine_index_log_append")
+            .copied()
+            .unwrap_or(0);
+        assert!(barriers >= 1, "some barrier must actually be taken");
+        assert!(
+            barriers < appends,
+            "{barriers} barriers for {appends} concurrent appends -- nothing coalesced"
+        );
+
+        // Sharing a barrier must cost nobody their record: every append is still readable.
+        let records = store.read_delta_records(4, 0).unwrap();
+        assert_eq!(records.len() as u64, appends, "every append must survive");
+    }
+
+    /// What a binary index-log record would actually save, measured on the record the log
+    /// really writes rather than a hand-made one.
+    ///
+    /// The line below is copied verbatim from a 100k-record ingest, so the shape, the string
+    /// lengths and the integer magnitudes are the ones that occur -- parsing it here also
+    /// keeps the current code honest about loading what it wrote. Name shortening has already
+    /// taken this record from 962.8 to 365.5 bytes across four rounds and is asymptotic: what
+    /// is left is the JSON itself -- quotes, braces, commas, and integers spelled in decimal.
+    #[test]
+    fn what_is_left_to_gain_from_a_binary_index_record() {
+        // One page item plus a key-state blob: the common delta the ingest path appends.
+        let line = r#"{"s":1,"q":1,"items":[{"k":"page","rb":545210715,
+            "pk":"string:m:0::0:0:126:0:0","ok":"m:0","mi":"string",
+            "oi":122110326161599232,"pi":0,
+            "a":{"a":0,"l":126,"pi":0,"oi":122110326161599232,
+                 "rs":545210715,"g":0,"b":0},
+            "sz":126,"il":false,"d":false}],
+            "aw":1,"u":true,
+            "ks":[{"key":"string:m:0","kind":"string","pages":[0],"version":1}]}"#;
+        let record: IndexDeltaRecord =
+            serde_json::from_str(line).expect("the record the log writes must still load");
+
+        let json = serde_json::to_vec(&record).unwrap();
+        let today = crate::log_framing::encode_line(&json);
+
+        // struct-as-MAP, matching the served-index container: the array form is positional,
+        // and positional mis-reads a struct that skipped an absent optional -- and the GC's
+        // anchor probe deserializes two fields by NAME out of an arbitrary record, which a
+        // positional encoding makes impossible.
+        let mut packed = Vec::new();
+        let mut serializer = rmp_serde::Serializer::new(&mut packed).with_struct_map();
+        serde::Serialize::serialize(&record, &mut serializer).unwrap();
+        let framed_packed = crate::log_framing::encode_line(&packed);
+
+        let zstd_json = zstd::stream::encode_all(json.as_slice(), 3).unwrap();
+        let zstd_packed = zstd::stream::encode_all(packed.as_slice(), 3).unwrap();
+
+        println!("  framing            {:>5} B", today.len() - json.len());
+        println!("  json (today)       {:>5} B framed {:>5} B", json.len(), today.len());
+        println!(
+            "  msgpack named      {:>5} B framed {:>5} B  ({:.2}x)",
+            packed.len(),
+            framed_packed.len(),
+            today.len() as f64 / framed_packed.len() as f64
+        );
+        println!("  zstd(json)         {:>5} B", zstd_json.len());
+        println!("  zstd(msgpack)      {:>5} B", zstd_packed.len());
+
+        // The round trip has to be exact, or the saving is not a saving.
+        let back: IndexDeltaRecord = rmp_serde::from_slice(&packed).unwrap();
+        assert_eq!(back, record, "msgpack must round-trip the record exactly");
+
+        // And the GC's probe must still find its two fields by name in the binary form,
+        // because GC retains raw payloads and never re-encodes them.
+        #[derive(serde::Deserialize)]
+        struct AnchorProbe {
+            #[serde(rename = "q", alias = "sequence")]
+            sequence: u64,
+            #[serde(rename = "aw", alias = "applied_wal_sequence", default)]
+            applied_wal_sequence: Option<u64>,
+        }
+        let probe: AnchorProbe = rmp_serde::from_slice(&packed).unwrap();
+        assert_eq!(probe.sequence, record.sequence);
+        assert_eq!(probe.applied_wal_sequence, record.applied_wal_sequence);
+
+        // Pin the direction, not a brittle exact size: binary must actually be smaller, and
+        // the assertion is paired with a nonzero check so it cannot pass by measuring nothing.
+        assert!(packed.len() > 0, "measured nothing");
+        assert!(
+            packed.len() < json.len(),
+            "binary {} B is not smaller than json {} B",
+            packed.len(),
+            json.len()
+        );
+    }
+
+    /// The decoder sniffs, so one file may hold both shapes -- which is exactly what a log
+    /// written across a rollout looks like. Nothing records which shape a line is; if the
+    /// sniff were wrong this is where it would show.
+    #[test]
+    fn one_log_file_can_hold_both_shapes() {
+        let json_record = IndexDeltaRecord {
+            shard_id: 1,
+            sequence: 1,
+            items: vec![block_item(1, "a", false)],
+            meta: None,
+            applied_wal_sequence: Some(1),
+            upsert: false,
+            key_states: Vec::new(),
+            shared_object_key: None,
+        };
+        let binary_record = IndexDeltaRecord {
+            sequence: 2,
+            items: vec![block_item(2, "b", false)],
+            ..json_record.clone()
+        };
+
+        let mut whole_packed = Vec::new();
+        let mut whole_ser = rmp_serde::Serializer::new(&mut whole_packed).with_struct_map();
+        serde::Serialize::serialize(&json_record, &mut whole_ser).unwrap();
+        let mut json_payload =
+            vec![index_container_byte(INDEX_LOG_CODEC_MSGPACK, INDEX_LOG_SHAPE_WHOLE)];
+        json_payload.extend_from_slice(&whole_packed);
+        let mut packed = Vec::new();
+        let mut ser = rmp_serde::Serializer::new(&mut packed).with_struct_map();
+        serde::Serialize::serialize(&binary_record, &mut ser).unwrap();
+        let mut binary_payload =
+            vec![index_container_byte(INDEX_LOG_CODEC_MSGPACK, INDEX_LOG_SHAPE_DELTA)];
+        binary_payload.extend_from_slice(&packed);
+
+        // Framing is independent of the payload shape, so both frame and verify the same way.
+        for payload in [&json_payload, &binary_payload] {
+            let framed = crate::log_framing::encode_line(payload);
+            let back = crate::log_framing::decode_line(&framed[..framed.len() - 1]).unwrap();
+            assert_eq!(back, payload.as_slice(), "framing must not care about the shape");
+        }
+
+        let a: IndexDeltaRecord = decode_index_payload(&json_payload).unwrap();
+        let b: IndexDeltaRecord = decode_index_payload(&binary_payload).unwrap();
+        assert_eq!(a.sequence, 1);
+        assert_eq!(b.sequence, 2);
+        assert_eq!(b.items[0].block_ref_key, "b");
+    }
+
+    /// GC retains the raw payload of a record it keeps, never re-encoding it -- a delta record
+    /// also parses as an IndexLogRecord, so re-serializing would drop its items. A binary
+    /// payload has to survive that path byte-for-byte too.
+    #[test]
+    fn the_anchor_probe_reads_a_binary_record_without_decoding_the_rest() {
+        #[derive(serde::Deserialize)]
+        struct AnchorProbe {
+            #[serde(rename = "q", alias = "sequence")]
+            sequence: u64,
+            #[serde(rename = "aw", alias = "applied_wal_sequence", default)]
+            applied_wal_sequence: Option<u64>,
+        }
+
+        let record = IndexDeltaRecord {
+            shard_id: 4,
+            sequence: 77,
+            items: vec![block_item(5, "c", false)],
+            meta: None,
+            applied_wal_sequence: Some(31),
+            upsert: true,
+            key_states: Vec::new(),
+            shared_object_key: None,
+        };
+        let mut packed = Vec::new();
+        let mut ser = rmp_serde::Serializer::new(&mut packed).with_struct_map();
+        serde::Serialize::serialize(&record, &mut ser).unwrap();
+        let mut payload =
+            vec![index_container_byte(INDEX_LOG_CODEC_MSGPACK, INDEX_LOG_SHAPE_DELTA)];
+        payload.extend_from_slice(&packed);
+
+        let probe: AnchorProbe = decode_index_payload(&payload).unwrap();
+        assert_eq!(probe.sequence, 77);
+        assert_eq!(probe.applied_wal_sequence, Some(31));
+
+        // And the bytes GC would retain are the bytes it was given.
+        let retained = payload.clone();
+        let again: AnchorProbe = decode_index_payload(&retained).unwrap();
+        assert_eq!(again.sequence, 77);
+        assert_eq!(retained, payload, "GC must retain the payload untouched");
+    }
+
+    /// A container written by a newer binary is refused with a clear error rather than
+    /// mis-parsed. Silently mis-reading a durable record is the failure worth preventing.
+    #[test]
+    fn an_unknown_payload_codec_is_refused_not_guessed_at() {
+        let mut payload = vec![index_container_byte(9, INDEX_LOG_SHAPE_DELTA)];
+        payload.extend_from_slice(b"whatever a later format puts here");
+        let result: Result<IndexDeltaRecord, _> = decode_index_payload(&payload);
+        match result {
+            Err(IndexLogError::Encoding(message)) => {
+                assert!(message.contains('9'), "the error should name the codec: {message}")
+            }
+            other => panic!("an unknown codec must be refused, got {other:?}"),
+        }
+
+        // An empty payload has no container byte at all, and is refused the same way.
+        let result: Result<IndexDeltaRecord, _> = decode_index_payload(&[]);
+        assert!(matches!(result, Err(IndexLogError::Encoding(_))));
+    }
+
+    /// An item that omits its default-valued fields still decodes, with those defaults.
+    ///
+    /// This is what makes omitting them safe in ONE step, with no ordering between writers and
+    /// readers. A renamed field or a changed type breaks an old reader -- it meets a name it does
+    /// not know, or a type it refuses. An ABSENT field with `#[serde(default)]` is a case every
+    /// reader already handles, including ones deployed long before this.
+    ///
+    /// So the property to pin is that the fields really do carry defaults, and that a record
+    /// written without them comes back saying the same thing.
+    #[test]
+    fn an_item_missing_its_default_fields_still_decodes() {
+        // A record from a writer that omits everything default-valued.
+        #[derive(serde::Serialize)]
+        struct Sparse {
+            #[serde(rename = "k")]
+            kind: IndexItemKind,
+            #[serde(rename = "rb")]
+            routing_bucket: u32,
+            #[serde(rename = "pk")]
+            block_ref_key: String,
+            #[serde(rename = "ok")]
+            object_key: String,
+            #[serde(rename = "mi")]
+            model_id: String,
+            #[serde(rename = "oi")]
+            object_id: u64,
+        }
+
+        let sparse = Sparse {
+            kind: IndexItemKind::Block,
+            routing_bucket: 8539,
+            block_ref_key: "17665223918442101733".to_string(),
+            object_key: "tenant/7/object/000000123".to_string(),
+            model_id: "string".to_string(),
+            object_id: 12_345,
+        };
+        let encoded = encode_as_map(&sparse, INDEX_LOG_SHAPE_DELTA);
+        let decoded: IndexItem =
+            decode_index_payload(&encoded).expect("an item missing defaults must decode");
+
+        // THE THREE DERIVED SLOTS ARE READ AT THE WIRE, because they are no longer fields.
+        // Their defaults are the subject of this half, and the wire row is where a default
+        // actually lands -- asserting them after the conversion would assert a derivation
+        // instead of the stored value.
+        let sparse_wire: IndexItemWire =
+            decode_index_payload(&encoded).expect("the sparse row must decode as a wire row");
+        assert!(!sparse_wire.in_log, "in_log must default to false when absent");
+        assert_eq!(sparse_wire.block_id, 0, "page_id must default to zero when absent");
+        assert_eq!(sparse_wire.size, 0, "size must default to zero when absent");
+
+        assert!(!decoded.deleted, "deleted must default to false when absent");
+        assert!(
+            decoded.entry.is_none(),
+            "a row that wrote no address has no payload"
+        );
+        assert_eq!(decoded.routing_bucket, 8539, "what WAS written must survive");
+        assert_eq!(decoded.object_key.as_ref(), "tenant/7/object/000000123");
+
+        // And a full item still round-trips: skipping is about what is written, not what is meant.
+        let full = IndexItem {
+            kind: IndexItemKind::Block,
+            routing_bucket: 8539,
+            block_ref_key: "17665223918442101733".to_string(),
+            object_key: "tenant/7/object/000000123".into(),
+            model_id: "string".to_string(),
+            object_id: 12_345,
+            // AN ADDRESS, DELIBERATELY. This half's subject is that a NON-DEFAULT value in each
+            // slot is still written, and the three derived slots only carry non-defaults when
+            // there is an address to derive them from. A length of 4096 and a block id of 7 make
+            // `sz` and `pi` non-default; `il` is then false, because a row holding a block id is
+            // not log-resident. The fixture used to state `block_id: 7` and `in_log: true`
+            // together, which the derivation says cannot both be true.
+            entry: Some(crate::block_store::ElementEntry::from_parts(
+                42, 1_048_576, 4096, Some(7), None,
+            )),
+            deleted: true,
+        };
+        let round_tripped: IndexItem = decode_index_payload(
+            &encode_index_payload(&full, INDEX_LOG_SHAPE_DELTA).expect("encode"),
+        )
+        .expect("decode");
+        // READ AT THE WIRE, for the same reason as the sparse half: these are slots now.
+        let full_wire: IndexItemWire = decode_index_payload(
+            &encode_index_payload(&full, INDEX_LOG_SHAPE_DELTA).expect("encode"),
+        )
+        .expect("decode");
+        assert_eq!(full_wire.block_id, 7, "a set page_id must still be written");
+        assert!(
+            !full_wire.in_log,
+            "a row holding a block id is not log-resident, so this slot is written false"
+        );
+        // `sz` IS THE STRIP SENTINEL. The size equals the address length by construction now, so
+        // the encoder always writes zero here and the reader derives 4096 back from the address.
+        // That is the harvest the conditional strip used to take only when the two agreed.
+        assert_eq!(0, full_wire.size, "the size slot carries the strip sentinel");
+        assert_eq!(
+            4096,
+            round_tripped
+                .entry
+                .as_ref()
+                .expect("the payload survives")
+                .length(),
+            "and the length comes back from the address"
+        );
+        assert!(round_tripped.deleted, "a true deleted must still be written");
+    }
+
+    /// A page handle reads whether it was written as a number or as text.
+    ///
+    /// The handle is a `u64` everywhere but the log, where it is stringified -- 20 bytes of a
+    /// 161-byte item. Moving the writer to the number cannot come first: msgpack refuses a type it
+    /// was not expecting rather than degrading, so a reader that only knows the string shape fails
+    /// outright on a log the new writer produced.
+    ///
+    /// This pins the half that lands first. Readers take both; the writer still emits text.
+    #[test]
+    fn a_block_handle_reads_as_a_number_or_a_string() {
+        // The same field names the item uses, with the handle as a NUMBER -- what a future writer
+        // would produce.
+        #[derive(serde::Serialize)]
+        struct NumericHandle {
+            #[serde(rename = "k")]
+            kind: IndexItemKind,
+            #[serde(rename = "rb")]
+            routing_bucket: u32,
+            #[serde(rename = "pk")]
+            block_ref_key: u64,
+            #[serde(rename = "ok")]
+            object_key: String,
+            #[serde(rename = "mi")]
+            model_id: String,
+            #[serde(rename = "oi")]
+            object_id: u64,
+            #[serde(rename = "pi")]
+            block_id: u64,
+            #[serde(rename = "sz")]
+            size: u64,
+            #[serde(rename = "il")]
+            in_log: bool,
+            #[serde(rename = "d")]
+            deleted: bool,
+        }
+
+        let handle = 17_665_223_918_442_101_733u64;
+        let numeric = NumericHandle {
+            kind: IndexItemKind::Block,
+            routing_bucket: 8539,
+            block_ref_key: handle,
+            object_key: "tenant/7/object/000000123".to_string(),
+            model_id: "string".to_string(),
+            object_id: 12_345,
+            block_id: 7,
+            size: 4096,
+            in_log: false,
+            deleted: false,
+        };
+        let as_number = encode_as_map(&numeric, INDEX_LOG_SHAPE_DELTA);
+        let decoded: IndexItem =
+            decode_index_payload(&as_number).expect("a numeric handle must decode");
+        assert_eq!(
+            decoded.block_ref_key,
+            handle.to_string(),
+            "a handle written as a number must come back as the same handle"
+        );
+        assert_eq!(decoded.routing_bucket, 8539, "the rest of the item must survive too");
+
+        // The text shape still reads, and is still what gets written.
+        let textual = IndexItem {
+            kind: IndexItemKind::Block,
+            routing_bucket: 8539,
+            block_ref_key: handle.to_string(),
+            object_key: "tenant/7/object/000000123".into(),
+            model_id: "string".to_string(),
+            object_id: 12_345,
+            // ADDRESS-LESS BY DESIGN: this fixture measures a floor, so it stays at
+            // the floor. An address would take the row from one nil to a six-slot
+            // array -- bigger, not smaller -- and the size it stated was never
+            // restored, because there was no address to derive it from.
+            entry: None,
+            deleted: false,
+        };
+        let as_text = encode_as_map(&textual, INDEX_LOG_SHAPE_DELTA);
+        let round_tripped: IndexItem = decode_index_payload(&as_text).expect("text must decode");
+        assert_eq!(round_tripped.block_ref_key, handle.to_string());
+
+        // The writer now emits the number, so `as_text` above is ALSO numeric and the two are no
+        // longer a text-vs-number comparison -- they are two different structs. `NumericHandle`
+        // is a hand-rolled mirror that does not skip its false bools, where `IndexItem` does, so
+        // it comes out SEVEN BYTES LARGER despite carrying the same handle. Comparing them was
+        // only ever meaningful while the text penalty outweighed that difference.
+        //
+        // Compare like with like instead: the same item, with a handle that parses as a number
+        // and one of the same length that does not.
+        let mut unparseable = textual.clone();
+        unparseable.block_ref_key = format!("x{}", &handle.to_string()[1..]);
+        assert_eq!(
+            unparseable.block_ref_key.len(),
+            handle.to_string().len(),
+            "the two handles must be the same length or the comparison measures the length"
+        );
+        let as_forced_text =
+            encode_as_map(&unparseable, INDEX_LOG_SHAPE_DELTA);
+        assert!(
+            as_forced_text.len() > as_text.len(),
+            "a handle that parses should be written as a number and be smaller: text {} vs number {}",
+            as_forced_text.len(),
+            as_text.len()
+        );
+        println!(
+            "  HANDLE same item, 20-char handle: as text {} B, as a number {} B (saves {} B a record)",
+            as_forced_text.len(),
+            as_text.len(),
+            as_forced_text.len() - as_text.len()
+        );
+        println!(
+            "  HANDLE text {} B vs number {} B ({} B a record if the writer ever moves)",
+            as_text.len(),
+            as_number.len(),
+            as_text.len().saturating_sub(as_number.len())
+        );
+    }
+
+    /// Stripping the address repeats and putting them back returns the item that went in.
+    ///
+    /// The shape that decides this is the third one: an address whose object id DIFFERS from the
+    /// item's. Stripping must leave it alone, or the restore would overwrite a real value with the
+    /// item's -- silently pointing an index entry at the wrong object. The fourth covers an address
+    /// that never had one, where restore fills from the item, which is what the WAL does too.
+    #[test]
+    fn the_address_repeats_round_trip() {
+        let object_id = 12_345_678_901_234_567u64;
+        let bucket = 8539u32;
+        let build = |address: Option<crate::block_store::ElementEntry>| IndexItem {
+            kind: IndexItemKind::Block,
+            routing_bucket: bucket,
+            block_ref_key: 17_665_223_918_442_101_733u64.to_string(),
+            object_key: "tenant/7/object/000000123".into(),
+            model_id: "string".to_string(),
+            object_id,
+            deleted: false,
+            // The address arrives as the closure's parameter, so it becomes the payload directly
+            // and the `None` case in the table below still builds an address-less row. The three
+            // slots stated here were this address's own derivation.
+            entry: address,
+        };
+        let cases = [
+            ("no address", None),
+            ("address repeats both", Some(crate::block_store::ElementEntry::from_parts(
+                42, 1_048_576, 4096, Some(7), Some(object_id), ))),
+            ("address holds a DIFFERENT object", Some(crate::block_store::ElementEntry::from_parts(
+                42, 0, 0, None, Some(object_id + 1), ))),
+            ("address holds neither", Some(crate::block_store::ElementEntry::from_parts(
+                42, 0, 0, None, None, ))),
+        ];
+
+        for (label, address) in cases {
+            let original = build(address);
+            let mut stripped = original.clone();
+            stripped.strip_address_repeats();
+
+            let payload = encode_index_payload(&stripped, INDEX_LOG_SHAPE_DELTA).expect("encode");
+            let mut back: IndexItem = decode_index_payload(&payload).expect("decode");
+            back.restore_address_repeats();
+
+            match label {
+                // NEITHER IS RESTORED ANY MORE, and there is nothing left to restore: an address
+                // has nowhere to put a routing bucket and nowhere to put an object id. The item's
+                // own fields are the only copy on the wire, which is what the stripping was
+                // arranging for, and `derived_object_id` turns the terms back into the id.
+                "address holds neither" => {
+                    assert!(back.entry.is_some(), "{label}: address survives");
+                    assert_eq!(back.object_id, object_id, "{label}: the item carries the id");
+                    assert_eq!(back.routing_bucket, bucket, "{label}");
+                }
+                _ => assert_eq!(back, original, "{label} did not round-trip"),
+            }
+        }
+    }
+
+
+    /// THE TWELVE STORED SLOTS DID NOT MOVE, ASSERTED AS SLOTS AND NOT AS A DIGEST.
+    ///
+    /// # WHY NOT A DIGEST, AND WHY NOT A ROUND TRIP
+    ///
+    /// A raw byte digest of an encoded row cannot be compared against anything: there is no
+    /// previous build to hash, and goldening one from this build proves the code equals itself.
+    /// And a ROUND TRIP cannot see this at all -- `encode` then `decode` agrees with itself
+    /// whatever the slots are called or wherever they sit, which is exactly why the shared-key
+    /// hoist test keeps passing while the bytes its fixture emits change. **A round trip cannot
+    /// detect a change in what gets encoded.**
+    ///
+    /// So the row is decoded as a POSITIONAL ARRAY and each slot is checked where it sits. That
+    /// states the wire contract rather than restating the encoder, and it fails if a slot is
+    /// reordered, retired, added, or given a different value -- any of which is a stored-format
+    /// change on a log that is positional and carries no version. (It does NOT "refuse a length
+    /// mismatch" -- see the correction on [`IndexItem::entry`]. A mismatch is refused by SLOT
+    /// TYPING where the types disagree, and a row short at the TAIL is accepted with its missing
+    /// slots defaulted.)
+    ///
+    /// # THE THREE DERIVED SLOTS ARE THE POINT
+    ///
+    /// `pi`, `sz` and `il` are no longer fields. They are computed in the serializer from the
+    /// address, so this is where "the bytes did not move" is actually proved: the block id slot
+    /// still carries the address's block id, the size slot carries the strip sentinel, and the
+    /// log-resident slot still carries `block_id().is_none()`.
+    /// A STORED DELTA ROW THAT NAMES ITS ELEMENT, AS BYTES, CAPTURED BEFORE THE WRITER COULD NOT.
+    ///
+    /// 44 bytes, twelve positional slots, produced by the capture helper that stood here, from
+    /// the production authority and the production strip pass. Slot 5 holds `"f0"`, which is what
+    /// `engine::collect_upsert_index_items` used to put there for a hash field, before both the
+    /// field and the helper were removed.
+    ///
+    /// NEVER REGENERATE THIS, AND THERE IS NOTHING LEFT TO REGENERATE IT WITH.
+    /// `capture_a_stored_row_that_names_its_element` stood below and is DELETED with the field:
+    /// `IndexItem` has no slot for an element name, so the helper could not build the row it
+    /// captured. These bytes are now the only record of the shape in the tree. A golden holding
+    /// YESTERDAY'S INPUT keeps its bytes; what moves is the assertions about what this binary
+    /// derives FROM them.
+    ///
+    /// # ITS PURPOSE HAS INVERTED, AND THAT IS WHY IT IS KEPT RATHER THAN RETIRED
+    ///
+    /// These twelve slots are now the RETIRED shape. `INDEX_ITEM_SLOTS` is eleven, so this row is
+    /// REFUSED -- and that makes it the only fixture in the tree that can drive the refusal against
+    /// bytes a build actually stored, rather than against a row this binary wrote and then chopped.
+    /// A golden whose only purpose was old-format TOLERANCE would come off under a pre-release
+    /// format change; this one's purpose is now the opposite of tolerance, so its bytes stay and the
+    /// assertions over them invert. That inversion is the change, and it is written at each arm.
+    ///
+    /// AND IT IS STILL THE SOURCE OF THE CURRENT SHAPE'S FIXTURE. `the_golden_without_its_element_name`
+    /// below excises slot 5 from these bytes, which is EXACTLY the edit this step makes to the
+    /// format -- and it is checked against what this binary writes rather than trusted, so ten of
+    /// the eleven slots of the current-shape fixture still come off a build that stored them.
+    const A_STORED_ROW_THAT_NAMES_ITS_ELEMENT: &str =
+        "9c00cd215ba0ac756e67617465642f6861736801a26630000795cf0000002a00100000cd100007c00700c2c2";
+
+    /// A STORED TWELVE-SLOT ROW IS REFUSED, BY NAME, AND THE ELEVEN-SLOT SHAPE LOADS.
+    ///
+    /// # WHAT THIS ARM USED TO SAY, AND WHY ITS SUBJECT INVERTED
+    ///
+    /// It was `a_stored_row_naming_its_element_decodes_and_its_name_is_still_readable`, and it
+    /// asserted the opposite of what is asserted below: that the twelve-slot golden DECODES, that
+    /// the wire row recovers `"f0"` out of slot 5, and that the handle the reader rebuilds from it
+    /// is the page-named spelling. Every one of those was true while the row carried a slot nothing
+    /// read. The slot is gone, the row is eleven slots, and a stored twelve-slot row is now refused
+    /// -- so the arm keeps its fixture and inverts its claim. Kept as one test rather than split
+    /// into "the old one is deleted" and "a new one is added", because the thing worth reading here
+    /// is which way round the statement goes.
+    ///
+    /// # WHAT IT PINS
+    ///
+    ///   1. THE BYTES, UNCHANGED. Twelve slots, slot 5 is `"f0"`, slot 2 is empty. Facts about a
+    ///      stored row, stable forever -- and 3 is what makes 2 load-bearing: the composite handle
+    ///      was stripped, so slot 5 was the element name's ONLY home on a stored row.
+    ///   2. THE REFUSAL, IN BOTH DECODE ARMS AND BY NAME. `IndexItem` and `IndexItemWire` both
+    ///      refuse, the message names BOTH arities, and it is the ARITY that is complained about
+    ///      rather than a type -- a refusal for the wrong reason is not a passing control, and
+    ///      "wrong msgpack marker" would be the decoder tripping over the shift rather than the gate
+    ///      talking.
+    ///   3. NOT HALF-APPLIED. Asserted as `is_err()` on the whole decode, which is the only way a
+    ///      twelve-slot row cannot become an item with a slot invented or dropped.
+    ///   4. THE CONTROL, WHICH IS WHAT STOPS THIS PASSING FOR THE WRONG REASON. The same stored row
+    ///      with slot 5 EXCISED decodes, and decodes as the row it is -- object key, model, address
+    ///      and tombstone flag all intact. A decoder that refused everything would satisfy 2 and 3
+    ///      and fail here.
+    ///   5. AND THE EXCISED FIXTURE IS WHAT THIS BINARY WRITES, byte for byte. That is the
+    ///      load-bearing check on the fixture itself: it says the eleven-slot row below is the
+    ///      production shape and not an arrangement of this test's own, so ten of its eleven slots
+    ///      are still bytes a build stored.
+    #[test]
+    fn a_stored_twelve_slot_row_is_refused_by_arity_and_the_eleven_slot_shape_loads() {
+        let bytes =
+            hex::decode(A_STORED_ROW_THAT_NAMES_ITS_ELEMENT).expect("the golden is valid hex");
+        // A TRUNCATED PASTE IS THE ONE WAY A BYTE LITERAL GOES WRONG IN SILENCE.
+        assert_eq!(
+            44,
+            bytes.len(),
+            "the golden is {} B, not the 44 B that were captured -- the literal has been edited",
+            bytes.len()
+        );
+
+        // (1) READ OFF THE BYTES, as a generic value, so the assertions name POSITIONS and no
+        // struct re-imposes the mapping under test. These three are facts about a stored row and
+        // do not move with this change.
+        let row: serde_json::Value =
+            rmp_serde::from_slice(&bytes).expect("the golden decodes as a generic value");
+        let slots = match &row {
+            serde_json::Value::Array(slots) => slots,
+            other => panic!("the golden is not an array, it is {other:?} -- the log is POSITIONAL"),
+        };
+        assert_eq!(12, slots.len(), "the golden holds {} slots, not 12", slots.len());
+        assert_eq!(
+            Some("f0"),
+            slots[5].as_str(),
+            "slot 5 of the stored row is {:?}, not the element name this fixture exists to hold",
+            slots[5]
+        );
+        assert_eq!(
+            Some(""),
+            slots[2].as_str(),
+            "slot 2 is {:?}; the whole point of this golden is that the composite handle was \
+             cleared, so the element name is not also spelled there",
+            slots[2]
+        );
+        println!("[golden] 12 slots, slot5={:?}, slot2={:?}", slots[5], slots[2]);
+
+        // (2) AND (3) THE REFUSAL, ON THE PATH A LOAD TAKES. `IndexItem` rides
+        // `serde(from = "IndexItemRow")`, so the arity gate is on this decode and nowhere else.
+        let refused = rmp_serde::from_slice::<IndexItem>(&bytes);
+        match &refused {
+            Err(error) => println!("[refused] IndexItem: {error}"),
+            Ok(item) => println!("[refused] IndexItem: ACCEPTED, deleted={}", item.deleted),
+        }
+        let message = refused
+            .expect_err(
+                "a stored TWELVE-slot row decoded into an IndexItem. The row is eleven slots now, \
+                 so accepting a twelve-slot one means a slot was dropped or invented in silence -- \
+                 a store that loads and then cannot be dumped, with no error anywhere",
+            )
+            .to_string();
+        assert!(
+            message.contains("positional slots"),
+            "the row was refused, but not on its ARITY: {message}. A refusal for an unintended \
+             reason is not a passing control -- a shifted slot also fails as a type mismatch, and \
+             THAT failure would survive the arity gate being deleted"
+        );
+        assert!(
+            message.contains("12") && message.contains("11"),
+            "the refusal does not name BOTH arities: {message}. Naming only one leaves whoever \
+             reads a load failure to guess which shape the store is in"
+        );
+
+        // AND THE OTHER ARM, WHICH REFUSES FOR A DIFFERENT REASON AND IS ASSERTED SEPARATELY.
+        // `IndexItemWire` is deserialized by the DERIVE, so it never reaches `IndexItemRow`'s gate:
+        // what refuses it is `rmp_serde` comparing the array header against the slots the visitor
+        // consumed and rejecting the LEFTOVER. Two mechanisms, so two assertions -- folding them
+        // into one loop over a shared message check is how a test comes to assert that both arms
+        // share a gate they do not.
+        let wire = rmp_serde::from_slice::<IndexItemWire>(&bytes);
+        match &wire {
+            Err(error) => println!("[refused] IndexItemWire: {error}"),
+            Ok(_) => println!("[refused] IndexItemWire: ACCEPTED"),
+        }
+        assert!(
+            wire.is_err(),
+            "the wire row accepted twelve slots into eleven fields. rmp_serde refuses a leftover \
+             element, so this means the struct still has a field for the slot"
+        );
+
+        // (4) THE CONTROL: the same stored row, with the slot this step removes EXCISED.
+        let current = the_golden_without_its_element_name();
+        assert_eq!(
+            41,
+            current.len(),
+            "excising a two-character fixstr drops 3 bytes of 44; this is {} B",
+            current.len()
+        );
+        let item: IndexItem = rmp_serde::from_slice(&current)
+            .expect("the eleven-slot shape of the same stored row must load");
+        assert_eq!(
+            "ungated/hash", &*item.object_key,
+            "the eleven-slot row decoded as some other row, so the slots did not simply close up"
+        );
+        assert_eq!("hash", item.model_id, "the model spelling moved with the excision");
+        assert_eq!(8539, item.routing_bucket, "the routing bucket moved with the excision");
+        let address = item.entry.as_ref().expect("the eleven-slot row carries its address");
+        assert_eq!(Some(7), address.block_id(), "the address lost its block id");
+        assert!(!item.deleted, "the captured row is a live row and must stay one");
+        assert!(
+            item.block_ref_key.is_empty(),
+            "slot 2 is the stripped handle and must still arrive empty"
+        );
+
+        // (5) AND IT IS WHAT THE WRITER EMITS. This is what makes the fixture above production
+        // shape rather than this test's own arrangement.
+        let rewritten = rmp_serde::to_vec(&item).expect("re-encode the decoded row");
+        assert_eq!(
+            current,
+            rewritten,
+            "the eleven-slot fixture is not what this binary writes for the row it decodes to. \
+             Excising slot 5 from the stored bytes is supposed to BE the format change, so a \
+             difference here means the writer and this fixture disagree about the current shape"
+        );
+        println!("[current] 11 slots, {} B, byte-identical to what the writer emits", current.len());
+    }
+
+    #[test]
+    fn the_eleven_stored_slots_are_in_order_and_the_three_derived_ones_carry_their_derivation() {
+        let address =
+            crate::block_store::ElementEntry::from_parts(42, 1_048_576, 4096, Some(7), None);
+        let item = IndexItem {
+            kind: IndexItemKind::Block,
+            routing_bucket: 8539,
+            block_ref_key: "17665223918442101733".to_string(),
+            object_key: "tenant/7/object/000000123".into(),
+            model_id: "string".to_string(),
+            object_id: 12_345,
+            entry: Some(address.clone()),
+            deleted: false,
+        };
+
+        // THE POSITIONAL SHAPE. Decoded as a generic value so the ASSERTIONS name positions,
+        // not fields -- a struct would re-impose the very mapping under test.
+        let bytes = rmp_serde::to_vec(&item).expect("encode the row positionally");
+        let row: serde_json::Value =
+            rmp_serde::from_slice(&bytes).expect("the row decodes as a generic value");
+        let slots = match &row {
+            serde_json::Value::Array(slots) => slots,
+            other => panic!("the row is not an array, it is {other:?} -- the log is POSITIONAL"),
+        };
+        assert_eq!(
+            11,
+            slots.len(),
+            "the row has {} slots, not 11. The index log is positional and carries no version, \
+             and the format stamp cannot help because it guards the NAMED served index. A slot \
+             leaving or arriving in the MIDDLE stops stored rows decoding -- by slot typing, not \
+             by any length check -- and one leaving the TAIL used to be worse, because \
+             `serde(default)` filled it in and the row then decoded wrongly in silence. \
+             `IndexItemRow` refuses a row that does not carry INDEX_ITEM_SLOTS slots, so the \
+             tail is loud too; this count is what the writer must keep emitting. ELEVEN since the \
+             element-name slot came off; a twelve here means it has come back.",
+            slots.len(),
+        );
+
+        let u = |at: usize| -> u64 {
+            slots[at].as_u64().unwrap_or_else(|| {
+                panic!("slot {at} is {:?}, which is not an unsigned number", slots[at])
+            })
+        };
+
+        // EVERY DERIVED SLOT MOVED DOWN ONE, WHICH IS WHAT TAKING A SLOT OUT OF THE MIDDLE
+        // MEANS. The positions below were 7, 9, 10 and 11 while the element-name slot sat at 5.
+        // Spelled out rather than left to the reader, because an off-by-one here would assert the
+        // neighbouring slot's derivation and still pass on a row where both happen to be zero.
+        //
+        // Slot 6 is the block id, and it is the ADDRESS'S block id.
+        assert_eq!(
+            address.block_id().unwrap_or_default(),
+            u(6),
+            "slot 6 must carry the address's block id",
+        );
+        // Slot 8 is the size, and it is the STRIP SENTINEL -- always zero, because the size is
+        // derived from the address and so cannot differ from its length.
+        assert_eq!(0, u(8), "slot 8 must carry the strip sentinel");
+        // Slot 9 is the log-resident flag, derived from whether the address names a block.
+        assert_eq!(
+            Some(address.block_id().is_none()),
+            slots[9].as_bool(),
+            "slot 9 must carry `block_id().is_none()`",
+        );
+        // And slot 10 is the tombstone, which is still a field.
+        assert_eq!(Some(false), slots[10].as_bool(), "slot 10 must carry `deleted`");
+
+        // SLOT 5 IS THE OBJECT ID NOW, AND THAT IS THE TRIPWIRE. It held the element name, then a
+        // constant nil, and now the slot is gone and its successor has moved into position 5. A
+        // STRING here means an element name has come back to the row; a NIL here means the
+        // constant-nil slot has come back. Asserting the type of the value that is supposed to be
+        // in the vacated position catches both, which a `slots[5].is_null()` pin could not -- that
+        // pin passed on exactly the shape this step removes.
+        assert_eq!(
+            Some(item.object_id),
+            slots[5].as_u64(),
+            "slot 5 carries {:?}, not the object id that moved into the vacated position. A \
+             string means the element name is back; a nil means the dead slot is back",
+            slots[5]
+        );
+        println!("[slots] 11 positional slots, with 6/8/9 carrying their derivation");
+
+        // AND THE NAMED SHAPE IS NOT THIS ROW'S TO WRITE, which is worth saying because it
+        // looks like an omission. `IndexItem`'s `Serialize` is hand-written and always calls
+        // `serialize_seq(Some(INDEX_ITEM_SLOTS))`, so it ignores `with_struct_map()` -- an item encoded
+        // "as a map" still comes out a sequence. The row is therefore only ever WRITTEN
+        // positionally, and the named shape exists only on the READ side, for rows an older
+        // binary wrote through a derived `Serialize`.
+        //
+        // That read side is covered by name elsewhere in this module:
+        // `an_index_item_written_with_the_old_field_names_still_loads` and
+        // `the_old_page_id_key_still_loads_into_the_renamed_block_id_field` address the slots by
+        // their STORED NAMES, so a rename breaks them. Which is the division of labour: a
+        // rename is caught there, and order and arity -- which no named test can see -- here.
+        let as_map = encode_as_map(&item, INDEX_LOG_SHAPE_DELTA);
+        let still_a_sequence: Result<std::collections::BTreeMap<String, serde_json::Value>, _> =
+            decode_index_payload(&as_map);
+        assert!(
+            still_a_sequence.is_err(),
+            "an item encoded through the map writer came out as a map. Its `Serialize` is \
+             hand-written positional, so this would mean the eleven slots are no longer written \
+             by position -- which is a stored-format change on a log that has no version to \
+             guard it.",
+        );
+        println!("[slots] and the row is written positionally even through the map writer");
+    }
+
+    /// A SIZE CANNOT DISAGREE WITH ITS ADDRESS, AND A STORED DISAGREEMENT IS COUNTED.
+    ///
+    /// # WHAT THIS TEST USED TO SAY, AND WHY ITS SUBJECT IS GONE
+    ///
+    /// It used to say the size strip is CONDITIONAL, and that the condition was the entire
+    /// content of it: `restore_size_repeat` can only put back `address.length`, so a size
+    /// stripped while it was something else is not recoverable -- the reader invents
+    /// `address.length` and cannot tell it did. Its doc recorded that mutation testing found
+    /// exactly that, and that dropping the equality check left the whole index-log and
+    /// block-store suite green.
+    ///
+    /// The size is no longer a field. It is derived from the address wherever it is written, so
+    /// a size that disagrees is not something this crate can construct -- the mutation that test
+    /// was written to kill is now the design.
+    ///
+    /// WHAT MAKES THAT A STRENGTHENING RATHER THAN A DELETED GUARD is the other thing the old
+    /// doc established: every item the engine writes sets `size` to `address.length`, at BOTH
+    /// production construction sites. So the condition protected a case no producer produces,
+    /// and removing the field turns "unproduced" into "unrepresentable". Without that sentence
+    /// the two would be indistinguishable.
+    ///
+    /// # SO THE PURPOSE IS INHERITED, NOT DROPPED
+    ///
+    /// The old test's real worry was a STORED row whose size disagrees, because the reader
+    /// cannot tell. That row is still possible -- an older or foreign writer could have produced
+    /// one -- and the conversion from [`IndexItemWire`] now COUNTS it instead of accepting it in
+    /// silence. Counted and not refused, deliberately: `restore_size_repeat` accepted such a row
+    /// before, so erroring would refuse rows that load today, which is a separate decision with
+    /// its own blast radius.
+    ///
+    /// Driven through a planted MAP row, because the in-memory type can no longer express the
+    /// disagreement. That is a codec-level drive rather than a weakened assertion.
+    #[test]
+    fn a_size_cannot_disagree_with_the_address_and_a_stored_disagreement_is_counted() {
+        let address = crate::block_store::ElementEntry::from_parts(7, 4096, 832, Some(3), None);
+        assert_eq!(832, address.length(), "VACUITY: the fixture address states its length");
+
+        let item = IndexItem {
+            kind: IndexItemKind::Block,
+            routing_bucket: 1024,
+            block_ref_key: "k".to_string(),
+            object_key: "tenant/1/object/9".into(),
+            model_id: "feature".to_string(),
+            object_id: 0,
+            entry: Some(address.clone()),
+            deleted: false,
+        };
+
+        // ONE: the encoder always writes the strip sentinel, because the size cannot differ from
+        // the length it is derived from. The harvest the conditional strip took only when the two
+        // agreed is now unconditional.
+        let encoded = encode_index_payload(&item, INDEX_LOG_SHAPE_DELTA).expect("encode");
+        let wire: IndexItemWire = decode_index_payload(&encoded).expect("decode as a wire row");
+        assert_eq!(
+            0, wire.size,
+            "the size slot must carry the strip sentinel for every row that has an address",
+        );
+
+        // TWO: and nothing is lost -- the length comes back from the address.
+        let back: IndexItem = decode_index_payload(&encoded).expect("decode");
+        assert_eq!(
+            832,
+            back.entry.as_ref().expect("the payload survives").length(),
+            "the length must come back from the address the row carries",
+        );
+
+        // THREE: a STORED row that disagrees is COUNTED. Planted as a map, because the in-memory
+        // type cannot hold a disagreeing size any more.
+        #[derive(serde::Serialize)]
+        struct PlantedRow {
+            #[serde(rename = "a")]
+            address: Option<crate::block_store::ElementEntry>,
+            #[serde(rename = "sz")]
+            size: u64,
+        }
+        reset_derived_slot_disagreements();
+        assert_eq!(
+            0,
+            derived_slot_disagreements(),
+            "VACUITY: the counter must start at zero or the increment below proves nothing",
+        );
+        let planted = encode_as_map(
+            &PlantedRow { address: Some(address.clone()), size: 999 },
+            INDEX_LOG_SHAPE_DELTA,
+        );
+        assert_ne!(999, address.length(), "the planted case only exists while these differ");
+        let _decoded: IndexItem =
+            decode_index_payload(&planted).expect("a disagreeing row still decodes");
+        assert!(
+            derived_slot_disagreements() >= 1,
+            "a stored size that disagrees with its address was accepted in silence; the counter \
+             is the only thing that now notices what the conditional strip used to protect",
+        );
+        println!(
+            "[derived-slots] a planted stored disagreement was counted: {}",
+            derived_slot_disagreements()
+        );
+    }
+
+    /// A NAMED STORED ROW THAT NAMES ITS ELEMENT IS REFUSED, NOT SILENTLY IGNORED.
+    ///
+    /// # WHAT THIS ARM USED TO BE, AND WHY THE SUBJECT INVERTED
+    ///
+    /// `a_stored_element_name_is_counted_when_it_is_dropped_and_a_nil_slot_is_not`. The element
+    /// name was still READ off a stored row and then dropped, because `IndexItem` had no field for
+    /// it, and `STORED_ELEMENT_NAMES_DROPPED` existed so the drop was not invisible. Its three
+    /// conversions of a named row and two of a nil row counted to exactly 3, and that count was the
+    /// whole test.
+    ///
+    /// THE SLOT IS GONE NOW AND SO IS THE COUNTER. A detector for a silent drop is only worth
+    /// having while the drop is possible; what replaces it is a REFUSAL, and this arm drives the
+    /// half of that refusal an arity check cannot see.
+    ///
+    /// # THE DEFECT IT CLOSES, WHICH IS A SERDE DEFAULT AND NOT A MISTAKE ANYONE MADE
+    ///
+    /// A derived `Deserialize` IGNORES a key it has no field for. The positional arm is refused by
+    /// arity in [`IndexItemRow`] -- twelve slots against eleven, named in the message -- but a MAP
+    /// has no arity. Without `deny_unknown_fields` on [`IndexItemWire`], a stored row written as a
+    /// named map by a binary that still had the field would decode with its `"c"` thrown away and
+    /// nothing anywhere would say so: an index that loads and then cannot be dumped. So the
+    /// strictness is declared on the struct, and this is what proves it fires.
+    ///
+    /// # THE CONTROLS, WHICH ARE WHAT MAKE THE REFUSAL MEAN WHAT IT SAYS
+    ///
+    ///   * THE SAME MAP WITHOUT THE KEY MUST LOAD, and must load as the row it is. A struct that
+    ///     refused every map would satisfy the subject and fail here, and that is the failure mode
+    ///     a blanket `deny_unknown_fields` could actually have: the named arm is the one the
+    ///     compatibility arms in this file build their fixtures through.
+    ///   * THE REFUSAL MUST NAME THE KEY. "unknown field" alone would be satisfied by a typo in
+    ///     the fixture; the message has to say which key, or this arm cannot tell a closed door
+    ///     from a misspelled one.
+    ///   * AND THE TWO PLANTED ROWS MUST DIFFER, or the control is the subject.
+    #[test]
+    fn a_named_stored_row_that_names_its_element_is_refused_rather_than_ignored() {
+        // Planted as a MAP, because no writer left in this binary can build a row that names an
+        // element -- the field it would have come from is gone, and so is the slot.
+        #[derive(serde::Serialize)]
+        struct PlantedRow {
+            #[serde(rename = "ok")]
+            object_key: std::sync::Arc<str>,
+            #[serde(rename = "mi")]
+            model_id: String,
+            #[serde(rename = "c", skip_serializing_if = "Option::is_none")]
+            component: Option<std::sync::Arc<str>>,
+        }
+        let plant = |named: Option<&str>| {
+            encode_as_map(
+                &PlantedRow {
+                    object_key: "tenant/1/object/9".into(),
+                    model_id: "feature".to_string(),
+                    component: named.map(std::sync::Arc::from),
+                },
+                INDEX_LOG_SHAPE_DELTA,
+            )
+        };
+        let names_the_element = plant(Some("f0"));
+        let names_nothing = plant(None);
+        assert_ne!(
+            names_the_element, names_nothing,
+            "the two planted rows are the same bytes, so the control is the subject"
+        );
+
+        // THE CONTROL FIRST, so a blanket refusal is ruled out before the refusal is read as a
+        // gate. Both halves: it decodes, AND it decodes as the row that was planted.
+        let tolerated: IndexItem = decode_index_payload(&names_nothing)
+            .expect("a named row carrying no element name must still load -- that tolerance is \
+                     what the aliases on IndexItemWire are for, and the compatibility arms in \
+                     this file build their fixtures through it");
+        assert_eq!(
+            "tenant/1/object/9", &*tolerated.object_key,
+            "the tolerated row decoded as something else, so this control says nothing"
+        );
+        assert_eq!("feature", tolerated.model_id, "the tolerated row lost its model spelling");
+        println!("[named] a map with no element name still loads");
+
+        // THE SUBJECT, ON BOTH DECODE TYPES, because `IndexItem` rides `serde(from)` over the wire
+        // row and `deny_unknown_fields` sits on the wire row -- so the refusal has to be shown
+        // arriving at the type a load actually asks for, not only at the one that declares it.
+        for what in ["IndexItem", "IndexItemWire"] {
+            let message = match what {
+                "IndexItem" => decode_index_payload::<IndexItem>(&names_the_element)
+                    .err()
+                    .map(|error| error.to_string()),
+                _ => decode_index_payload::<IndexItemWire>(&names_the_element)
+                    .err()
+                    .map(|error| error.to_string()),
+            };
+            let Some(message) = message else {
+                panic!(
+                    "a named stored row carrying an element name decoded into {what} with the key \
+                     THROWN AWAY. A serde derive ignores an unknown key, so this is the silent \
+                     drop `deny_unknown_fields` exists to stop: the store loads and then cannot be \
+                     dumped, with no error anywhere"
+                );
+            };
+            println!("[named] {what} refused: {message}");
+            assert!(
+                message.contains("unknown field"),
+                "{what} refused the row, but not as an unknown field: {message}. A refusal for an \
+                 unintended reason is not a passing control"
+            );
+            assert!(
+                message.contains("`c`"),
+                "the refusal does not name the key it refused: {message}. Without the key named, \
+                 a misspelled fixture is indistinguishable from the gate firing"
+            );
+        }
+    }
+
+    /// `budget_exhausted` is a claim about what is LEFT OVER, and the boundary is the claim.
+    ///
+    /// A round whose removable count is exactly its budget removes all of it and leaves nothing,
+    /// so the flag is false. One off here tells the caller in `storage_lifecycle_methods` that
+    /// there is more to do on a log that is already down to its retained tail. Mutation testing
+    /// found the boundary unguarded: flipping `>` to `>=` left the whole index-log suite green.
+    ///
+    /// Both sides are asserted, with a denominator -- a round that removed nothing would satisfy
+    /// a one-sided version of this while saying nothing about either side.
+    #[test]
+    fn the_index_log_budget_says_exhausted_only_when_records_are_left_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        for value in 1..=10u64 {
+            store
+                .append_json(5, format!("{{\"value\":{value}}}").as_bytes())
+                .unwrap();
+        }
+
+        // Sequences 1..=5 sit below the floor, so five records are removable.
+        const REMOVABLE: usize = 5;
+
+        // AT the budget: all five go, nothing is left, the flag is false.
+        let exact = store.gc_before_sequence_limited(5, 6, REMOVABLE).unwrap();
+        assert_eq!(
+            exact.dropped_segments, 0,
+            "this measures the ACTIVE piece; a rolled log would put the records somewhere the \
+budget does not apply and the boundary below would be about nothing",
+        );
+        assert_eq!(
+            exact.removable_records_before_budget, REMOVABLE,
+            "denominator: the round has to have found the five removable records",
+        );
+        assert_eq!(exact.records_removed, REMOVABLE, "and removed all of them");
+        assert!(
+            !exact.budget_exhausted,
+            "a round that removed every removable record left nothing over, so the budget was \
+not exhausted -- reporting otherwise schedules another round to find an empty log",
+        );
+
+        // BELOW the budget: one record is left over, and the flag says so.
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        for value in 1..=10u64 {
+            store
+                .append_json(5, format!("{{\"value\":{value}}}").as_bytes())
+                .unwrap();
+        }
+        let capped = store.gc_before_sequence_limited(5, 6, REMOVABLE - 1).unwrap();
+        assert_eq!(capped.removable_records_before_budget, REMOVABLE);
+        assert!(
+            capped.budget_exhausted,
+            "five removable records against a budget of four leaves one over, which is what the \
+flag exists to say",
+        );
+    }
+
+    /// What the address repeats costs, per index item.
+    ///
+    /// `BlockAddress` carries `object_id` and `routing_bucket`, and the item carries both again as
+    /// its own fields. For a page belonging to one object they hold the same value, so the pair is
+    /// written twice per item. The WAL side already strips that on its way to protobuf --
+    /// `item_to_proto` drops the address's object id when it repeats the item's, and says why --
+    /// and this measures whether the index log is paying what the WAL stopped paying.
+    #[test]
+    #[ignore]
+    fn what_the_address_repeats_costs() {
+        let object_id = 12_345_678_901_234_567u64;
+        let bucket = 8539u32;
+        let item = |address: Option<crate::block_store::ElementEntry>| IndexItem {
+            kind: IndexItemKind::Block,
+            routing_bucket: bucket,
+            block_ref_key: 17_665_223_918_442_101_733u64.to_string(),
+            object_key: "tenant/7/object/000000123".into(),
+            model_id: "string".to_string(),
+            object_id,
+            deleted: false,
+            // The address arrives as the closure's parameter, so it becomes the payload directly
+            // and the `None` case in the table below still builds an address-less row. The three
+            // slots stated here were this address's own derivation.
+            entry: address,
+        };
+
+        // As written today: the address repeats the item's object id and routing bucket.
+        let repeats = item(Some(crate::block_store::ElementEntry::from_parts(
+            42, 1_048_576, 4096, Some(7), Some(object_id),
+        )));
+        // The same address with the two the item already states left out.
+        let deduped = item(Some(crate::block_store::ElementEntry::from_parts(
+            42, 1_048_576, 4096, Some(7), None,
+        )));
+
+        let a = encode_index_payload(&repeats, INDEX_LOG_SHAPE_DELTA).expect("encode").len();
+        let b = encode_index_payload(&deduped, INDEX_LOG_SHAPE_DELTA).expect("encode").len();
+        println!(
+            "  REPEATS item {a} B with the repeats, {b} B without -- {} B, {:.1}% of the item",
+            a - b,
+            100.0 * (a - b) as f64 / a as f64,
+        );
+        assert!(a >= b, "dropping fields cannot make it larger");
+    }
+
+    /// What an index-log item is actually made of, field by field.
+    ///
+    /// The whole record measures 233 bytes on a real ingest. Before proposing to narrow anything,
+    /// find out which field is paying for it -- a guess about which one dominates is how the last
+    /// three measurements in this area went wrong.
+    ///
+    /// Measured by encoding the item, then encoding it again with one field cleared, and taking
+    /// the difference. That prices each field in the SHAPE THE LOG ACTUALLY WRITES rather than in
+    /// the size of the Rust type.
+    #[test]
+    #[ignore]
+    fn what_an_index_item_is_made_of() {
+        let full = IndexItem {
+            kind: IndexItemKind::Block,
+            routing_bucket: 8539,
+            block_ref_key: 17_665_223_918_442_101_733u64.to_string(),
+            object_key: "tenant/7/object/000000123".into(),
+            model_id: "string".to_string(),
+            object_id: 12_345_678_901_234_567u64,
+            // The three slots this used to state were its own derivation; the codec
+            // computes them where they are written.
+            entry: Some(crate::block_store::ElementEntry::from_parts(
+                42, 1_048_576, 4096, Some(7), Some(12_345_678_901_234_567),
+            )),
+            deleted: false,
+        };
+
+        let whole = encode_index_payload(&full, INDEX_LOG_SHAPE_DELTA).expect("encode").len();
+        let price = |label: &str, mut cleared: IndexItem| {
+            let without = encode_index_payload(&cleared, INDEX_LOG_SHAPE_DELTA).expect("encode").len();
+            let _ = &mut cleared;
+            println!(
+                "    ITEMFIELD {label:<14} {:>4} B ({:>4.1}% of {whole})",
+                whole.saturating_sub(without),
+                100.0 * whole.saturating_sub(without) as f64 / whole as f64
+            );
+        };
+
+        println!("  ITEM whole record {whole} B");
+        price("address", IndexItem { entry: None, ..full.clone() });
+        price("object_key", IndexItem { object_key: empty_object_key(), ..full.clone() });
+        price("page_ref_key", IndexItem { block_ref_key: String::new(), ..full.clone() });
+        price("model_id", IndexItem { model_id: String::new(), ..full.clone() });
+        price("object_id", IndexItem { object_id: 0, ..full.clone() });
+
+        assert!(whole > 0, "the probe must encode something");
+    }
+
+    /// WHAT EVERY BYTE OF AN INDEX ITEM IS SPENT ON, AS ARITHMETIC RATHER THAN AS A LITERAL.
+    ///
+    /// Two reconstructions, and each one is a SUM THAT HAS TO CLOSE. Neither restates a width:
+    /// the literals stay where they belong -- at the declaration, as a `const` assertion, and in
+    /// `engine::tests::per_item_byte_budget` -- and this says WHY each number is the number it is,
+    /// so a field that moves fails here with the group it moved out of.
+    ///
+    ///   * RESIDENT. The declared fields in TWO GROUPS -- the eight-aligned ones, and the tail the
+    ///     aligner rounds up -- plus the proof that each field is really in the group this test
+    ///     puts it in. A decomposition that only adds up is satisfied by a field counted in the
+    ///     wrong group and a compensating error elsewhere; asserting each member's own alignment
+    ///     is what makes the split a statement rather than a coincidence.
+    ///
+    ///   * WIRE. A msgpack array is a header followed by its elements CONCATENATED, so the twelve
+    ///     slot encodings sum to the row EXACTLY, and the test asserts they do. Each slot is
+    ///     priced by encoding its own value through the same adapter the row's `Serialize` uses.
+    ///
+    /// WHY NOT THE DIFFERENCE METHOD, AND THE SIZE OF THE ERROR IT MAKES.
+    /// `what_an_index_item_is_made_of` above clears one field and subtracts. Under a POSITIONAL
+    /// encoding that does not price the slot: clearing a field writes `nil` or an empty string in
+    /// the slot it already had, so the difference is value-minus-placeholder and the slot itself --
+    /// which is what a format break would have to remove -- is never priced at all. Run both and
+    /// the gap is exactly that placeholder: the difference probe prices the address slot at 15 B
+    /// where it is 16, one byte of `nil` short, and prices `model_id` at 0 B for a slot that costs
+    /// 1 -- a field it reports as free. The two probes answer different questions and the
+    /// difference one reads like this one, which is the whole reason for saying so here.
+    ///
+    /// AND THE RESIDENT NUMBER IS NOT A PER-CORPUS COST, which is the thing most likely to be read
+    /// off this test wrongly. This struct is per CHANGED BLOCK PER APPEND and transient: it is
+    /// built, stripped, encoded and dropped inside one append, so what it costs at any moment is
+    /// bounded by the BATCH, not by the store. `engine::tests::per_item_byte_budget`'s own corpus
+    /// ranking is the evidence -- it measures eight structures at two corpus sizes and this one is
+    /// not among them, because there is no corpus count to measure. The durable per-item cost of an
+    /// index item is the WIRE row below, and that is the number a footprint argument wants.
+    #[test]
+    fn what_every_byte_of_an_index_item_is_spent_on() {
+        use std::mem::{align_of, size_of};
+
+        // ------------------------------------------------------------------
+        // RESIDENT
+        // ------------------------------------------------------------------
+        let align = align_of::<IndexItem>();
+        assert_eq!(8, align, "the groups below are an eight-aligned split");
+
+        // Each member of the first group must actually BE eight-aligned, or it does not belong
+        // to it and the split is a fiction that happens to add up.
+        for (name, member) in [
+            ("String", align_of::<String>()),
+            ("Option<String>", align_of::<Option<String>>()),
+            ("Arc<str>", align_of::<std::sync::Arc<str>>()),
+            (
+                "Option<Arc<str>>",
+                align_of::<Option<std::sync::Arc<str>>>(),
+            ),
+            (
+                "Option<ElementEntry>",
+                align_of::<Option<crate::block_store::ElementEntry>>(),
+            ),
+            ("u64", align_of::<u64>()),
+        ] {
+            assert_eq!(
+                align, member,
+                "{name} is counted in the eight-aligned group and is {member}-aligned",
+            );
+        }
+        for (name, member) in [
+            ("u32", align_of::<u32>()),
+            ("IndexItemKind", align_of::<IndexItemKind>()),
+            ("bool", align_of::<bool>()),
+        ] {
+            assert!(
+                member < align,
+                "{name} is counted in the rounded tail and is {member}-aligned, which puts it in \
+                 the other group",
+            );
+        }
+
+        //   block_ref_key, model_id             : String                (2 x 24)
+        //   object_key                          : Arc<str>              (16, a thin pointer and a
+        //                                          length, shared with the resident entry)
+        //   address                             : Option<BlockAddress>  (24: a 16-byte address
+        //                                          with no niche, so the discriminant costs a word)
+        //   object_id                           : u64                   (1 x 8)
+        //
+        // TWO WORDS LEFT THIS GROUP. `block_id` and `size` were derivations of the address --
+        // `address.block_id()` and `address.length()` -- so they are computed where they are
+        // written instead of stored beside it. The payload that replaced the address is the same
+        // width: `Option<ElementEntry>` is 24, exactly what `Option<BlockAddress>` was.
+        // TWO WORDS LEFT THIS GROUP, AND THE PRICE IS THE DISTANCE. The element name was an
+        // `Option<Arc<str>>`, and `Arc<str>` is a FAT pointer, so the option cost two whole words
+        // with its discriminant in the pointer's niche. 112 -> 96, which with the 8-byte tail is
+        // the struct's 104. The TERM IS REMOVED rather than the total adjusted, so the sum is
+        // still reconstructed from the types and still fails naming the group a field left.
+        let eight_aligned = 2 * size_of::<String>()
+            + size_of::<std::sync::Arc<str>>()
+            + size_of::<Option<crate::block_store::ElementEntry>>()
+            + size_of::<u64>();
+        //   routing_bucket : u32            (4)
+        //   kind           : IndexItemKind  (1, a three-variant enum with no payload)
+        //   deleted        : bool           (1)
+        //
+        // `in_log` left this group with the other two: it was `address.block_id().is_none()`.
+        let tail = size_of::<u32>() + size_of::<IndexItemKind>() + size_of::<bool>();
+        let rounded_tail = (tail + align - 1) / align * align;
+
+        println!("=== IndexItem, resident ===");
+        println!("  eight-aligned group {eight_aligned:>4} B");
+        println!("  tail                {tail:>4} B -> {rounded_tail} rounded");
+        println!("  total               {:>4} B", size_of::<IndexItem>());
+
+        assert_eq!(
+            96, eight_aligned,
+            "the eight-aligned group is {eight_aligned} B, not 96 -- a field entered or left it",
+        );
+        // THE STEP IS ASSERTED AS A DISTANCE, not left as two numbers in a comment. This group was
+        // 112 while the row named its element, and the sixteen bytes that left are exactly what an
+        // `Option<Arc<str>>` costs -- so the identity below holds only while THAT is the width that
+        // left. A later change taking something else out of this group breaks it rather than
+        // quietly inheriting the number.
+        assert_eq!(
+            112,
+            eight_aligned + size_of::<Option<std::sync::Arc<str>>>(),
+            "the group plus the element name's own width is {}, not the 112 it was before the name \
+             came off -- so 96 was not reached by removing an `Option<Arc<str>>`",
+            eight_aligned + size_of::<Option<std::sync::Arc<str>>>(),
+        );
+        assert_eq!(6, tail, "the tail is {tail} B of field, not 6");
+        assert_eq!(8, rounded_tail, "the tail rounds to {rounded_tail}, not 8");
+        assert_eq!(
+            eight_aligned + rounded_tail,
+            size_of::<IndexItem>(),
+            "the groups add to {} and the struct is {} -- the field list here has drifted from \
+             the declaration",
+            eight_aligned + rounded_tail,
+            size_of::<IndexItem>(),
+        );
+
+        // THE TWO SPARE BYTES, AND THEY ARE THE WHOLE VERDICT ON NARROWING THIS STRUCT.
+        //
+        // The tail holds 6 bytes of field in the 8 the aligner gives it -- it was 7 before
+        // `in_log` left. So: a field of up to TWO BYTES added to the tail is FREE, and EVERY
+        // narrowing of a tail field is worth EXACTLY ZERO -- `routing_bucket` at 16 bits leaves a
+        // 4-byte tail that rounds straight back to 8, and deleting `kind` and `deleted` outright
+        // leaves 4 and still rounds to 8. Shedding eight bytes means taking a WHOLE WORD out of
+        // the eight-aligned group, or emptying the tail completely -- all three of its fields,
+        // for one word.
+        assert_eq!(
+            2,
+            rounded_tail - tail,
+            "the tail has {} spare bytes, not 2; the narrowing verdict above is derived from \
+             there being exactly two, which is what `in_log` leaving the tail bought",
+            rounded_tail - tail,
+        );
+
+        // ------------------------------------------------------------------
+        // WIRE
+        // ------------------------------------------------------------------
+        // The adapters the row's `Serialize` wraps three of its slots in. Re-declared here rather
+        // than shared, because the point is to price what the row writes: if either copy drifts,
+        // the closing assertion below stops summing to the row.
+        struct Kind<'a>(&'a IndexItemKind);
+        impl serde::Serialize for Kind<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                item_kind_as_number(self.0, s)
+            }
+        }
+        struct Handle<'a>(&'a str);
+        impl serde::Serialize for Handle<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                block_ref_key_as_number_when_it_is_one(self.0, s)
+            }
+        }
+        struct Model<'a>(&'a str);
+        impl serde::Serialize for Model<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                model_id_as_number_when_it_is_known(self.0, s)
+            }
+        }
+        fn one<T: serde::Serialize>(value: &T) -> usize {
+            rmp_serde::to_vec(value).expect("encode one slot").len()
+        }
+
+        let shard: ShardId = 7;
+        let address = crate::block_store::ElementEntry::from_parts(42, 1_048_576, 4096, Some(7), None);
+        let object_key = "tenant/7/object/000000123".to_string();
+        let model_id = "string".to_string();
+        let mut item = IndexItem {
+            kind: IndexItemKind::Block,
+            routing_bucket: 8539,
+            block_ref_key: block_ref_key_from_parts(
+                &model_id,
+                &object_key,
+                None,
+                address.block_slab_id(),
+                address.offset(),
+                address.length(),
+                address.block_id().unwrap_or_default(),
+                address.generation().unwrap_or_default(),
+            ),
+            object_key: object_key.clone().into(),
+            model_id: model_id.clone(),
+            object_id: crate::engine::hashing::stable_block_object_id(shard, &model_id, &object_key),
+            // The three slots this used to state were its own derivation; the codec
+            // computes them where they are written.
+            entry: Some(address.clone()),
+            deleted: false,
+        };
+
+        // THE THREE DERIVED SLOTS, as the serializer computes them. Defined once so both
+        // tables and the sentinel assertion price the same expressions the encoder uses.
+        fn slot_block_id(item: &IndexItem) -> u64 {
+            item.entry
+                .as_ref()
+                .and_then(|entry| entry.block_id())
+                .unwrap_or_default()
+        }
+        fn slot_address(item: &IndexItem) -> Option<&crate::block_store::ElementEntry> {
+            item.entry.as_ref()
+        }
+        fn slot_in_log(item: &IndexItem) -> bool {
+            item.entry
+                .as_ref()
+                .map(|entry| entry.log_resident())
+                .unwrap_or(false)
+        }
+        fn slot_size_written(_item: &IndexItem) -> u64 {
+            0
+        }
+
+        // THE UNSTRIPPED ROW FIRST, so each strip is priced against the row that carries it.
+        let before: Vec<(&str, usize)> = vec![
+            ("kind", one(&Kind(&item.kind))),
+            ("routing_bucket", one(&item.routing_bucket)),
+            ("block handle", one(&Handle(&item.block_ref_key))),
+            ("object_key", one(&item.object_key)),
+            ("model", one(&Model(&item.model_id))),
+            // THE ELEMENT-NAME SLOT IS NOT PRICED BECAUSE IT IS NOT WRITTEN. It stood here at
+            // position 5, priced as the constant nil the encoder put in it -- one byte on every
+            // row of every kind, which is exactly what this table is for showing. The slot is gone
+            // and the row is eleven slots, so the line comes out: a table that priced a slot the
+            // writer does not emit would not sum to the row, and the closing assertions below are
+            // what would catch that.
+            ("object_id", one(&item.object_id)),
+            // THE THREE DERIVED SLOTS, priced as the SERIALIZER writes them. They are no longer
+            // fields, but all eleven slots are still on the wire, so this stays a measurement of
+            // the row rather than of the struct. `size` is the strip sentinel and so always zero.
+            ("block_id", one(&slot_block_id(&item))),
+            ("address", one(&slot_address(&item))),
+            ("size", one(&0u64)),
+            ("in_log", one(&slot_in_log(&item))),
+            ("deleted", one(&item.deleted)),
+        ];
+        let unstripped = rmp_serde::to_vec(&item).expect("encode the row").len();
+
+        // POSITIVE CONTROLS. Each strip has to actually FIRE on this row, or the "after" column
+        // below is the cost of a writer that gave up, which reads identically to a cheap one.
+        item.strip_block_ref_key_repeat();
+        assert!(
+            item.block_ref_key.is_empty(),
+            "the composite-handle strip did not fire, so this row is not the shape the writer emits",
+        );
+        item.strip_size_repeat();
+        // THE SENTINEL IS UNCONDITIONAL. The size is derived from the address, so it cannot
+        // differ from the length and the encoder always writes zero. What used to be a
+        // conditional that had to be shown firing is now a property of the type.
+        assert_eq!(
+            0,
+            slot_size_written(&item),
+            "the size slot must carry the strip sentinel",
+        );
+        item.strip_address_repeats();
+        item.strip_object_id_repeat(shard);
+        assert_eq!(0, item.object_id, "the object-id strip did not fire");
+
+        let after: Vec<(&str, usize)> = vec![
+            ("kind", one(&Kind(&item.kind))),
+            ("routing_bucket", one(&item.routing_bucket)),
+            ("block handle", one(&Handle(&item.block_ref_key))),
+            ("object_key", one(&item.object_key)),
+            ("model", one(&Model(&item.model_id))),
+            // THE ELEMENT-NAME SLOT IS NOT PRICED BECAUSE IT IS NOT WRITTEN. It stood here at
+            // position 5, priced as the constant nil the encoder put in it -- one byte on every
+            // row of every kind, which is exactly what this table is for showing. The slot is gone
+            // and the row is eleven slots, so the line comes out: a table that priced a slot the
+            // writer does not emit would not sum to the row, and the closing assertions below are
+            // what would catch that.
+            ("object_id", one(&item.object_id)),
+            // THE THREE DERIVED SLOTS, priced as the SERIALIZER writes them. They are no longer
+            // fields, but all eleven slots are still on the wire, so this stays a measurement of
+            // the row rather than of the struct. `size` is the strip sentinel and so always zero.
+            ("block_id", one(&slot_block_id(&item))),
+            ("address", one(&slot_address(&item))),
+            ("size", one(&0u64)),
+            ("in_log", one(&slot_in_log(&item))),
+            ("deleted", one(&item.deleted)),
+        ];
+        let stripped = rmp_serde::to_vec(&item).expect("encode the row").len();
+
+        // An eleven-element array is one header byte (`0x9b`, fixarray) and then the elements.
+        const ARRAY_HEADER: usize = 1;
+        let sum_before: usize = before.iter().map(|slot| slot.1).sum();
+        let sum_after: usize = after.iter().map(|slot| slot.1).sum();
+
+        println!("=== IndexItem, on the wire: 11 positional slots ===");
+        println!("  {:<16} {:>9} {:>9}", "slot", "written", "stripped");
+        for (index, (name, bytes)) in before.iter().enumerate() {
+            println!("  {name:<16} {bytes:>9} {:>9}", after[index].1);
+        }
+        println!("  {:<16} {ARRAY_HEADER:>9} {ARRAY_HEADER:>9}", "array header");
+        println!(
+            "  {:<16} {:>9} {:>9}",
+            "ROW",
+            ARRAY_HEADER + sum_before,
+            ARRAY_HEADER + sum_after
+        );
+
+        // THE CLOSING ASSERTIONS. These are what make the table a decomposition: if any slot were
+        // priced through the wrong adapter, or a slot were missing from the list, the sum would
+        // not be the row.
+        assert_eq!(
+            ARRAY_HEADER + sum_before,
+            unstripped,
+            "the eleven slot sizes sum to {} and the written row is {unstripped} B",
+            ARRAY_HEADER + sum_before,
+        );
+        assert_eq!(
+            ARRAY_HEADER + sum_after,
+            stripped,
+            "the eleven slot sizes sum to {} and the stripped row is {stripped} B",
+            ARRAY_HEADER + sum_after,
+        );
+        assert_eq!(
+            INDEX_ITEM_SLOTS,
+            before.len(),
+            "the row writes {INDEX_ITEM_SLOTS} slots; this table prices {}",
+            before.len(),
+        );
+        assert!(
+            stripped < unstripped,
+            "the strips are supposed to make the row SMALLER: {unstripped} -> {stripped}",
+        );
+    }
+
+    /// WHAT AN INDEX ITEM COSTS PER APPEND, AT THREE BATCH SIZES.
+    ///
+    /// The row is not the whole story and the record is not the row: a delta record carries an
+    /// envelope -- shard, sequence, meta, the key states, the hoisted object key -- that a batch
+    /// of one pays in full and a batch of thirty-two divides. So the per-item figure is the
+    /// MARGINAL one, read off the slope between batch sizes, and a single batch size cannot tell
+    /// an envelope from an item.
+    ///
+    /// THREE SIZES AND NOT TWO, because two points fit any line. The slope between 1 and 8 and
+    /// the slope between 8 and 32 have to agree, or the thing being measured is not per-item.
+    #[test]
+    fn what_an_index_item_costs_per_append_at_three_batch_sizes() {
+        let shard: ShardId = 7;
+        let mut measured: Vec<(usize, usize)> = Vec::new();
+        for count in [1usize, 8, 32] {
+            let items: Vec<IndexItem> = (0..count)
+                .map(|index| {
+                    let object_key = format!("tenant/7/object/{index:09}");
+                    let model_id = "string".to_string();
+                    let address = crate::block_store::ElementEntry::from_parts(
+                        42,
+                        1_048_576 + index as u64 * 4096,
+                        4096,
+                        Some(index as u64),
+                        None,
+                    );
+                    let mut item = IndexItem {
+                        kind: IndexItemKind::Block,
+                        routing_bucket: 8539,
+                        block_ref_key: block_ref_key_from_parts(
+                            &model_id,
+                            &object_key,
+                            None,
+                            address.block_slab_id(),
+                            address.offset(),
+                            address.length(),
+                            address.block_id().unwrap_or_default(),
+                            address.generation().unwrap_or_default(),
+                        ),
+                        object_key: object_key.clone().into(),
+                        model_id: model_id.clone(),
+                        object_id: crate::engine::hashing::stable_block_object_id(
+                            shard, &model_id, &object_key,
+                        ),
+                        // The three slots this used to state were its own derivation; the codec
+                        // computes them where they are written.
+                        entry: Some(address.clone()),
+                        deleted: false,
+                    };
+                    item.strip_block_ref_key_repeat();
+                    item.strip_size_repeat();
+                    item.strip_address_repeats();
+                    item.strip_object_id_repeat(shard);
+                    assert!(
+                        item.block_ref_key.is_empty(),
+                        "the handle strip must fire, or this measures an unstripped writer",
+                    );
+                    item
+                })
+                .collect();
+            let record = IndexDeltaRecord {
+                shard_id: shard,
+                sequence: 1,
+                items,
+                meta: None,
+                applied_wal_sequence: Some(1),
+                upsert: true,
+                key_states: Vec::new(),
+                shared_object_key: None,
+            };
+            // The payload WITHOUT compression, so the figure is the record's own shape rather
+            // than zstd's opinion of this fixture's repetitiveness.
+            let bytes = rmp_serde::to_vec(&record).expect("encode the record").len();
+            measured.push((count, bytes));
+        }
+
+        println!("=== a delta record, by batch size ===");
+        for (count, bytes) in &measured {
+            println!(
+                "  {count:>3} items {bytes:>6} B  ({:>6.1} B/item all-in)",
+                *bytes as f64 / *count as f64
+            );
+        }
+        let (small, small_bytes) = measured[0];
+        let (mid, mid_bytes) = measured[1];
+        let (large, large_bytes) = measured[2];
+        let slope_low = (mid_bytes - small_bytes) as f64 / (mid - small) as f64;
+        let slope_high = (large_bytes - mid_bytes) as f64 / (large - mid) as f64;
+        println!("  marginal {slope_low:.2} B/item over 1..8, {slope_high:.2} B/item over 8..32");
+
+        assert!(
+            (slope_low - slope_high).abs() < 4.0,
+            "the two slopes are {slope_low:.2} and {slope_high:.2} B/item -- a per-item cost has \
+             one slope, so something here scales with the record and not with the items",
+        );
+        assert!(
+            slope_high > 0.0,
+            "a record carrying more items must be larger",
+        );
+    }
+
+    /// WHAT THE REMAINING NARROWING MECHANISMS ARE WORTH ON A DELTA ROW, MEASURED.
+    ///
+    /// `what_every_byte_of_an_index_item_is_spent_on` prices the row a writer emits for items
+    /// that each name a DIFFERENT object: 119 B unstripped, 55 B stripped. That is the worst
+    /// case and not the common one. A write that touches several blocks almost always touches
+    /// several blocks OF ONE OBJECT, and then a sixth harvest fires that the per-slot table
+    /// cannot show, because it lives on the RECORD and not on the item: the writer hoists the
+    /// object key to `IndexDeltaRecord::shared_object_key` and blanks every copy. The object key
+    /// is 26 of those 55 bytes, so the common row is a different number and this measures it.
+    ///
+    /// Then each mechanism still on the table is priced as a MEASURED re-encode of that row,
+    /// not as arithmetic over the slot widths. The widths do not predict the encoding: this is
+    /// msgpack, which writes the smallest form of a VALUE and is indifferent to the Rust type
+    /// the value came out of. That single fact kills the first candidate outright, and only a
+    /// measurement shows it -- an arithmetic argument from `size_of` would have predicted a win.
+    ///
+    /// WHAT EACH VERDICT COSTS, AND WHICH ARE SLOT-PRESERVING. The row is a positional array
+    /// with no field name written anywhere, so a mechanism that changes the NUMBER of slots
+    /// shortens the array and every already-written row stops decoding. That is a format break
+    /// and a stamp. A mechanism that keeps the arity and writes a cheaper value into one slot is
+    /// not: an old row carries the dear value and restores as a no-op. So the two classes are
+    /// priced separately and the cheap-looking one is usually the one that breaks the format.
+    ///
+    /// AND ONE SLOT-REMOVING MECHANISM HAS NOW BEEN SPENT, which is why this doc no longer says
+    /// "twelve". The element-name slot came off -- twelve slots to eleven -- and it cost exactly
+    /// what this paragraph predicts: every already-written row stops decoding, a refusal naming
+    /// both arities, and `engine::SHARD_INDEX_FORMAT_VERSION` at 13. The verdicts below are
+    /// unchanged in kind; only the arity they are measured against moved.
+    #[test]
+    fn what_the_remaining_index_item_mechanisms_are_worth() {
+        let shard: ShardId = 7;
+        let model_id = "string".to_string();
+        let object_key = "tenant/7/object/000000123".to_string();
+
+        // Eight blocks of ONE object -- the shape the hoist was built for.
+        let build = || -> Vec<IndexItem> {
+            (0..8u64)
+                .map(|index| {
+                    let address = crate::block_store::ElementEntry::from_parts(
+                        42,
+                        1_048_576 + index * 4096,
+                        4096,
+                        Some(index),
+                        None,
+                    );
+                    let mut item = IndexItem {
+                        kind: IndexItemKind::Block,
+                        routing_bucket: 8539,
+                        block_ref_key: block_ref_key_from_parts(
+                            &model_id,
+                            &object_key,
+                            None,
+                            address.block_slab_id(),
+                            address.offset(),
+                            address.length(),
+                            address.block_id().unwrap_or_default(),
+                            address.generation().unwrap_or_default(),
+                        ),
+                        object_key: object_key.clone().into(),
+                        model_id: model_id.clone(),
+                        object_id: crate::engine::hashing::stable_block_object_id(
+                            shard, &model_id, &object_key,
+                        ),
+                        // The three slots this used to state were its own derivation; the codec
+                        // computes them where they are written.
+                        entry: Some(address.clone()),
+                        deleted: false,
+                    };
+                    // The writer's order, which is load-bearing: the handle strip DERIVES from
+                    // `object_key`, so blanking the key before it runs makes it decline.
+                    item.strip_block_ref_key_repeat();
+                    item.strip_size_repeat();
+                    item.strip_address_repeats();
+                    item.strip_object_id_repeat(shard);
+                    item
+                })
+                .collect()
+        };
+
+        let row = |item: &IndexItem| rmp_serde::to_vec(item).expect("encode a row").len();
+
+        // POSITIVE CONTROLS on the four item strips. Without these the "common row" below is
+        // the cost of a writer that gave up, which reads identically to a cheap one.
+        let distinct = build();
+        assert!(
+            distinct[0].block_ref_key.is_empty(),
+            "the composite-handle strip did not fire",
+        );
+        // THE SENTINEL IS UNCONDITIONAL, so there is no conditional left to show firing: the
+        // size is derived from the address and the encoder always writes zero.
+        assert!(
+            distinct[0].entry.is_some(),
+            "the row carries a payload, so its size slot is the sentinel by construction",
+        );
+        assert_eq!(0, distinct[0].object_id, "the object-id strip did not fire");
+        let unhoisted = row(&distinct[0]);
+
+        // THE SIXTH HARVEST, the one that does not appear in a per-slot table of the item.
+        let mut hoisted = build();
+        let shared = match hoisted.split_first() {
+            Some((first, rest)) if rest.iter().all(|i| i.object_key == first.object_key) => {
+                Some(first.object_key.clone())
+            }
+            _ => None,
+        };
+        assert!(
+            shared.is_some(),
+            "eight blocks of one object must hoist, or this measures the wrong case",
+        );
+        for item in hoisted.iter_mut() {
+            item.object_key = empty_object_key();
+        }
+        let common = row(&hoisted[0]);
+
+        println!("=== a delta row, by case ===");
+        println!("  distinct objects   {unhoisted:>4} B");
+        println!("  one object, hoisted{common:>5} B   <- the common case");
+
+        assert!(
+            common < unhoisted,
+            "hoisting the key must shrink the row: {unhoisted} -> {common}",
+        );
+
+        // ------------------------------------------------------------------
+        // The mechanisms, each measured against the COMMON row.
+        // ------------------------------------------------------------------
+        let mut priced: Vec<(&str, usize, &str)> = Vec::new();
+
+        // (1) NARROWING A FIELD'S TYPE. Priced by giving the field a value that a sixteen-bit
+        // field could hold and re-encoding. If the encoding cared about the declared width this
+        // would move; it does not, because the value is already written in its smallest form.
+        let mut narrowed = hoisted[0].clone();
+        narrowed.routing_bucket = 8539; // already fits sixteen bits
+        assert_eq!(
+            common,
+            row(&narrowed),
+            "a value that fits sixteen bits already encodes as its smallest form, so declaring \
+             the field u16 cannot move the row",
+        );
+        priced.push(("narrow routing_bucket to u16", 0, "slot-preserving"));
+
+        // (2) PACKING kind, in_log AND deleted INTO ONE SLOT. Priced by measuring the three
+        // slots the row writes today against the one byte a bitfield would write. This is the
+        // candidate that looks cheap and is not: it takes the array from eleven slots to nine.
+        //
+        // THROUGH THE ADAPTER THE ROW ACTUALLY USES. `kind` is not written as a Rust enum --
+        // it goes through `item_kind_as_number`, and encoding the enum directly writes its
+        // variant NAME instead. The first version of this test did exactly that and the
+        // mechanism looked like a 6-byte win at 20% of the row, which is the cost of a slot
+        // nobody emits. The control below is that adapter pricing at one byte.
+        struct Kind<'a>(&'a IndexItemKind);
+        impl serde::Serialize for Kind<'_> {
+            fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+                item_kind_as_number(self.0, s)
+            }
+        }
+        let kind_slot = rmp_serde::to_vec(&Kind(&hoisted[0].kind)).expect("k").len();
+        assert_eq!(
+            1, kind_slot,
+            "the row writes `kind` as a number in one byte; this priced it at {kind_slot}, so it \
+             is not going through the adapter the row uses",
+        );
+        // THE `il` SLOT IS DERIVED NOW, so it is priced as the serializer writes it rather
+        // than read off a field.
+        let hoisted_in_log = hoisted[0]
+            .entry
+            .as_ref()
+            .map(|entry| entry.log_resident())
+            .unwrap_or(false);
+        let three_slots = kind_slot
+            + rmp_serde::to_vec(&hoisted_in_log).expect("l").len()
+            + rmp_serde::to_vec(&hoisted[0].deleted).expect("d").len();
+        let one_slot = rmp_serde::to_vec(&0u8).expect("packed").len();
+        priced.push((
+            "pack kind + in_log + deleted",
+            three_slots - one_slot,
+            "SLOT-REMOVING: eleven slots become nine, every written row stops decoding",
+        ));
+
+        // (3) HOISTING routing_bucket TO THE RECORD, the way the object key already is. The
+        // item keeps its slot and the writer puts a zero in it, so this is slot-preserving: an
+        // old row carries a real bucket and the restore, keyed on the RECORD field being
+        // present rather than on the item's zero, leaves it alone. No sentinel is spent, which
+        // matters because a zero IS a legal routing bucket.
+        let mut bucket_hoisted = hoisted[0].clone();
+        bucket_hoisted.routing_bucket = 0;
+        priced.push((
+            "hoist routing_bucket to the record",
+            common - row(&bucket_hoisted),
+            "slot-preserving; needs the record to carry it",
+        ));
+
+        println!("=== mechanisms, against a {common} B common row ===");
+        for (name, saving, note) in &priced {
+            println!(
+                "  {name:<34} {saving:>2} B  {:>5.1}%  {note}",
+                *saving as f64 / common as f64 * 100.0
+            );
+        }
+
+        // ------------------------------------------------------------------
+        // THE VERDICTS, as assertions so a change that makes one of them wrong fails here.
+        // ------------------------------------------------------------------
+
+        // Narrowing is worth nothing on the wire, and `what_every_byte_of_an_index_item_is_spent_on`
+        // has already shown it is worth nothing resident -- the tail holds 7 bytes of field in
+        // the 8 the aligner gives it, so every narrowing of a tail field rounds straight back.
+        assert_eq!(
+            0, priced[0].1,
+            "narrowing is supposed to be worth zero on the wire; it measured {} B",
+            priced[0].1,
+        );
+
+        // The bitfield is worth two bytes and costs the format. Stated as a bound rather than an
+        // equality: what matters is that it is small, not that it is exactly two.
+        assert!(
+            priced[1].1 <= 3,
+            "packing three one-byte slots into one cannot save more than 2 B; it measured {}",
+            priced[1].1,
+        );
+
+        // The hoist is the only one of the three that is both non-zero and slot-preserving.
+        assert!(
+            priced[2].1 > 0,
+            "hoisting the bucket must save something, or there is nothing to propose",
+        );
+        assert!(
+            priced[2].1 >= priced[0].1,
+            "the hoist is the surviving candidate and must beat the refuted one",
+        );
+
+        // AND THE ONE MECHANISM THAT IS NOT PRICED HERE, BECAUSE IT IS A CORRECTNESS BUG.
+        //
+        // Reading `size == 0` as a tombstone, and dropping the `deleted` flag, is unavailable in
+        // this encoding for a reason that has nothing to do with how many bytes it would save:
+        // `size == 0` IS ALREADY TAKEN. `strip_size_repeat` zeroes the field whenever it equals
+        // the address's length and `restore_size_repeat` reads that zero as "take the length
+        // from the address" -- so a zero size is what a LIVE row looks like after stripping,
+        // which is nearly every row. The assertion below is that collision, stated.
+        //
+        // The second collision is independent of the strip and is the one that loses data: a
+        // block that legitimately holds zero bytes has an address whose length is zero, so it
+        // restores to a zero size and would be read as a tombstone -- and a tombstone REMOVES
+        // the entry on replay. An empty value is a supported command shape, not a hypothetical;
+        // the WAL's own round-trip fixtures carry a case named for it.
+        let live = hoisted[0].clone();
+        assert_eq!(
+            4096,
+            live.entry
+                .as_ref()
+                .expect("a live row carries a payload")
+                .length(),
+            "a live row's length comes back from the address, which is what makes a zero size \
+             slot mean 'derivable' rather than 'deleted'",
+        );
+        // AND THE PROPERTY IS NOW TRIVIALLY TRUE RATHER THAN MERELY OBSERVED. The size slot is
+        // the sentinel for every row that has an address, so a zero there can only ever mean
+        // derivable -- it cannot also mean deleted, because it no longer varies at all.
+        assert!(
+            !hoisted[0].deleted,
+            "this row is live, and its zero size slot is the sentinel every live row carries",
+        );
+        assert!(
+            !hoisted[0].deleted,
+            "the row the assertion above is about must be a LIVE one for it to say anything",
+        );
+    }
+
+    /// THE HOISTED COMPONENTLESS ROW IS THIRTY BYTES, AND THE KIND SPELLING IS NOT A CONFOUND.
+    ///
+    /// # WHAT THIS ARM MEASURED, AND WHY THAT HALF IS DELETED RATHER THAN LEFT RED
+    ///
+    /// It was `what_a_container_elements_row_costs`, and it priced an element name on a delta row
+    /// at three name lengths -- 1, 16 and 64, the last crossing msgpack's fixstr boundary. All
+    /// three arms and all three verdicts are DELETED, because a row cannot carry an element name
+    /// any more: `IndexItem` has no such field and the encoder writes a constant nil into slot 5.
+    ///
+    /// THE RESULT IS WRITTEN HERE RATHER THAN LEFT AS A DELETION, because a deletion leaves a
+    /// reviewer nothing to read. What the three verdicts claimed was: a name is not free on any
+    /// arm; it is paid PER ROW at its own length plus a header, so between `length` and
+    /// `length + 2`; and at 64 characters the name alone outweighed the entire 30-byte
+    /// componentless row. The post-change measurement is that a 1-character name left the row at
+    /// 30 B against a 30 B control -- a delta of ZERO, which is what reddened the first verdict.
+    ///
+    /// AND THE 30 IS 29 NOW, WHICH IS A SECOND STEP AND NOT A RE-GOLDENING. The slot that held the
+    /// constant nil came off the row entirely -- `INDEX_ITEM_SLOTS` went twelve to eleven -- and a
+    /// msgpack nil is one byte, so the hoisted row is one byte shorter and nothing else about it
+    /// moved. The reason is written here because a baseline whose number changes without one is
+    /// exactly how a stale figure comes to be read as a measured one: the pin below is the thing
+    /// every row figure in this campaign is quoted against, so it has to say WHY it moved.
+    ///
+    /// THE PRE-CHANGE FIGURES ARE NOT QUOTED, AND THAT IS DELIBERATE. The arm was not re-run on
+    /// the base in this session, so the only numbers in hand are the BOUNDS its own assertions
+    /// stated, not measurements. Writing 2, 17 and 66 here because the bounds imply them would be
+    /// arithmetic wearing a measurement's clothes.
+    ///
+    /// # AND THE COST DID NOT VANISH, IT MOVED -- WHICH IS THE ACCOUNTING THAT MATTERS
+    ///
+    /// Zero per ROW is not zero. A container element's name is carried once per touched element in
+    /// the delta record's own `key_states` blobs, under `engine::CARRIED_CONTAINER_FIELDS`, beside
+    /// the address. So the charge moved from one copy per PAGE ENTRY to one copy per TOUCHED
+    /// ELEMENT per record, and anyone pricing it has to price it there. This arm does not measure
+    /// that, and says so rather than leaving a zero to be read as a saving.
+    ///
+    /// # WHAT SURVIVES, AND IT IS THE TWO CONTROLS
+    ///
+    /// The 30-byte pin and the kind-spelling control are unaffected by the removal -- both rows
+    /// were already componentless -- and both catch a real failure: a fixture that stopped
+    /// hoisting, or a strip that stopped firing, moves them. They are kept and the arm is renamed
+    /// to what it now does.
+    ///
+    /// EVERY ROW FIGURE THIS CAMPAIGN PUBLISHED WAS MEASURED ON A ROW WITH `component: None`.
+    /// 119 B unstripped and 55 B stripped come from `what_every_byte_of_an_index_item_is_spent_on`;
+    /// the hoisted common row comes from `what_the_remaining_index_item_mechanisms_are_worth`
+    /// directly above. All three fixtures build a `string` record, and a string record's block
+    /// names no element inside its object because there is no element -- those rows are
+    /// COMPONENTLESS.
+    ///
+    /// A CONTAINER ROW IS NOT. A hash field, a set member and a zset member each carry the
+    /// element's own name in the `component` slot, at the length of that name, ONCE PER ROW. So
+    /// the conclusion that was drawn from those figures -- that the identity still on a row is
+    /// down to a couple of bytes, so sharing it would buy nothing -- is a true statement about
+    /// the rows that were measured and says nothing at all about the rows that carry an element
+    /// name. This prices that difference.
+    ///
+    /// WHY THE CONTROL IS ASSERTED AND NOT MERELY PRINTED. A fixture that quietly stopped
+    /// hoisting, or a strip that stopped firing, moves every arm here in the same direction, and
+    /// three deltas against a moved baseline still read as plausible. So the componentless row is
+    /// built on this same fixture and asserted equal to the figure the campaign's own rows were
+    /// taken against, and the three arms are reported as deltas FROM it.
+    ///
+    /// AND THE KIND NAME IS ELIMINATED AS A CONFOUND IN THE SAME BREATH. The campaign's rows say
+    /// `string` in the model slot and a container row says `hash`, which is a different number of
+    /// characters -- so a second control re-measures the componentless row under `hash` and
+    /// asserts the two agree. They do, because both spellings go through
+    /// `model_id_as_number_when_it_is_known` and both are known; without this arm the element
+    /// deltas below would silently carry the model slot's difference as well.
+    #[test]
+    fn the_hoisted_row_is_twenty_nine_bytes_and_the_kind_spelling_is_not_a_confound() {
+        let shard: ShardId = 7;
+        let object_key = "tenant/7/object/000000123".to_string();
+
+        // The eight-blocks-of-one-object fixture of the mechanism pricing above, verbatim apart
+        // from the two things being varied: the model spelling and the element name.
+        // THE ELEMENT-NAME PARAMETER IS GONE, NOT RENAMED TO `_component`. It could no longer
+        // reach the row, so keeping it would have made the three arms below encode the SAME row
+        // three times and compare it with itself -- a fixture parameter that varies nothing, which
+        // is how an arm reads as a tree fact while asserting only its own setup. A caller that
+        // tries to name an element is now a compile error instead.
+        let row_of = |model: &str| -> usize {
+            let model_id = model.to_string();
+            let mut items: Vec<IndexItem> = (0..8u64)
+                .map(|index| {
+                    let address = crate::block_store::ElementEntry::from_parts(
+                        42,
+                        1_048_576 + index * 4096,
+                        4096,
+                        Some(index),
+                        None,
+                    );
+                    let mut item = IndexItem {
+                        kind: IndexItemKind::Block,
+                        routing_bucket: 8539,
+                        // `None`, NOT THE LOOP'S OWN NAME. The strip clears the stored handle
+                        // only on an exact match against a derivation that passes `None`, so
+                        // naming the element here would make it DECLINE and this fixture would
+                        // price a row carrying a whole composite key -- a shape no writer
+                        // produces.
+                        block_ref_key: block_ref_key_from_parts(
+                            &model_id,
+                            &object_key,
+                            None,
+                            address.block_slab_id(),
+                            address.offset(),
+                            address.length(),
+                            address.block_id().unwrap_or_default(),
+                            address.generation().unwrap_or_default(),
+                        ),
+                        object_key: object_key.clone().into(),
+                        model_id: model_id.clone(),
+                        object_id: crate::engine::hashing::stable_block_object_id(
+                            shard, &model_id, &object_key,
+                        ),
+                        // The three slots this used to state were its own derivation; the codec
+                        // computes them where they are written.
+                        entry: Some(address.clone()),
+                        deleted: false,
+                    };
+                    // The writer's order. The handle strip DERIVES from `object_key` AND from
+                    // `component`, so it fires for an element row exactly as it does for a
+                    // componentless one -- which is the only reason these arms are comparable.
+                    item.strip_block_ref_key_repeat();
+                    item.strip_size_repeat();
+                    item.strip_address_repeats();
+                    item.strip_object_id_repeat(shard);
+                    item
+                })
+                .collect();
+
+            // POSITIVE CONTROLS ON EVERY ARM, not once on the baseline. A row left unstripped is
+            // the cost of a writer that gave up, and it reads identically to an expensive element.
+            assert!(
+                items[0].block_ref_key.is_empty(),
+                "the composite-handle strip did not fire for model {model}",
+            );
+            assert!(
+                items[0].entry.is_some(),
+                "model {model} must carry a payload, so its size slot is the sentinel by \
+                 construction",
+            );
+            assert_eq!(
+                0, items[0].object_id,
+                "the object-id strip did not fire for model {model}",
+            );
+
+            // The record-level hoist, which is what makes this the COMMON row rather than the
+            // worst case. Checked before it is applied, so a fixture that stopped sharing the
+            // object key fails here instead of measuring a case nobody emits.
+            assert!(
+                items.iter().all(|i| i.object_key == items[0].object_key),
+                "eight blocks of one object must hoist, or this measures the wrong case",
+            );
+            for item in items.iter_mut() {
+                item.object_key = empty_object_key();
+            }
+
+            rmp_serde::to_vec(&items[0]).expect("encode a row").len()
+        };
+
+        // THE CONTROL: the componentless hoisted row every published figure in this campaign was
+        // measured against. 29, NOT 30, SINCE THE ELEMENT-NAME SLOT CAME OFF -- one byte of
+        // msgpack nil, written on every row of every kind, and now not written at all.
+        const CONTROL_ROW_BYTES: usize = 29;
+        let control = row_of("string");
+        assert_eq!(
+            CONTROL_ROW_BYTES, control,
+            "the componentless hoisted row measured {control} B, not the {CONTROL_ROW_BYTES} B \
+             the campaign's row figures were taken against. The fixture, the strips or the \
+             encoding has moved, and every delta below would be against the wrong baseline",
+        );
+
+        // THE SECOND CONTROL: the kind name is not what the deltas below are measuring.
+        let control_hash = row_of("hash");
+        assert_eq!(
+            control, control_hash,
+            "a componentless row costs {control} B under `string` and {control_hash} B under \
+             `hash`, so the model slot differs between the campaign's fixture and a container's \
+             and the element deltas below would carry that difference too",
+        );
+
+        println!("=== the hoisted componentless row ===");
+        println!("  string  {control} B");
+        println!("  hash    {control_hash} B");
+        println!(
+            "  the three element-name arms that stood here are deleted: a row cannot carry an \
+             element name, and their result is recorded in this arm's doc"
+        );
+    }
+
+
+
+    /// Append a binary-framed record carrying a msgpack payload, after whatever is already in
+    /// the log. Returns the path so a test can measure the file.
+    #[cfg(test)]
+    fn append_binary_framed(dir: &std::path::Path, record: &IndexDeltaRecord) -> PathBuf {
+        let mut packed = Vec::new();
+        let mut serializer = rmp_serde::Serializer::new(&mut packed).with_struct_map();
+        serde::Serialize::serialize(record, &mut serializer).unwrap();
+        let mut payload =
+            vec![index_container_byte(INDEX_LOG_CODEC_MSGPACK, INDEX_LOG_SHAPE_DELTA)];
+        payload.extend_from_slice(&packed);
+
+        let path = index_log_path(dir, record.shard_id);
+        let mut file = OpenOptions::new().create(true).append(true).open(&path).unwrap();
+        file.write_all(&crate::log_framing::encode_frame(&payload)).unwrap();
+        file.sync_all().unwrap();
+        path
+    }
+
+    /// A record carrying a raw newline inside its payload must still be read whole.
+    ///
+    /// Sequence 10 encodes as the single byte 0x0A -- a literal newline sitting in the middle
+    /// of a record. A reader that finds record boundaries by scanning for '\n' cuts this
+    /// record in half; one that takes the length the frame declares does not. This is the
+    /// whole reason every read path had to stop splitting on newlines BEFORE a binary payload
+    /// could ever be written: with the old reader this record is unreadable, and the sequence
+    /// tail scan would have trimmed it off the end of the file as a torn append.
+    #[test]
+    fn a_record_whose_payload_holds_a_newline_byte_is_read_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        store
+            .append_delta(3, vec![block_item(1, "first", false)], Vec::new(), Some(1), None, true, true)
+            .unwrap();
+        drop(store);
+
+        let record = IndexDeltaRecord {
+            shard_id: 3,
+            sequence: 10,
+            items: vec![block_item(2, "second", false)],
+            meta: None,
+            applied_wal_sequence: Some(2),
+            upsert: true,
+            key_states: Vec::new(),
+            shared_object_key: None,
+        };
+        let path = append_binary_framed(dir.path(), &record);
+        let on_disk = std::fs::read(&path).unwrap();
+        assert!(
+            on_disk.windows(1).any(|b| b == b"\n"),
+            "the log must contain a newline byte for this test to mean anything"
+        );
+
+        let reopened = LocalIndexLogStore::new(dir.path());
+        let records = reopened.read_delta_records(3, 0).unwrap();
+        assert_eq!(records.len(), 2, "both records must survive: {records:?}");
+        assert_eq!(records[1].sequence, 10);
+        assert_eq!(records[1].items[0].block_ref_key, "second");
+        assert_eq!(records[1].applied_wal_sequence, Some(2));
+    }
+
+    /// The tail scan trims the file back to its last whole record. Given a record it cannot
+    /// find the end of, it would trim a durable record away -- so this pins that it does not.
+    #[test]
+    fn the_tail_scan_does_not_trim_a_whole_binary_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        store
+            .append_delta(4, vec![block_item(1, "a", false)], Vec::new(), Some(1), None, true, true)
+            .unwrap();
+        drop(store);
+
+        let record = IndexDeltaRecord {
+            shard_id: 4,
+            sequence: 10,
+            items: vec![block_item(2, "b", false)],
+            meta: None,
+            applied_wal_sequence: Some(2),
+            upsert: true,
+            key_states: Vec::new(),
+            shared_object_key: None,
+        };
+        let path = append_binary_framed(dir.path(), &record);
+        let before = std::fs::metadata(&path).unwrap().len();
+
+        // `scan` drives last_sequence_at, which is the path that truncates.
+        let reopened = LocalIndexLogStore::new(dir.path());
+        reopened.scan(4, 0, u64::MAX, u64::MAX).unwrap();
+
+        let after = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(after, before, "the tail scan trimmed a whole record");
+        assert_eq!(reopened.read_delta_records(4, 0).unwrap().len(), 2);
+    }
+
+    /// `scan_bounded` hands the caller each record's raw framed bytes to ship onward, so its
+    /// idea of where a record ends has to be the writer's. A newline slice would hand on half
+    /// a record, and the half would still look like a plausible one.
+    #[test]
+    fn scan_bounded_hands_back_whole_records_not_newline_slices() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        store
+            .append_delta(6, vec![block_item(1, "a", false)], Vec::new(), Some(1), None, true, true)
+            .unwrap();
+        drop(store);
+
+        let record = IndexDeltaRecord {
+            shard_id: 6,
+            sequence: 10,
+            items: vec![block_item(2, "b", false)],
+            meta: None,
+            applied_wal_sequence: Some(2),
+            upsert: true,
+            key_states: Vec::new(),
+            shared_object_key: None,
+        };
+        append_binary_framed(dir.path(), &record);
+
+        let reopened = LocalIndexLogStore::new(dir.path());
+        let (rows, truncated) = reopened.scan_bounded(6, 0, u64::MAX, u64::MAX).unwrap();
+        assert!(!truncated, "the whole log fits in the budget");
+        assert_eq!(rows.len(), 2, "one row per record");
+
+        // The binary row must be a complete frame on its own, and decode to what was written.
+        let (consumed, payload) = crate::log_framing::next_frame(&rows[1].1)
+            .unwrap()
+            .expect("the row must be a whole frame");
+        assert_eq!(consumed, rows[1].1.len(), "the row is exactly one record");
+        let back: IndexDeltaRecord = decode_index_payload(payload).unwrap();
+        assert_eq!(back, record);
+    }
+
+    /// A torn binary tail -- a crash partway through an append -- is trimmed, not reported as
+    /// corruption. The distinction matters: trimming committed damage loses durable records,
+    /// and erroring on a torn tail wedges a node that merely crashed at the wrong moment.
+    #[test]
+    fn a_torn_binary_tail_is_trimmed_rather_than_called_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        store
+            .append_delta(8, vec![block_item(1, "a", false)], Vec::new(), Some(1), None, true, true)
+            .unwrap();
+        drop(store);
+
+        let record = IndexDeltaRecord {
+            shard_id: 8,
+            sequence: 10,
+            items: vec![block_item(2, "b", false)],
+            meta: None,
+            applied_wal_sequence: Some(2),
+            upsert: true,
+            key_states: Vec::new(),
+            shared_object_key: None,
+        };
+        let path = append_binary_framed(dir.path(), &record);
+        let whole = std::fs::metadata(&path).unwrap().len();
+
+        // Chop the last few bytes: the frame now declares more than the file holds.
+        let file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(whole - 3).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+
+        let reopened = LocalIndexLogStore::new(dir.path());
+        let records = reopened
+            .read_delta_records(8, 0)
+            .expect("a torn tail is not corruption");
+        assert_eq!(records.len(), 1, "the torn record is dropped, the whole one kept");
+        assert_eq!(records[0].items[0].block_ref_key, "a");
+    }
+
+
+    /// End to end: what the store writes now is a container in a binary frame, and it reads
+    /// back. The unit tests above encode and decode by hand; this one goes through the append
+    /// path, the file, and the fold -- which is where a mismatch between writer and reader
+    /// would actually show up.
+    #[test]
+    fn a_record_written_now_is_a_container_and_still_folds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        store
+            .append_delta(9, vec![block_item(1, "a", false)], Vec::new(), Some(1), None, true, true)
+            .unwrap();
+        store
+            .append_delta(9, vec![block_item(2, "b", false)], Vec::new(), Some(2), None, true, true)
+            .unwrap();
+        drop(store);
+
+        let path = index_log_path(dir.path(), 9);
+        let raw = std::fs::read(&path).unwrap();
+        assert_eq!(
+            raw.first(),
+            Some(&crate::log_framing::FRAME_MAGIC_V3),
+            "the record carries the binary frame"
+        );
+        assert!(
+            raw.iter().any(|byte| {
+                let (codec, shape) = index_container_parts(*byte);
+                (codec == INDEX_LOG_CODEC_MSGPACK || codec == INDEX_LOG_CODEC_MSGPACK_ZSTD)
+                    && (shape == INDEX_LOG_SHAPE_WHOLE || shape == INDEX_LOG_SHAPE_DELTA)
+            }),
+            "the payload carries a container byte"
+        );
+        assert!(
+            !raw.starts_with(b"#tsf2 "),
+            "nothing should still be writing the text frame"
+        );
+
+        let reopened = LocalIndexLogStore::new(dir.path());
+        let records = reopened.read_delta_records(9, 0).unwrap();
+        assert_eq!(records.len(), 2, "both records fold back: {records:?}");
+        assert_eq!(records[0].items[0].block_ref_key, "a");
+        assert_eq!(records[1].items[0].block_ref_key, "b");
+        assert_eq!(records[1].applied_wal_sequence, Some(2));
+    }
+
+
+    /// GC decodes EVERY record as an IndexLogRecord -- including delta records, of which it
+    /// reads only `sequence`. A container that mis-read that one field would make GC retain
+    /// everything while reporting nothing reclaimable.
+    #[test]
+    fn a_delta_container_still_reads_as_a_whole_index_record_for_gc() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        for i in 1..=3u64 {
+            store
+                .append_delta(5, vec![block_item(1, "k", false)], Vec::new(), Some(i), None, true, true)
+                .unwrap();
+        }
+        drop(store);
+
+        let contents = std::fs::read(index_log_path(dir.path(), 5)).unwrap();
+        let records = split_records(&contents);
+        assert_eq!(records.len(), 3, "three records on disk");
+
+        let sequences: Vec<u64> = records
+            .iter()
+            .map(|raw| {
+                let payload = crate::log_framing::next_frame(raw).unwrap().unwrap().1;
+                // What the sweep actually reads: the head of the record, whichever shape it
+                // is. A delta no longer decodes as a whole-index record -- rows carry no names to
+                // match on -- and the head is what made that unnecessary.
+                let record: IndexRecordHead = decode_index_payload(payload)
+                    .expect("a delta container must still answer for its sequence");
+                record.sequence
+            })
+            .collect();
+        assert_eq!(sequences, vec![1, 2, 3], "GC must see the real sequences");
+    }
+
+    /// The load-path fold's own test, CALLED rather than copied, so the piece-level decline and
+    /// the per-record one are literally the same predicate.
+    ///
+    /// This used to be a transcription of `fold_index_log_deltas`'s first three lines, under a
+    /// comment claiming it could not drift from them. It drifted: the fold read a missing anchor
+    /// as anchor 0 and so did this, after #1842 had already stopped the piece name from doing so.
+    fn load_path_applies(record: &IndexDeltaRecord, base_anchor: u64) -> bool {
+        !super::delta_record_is_reflected_by(record, base_anchor)
+    }
+
+    /// Fold a log the two ways and report what each cost, for a given base anchor.
+    fn fold_both_ways(
+        store: &LocalIndexLogStore,
+        shard_id: ShardId,
+        base_anchor: u64,
+    ) -> (Vec<u64>, u64, Vec<u64>, u64, u64) {
+        probe::reset();
+        let mut opening_everything = Vec::new();
+        store
+            .for_each_delta_record(shard_id, 0, |record| {
+                if load_path_applies(&record, base_anchor) {
+                    opening_everything.push(record.sequence);
+                }
+            })
+            .unwrap();
+        let frames_opening_everything = probe::fold_frames_read();
+
+        probe::reset();
+        let mut declining = Vec::new();
+        store
+            .for_each_delta_record_above_anchor(shard_id, 0, base_anchor, |record| {
+                if load_path_applies(&record, base_anchor) {
+                    declining.push(record.sequence);
+                }
+            })
+            .unwrap();
+        (
+            opening_everything,
+            frames_opening_everything,
+            declining,
+            probe::fold_frames_read(),
+            probe::fold_pieces_declined(),
+        )
+    }
+
+    /// Append `records` anchored deltas whose anchors CLIMB, so the pieces do not all name the
+    /// same thing.
+    ///
+    /// ONE store handle for the whole fixture, not one per append: the handle caches the shard's
+    /// last sequence, and a fresh handle re-derives it by reading the piece being written from
+    /// the start -- which makes building an n-record fixture cost n-squared frame reads.
+    fn climbing_anchor_log(
+        store: &LocalIndexLogStore,
+        shard_id: ShardId,
+        records: usize,
+    ) {
+        for value in 0..records {
+            store
+                .append_delta(
+                    shard_id,
+                    vec![block_item(
+                        (value % 64) as u32,
+                        &format!("tenant/1/object/{value:08}"),
+                        false,
+                    )],
+                    Vec::new(),
+                    // The anchor climbs with the record, so successive pieces name successively
+                    // higher anchors and a base anchor can fall BETWEEN two pieces. A fixture
+                    // whose pieces all named one anchor could not tell a correct decision from a
+                    // constant one.
+                    Some(value as u64 + 1),
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap();
+        }
+    }
+
+    /// THE DIRECTION THAT LOSES DATA: what the load path APPLIES must not move.
+    ///
+    /// A wrong piece-level decision fails one way silently and one way loudly. Declining a piece
+    /// that still holds a record the fold would apply loses an eviction recorded only in that
+    /// delta, and the load reports success -- invisible. Opening a piece that could have been
+    /// declined is merely slow. So the assertion that matters is an EQUALITY on the records
+    /// handed back, not an inequality on the cost; the cost is taken as a separate half, after.
+    ///
+    /// The fixture has to be able to express the defect, which takes three things and each is
+    /// floored rather than hoped for: more than one sealed piece, pieces that do NOT all name
+    /// the same anchor, and a base anchor that falls strictly inside the range they name -- so
+    /// some pieces are declinable, some are not, and a decline of "all" or "none" fails.
+    #[test]
+    fn declining_a_piece_changes_nothing_about_what_the_load_path_applies() {
+        let _rolling = roll_at(4 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        const RECORDS: usize = 3_000;
+        let store = LocalIndexLogStore::new(dir.path());
+        climbing_anchor_log(&store, 11, RECORDS);
+
+        let spans: Vec<IndexSegmentSpan> = index_log_segment_paths(dir.path(), 11)
+            .iter()
+            .filter_map(|path| sealed_index_log_span(path, 11))
+            .collect();
+        // DENOMINATOR ONE: more than one piece. A single-piece log cannot express a per-piece
+        // decision at all.
+        assert!(
+            spans.len() >= 4,
+            "fixture sealed {} pieces -- a per-piece decision needs several",
+            spans.len()
+        );
+        // DENOMINATOR TWO: the pieces are not identical in the dimension the decline keys on.
+        let distinct_anchors: std::collections::BTreeSet<u64> =
+            spans.iter().map(|span| span.max_applied_wal).collect();
+        assert!(
+            distinct_anchors.len() >= 4,
+            "every piece names the same anchor ({distinct_anchors:?}) -- this fixture cannot \
+             tell a correct decision from a constant one"
+        );
+
+        // DENOMINATOR THREE: a base anchor STRICTLY INSIDE what the pieces name, so the right
+        // answer is neither "decline everything" nor "decline nothing".
+        let lowest = *distinct_anchors.iter().next().unwrap();
+        let highest = *distinct_anchors.iter().next_back().unwrap();
+        let base_anchor = lowest + (highest - lowest) / 2;
+        assert!(
+            base_anchor > lowest && base_anchor < highest,
+            "base anchor {base_anchor} is not strictly inside the named range {lowest}..{highest}"
+        );
+
+        let (everything, frames_everything, declining, frames_declining, declined) =
+            fold_both_ways(&store, 11, base_anchor);
+
+        println!(
+            "index-log replay fold at base anchor {base_anchor}: opening every piece = {} frames \
+             / {} applied | declining = {} frames / {} applied / {} of {} sealed pieces declined",
+            frames_everything,
+            everything.len(),
+            frames_declining,
+            declining.len(),
+            declined,
+            spans.len(),
+        );
+
+        // HALF ONE, AND IT IS THE POINT: the records the load path applies are IDENTICAL. Not a
+        // count -- the sequences themselves, in order, so a decline that dropped one record and
+        // duplicated another would still fail.
+        assert_eq!(
+            declining, everything,
+            "declining pieces changed WHICH records the load path applies -- this is the silent \
+             direction"
+        );
+        // HALF TWO, ORDERED AFTER IT AND NON-VACUOUS: something was actually applied, so half
+        // one is not an equality between two empty lists.
+        assert!(
+            !everything.is_empty(),
+            "the fold applied nothing at all -- half one compared two empty lists"
+        );
+        // HALF THREE: and it cost less. Some pieces were declined, and not all of them.
+        assert!(
+            declined > 0 && (declined as usize) < spans.len(),
+            "expected a strict subset of {} pieces to be declined, got {declined}",
+            spans.len()
+        );
+        assert!(
+            frames_declining < frames_everything,
+            "the decline read {frames_declining} frames against {frames_everything} -- it saved \
+             nothing"
+        );
+    }
+
+    /// A PIECE NO DUMP CAN REFLECT IS NEVER DECLINED, EVEN AT THE TOP BASE ANCHOR.
+    ///
+    /// `INDEX_SEGMENT_UNREFLECTED` is `u64::MAX`, so a comparison alone would decline such a
+    /// piece at exactly one base anchor: `u64::MAX` itself. That value is not reachable by a
+    /// deployment, which is precisely why it must be excluded by the CODE and not by the
+    /// deployment -- the same reasoning #1842 used to keep the sweep off these pieces.
+    ///
+    /// This is the boundary value, and it is the one a mutant that drops the
+    /// `!= INDEX_SEGMENT_UNREFLECTED` clause fails.
+    #[test]
+    fn a_piece_no_dump_reflects_is_read_even_at_the_top_base_anchor() {
+        let _rolling = roll_at(0);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        const ROUNDS: usize = 16;
+        for round in 0..ROUNDS {
+            store
+                .append_delta(
+                    12,
+                    Vec::new(),
+                    vec![serde_json::json!({ "key": format!("expired-{round:03}") })],
+                    None,
+                    None,
+                    false,
+                    false,
+                )
+                .unwrap();
+        }
+        let active_len = index_log_path(dir.path(), 12).metadata().unwrap().len();
+        assert!(active_len > 0, "fixture wrote nothing");
+        set_index_log_segment_bytes_for_test(Some(active_len));
+        store
+            .append_delta(12, Vec::new(), Vec::new(), Some(9), Some(MetaItem::default()), false, false)
+            .unwrap();
+
+        // DENOMINATOR: exactly one sealed piece, and it names the saturated anchor. Without
+        // this the test below would pass against a piece naming a small anchor.
+        let spans: Vec<IndexSegmentSpan> = index_log_segment_paths(dir.path(), 12)
+            .iter()
+            .filter_map(|path| sealed_index_log_span(path, 12))
+            .collect();
+        assert_eq!(spans.len(), 1, "fixture must seal exactly one piece: {spans:?}");
+        assert_eq!(
+            spans[0].max_applied_wal, INDEX_SEGMENT_UNREFLECTED,
+            "fixture piece does not name the saturated anchor: {spans:?}"
+        );
+
+        probe::reset();
+        let mut tombstones = 0usize;
+        store
+            .for_each_delta_record_above_anchor(12, 0, u64::MAX, |record| {
+                if !record.key_states.is_empty() {
+                    tombstones += 1;
+                }
+            })
+            .unwrap();
+        let declined = probe::fold_pieces_declined();
+        println!(
+            "unreflectable piece at base anchor u64::MAX: {declined} declined, {tombstones} of \
+             {ROUNDS} expiry checkpoints read"
+        );
+        assert_eq!(
+            declined, 0,
+            "a piece naming the saturated anchor was declined at base anchor u64::MAX"
+        );
+        assert_eq!(
+            tombstones, ROUNDS,
+            "the fold read {tombstones} of {ROUNDS} anchor-less checkpoints"
+        );
+    }
+
+    /// THE BOUNDARY ON THE COMPARISON ITSELF: at the named anchor, declined; one below it, read.
+    ///
+    /// The piece holds `start..end` and names the highest anchor any record in it carries. A base
+    /// AT that anchor reflects every record in the piece, so it may go unread; a base ONE BELOW
+    /// it does not reflect the last record, so the piece must be opened. A mutant that turns the
+    /// `<=` into `<` fails the first half; one that turns it into `>=` or drops the comparison
+    /// fails the second.
+    #[test]
+    fn a_piece_is_declined_at_the_anchor_it_names_and_read_one_below_it() {
+        let _rolling = roll_at(4 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        climbing_anchor_log(&store, 13, 2_000);
+
+        let spans: Vec<IndexSegmentSpan> = index_log_segment_paths(dir.path(), 13)
+            .iter()
+            .filter_map(|path| sealed_index_log_span(path, 13))
+            .collect();
+        assert!(spans.len() >= 2, "fixture sealed {} pieces", spans.len());
+        // The FIRST piece's named anchor is the boundary under test: at it, that piece and
+        // nothing else is declinable.
+        let named = spans[0].max_applied_wal;
+        assert!(named > 1, "first piece names anchor {named} -- no room below it");
+
+        probe::reset();
+        store
+            .for_each_delta_record_above_anchor(13, 0, named, |_| {})
+            .unwrap();
+        let at_the_anchor = probe::fold_pieces_declined();
+
+        probe::reset();
+        store
+            .for_each_delta_record_above_anchor(13, 0, named - 1, |_| {})
+            .unwrap();
+        let one_below = probe::fold_pieces_declined();
+
+        println!(
+            "boundary at the anchor a piece names ({named}): declined {at_the_anchor} at it, \
+             {one_below} one below it, over {} sealed pieces",
+            spans.len()
+        );
+        assert_eq!(
+            at_the_anchor, 1,
+            "a base AT the anchor the first piece names declined {at_the_anchor} pieces, expected 1"
+        );
+        assert_eq!(
+            one_below, 0,
+            "a base ONE BELOW the anchor the first piece names declined {one_below} pieces -- \
+             that piece still holds a record the base does not reflect"
+        );
+    }
+
+    /// THE PIECE BEING WRITTEN IS NEVER DECLINED, AT ANY BASE ANCHOR.
+    ///
+    /// It carries no numbers in its name, so there is nothing to decide from -- and it is the one
+    /// piece that certainly holds records no dump has reflected, because it is still being
+    /// appended to. A decline that reached it would drop the newest writes on every restore,
+    /// which is the worst version of the silent direction.
+    ///
+    /// A base anchor of `u64::MAX` is above every record in the log, so every SEALED piece is
+    /// declinable here and only the active one can account for what is read.
+    #[test]
+    fn the_piece_being_written_is_never_declined() {
+        let _rolling = roll_at(4 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        climbing_anchor_log(&store, 14, 2_000);
+
+        let spans: Vec<IndexSegmentSpan> = index_log_segment_paths(dir.path(), 14)
+            .iter()
+            .filter_map(|path| sealed_index_log_span(path, 14))
+            .collect();
+        let active_records = {
+            let mut count = 0usize;
+            let mut tally = IndexLogReadTally::start();
+            let file = open_index_log_read(&index_log_path(dir.path(), 14), &mut tally).unwrap();
+            let mut reader = BufReader::new(file);
+            while let Some((_, payload)) = crate::log_framing::read_frame(&mut reader).unwrap() {
+                if !payload.iter().all(|byte| byte.is_ascii_whitespace()) {
+                    count += 1;
+                }
+            }
+            count
+        };
+        // DENOMINATOR: the active piece must hold something, or "it was still read" is vacuous.
+        assert!(
+            active_records > 0,
+            "the piece being written holds no record -- there is nothing for this to be about"
+        );
+        assert!(!spans.is_empty(), "fixture sealed no piece");
+
+        probe::reset();
+        let mut taken = 0usize;
+        store
+            .for_each_delta_record_above_anchor(14, 0, u64::MAX, |_| taken += 1)
+            .unwrap();
+        let declined = probe::fold_pieces_declined();
+        let frames = probe::fold_frames_read();
+        println!(
+            "at base anchor u64::MAX: {declined} of {} sealed pieces declined, {frames} frames \
+             read, {taken} records taken, active piece holds {active_records}",
+            spans.len()
+        );
+        assert_eq!(
+            declined as usize,
+            spans.len(),
+            "every sealed piece is below u64::MAX and should have been declined"
+        );
+        assert_eq!(
+            frames as usize, active_records,
+            "the frames read must be exactly the piece being written: {frames} against \
+             {active_records}"
+        );
+        assert_eq!(
+            taken, active_records,
+            "the piece being written was not handed over whole: {taken} of {active_records}"
+        );
+    }
+
+    /// A LOG WHOSE PIECES NAME ANCHOR 0 IS NEVER DECLINED, BY ANY CALLER.
+    ///
+    /// `base_anchor > 0` looks like a defensive clause and is not. A whole-index log names 0 in
+    /// EVERY piece -- `how_many_sealed_pieces_name_anchor_zero` measures exactly that -- so
+    /// without the guard `0 <= 0` is true and every piece of such a log is declined by every
+    /// caller, including the two that pass no anchor at all and are supposed to read the log
+    /// whole.
+    ///
+    /// The fixture is the one that can express it: a log built from `append_json`, which writes
+    /// whole-index records that carry no anchor by construction. A fixture of anchored deltas
+    /// names nothing 0 and cannot tell the guard from a constant.
+    #[test]
+    fn a_log_whose_pieces_name_anchor_zero_is_never_declined() {
+        let _rolling = roll_at(4 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        const RECORDS: usize = 3_000;
+        for value in 0..RECORDS {
+            store
+                .append_json(15, format!("{{\"value\":\"{value:08}\"}}").as_bytes())
+                .unwrap();
+        }
+
+        // DENOMINATOR: several sealed pieces, and EVERY one of them names anchor 0. Without this
+        // the assertions below would hold for a log that simply had nothing declinable in it.
+        let spans: Vec<IndexSegmentSpan> = index_log_segment_paths(dir.path(), 15)
+            .iter()
+            .filter_map(|path| sealed_index_log_span(path, 15))
+            .collect();
+        assert!(spans.len() >= 4, "fixture sealed {} pieces", spans.len());
+        let naming_zero = spans.iter().filter(|span| span.max_applied_wal == 0).count();
+        assert_eq!(
+            naming_zero,
+            spans.len(),
+            "fixture must name every piece 0 or it cannot express this: {spans:?}"
+        );
+
+        // The two entry points that pass no anchor, and the anchor-aware one at a base of 0 --
+        // which is what an absent or empty base gives it.
+        probe::reset();
+        store.for_each_delta_record(15, 0, |_| {}).unwrap();
+        let plain = (probe::fold_pieces_declined(), probe::fold_frames_read());
+        probe::reset();
+        store.read_delta_records(15, 0).unwrap();
+        let collecting = (probe::fold_pieces_declined(), probe::fold_frames_read());
+        probe::reset();
+        store
+            .for_each_delta_record_above_anchor(15, 0, 0, |_| {})
+            .unwrap();
+        let at_zero = (probe::fold_pieces_declined(), probe::fold_frames_read());
+
+        println!(
+            "a log of {RECORDS} whole-index records in {} pieces, every piece naming anchor 0: \
+             for_each_delta_record = {} declined / {} frames | read_delta_records = {} declined / \
+             {} frames | at base anchor 0 = {} declined / {} frames",
+            spans.len(),
+            plain.0,
+            plain.1,
+            collecting.0,
+            collecting.1,
+            at_zero.0,
+            at_zero.1,
+        );
+
+        // THE APPARATUS FLOOR, FIRST: all three walks must have read the log, or three zeroes in
+        // the declined column mean only that nothing ran.
+        assert_eq!(
+            plain.1 as usize, RECORDS,
+            "APPARATUS: the plain walk read {} frames of {RECORDS}",
+            plain.1
+        );
+        assert_eq!(collecting.1 as usize, RECORDS, "APPARATUS: the collecting walk");
+        assert_eq!(at_zero.1 as usize, RECORDS, "APPARATUS: the walk at base anchor 0");
+        // THE CLAIM: nothing was declined anywhere. A base at anchor 0 is no base at all.
+        assert_eq!(plain.0, 0, "for_each_delta_record declined {} pieces", plain.0);
+        assert_eq!(collecting.0, 0, "read_delta_records declined {} pieces", collecting.0);
+        assert_eq!(
+            at_zero.0, 0,
+            "a base anchor of 0 declined {} pieces -- an absent base reflects nothing, and every \
+             piece of a whole-index log names 0",
+            at_zero.0
+        );
+    }
+
+    /// THE CONTINUITY WATERMARK CROSSES A DECLINED PIECE, TAKEN FROM ITS NAME.
+    ///
+    /// The fold refuses a delta stream whose sequences do not strictly climb, and that refusal is
+    /// what stops a holed stream being folded as though it were whole. A declined piece is not
+    /// read, so the records inside it cannot advance the watermark -- and if nothing else does,
+    /// the first record AFTER the declined piece is compared against a watermark from BEFORE it,
+    /// which passes sequences that overlap the piece just declined.
+    ///
+    /// The piece's name says the sequence one past its last record, so the watermark is carried
+    /// across from there instead. This test makes the two answers differ: the first piece is
+    /// renamed so its name claims a span reaching past every later record, which is exactly the
+    /// shape an overlap has. With the watermark carried, the fold refuses. Without it, the fold
+    /// accepts a stream whose sequences run backwards across the boundary.
+    ///
+    /// The rename is the only way to build this: the writer cannot produce an overlapping pair,
+    /// which is the point -- the check exists for a log that has been damaged, and damage has to
+    /// be applied from outside.
+    #[test]
+    fn the_continuity_watermark_crosses_a_declined_piece_from_its_name() {
+        let _rolling = roll_at(4 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let store = LocalIndexLogStore::new(dir.path());
+        const RECORDS: usize = 1_500;
+        climbing_anchor_log(&store, 16, RECORDS);
+
+        let sealed: Vec<PathBuf> = index_log_segment_paths(dir.path(), 16)
+            .into_iter()
+            .filter(|path| sealed_index_log_span(path, 16).is_some())
+            .collect();
+        assert!(sealed.len() >= 3, "fixture sealed {} pieces", sealed.len());
+        let first = sealed[0].clone();
+        let span = sealed_index_log_span(&first, 16).unwrap();
+
+        // THE CONTROL, AND IT RUNS FIRST: undamaged, at a base anchor that declines this piece,
+        // the fold succeeds. Without this the refusal below could be the fixture rather than the
+        // overlap.
+        let base_anchor = span.max_applied_wal;
+        assert!(base_anchor > 0, "the first piece names anchor 0: {span:?}");
+        probe::reset();
+        store
+            .for_each_delta_record_above_anchor(16, 0, base_anchor, |_| {})
+            .expect("CONTROL: an undamaged log must fold");
+        let declined_clean = probe::fold_pieces_declined();
+        assert!(
+            declined_clean > 0,
+            "CONTROL: nothing was declined at base anchor {base_anchor}, so the watermark never \
+             had to cross anything"
+        );
+
+        // THE DAMAGE. The name now claims the piece holds every sequence in the log, which
+        // overlaps every later piece. Only the name changes; the bytes are untouched.
+        let widened = IndexSegmentSpan {
+            start: span.start,
+            end: (RECORDS as u64) + 1,
+            max_applied_wal: span.max_applied_wal,
+        };
+        assert!(
+            widened.end > span.end,
+            "the widened name {widened:?} does not overlap anything: {span:?}"
+        );
+        let damaged = sealed_index_log_path(dir.path(), 16, widened);
+        fs::rename(&first, &damaged).unwrap();
+
+        probe::reset();
+        let outcome = store.for_each_delta_record_above_anchor(16, 0, base_anchor, |_| {});
+        let declined_damaged = probe::fold_pieces_declined();
+        println!(
+            "continuity across a declined piece: clean fold declined {declined_clean} and \
+             succeeded; with the first piece renamed {:?} -> {:?} the fold declined \
+             {declined_damaged} and returned {}",
+            span,
+            widened,
+            match &outcome {
+                Ok(()) => "Ok".to_string(),
+                Err(err) => format!("Err({err})"),
+            }
+        );
+
+        // FLOOR: the damaged run must still have declined the piece, or the watermark was never
+        // asked to cross it and this test is about nothing.
+        assert!(
+            declined_damaged > 0,
+            "the damaged run declined nothing, so the carried watermark was never exercised"
+        );
+        match outcome {
+            Ok(()) => panic!(
+                "the fold accepted a stream whose later pieces overlap the span the declined \
+                 piece NAMES. The watermark did not cross it, so every record after the declined \
+                 piece was checked against a watermark from before it"
+            ),
+            Err(err) => {
+                let text = err.to_string();
+                assert!(
+                    text.contains("continuity"),
+                    "the fold refused, but not for continuity: {text}"
+                );
+            }
+        }
+    }
+
+    /// The byte offset just past each of the twelve slots of `A_STORED_ROW_THAT_NAMES_ITS_ELEMENT`.
+    ///
+    /// THAT CONST IS REUSED RATHER THAN RE-CAPTURED. It already holds 44 bytes of a positional row
+    /// a previous build stored, with its capture helper beside it as provenance, and it is a
+    /// golden recording YESTERDAY'S INPUT -- the kind whose bytes must not move. One fixture, three
+    /// statements about it, and no second copy of the literal to drift.
+    ///
+    /// TWELVE, STILL, AND THAT IS NOT A STALE NUMBER. It describes the GOLDEN, which is a stored
+    /// row of the shape this step retired. The row the WRITER emits is eleven slots, and the
+    /// fixture for that shape is derived from this table by
+    /// [`the_golden_without_its_element_name`] -- so the one place twelve and eleven meet is the
+    /// excision, and it is checked against the writer rather than asserted.
+    ///
+    /// NOT TRUSTED, CHECKED. The test below rebuilds every prefix from these and asserts each one
+    /// decodes as an array whose elements are the full row's own leading elements, so an offset
+    /// that does not land on an element boundary fails there rather than producing a row that is
+    /// short for the wrong reason.
+    const SLOT_ENDS: [usize; 12] = [2, 5, 6, 19, 20, 23, 24, 25, 41, 42, 43, 44];
+
+    /// The leading `slots` elements of `row`, as a well-formed msgpack array.
+    ///
+    /// The fixarray header is REWRITTEN rather than left alone, which is what makes this a short
+    /// ROW and not a truncated FILE: a byte-truncated row keeps its original header and fails on a
+    /// marker it cannot read, which was never the defect.
+    ///
+    /// `ends` is the offset table FOR THAT ROW, passed in rather than read off a constant, because
+    /// there are two shapes in play now -- the twelve-slot golden and the eleven-slot row the
+    /// writer emits -- and a helper that silently used the golden's table on the current row would
+    /// cut at the wrong bytes and still produce something that decodes.
+    fn leading_slots_of(row: &[u8], ends: &[usize], slots: usize) -> Vec<u8> {
+        assert_eq!(
+            0x90 | ends.len() as u8,
+            row[0],
+            "the row's header does not declare the {} slots its offset table describes",
+            ends.len()
+        );
+        assert!((1..=15).contains(&slots), "a fixarray header can only say 0..=15");
+        assert!(slots <= ends.len(), "there is no slot {slots} to stop after");
+        let mut out = Vec::with_capacity(1 + ends[slots - 1]);
+        out.push(0x90 | slots as u8);
+        out.extend_from_slice(&row[1..ends[slots - 1]]);
+        out
+    }
+
+    /// THE GOLDEN WITH ITS ELEMENT-NAME SLOT EXCISED: the shape this binary writes, from bytes a
+    /// build stored.
+    ///
+    /// # WHY DERIVE IT RATHER THAN CAPTURE A NEW ONE
+    ///
+    /// Because the excision IS the change. Slot 5 held the element name; taking it out of a stored
+    /// row produces exactly what the current writer emits for that row, so ten of the eleven slots
+    /// of this fixture are still bytes that came off a build rather than off this binary -- which
+    /// is the whole reason the golden exists. Capturing afresh from this binary would have replaced
+    /// a stored row with this binary's own output and lost that.
+    ///
+    /// AND IT IS CHECKED AGAINST THE WRITER, not assumed equal to it, by
+    /// `a_stored_twelve_slot_row_is_refused_by_arity_and_the_eleven_slot_shape_loads`: it decodes
+    /// this and re-encodes the item, and the bytes must match. A derived fixture that the writer
+    /// disagrees with is the shape that turns a format test into a test of its own arrangement.
+    fn the_golden_without_its_element_name() -> Vec<u8> {
+        let row = hex::decode(A_STORED_ROW_THAT_NAMES_ITS_ELEMENT).expect("the golden is valid hex");
+        assert_eq!(0x9c, row[0], "the golden does not start as a twelve-element fixarray");
+        assert_eq!(44, row.len(), "the golden is {} B, not 44 -- the literal has been edited", row.len());
+        let mut out = Vec::with_capacity(1 + ELEVEN_SLOT_ENDS[10]);
+        out.push(0x9b);
+        out.extend_from_slice(&row[1..SLOT_ENDS[4]]);
+        out.extend_from_slice(&row[SLOT_ENDS[5]..]);
+        out
+    }
+
+    /// `SLOT_ENDS`, for the row [`the_golden_without_its_element_name`] produces.
+    ///
+    /// DERIVED FROM THE GOLDEN'S TABLE RATHER THAN WRITTEN OUT, so there is no second literal to
+    /// drift against the first: every offset past the excised slot moves down by its width and
+    /// every offset before it does not move at all. The prefix loop in the arity test is what
+    /// proves these land on element boundaries -- the same check the golden's own table gets.
+    const ELEVEN_SLOT_ENDS: [usize; 11] = {
+        let gap = SLOT_ENDS[5] - SLOT_ENDS[4];
+        [
+            SLOT_ENDS[0],
+            SLOT_ENDS[1],
+            SLOT_ENDS[2],
+            SLOT_ENDS[3],
+            SLOT_ENDS[4],
+            SLOT_ENDS[6] - gap,
+            SLOT_ENDS[7] - gap,
+            SLOT_ENDS[8] - gap,
+            SLOT_ENDS[9] - gap,
+            SLOT_ENDS[10] - gap,
+            SLOT_ENDS[11] - gap,
+        ]
+    };
+
+    /// A STORED ROW SHORT AT ITS TAIL IS REFUSED, SO A TOMBSTONE CANNOT COME BACK LIVE.
+    ///
+    /// # THE DEFECT
+    ///
+    /// The index-log row is a POSITIONAL msgpack array of `INDEX_ITEM_SLOTS` and every slot of
+    /// `IndexItemWire` carries `#[serde(default)]`. serde's derived `visit_seq` fills a slot the
+    /// array never reached with `Default`, so a row one slot short decoded as a full one whose last
+    /// slot said `false` -- and the last slot is `deleted`. A stored tombstone read back as a LIVE
+    /// row, which resurrects the object it had removed, with no error anywhere.
+    ///
+    /// # WHY IT IS DRIVEN FROM CAPTURED BYTES
+    ///
+    /// Because the shape under test is what a WRITER put on disk, and nothing in this crate can be
+    /// asked to write a short row -- `IndexItem::serialize` writes `INDEX_ITEM_SLOTS`
+    /// unconditionally. Encoding a row with this binary and chopping it would test this binary's
+    /// output against itself; these bytes came off a build that stored them.
+    ///
+    /// THE ARITY MOVED AND THE PROVENANCE DID NOT. The row is eleven slots now, and the fixture is
+    /// the captured twelve-slot golden with its element-name slot EXCISED -- the one edit this
+    /// format change makes -- so ten of its eleven slots are still stored bytes. The excision is
+    /// checked against what the writer emits in
+    /// `a_stored_twelve_slot_row_is_refused_by_arity_and_the_eleven_slot_shape_loads`, which is
+    /// what keeps "captured" from quietly becoming "arranged".
+    ///
+    /// # THE CLASS, NOT ONE FIELD
+    ///
+    /// Four arities are driven, each one slot shorter than the last. Ten loses `deleted` (a
+    /// tombstone goes live), nine also loses `in_log`, eight also loses the size sentinel, and
+    /// seven loses the whole ADDRESS -- an entry that named a block reads back naming none. Every
+    /// one of those defaults is a lie the row never told.
+    ///
+    /// # AND THE SIDE THAT WAS ALREADY REFUSED
+    ///
+    /// Asserted too, because a change that made the short side loud by making the long side quiet
+    /// would look identical from the short side alone.
+    #[test]
+    fn a_stored_row_short_at_its_tail_is_refused_and_a_tombstone_stays_dead() {
+        // THE CURRENT SHAPE, FROM STORED BYTES: the captured row with its element-name slot
+        // excised. The helper asserts the golden's own length and header, so an edited literal
+        // fails there.
+        let stored = the_golden_without_its_element_name();
+        assert_eq!(
+            41,
+            stored.len(),
+            "the current-shape fixture is {} B; excising a two-character fixstr takes 44 to 41",
+            stored.len(),
+        );
+
+        // POSITIVE CONTROL ON THE INSTRUMENT: the sound row still decodes, and it decodes as the
+        // row it is. A refusal that also refused this would be a broken decoder, not a gate.
+        let sound: IndexItem = rmp_serde::from_slice(&stored)
+            .expect("the eleven-slot row must decode -- it is the shape the writer emits");
+        assert_eq!(
+            "ungated/hash",
+            &*sound.object_key,
+            "the fixture decoded as some other row",
+        );
+        assert!(sound.entry.is_some(), "the fixture carries an address");
+        assert!(!sound.deleted, "the captured row is a live row");
+
+        // THE OFFSET TABLE IS CHECKED, NOT TRUSTED. Every prefix must decode as an array whose
+        // elements ARE the full row's leading elements, which is what makes "short at the tail"
+        // mean an element boundary rather than an arbitrary byte. This also checks the DERIVED
+        // table: `ELEVEN_SLOT_ENDS` is `SLOT_ENDS` with the excised slot's width taken out of
+        // every offset past it, and an arithmetic slip there would land off a boundary here.
+        let full = match rmp_serde::from_slice::<serde_json::Value>(&stored) {
+            Ok(serde_json::Value::Array(slots)) => slots,
+            other => panic!("the fixture is not an array: {other:?} -- the log is POSITIONAL"),
+        };
+        assert_eq!(
+            INDEX_ITEM_SLOTS,
+            full.len(),
+            "the fixture holds {} slots, not {INDEX_ITEM_SLOTS}",
+            full.len()
+        );
+        for slots in 1..=INDEX_ITEM_SLOTS {
+            let prefix = leading_slots_of(&stored, &ELEVEN_SLOT_ENDS, slots);
+            let decoded = match rmp_serde::from_slice::<serde_json::Value>(&prefix) {
+                Ok(serde_json::Value::Array(values)) => values,
+                other => panic!("the {slots}-slot prefix is not a well-formed array: {other:?}"),
+            };
+            assert_eq!(
+                full[..slots],
+                decoded[..],
+                "ELEVEN_SLOT_ENDS[{}] does not land on an element boundary of the fixture",
+                slots - 1,
+            );
+        }
+
+        // THE TOMBSTONE THIS IS ABOUT. The captured row is live, so its last slot is flipped from
+        // msgpack false to msgpack true -- a one-byte change at an element boundary the loop above
+        // just proved, producing exactly the bytes the writer emits for a removal.
+        let mut tombstone = stored.clone();
+        let last = ELEVEN_SLOT_ENDS[ELEVEN_SLOT_ENDS.len() - 1] - 1;
+        assert_eq!(40, last, "the last slot of an eleven-slot fixture does not start at byte 40");
+        assert_eq!(0xc2, tombstone[last], "the last slot of the fixture is not msgpack false");
+        tombstone[last] = 0xc3;
+        let dead: IndexItem = rmp_serde::from_slice(&tombstone)
+            .expect("the tombstone variant must be a decodable eleven-slot row");
+        assert!(
+            dead.deleted,
+            "the flip did not land on `deleted`, so nothing below is about a tombstone",
+        );
+
+        // THE DEFECT, ON THE TOMBSTONE. One slot short: the row never said anything about
+        // `deleted`, and before the arity was checked it read back as `false`.
+        let one_short = INDEX_ITEM_SLOTS - 1;
+        let short = leading_slots_of(&tombstone, &ELEVEN_SLOT_ENDS, one_short);
+        assert_eq!(40, short.len(), "dropping one slot of msgpack true drops exactly one byte");
+        // It is WELL-FORMED msgpack -- so a refusal below is the arity gate talking, not a parser
+        // running off the end of the buffer.
+        let decoded = match rmp_serde::from_slice::<serde_json::Value>(&short) {
+            Ok(serde_json::Value::Array(values)) => values,
+            other => panic!("the {one_short}-slot row is not well-formed msgpack: {other:?}"),
+        };
+        assert_eq!(
+            one_short,
+            decoded.len(),
+            "the short row holds {} slots",
+            decoded.len()
+        );
+
+        let refused = rmp_serde::from_slice::<IndexItem>(&short);
+        match &refused {
+            Err(error) => println!("[short] {one_short} slots refused: {error}"),
+            Ok(item) => println!("[short] {one_short} slots ACCEPTED, deleted={}", item.deleted),
+        }
+        assert!(
+            refused.is_err(),
+            "a {one_short}-slot row decoded into an IndexItem whose `deleted` is {:?}; the row \
+             never said so, and a tombstone read as live resurrects the object it removed",
+            refused.as_ref().map(|item| item.deleted).ok(),
+        );
+        let message = refused.unwrap_err().to_string();
+        assert!(
+            message.contains("positional slots"),
+            "the refusal does not say the arity was what was wrong: {message}",
+        );
+
+        // THE CLASS. Each shorter arity drops one more trailing slot, and each of those defaults
+        // is a value the row never carried.
+        for (slots, what_would_be_lost) in [
+            (10usize, "deleted -- a tombstone reads live"),
+            (9, "in_log -- an entry reads as not log-resident"),
+            (8, "the size sentinel"),
+            (7, "the whole address -- an entry reads as naming no block"),
+        ] {
+            let candidate = leading_slots_of(&tombstone, &ELEVEN_SLOT_ENDS, slots);
+            assert!(
+                rmp_serde::from_slice::<serde_json::Value>(&candidate).is_ok(),
+                "the {slots}-slot row is not well-formed msgpack, so it tests the wrong thing",
+            );
+            let outcome = rmp_serde::from_slice::<IndexItem>(&candidate);
+            println!(
+                "[class] {slots} slots -> {}",
+                if outcome.is_err() { "refused" } else { "ACCEPTED" }
+            );
+            assert!(
+                outcome.is_err(),
+                "a {slots}-slot row was accepted, losing {what_would_be_lost}",
+            );
+        }
+
+        // THE LONG SIDE, so a change cannot trade one for the other. TWELVE IS THE RETIRED
+        // SHAPE and gets its own arm -- `a_stored_twelve_slot_row_is_refused_by_arity_and_the
+        // _eleven_slot_shape_loads`, over the unexcised golden -- so what is driven here is one
+        // slot longer than that again, which nothing has ever written.
+        let mut longer = vec![0x9du8];
+        longer.extend_from_slice(&tombstone[1..]);
+        longer.push(0xc0);
+        longer.push(0xc0);
+        assert!(
+            rmp_serde::from_slice::<IndexItem>(&longer).is_err(),
+            "a thirteen-slot row must still be refused -- the arity gate reads the header first",
+        );
+        // And a BYTE-truncated row, whose header still claims the full arity, was never the
+        // defect: it fails as malformed msgpack. Asserted so the two failures are not confused
+        // for each other, here or in a later reading of this file.
+        assert!(
+            rmp_serde::from_slice::<IndexItem>(&tombstone[..tombstone.len() - 1]).is_err(),
+            "a byte-truncated row must fail as malformed msgpack",
+        );
+
+        // THE TOLERANT PATH, UNTOUCHED. The NAMED shape is deliberately missing-key tolerant and
+        // the compatibility arms in this file depend on it. A map has no tail to be short at.
+        let named = serde_json::json!({
+            "k": "page",
+            "rb": 8539,
+            "ok": "ungated/hash",
+            "mi": "hash",
+        });
+        let packed = rmp_serde::to_vec_named(&named).expect("pack the named shape");
+        let tolerated: IndexItem = rmp_serde::from_slice(&packed)
+            .expect("a named row with no `d` key must keep loading -- that tolerance is on purpose");
+        assert!(!tolerated.deleted, "the named arm fills an absent `d` with its default, as before");
+        println!("[named] a map with four of {INDEX_ITEM_SLOTS} keys still loads");
+    }
+
+    /// A RECORD CARRYING A SHORT ROW IS REFUSED AS AN `Encoding` ERROR, NOT AS `Corruption`.
+    ///
+    /// # WHY THE CLASS IS THIS ONE
+    ///
+    /// `Corruption` is defined in this file as a record that failed its per-record integrity
+    /// envelope -- the framing length or digest -- or that broke delta sequence continuity. A
+    /// short row fails none of those: the frame's length matched and its CRC32C matched, so the
+    /// bytes arrived exactly as they were written. `Encoding` is defined as a malformed payload
+    /// behind an envelope that already passed, which is what this is. It also cannot be torn
+    /// bytes: a msgpack array states its arity before its elements, so byte loss leaves a header
+    /// claiming the full arity, and `log_framing::next_frame` stops at a torn tail before the row
+    /// decoder is reached at all.
+    ///
+    /// # DRIVEN THROUGH `decode_index_payload`
+    ///
+    /// Because that is where the class is decided, and a test asserting it anywhere else would be
+    /// asserting its own arrangement. The short row is SPLICED into a record this binary wrote,
+    /// so the envelope around it is a real one.
+    #[test]
+    fn a_record_carrying_a_short_row_is_refused_as_an_encoding_error() {
+        let shard: ShardId = 1;
+        let address = crate::block_store::ElementEntry::from_parts(42, 1_048_576, 4096, Some(7), None);
+        let item = IndexItem {
+            kind: IndexItemKind::Block,
+            routing_bucket: 8539,
+            block_ref_key: String::new(),
+            object_key: "ungated/hash".into(),
+            model_id: "hash".to_string(),
+            object_id: 0,
+            entry: Some(address),
+            deleted: true,
+        };
+        let row = rmp_serde::to_vec(&item).expect("encode the row");
+        assert_eq!(
+            0x90 | INDEX_ITEM_SLOTS as u8,
+            row[0],
+            "the writer no longer emits a {INDEX_ITEM_SLOTS}-element fixarray"
+        );
+        assert_eq!(
+            0xc3,
+            row[row.len() - 1],
+            "the last slot of a tombstone row is not msgpack true, so the drop below is not `deleted`",
+        );
+        let mut short_row = vec![0x90 | (INDEX_ITEM_SLOTS - 1) as u8];
+        short_row.extend_from_slice(&row[1..row.len() - 1]);
+
+        let record = IndexDeltaRecord {
+            shard_id: shard,
+            sequence: 1,
+            items: vec![item],
+            meta: None,
+            applied_wal_sequence: Some(1),
+            upsert: true,
+            key_states: Vec::new(),
+            shared_object_key: None,
+        };
+        let payload = encode_index_payload(&record, INDEX_LOG_SHAPE_DELTA).expect("encode");
+
+        // POSITIVE CONTROL: the record decodes and the tombstone is a tombstone.
+        let sound: IndexDeltaRecord =
+            decode_index_payload(&payload).expect("the unspliced record must decode");
+        assert_eq!(1, sound.items.len(), "the control record carries one item");
+        assert!(sound.items[0].deleted, "the control item must be a tombstone");
+
+        // THE SPLICE. The row's bytes appear verbatim inside the record, exactly once.
+        let at = payload
+            .windows(row.len())
+            .position(|window| window == row.as_slice())
+            .expect("the row bytes are not in the record, so this splices nothing");
+        assert_eq!(
+            1,
+            payload.windows(row.len()).filter(|w| *w == row.as_slice()).count(),
+            "the row bytes occur more than once, so the splice is ambiguous",
+        );
+        let mut spliced = Vec::with_capacity(payload.len() - 1);
+        spliced.extend_from_slice(&payload[..at]);
+        spliced.extend_from_slice(&short_row);
+        spliced.extend_from_slice(&payload[at + row.len()..]);
+        assert_eq!(
+            payload.len() - 1,
+            spliced.len(),
+            "the splice did not drop exactly one byte",
+        );
+
+        let outcome = decode_index_payload::<IndexDeltaRecord>(&spliced);
+        match &outcome {
+            Err(error) => println!("[record] refused: {error}"),
+            Ok(decoded) => println!(
+                "[record] ACCEPTED with deleted={:?}",
+                decoded.items.first().map(|item| item.deleted),
+            ),
+        }
+        match outcome {
+            Err(IndexLogError::Encoding(message)) => {
+                assert!(
+                    message.contains("positional slots"),
+                    "the refusal does not name the arity: {message}",
+                );
+            }
+            Err(other) => panic!(
+                "a short row must be an Encoding error -- the framing envelope passed and the \
+                 bytes arrived intact -- and it came back as {other:?}",
+            ),
+            Ok(decoded) => panic!(
+                "a record whose row lost its last slot decoded, with deleted={:?}",
+                decoded.items.first().map(|item| item.deleted),
+            ),
+        }
+    }
+}
