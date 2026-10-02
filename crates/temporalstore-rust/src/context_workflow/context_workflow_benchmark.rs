@@ -294,3 +294,300 @@ pub fn run_context_pipeline_benchmark_sweep(
         request.profiles.clone()
     };
     let mut reports = Vec::with_capacity(profiles.len());
+    for (index, profile) in profiles.into_iter().enumerate() {
+        reports.push(run_context_pipeline_benchmark(
+            engine,
+            ContextPipelineBenchmarkRequest {
+                shard_id: request.shard_id,
+                tenant_hash: request.tenant_hash + index as u64,
+                profile: profile.profile,
+                source_count: profile.source_count,
+                query_count: profile.query_count,
+                max_events: profile.max_events,
+                provider: request.provider.clone(),
+                thresholds: request.thresholds.clone(),
+            },
+        ));
+    }
+    let profile_count = reports.len();
+    let all_profiles_ready = reports.iter().all(|report| report.status.ok);
+    let min_hit_at_k = reports
+        .iter()
+        .map(|report| report.hit_at_k)
+        .fold(1.0f32, f32::min);
+    let min_mean_reciprocal_rank = reports
+        .iter()
+        .map(|report| report.mean_reciprocal_rank)
+        .fold(1.0f32, f32::min);
+    let min_evidence_retention_at_k = reports
+        .iter()
+        .map(|report| report.evidence_retention_at_k)
+        .fold(1.0f32, f32::min);
+    let min_token_reduction_percent = reports
+        .iter()
+        .map(|report| report.token_reduction_percent)
+        .fold(100.0f32, f32::min);
+    let max_retrieve_p95_ms = reports
+        .iter()
+        .map(|report| report.retrieve_p95_ms)
+        .max()
+        .unwrap_or_default();
+    let max_inject_p95_ms = reports
+        .iter()
+        .map(|report| report.inject_p95_ms)
+        .max()
+        .unwrap_or_default();
+    let total_sources = reports.iter().map(|report| report.source_count).sum();
+    let total_queries = reports.iter().map(|report| report.query_count).sum();
+    let profile_signatures = reports
+        .iter()
+        .map(|report| report.workload_signature)
+        .collect::<Vec<_>>();
+    let min_sources_per_topic = reports
+        .iter()
+        .map(|report| report.min_sources_per_topic)
+        .min()
+        .unwrap_or_default();
+    let max_sources_per_topic = reports
+        .iter()
+        .map(|report| report.max_sources_per_topic)
+        .max()
+        .unwrap_or_default();
+    let min_source_kind_coverage_count = reports
+        .iter()
+        .map(|report| report.source_kind_coverage_count)
+        .min()
+        .unwrap_or_default();
+    let total_zero_hit_queries = reports.iter().map(|report| report.zero_hit_queries).sum();
+    let total_selected_tokens = reports
+        .iter()
+        .map(|report| report.selected_context_tokens as u64)
+        .sum::<u64>();
+    let max_selected_tokens_per_query = reports
+        .iter()
+        .map(|report| report.max_selected_tokens_per_query)
+        .max()
+        .unwrap_or_default();
+    let avg_selected_tokens_per_query = if total_queries == 0 {
+        0.0
+    } else {
+        total_selected_tokens as f64 / total_queries as f64
+    };
+    let all_thresholds_passed = reports.iter().all(|report| report.threshold_passed);
+    let threshold_violations = reports
+        .iter()
+        .flat_map(|report| {
+            report
+                .threshold_violations
+                .iter()
+                .map(|violation| format!("{}:{violation}", report.profile))
+        })
+        .collect::<Vec<_>>();
+    let status = if profile_count > 0
+        && all_profiles_ready
+        && all_thresholds_passed
+        && min_hit_at_k >= 1.0
+        && min_mean_reciprocal_rank > 0.0
+        && min_evidence_retention_at_k >= 1.0
+        && min_token_reduction_percent > 0.0
+    {
+        Status::ok()
+    } else {
+        Status::error(
+            "context_pipeline_benchmark_sweep_incomplete",
+            format!(
+                "profiles={profile_count} ready={all_profiles_ready} min_hit_at_k={min_hit_at_k:.3} min_mrr={min_mean_reciprocal_rank:.3} min_evidence_retention={min_evidence_retention_at_k:.3} min_token_reduction={min_token_reduction_percent:.3}"
+            ),
+        )
+    };
+
+    ContextPipelineBenchmarkSweepReport {
+        status,
+        benchmark_name: "reference_style_context_management_sweep".to_string(),
+        profile_count,
+        reports,
+        all_profiles_ready,
+        min_hit_at_k,
+        min_mean_reciprocal_rank,
+        min_evidence_retention_at_k,
+        min_token_reduction_percent,
+        max_retrieve_p95_ms,
+        max_inject_p95_ms,
+        total_sources,
+        total_queries,
+        profile_signatures,
+        min_sources_per_topic,
+        max_sources_per_topic,
+        min_source_kind_coverage_count,
+        total_zero_hit_queries,
+        avg_selected_tokens_per_query,
+        max_selected_tokens_per_query,
+        all_thresholds_passed,
+        threshold_violations,
+        evidence: vec![
+            "Benchmark sweep runs multiple deterministic profile sizes through the same Context pipeline".to_string(),
+            "Sweep aggregates readiness, threshold gates, hit@k, MRR, evidence retention, token budget, token reduction, latency, total source count, and total query count".to_string(),
+        ],
+    }
+}
+
+pub(crate) fn benchmark_threshold_violations(
+    thresholds: &ContextPipelineBenchmarkThresholds,
+    hit_at_k: f32,
+    mean_reciprocal_rank: f32,
+    recall_at_k: f32,
+    evidence_retention_at_k: f32,
+    token_reduction_percent: f32,
+    max_selected_tokens_per_query: u32,
+    retrieve_p50_ms: u128,
+    retrieve_p95_ms: u128,
+    ingest_sources_per_sec: f64,
+    retrieve_queries_per_sec: f64,
+    inject_queries_per_sec: f64,
+) -> Vec<String> {
+    let mut violations = Vec::new();
+    if hit_at_k < thresholds.min_hit_at_k {
+        violations.push(format!(
+            "hit_at_k {hit_at_k:.3} below {:.3}",
+            thresholds.min_hit_at_k
+        ));
+    }
+    if mean_reciprocal_rank < thresholds.min_mean_reciprocal_rank {
+        violations.push(format!(
+            "mean_reciprocal_rank {mean_reciprocal_rank:.3} below {:.3}",
+            thresholds.min_mean_reciprocal_rank
+        ));
+    }
+    if recall_at_k < thresholds.min_recall_at_k {
+        violations.push(format!(
+            "recall_at_k {recall_at_k:.3} below {:.3}",
+            thresholds.min_recall_at_k
+        ));
+    }
+    if evidence_retention_at_k < thresholds.min_evidence_retention_at_k {
+        violations.push(format!(
+            "evidence_retention_at_k {evidence_retention_at_k:.3} below {:.3}",
+            thresholds.min_evidence_retention_at_k
+        ));
+    }
+    if token_reduction_percent < thresholds.min_token_reduction_percent {
+        violations.push(format!(
+            "token_reduction_percent {token_reduction_percent:.3} below {:.3}",
+            thresholds.min_token_reduction_percent
+        ));
+    }
+    if max_selected_tokens_per_query > thresholds.max_selected_tokens_per_query {
+        violations.push(format!(
+            "max_selected_tokens_per_query {max_selected_tokens_per_query} above {}",
+            thresholds.max_selected_tokens_per_query
+        ));
+    }
+    if retrieve_p50_ms > thresholds.max_retrieve_p50_ms {
+        violations.push(format!(
+            "retrieve_p50_ms {retrieve_p50_ms} above {}",
+            thresholds.max_retrieve_p50_ms
+        ));
+    }
+    if retrieve_p95_ms > thresholds.max_retrieve_p95_ms {
+        violations.push(format!(
+            "retrieve_p95_ms {retrieve_p95_ms} above {}",
+            thresholds.max_retrieve_p95_ms
+        ));
+    }
+    if ingest_sources_per_sec < thresholds.min_ingest_sources_per_sec {
+        violations.push(format!(
+            "ingest_sources_per_sec {ingest_sources_per_sec:.3} below {:.3}",
+            thresholds.min_ingest_sources_per_sec
+        ));
+    }
+    if retrieve_queries_per_sec < thresholds.min_retrieve_queries_per_sec {
+        violations.push(format!(
+            "retrieve_queries_per_sec {retrieve_queries_per_sec:.3} below {:.3}",
+            thresholds.min_retrieve_queries_per_sec
+        ));
+    }
+    if inject_queries_per_sec < thresholds.min_inject_queries_per_sec {
+        violations.push(format!(
+            "inject_queries_per_sec {inject_queries_per_sec:.3} below {:.3}",
+            thresholds.min_inject_queries_per_sec
+        ));
+    }
+    violations
+}
+
+pub(crate) fn context_source_kind_name(kind: ContextSourceKind) -> &'static str {
+    match kind {
+        ContextSourceKind::Document => "document",
+        ContextSourceKind::Chat => "chat",
+        ContextSourceKind::Ticket => "ticket",
+        ContextSourceKind::Code => "code",
+        ContextSourceKind::Incident => "incident",
+        ContextSourceKind::UserEvent => "user_event",
+    }
+}
+
+pub(crate) fn benchmark_source_kind(index: usize) -> ContextSourceKind {
+    match index % 6 {
+        0 => ContextSourceKind::Incident,
+        1 => ContextSourceKind::Ticket,
+        2 => ContextSourceKind::Document,
+        3 => ContextSourceKind::Chat,
+        4 => ContextSourceKind::Code,
+        _ => ContextSourceKind::UserEvent,
+    }
+}
+
+pub(crate) fn benchmark_context_body(index: usize, topic_index: usize, topic_sequence: usize) -> String {
+    let is_latest_update = topic_sequence > 1;
+    let update_marker = if is_latest_update {
+        "latest memory update"
+    } else {
+        "earlier memory"
+    };
+    let detail = match (topic_index % 4, is_latest_update) {
+        (0, true) => "checkout payment risk score changed after a fraud review, with the current status captured for later QA",
+        (0, false) => "checkout payment risk score baseline from the original fraud review remains available as historical context",
+        (1, true) => "backend service dependency outage created a current temporal incident timeline and recovery sequence",
+        (1, false) => "backend service dependency health snapshot captured the initial incident history before recovery",
+        (2, true) => "customer preference was updated during a later conversation session and replaced the stale setting",
+        (2, false) => "customer preference captured the original conversation setting before any later change",
+        (_, true) => "support ticket follow-up recorded the agent action, user ask, and open helpdesk state",
+        (_, false) => "support ticket captured the first user ask before the agent follow-up action",
+    };
+    format!(
+        "Benchmark context item {index}: {update_marker} for topic {topic_index}; {detail}; retrieval hint and follow-up action are preserved."
+    )
+}
+
+pub(crate) fn benchmark_query_for_topic(topic_index: usize) -> String {
+    let topic_phrase = format!("topic {topic_index}");
+    match topic_index % 4 {
+        0 => format!("latest payment fraud status {topic_phrase}"),
+        1 => format!("recent service outage timeline {topic_phrase}"),
+        2 => format!("customer preference update conversation {topic_phrase}"),
+        _ => format!("support ticket follow up {topic_phrase}"),
+    }
+}
+
+pub(crate) fn percentile_latency(sorted_latencies: &[u128], percentile: usize) -> u128 {
+    if sorted_latencies.is_empty() {
+        return 0;
+    }
+    let rank = ((sorted_latencies.len() - 1) * percentile.min(100)) / 100;
+    sorted_latencies[rank]
+}
+
+pub(crate) fn token_reduction_percent(full_tokens: u32, selected_tokens: u32) -> f32 {
+    if full_tokens == 0 {
+        return 0.0;
+    }
+    let saved = full_tokens.saturating_sub(selected_tokens);
+    (saved as f32 * 100.0) / full_tokens as f32
+}
+
+pub(crate) fn rate_per_sec(count: usize, elapsed_ms: u128) -> f64 {
+    if elapsed_ms == 0 {
+        return count as f64;
+    }
+    (count as f64 * 1000.0) / elapsed_ms as f64
+}

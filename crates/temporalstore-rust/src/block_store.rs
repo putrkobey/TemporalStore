@@ -4938,3 +4938,4944 @@ const RETIRED_NAMES: &[&str] = &[
         let manifest = slab_manifest_path(dir.path());
         // Land one append so the manifest exists at a known state, then snapshot it.
         store.append(b"seed").unwrap();
+        store.sync_durable().unwrap();
+        let after_seed = std::fs::read(&manifest).unwrap();
+        // A burst of appends: NONE of them may rewrite the manifest (deferred off the write path).
+        for i in 0..200u32 {
+            store.append(format!("record-{i}").as_bytes()).unwrap();
+        }
+        assert_eq!(
+            std::fs::read(&manifest).unwrap(),
+            after_seed,
+            "the slab manifest must NOT be re-serialized per append on the default path"
+        );
+        // The deferred catalog materializes in one shot; now it reflects the burst (bytes grew).
+        store.sync_durable().unwrap();
+        assert_ne!(
+            std::fs::read(&manifest).unwrap(),
+            after_seed,
+            "sync_durable must materialize the deferred catalog exactly once"
+        );
+    }
+
+    #[test]
+    fn slab_catalog_folds_slabs_and_install_reconstructs_lifecycle() {
+        // MANIFEST-CONFORMANCE FOLD round-trip at the block-store layer: project the slab catalog into
+        // the durable SlabCatalogEntry subset, then reconstruct the slab lifecycle from that projection
+        // with the slab-manifest file deleted -- proving the folded catalog is a lossless source
+        // of the durable slab state (diagnostics are recomputed from the slab separately).
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.append(b"a").unwrap();
+        // Seal the first slab by rolling to a new active slab.
+        store.roll_slab().unwrap();
+        store.append(b"b").unwrap();
+        store.sync_durable().unwrap();
+        let catalog = store.slab_catalog(7);
+        // Two slabs: the sealed first slab and the active second slab.
+        assert_eq!(catalog.len(), 2);
+        assert!(catalog.iter().any(|z| z.state == crate::index_log::SlabCatalogState::Sealed));
+        assert!(catalog.iter().any(|z| z.state == crate::index_log::SlabCatalogState::Active));
+        assert!(catalog.iter().all(|z| z.version == 7));
+        // Delete the slab-manifest file so the reopened store has no cached catalog file; it
+        // reconstructs slabs from the durable slabs (reconcile-on-open), then we install the
+        // folded catalog on top. The lifecycle states must match the pre-crash projection.
+        let reopened = BlockStore::new(dir.path());
+        std::fs::remove_file(slab_manifest_path(dir.path())).ok();
+        let changed = reopened.install_slab_catalog(&catalog).unwrap();
+        let recovered = reopened.slab_catalog(0);
+        let state_of = |slab: u64, zs: &[crate::index_log::SlabCatalogEntry]| {
+            zs.iter().find(|z| z.block_slab_id == slab).map(|z| z.state)
+        };
+        for entry in &catalog {
+            assert_eq!(
+                state_of(entry.block_slab_id, &recovered),
+                Some(entry.state),
+                "slab {} lifecycle must reconstruct from the folded catalog",
+                entry.block_slab_id
+            );
+        }
+        let _ = changed;
+    }
+
+    #[test]
+    fn gc_slabs_removes_old_non_current_slabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.install_slab(0, b"current").unwrap();
+        store.install_slab(1, b"old").unwrap();
+        store.install_slab(2, b"keep").unwrap();
+
+        let report = store.gc_slabs_before(2).unwrap();
+        assert_eq!(report.removed_block_slab_ids, vec![0, 1]);
+        assert_eq!(report.retained_block_slab_ids, vec![2]);
+        assert_eq!(
+            report.removed_physical_bytes,
+            (b"current".len() + b"old".len()) as u64
+        );
+        assert_eq!(report.retained_physical_bytes, b"keep".len() as u64);
+        assert!(report.retained_current_block_slab_ids.is_empty());
+        assert!(report.retained_live_block_slab_ids.is_empty());
+        assert_eq!(store.slab_ids().unwrap(), vec![2]);
+    }
+
+    /// The point of pre-allocation: once the background prepare has rolled a full slab, the
+    /// next client append lands on the fresh one without rolling inline.
+    ///
+    /// Drives the threshold through the explicit-target API so the test never touches the
+    /// process-wide slab-target env var.
+    #[test]
+    fn prepare_next_slab_takes_the_roll_off_the_append_path() {
+        const TARGET: u64 = 2048;
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+
+        let payload = vec![b'x'; 512];
+        let mut guard = 0;
+        let mut full_slab = 0;
+        while !store.needs_slab_preparation_with_target(TARGET) {
+            full_slab = store.append(&payload).unwrap().block_slab_id();
+            guard += 1;
+            assert!(guard < 200, "filled {guard} times without reaching the target");
+        }
+
+        let rolled = store
+            .prepare_next_slab_with_target(TARGET)
+            .unwrap()
+            .expect("a slab at target must roll");
+        assert_eq!(rolled.previous_block_slab_id, full_slab);
+        assert!(rolled.new_block_slab_id > full_slab);
+
+        // The next append lands on the fresh slab, and did not have to roll to get there.
+        let after = store.append(&payload).unwrap();
+        assert_eq!(after.block_slab_id(), rolled.new_block_slab_id);
+    }
+
+    /// Prepare must be a no-op while the slab has room, or a background cycle would shred the
+    /// store into one slab per pass.
+    #[test]
+    fn prepare_next_slab_is_a_noop_below_target() {
+        const TARGET: u64 = 1 << 20;
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.append(b"small").unwrap();
+
+        assert!(!store.needs_slab_preparation_with_target(TARGET));
+        assert!(store.prepare_next_slab_with_target(TARGET).unwrap().is_none());
+        // Repeated passes must stay no-ops.
+        assert!(store.prepare_next_slab_with_target(TARGET).unwrap().is_none());
+        assert_eq!(store.slab_ids().unwrap().len(), 1);
+    }
+
+    /// A freshly rolled, still-empty slab must not roll again — otherwise prepare would mint
+    /// an empty slab on every cycle forever.
+    #[test]
+    fn prepare_next_slab_does_not_roll_an_empty_slab() {
+        const TARGET: u64 = 2048;
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let payload = vec![b'y'; 512];
+        let mut guard = 0;
+        while !store.needs_slab_preparation_with_target(TARGET) {
+            store.append(&payload).unwrap();
+            guard += 1;
+            assert!(guard < 200, "filled {guard} times without reaching the target");
+        }
+        store
+            .prepare_next_slab_with_target(TARGET)
+            .unwrap()
+            .expect("first roll");
+
+        assert!(!store.needs_slab_preparation_with_target(TARGET));
+        assert!(store.prepare_next_slab_with_target(TARGET).unwrap().is_none());
+    }
+
+    /// Pre-allocation is an optimisation, not a correctness requirement: with prepare never
+    /// called, every payload written across an explicit roll must still read back.
+    #[test]
+    fn data_survives_when_prepare_never_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let payload = vec![b'z'; 512];
+        let mut addresses = Vec::new();
+        for round in 0..8 {
+            addresses.push(store.append(&payload).unwrap());
+            if round % 3 == 2 {
+                store.roll_slab().unwrap();
+            }
+        }
+        assert!(store.slab_ids().unwrap().len() > 1, "rolls must have happened");
+        for address in &addresses {
+            assert_eq!(store.read(address).unwrap(), payload);
+        }
+    }
+
+    #[test]
+    fn roll_slab_moves_future_appends_to_fresh_slab() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let first = store.append(b"first").unwrap();
+        assert_eq!(first.block_slab_id(), 0);
+
+        let roll = store.roll_slab().unwrap();
+        assert_eq!(roll.previous_block_slab_id, 0);
+        assert_eq!(roll.new_block_slab_id, 1);
+        let second = store.append(b"second").unwrap();
+        assert_eq!(second.block_slab_id(), 1);
+        assert_eq!(second.offset(), 0);
+        assert_eq!(store.read(&first).unwrap(), b"first");
+        assert_eq!(store.read(&second).unwrap(), b"second");
+    }
+
+    #[test]
+    fn reopened_store_appends_to_latest_existing_slab() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let first = store.append(b"first").unwrap();
+        let roll = store.roll_slab().unwrap();
+        let second = store.append(b"second").unwrap();
+        assert_eq!(roll.new_block_slab_id, second.block_slab_id());
+
+        let reopened = BlockStore::new(dir.path());
+        let third = reopened.append(b"third").unwrap();
+
+        assert_eq!(third.block_slab_id(), second.block_slab_id());
+        assert!(third.offset() > second.offset());
+        assert_eq!(reopened.read(&first).unwrap(), b"first");
+        assert_eq!(reopened.read(&second).unwrap(), b"second");
+        assert_eq!(reopened.read(&third).unwrap(), b"third");
+    }
+
+    // shared-corpus: storage_stream_manifest_disk_reconciliation;
+    #[test]
+    fn reopen_reconciles_manifest_missing_existing_stream_slab() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let first = store.append(b"first").unwrap();
+        store.roll_slab().unwrap();
+        let second = store.append(b"second").unwrap();
+        drop(store);
+
+        let manifest_path = slab_manifest_path(dir.path());
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["bands"] = serde_json::json!([manifest["bands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|slab| slab["block_segment_id"] == serde_json::json!(first.block_slab_id()))
+            .unwrap()
+            .clone()]);
+        fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let reopened = BlockStore::new(dir.path());
+        let descriptors = reopened.slab_descriptors();
+
+        assert!(descriptors
+            .iter()
+            .any(|slab| slab.block_slab_id == first.block_slab_id()
+                && slab.state == BlockStoreSlabState::Sealed));
+        assert!(descriptors
+            .iter()
+            .any(|slab| slab.block_slab_id == second.block_slab_id()
+                && slab.state == BlockStoreSlabState::Active));
+        let report = reopened.stream_backed_slab_runtime_report().unwrap();
+        assert!(report.slab_manifest_reconciled_on_open);
+        assert!(report.slab_manifest_disk_consistent);
+        assert_eq!(report.manifest_extra_stream_slabs, 0);
+        assert_eq!(report.manifest_missing_stream_slabs, 0);
+        assert_eq!(reopened.read(&first).unwrap(), b"first");
+        assert_eq!(reopened.read(&second).unwrap(), b"second");
+    }
+
+    // shared-corpus: storage_stream_manifest_disk_reconciliation;
+    #[test]
+    fn reopen_marks_manifest_slab_without_stream_file_as_purged() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let first = store.append(b"first").unwrap();
+        store.roll_slab().unwrap();
+        let second = store.append(b"second").unwrap();
+        drop(store);
+
+        fs::remove_file(slab_path(dir.path(), first.block_slab_id())).unwrap();
+
+        let reopened = BlockStore::new(dir.path());
+        let descriptors = reopened.slab_descriptors();
+
+        assert!(descriptors
+            .iter()
+            .any(|slab| slab.block_slab_id == first.block_slab_id()
+                && slab.state == BlockStoreSlabState::Purged));
+        assert!(descriptors
+            .iter()
+            .any(|slab| slab.block_slab_id == second.block_slab_id()
+                && slab.state == BlockStoreSlabState::Active));
+        let report = reopened.stream_backed_slab_runtime_report().unwrap();
+        assert!(report.slab_manifest_reconciled_on_open);
+        assert!(report.slab_manifest_disk_consistent);
+        assert_eq!(report.manifest_extra_stream_slabs, 0);
+        assert_eq!(report.manifest_missing_stream_slabs, 0);
+        assert_eq!(reopened.read(&second).unwrap(), b"second");
+    }
+
+    #[test]
+    fn installed_higher_slab_becomes_current_for_future_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.install_slab(3, b"restored-segment").unwrap();
+
+        let next = store.append(b"after-restore").unwrap();
+
+        assert_eq!(next.block_slab_id(), 3);
+        assert_eq!(next.offset(), b"restored-segment".len() as u64);
+        assert_eq!(next.compact_slab_id(), Some(3));
+        assert_eq!(
+            next.compact_slab_offset(),
+            Some(b"restored-segment".len() as u32)
+        );
+        assert_eq!(
+            next.compact_slab_address(),
+            Some((3_u64 << 32) | b"restored-segment".len() as u64)
+        );
+        let from_compact_slab = ElementEntry::from_compact_slab_address(
+            next.compact_slab_address().unwrap(),
+            next.length(),
+        );
+        assert_eq!(from_compact_slab.block_slab_id(), next.block_slab_id());
+        assert_eq!(from_compact_slab.offset(), next.offset());
+        assert_eq!(from_compact_slab.length, next.length);
+        assert_eq!(store.read(&next).unwrap(), b"after-restore");
+    }
+
+    /// What the block envelope actually carries, and therefore what removing the index copy costs.
+    ///
+    /// Written before assuming: a v7 record stores a CRC32C in its checksum field, not a SHA-256
+    /// (v6 and earlier stored the full digest). So dropping  from the address does NOT
+    /// relocate the digest -- for a current record the SHA-256 is not recoverable at all. What
+    /// survives is verification, which is the property reads depend on, and that is asserted by
+    /// the corruption test below.
+    #[test]
+    fn the_envelope_carries_a_crc_not_a_digest() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let payload = b"digest-lives-with-the-page";
+        let address = store.append(payload).unwrap();
+
+        let path = slab_path(dir.path(), address.block_slab_id());
+        let slab = fs::read(&path).unwrap();
+        let start = address.offset() as usize;
+        let record = &slab[start..start + address.length as usize];
+        let at = record::BLOCK_RECORD_CHECKSUM_OFFSET;
+        let field = &record[at..at + record::BLOCK_RECORD_CHECKSUM_LEN];
+
+        assert_ne!(
+            hex::encode(field),
+            record::sha256_hex(payload),
+            "if this ever matches, the envelope holds a full digest and the index copy could              genuinely be relocated rather than dropped"
+        );
+        assert_eq!(
+            field,
+            crate::checksum::crc32c(payload).to_le_bytes(),
+            "the field is the crc32c of the payload"
+        );
+        assert_eq!(
+            record::BLOCK_RECORD_CHECKSUM_LEN,
+            4,
+            "the field is the checksum and nothing else: no padding, no marker"
+        );
+        // TWO PINS NOW, BECAUSE THE FOUR FIELDS ARE IN TWO STRUCTURES.
+        //
+        // THE ADDRESS IS ONE WORD: a 32-bit slab id in the high half and a 32-bit offset in the
+        // low, with no spare bit and nothing beside it.
+        //
+        // THE HOLDER IS THAT WORD PLUS THE THREE FIELDS THAT USED TO SIT INSIDE IT -- `length`
+        // (4), `block_id` (2) and the presence byte (1). 8 + 4 + 2 + 1 = 15 in 16, which is
+        // exactly what the address cost while it held them. THE MOVE WAS WORTH ZERO BYTES: the
+        // word shed eight and the holder took eight back, here and at every other holder in the
+        // engine. `engine::tests::address_footprint::the_priced_shapes_for_an_address_and_its_siblings`
+        // measures all of them, with one control that does not move when a byte is removed and
+        // one that does when a word is added.
+        //
+        // WHAT IT BOUGHT WAS SHAPE, NOT SIZE: four fields that were private to one opaque type
+        // are four named fields on the row that holds them, each able to be narrowed or dropped on
+        // its own evidence, and there is exactly one place that knows how a slab id and an offset
+        // become a number.
+        //
+        // THE HISTORY OF THE WIDTH, KEPT BECAUSE EACH STEP IS A DIFFERENT LESSON. It was 64 while
+        // the grouping id was a seventh field; it is the slab's own id, so it is read off the
+        // address instead of stored. 56 while `length` and `block_id` were 64-bit fields holding
+        // values the block-record encoder refuses above 2^30 and above `u16::MAX` respectively, 48
+        // while `generation` was stored rather than derived, 40 while the slab id and the offset
+        // were two 64-bit fields rather than two halves of one word, 32 while the routing bucket
+        // was a field rather than the container's answer, 24 while the address carried an
+        // `object_id` of its own, and 16 while it still carried these three. Every step before
+        // this one took bytes out of the SYSTEM; this one moved them one level up, which is why it
+        // is the first step in that list worth nothing.
+        //
+        // THIS PIN IS WHY THE SWEEP THAT MOVED THE OTHERS WAS INCOMPLETE. It lives in a test about
+        // the checksum field, not in a footprint test, so a scan of the footprint files did not
+        // reach it; and `cargo check` cannot see a width pin written as `assert_eq!` in a test
+        // body. That sentence was written as a prediction about the next width change. It came
+        // true on this one: this line was the single assertion the whole change missed, and the
+        // full suite is what caught it -- nothing else could have.
+        assert_eq!(std::mem::size_of::<BlockAddress>(), 8);
+        assert_eq!(std::mem::size_of::<ElementEntry>(), 16);
+    }
+
+    #[test]
+    fn block_address_checksum_rejects_corrupt_slab_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let address = store.append(b"verified-page").unwrap();
+        // The address no longer carries a digest. The block does, and a read still verifies
+        // against it -- corrupting the slab below must still be caught.
+        assert_eq!(store.read(&address).unwrap(), b"verified-page");
+
+        let path = slab_path(dir.path(), address.block_slab_id());
+        let mut slab = fs::read(&path).unwrap();
+        *slab.last_mut().unwrap() ^= 0xff;
+        fs::write(path, slab).unwrap();
+        let err = store.read(&address).unwrap_err();
+        assert!(matches!(err, BlockStoreError::ChecksumMismatch { .. }));
+    }
+
+    // shared-corpus: storage_object_page_bucket_agreement_surfaces;
+    #[test]
+    fn block_address_matches_compact_slab_metadata_contract_and_checksum_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let address = store
+            .append_with_block_metadata(b"address-contract", Some(4242), Some(17))
+            .unwrap();
+
+        assert_eq!(address.block_slab_id(), 0);
+        assert_eq!(address.offset(), 0);
+        assert!(address.length() > b"address-contract".len() as u64);
+        assert_eq!(address.block_id(), Some(0));
+        // The append was handed 4242 as the object id and the address does not keep one. What it
+        // keeps is the generation, which is the block id.
+        assert_eq!(address.generation(), Some(0));
+        assert_eq!(address.slab_id(), Some(0));
+        assert_eq!(address.compact_slab_id(), Some(0));
+        assert_eq!(address.compact_slab_offset(), Some(0));
+        assert_eq!(address.compact_slab_address(), Some(0));
+        let from_compact_slab = ElementEntry::from_compact_slab_address(
+            address.compact_slab_address().unwrap(),
+            address.length(),
+        );
+        assert_eq!(
+            from_compact_slab.block_slab_id(),
+            address.block_slab_id()
+        );
+        assert_eq!(from_compact_slab.offset(), address.offset());
+        assert_eq!(from_compact_slab.length, address.length);
+        assert_eq!(store.read(&address).unwrap(), b"address-contract");
+
+        let legacy_alias_json = serde_json::json!({
+            // The renames still load; the split address does not. See
+            // `a_split_address_is_refused_and_a_merged_one_round_trips`.
+            "a": address.address_word(),
+            "length": address.length,
+            "page_id": address.block_id(),
+            // A VALUE THE ADDRESS CANNOT PRODUCE, for the same reason `routing_slot` below is one:
+            // an old index carries a real `object_id`, the slot is still read, and loading such a
+            // row must neither fail nor change the address. It feeds the generation cross-check and
+            // lands in no field.
+            "object_id": 4242_u64,
+            // A NUMBER THE ADDRESS CANNOT PRODUCE, which is what makes this row worth keeping: the
+            // key is still on the wire, an older index carries a real bucket in it, and loading one
+            // must neither fail nor change the address. `from_checksum_alias == address` below is
+            // that assertion, and it only means something if the value here is one the address
+            // could not have written.
+            "routing_slot": 545_210_715_u32,
+            // generation is a canonical, always-present field on write (append sets
+            // Some(page_id)) and on read (record decode derives it), so the legacy
+            // alias JSON must carry it or the round-trip deserializes to None.
+            "generation": address.generation(),
+            "band_id": address.slab_id(),
+            // A document written before the digest left the index carries it under this
+            // alias. It must still LOAD -- accepted and ignored -- which is what this asserts.
+            "checksum": sha256_hex(b"address-contract"),
+        });
+        let from_checksum_alias: ElementEntry = serde_json::from_value(legacy_alias_json).unwrap();
+        assert_eq!(from_checksum_alias, address);
+        assert_eq!(
+            serde_json::to_value(&address).unwrap().get("sha256"),
+            None,
+            "an index written now omits the digest; the page envelope carries it"
+        );
+        assert_eq!(
+            serde_json::json!(sha256_hex(b"address-contract")),
+            serde_json::json!(sha256_hex(b"address-contract"))
+        );
+    }
+
+    #[test]
+    fn block_slab_records_have_self_describing_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let address = store.append(b"enveloped-page").unwrap();
+        let raw = store.read_slab(address.block_slab_id()).unwrap();
+
+        assert_eq!(address.block_id(), Some(0));
+        assert_eq!(store.read(&address).unwrap(), b"enveloped-page");
+    }
+
+    #[test]
+    fn block_id_mismatch_rejects_corrupt_address_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let mut address = store.append(b"identity-checked-page").unwrap();
+        address.set_block_id(Some(address.block_id().unwrap() + 1));
+
+        let err = store.read(&address).unwrap_err();
+        assert!(matches!(err, BlockStoreError::CorruptBlockEnvelope { .. }));
+    }
+
+    #[test]
+    fn a_slab_descriptor_carries_the_same_number_twice() {
+        // A descriptor's `stored_slab_id` and its `block_slab_id` are ONE value under two names.
+        // Every construction site says so: each one now writes the slab id itself into both,
+        // which is what removing the identity helper made visible.
+        //
+        // `rolled_slabs_stamp_new_slab_ids` below pins that for an ADDRESS. This pins it for the
+        // DESCRIPTOR, which is the struct that actually stores both, and where a caller picks
+        // whichever name is nearer without it mattering today.
+        //
+        // Removing either field is a wire change -- both serialize and the compat corpora carry
+        // them -- so the duplication stays. What must not happen is the two diverging quietly.
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.append(b"first").unwrap();
+        store.roll_slab().unwrap();
+        store.append(b"second").unwrap();
+
+        let descriptors = store.slab_descriptors();
+        assert!(
+            descriptors.len() >= 2,
+            "the roll should give at least two descriptors, got {}",
+            descriptors.len()
+        );
+        for descriptor in &descriptors {
+            assert_eq!(
+                descriptor.stored_slab_id, descriptor.block_slab_id,
+                "one unit, one id: stored_slab_id and block_slab_id must never diverge"
+            );
+        }
+    }
+
+    /// The stored id IS the slab id -- but across DESERIALIZATION that is trusted, not enforced,
+    /// and the route where it is trusted hardest is the one an open deliberately does not look at.
+    ///
+    /// `a_slab_descriptor_carries_the_same_number_twice` pins the invariant on the paths that
+    /// COMPUTE it: every one of them writes the slab id itself, so a descriptor this process
+    /// builds cannot diverge. The manifest is the hole. `stored_slab_id` serializes, under the
+    /// older `band_id` key, and `load_slab_manifest_at` keeps whatever number the file carried.
+    ///
+    /// Consumers then read that stored number instead of recomputing it: `gc_utility_candidates`
+    /// groups slabs by it in two places, and `compute_slab_usage` keys its per-slab usage rows by
+    /// it. Two slabs carrying one id are summed together there, so each one's GC utility is
+    /// scored against the other one's bytes.
+    ///
+    /// THE ROUTE THIS GUARD EXISTS FOR IS THE SKIP. Re-inspecting a sealed slab whose size and
+    /// mtime still match what it was verified against is the bulk of a cold open, so by default
+    /// (`TS_REVERIFY_ALL_SLABS` unset) it is not done, and the descriptor is carried over from
+    /// the manifest untouched. An earlier shape of this test opened the store TWICE and asserted
+    /// the property. That reads as a guard and is not one: the stamp that arms the skip is
+    /// written by the second open and only persisted afterwards, so that test skipped ZERO slabs
+    /// and proved nothing about the route its own comment named. It takes THREE opens, and the
+    /// skipped count is asserted non-zero HERE, as a denominator, before any property is.
+    ///
+    /// No manifest is believed to carry a divergent id today -- the historical grouping value was
+    /// the identity too, because the grouping size and the slab size were never configured
+    /// differently. This pins the consequence rather than the belief, and it is the guard the
+    /// consolidation of the two names is judged against: the code now says slab everywhere, the
+    /// manifest still says band, and this is where those two meet.
+    #[test]
+    fn a_stored_slab_id_that_disagrees_with_its_descriptor_is_normalised_on_load() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.append(b"first").unwrap();
+        store.roll_slab().unwrap();
+        store.append(b"second-is-a-little-longer").unwrap();
+        store.roll_slab().unwrap();
+        store.append(b"third").unwrap();
+        drop(store);
+
+        // OPEN TWO. The one that inspects the sealed slabs, stamps
+        // `verified_source_mtime_unix_ms` onto their descriptors and writes the manifest out.
+        // It skips nothing -- which is exactly why a two-open test exercises nothing.
+        let warm = BlockStore::new(dir.path());
+        assert_eq!(
+            warm.slabs_skipped_reinspection_on_open(),
+            0,
+            "the second open cannot skip anything yet: it is the one doing the stamping"
+        );
+        drop(warm);
+
+        let manifest_path = slab_manifest_path(dir.path());
+        let raw = fs::read(&manifest_path).unwrap();
+        let mut manifest: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+
+        // DENOMINATOR: the manifest really has descriptors, and they really agree to begin with.
+        // The KEYS read here are the on-disk spelling and are deliberately not the Rust one:
+        // "bands" and "band_id" are the format, `slabs` and `stored_slab_id` are the code.
+        // The slab id is read under `block_segment_id` because that is what THIS build writes; a
+        // manifest from an older build spells it `page_segment_id` and loads through the alias.
+        let entries = manifest["bands"].as_array_mut().expect("bands array");
+        assert!(
+            entries.len() >= 3,
+            "the manifest must really carry descriptors: {entries:?}"
+        );
+        for entry in entries.iter() {
+            assert_eq!(
+                entry["band_id"].as_u64(),
+                entry["block_segment_id"].as_u64(),
+                "they agree before the edit"
+            );
+        }
+
+        // Make EVERY descriptor disagree, exactly as a grouping id would have. The active slab is
+        // always inspected and would be rewritten whatever this file said; the two sealed ones
+        // are the point.
+        for entry in entries.iter_mut() {
+            entry["band_id"] = serde_json::json!(999_u64);
+        }
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        // OPEN THREE. Editing the manifest does not touch the slab files, so every sealed slab
+        // still matches what its descriptor was verified against and takes the skip.
+        let reopened = BlockStore::new(dir.path());
+
+        // THE DENOMINATOR FOR THE ROUTE, asserted BEFORE the property. Without it, a change that
+        // quietly stopped skipping -- or a default that went back to re-verifying everything --
+        // would leave everything below passing while covering nothing at all.
+        let skipped = reopened.slabs_skipped_reinspection_on_open();
+        assert!(
+            skipped > 0,
+            "this guard must actually exercise the skip route, and it skipped {skipped} slabs"
+        );
+
+        let descriptors = reopened.slab_descriptors();
+        assert!(
+            descriptors.len() >= 3,
+            "the reopened store must really have loaded the descriptors: {descriptors:?}"
+        );
+        let divergent = descriptors
+            .iter()
+            .filter(|descriptor| descriptor.stored_slab_id != descriptor.block_slab_id)
+            .collect::<Vec<_>>();
+
+        // THE ANSWER: the open NORMALISES it. `reconcile_slab_manifest_with_disk` ends with a
+        // sweep over EVERY descriptor, not merely the ones it re-read, so a manifest cannot
+        // smuggle in a grouping the rest of the code would then honour.
+        assert!(
+            divergent.is_empty(),
+            "a divergent stored band id must not survive the load, and {skipped} slabs took the \
+             skip route on this open: {divergent:?}"
+        );
+
+        // AND THE CONSEQUENCE, at the consumer that groups by the stored value. Each slab is its
+        // own group, so each candidate's group bytes are its own bytes and no one else's. Under a
+        // shared id the two collectable slabs report each other's bytes as their group total and
+        // their GC utility is scored against the wrong denominator.
+        let candidates = reopened
+            .gc_utility_candidates(2, Vec::<u64>::new())
+            .unwrap();
+        assert!(
+            candidates.len() >= 2,
+            "the consequence needs at least two collectable slabs: {candidates:?}"
+        );
+        for candidate in &candidates {
+            assert_eq!(
+                candidate.total_bytes, candidate.bytes,
+                "each slab is its own group, so its group bytes are its own: {candidate:?}"
+            );
+        }
+    }
+
+    /// The CODE says slab. The FILE still says band, and that is the point.
+    ///
+    /// `slab_manifest.json` is read by binaries that are already deployed, and the descriptor's
+    /// `band_id` carries no `#[serde(default)]` -- so a manifest written under renamed keys is
+    /// not "an older shape with a missing field", it is unreadable. There is no alias mechanism
+    /// on the WRITE side to soften that: serde writes exactly one name per field.
+    ///
+    /// Renaming a Rust field whose wire name was IMPLICIT is the way that happens by accident.
+    /// It compiles, every type-level test still passes, and the only thing that changed is the
+    /// bytes on disk. This asserts the bytes.
+    #[test]
+    fn a_folded_manifest_still_writes_the_keys_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.append(b"first").unwrap();
+        store.roll_slab().unwrap();
+        store.append(b"second").unwrap();
+        store.sync_durable().unwrap();
+        drop(store);
+
+        let raw = fs::read(slab_manifest_path(dir.path())).expect("the manifest must be on disk");
+        let manifest: serde_json::Value = serde_json::from_slice(&raw).expect("valid json");
+
+        // DENOMINATOR FIRST: read the array under the key it must be written at, and prove it is
+        // not empty. Without this every per-entry assertion below is vacuously true.
+        let entries = manifest
+            .get("bands")
+            .unwrap_or_else(|| panic!("the slab list must be written under \"bands\": {manifest}"))
+            .as_array()
+            .expect("an array");
+        assert!(
+            entries.len() >= 2,
+            "this guard needs descriptors to look at, and found {}: {manifest}",
+            entries.len()
+        );
+        assert!(
+            manifest.get("slabs").is_none(),
+            "the Rust field name must NOT reach the file: {manifest}"
+        );
+
+        for entry in entries {
+            assert!(
+                entry.get("band_id").is_some(),
+                "every descriptor keeps its on-disk id key: {entry}"
+            );
+            assert!(
+                entry.get("block_segment_id").is_some(),
+                "and the slab-id key this build writes: {entry}"
+            );
+            assert!(
+                entry.get("stored_slab_id").is_none(),
+                "the Rust field name must NOT reach the file: {entry}"
+            );
+        }
+
+        // And the file this process wrote is one this process can read: the keys above are not
+        // merely present, they are the ones the deserializer binds.
+        let reopened = BlockStore::new(dir.path());
+        let descriptors = reopened.slab_descriptors();
+        assert_eq!(
+            descriptors.len(),
+            entries.len(),
+            "every descriptor on disk must come back: {descriptors:?}"
+        );
+    }
+
+    #[test]
+    fn rolled_slabs_stamp_new_slab_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let first = store.append(b"first-slab").unwrap();
+        let roll = store.roll_slab().unwrap();
+        let second = store.append(b"second-slab").unwrap();
+
+        assert_eq!(first.slab_id(), Some(first.block_slab_id()));
+        assert_eq!(second.slab_id(), Some(second.block_slab_id()));
+        assert_eq!(second.slab_id(), Some(roll.new_block_slab_id));
+        assert_ne!(first.slab_id(), second.slab_id());
+    }
+
+    #[test]
+    fn slab_manifest_tracks_roll_reopen_gc_and_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let first = store.append(b"first-slab").unwrap();
+        store.roll_slab().unwrap();
+        let second = store.append(b"second-slab").unwrap();
+
+        let slabs = store.slab_descriptors();
+        assert_eq!(slabs.len(), 2);
+        assert_eq!(slabs[0].block_slab_id, first.block_slab_id());
+        assert_eq!(slabs[0].state, BlockStoreSlabState::Sealed);
+        assert_eq!(slabs[0].first_block_id, first.block_id());
+        assert_eq!(slabs[0].last_block_id, first.block_id());
+        assert!(slabs[0].created_unix_ms.is_some());
+        assert!(slabs[0].updated_unix_ms.is_some());
+        assert_eq!(slabs[1].block_slab_id, second.block_slab_id());
+        assert_eq!(slabs[1].state, BlockStoreSlabState::Active);
+        assert_eq!(slabs[1].first_block_id, second.block_id());
+        assert_eq!(slabs[1].last_block_id, second.block_id());
+        assert!(slabs[1].created_unix_ms.is_some());
+        assert!(slabs[1].updated_unix_ms.is_some());
+        assert!(slab_manifest_path(dir.path()).exists());
+        let initial_summary = store.slab_summary();
+        assert_eq!(initial_summary.sealed_slabs, 1);
+        assert_eq!(initial_summary.active_slabs, 1);
+        assert_eq!(initial_summary.delayed_destroy_slabs, 0);
+        assert_eq!(initial_summary.purged_slabs, 0);
+        assert_eq!(
+            initial_summary.sealed_physical_bytes,
+            slabs[0].physical_bytes
+        );
+        assert_eq!(
+            initial_summary.active_physical_bytes,
+            slabs[1].physical_bytes
+        );
+        assert_eq!(
+            initial_summary.live_physical_bytes,
+            slabs[0].physical_bytes + slabs[1].physical_bytes
+        );
+        assert_eq!(initial_summary.reclaimable_physical_bytes, 0);
+        assert!(initial_summary.oldest_known_slab_unix_ms.is_some());
+        assert!(initial_summary.oldest_known_slab_age_ms.is_some());
+        assert!(initial_summary.oldest_live_slab_unix_ms.is_some());
+        assert!(initial_summary.oldest_live_slab_age_ms.is_some());
+        assert!(initial_summary.oldest_reclaimable_slab_unix_ms.is_none());
+        assert!(initial_summary.oldest_reclaimable_slab_age_ms.is_none());
+        let initial_slab_usage = store.slab_usage();
+        assert_eq!(initial_slab_usage.len(), 2);
+        assert_eq!(initial_slab_usage[0].stored_slab_id, slabs[0].stored_slab_id);
+        assert_eq!(
+            initial_slab_usage[0].block_slab_id,
+            slabs[0].block_slab_id
+        );
+        assert_eq!(
+            initial_slab_usage[0].block_store_used_bytes,
+            slabs[0].physical_bytes
+        );
+        assert_eq!(
+            initial_slab_usage[0].live_block_store_used_bytes,
+            slabs[0].physical_bytes
+        );
+        assert_eq!(initial_slab_usage[0].reclaimable_block_store_used_bytes, 0);
+        assert_eq!(initial_slab_usage[0].purged_block_store_used_bytes, 0);
+
+        let reopened = BlockStore::new(dir.path());
+        let reopened_slabs = reopened.slab_descriptors();
+        assert_eq!(reopened_slabs.len(), slabs.len());
+        // The slab must survive a reopen unchanged. `verified_source_mtime_unix_ms` is excluded
+        // because it is not part of the slab: it records when the descriptor was last checked
+        // against the file, and the two sides differ on that for a good reason, asserted below.
+        let strip = |slab: &BlockStoreSlabDescriptor| {
+            let mut slab = slab.clone();
+            slab.verified_source_mtime_unix_ms = None;
+            slab
+        };
+        assert_eq!(strip(&reopened_slabs[0]), strip(&slabs[0]));
+        // The original store wrote and sealed this slab without ever inspecting it, so it has
+        // nothing verified to record; the reopen reconciled, which inspected it, so it does.
+        assert!(
+            slabs[0].verified_source_mtime_unix_ms.is_none(),
+            "a slab this process only wrote has not been verified by inspection: {:?}",
+            slabs[0]
+        );
+        assert!(
+            reopened_slabs[0].verified_source_mtime_unix_ms.is_some(),
+            "reopening inspected this slab, so the identity it verified should be recorded: {:?}",
+            reopened_slabs[0]
+        );
+        assert_eq!(
+            reopened_slabs[1].block_slab_id,
+            slabs[1].block_slab_id
+        );
+        assert_eq!(reopened_slabs[1].state, slabs[1].state);
+        assert_eq!(
+            reopened_slabs[1].physical_bytes,
+            slabs[1].physical_bytes
+        );
+        assert_eq!(reopened_slabs[1].logical_bytes, slabs[1].logical_bytes);
+        assert_eq!(
+            reopened_slabs[1].created_unix_ms,
+            slabs[1].created_unix_ms
+        );
+        assert!(reopened_slabs[1].updated_unix_ms >= slabs[1].updated_unix_ms);
+
+        let report = reopened
+            .gc_slabs_before_with_live_refs_delayed_destroy(1, std::iter::empty())
+            .unwrap();
+        assert_eq!(report.delayed_destroy_block_slab_ids, vec![0]);
+        let delayed = reopened.slab_descriptors();
+        assert_eq!(delayed[0].state, BlockStoreSlabState::DelayedDestroy);
+        assert!(delayed[0].physical_bytes > 0);
+        assert_eq!(delayed[0].created_unix_ms, slabs[0].created_unix_ms);
+        assert!(delayed[0].updated_unix_ms >= slabs[0].updated_unix_ms);
+        assert_eq!(delayed[1].state, BlockStoreSlabState::Active);
+        let delayed_summary = reopened.slab_summary();
+        assert_eq!(delayed_summary.delayed_destroy_slabs, 1);
+        assert_eq!(delayed_summary.active_slabs, 1);
+        assert_eq!(
+            delayed_summary.delayed_destroy_physical_bytes,
+            delayed[0].physical_bytes
+        );
+        assert_eq!(
+            delayed_summary.reclaimable_physical_bytes,
+            delayed[0].physical_bytes
+        );
+        assert_eq!(
+            delayed_summary.live_physical_bytes,
+            delayed[1].physical_bytes
+        );
+        assert!(delayed_summary.oldest_known_slab_unix_ms.is_some());
+        assert!(delayed_summary.oldest_live_slab_unix_ms.is_some());
+        assert_eq!(
+            delayed_summary.oldest_reclaimable_slab_unix_ms,
+            delayed[0].updated_unix_ms
+        );
+        assert!(delayed_summary.oldest_reclaimable_slab_age_ms.is_some());
+        let delayed_slab_usage = reopened.slab_usage();
+        let delayed_first = delayed_slab_usage
+            .iter()
+            .find(|slab| slab.block_slab_id == first.block_slab_id())
+            .unwrap();
+        assert_eq!(
+            delayed_first.reclaimable_block_store_used_bytes,
+            delayed[0].physical_bytes
+        );
+        assert_eq!(delayed_first.live_block_store_used_bytes, 0);
+
+        let purge = reopened
+            .purge_delayed_destroy_slabs_older_than(0)
+            .unwrap();
+        assert_eq!(purge.purged_block_slab_ids, vec![0]);
+        assert!(purge.purged_physical_bytes > 0);
+        let purged = BlockStore::new(dir.path()).slab_descriptors();
+        assert_eq!(purged[0].state, BlockStoreSlabState::Purged);
+        assert_eq!(purged[0].created_unix_ms, slabs[0].created_unix_ms);
+        assert!(purged[0].updated_unix_ms >= delayed[0].updated_unix_ms);
+        assert_eq!(purged[1].state, BlockStoreSlabState::Active);
+        let purged_summary = BlockStore::new(dir.path()).slab_summary();
+        assert_eq!(purged_summary.purged_slabs, 1);
+        assert_eq!(purged_summary.active_slabs, 1);
+        assert_eq!(
+            purged_summary.purged_physical_bytes,
+            purged[0].physical_bytes
+        );
+        assert_eq!(purged_summary.live_physical_bytes, purged[1].physical_bytes);
+        assert_eq!(purged_summary.reclaimable_physical_bytes, 0);
+        let purged_slab_usage = BlockStore::new(dir.path()).slab_usage();
+        let purged_first = purged_slab_usage
+            .iter()
+            .find(|slab| slab.block_slab_id == first.block_slab_id())
+            .unwrap();
+        assert_eq!(
+            purged_first.purged_block_store_used_bytes,
+            purged[0].physical_bytes
+        );
+        assert_eq!(purged_first.reclaimable_block_store_used_bytes, 0);
+        assert!(purged_summary.oldest_known_slab_unix_ms.is_some());
+        assert!(purged_summary.oldest_live_slab_unix_ms.is_some());
+        assert!(purged_summary.oldest_reclaimable_slab_unix_ms.is_none());
+        assert!(purged_summary.oldest_reclaimable_slab_age_ms.is_none());
+    }
+
+    #[test]
+    fn missing_slab_manifest_rebuilds_from_existing_slabs() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let first = store.append(b"first-slab").unwrap();
+        store.roll_slab().unwrap();
+        let second = store.append(b"second-slab").unwrap();
+        fs::remove_file(slab_manifest_path(dir.path())).unwrap();
+
+        let rebuilt = BlockStore::new(dir.path());
+        let slabs = rebuilt.slab_descriptors();
+
+        assert_eq!(slabs.len(), 2);
+        assert_eq!(slabs[0].block_slab_id, first.block_slab_id());
+        assert_eq!(slabs[0].state, BlockStoreSlabState::Sealed);
+        assert_eq!(slabs[0].first_block_id, first.block_id());
+        assert_eq!(slabs[0].last_block_id, first.block_id());
+        assert!(slabs[0].created_unix_ms.is_some());
+        assert!(slabs[0].updated_unix_ms.is_some());
+        assert_eq!(slabs[1].block_slab_id, second.block_slab_id());
+        assert_eq!(slabs[1].state, BlockStoreSlabState::Active);
+        assert_eq!(slabs[1].first_block_id, second.block_id());
+        assert_eq!(slabs[1].last_block_id, second.block_id());
+        assert!(slabs[1].created_unix_ms.is_some());
+        assert!(slabs[1].updated_unix_ms.is_some());
+        assert!(slab_manifest_path(dir.path()).exists());
+
+        let report = rebuilt.stream_backed_slab_runtime_report().unwrap();
+        assert!(report.runtime_ready, "{report:?}");
+        assert_eq!(report.slab_lifecycle_states, vec!["active", "sealed"]);
+        assert!(report.slab_manifest_ready);
+        assert!(report.slab_manifest_rebuild_ready);
+        assert!(report.slab_stats_ready);
+        assert_eq!(report.slab_usage.len(), 2);
+        assert_eq!(
+            report
+                .slab_usage
+                .iter()
+                .map(|slab| slab.block_store_used_bytes)
+                .sum::<u64>(),
+            report.physical_bytes
+        );
+        assert!(!report.slab_manifest_reconciled_on_open);
+        assert!(report.slab_manifest_disk_consistent);
+        assert_eq!(report.manifest_missing_stream_slabs, 0);
+        assert_eq!(report.manifest_extra_stream_slabs, 0);
+        assert_eq!(report.corrupt_slab_count, 0);
+        assert_eq!(report.partial_slab_count, 0);
+        assert!(report.partial_slab_recovery_ready);
+        assert_eq!(report.readable_prefix_physical_bytes, report.physical_bytes);
+    }
+
+    // shared-corpus: storage_stream_partial_band_rebuild;
+    #[test]
+    fn partial_slab_manifest_rebuild_preserves_readable_prefix_and_reports_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let first_payload = b"sealed-readable-prefix".repeat(64);
+        let first = store.append(&first_payload).unwrap();
+        store.roll_slab().unwrap();
+        let second = store.append(b"active-clean-tail").unwrap();
+
+        let first_slab = slab_path(dir.path(), first.block_slab_id());
+        let readable_prefix = fs::metadata(&first_slab).unwrap().len();
+        OpenOptions::new()
+            .append(true)
+            .open(&first_slab)
+            .unwrap()
+            .write_all(b"partial-corrupt-tail")
+            .unwrap();
+        fs::remove_file(slab_manifest_path(dir.path())).unwrap();
+
+        let rebuilt = BlockStore::new(dir.path());
+        assert_eq!(rebuilt.read(&first).unwrap(), first_payload);
+        assert_eq!(rebuilt.read(&second).unwrap(), b"active-clean-tail");
+
+        let slabs = rebuilt.slab_descriptors();
+        let sealed = slabs
+            .iter()
+            .find(|slab| slab.block_slab_id == first.block_slab_id())
+            .unwrap();
+        assert_eq!(sealed.state, BlockStoreSlabState::Sealed);
+        assert!(sealed.has_corruption);
+        assert_eq!(sealed.first_error_offset, Some(readable_prefix));
+        assert_eq!(sealed.readable_prefix_physical_bytes, readable_prefix);
+        assert_eq!(sealed.first_block_id, first.block_id());
+        assert_eq!(sealed.last_block_id, first.block_id());
+        assert!(sealed
+            .first_error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("mixed raw bytes"));
+        assert!(slab_manifest_path(dir.path()).exists());
+
+        let report = rebuilt.stream_backed_slab_runtime_report().unwrap();
+        assert!(!report.runtime_ready, "{report:?}");
+        assert!(report.slab_manifest_ready);
+        assert!(report.slab_manifest_rebuild_ready);
+        assert!(!report.slab_manifest_reconciled_on_open);
+        assert!(report.slab_manifest_disk_consistent);
+        assert_eq!(report.manifest_missing_stream_slabs, 0);
+        assert_eq!(report.manifest_extra_stream_slabs, 0);
+        assert_eq!(report.slab_lifecycle_states, vec!["active", "sealed"]);
+        assert_eq!(report.corrupt_slab_count, 1);
+        assert_eq!(report.partial_slab_count, 1);
+        assert_eq!(
+            report.readable_prefix_physical_bytes,
+            readable_prefix + second.length()
+        );
+        assert!(report.partial_slab_recovery_ready);
+        assert!(!report.envelope_checksum_ready);
+        assert!(report
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("readable prefix was preserved")));
+    }
+
+    #[test]
+    fn logical_block_range_skips_record_envelopes_across_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.append(b"abc").unwrap();
+        store.append(b"def").unwrap();
+
+        assert_eq!(store.read_logical_range(0, 1, 4).unwrap(), b"bcde");
+    }
+
+    #[test]
+    fn read_range_and_logical_range_drive_shared_slab_read_through() {
+        // On-demand lazy recovery must cover slab-report / streaming reads too:
+        // read_range and read_logical_range on a metadata-only restored node must pull a
+        // not-yet-fetched checkpoint slab from shared storage on first access (previously
+        // they hit a local File::open miss instead of the shared read-through).
+        #[derive(Debug)]
+        struct OneSlabSource {
+            block_slab_id: u64,
+            bytes: Vec<u8>,
+        }
+        impl SharedSlabSource for OneSlabSource {
+            fn fetch_slab(&self, block_slab_id: u64) -> Result<Option<Vec<u8>>, BlockStoreError> {
+                Ok((block_slab_id == self.block_slab_id).then(|| self.bytes.clone()))
+            }
+        }
+
+        // Producer writes a real slab; capture its raw bytes to serve lazily to fresh nodes.
+        let producer_dir = tempfile::tempdir().unwrap();
+        let producer = BlockStore::new(producer_dir.path());
+        producer.append(b"abc").unwrap();
+        producer.append(b"def").unwrap();
+        let raw = producer.read_slab(0).unwrap();
+        drop(producer);
+
+        // read_range: fresh node, slab absent locally, shared source attached.
+        let range_dir = tempfile::tempdir().unwrap();
+        let range_node = BlockStore::new(range_dir.path());
+        range_node.attach_shared_slab_source(Arc::new(OneSlabSource {
+            block_slab_id: 0,
+            bytes: raw.clone(),
+        }));
+        assert!(
+            !range_node.slab_ids().unwrap().contains(&0),
+            "slab must not be installed before the range read"
+        );
+        assert_eq!(range_node.stats().shared_slab_fetches, 0);
+        let raw_prefix = range_node.read_range(0, 0, 3).unwrap();
+        assert_eq!(
+            range_node.stats().shared_slab_fetches, 1,
+            "read_range must fetch the missing slab exactly once"
+        );
+        assert_eq!(raw_prefix.len(), 3);
+        assert_eq!(raw, range_node.read_slab(0).unwrap());
+        // Cached now: a second range read must not re-fetch.
+        let _ = range_node.read_range(0, 0, 3).unwrap();
+        assert_eq!(
+            range_node.stats().shared_slab_fetches, 1,
+            "cached slab: no re-fetch"
+        );
+
+        // read_logical_range: independent fresh node so its fetch count starts at 0.
+        let logical_dir = tempfile::tempdir().unwrap();
+        let logical_node = BlockStore::new(logical_dir.path());
+        logical_node.attach_shared_slab_source(Arc::new(OneSlabSource {
+            block_slab_id: 0,
+            bytes: raw.clone(),
+        }));
+        assert_eq!(logical_node.stats().shared_slab_fetches, 0);
+        let logical = logical_node.read_logical_range(0, 1, 4).unwrap();
+        assert_eq!(
+            logical_node.stats().shared_slab_fetches, 1,
+            "read_logical_range must fetch the missing slab exactly once"
+        );
+        assert_eq!(logical, b"bcde");
+    }
+
+        /// A record written by the streaming encoder must still decode, and vice versa.
+    ///
+    /// The block-record encoder used to build a zstd compressor per call; it now holds one per
+    /// thread, which removed about 80% of what a write allocates. The two APIs frame a stream
+    /// differently, so the STORED BYTES changed -- and a stored-byte change is only safe if a
+    /// record written by either build reads on either.
+    ///
+    /// This pins that both ways round, which a round-trip test through one encoder cannot: it
+    /// would pass just as happily if the format had shifted under it.
+    #[test]
+    fn block_records_written_by_either_encoder_decode() {
+        let payload: Vec<u8> = (0..4096u32).map(|i| ((i * 7 + (i >> 3)) % 251) as u8).collect();
+        let level = 3;
+
+        // What the old encoder produced, byte for byte.
+        let streaming = zstd::stream::encode_all(std::io::Cursor::new(&payload[..]), level)
+            .expect("streaming encode");
+        // What the held compressor produces now.
+        let bulk = {
+            let mut compressor = zstd::bulk::Compressor::new(level).expect("compressor");
+            compressor.compress(&payload).expect("bulk encode")
+        };
+
+        assert_ne!(
+            streaming, bulk,
+            "if these ever match, this test is no longer proving anything and should be removed"
+        );
+
+        // The decode path a reader takes, given the exact payload length from the header.
+        for (label, blob) in [("streaming", &streaming), ("bulk", &bulk)] {
+            let mut decompressor = zstd::bulk::Decompressor::new().expect("decompressor");
+            let back = decompressor
+                .decompress(blob, payload.len())
+                .unwrap_or_else(|error| panic!("{label} record failed the bulk decode: {error}"));
+            assert_eq!(back, payload, "{label} record decoded to the wrong bytes");
+
+            // And the streaming fallback the decoder uses above its size ceiling.
+            let back = zstd::stream::decode_all(std::io::Cursor::new(&blob[..]))
+                .unwrap_or_else(|error| panic!("{label} record failed the streaming decode: {error}"));
+            assert_eq!(back, payload, "{label} record decoded to the wrong bytes");
+        }
+    }
+
+    #[test]
+    fn compressed_block_records_round_trip_and_remain_logical() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let first_payload = b"prefix-".repeat(80);
+        let second_payload = b"suffix-".repeat(80);
+        let first = store.append(&first_payload).unwrap();
+        let second = store.append(&second_payload).unwrap();
+        let raw = store.read_slab(first.block_slab_id()).unwrap();
+
+        assert!(first.length() < (record::BLOCK_RECORD_HEADER_LEN + first_payload.len()) as u64);
+        assert!(second.length() < (record::BLOCK_RECORD_HEADER_LEN + second_payload.len()) as u64);
+        assert_eq!(store.read(&first).unwrap(), first_payload);
+        assert_eq!(store.read(&second).unwrap(), second_payload);
+
+        let logical_offset = first_payload.len() as u64 - 3;
+        let logical = store
+            .read_logical_range(first.block_slab_id(), logical_offset, 12)
+            .unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&first_payload[first_payload.len() - 3..]);
+        expected.extend_from_slice(&second_payload[..9]);
+        assert_eq!(logical, expected);
+        assert_eq!(record::block_record_compression_byte(&raw), BLOCK_RECORD_COMPRESSION_ZSTD);
+
+        let stats = store.stats();
+        assert_eq!(stats.writes, 2);
+        assert_eq!(
+            stats.logical_bytes_written,
+            (first_payload.len() + second_payload.len()) as u64
+        );
+        assert_eq!(stats.compressed_records_written, 2);
+        assert_eq!(stats.compressed_records_read, 4);
+        assert!(stats.compression_bytes_saved > 0);
+        assert!(stats.bytes_written < stats.logical_bytes_written);
+        assert!(stats.logical_bytes_read >= stats.bytes_read);
+    }
+
+    // shared-corpus: storage_stream_backed_band_runtime;
+    #[test]
+    fn stream_backed_slab_runtime_report_covers_roll_read_manifest_and_delayed_destroy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let first_payload = b"slab-stream-first-".repeat(96);
+        let second_payload = b"slab-stream-second-".repeat(96);
+        let first = store
+            .append_with_block_metadata(&first_payload, Some(11), Some(7))
+            .unwrap();
+        let second = store
+            .append_with_block_metadata(&second_payload, Some(12), Some(7))
+            .unwrap();
+        assert_eq!(first.block_slab_id(), second.block_slab_id());
+
+        let logical_offset = first_payload.len() as u64 - 8;
+        let logical = store
+            .read_logical_range(first.block_slab_id(), logical_offset, 16)
+            .unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&first_payload[first_payload.len() - 8..]);
+        expected.extend_from_slice(&second_payload[..8]);
+        assert_eq!(logical, expected);
+
+        let roll = store.roll_slab().unwrap();
+        let third_payload = b"slab-stream-third-".repeat(96);
+        let third = store
+            .append_with_block_metadata(&third_payload, Some(13), Some(8))
+            .unwrap();
+        assert_eq!(third.block_slab_id(), roll.new_block_slab_id);
+        let before_gc = store.stream_backed_slab_runtime_report().unwrap();
+        assert!(before_gc.runtime_ready, "{before_gc:?}");
+        assert_eq!(before_gc.active_slabs, 1);
+        assert_eq!(before_gc.sealed_slabs, 1);
+        assert_eq!(before_gc.slab_lifecycle_states, vec!["active", "sealed"]);
+        assert_eq!(before_gc.stream_record_count, 3);
+        assert_eq!(before_gc.first_block_id, first.block_id());
+        assert_eq!(before_gc.last_block_id, third.block_id());
+        assert!(before_gc.block_id_continuity_ready);
+        assert!(before_gc.slab_manifest_rebuild_ready);
+        assert!(before_gc.slab_stats_ready);
+        assert_eq!(before_gc.slab_usage.len(), 2);
+        assert_eq!(
+            before_gc
+                .slab_usage
+                .iter()
+                .map(|slab| slab.block_store_used_bytes)
+                .sum::<u64>(),
+            before_gc.physical_bytes
+        );
+        assert!(before_gc.logical_stream_bytes_read >= 16);
+        assert!(before_gc.slab_state_transition_count >= 2);
+
+        let delayed = store
+            .gc_slabs_before_with_live_refs_delayed_destroy(
+                roll.new_block_slab_id,
+                [roll.new_block_slab_id],
+            )
+            .unwrap();
+        assert_eq!(
+            delayed.delayed_destroy_block_slab_ids,
+            vec![roll.previous_block_slab_id]
+        );
+
+        let reopened = BlockStore::new(dir.path());
+        assert_eq!(reopened.read(&third).unwrap(), third_payload);
+        let report = reopened.stream_backed_slab_runtime_report().unwrap();
+        assert!(report.runtime_ready, "{report:?}");
+        assert_eq!(report.active_slabs, 1);
+        assert_eq!(report.delayed_destroy_slabs, 1);
+        assert_eq!(
+            report.slab_lifecycle_states,
+            vec!["active", "delayed_destroy"]
+        );
+        assert!(report.slab_count >= 2);
+        assert!(report.stream_slab_count >= 1);
+        assert!(report.logical_stream_read_ready);
+        assert!(report.append_roll_ready);
+        assert!(report.slab_manifest_ready);
+        assert!(report.slab_manifest_rebuild_ready);
+        assert!(report.slab_stats_ready);
+        assert!(report
+            .slab_usage
+            .iter()
+            .any(|slab| slab.state == BlockStoreSlabState::DelayedDestroy
+                && slab.reclaimable_block_store_used_bytes > 0));
+        assert!(report
+            .slab_usage
+            .iter()
+            .any(|slab| slab.state == BlockStoreSlabState::Active
+                && slab.live_block_store_used_bytes > 0));
+        assert!(report.envelope_checksum_ready);
+        assert!(report.compression_stream_ready);
+        assert!(report.delayed_destroy_ready);
+        assert!(!report.purge_lifecycle_ready);
+        assert!(report.logical_bytes >= third_payload.len() as u64);
+        assert_eq!(report.stream_record_count, 1);
+        assert_eq!(report.first_block_id, third.block_id());
+        assert_eq!(report.last_block_id, third.block_id());
+        assert!(report.block_id_continuity_ready);
+        assert!(report.blockers.is_empty());
+        assert!(report
+            .evidence
+            .iter()
+            .any(|item| item.contains("logical stream reads span records")));
+        assert!(report
+            .evidence
+            .iter()
+            .any(|item| item.contains("page-id continuity")));
+
+        let purge = reopened
+            .purge_delayed_destroy_slabs_older_than(0)
+            .unwrap();
+        assert_eq!(
+            purge.purged_block_slab_ids,
+            vec![roll.previous_block_slab_id]
+        );
+        let purged = BlockStore::new(dir.path())
+            .stream_backed_slab_runtime_report()
+            .unwrap();
+        assert!(purged.runtime_ready, "{purged:?}");
+        assert_eq!(purged.active_slabs, 1);
+        assert_eq!(purged.delayed_destroy_slabs, 0);
+        assert_eq!(purged.purged_slabs, 1);
+        assert_eq!(purged.slab_lifecycle_states, vec!["active", "purged"]);
+        assert!(purged.slab_stats_ready);
+        assert!(purged
+            .slab_usage
+            .iter()
+            .any(|slab| slab.state == BlockStoreSlabState::Purged
+                && slab.purged_block_store_used_bytes > 0));
+        assert!(purged.purge_lifecycle_ready);
+        assert!(purged.append_roll_ready);
+        assert!(purged.block_id_continuity_ready);
+    }
+
+    #[test]
+    fn slab_reports_describe_block_counts_bytes_and_compression() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let first_payload = b"prefix-".repeat(80);
+        let second_payload = b"suffix-".repeat(80);
+        let first = store.append(&first_payload).unwrap();
+        let second = store.append(&second_payload).unwrap();
+
+        let reports = store.slab_reports().unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].block_slab_id, first.block_slab_id());
+        assert_eq!(reports[0].physical_bytes, first.length() + second.length());
+        assert_eq!(
+            reports[0].logical_bytes,
+            (first_payload.len() + second_payload.len()) as u64
+        );
+        assert_eq!(reports[0].block_count, 2);
+        assert_eq!(reports[0].compressed_records, 2);
+        assert_eq!(
+            reports[0].readable_prefix_physical_bytes,
+            reports[0].physical_bytes
+        );
+        assert!(!reports[0].has_corruption);
+        assert_eq!(reports[0].first_error_offset, None);
+        assert_eq!(reports[0].first_block_id, first.block_id());
+        assert_eq!(reports[0].last_block_id, second.block_id());
+        assert_eq!(reports[0].block_index_count, 2);
+        assert_eq!(reports[0].block_index_entries.len(), 2);
+        assert_eq!(
+            reports[0].block_index_entries[0].block_slab_id,
+            first.block_slab_id()
+        );
+        assert_eq!(reports[0].block_index_entries[0].offset, first.offset());
+        assert_eq!(reports[0].block_index_entries[0].length, first.length());
+        assert_eq!(
+            reports[0].block_index_entries[0].compact_slab_address,
+            first.compact_slab_address()
+        );
+        assert_eq!(
+            reports[0].block_index_entries[0].compact_slab_id,
+            first.compact_slab_id()
+        );
+        assert_eq!(
+            reports[0].block_index_entries[0].compact_slab_offset,
+            first.compact_slab_offset()
+        );
+        assert_eq!(reports[0].block_index_entries[0].block_id, first.block_id());
+        assert_eq!(
+            reports[0].block_index_entries[0].block_size,
+            first_payload.len() as u64
+        );
+        assert!(reports[0].block_index_entries[0].stored_size < first_payload.len() as u64);
+        assert!(!reports[0].block_index_entries[0].dirty);
+        assert!(!reports[0].block_index_entries[0].deleted);
+        assert!(!reports[0].block_index_entries[0].block_in_log);
+        assert_eq!(reports[0].block_index_entries[1].offset, second.offset());
+        assert_eq!(reports[0].block_index_entries[1].length, second.length());
+        assert_eq!(reports[0].block_index_entries[1].block_id, second.block_id());
+        assert_eq!(reports[0].first_error, None);
+    }
+
+    #[test]
+    fn slab_reports_capture_first_corrupt_record_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let first = store.append(b"healthy").unwrap();
+        let second = store.append(b"damaged").unwrap();
+        let path = slab_path(dir.path(), second.block_slab_id());
+        let mut slab = fs::read(&path).unwrap();
+        *slab.last_mut().unwrap() ^= 0xff;
+        fs::write(path, slab).unwrap();
+
+        let reports = store.slab_reports().unwrap();
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].block_count, 1);
+        assert_eq!(reports[0].logical_bytes, b"healthy".len() as u64);
+        assert_eq!(reports[0].readable_prefix_physical_bytes, first.length());
+        assert!(reports[0].has_corruption);
+        assert_eq!(reports[0].first_error_offset, Some(first.length()));
+        assert_eq!(reports[0].first_block_id, first.block_id());
+        assert_eq!(reports[0].last_block_id, first.block_id());
+        let error = reports[0]
+            .first_error
+            .as_ref()
+            .expect("corrupt second record should be reported");
+        assert!(error.contains("checksum") || error.contains("corrupt page envelope"));
+    }
+
+    #[test]
+    fn block_record_compression_policy_can_disable_or_raise_threshold() {
+        let payload = b"policy-controlled-".repeat(80);
+
+        let disabled_dir = tempfile::tempdir().unwrap();
+        let disabled_store = BlockStore::with_options(
+            disabled_dir.path(),
+            BlockStoreOptions {
+                compression_enabled: false,
+                ..BlockStoreOptions::default()
+            },
+        );
+        let disabled_address = disabled_store.append(&payload).unwrap();
+        let disabled_raw = disabled_store
+            .read_slab(disabled_address.block_slab_id())
+            .unwrap();
+
+        // Stated from the values that went in, because a varint header has no fixed length: it
+        // is the fixed part, one varint per number, and the compression codec.
+        let expected_header = record::BLOCK_RECORD_HEADER_LEN;
+        assert_eq!(
+            disabled_address.length(),
+            (expected_header + payload.len()) as u64
+        );
+        assert_eq!(
+            expected_header,
+            record::BLOCK_RECORD_HEADER_LEN,
+            "one header size, whatever the values"
+        );
+        assert_eq!(record::block_record_compression_byte(&disabled_raw), BLOCK_RECORD_COMPRESSION_NONE);
+        assert_eq!(disabled_store.read(&disabled_address).unwrap(), payload);
+        assert_eq!(disabled_store.stats().compressed_records_written, 0);
+        assert_eq!(disabled_store.stats().compression_bytes_saved, 0);
+
+        let threshold_dir = tempfile::tempdir().unwrap();
+        let threshold_store = BlockStore::with_options(
+            threshold_dir.path(),
+            BlockStoreOptions {
+                compression_min_bytes: payload.len() + 1,
+                ..BlockStoreOptions::default()
+            },
+        );
+        let threshold_address = threshold_store.append(&payload).unwrap();
+        let threshold_raw = threshold_store
+            .read_slab(threshold_address.block_slab_id())
+            .unwrap();
+
+        let threshold_header = record::BLOCK_RECORD_HEADER_LEN;
+        assert_eq!(
+            threshold_address.length(),
+            (threshold_header + payload.len()) as u64
+        );
+        assert_eq!(record::block_record_compression_byte(&threshold_raw), BLOCK_RECORD_COMPRESSION_NONE);
+        assert_eq!(threshold_store.read(&threshold_address).unwrap(), payload);
+        assert_eq!(threshold_store.stats().compressed_records_written, 0);
+        assert_eq!(threshold_store.stats().compression_bytes_saved, 0);
+    }
+
+    #[test]
+    fn block_envelope_rejects_corrupt_compressed_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let address = store.append(&b"compress-me-".repeat(80)).unwrap();
+        let path = slab_path(dir.path(), address.block_slab_id());
+        let mut slab = fs::read(&path).unwrap();
+        *slab.last_mut().unwrap() ^= 0xff;
+        fs::write(path, slab).unwrap();
+
+        let err = store.read(&address).unwrap_err();
+        assert!(matches!(
+            err,
+            BlockStoreError::ChecksumMismatch { .. } | BlockStoreError::CorruptBlockEnvelope { .. }
+        ));
+    }
+
+    #[test]
+    fn block_envelope_rejects_corrupt_header_lengths() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let address = store.append(b"header-checked-page").unwrap();
+        let path = slab_path(dir.path(), address.block_slab_id());
+        let mut slab = fs::read(&path).unwrap();
+        // Make the block say it is far larger than the record holds. The size sits at a
+        // constant offset now, so this corrupts the number itself rather than payload bytes,
+        // which would only be caught by the checksum.
+        let size_at = record::BLOCK_RECORD_LENGTH_OFFSET;
+        slab[size_at] = 0xFF;
+        slab[size_at + 1] = 0xFF;
+        slab[size_at + 2] = 0xFF;
+        slab[size_at + 3] = 0x3F;
+        fs::write(path, slab).unwrap();
+
+        let err = store.read(&address).unwrap_err();
+        assert!(
+            matches!(err, BlockStoreError::CorruptBlockEnvelope { .. }),
+            "expected a corrupt envelope, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn block_address_without_checksum_keeps_legacy_read_compatibility() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let legacy_address = ElementEntry::from_parts(0, 0, b"alteredpage".len() as u64, None, None);
+        fs::write(
+            slab_path(dir.path(), legacy_address.block_slab_id()),
+            b"alteredpage",
+        )
+        .unwrap();
+
+        assert_eq!(store.read(&legacy_address).unwrap(), b"alteredpage");
+    }
+
+    #[test]
+    fn gc_slabs_retains_live_index_references_below_floor() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.install_slab(0, b"current").unwrap();
+        store.install_slab(1, b"live").unwrap();
+        store.install_slab(2, b"stale").unwrap();
+        store.install_slab(3, b"keep").unwrap();
+
+        let report = store.gc_slabs_before_with_live_refs(3, [1_u64]).unwrap();
+        assert_eq!(report.removed_block_slab_ids, vec![0, 2]);
+        assert_eq!(report.retained_block_slab_ids, vec![1, 3]);
+        assert_eq!(
+            report.removed_physical_bytes,
+            (b"current".len() + b"stale".len()) as u64
+        );
+        assert_eq!(
+            report.retained_physical_bytes,
+            (b"live".len() + b"keep".len()) as u64
+        );
+        assert!(report.retained_current_block_slab_ids.is_empty());
+        assert_eq!(report.retained_live_block_slab_ids, vec![1]);
+        assert_eq!(report.retained_live_physical_bytes, b"live".len() as u64);
+        assert_eq!(store.slab_ids().unwrap(), vec![1, 3]);
+    }
+
+    /// A freshly quarantined slab is NOT purged; one that has waited long enough is.
+    ///
+    /// "Delayed destroy" quarantined the file and then deleted every file it found, so the delay
+    /// lasted only until something called purge -- a slab set aside a second earlier went with the
+    /// rest. The hazard is written down in the compaction commit path: a reclaim that quarantines
+    /// and purges, followed by a reload of an index that still names the slab, dangles at a
+    /// deleted slab.
+    ///
+    /// Both directions are asserted because either alone is passable by a broken purge: one that
+    /// never deleted anything would satisfy the first, and one that ignored the age would satisfy
+    /// the second.
+    #[test]
+    fn a_quarantined_slab_waits_before_it_is_destroyed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.install_slab(0, b"stale").unwrap();
+        store.install_slab(1, b"live").unwrap();
+        store
+            .gc_slabs_before_with_live_refs_delayed_destroy(1, [1_u64])
+            .unwrap();
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap(),
+            vec![0],
+            "the slab is in quarantine to begin with"
+        );
+
+        // An hour has not passed, so the purge declines and SAYS it declined.
+        let held = store
+            .purge_delayed_destroy_slabs_older_than(DELAYED_DESTROY_MIN_AGE_MS)
+            .unwrap();
+        assert!(
+            held.purged_block_slab_ids.is_empty(),
+            "a slab quarantined moments ago must not be destroyed"
+        );
+        assert_eq!(
+            held.retained_too_young_block_slab_ids,
+            vec![0],
+            "and the report must say why it is still there"
+        );
+        assert_eq!(held.retained_too_young_physical_bytes, b"stale".len() as u64);
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap(),
+            vec![0],
+            "the file is still in quarantine"
+        );
+
+        // Old enough -- expressed as a zero age rather than by waiting an hour.
+        let purged = store.purge_delayed_destroy_slabs_older_than(0).unwrap();
+        assert_eq!(
+            purged.purged_block_slab_ids,
+            vec![0],
+            "a slab past its wait is destroyed"
+        );
+        assert!(
+            purged.retained_too_young_block_slab_ids.is_empty(),
+            "and nothing is held back once it is old enough"
+        );
+        assert!(
+            store.delayed_destroy_slab_ids().unwrap().is_empty(),
+            "quarantine is empty afterwards"
+        );
+    }
+
+    /// The destroy re-checks liveness, and a slab that comes back live is UN-QUARANTINED.
+    ///
+    /// The shape the re-check exists for: the collector quarantines a slab nothing references,
+    /// and only afterwards does something -- a dump manifest whose embedded index installs blocks
+    /// in it -- start needing it again. The purge that runs next is the irreversible step, and
+    /// before this it consulted only a directory listing and a timestamp.
+    ///
+    /// THE THREE OUTCOMES ARE ASSERTED SEPARATELY. A purge that destroyed nothing at all would
+    /// satisfy "the live slab survived"; one that restored everything would satisfy it too and
+    /// free nothing; and a restore that only declined to unlink, leaving the file in the trash
+    /// directory, would satisfy both while the slab stayed unreadable by path. So this asserts
+    /// that the dead slab WAS destroyed, that the live slab was NOT, and that the live slab is
+    /// back where a reader looks for it.
+    #[test]
+    fn a_quarantined_slab_that_is_live_again_is_returned_not_destroyed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.install_slab(0, b"needed-again").unwrap();
+        store.install_slab(1, b"really-stale").unwrap();
+        store.install_slab(2, b"current").unwrap();
+        store
+            .gc_slabs_before_with_live_refs_delayed_destroy(2, [2_u64])
+            .unwrap();
+
+        // THE DENOMINATOR. Both slabs are really in quarantine, and really out of the store, so
+        // the assertions below are about a purge that had two things to act on.
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap(),
+            vec![0, 1],
+            "both slabs were really quarantined"
+        );
+        assert_eq!(
+            store.slab_ids().unwrap(),
+            vec![2],
+            "and really left the store, so a reader cannot reach either by path"
+        );
+
+        // Slab 0 became live again after it was quarantined. Slab 1 did not.
+        let report = store
+            .purge_delayed_destroy_slabs_checked(0, [0_u64])
+            .unwrap();
+
+        assert_eq!(
+            report.restored_block_slab_ids,
+            vec![0],
+            "the slab that came back live is taken out of quarantine"
+        );
+        assert_eq!(
+            report.restored_physical_bytes,
+            b"needed-again".len() as u64
+        );
+        assert_eq!(
+            report.purged_block_slab_ids,
+            vec![1],
+            "and the one that is genuinely dead is still destroyed -- the re-check is not a \
+             blanket refusal to reclaim"
+        );
+        assert_eq!(report.purged_physical_bytes, b"really-stale".len() as u64);
+        assert!(report.restore_blocked_block_slab_ids.is_empty());
+
+        // The repair is the rename, not the reprieve: the slab is READABLE BY PATH again.
+        assert_eq!(
+            store.slab_ids().unwrap(),
+            vec![0, 2],
+            "the restored slab is back in the store where a reader looks for it"
+        );
+        assert_eq!(
+            store.read_slab(0).unwrap(),
+            b"needed-again".to_vec(),
+            "and its bytes are intact"
+        );
+        assert!(
+            store.delayed_destroy_slab_ids().unwrap().is_empty(),
+            "quarantine is empty: one restored, one destroyed, nothing stranded"
+        );
+    }
+
+    /// A quarantined slab the manifest does not name still gets a grace window.
+    ///
+    /// THIS IS A SECOND LINE, NOT THE FIRST. `reconcile_slab_manifest_with_disk` already walks the
+    /// trash directory on every open and stamps a `DelayedDestroy` descriptor onto every file it
+    /// finds there, described or not -- so the crash window inside the collector's loop (rename
+    /// each slab, persist the manifest once at the end, die in between) is repaired at the next
+    /// open, and within a live process the rename and the state write happen back to back under
+    /// one lock. The descriptor-less slab is therefore not reachable through the ordinary API,
+    /// which is why this constructs one directly.
+    ///
+    /// It is guarded anyway because the purge's own reading of the case was the OPPOSITE policy:
+    /// a slab with no descriptor was destroyed on sight, with the whole hour skipped. That is a
+    /// dangerous default to leave standing behind a repair in a different module -- the repair
+    /// can be narrowed, skipped for speed, or run after the purge, and then the destroy is
+    /// immediate again with nothing to say so.
+    ///
+    /// Asserted in BOTH directions, because one alone is passable: a purge that never destroyed
+    /// an undescribed slab at all would satisfy the first assertion and leak the bytes for ever.
+    #[test]
+    fn a_quarantined_slab_with_no_descriptor_still_waits() {
+        // An id no slab in this store uses: a fresh store already opens slab 0 active, and
+        // reusing that id would collide with a descriptor that legitimately exists.
+        const ORPHAN: u64 = 7;
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.install_slab(1, b"current").unwrap();
+
+        // A file in quarantine that the manifest never learned about.
+        let trash = delayed_destroy_dir(dir.path());
+        fs::create_dir_all(&trash).unwrap();
+        fs::write(
+            trash.join(format!("block_segment_{ORPHAN:020}.seg.deleted.1")),
+            b"orphaned-by-a-crash",
+        )
+        .unwrap();
+
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap(),
+            vec![ORPHAN],
+            "DENOMINATOR: the slab is really in quarantine, so the purge has something to act on"
+        );
+        assert!(
+            !store
+                .slab_descriptors()
+                .iter()
+                .any(|descriptor| descriptor.block_slab_id == ORPHAN),
+            "DENOMINATOR: and it really has no descriptor, so this exercises the fallback"
+        );
+
+        // The hour has not passed by ANY clock, so the purge must decline.
+        let held = store
+            .purge_delayed_destroy_slabs_older_than(DELAYED_DESTROY_MIN_AGE_MS)
+            .unwrap();
+        assert!(
+            held.purged_block_slab_ids.is_empty(),
+            "a slab quarantined moments ago must keep its grace even with no descriptor"
+        );
+        assert_eq!(
+            held.retained_too_young_block_slab_ids,
+            vec![ORPHAN],
+            "and the report must say it was held, not that there was nothing to do"
+        );
+
+        // But it is still reclaimable: the fallback grants a window, it does not grant immunity.
+        let purged = store.purge_delayed_destroy_slabs_older_than(0).unwrap();
+        assert_eq!(
+            purged.purged_block_slab_ids,
+            vec![ORPHAN],
+            "past its wait, an undescribed slab is destroyed like any other"
+        );
+        assert!(store.delayed_destroy_slab_ids().unwrap().is_empty());
+    }
+
+    /// A purge told which slabs it may destroy destroys those and leaves the rest ALONE.
+    ///
+    /// The half of the per-slab reclaim gate that lives in this file. Once the collector stops
+    /// being suppressed by a single pinned slab, a round runs whenever ANY candidate is free --
+    /// and a purge that still swept the whole trash directory would then destroy the quarantined
+    /// slabs the dependency plan had specifically blocked. That converts a suppressed reclaim
+    /// into lost data, which is why the list and the gate move together.
+    ///
+    /// The two outcomes are asserted SEPARATELY. A purge that destroyed nothing would satisfy
+    /// "the blocked slab survived"; one that destroyed everything would satisfy "the free slab
+    /// was reclaimed". Only both together say the list was actually consulted.
+    #[test]
+    fn a_purge_handed_a_slab_list_leaves_the_rest_in_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.install_slab(0, b"free-to-go").unwrap();
+        store.install_slab(1, b"pinned-by-a-follower").unwrap();
+        store.install_slab(2, b"current").unwrap();
+        store
+            .gc_slabs_before_with_live_refs_delayed_destroy(2, [2_u64])
+            .unwrap();
+
+        // DENOMINATOR: the purge really has two slabs to act on, so "one survived" is a choice
+        // it made rather than a directory that was empty.
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap(),
+            vec![0, 1],
+            "both slabs were really quarantined"
+        );
+
+        // Slab 1 is blocked upstream; only slab 0 is free.
+        let report = store
+            .purge_delayed_destroy_slabs_selected(
+                0,
+                Vec::<u64>::new(),
+                Some([0_u64].into_iter().collect()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            report.purged_block_slab_ids,
+            vec![0],
+            "the free slab is reclaimed -- one blocked slab no longer suppresses the others"
+        );
+        assert!(
+            report.retained_too_young_block_slab_ids.is_empty(),
+            "the blocked slab is not reported as too young: it was never considered, and saying \
+             'not yet' about it would describe a wait that is not what is holding it"
+        );
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap(),
+            vec![1],
+            "and the blocked slab is still in quarantine, undestroyed"
+        );
+
+        // Unnarrowed, it takes the rest: the list narrows this round, it does not retire a slab.
+        let rest = store.purge_delayed_destroy_slabs_older_than(0).unwrap();
+        assert_eq!(
+            rest.purged_block_slab_ids,
+            vec![1],
+            "once nothing blocks it, the slab is reclaimed on a later round"
+        );
+    }
+
+    /// One uncapped purge round against `slabs` quarantined slabs, timed, then one capped round
+    /// against the same fixture. Prints; returns nothing. The body of the two scale tests below.
+    ///
+    /// Split out of the loop it used to be so each size is a test of its own and can be RUN on
+    /// its own. The 80,000 arm writes eighty thousand files and is the expensive half; on a box
+    /// short of disk, running the 8,000 arm alone is a real measurement, whereas running neither
+    /// and scaling the other is not a measurement at all.
+    fn purge_at_scale_arm(slabs: u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+
+        // The quarantine state is built DIRECTLY rather than by installing and collecting
+        // N slabs. Installing is the harness, not the subject: it summarises every slab and
+        // periodically rewrites the manifest. What is being measured is the purge -- the round
+        // that the re-check and the slab list changed, and the one that holds the store lock
+        // while it unlinks.
+        let started = std::time::Instant::now();
+        let trash = delayed_destroy_dir(dir.path());
+        fs::create_dir_all(&trash).unwrap();
+        for id in 0..slabs {
+            fs::write(
+                trash.join(format!("block_segment_{id:020}.seg.deleted.{id}")),
+                b"slab",
+            )
+            .unwrap();
+        }
+        let setup_ms = started.elapsed().as_secs_f64() * 1e3;
+
+        // DENOMINATOR: the quarantine really is the size claimed, so the counts below are
+        // about a purge that had that much to decide.
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap().len() as u64,
+            slabs,
+            "every slab must really be in quarantine before the purge runs"
+        );
+
+        // A tenth are live again; a further tenth are blocked upstream. Disjoint, so each
+        // outcome has its own denominator and one cannot cover for another.
+        let live = (0..slabs).filter(|id| id % 10 == 0).collect::<Vec<_>>();
+        let blocked = (0..slabs).filter(|id| id % 10 == 1).collect::<Vec<_>>();
+        let selected = (0..slabs).filter(|id| id % 10 != 1).collect::<BTreeSet<_>>();
+        assert!(!live.is_empty() && !blocked.is_empty());
+
+        // ONE ROUND WITH THE CAP OFF -- the shape this change is about, kept runnable so the
+        // number it replaces can still be produced rather than only quoted.
+        let started = std::time::Instant::now();
+        let report = store
+            .purge_delayed_destroy_slabs_capped(0, live.clone(), Some(selected.clone()), 0)
+            .unwrap();
+        let purge_ms = started.elapsed().as_secs_f64() * 1e3;
+
+        let expected_purged = slabs - live.len() as u64 - blocked.len() as u64;
+        // THREE HALVES, SEPARATELY.
+        assert_eq!(
+            report.restored_block_slab_ids.len(),
+            live.len(),
+            "every live slab was restored"
+        );
+        assert_eq!(
+            report.purged_block_slab_ids.len() as u64,
+            expected_purged,
+            "every slab that was neither live nor blocked was destroyed"
+        );
+        assert!(
+            !report.budget_exhausted,
+            "an uncapped round must not report a budget it did not have"
+        );
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap().len(),
+            blocked.len(),
+            "and exactly the blocked slabs are still in quarantine"
+        );
+        // The restored slabs are back in the store, readable by path.
+        let present = store.slab_ids().unwrap().into_iter().collect::<BTreeSet<_>>();
+        assert!(
+            live.iter().all(|id| present.contains(id)),
+            "every restored slab is readable by path again"
+        );
+
+        println!(
+            "  {slabs:>6} quarantined: setup {setup_ms:>9.1} ms   UNCAPPED purge {purge_ms:>9.1} ms \
+             ({:>6} destroyed, {:>5} restored, {:>5} held)   per slab {:.4} ms",
+            report.purged_block_slab_ids.len(),
+            report.restored_block_slab_ids.len(),
+            blocked.len(),
+            purge_ms / slabs as f64,
+        );
+
+        // And now ONE ROUND UNDER THE SHIPPED CAP, on a freshly rebuilt quarantine of the same
+        // size. This is the number that matters: how long the store lock is held by a round the
+        // scheduler actually runs.
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let trash = delayed_destroy_dir(dir.path());
+        fs::create_dir_all(&trash).unwrap();
+        for id in 0..slabs {
+            fs::write(
+                trash.join(format!("block_segment_{id:020}.seg.deleted.{id}")),
+                b"slab",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap().len() as u64,
+            slabs,
+            "the capped round must face the same size quarantine as the uncapped one"
+        );
+        let started = std::time::Instant::now();
+        let capped = store
+            .purge_delayed_destroy_slabs_selected(0, live.clone(), Some(selected))
+            .unwrap();
+        let capped_ms = started.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(
+            capped.processed_block_slabs, DELAYED_DESTROY_MAX_SLABS_PER_ROUND,
+            "a capped round against a quarantine far larger than its budget spends all of it"
+        );
+        assert!(
+            capped.budget_exhausted,
+            "and says there is more to do -- otherwise a caller stops draining"
+        );
+        println!(
+            "  {slabs:>6} quarantined:                    CAPPED purge {capped_ms:>9.1} ms \
+             ({:>6} destroyed, {:>5} restored) at a budget of {}",
+            capped.purged_block_slab_ids.len(),
+            capped.restored_block_slab_ids.len(),
+            DELAYED_DESTROY_MAX_SLABS_PER_ROUND,
+        );
+    }
+
+    /// The re-checked, list-narrowed purge at 8,000 slabs, capped and uncapped. Prints.
+    ///
+    ///   cargo test -p temporalstore-rust --lib the_purge_at_scale \
+    ///       -- --ignored --nocapture --test-threads=1
+    ///
+    /// Ignored because it creates eight thousand files; the correctness guards run in CI, and
+    /// this answers the question correctness cannot -- what ONE purge round costs while it holds
+    /// the store lock, with the cap off and with the cap on.
+    ///
+    /// Every count is asserted as a separate half. Five defects in this area each presented as
+    /// one half full and the other zero, and a combined total hid all of them.
+    #[test]
+    #[ignore]
+    fn the_purge_at_scale() {
+        purge_at_scale_arm(8_000);
+    }
+
+    /// The same measurement at 80,000 slabs, where the unbounded round was measured at 58.7 s.
+    ///
+    ///   cargo test -p temporalstore-rust --lib the_purge_at_eighty_thousand_slabs \
+    ///       -- --ignored --nocapture --test-threads=1
+    ///
+    /// SEPARATE FROM THE 8,000 ARM BECAUSE IT IS THE EXPENSIVE ONE. It writes eighty thousand
+    /// files twice over and wants real disk headroom; on a box that cannot spare it, the 8,000
+    /// arm above still produces a measurement, and this one should be reported as not run rather
+    /// than scaled up from the other.
+    #[test]
+    #[ignore]
+    fn the_purge_at_eighty_thousand_slabs() {
+        purge_at_scale_arm(80_000);
+    }
+
+    /// Build a quarantine of `slabs` files directly, without installing or collecting anything.
+    ///
+    /// The collector is not the subject of the purge guards below, and going through it would
+    /// make each of them pay for a full install of every slab.
+    fn quarantine_fixture(root: &std::path::Path, slabs: u64) {
+        let trash = delayed_destroy_dir(root);
+        fs::create_dir_all(&trash).unwrap();
+        for id in 0..slabs {
+            fs::write(
+                trash.join(format!("block_segment_{id:020}.seg.deleted.{id}")),
+                b"slab",
+            )
+            .unwrap();
+        }
+    }
+
+    /// A capped purge must ADVANCE: each round must move to slabs the last one did not touch, and
+    /// the whole quarantine must be drained in the number of rounds the budget predicts.
+    ///
+    /// THE ROUND COUNT IS COMPUTED BEFORE THE RUN AND THE RUN IS GIVEN MORE ROUNDS THAN IT NEEDS.
+    /// A loop that stops at exactly the predicted number cannot tell a cap that finished from a
+    /// cap that stalled on its last round and was cut off -- both end with the loop exhausted.
+    /// Running past the prediction and asserting there was nothing left to do makes those two
+    /// outcomes different.
+    ///
+    /// The per-round sets are asserted DISJOINT as well as exhaustive. Exhaustive alone would be
+    /// satisfied by a cap that re-walked the same slabs and happened to get through them; disjoint
+    /// alone would be satisfied by a cap that destroyed three slabs and then stopped for ever.
+    #[test]
+    fn a_capped_purge_advances_and_drains_in_the_rounds_its_budget_predicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let slabs = 500u64;
+        let budget = 40usize;
+        quarantine_fixture(dir.path(), slabs);
+
+        // DENOMINATOR: the quarantine really holds what the arithmetic below assumes.
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap().len() as u64,
+            slabs,
+            "every slab must really be in quarantine before the first round"
+        );
+
+        let live = (0..slabs).filter(|id| id % 10 == 0).collect::<Vec<_>>();
+        let blocked = (0..slabs).filter(|id| id % 10 == 1).collect::<BTreeSet<_>>();
+        let selected = (0..slabs).filter(|id| id % 10 != 1).collect::<BTreeSet<_>>();
+        let expected_destroyed = (0..slabs)
+            .filter(|id| id % 10 != 0 && id % 10 != 1)
+            .collect::<BTreeSet<_>>();
+        // Work is a destroy or a restore. The blocked slabs are named by nobody, so they are
+        // never work, and a budget spent on them would be a budget spent on nothing.
+        let work = expected_destroyed.len() + live.len();
+        let predicted_rounds = work.div_ceil(budget);
+        assert_eq!(
+            (work, predicted_rounds),
+            (450, 12),
+            "the prediction is arithmetic on the fixture, stated before the run"
+        );
+        // The budget must not divide the work exactly: a round that spends its budget as the work
+        // runs out still reports `budget_exhausted`, so an evenly-dividing fixture takes one extra
+        // empty round whose existence depends on `read_dir` order. A partial last round does not.
+        assert_ne!(work % budget, 0, "the last round must be a partial one");
+        // Deliberately more rounds than predicted, so "finished" and "stalled" look different.
+        let allowed_rounds = predicted_rounds + 8;
+
+        let mut rounds = 0usize;
+        let mut per_round_touched: Vec<BTreeSet<u64>> = Vec::new();
+        let mut all_destroyed = BTreeSet::new();
+        let mut all_restored = BTreeSet::new();
+        loop {
+            let report = store
+                .purge_delayed_destroy_slabs_capped(
+                    0,
+                    live.clone(),
+                    Some(selected.clone()),
+                    budget,
+                )
+                .unwrap();
+            let touched = report
+                .purged_block_slab_ids
+                .iter()
+                .chain(report.restored_block_slab_ids.iter())
+                .copied()
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                touched.len(),
+                report.processed_block_slabs,
+                "the round's own count of what it did must match what it reported doing"
+            );
+            all_destroyed.extend(report.purged_block_slab_ids.iter().copied());
+            all_restored.extend(report.restored_block_slab_ids.iter().copied());
+            per_round_touched.push(touched);
+            rounds += 1;
+            if !report.budget_exhausted {
+                break;
+            }
+            assert_eq!(
+                report.processed_block_slabs, budget,
+                "a round that says it ran out of budget must have SPENT the budget; anything \
+                 less means it stopped for some other reason and is calling it a budget"
+            );
+            assert!(
+                rounds <= allowed_rounds,
+                "the drain did not finish in {allowed_rounds} rounds, which is {} more than the \
+                 {predicted_rounds} its budget predicts -- that is a stall, not a slow cap",
+                allowed_rounds - predicted_rounds
+            );
+        }
+
+        // IT ADVANCED: no round revisited a slab an earlier round had already dealt with.
+        let mut seen = BTreeSet::new();
+        for (index, touched) in per_round_touched.iter().enumerate() {
+            assert!(
+                touched.is_disjoint(&seen),
+                "round {index} acted on a slab an earlier round had already finished with; the \
+                 set the cap processes must MOVE"
+            );
+            seen.extend(touched.iter().copied());
+        }
+        // AND IT FINISHED, in exactly the rounds the budget predicted.
+        assert_eq!(
+            rounds, predicted_rounds,
+            "draining {work} slabs at {budget} a round must take {predicted_rounds} rounds"
+        );
+        assert_eq!(
+            all_destroyed, expected_destroyed,
+            "every slab that was neither live nor blocked was destroyed, across the rounds"
+        );
+        assert_eq!(
+            all_restored,
+            live.iter().copied().collect::<BTreeSet<_>>(),
+            "and every live slab was restored, across the rounds"
+        );
+        assert_eq!(
+            store
+                .delayed_destroy_slab_ids()
+                .unwrap()
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            blocked,
+            "exactly the blocked slabs are left in quarantine"
+        );
+        // One more round finds nothing to do -- the drain is over, not merely paused.
+        let after = store
+            .purge_delayed_destroy_slabs_capped(0, live.clone(), Some(selected), budget)
+            .unwrap();
+        assert_eq!(
+            (after.processed_block_slabs, after.budget_exhausted),
+            (0, false),
+            "a round after the drain must do nothing and must not claim there is more"
+        );
+    }
+
+    /// A quarantine that is almost entirely slabs the caller has NOT named must still drain the
+    /// few it has.
+    ///
+    /// THIS IS THE STALL THE CAP HAS TO NOT HAVE. Nine hundred of these thousand slabs are
+    /// blocked upstream; they are skipped every round and they stay in the directory, so they are
+    /// in front of the loop again next round. A budget charged for every ENTRY THE LOOP LOOKS AT
+    /// rather than for every slab it ACTS ON would spend all ten of each round's units on the
+    /// same blocked slabs and destroy nothing, for ever -- and from the outside that is
+    /// indistinguishable from a cap that is merely conservative.
+    ///
+    /// A hundred rounds is the entry-counted cost; twelve is the work-counted one. The assertion
+    /// is on twelve.
+    ///
+    /// THE BUDGET DELIBERATELY DOES NOT DIVIDE THE WORK. 100 slabs at 10 a round would finish in
+    /// ten full rounds -- and a round that spends its budget exactly as the work runs out still
+    /// reports `budget_exhausted`, so the drain takes an eleventh, empty round whose existence
+    /// depends on where in directory order the last actionable slab happened to sit. At 9 a round
+    /// the last round is always partial, always walks to the end of the directory, and always
+    /// reports the drain finished: twelve rounds, whatever order `read_dir` returns.
+    #[test]
+    fn a_capped_purge_is_not_starved_by_the_slabs_it_must_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let slabs = 1_000u64;
+        let budget = 9usize;
+        quarantine_fixture(dir.path(), slabs);
+
+        // DENOMINATORS, both halves, before anything runs.
+        let selected = (0..slabs).filter(|id| id % 10 == 0).collect::<BTreeSet<_>>();
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap().len() as u64,
+            slabs,
+            "a thousand slabs really are in quarantine"
+        );
+        assert_eq!(
+            selected.len(),
+            100,
+            "and only a hundred of them are this caller's business -- the other nine hundred are \
+             what the loop has to walk past"
+        );
+
+        let predicted_rounds = selected.len().div_ceil(budget);
+        assert_eq!(predicted_rounds, 12, "stated before the run");
+        assert_ne!(
+            selected.len() % budget,
+            0,
+            "the budget must not divide the work, or the last round's report depends on where in \
+             directory order the final actionable slab sits"
+        );
+        let allowed_rounds = predicted_rounds + 5;
+
+        let mut rounds = 0usize;
+        let mut destroyed = BTreeSet::new();
+        loop {
+            let report = store
+                .purge_delayed_destroy_slabs_capped(
+                    0,
+                    Vec::<u64>::new(),
+                    Some(selected.clone()),
+                    budget,
+                )
+                .unwrap();
+            destroyed.extend(report.purged_block_slab_ids.iter().copied());
+            rounds += 1;
+            if !report.budget_exhausted {
+                break;
+            }
+            assert!(
+                rounds <= allowed_rounds,
+                "after {rounds} rounds the drain has destroyed {} of {}; a budget spent on \
+                 entries examined instead of work done would look exactly like this",
+                destroyed.len(),
+                selected.len()
+            );
+        }
+        assert_eq!(
+            rounds, predicted_rounds,
+            "the skipped slabs must cost the loop a walk, never a unit of budget"
+        );
+        assert_eq!(
+            destroyed, selected,
+            "and every slab the caller did name was destroyed"
+        );
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap().len(),
+            900,
+            "with the nine hundred it did not name still in quarantine"
+        );
+    }
+
+    /// The cap must bound HOW MANY slabs a round reaches, never what happens to one it reached.
+    ///
+    /// Every slab here is live, so every slab the round touches must go through the last-chance
+    /// re-check and come back OUT of quarantine, readable by path again. A cap that reached a
+    /// slab and skipped the re-check to save time would destroy live data, which is the one
+    /// failure this whole path exists to prevent.
+    #[test]
+    fn a_capped_purge_re_checks_liveness_for_every_slab_it_reaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let slabs = 60u64;
+        let budget = 7usize;
+        quarantine_fixture(dir.path(), slabs);
+        let live = (0..slabs).collect::<Vec<_>>();
+
+        // DENOMINATOR: the store holds none of these yet, so "readable by path" below is the
+        // restore's doing and not a file that was already there.
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap().len() as u64,
+            slabs,
+            "every slab is in quarantine"
+        );
+        assert!(
+            store.slab_ids().unwrap().is_empty(),
+            "and none of them is in the store"
+        );
+
+        let mut restored = BTreeSet::new();
+        let mut rounds = 0usize;
+        loop {
+            let report = store
+                .purge_delayed_destroy_slabs_capped(0, live.clone(), None, budget)
+                .unwrap();
+            assert!(
+                report.purged_block_slab_ids.is_empty(),
+                "a live slab must never be destroyed, capped round or not"
+            );
+            restored.extend(report.restored_block_slab_ids.iter().copied());
+            rounds += 1;
+            if !report.budget_exhausted {
+                break;
+            }
+            assert_eq!(
+                report.restored_block_slab_ids.len(),
+                budget,
+                "a full round restores exactly its budget -- the cap limits the count, not the \
+                 treatment"
+            );
+            assert!(rounds <= 20, "60 slabs at 7 a round must not take 20 rounds");
+        }
+        assert_eq!(
+            restored.len() as u64,
+            slabs,
+            "every live slab came back out of quarantine"
+        );
+        assert_eq!(
+            store.slab_ids().unwrap().len() as u64,
+            slabs,
+            "and every one of them is readable by path again"
+        );
+        assert!(
+            store.delayed_destroy_slab_ids().unwrap().is_empty(),
+            "with nothing left in quarantine"
+        );
+    }
+
+    /// The collector's victim order is LARGEST SLAB FIRST, not the highest-garbage order its sort
+    /// key is written to express -- and that is why the collector's own per-round budget stays
+    /// OFF while the purge gets one.
+    ///
+    /// `can_the_block_gc_garbage_floor_bind` establishes the premise and asserts it in CI: every
+    /// candidate reports `used_bytes == 0`, so every candidate reports the same zero live
+    /// fraction. This test states the CONSEQUENCE for ordering. With the first sort key uniform
+    /// and the second (`utility_score`) uniform too, the first key that can separate two
+    /// candidates is physical size, descending. The order the comment above the sort describes is
+    /// therefore not the order that happens.
+    ///
+    /// NOTHING IS PUBLISHED HERE, AND THAT IS THE POINT. `used_bytes` now means live block bytes
+    /// on the slab whenever an index has published a tally, and
+    /// `a_published_live_tally_makes_used_bytes_mean_live_block_bytes` shows that ordering coming
+    /// out highest-garbage first. This store has no publisher, so it exercises the unpublished
+    /// arm -- which is still what a bare `BlockStore` does, and still orders by size.
+    ///
+    /// AN UNBOUNDED COLLECTOR DOES NOT CARE -- it takes every candidate, so the order only
+    /// decides what happens first. A BUDGETED ONE DOES: the budget makes the order decide who
+    /// SURVIVES, and here the survivors would be the smallest files, chosen by a rule nobody
+    /// wrote down and unrelated to how much garbage they hold. Worse, it can starve: small slabs
+    /// keep losing to every larger slab that arrives later.
+    ///
+    /// The purge cap has neither problem, which is the asymmetry behind treating the two
+    /// differently. Its budget is spent on work, every slab it charges for LEAVES the trash
+    /// directory, and the set it has left to do strictly shrinks -- so nothing it defers can be
+    /// deferred for ever, whatever order the directory hands it.
+    ///
+    /// If this test starts failing because the order changed, the question of whether to budget
+    /// the collector is open again and should be re-asked rather than assumed.
+    #[test]
+    fn the_collector_victim_order_is_size_while_every_candidate_reports_zero_used_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        // Sizes deliberately disagree with id order, so an assertion about the resulting order
+        // cannot be satisfied by the slabs merely coming back in the order they were made.
+        store.install_slab(0, &vec![b'a'; 200]).unwrap();
+        store.install_slab(1, &vec![b'b'; 800]).unwrap();
+        store.install_slab(2, &vec![b'c'; 400]).unwrap();
+        store.install_slab(3, &vec![b'd'; 100]).unwrap();
+        store.install_slab(4, b"current").unwrap();
+
+        let candidates = store.gc_utility_candidates(4, Vec::<u64>::new()).unwrap();
+        // DENOMINATOR: there really are four candidates to order.
+        assert_eq!(
+            candidates.len(),
+            4,
+            "four slabs are below the retention floor and collectable"
+        );
+        // THE PREMISE, restated where the consequence is drawn, so this test fails on its own
+        // terms if used bytes ever start meaning live block bytes.
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.used_bytes == 0
+                    && candidate.utility_basis_points == 0),
+            "every candidate reports a zero live fraction, so the garbage key carries no \
+             information to sort by: {candidates:?}"
+        );
+        assert!(
+            candidates
+                .iter()
+                .all(|candidate| candidate.utility_score == 0),
+            "and the categorical score is uniform too, so it cannot separate them either"
+        );
+
+        let order = candidates
+            .iter()
+            .map(|candidate| candidate.block_slab_id)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            order,
+            vec![1, 2, 0, 3],
+            "the order that actually results is descending physical size (800, 400, 200, 100 \
+             bytes of payload), not anything about garbage"
+        );
+
+        // So a budget of two would destroy the two LARGEST and leave the two smallest.
+        let plan = store
+            .gc_policy_plan(
+                4,
+                Vec::<u64>::new(),
+                &BlockStoreGcPolicy::max_slabs(2),
+            )
+            .unwrap();
+        assert_eq!(
+            plan.selected_block_slab_ids,
+            vec![1, 2],
+            "a budgeted collector picks its victims by file size; the survivors are the small \
+             slabs, for no reason connected to how much of them is garbage"
+        );
+
+        // AND THE SHIPPED POLICY LEAVES THAT BUDGET OFF.
+        assert_eq!(
+            BlockStoreGcPolicy::with_slab_garbage_floor(
+                crate::engine::reports::DEFAULT_BLOCK_GC_MIN_SLAB_GARBAGE_BASIS_POINTS,
+                None,
+            )
+            .max_destroy_slabs,
+            0,
+            "the collector's per-round budget is off, and stays off until used bytes mean live \
+             page bytes within the slab"
+        );
+    }
+
+    /// Quarantining N slabs must cost a FIXED number of directory fsyncs, not two per slab.
+    ///
+    /// RUN AT TWO SIZES AND COMPARED, because a single size cannot tell a constant from a
+    /// coefficient. Measured on the unhoisted loop with `strace -y -e trace=fsync`: quarantining
+    /// 199 slabs issued 199 fsyncs of the trash directory and 199 of the store root; 799 slabs
+    /// issued 799 and 799. Hoisted, both sizes must issue the same small number.
+    ///
+    /// THE NON-ZERO ASSERTION IS NOT DECORATION. Deleting every fsync in the module makes both
+    /// counts zero, which satisfies "the count does not grow with the slab count" perfectly --
+    /// a mutation that removes the durability this test is standing next to would PASS on the
+    /// equality alone. The floor is what makes the guard about hoisting the fsyncs rather than
+    /// about having none.
+    #[test]
+    fn quarantining_a_round_of_slabs_fsyncs_its_directories_once_not_once_per_slab() {
+        let mut measured: Vec<(u64, usize, u64)> = Vec::new();
+        for slabs in [16u64, 64] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = BlockStore::new(dir.path());
+            for id in 0..slabs {
+                store.install_slab(id, b"slab-contents").unwrap();
+            }
+            let before = super::paths::directory_fsyncs();
+            let report = store
+                .gc_slabs_before_with_live_refs_delayed_destroy(slabs - 1, [slabs - 1])
+                .unwrap();
+            let fsyncs = super::paths::directory_fsyncs() - before;
+            // DENOMINATOR: the round really quarantined nearly every slab, so a small fsync
+            // count is a hoist and not an empty round.
+            assert_eq!(
+                report.delayed_destroy_block_slab_ids.len() as u64,
+                slabs - 1,
+                "the round must really have quarantined {} slabs",
+                slabs - 1
+            );
+            measured.push((slabs, report.delayed_destroy_block_slab_ids.len(), fsyncs));
+        }
+
+        let (small, small_quarantined, small_fsyncs) = measured[0];
+        let (large, large_quarantined, large_fsyncs) = measured[1];
+        assert!(
+            large_quarantined > small_quarantined * 3,
+            "the two sizes must really differ, or 'the count did not grow' says nothing"
+        );
+        assert_eq!(
+            small_fsyncs, large_fsyncs,
+            "quarantining {small_quarantined} slabs cost {small_fsyncs} directory fsyncs and \
+             {large_quarantined} cost {large_fsyncs}; a count that tracks the slab count is the \
+             per-slab fsync back again"
+        );
+        // Two for the round's renames, one for the manifest that records them.
+        assert_eq!(
+            small_fsyncs, 3,
+            "a quarantine round syncs the store root and the trash directory once each, and the \
+             manifest write syncs the root once more"
+        );
+        assert!(
+            small_fsyncs >= 2,
+            "and it must still sync BOTH directories -- a round that syncs nothing would satisfy \
+             the equality above while making the renames undurable"
+        );
+    }
+
+    /// A purge round that DESTROYED AND RESTORED NOTHING must not fsync, and must not rewrite the
+    /// slab manifest.
+    ///
+    /// The collector half of this stage already has the guard --
+    /// `a_gc_round_that_reclaimed_nothing_does_not_rewrite_the_manifest` -- and the reasoning it
+    /// records applies word for word here: the manifest write "serialises every slab, fsyncs the
+    /// temp file, renames it and fsyncs the parent directory", on a stage the periodic loop runs
+    /// whenever block pressure holds. The purge runs in the SAME round as the collector, from
+    /// `apply_storage_lifecycle`, and had no such guard: it synced both directories and rewrote the
+    /// manifest on every round, including the rounds where every quarantined slab was still inside
+    /// its grace window and the round therefore touched nothing at all -- which is what a purge
+    /// round looks like for the whole hour after a quarantine.
+    ///
+    /// Counted rather than timed: how many fsyncs a round issues is the shape itself and reads the
+    /// same on a loaded box as on an idle one.
+    #[test]
+    fn a_purge_round_that_acted_on_nothing_does_not_fsync_or_rewrite_the_manifest() {
+        fn arm(
+            min_age_ms: u64,
+            live_block_slab_ids: Vec<u64>,
+        ) -> (u64, bool, BlockStorePurgeDelayedDestroyReport) {
+            let dir = tempfile::tempdir().unwrap();
+            let store = BlockStore::new(dir.path());
+            for index in 0..8u64 {
+                store.append(format!("record-{index}").as_bytes()).unwrap();
+            }
+            store.sync_durable().unwrap();
+            quarantine_fixture(dir.path(), 16);
+            let manifest = slab_manifest_path(dir.path());
+            assert!(manifest.exists(), "the fixture needs a manifest to leave alone");
+            let mtime_before = std::fs::metadata(&manifest).unwrap().modified().unwrap();
+            let fsyncs_before = super::paths::directory_fsyncs();
+            let report = store
+                .purge_delayed_destroy_slabs_capped(min_age_ms, live_block_slab_ids, None, 0)
+                .unwrap();
+            let fsyncs = super::paths::directory_fsyncs() - fsyncs_before;
+            let mtime_after = std::fs::metadata(&manifest).unwrap().modified().unwrap();
+            (fsyncs, mtime_before != mtime_after, report)
+        }
+
+        // Nothing is old enough, so the round walks all sixteen entries and acts on none of them.
+        let (idle_fsyncs, idle_rewrote, idle) = arm(u64::MAX, Vec::new());
+        // THE DENOMINATOR: the round really did walk the quarantine. A round that found an empty
+        // directory would satisfy everything below for the wrong reason.
+        assert_eq!(
+            idle.retained_too_young_block_slab_ids.len(),
+            16,
+            "the idle round must have examined all sixteen quarantined slabs: {idle:?}"
+        );
+        assert_eq!(idle.processed_block_slabs, 0, "and charged its budget for none: {idle:?}");
+        assert!(idle.purged_block_slab_ids.is_empty(), "{idle:?}");
+        assert!(idle.restored_block_slab_ids.is_empty(), "{idle:?}");
+
+        // THE TWO HALVES, ASSERTED SEPARATELY.
+        assert_eq!(
+            idle_fsyncs, 0,
+            "a purge round that destroyed and restored nothing issued {idle_fsyncs} directory \
+             fsyncs; there is no rename and no unlink for them to commit"
+        );
+        assert!(
+            !idle_rewrote,
+            "and it rewrote the slab manifest with byte-identical content: {idle:?}"
+        );
+
+        // THE CONTROL, on the same fixture: a round that DOES act still syncs and still writes.
+        // Without this the assertions above are satisfied by a purge that stopped working.
+        let (busy_fsyncs, _, busy) = arm(0, Vec::new());
+        assert_eq!(
+            busy.purged_block_slab_ids.len(),
+            16,
+            "the control round must really have destroyed the quarantine: {busy:?}"
+        );
+        assert!(
+            busy_fsyncs >= 3,
+            "a round that unlinked sixteen slabs must still sync both directories and the \
+             manifest rename, but issued {busy_fsyncs}"
+        );
+
+        // THE OTHER HALF OF THE CONDITION, ON ITS OWN. A round can do work without destroying
+        // anything: a slab that came back live is RENAMED out of quarantine and back into the
+        // store, and that rename needs the same two directory fsyncs an unlink does. Without this
+        // arm the guard passes while testing only the purged half -- verified by mutation:
+        // narrowing the condition to `!purged.is_empty()` alone left all 79 tests green.
+        //
+        // Nothing is old enough to destroy, and ids 8..16 are named live. Ids 0..8 stay put
+        // (too young), so this round restores and destroys nothing.
+        let (restore_fsyncs, _, restore) = arm(u64::MAX, (8..16).collect::<Vec<u64>>());
+        assert_eq!(
+            restore.restored_block_slab_ids,
+            (8..16).collect::<Vec<u64>>(),
+            "the restore-only round must really have restored eight slabs: {restore:?}"
+        );
+        assert!(
+            restore.purged_block_slab_ids.is_empty(),
+            "and destroyed none, which is the whole point of this arm: {restore:?}"
+        );
+        assert!(
+            restore_fsyncs >= 3,
+            "a round that renamed eight slabs back into the store must still sync both \
+             directories and the manifest rename, but issued {restore_fsyncs}"
+        );
+    }
+
+    /// A purge round's directory fsyncs must not track the number of slabs it RESTORES.
+    ///
+    /// The unlinks were already batched to one trash-directory fsync per round. The restores were
+    /// not: each one fsynced the trash directory and the store root, so a round that restored
+    /// eight thousand slabs issued sixteen thousand fsyncs to commit renames that travel between
+    /// the same two directories.
+    ///
+    /// Compared against a round that restores NOTHING, on the same fixture size, so the number
+    /// being held constant is the restore count and not the round.
+    #[test]
+    fn a_purge_round_fsyncs_its_directories_once_however_many_slabs_it_restores() {
+        let mut measured: Vec<(usize, usize, u64)> = Vec::new();
+        for live_count in [0u64, 48] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = BlockStore::new(dir.path());
+            let slabs = 64u64;
+            quarantine_fixture(dir.path(), slabs);
+            assert_eq!(
+                store.delayed_destroy_slab_ids().unwrap().len() as u64,
+                slabs,
+                "the fixture is the same size in both arms"
+            );
+            let live = (0..live_count).collect::<Vec<_>>();
+            let before = super::paths::directory_fsyncs();
+            let report = store
+                .purge_delayed_destroy_slabs_capped(0, live, None, 0)
+                .unwrap();
+            let fsyncs = super::paths::directory_fsyncs() - before;
+            // DENOMINATORS: both halves of the round really happened.
+            assert_eq!(
+                report.restored_block_slab_ids.len() as u64,
+                live_count,
+                "the round restored what this arm asked it to"
+            );
+            assert_eq!(
+                report.purged_block_slab_ids.len() as u64,
+                slabs - live_count,
+                "and destroyed the rest"
+            );
+            measured.push((
+                report.restored_block_slab_ids.len(),
+                report.purged_block_slab_ids.len(),
+                fsyncs,
+            ));
+        }
+
+        let (no_restores, _, no_restore_fsyncs) = measured[0];
+        let (many_restores, _, many_restore_fsyncs) = measured[1];
+        assert_eq!(no_restores, 0);
+        assert_eq!(many_restores, 48);
+        assert_eq!(
+            no_restore_fsyncs, many_restore_fsyncs,
+            "a round restoring 48 slabs cost {many_restore_fsyncs} directory fsyncs against \
+             {no_restore_fsyncs} for a round restoring none; the difference is the per-restore \
+             fsync"
+        );
+        assert!(
+            no_restore_fsyncs >= 2,
+            "and the round must still sync both directories -- zero would satisfy the equality \
+             while leaving every rename undurable"
+        );
+    }
+
+    /// What a quarantine round leaves on disk must not change when the fsyncs move.
+    ///
+    /// The hoist widens the window in which a crash can leave the batch half-applied; it must not
+    /// change the outcome of the round that COMPLETES. A store reopened from the same root has to
+    /// see the same thing either way: every quarantined slab gone from the store, every one of
+    /// them in the trash directory, and the manifest agreeing.
+    #[test]
+    fn a_quarantine_round_is_durable_as_a_whole_after_the_fsyncs_are_hoisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let slabs = 32u64;
+        for id in 0..slabs {
+            store.install_slab(id, b"slab-contents").unwrap();
+        }
+        // DENOMINATOR: everything is in the store before the round.
+        assert_eq!(store.slab_ids().unwrap().len() as u64, slabs);
+        assert!(store.delayed_destroy_slab_ids().unwrap().is_empty());
+
+        let report = store
+            .gc_slabs_before_with_live_refs_delayed_destroy(slabs - 1, [slabs - 1])
+            .unwrap();
+        assert_eq!(report.delayed_destroy_block_slab_ids.len() as u64, slabs - 1);
+        drop(store);
+
+        let reopened = BlockStore::new(dir.path());
+        assert_eq!(
+            reopened.slab_ids().unwrap(),
+            vec![slabs - 1],
+            "only the current slab is left in the store after a reopen"
+        );
+        assert_eq!(
+            reopened.delayed_destroy_slab_ids().unwrap().len() as u64,
+            slabs - 1,
+            "and every quarantined slab is still in the trash directory"
+        );
+        // The manifest agrees with the directory: each quarantined slab reads as DelayedDestroy.
+        let quarantined = reopened
+            .delayed_destroy_slab_ids()
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let states = reopened
+            .inner
+            .lock()
+            .unwrap()
+            .slabs
+            .iter()
+            .filter(|(id, _)| quarantined.contains(id))
+            .map(|(_, slab)| slab.state)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            states.len() as u64,
+            slabs - 1,
+            "every quarantined slab has a descriptor after the reopen"
+        );
+        assert!(
+            states
+                .iter()
+                .all(|state| matches!(state, BlockStoreSlabState::DelayedDestroy)),
+            "and each one reads as DelayedDestroy -- the manifest written after the renames \
+             agrees with the directory the renames produced"
+        );
+    }
+
+    #[test]
+    fn delayed_destroy_gc_quarantines_stale_slabs_before_purge() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.install_slab(0, b"current").unwrap();
+        store.install_slab(1, b"stale").unwrap();
+        store.install_slab(2, b"live").unwrap();
+        store.install_slab(3, b"keep").unwrap();
+
+        let report = store
+            .gc_slabs_before_with_live_refs_delayed_destroy(3, [2_u64])
+            .unwrap();
+
+        assert_eq!(report.removed_block_slab_ids, vec![0, 1]);
+        assert_eq!(report.delayed_destroy_block_slab_ids, vec![0, 1]);
+        assert_eq!(
+            report.removed_physical_bytes,
+            (b"current".len() + b"stale".len()) as u64
+        );
+        assert_eq!(
+            report.delayed_destroy_physical_bytes,
+            report.removed_physical_bytes
+        );
+        assert_eq!(report.retained_block_slab_ids, vec![2, 3]);
+        assert_eq!(report.retained_live_block_slab_ids, vec![2]);
+        assert_eq!(report.retained_live_physical_bytes, b"live".len() as u64);
+        assert_eq!(store.slab_ids().unwrap(), vec![2, 3]);
+        assert_eq!(store.delayed_destroy_slab_ids().unwrap(), vec![0, 1]);
+        let delayed_reports = store.delayed_destroy_slab_reports().unwrap();
+        assert_eq!(delayed_reports.len(), 2);
+        assert_eq!(delayed_reports[0].block_slab_id, 0);
+        assert_eq!(delayed_reports[0].physical_bytes, b"current".len() as u64);
+        assert!(delayed_reports[0].modified_unix_ms.is_some());
+        assert_eq!(delayed_reports[1].block_slab_id, 1);
+        assert_eq!(delayed_reports[1].physical_bytes, b"stale".len() as u64);
+        assert!(delayed_reports[1].modified_unix_ms.is_some());
+
+        let purge = store.purge_delayed_destroy_slabs_older_than(0).unwrap();
+        assert_eq!(purge.purged_block_slab_ids, vec![0, 1]);
+        assert_eq!(
+            purge.purged_physical_bytes,
+            (b"current".len() + b"stale".len()) as u64
+        );
+        assert!(store.delayed_destroy_slab_ids().unwrap().is_empty());
+        assert!(store.delayed_destroy_slab_reports().unwrap().is_empty());
+        assert_eq!(store.slab_ids().unwrap(), vec![2, 3]);
+    }
+
+    /// A PUBLISHED LIVE TALLY MAKES `used_bytes` MEAN LIVE BLOCK BYTES, AND THE FLOOR THEN BINDS.
+    ///
+    /// The arithmetic on its own, with the tally supplied directly rather than earned by a
+    /// workload, because the question here is whether the MACHINERY works: given a slab that is
+    /// 90% live, does the shipped 4,000 basis-point garbage floor exclude it?
+    ///
+    /// It does, and that is new. The figure `used_bytes` used to carry summed the file sizes of
+    /// the slabs grouped under the same stored id that are NOT collectable -- and since the
+    /// candidate filter is the exact negation of that test, and a stored id names exactly one
+    /// slab, no candidate could ever contribute to its own used bytes. Every candidate read 0,
+    /// 10,000 bp of garbage, and the floor excluded nothing at any setting.
+    ///
+    /// WHAT THIS DOES NOT SAY. It does not say the floor starts excluding slabs in a running
+    /// store. `can_the_block_gc_garbage_floor_bind` is where that is measured, and the answer
+    /// there is still no -- for a reason that lives in the CANDIDATE PREDICATE and not in this
+    /// arithmetic: a collector candidate is a slab that no live block points at, so its maintained
+    /// live bytes are genuinely zero. The two tests answer different halves of the same question,
+    /// and both are needed: this one that the knob is real, that one that nothing in a running
+    /// store currently presents it with a partially-live candidate.
+    #[test]
+    fn a_published_live_tally_makes_used_bytes_mean_live_block_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        // Equal sizes, so nothing below can be satisfied by the slabs merely differing in size --
+        // which is the key the order actually used to fall through to.
+        store.install_slab(0, &vec![b'a'; 1_000]).unwrap();
+        store.install_slab(1, &vec![b'b'; 1_000]).unwrap();
+        store.install_slab(2, &vec![b'c'; 1_000]).unwrap();
+        store.install_slab(3, b"current").unwrap();
+
+        // THE PREMISE, restated where it is about to be overturned.
+        let before = store.gc_utility_candidates(3, Vec::<u64>::new()).unwrap();
+        assert_eq!(
+            before.len(),
+            3,
+            "three slabs are below the retention floor and collectable"
+        );
+        assert!(
+            before
+                .iter()
+                .all(|candidate| candidate.used_bytes == 0
+                    && candidate.utility_basis_points == 0),
+            "with nothing published, every candidate reports the old zero: {before:?}"
+        );
+
+        store.publish_live_block_bytes(BTreeMap::from([
+            (
+                0_u64,
+                BlockStoreSlabLive {
+                    live_block_refs: 2,
+                    live_bytes: 200,
+                },
+            ),
+            (
+                1_u64,
+                BlockStoreSlabLive {
+                    live_block_refs: 9,
+                    live_bytes: 900,
+                },
+            ),
+        ]));
+
+        let after = store.gc_utility_candidates(3, Vec::<u64>::new()).unwrap();
+        assert_eq!(after.len(), 3, "the same three candidates: {after:?}");
+        let by_id = |block_slab_id: u64| {
+            after
+                .iter()
+                .find(|candidate| candidate.block_slab_id == block_slab_id)
+                .unwrap_or_else(|| panic!("candidate {block_slab_id} missing from {after:?}"))
+        };
+        assert_eq!(by_id(0).used_bytes, 200);
+        assert_eq!(by_id(0).total_bytes, 1_000);
+        assert_eq!(by_id(0).stale_bytes, 800);
+        assert_eq!(by_id(0).utility_basis_points, 2_000);
+        assert_eq!(by_id(1).used_bytes, 900);
+        assert_eq!(by_id(1).utility_basis_points, 9_000);
+        // Absent from the published tally is ZERO LIVE BYTES, not "unknown": the publisher walks
+        // its whole index, so a slab it did not name holds nothing live.
+        assert_eq!(by_id(2).used_bytes, 0);
+        assert_eq!(by_id(2).utility_basis_points, 0);
+
+        // HIGHEST GARBAGE FIRST, which is what the sort comment has always claimed and what a
+        // uniformly zero first key could never deliver.
+        assert_eq!(
+            after
+                .iter()
+                .map(|candidate| candidate.block_slab_id)
+                .collect::<Vec<_>>(),
+            vec![2, 0, 1],
+            "ascending live fraction is descending garbage: {after:?}"
+        );
+
+        let plan = store
+            .gc_policy_plan(
+                3,
+                Vec::<u64>::new(),
+                &BlockStoreGcPolicy::with_slab_garbage_floor(4_000, None),
+            )
+            .unwrap();
+        // THE DENOMINATOR: three candidates were offered to the floor.
+        assert_eq!(plan.candidate_count, 3, "{plan:?}");
+        assert_eq!(
+            plan.skipped_by_policy_count, 1,
+            "the 90%-live slab is 1,000 bp of garbage and the floor is 4,000, so the floor \
+             excludes it -- which it could not do for any slab, at any setting, before a tally \
+             was published: {plan:?}"
+        );
+        assert_eq!(
+            plan.selected_block_slab_ids,
+            vec![2, 0],
+            "and the two above the floor are selected, most-garbage first: {plan:?}"
+        );
+        assert_eq!(plan.candidate_used_bytes, 1_100);
+        assert_eq!(plan.candidate_total_bytes, 3_000);
+
+        // The read-only whole-store view agrees with what the plan was handed.
+        let fractions = store.slab_live_fractions().unwrap();
+        assert_eq!(fractions.len(), 4, "every slab, not just the candidates");
+        let live_points = fractions
+            .iter()
+            .map(|fraction| fraction.live_basis_points)
+            .collect::<Vec<_>>();
+        assert_eq!(live_points, vec![2_000, 9_000, 0, 0], "{fractions:?}");
+    }
+
+    /// A slab the PUBLISHED TALLY still credits with live bytes is not reclaimed, however little
+    /// of it is live.
+    ///
+    /// The tally's own header says it "only ever KEEPS a slab; it never grants permission to delete
+    /// one". Its only consumer was the garbage floor, and a floor is a threshold: at the shipped
+    /// 4,000 basis points a slab that is 20% live is 8,000 bp of garbage and clears it. So the
+    /// tally could keep a slab only once it was more than 60% live.
+    ///
+    /// Two arms on ONE fixture, differing only in whether a tally was published, so the number the
+    /// assertions move is the tally and not the store.
+    #[test]
+    fn a_slab_the_tally_still_credits_with_live_bytes_is_not_reclaimed() {
+        fn arm(publish: bool) -> (BlockStoreGcReport, Vec<u64>) {
+            let dir = tempfile::tempdir().unwrap();
+            let store = BlockStore::new(dir.path());
+            // Equal sizes: nothing below can be satisfied by the slabs merely differing in length.
+            store.install_slab(0, &vec![b'a'; 1_000]).unwrap();
+            store.install_slab(1, &vec![b'b'; 1_000]).unwrap();
+            store.install_slab(2, b"current").unwrap();
+            if publish {
+                // Slab 0 is 20% live -- 8,000 bp of garbage, which clears the shipped 4,000 floor.
+                // Slab 1 is named nowhere, which the publisher's contract reads as zero live bytes.
+                store.publish_live_block_bytes(BTreeMap::from([(
+                    0_u64,
+                    BlockStoreSlabLive {
+                        live_block_refs: 2,
+                        live_bytes: 200,
+                    },
+                )]));
+            }
+            // The caller's live id set is EMPTY in both arms. That is the disagreement being
+            // tested: the walk says nothing is live, the tally says slab 0 is.
+            let report = store
+                .gc_slabs_before_with_live_refs(2, Vec::<u64>::new())
+                .unwrap();
+            let left = store.slab_ids().unwrap();
+            (report, left)
+        }
+
+        let (without, left_without) = arm(false);
+        let (with, left_with) = arm(true);
+
+        // THE DENOMINATOR, and the control. With no tally published the check reads zero and the
+        // round reclaims both slabs below the floor, exactly as it did before.
+        assert_eq!(
+            without.removed_block_slab_ids,
+            vec![0, 1],
+            "the unpublished arm must reclaim both candidates, or the arm below proves nothing: \
+             {without:?}"
+        );
+        assert!(
+            without.retained_live_bytes_block_slab_ids.is_empty(),
+            "nothing was published, so nothing can be held back by a tally: {without:?}"
+        );
+        assert_eq!(without.retained_live_bytes_physical_bytes, 0);
+        assert_eq!(left_without, vec![2], "only the current slab survives: {left_without:?}");
+
+        // THE TWO HALVES, ASSERTED SEPARATELY.
+        //
+        // Half one: the slab the tally credits is held back, named, and still on disk.
+        assert_eq!(
+            with.retained_live_bytes_block_slab_ids,
+            vec![0],
+            "the 20%-live slab must be refused, not merely under-selected: {with:?}"
+        );
+        assert_eq!(
+            with.retained_live_bytes_physical_bytes, 1_000,
+            "and reported at its own physical size: {with:?}"
+        );
+        assert!(
+            with.retained_block_slab_ids.contains(&0),
+            "a refused slab is retained: {with:?}"
+        );
+        assert!(
+            left_with.contains(&0),
+            "and its file is still in the store: {left_with:?}"
+        );
+
+        // Half two: the round still did its work on the slab the tally agrees is dead. A check
+        // that refused everything would satisfy half one and be useless.
+        assert_eq!(
+            with.removed_block_slab_ids,
+            vec![1],
+            "the slab with no tallied live bytes is still reclaimed: {with:?}"
+        );
+        assert!(
+            !left_with.contains(&1),
+            "and its file is gone: {left_with:?}"
+        );
+        assert_eq!(left_with, vec![0, 2], "{left_with:?}");
+
+        // The refusal is not double-counted as an ordinary live-set retention: the caller's id set
+        // was empty in both arms, so that list must stay empty.
+        assert!(
+            with.retained_live_block_slab_ids.is_empty(),
+            "the caller named no live slabs, so `retained_live` must not absorb the refusal: \
+             {with:?}"
+        );
+    }
+
+    #[test]
+    fn utility_gc_selects_low_utility_stale_slabs_with_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.install_slab(0, b"small").unwrap();
+        store.install_slab(1, b"largest-stale-segment").unwrap();
+        store.install_slab(2, b"live-segment").unwrap();
+        store.install_slab(3, b"current-segment").unwrap();
+
+        let candidates = store.gc_utility_candidates(3, [2_u64]).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.block_slab_id)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.utility_score == 0));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.utility_basis_points == 0));
+        assert!(candidates.iter().all(|candidate| candidate.used_bytes == 0));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.stale_bytes == candidate.total_bytes));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.created_unix_ms.is_some()));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.updated_unix_ms.is_some()));
+        assert!(candidates
+            .iter()
+            .all(|candidate| candidate.age_ms.is_some()));
+
+        let no_op = store
+            .gc_slabs_before_with_live_refs_utility(3, [2_u64], 0, true)
+            .unwrap();
+        assert!(no_op.removed_block_slab_ids.is_empty());
+        assert_eq!(no_op.removed_physical_bytes, 0);
+        assert_eq!(store.slab_ids().unwrap(), vec![0, 1, 2, 3]);
+
+        let report = store
+            .gc_slabs_before_with_live_refs_utility(3, [2_u64], 1, true)
+            .unwrap();
+        assert_eq!(report.removed_block_slab_ids, vec![1]);
+        assert_eq!(report.delayed_destroy_block_slab_ids, vec![1]);
+        assert_eq!(
+            report.removed_physical_bytes,
+            b"largest-stale-segment".len() as u64
+        );
+        assert_eq!(
+            report.delayed_destroy_physical_bytes,
+            b"largest-stale-segment".len() as u64
+        );
+        assert_eq!(report.retained_block_slab_ids, vec![0, 2, 3]);
+        assert_eq!(report.retained_live_block_slab_ids, vec![2]);
+        assert_eq!(
+            report.retained_live_physical_bytes,
+            b"live-segment".len() as u64
+        );
+        assert_eq!(store.slab_ids().unwrap(), vec![0, 2, 3]);
+        assert_eq!(store.delayed_destroy_slab_ids().unwrap(), vec![1]);
+        let delayed_reports = store.delayed_destroy_slab_reports().unwrap();
+        assert_eq!(delayed_reports.len(), 1);
+        assert_eq!(delayed_reports[0].block_slab_id, 1);
+        assert_eq!(
+            delayed_reports[0].physical_bytes,
+            b"largest-stale-segment".len() as u64
+        );
+        assert!(delayed_reports[0].modified_unix_ms.is_some());
+    }
+
+    #[test]
+    fn slab_garbage_floor_gates_reclaim_by_garbage_ratio() {
+        // garbage-ratio GC conformance: reclaim is gated on a minimum slab garbage ratio
+        // (garbage = 10_000 - slab live-fraction). Floor 0 (the default) reclaims every
+        // eligible slab as before; a floor above a slab's garbage ratio excludes it.
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.install_slab(0, b"stale-a").unwrap();
+        store.install_slab(1, b"stale-b").unwrap();
+        store.install_slab(2, b"kept-above-floor").unwrap();
+        let floor_zero = store
+            .gc_policy_plan(
+                2,
+                Vec::<u64>::new(),
+                &BlockStoreGcPolicy::with_slab_garbage_floor(0, None),
+            )
+            .unwrap();
+        assert_eq!(floor_zero.selected_block_slab_ids, vec![0, 1]);
+        assert_eq!(floor_zero.skipped_by_policy_count, 0);
+        let floor_impossible = store
+            .gc_policy_plan(
+                2,
+                Vec::<u64>::new(),
+                &BlockStoreGcPolicy::with_slab_garbage_floor(10_001, None),
+            )
+            .unwrap();
+        assert!(floor_impossible.selected_block_slab_ids.is_empty());
+        assert_eq!(floor_impossible.skipped_by_policy_count, 2);
+    }
+
+    /// The per-round budget is INERT on the production path, and that is now written down.
+    ///
+    /// `BlockStoreGcPolicy` can bound a round two ways -- a slab count and a physical-byte total
+    /// -- and `policy_gc_plans_and_applies_byte_bounded_destroy` proves both work. Neither binds
+    /// in production: `with_slab_garbage_floor` is the only constructor the scheduled cycle uses
+    /// and it sets both to 0, which means "no limit". The operator path does not even reach the
+    /// policy layer, and the purge takes no budget at all.
+    ///
+    /// A capability that is implemented, tested, and switched off everywhere it would matter is
+    /// the hardest kind to notice: the tests are green, the struct looks complete, and nothing
+    /// says the shipped path opted out. This test is what says it. It is deliberately an
+    /// assertion of the CURRENT state rather than a fix -- changing a shipped default is a policy
+    /// call, and the recommendation attached to this work is that the PURGE should be capped
+    /// (unbounded unlinking under the store lock, linear in quarantine depth) while the
+    /// COLLECTOR's budget should stay off until the victim ordering it would truncate is the
+    /// intended one. Capping a wrong order makes the wrong slabs survive.
+    ///
+    /// So: when someone switches a budget on, this test fails, and the failure is the review
+    /// prompt. It cannot go back to being inert quietly.
+    #[test]
+    fn the_production_gc_policy_ships_with_both_round_budgets_off() {
+        let shipped = BlockStoreGcPolicy::with_slab_garbage_floor(
+            crate::engine::reports::DEFAULT_BLOCK_GC_MIN_SLAB_GARBAGE_BASIS_POINTS,
+            None,
+        );
+        assert_eq!(
+            shipped.max_destroy_slabs, 0,
+            "the slab-count budget is off on the only constructor the scheduled cycle uses; \
+             turning it on is a policy change that must be made deliberately"
+        );
+        assert_eq!(
+            shipped.max_destroy_physical_bytes, 0,
+            "and so is the byte budget"
+        );
+
+        // The halves are separate: a budget being CONSTRUCTIBLE is not a budget being APPLIED,
+        // and asserting only the first would leave the shipped path unexamined. This is the
+        // second half -- the plumbing works, so 0 really does mean "chose not to", not "cannot".
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.install_slab(0, b"a").unwrap();
+        store.install_slab(1, b"b").unwrap();
+        store.install_slab(2, b"current").unwrap();
+        let bounded = store
+            .gc_policy_plan(2, Vec::<u64>::new(), &BlockStoreGcPolicy::max_slabs(1))
+            .unwrap();
+        assert_eq!(
+            bounded.selected_block_slab_ids.len(),
+            1,
+            "a budget of one really does bound a round: {bounded:?}"
+        );
+        assert_eq!(bounded.skipped_by_budget_count, 1);
+        let unbounded = store.gc_policy_plan(2, Vec::<u64>::new(), &shipped).unwrap();
+        assert_eq!(
+            unbounded.selected_block_slab_ids.len(),
+            2,
+            "and the shipped policy bounds nothing: {unbounded:?}"
+        );
+        assert_eq!(unbounded.skipped_by_budget_count, 0);
+    }
+
+    #[test]
+    fn policy_gc_plans_and_applies_byte_bounded_destroy() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.install_slab(0, b"small").unwrap();
+        store.install_slab(1, b"largest-stale-segment").unwrap();
+        store.install_slab(2, b"live-segment").unwrap();
+        store.install_slab(3, b"current-segment").unwrap();
+
+        let policy = BlockStoreGcPolicy {
+            max_destroy_slabs: 2,
+            max_destroy_physical_bytes: b"small".len() as u64,
+            max_utility_score: Some(0),
+            min_age_ms: Some(0),
+            min_slab_garbage_basis_points: None,
+        };
+        let plan = store.gc_policy_plan(3, [2_u64], &policy).unwrap();
+        assert_eq!(plan.retain_from_block_slab_id, 3);
+        assert_eq!(plan.candidate_count, 2);
+        assert_eq!(
+            plan.candidate_physical_bytes,
+            (b"small".len() + b"largest-stale-segment".len()) as u64
+        );
+        assert_eq!(plan.candidate_total_bytes, plan.candidate_physical_bytes);
+        assert_eq!(plan.candidate_used_bytes, 0);
+        assert_eq!(plan.candidate_stale_bytes, plan.candidate_physical_bytes);
+        assert_eq!(plan.candidate_utility_basis_points, 0);
+        assert_eq!(plan.selected_block_slab_ids, vec![0]);
+        assert_eq!(plan.selected_physical_bytes, b"small".len() as u64);
+        assert_eq!(plan.skipped_by_policy_count, 0);
+        assert_eq!(plan.skipped_by_policy_physical_bytes, 0);
+        assert_eq!(plan.skipped_by_budget_count, 1);
+        assert_eq!(
+            plan.skipped_by_budget_physical_bytes,
+            b"largest-stale-segment".len() as u64
+        );
+        assert_eq!(
+            plan.candidates
+                .iter()
+                .map(|candidate| candidate.block_slab_id)
+                .collect::<Vec<_>>(),
+            vec![1, 0]
+        );
+
+        let report = store
+            .gc_slabs_before_with_live_refs_policy(3, [2_u64], policy, true)
+            .unwrap();
+        assert_eq!(report.removed_block_slab_ids, vec![0]);
+        assert_eq!(report.delayed_destroy_block_slab_ids, vec![0]);
+        assert_eq!(report.retained_block_slab_ids, vec![1, 2, 3]);
+        assert_eq!(store.slab_ids().unwrap(), vec![1, 2, 3]);
+        assert_eq!(store.delayed_destroy_slab_ids().unwrap(), vec![0]);
+    }
+
+    /// Install, quarantine and purge, timed apart.
+    ///
+    /// A purge round used to unlink every quarantined slab with the store's lock held, so the
+    /// round was unbounded in the amount of work it did. Whether that is the expensive part, or
+    /// whether getting there is, is what this separates -- an earlier attempt timed all three
+    /// together at twenty thousand slabs and did not finish in an hour.
+    ///
+    /// THE PURGE IS NOW DRAINED IN ROUNDS, because one call no longer finishes it. The longest
+    /// single round is what the lock hold costs and is printed beside the total; a total alone
+    /// would say the cap had made things slower while hiding that the thing it bounds got
+    /// shorter. The round count is printed too: at 3,200 slabs and a budget of 1,000 it is the
+    /// four that the arithmetic predicts, so a drain that quietly stopped early would show up
+    /// here as a count that is too small rather than as a number nobody checks.
+    #[test]
+    fn quarantine_and_purge_timed_by_phase() {
+        for slabs in [200u64, 800, 3_200] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = BlockStore::new(dir.path());
+
+            let started = std::time::Instant::now();
+            for id in 0..slabs {
+                store.install_slab(id, b"slab-contents").unwrap();
+            }
+            let install = started.elapsed().as_secs_f64() * 1e3;
+
+            let started = std::time::Instant::now();
+            let quarantined = store
+                .gc_slabs_before_with_live_refs_delayed_destroy(slabs - 1, [slabs - 1])
+                .unwrap()
+                .delayed_destroy_block_slab_ids
+                .len();
+            let quarantine = started.elapsed().as_secs_f64() * 1e3;
+            // DENOMINATOR: the purge below really has this much to drain.
+            assert_eq!(
+                quarantined as u64,
+                slabs - 1,
+                "the quarantine phase must really have set aside {} slabs",
+                slabs - 1
+            );
+
+            let expected_rounds = quarantined.div_ceil(DELAYED_DESTROY_MAX_SLABS_PER_ROUND);
+            let started = std::time::Instant::now();
+            let mut destroyed = 0usize;
+            let mut rounds = 0usize;
+            let mut longest_round_ms = 0.0f64;
+            loop {
+                let round_started = std::time::Instant::now();
+                let report = store.purge_delayed_destroy_slabs_older_than(0).unwrap();
+                let round_ms = round_started.elapsed().as_secs_f64() * 1e3;
+                longest_round_ms = longest_round_ms.max(round_ms);
+                destroyed += report.purged_block_slab_ids.len();
+                rounds += 1;
+                if !report.budget_exhausted {
+                    break;
+                }
+                assert!(
+                    rounds <= expected_rounds + 4,
+                    "the drain of {quarantined} slabs did not finish in {} rounds",
+                    expected_rounds + 4
+                );
+            }
+            let purge = started.elapsed().as_secs_f64() * 1e3;
+            assert_eq!(
+                destroyed, quarantined,
+                "the rounds together must destroy every quarantined slab"
+            );
+            assert_eq!(
+                rounds, expected_rounds,
+                "and must take the number of rounds the budget predicts"
+            );
+
+            println!(
+                "  {slabs:>5} slabs: install {install:>9.1} ms ({:>6.3} ms each)   quarantine \
+                 {quarantine:>9.1} ms   purge {purge:>8.1} ms over {rounds} round(s), longest \
+                 round {longest_round_ms:>7.1} ms ({destroyed} destroyed)",
+                install / slabs as f64,
+            );
+        }
+    }
+
+    /// A slab roll writes the whole slab manifest, and the counter must SAY SO.
+    ///
+    /// `slab_manifest_writes` is `pub` on this crate and documented "times the whole slab manifest
+    /// was written out". It was incremented at ONE of the twelve places that write it -- the
+    /// periodic write inside `install_slab` -- so a store that only rolled reported zero while
+    /// every roll wrote a whole manifest. Downstream forks read the same field.
+    ///
+    /// A DELTA ACROSS A REAL ROLL, not an absolute. An apparatus wired to nothing reads zero
+    /// before and zero after and would pass an absolute of zero; the delta is what says the roll
+    /// is the thing being counted. The roll report is asserted FIRST so a roll that never happened
+    /// cannot pass as a roll that wrote nothing.
+    #[test]
+    fn a_slab_roll_is_counted_as_a_manifest_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.append(b"before-the-roll").unwrap();
+
+        let before = store.stats().slab_manifest_writes;
+        let report = store.roll_slab().unwrap();
+        let after = store.stats().slab_manifest_writes;
+
+        assert_ne!(
+            report.new_block_slab_id, report.previous_block_slab_id,
+            "the roll must actually have rolled, or the delta below is measuring nothing"
+        );
+        assert!(
+            after >= before + 1,
+            "a roll wrote the whole slab manifest but slab_manifest_writes moved {before} -> \
+             {after}; this field is pub on a crate other people build on"
+        );
+    }
+
+    /// And it counts ONE PER WRITE, not "at least once ever".
+    ///
+    /// The second direction on the same field. A counter bumped once at the first roll and never
+    /// again satisfies the delta above; it does not satisfy this. `roll_slab` persists the
+    /// manifest exactly once, so five rolls must move the number by exactly five -- an equality,
+    /// which is what a mutant that moves the increment somewhere cheaper has to break.
+    #[test]
+    fn five_slab_rolls_are_counted_five_times() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.append(b"before-the-rolls").unwrap();
+
+        let before = store.stats().slab_manifest_writes;
+        let mut rolled = 0u64;
+        for _ in 0..5 {
+            let report = store.roll_slab().unwrap();
+            assert_ne!(
+                report.new_block_slab_id, report.previous_block_slab_id,
+                "every one of these must be a real roll"
+            );
+            rolled += 1;
+        }
+        let after = store.stats().slab_manifest_writes;
+
+        assert_eq!(rolled, 5, "the denominator: five rolls were attempted and five happened");
+        assert_eq!(
+            after - before,
+            5,
+            "five rolls wrote five whole manifests; slab_manifest_writes moved {before} -> {after}"
+        );
+    }
+
+    /// Installing slabs must not cost more as the store fills up.
+    ///
+    /// Writing the slab manifest costs the whole manifest, so writing it per install made
+    /// installing n slabs cost n manifests: measured at 111.7 ms per install with two hundred slabs
+    /// in the store and 270.7 ms with eight hundred. Written every so often instead, both are about
+    /// 5.4 ms and the cost stops tracking the size of the store.
+    ///
+    /// Counted rather than timed. A duration would assert the right thing on an idle machine and
+    /// something else entirely on a busy one; the number of manifest writes is the shape itself.
+    #[test]
+    fn installing_slabs_does_not_write_a_manifest_each_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let slabs = 512u64;
+        for id in 0..slabs {
+            store.install_slab(id, b"slab-contents").unwrap();
+        }
+        let writes = store.stats().slab_manifest_writes;
+        assert!(
+            writes < slabs / 8,
+            "installing {slabs} slabs wrote the manifest {writes} times; one per install is what \
+             made each install cost the whole store"
+        );
+        assert!(
+            writes > 0,
+            "the manifest should still reach disk periodically, or a crash rebuilds everything"
+        );
+        // And it is still correct: a reopen sees every slab, whether or not the last write landed.
+        drop(store);
+        let reopened = BlockStore::new(dir.path());
+        assert_eq!(
+            reopened.slab_ids().unwrap().len(),
+            slabs as usize,
+            "every installed slab must still be there after a reopen"
+        );
+    }
+
+    /// The roll predicate answered at its threshold, which nothing asked it before.
+    ///
+    /// `should_roll_before_append` is called on EVERY append, and the shipped slab target is a
+    /// GiB. Every test in this crate writes a few KB into a tempdir, so
+    /// `write_offset + record_len > slab_target_bytes` is false in all of them and only the
+    /// `write_offset > 0` conjunct is ever exercised. Measured by mutation: replacing the whole
+    /// predicate with `false` -- an append that can never roll, one slab for ever -- leaves all
+    /// 82 block-store tests green, while replacing it with the bare `write_offset > 0` is caught
+    /// at once. So the half that decides WHEN to roll was untested and the half that decides
+    /// whether a slab is empty was not.
+    ///
+    /// This asks the predicate directly, at numbers a fixture cannot reach, which is the only way
+    /// to reach the threshold without seeding a gibibyte. Both predicates are here because they
+    /// are deliberately different and the difference is the thing worth pinning: one asks "will
+    /// THIS record overflow", the other "is the slab full enough to roll now".
+    #[test]
+    fn the_roll_predicates_answer_at_their_thresholds() {
+        // THE EMPTY-SLAB GUARD. A freshly rolled slab must not roll again, however large the
+        // record: without this a background cycle mints an empty slab every pass.
+        assert!(
+            !should_roll_before_append(0, 10_000, 100),
+            "an empty slab never rolls, even for a record larger than the whole target"
+        );
+        assert!(!slab_is_at_target(0, 100), "an empty slab is never at target");
+
+        // THE THRESHOLD ITSELF, asserted on both sides of the boundary and ON it. A record that
+        // exactly fills the target is written where it is; the first byte past it rolls.
+        assert!(
+            !should_roll_before_append(90, 10, 100),
+            "a record that exactly fills the target does not roll: 90 + 10 == 100"
+        );
+        assert!(
+            should_roll_before_append(90, 11, 100),
+            "the first byte past the target rolls: 90 + 11 > 100"
+        );
+        assert!(
+            should_roll_before_append(100, 1, 100),
+            "a slab already at target rolls for any non-empty record"
+        );
+        assert!(
+            !should_roll_before_append(100, 0, 100),
+            "and a zero-length record at the target does not"
+        );
+
+        // `slab_is_at_target` answers the OTHER question, with no record in hand, and its
+        // boundary is inclusive where the one above is exclusive.
+        assert!(
+            !slab_is_at_target(99, 100),
+            "under target is not at target"
+        );
+        assert!(
+            slab_is_at_target(100, 100),
+            "exactly at target IS at target -- inclusive, unlike should_roll_before_append"
+        );
+        assert!(slab_is_at_target(101, 100), "and past it stays at target");
+
+        // THE DENOMINATOR FOR WHY THIS TEST HAS TO ASK DIRECTLY: the shipped target is large
+        // enough that no tempdir fixture in this crate crosses it.
+        let shipped = effective_block_slab_target_bytes();
+        assert!(
+            shipped >= 1 << 20,
+            "the shipped slab target is {shipped} bytes; a fixture-driven roll test would have \
+             to write that much, which is why this one asks the predicate instead"
+        );
+    }
+
+    /// THE CEILING THE ADDRESS WORD RESTS ON, ASKED AT THE CAP AND NOT AT THE FIXTURE DEFAULT.
+    ///
+    /// The low half of an address holds `0 ..= u32::MAX`, and what keeps a recorded offset inside
+    /// that is the roll predicate, not arithmetic. The claim is "an offset can never EQUAL the
+    /// slab target", and the two assertions below are the whole proof of it at the largest target
+    /// an operator may now configure -- one that a fixture would have to write four gibibytes to
+    /// reach, which is why this asks the predicate directly.
+    ///
+    /// The fixture default proves nothing here: at a 1 GiB target every offset fits in 30 bits
+    /// and the boundary is never approached. This campaign has twice shipped a premise that was
+    /// true at the default and false at what an operator is told to set.
+    #[test]
+    fn an_offset_can_never_equal_the_slab_target_so_the_low_half_holds_it() {
+        let cap = crate::storage_config::MAX_BLOCK_SLAB_TARGET_BYTES;
+        assert_eq!(
+            cap - 1,
+            MAX_ADDRESSABLE_BLOCK_OFFSET,
+            "the cap and the addressable offset must be one apart, or one of them is wrong"
+        );
+
+        // THE HIGHEST OFFSET A STORE CAN RECORD. At a target of 2^32 a record starting at
+        // 2^32 - 1 does not roll, so that offset IS reachable -- and it is exactly u32::MAX.
+        assert!(
+            !should_roll_before_append(MAX_ADDRESSABLE_BLOCK_OFFSET, 1, cap),
+            "an offset of u32::MAX must still be writable at the capped target, or the ceiling \
+             is lower than the cap says"
+        );
+
+        // AND THE FIRST OFFSET IT CANNOT. At the target itself, any record at all rolls, so no
+        // record is ever recorded at an offset equal to the target. `record_len >= 1` is what
+        // makes this total: `encode_block_record` always emits at least a header.
+        assert!(
+            should_roll_before_append(cap, 1, cap),
+            "an offset equal to the target must roll; if it did not, the usable ceiling would be \
+             the target minus one RECORD rather than minus one BYTE"
+        );
+        assert!(
+            crate::block_store::record::BLOCK_RECORD_HEADER_LEN >= 1,
+            "a zero-length record would make the roll predicate's strict comparison reachable at \
+             the target itself, and the offset would not fit"
+        );
+
+        // The round trip AT that ceiling, through the real constructor rather than through the
+        // packing helpers alone.
+        let at_ceiling = ElementEntry::try_from_parts(
+            MAX_ADDRESSABLE_BLOCK_SLAB_ID,
+            MAX_ADDRESSABLE_BLOCK_OFFSET,
+            4,
+            Some(1),
+            Some(2),
+        )
+        .expect("the ceiling itself must be addressable");
+        assert_eq!(at_ceiling.block_slab_id(), MAX_ADDRESSABLE_BLOCK_SLAB_ID);
+        assert_eq!(at_ceiling.offset(), MAX_ADDRESSABLE_BLOCK_OFFSET);
+
+        // And through the stored form, because that is where a merged word is actually carried.
+        let stored = serde_json::to_string(&at_ceiling).expect("address serializes");
+        let back: ElementEntry = serde_json::from_str(&stored).expect("address round-trips");
+        assert_eq!(back, at_ceiling, "the ceiling did not survive the stored form");
+    }
+
+    /// A SLAB ID THAT DOES NOT FIT IS REFUSED. Fed one, and the refusal is the assertion.
+    ///
+    /// The control is the half that matters: the value one below is ACCEPTED, so this is a
+    /// boundary and not a constructor that refuses everything. And the truncation that would have
+    /// happened instead is spelled out -- `as u32` on the refused id produces a small, entirely
+    /// plausible slab id, which is why saturating or narrowing here would be corruption rather
+    /// than a visible failure.
+    #[test]
+    fn an_out_of_range_slab_id_is_refused_rather_than_truncated() {
+        let too_large = MAX_ADDRESSABLE_BLOCK_SLAB_ID + 3; // past the two reserved sentinels too
+        let refused = ElementEntry::try_from_parts(too_large, 0, 4, Some(1), None)
+            .expect_err("a slab id past the addressable range must be refused");
+        assert_eq!(refused.block_slab_id, too_large);
+        assert!(
+            refused.to_string().contains("does not fit the address word"),
+            "the refusal does not say what is wrong: {refused}"
+        );
+
+        let accepted =
+            ElementEntry::try_from_parts(MAX_ADDRESSABLE_BLOCK_SLAB_ID, 0, 4, Some(1), None)
+                .expect("the largest addressable slab id must be accepted");
+        assert_eq!(accepted.block_slab_id(), MAX_ADDRESSABLE_BLOCK_SLAB_ID);
+
+        assert_ne!(
+            u64::from(too_large as u32),
+            too_large,
+            "this id survives a truncation, so it does not demonstrate what the refusal prevents"
+        );
+    }
+
+    /// AN OFFSET THAT DOES NOT FIT IS REFUSED. Fed one, with the same two controls.
+    #[test]
+    fn an_out_of_range_offset_is_refused_rather_than_truncated() {
+        let too_large = MAX_ADDRESSABLE_BLOCK_OFFSET + 1;
+        let refused = ElementEntry::try_from_parts(1, too_large, 4, Some(1), None)
+            .expect_err("an offset past the addressable range must be refused");
+        assert_eq!(refused.offset, too_large);
+        assert!(
+            refused.to_string().contains("does not fit the address word"),
+            "the refusal does not say what is wrong: {refused}"
+        );
+
+        let accepted =
+            ElementEntry::try_from_parts(1, MAX_ADDRESSABLE_BLOCK_OFFSET, 4, Some(1), None)
+                .expect("the largest addressable offset must be accepted");
+        assert_eq!(accepted.offset(), MAX_ADDRESSABLE_BLOCK_OFFSET);
+
+        // Truncated, this offset is ZERO -- the first record in the slab. A read following it
+        // would return a real block's bytes, with no error anywhere.
+        assert_eq!(
+            too_large as u32, 0,
+            "this offset does not truncate to a plausible one, so it does not demonstrate what \
+             the refusal prevents"
+        );
+    }
+
+    /// The infallible spelling RAISES the same refusal rather than truncating.
+    #[test]
+    #[should_panic(expected = "does not fit the address word")]
+    fn from_parts_panics_on_an_address_it_cannot_name() {
+        let _ = ElementEntry::from_parts(1, MAX_ADDRESSABLE_BLOCK_OFFSET + 1, 4, Some(1), None);
+    }
+
+    /// THE TWO SENTINELS ARE ADDRESSABLE AND RESERVED, WHICH ARE DIFFERENT CLAIMS.
+    ///
+    /// Addressable: they survive the word, so a log-resident block stays recognisable as one.
+    /// Reserved: they are above every slab id a store mints, so no real slab can ever be mistaken
+    /// for one. A sentinel that satisfied only the first would collide with a real slab.
+    #[test]
+    fn the_log_resident_sentinels_are_addressable_and_reserved() {
+        for sentinel in [
+            crate::engine::HOT_BLOCK_SLAB_ID,
+            crate::wal_record::WAL_LOG_SLAB_ID,
+        ] {
+            assert!(
+                sentinel > MAX_ADDRESSABLE_BLOCK_SLAB_ID,
+                "sentinel {sentinel} is inside the mintable range"
+            );
+            let address = ElementEntry::try_from_parts(sentinel, 7, 4, None, Some(9))
+                .expect("a sentinel address must be constructible");
+            assert_eq!(address.block_slab_id(), sentinel);
+            assert_eq!(address.offset(), 7);
+            assert!(crate::wal_record::is_wal_resident(address.block_slab_id()));
+        }
+    }
+
+    /// THE STORED SHAPE CARRIES ONE WORD, AND THE SPLIT SPELLING IS REFUSED BY NAME.
+    ///
+    /// THE MUTANT THIS EXISTS TO KILL is a one-line change: give the merged field
+    /// `alias = "ps"`. An index written before the merge would then load, silently, with its slab
+    /// id read as a whole address word -- slab 0 and an offset of whatever the slab id was. Every
+    /// read through it would go to the wrong place and nothing would report anything. So this
+    /// feeds the conversion exactly that document and requires a failure.
+    #[test]
+    fn a_split_address_is_refused_and_a_merged_one_round_trips() {
+        let address = ElementEntry::from_parts(3, 4096, 128, Some(1), Some(2));
+        let stored = serde_json::to_value(&address).expect("address serializes");
+        let object = stored.as_object().expect("the stored address is a map");
+        assert!(
+            object.contains_key("a"),
+            "the stored address does not carry the merged word: {stored}"
+        );
+        assert!(
+            !object.contains_key("ps") && !object.contains_key("o"),
+            "the stored address still carries the split spelling: {stored}"
+        );
+        assert_eq!(
+            object.get("a").and_then(serde_json::Value::as_u64),
+            Some(make_block_address_word(3, 4096)),
+            "the stored word is not the two halves packed"
+        );
+        let back: ElementEntry = serde_json::from_value(stored).expect("address round-trips");
+        assert_eq!(back, address);
+
+        // The split spelling, exactly as an older binary wrote it, in BOTH the short names and
+        // the oldest long ones -- the alias list is where a hole would hide.
+        for split in [
+            serde_json::json!({"ps": 3, "o": 4096, "l": 128, "pi": 1, "oi": 2, "rs": 7}),
+            serde_json::json!({
+                "page_segment_id": 3, "offset": 4096, "length": 128, "page_id": 1
+            }),
+            serde_json::json!({
+                "page_slab_id": 3, "offset": 4096, "length": 128, "page_id": 1
+            }),
+        ] {
+            let refused = serde_json::from_value::<ElementEntry>(split.clone())
+                .expect_err("a split address must not load: {split}");
+            assert!(
+                refused.to_string().contains("no address word")
+                    && refused.to_string().contains("two separate fields"),
+                "the split address {split} failed for some other reason: {refused}"
+            );
+        }
+
+        // AND IT MUST NOT LOAD AS A DEFAULT EITHER. The refusal above is only worth something if
+        // the same document would otherwise have produced slab 0 offset 0 -- a real address for
+        // the first block of the first slab. Nothing here may come back at all.
+        let split = serde_json::json!({"ps": 3, "o": 4096, "l": 128, "pi": 1});
+        assert!(
+            serde_json::from_value::<ElementEntry>(split).is_err(),
+            "a split address produced an address rather than a failure"
+        );
+    }
+
+    /// THE POSITIONAL ENCODING REFUSES THE OLD RECORD TOO, AND FOR A DIFFERENT REASON.
+    ///
+    /// The index log packs an address as an ARRAY: a field is a position, not a name, so there
+    /// are no unknown keys to notice and the JSON refusal above says nothing about it. What
+    /// protects it is the array LENGTH -- an address written before the merge is THREE elements
+    /// longer than this struct has fields, and the three have separate causes:
+    ///
+    ///   * ONE because the slab id and the offset became a single word.
+    ///   * TWO because `rs` and `h` were retired from the wire struct. That is why this number
+    ///     moved: it was ONE while those slots were still written as nil.
+    ///
+    /// The distinction matters because only the first was a REINTERPRETATION risk -- an old `ps`
+    /// read as the new `a` is a well-formed address for a different block. The other two are a
+    /// shorter array meeting a longer one, which `shorter_struct_against_an_existing_row` shows is
+    /// refused by length rather than reinterpreted.
+    ///
+    /// This builds the old array by hand and requires the decode to fail. Without it the merge
+    /// would rest on an assumption about `rmp_serde`'s tolerance for a length mismatch, and a
+    /// tolerant decoder would read the old `ps` as the new `a` -- exactly the silent
+    /// mis-parse the whole migration exists to prevent.
+    #[test]
+    fn a_positionally_packed_split_address_does_not_decode_as_a_merged_one() {
+        let address = ElementEntry::from_parts(3, 4096, 128, Some(1), Some(2));
+        let mut merged = Vec::new();
+        address
+            .serialize(&mut rmp_serde::Serializer::new(&mut merged))
+            .expect("the merged address packs positionally");
+        let round_tripped: ElementEntry =
+            rmp_serde::from_slice(&merged).expect("and unpacks again");
+        assert_eq!(round_tripped, address);
+
+        // The old shape: the same values with the slab id and the offset as two elements, AND the
+        // two retired slots still present -- eight elements against this struct's five.
+        let mut split = Vec::new();
+        (
+            3u64,
+            4096u64,
+            128u64,
+            Some(1u64),
+            Some(2u64),
+            Some(7u32),
+            Some(1u64),
+            None::<String>,
+        )
+            .serialize(&mut rmp_serde::Serializer::new(&mut split))
+            .expect("the split address packs positionally");
+        // The msgpack fixarray header is `0x90 | n`, so the element COUNT is readable straight
+        // off the first byte -- which is the property the refusal rests on, and comparing byte
+        // lengths would not have shown it (the halves carry the same numbers either way).
+        assert_eq!(merged[0] & 0xF0, 0x90, "the merged form is a fixarray");
+        assert_eq!(split[0] & 0xF0, 0x90, "and so is the split one");
+        // BOTH COUNTS ARE STATED, not just their difference: a relationship that holds can hold
+        // at the wrong pair of numbers, and these two moved for different reasons.
+        assert_eq!(
+            5,
+            (merged[0] & 0x0F) as usize,
+            "the merged address packs FIVE elements -- `a`, `l`, `pi`, `oi`, `g`. It was seven \
+             until `rs` and `h` were retired; if this is not five, the struct changed and the \
+             split fixture below no longer describes what it is being compared against"
+        );
+        assert_eq!(
+            8,
+            (split[0] & 0x0F) as usize,
+            "the pre-merge shape packs EIGHT elements: slab, offset, length, page_id, object_id, \
+             routing_slot, generation, sha256"
+        );
+        assert_eq!(
+            (split[0] & 0x0F) as usize,
+            (merged[0] & 0x0F) as usize + 3,
+            "the old shape must be exactly three elements longer than the new one -- one because \
+             two u64 fields became one word, two because `rs` and `h` left the struct; if the \
+             counts matched, the length is not what separates them"
+        );
+        assert!(
+            rmp_serde::from_slice::<ElementEntry>(&split).is_err(),
+            "a positionally packed SPLIT address decoded as a merged one; it would have read \
+             slab {} as the whole address word",
+            3
+        );
+    }
+
+    /// `make` and `extract` are inverses across the corners, including the ones a store reaches.
+    #[test]
+    fn the_address_word_packs_and_unpacks_at_every_corner() {
+        let corners = [
+            (0u32, 0u32),
+            (0, u32::MAX),
+            (u32::MAX, 0),
+            (u32::MAX, u32::MAX),
+            (1, 4096),
+            (MAX_ADDRESSABLE_BLOCK_SLAB_ID as u32, u32::MAX),
+        ];
+        for (slab, offset) in corners {
+            let word = make_block_address_word(slab, offset);
+            assert_eq!(extract_block_slab_id(word), slab, "slab half of {word}");
+            assert_eq!(extract_block_offset(word), offset, "offset half of {word}");
+        }
+        // The halves must not bleed into each other: the same slab with two offsets differs only
+        // in the low half, and the same offset in two slabs only in the high half.
+        assert_eq!(
+            make_block_address_word(1, 0) ^ make_block_address_word(1, u32::MAX),
+            u64::from(u32::MAX)
+        );
+        assert_eq!(
+            make_block_address_word(0, 1) ^ make_block_address_word(u32::MAX, 1),
+            u64::from(u32::MAX) << 32
+        );
+    }
+
+    /// A roll never hands back an id a slab file on disk already holds.
+    ///
+    /// THIS IS WHAT MAKES A STALE ADDRESS SAFE. A block address names (slab, offset, length); if
+    /// a roll could mint an id a file already occupies, a reader holding an address into the old
+    /// slab would resolve into a DIFFERENT record's bytes at the same offset. The record header
+    /// carries only the block ordinal: the object-id and routing-bucket cross-checks in
+    /// `decode_block_record` cannot fire, and the slab-id one has been removed as vacuous -- it
+    /// compared the slab a reader opened against itself. That leaves monotonic ids, the
+    /// stored-length check and the block ordinal.
+    ///
+    /// IT DOES NOT LEAVE THE PAYLOAD CHECKSUM, whatever the shape of the sentence suggests. The
+    /// checksum is a CRC32C over a record's own payload, so any intact record verifies no matter
+    /// who asked for it;
+    /// `the_payload_checksum_cannot_tell_one_record_from_another_at_the_same_address` in
+    /// `engine::tests::address_footprint` serves an address a different record and shows it comes
+    /// back clean. So this derivation is not one defence of several -- under it there is nothing.
+    ///
+    /// `roll_slab_inner` derives the next id TWICE, from the in-memory id and from the highest id
+    /// on disk, and takes the larger. Both derivations were unguarded: dropping the disk half
+    /// (`next_from_current.max(next_from_disk)` -> `next_from_current`) left all 82 block-store
+    /// tests green. A `max` over two derivations is caught only when BOTH are broken, so the disk
+    /// half needs a case where it is the one that wins -- which is this one.
+    #[test]
+    fn a_roll_never_mints_an_id_a_slab_file_already_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        store.append(b"the first record").unwrap();
+
+        // A slab file the store does not know about, above the active id. A metadata-only
+        // restore, a checkpoint install and a crash mid-roll all reach this state: files on disk
+        // whose ids run ahead of the id the store is holding.
+        let stranded = 5u64;
+        let stranded_bytes = b"bytes that must survive the roll".to_vec();
+        fs::write(slab_path(dir.path(), stranded), &stranded_bytes).unwrap();
+
+        // DENOMINATORS, before the roll: the store's own id is BELOW the stranded one, so the
+        // disk half of the derivation is the half that has to win here. Without this the test
+        // would pass on a store that never needed the disk scan at all.
+        let active_before = store.slab_ids().unwrap();
+        assert!(
+            active_before.contains(&stranded),
+            "the stranded slab really is on disk: {active_before:?}"
+        );
+        assert!(
+            active_before.iter().copied().max().unwrap() == stranded,
+            "and it really is the highest id present: {active_before:?}"
+        );
+
+        let report = store.roll_slab().unwrap();
+
+        assert!(
+            report.new_block_slab_id > stranded,
+            "the roll must mint an id above every slab file on disk, not {} which sits at or \
+             below the stranded {stranded}",
+            report.new_block_slab_id
+        );
+        assert_eq!(
+            fs::read(slab_path(dir.path(), stranded)).unwrap(),
+            stranded_bytes,
+            "and the stranded slab's bytes must be untouched -- a reused id overwrites them"
+        );
+
+        // The ids only ever go up from here: a second roll must clear the first.
+        let second = store.roll_slab().unwrap();
+        assert!(
+            second.new_block_slab_id > report.new_block_slab_id,
+            "slab ids are monotonic: {} then {}",
+            report.new_block_slab_id,
+            second.new_block_slab_id
+        );
+    }
+
+    /// Build `slabs` sealed slab files directly, then open a store over them.
+    ///
+    /// Installing them through the append path would measure the harness: every append summarises
+    /// the slab set and periodically rewrites the manifest, so the install would cost far more
+    /// than the one roll that is the subject. What is wanted is a store whose DIRECTORY and whose
+    /// MANIFEST both already hold `slabs` entries, which is the state a long-running shard is in.
+    ///
+    /// The files are empty, so each descriptor carries a zero where a live one carries a real byte
+    /// count. That makes the manifest bytes below a FLOOR rather than a live figure -- a live
+    /// descriptor's numbers are wider -- and leaves the growth RATE, which is what the two sizes
+    /// are being compared for, unchanged.
+    fn rolled_store_fixture(root: &std::path::Path, slabs: u64) -> BlockStore {
+        fs::create_dir_all(root).unwrap();
+        let mut block_slab_id = 0u64;
+        while block_slab_id < slabs {
+            File::create(slab_path(root, block_slab_id)).unwrap();
+            block_slab_id += 1;
+        }
+        BlockStore::new(root)
+    }
+
+    /// One roll against a store that already holds `slabs` slabs, timed and counted. Prints;
+    /// returns nothing. The body of the two scale tests below.
+    ///
+    /// MEASURED, debug profile, both arms back to back at load 13.6 falling to 9.8:
+    ///
+    ///                          8,000 slabs   80,000 slabs      ratio
+    ///     one roll              1,188.10 ms    11,979.76 ms    10.08x
+    ///       directory scan         10.31 ms       105.68 ms    10.25x
+    ///       the rest            1,177.79 ms    11,874.08 ms    10.08x
+    ///     manifest bytes          2,813,816      28,297,816    10.06x
+    ///     directory fsyncs                2               2     FLAT
+    ///
+    /// So the BARRIER COUNT is flat and the BYTES and the WALL TIME are linear, and the linear
+    /// half is almost entirely the manifest: the directory scan is 0.9% of the roll. A roll holds
+    /// the block-store mutex for all of it, so at 80,000 slabs every append and every read that
+    /// touches the store waits twelve seconds behind one roll. The wall times are a debug build
+    /// and a loaded box; the RATIO is the part that carries.
+    ///
+    /// Split so each size is a test of its own and can be RUN on its own: the 80,000 arm writes
+    /// eighty thousand files, and on a box short of disk the 8,000 arm alone is still a real
+    /// measurement, whereas scaling one arm up to the other is not a measurement at all.
+    fn roll_at_scale_arm(slabs: u64) {
+        let dir = tempfile::tempdir().unwrap();
+
+        let started = std::time::Instant::now();
+        let store = rolled_store_fixture(dir.path(), slabs);
+        let open_ms = started.elapsed().as_secs_f64() * 1e3;
+
+        // DENOMINATORS, both halves separately: the DIRECTORY really holds that many slabs, and
+        // so does the MANIFEST. A roll scans the first and rewrites the second, so a measurement
+        // taken with either one short is measuring a smaller store than it claims.
+        assert_eq!(
+            store.slab_ids().unwrap().len() as u64,
+            slabs,
+            "every slab must really be on disk before the roll is timed"
+        );
+        let summary_before = store.slab_summary();
+        assert_eq!(
+            summary_before.active_slabs + summary_before.sealed_slabs,
+            slabs,
+            "and every slab must really carry a descriptor in the manifest"
+        );
+
+        let manifest_path = slab_manifest_path(dir.path());
+        let manifest_bytes_before = fs::metadata(&manifest_path).unwrap().len();
+        assert!(
+            manifest_bytes_before > 0,
+            "the manifest must be on disk before the roll, or the rewrite below is not a rewrite"
+        );
+
+        // WHICH OF THE TWO HALVES THE TIME GOES TO. A roll does two things that both grow with the
+        // slab count: it rescans the slab directory to derive the next id, and it rewrites the
+        // whole manifest. `slab_ids()` is exactly the scan the roll performs, so timing it alone
+        // splits the total and says which half a fix would have to address -- without which the
+        // number below is a cost with no address.
+        let started = std::time::Instant::now();
+        let scanned = store.slab_ids().unwrap().len() as u64;
+        let directory_scan_ms = started.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(
+            scanned, slabs,
+            "the timed scan really walked every slab, or it is not the roll's scan"
+        );
+
+        // THE MEASUREMENT. One roll, with the store lock held for all of it.
+        let fsyncs_before = super::paths::directory_fsyncs();
+        let started = std::time::Instant::now();
+        let report = store.roll_slab().unwrap();
+        let roll_ms = started.elapsed().as_secs_f64() * 1e3;
+        let directory_fsyncs_per_roll = super::paths::directory_fsyncs() - fsyncs_before;
+
+        let manifest_bytes_after = fs::metadata(&manifest_path).unwrap().len();
+
+        assert!(
+            report.new_block_slab_id >= slabs,
+            "the roll must mint an id above every slab file on disk, not {}",
+            report.new_block_slab_id
+        );
+
+        println!(
+            "  {slabs:>6} slabs: open {open_ms:>9.1} ms   ROLL {roll_ms:>8.2} ms   \
+             (directory scan {directory_scan_ms:>7.2} ms, rest {:>8.2} ms)   \
+             manifest {manifest_bytes_before:>10} -> {manifest_bytes_after:>10} bytes \
+             ({:>5} bytes/slab)   directory fsyncs {directory_fsyncs_per_roll}",
+            roll_ms - directory_scan_ms,
+            manifest_bytes_before / slabs.max(1),
+        );
+    }
+
+    /// What ONE roll costs on a shard already holding 8,000 slabs. Prints.
+    ///
+    ///   cargo test -p temporalstore-rust --lib the_roll_at_scale \
+    ///       -- --ignored --nocapture --test-threads=1
+    ///
+    /// Ignored because it creates eight thousand files; the correctness guards run in CI, and this
+    /// answers the question correctness cannot -- what a roll costs while it holds the store lock,
+    /// on a directory and a manifest that have been accumulating for the life of the shard.
+    #[test]
+    #[ignore]
+    fn the_roll_at_scale() {
+        roll_at_scale_arm(8_000);
+    }
+
+    /// The same measurement at 80,000 slabs, the size at which the purge round was 58.7 s.
+    ///
+    ///   cargo test -p temporalstore-rust --lib the_roll_at_eighty_thousand_slabs \
+    ///       -- --ignored --nocapture --test-threads=1
+    ///
+    /// SEPARATE FROM THE 8,000 ARM BECAUSE IT IS THE EXPENSIVE ONE, and on a box that cannot spare
+    /// the disk it should be reported as not run rather than scaled up from the other.
+    #[test]
+    #[ignore]
+    fn the_roll_at_eighty_thousand_slabs() {
+        roll_at_scale_arm(80_000);
+    }
+
+    /// A roll issues the same number of directory fsyncs whatever the shard has accumulated.
+    ///
+    /// THIS PINS THE HALF OF THE ROLL THAT IS FLAT, and it is worth pinning precisely because the
+    /// other half is not: a roll rescans the whole slab directory and rewrites the whole manifest,
+    /// so its BYTES and its WALL TIME both grow with the slab count. The barrier COUNT does not,
+    /// and the reason is structural -- `roll_slab_inner` fsyncs the outgoing slab, the incoming
+    /// slab and the store root once each, and `persist_slab_manifest` fsyncs one temp file and one
+    /// directory, none of them per slab.
+    ///
+    /// That is exactly the property a per-slab fsync destroys, and the quarantine side of this
+    /// file has already had one: a single-slab rename-and-fsync helper handed to a loop re-synced
+    /// the same two directories once per iteration, which is how 2 fsyncs per round became 2 per
+    /// slab. A roll has no loop today, so the way this regresses is someone adding one -- and the
+    /// count is what notices, at any size, without writing eighty thousand files.
+    ///
+    /// TEN TIMES THE SLABS, chosen to match the ratio the two ignored arms above are compared at,
+    /// at a size a CI run can afford.
+    #[test]
+    fn a_roll_costs_the_same_directory_fsyncs_at_any_slab_count() {
+        let small_dir = tempfile::tempdir().unwrap();
+        let small = rolled_store_fixture(small_dir.path(), 4);
+        let large_dir = tempfile::tempdir().unwrap();
+        let large = rolled_store_fixture(large_dir.path(), 40);
+
+        // DENOMINATOR: the two fixtures really do differ by the factor the claim rests on. Without
+        // this the test passes on two stores of the same size, which compares nothing.
+        let small_slabs = small.slab_ids().unwrap().len();
+        let large_slabs = large.slab_ids().unwrap().len();
+        assert_eq!(small_slabs, 4, "the small fixture really holds four slabs");
+        assert_eq!(large_slabs, 40, "the large fixture really holds forty");
+
+        let before = super::paths::directory_fsyncs();
+        small.roll_slab().unwrap();
+        let small_fsyncs = super::paths::directory_fsyncs() - before;
+
+        let before = super::paths::directory_fsyncs();
+        large.roll_slab().unwrap();
+        let large_fsyncs = super::paths::directory_fsyncs() - before;
+
+        // A VACUITY FLOOR. A roll that issued no directory fsync at all would satisfy the equality
+        // below while making the slab and the manifest rename both non-durable, which is the
+        // opposite of the property being pinned.
+        assert!(
+            small_fsyncs >= 2,
+            "a roll must fsync at least the store root for the new slab and for the manifest \
+             rename, not {small_fsyncs}"
+        );
+        assert_eq!(
+            small_fsyncs, large_fsyncs,
+            "ten times the slabs must not cost more directory fsyncs: {small_fsyncs} at \
+             {small_slabs} slabs against {large_fsyncs} at {large_slabs}"
+        );
+
+        // And the other half of the shape, asserted rather than left implied: the manifest the
+        // roll rewrote IS larger on the larger store, so the two rolls were not doing equal work.
+        let small_manifest = fs::metadata(slab_manifest_path(small_dir.path()))
+            .unwrap()
+            .len();
+        let large_manifest = fs::metadata(slab_manifest_path(large_dir.path()))
+            .unwrap()
+            .len();
+        assert!(
+            large_manifest > small_manifest * 5,
+            "the larger store's manifest must be the larger write: {small_manifest} against \
+             {large_manifest}"
+        );
+    }
+
+    /// A blocked restore costs the purge a walk, never a unit of its budget.
+    ///
+    /// THE BUDGET IS SPENT ON WORK DONE, and `purge_delayed_destroy_slabs_capped` names three
+    /// reasons a slab is skipped -- not named by the caller's list, not old enough yet, and
+    /// live-but-blocked. `a_capped_purge_is_not_starved_by_the_slabs_it_must_skip` passes
+    /// `min_age_ms` of 0 and an empty live set, so it reaches exactly ONE of the three: the
+    /// caller's-list skip. The other two were unmeasured, and the live-but-blocked one is the
+    /// one with a six-line comment defending the decision. Adding `processed += 1` to the
+    /// blocked-restore branch -- the exact inversion that comment forbids -- left all 82
+    /// block-store tests green.
+    ///
+    /// `restore_blocked_block_slab_ids` was asserted in one place in the crate, and asserted
+    /// EMPTY, so no test had ever produced a blocked restore at all.
+    ///
+    /// The invariant asserted per round is the one that cannot be satisfied by accident:
+    /// `processed_block_slabs` equals the slabs that LEFT the trash directory this round, which
+    /// is restores plus destroys and nothing else. A budget charged for a skip breaks it
+    /// immediately, whatever order `read_dir` happens to hand the entries back in.
+    #[test]
+    fn a_blocked_restore_does_not_spend_the_purge_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let slabs = 50u64;
+        let blocked = 8u64;
+        let budget = 5usize;
+        quarantine_fixture(dir.path(), slabs);
+
+        // Occupy the destination of the first `blocked` ids. `restore_slab_from_delayed_destroy_
+        // unsynced` returns false without moving anything when a file already sits where the
+        // slab would land, so these are live, reached, and cannot be restored.
+        let mut occupied = BTreeSet::new();
+        let mut id = 0u64;
+        while id < blocked {
+            fs::write(slab_path(dir.path(), id), b"an id already in use").unwrap();
+            occupied.insert(id);
+            id += 1;
+        }
+
+        // DENOMINATORS, both halves, before the run.
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap().len() as u64,
+            slabs,
+            "every slab is in quarantine"
+        );
+        assert_eq!(
+            store.slab_ids().unwrap().len() as u64,
+            blocked,
+            "and exactly the blocked ids are already occupied in the store"
+        );
+
+        let restorable = slabs - blocked;
+        let predicted_rounds = (restorable as usize).div_ceil(budget);
+        assert_ne!(
+            restorable as usize % budget,
+            0,
+            "the budget must not divide the work, or the last round's report depends on where in \
+             directory order the final actionable slab sits"
+        );
+        let allowed_rounds = predicted_rounds + 5;
+
+        let live = (0..slabs).collect::<Vec<_>>();
+        let mut rounds = 0usize;
+        let mut restored = BTreeSet::new();
+        let mut blocked_seen = BTreeSet::new();
+        loop {
+            let report = store
+                .purge_delayed_destroy_slabs_capped(0, live.clone(), None, budget)
+                .unwrap();
+            // THE HALF THAT CATCHES THE INVERSION, asserted every round: budget is charged for
+            // slabs that LEFT the directory, and a blocked restore left nothing.
+            assert_eq!(
+                report.processed_block_slabs,
+                report.restored_block_slab_ids.len() + report.purged_block_slab_ids.len(),
+                "budget is spent on work done; a blocked restore moved nothing and must not be \
+                 charged for: {report:?}"
+            );
+            assert!(
+                report.purged_block_slab_ids.is_empty(),
+                "every slab here is live, so none may be destroyed: {report:?}"
+            );
+            restored.extend(report.restored_block_slab_ids.iter().copied());
+            blocked_seen.extend(report.restore_blocked_block_slab_ids.iter().copied());
+            rounds += 1;
+            if !report.budget_exhausted {
+                break;
+            }
+            assert!(
+                rounds <= allowed_rounds,
+                "after {rounds} rounds {} of {restorable} slabs have been restored; a budget \
+                 charged for the blocked slabs it walks past would look exactly like this",
+                restored.len()
+            );
+        }
+
+        // THE OTHER HALF: the drain finished in the rounds the budget predicts, so the eight
+        // blocked slabs cost the loop a walk and nothing else.
+        assert_eq!(
+            rounds, predicted_rounds,
+            "the blocked slabs must cost the loop a walk, never a unit of budget"
+        );
+        assert_eq!(
+            restored.len() as u64,
+            restorable,
+            "every restorable slab came back out of quarantine"
+        );
+        assert_eq!(
+            blocked_seen, occupied,
+            "and every blocked slab was reported blocked, not restored and not destroyed"
+        );
+        assert_eq!(
+            store.delayed_destroy_slab_ids().unwrap().len() as u64,
+            blocked,
+            "the blocked slabs stay in quarantine: not destroyed, not restored"
+        );
+    }
+
+    /// A store whose manifest still carries the legacy name loads its descriptors.
+    ///
+    /// `page_zone_manifest.json` is how the tree notices a store written before the slab manifest
+    /// was renamed, and `the_on_disk_names_are_the_ones_the_readers_parse` asserts the constant
+    /// still spells it. That guards the NAME and not the WIRING, which is the half that fails
+    /// silently: the fallback in `load_slab_manifest_at` and the existence probe in
+    /// `BlockStore::with_options` can each be removed with all 82 block-store tests still green.
+    /// A store that stops reading the legacy file does not error -- it finds no manifest, falls
+    /// through to `rebuild_slab_manifest_at`, and succeeds, which is exactly the silent miss the
+    /// name assertion was written to prevent.
+    ///
+    /// THE DISCRIMINATOR IS A SLAB WITH NO FILE. `rebuild_slab_manifest_at` walks the slab files
+    /// on disk, so a descriptor for a slab whose file is gone cannot come from a rebuild; it can
+    /// only come from a manifest that was read. `slab_manifest_reconciled_on_open` will NOT do
+    /// the job here -- reconcile re-inspects the freshly written descriptors either way and
+    /// reports `true` whether or not the legacy file was opened, so a test resting on it passes
+    /// on both sides of the wiring it means to pin.
+    #[test]
+    fn a_store_written_under_the_legacy_manifest_name_still_loads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = BlockStore::new(dir.path());
+        let first = store.append(b"first-slab").unwrap();
+        store.roll_slab().unwrap();
+        let second = store.append(b"second-slab").unwrap();
+        drop(store);
+
+        // The first slab's FILE goes; the manifest still names it. Nothing on disk does.
+        fs::remove_file(slab_path(dir.path(), first.block_slab_id())).unwrap();
+
+        // Age the store back to the spelling a pre-rename deployment wrote.
+        let current = slab_manifest_path(dir.path());
+        let legacy = legacy_zone_manifest_path(dir.path());
+        assert!(current.exists(), "denominator: the store wrote a manifest");
+        fs::rename(&current, &legacy).unwrap();
+        assert!(
+            !current.exists(),
+            "denominator: the new name is gone, so anything found came from the legacy one"
+        );
+        assert!(
+            legacy.exists(),
+            "denominator: the legacy name is what is on disk"
+        );
+
+        let reopened = BlockStore::new(dir.path());
+        let descriptors = reopened.slab_descriptors();
+
+        // THE HALF A REBUILD CANNOT FAKE.
+        assert!(
+            descriptors.iter().any(|slab| slab.block_slab_id == first.block_slab_id()
+                && slab.state == BlockStoreSlabState::Purged),
+            "the legacy manifest must be READ: a slab with no file on disk is knowable only from \
+             a manifest, and a store that missed it rebuilds around the hole and looks perfectly \
+             healthy: {descriptors:?}"
+        );
+        // THE OTHER HALF, asserted separately: the slab that does have a file is still described
+        // and still reads, so the first half is not passing on a store that failed to open.
+        assert!(
+            descriptors.iter().any(|slab| slab.block_slab_id == second.block_slab_id()
+                && slab.state == BlockStoreSlabState::Active),
+            "the surviving slab must still be active: {descriptors:?}"
+        );
+        assert_eq!(
+            reopened.read(&second).unwrap(),
+            b"second-slab".to_vec(),
+            "and its records still read"
+        );
+    }
+
+    /// One manifest persist costs the same number of `write(2)` calls at ten times the slabs.
+    ///
+    /// THIS PINS THE HALF OF THE PERSIST THAT IS NOW FLAT. `persist_slab_manifest` used to hand
+    /// `serde_json` a bare `File`, and `serde_json` writes a document in fragments -- a key, a
+    /// colon, a number, a comma -- one syscall each. Measured under `strace` at 8,000 slabs, two
+    /// persists of a 2,813,816-byte manifest cost 1,600,144 `write` calls, 3.5 bytes apiece and
+    /// 97.8% of the process's syscall time. The BYTES of a manifest are linear in the slab count
+    /// and will stay linear; the SYSCALLS no longer are, because a buffer absorbs the fragments.
+    ///
+    /// Counted rather than timed, for the reason the directory-fsync guard above is: the count
+    /// reads the same on a loaded box as on an idle one, and it is the shape that regressed.
+    ///
+    /// The way this regresses is someone unwrapping the buffer -- writing at the `File` again, or
+    /// serialising to it before the buffer is in place -- and at these sizes the count goes from a
+    /// handful to tens of thousands, so it is not a close call.
+    #[test]
+    fn a_manifest_persist_costs_the_same_writes_at_ten_times_the_slabs() {
+        let small_dir = tempfile::tempdir().unwrap();
+        let small = rolled_store_fixture(small_dir.path(), 40);
+        let large_dir = tempfile::tempdir().unwrap();
+        let large = rolled_store_fixture(large_dir.path(), 400);
+
+        // DENOMINATOR, both halves: the two fixtures really differ by the factor the claim rests
+        // on. Without it this passes on two stores of the same size, which compares nothing.
+        let small_slabs = small.slab_ids().unwrap().len();
+        let large_slabs = large.slab_ids().unwrap().len();
+        assert_eq!(small_slabs, 40, "the small fixture really holds forty slabs");
+        assert_eq!(large_slabs, 400, "the large fixture really holds four hundred");
+
+        let before = manifest_file_writes();
+        small.roll_slab().unwrap();
+        let small_writes = manifest_file_writes() - before;
+
+        let before = manifest_file_writes();
+        large.roll_slab().unwrap();
+        let large_writes = manifest_file_writes() - before;
+
+        // A VACUITY FLOOR. A persist that issued no write at all would satisfy the equality below
+        // while leaving the manifest empty, which is the opposite of the property being pinned.
+        assert!(
+            small_writes >= 1,
+            "a persist must write the manifest at least once, not {small_writes}"
+        );
+
+        // AND A SECOND DENOMINATOR: the document really is made of thousands of fragments, so an
+        // unbuffered writer would have issued thousands of syscalls here. Without this the counts
+        // could both be 1 because the manifest is trivially small, and the guard would pin
+        // nothing. Four hundred descriptors at ~350 bytes each is >= 100,000 bytes.
+        let large_manifest_bytes = fs::metadata(slab_manifest_path(large_dir.path()))
+            .unwrap()
+            .len();
+        assert!(
+            large_manifest_bytes >= 100_000,
+            "the larger manifest must be a document worth buffering, not {large_manifest_bytes} \
+             bytes"
+        );
+
+        assert_eq!(
+            small_writes, large_writes,
+            "ten times the slabs must not cost more manifest writes: {small_writes} at \
+             {small_slabs} slabs against {large_writes} at {large_slabs}"
+        );
+        // And an absolute ceiling, so the equality cannot be satisfied by both sides regressing
+        // together. The buffer is 256 KiB and the larger manifest is well under it.
+        assert!(
+            large_writes <= 4,
+            "one persist must cost a handful of syscalls, not {large_writes}"
+        );
+    }
+
+    /// The manifest is written COMPACT, and nothing outside this crate wants it otherwise.
+    ///
+    /// Pretty-printing cost bytes on a file that is rewritten on every roll and read by no person:
+    /// `load_slab_manifest_at` parses it with `from_slice`, and the one tool outside this crate
+    /// that opens it -- `tools/matrixark_merge_rust_hook_stores.py` -- parses it with
+    /// `json.loads`. Both are whitespace-insensitive, so the indentation was bytes and fragments
+    /// spent for nothing.
+    ///
+    /// Asserted on the NEWLINE COUNT rather than on the byte total: a size assertion drifts every
+    /// time a descriptor gains a field, whereas a pretty-printed document puts every one of its
+    /// tens of thousands of tokens on a line of its own, so the newline count separates the two
+    /// arrangements by four orders of magnitude and will keep doing so.
+    #[test]
+    fn the_manifest_is_written_as_one_compact_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = rolled_store_fixture(dir.path(), 40);
+        store.roll_slab().unwrap();
+
+        let bytes = fs::read(slab_manifest_path(dir.path())).unwrap();
+
+        // DENOMINATOR: there really is a manifest here, holding the descriptors this asserts
+        // about. An empty or absent file has one newline too, and would pass the claim below
+        // while proving nothing.
+        let manifest: BlockStoreSlabManifest = serde_json::from_slice(&bytes).unwrap();
+        assert!(
+            manifest.slabs.len() >= 41,
+            "the manifest must hold the forty seeded slabs and the rolled one, not {}",
+            manifest.slabs.len()
+        );
+        assert!(
+            bytes.len() >= 10_000,
+            "and it must be a real document, not {} bytes",
+            bytes.len()
+        );
+
+        let newlines = bytes.iter().filter(|byte| **byte == b'\n').count();
+        assert_eq!(
+            newlines, 1,
+            "a compact manifest is one line plus the trailing newline; {newlines} newlines over \
+             {} descriptors is a pretty-printed one",
+            manifest.slabs.len()
+        );
+    }
+
+    /// What each of the four ways to write the manifest costs, at one slab count. Prints.
+    ///
+    ///   cargo test -p temporalstore-rust --lib what_the_manifest_arrangements_cost \
+    ///       -- --ignored --nocapture --test-threads=1
+    ///
+    /// The point is to separate the two halves of the change rather than ship them as one number:
+    /// COMPACT saves bytes and fragments, BUFFERING saves syscalls, and only a measurement says
+    /// which of the two the roll was actually paying for.
+    ///
+    /// Each arm serialises the SAME descriptor set -- the one the fixture's own manifest holds --
+    /// to a fresh file with the same barrier the real persist takes, so the arms differ in
+    /// exactly the writer and the formatter and in nothing else.
+    fn manifest_arrangement_arm(slabs: u64) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = rolled_store_fixture(dir.path(), slabs);
+
+        // DENOMINATOR: the manifest being re-serialised really holds `slabs` descriptors. An arm
+        // timed against a short manifest is measuring a smaller store than it claims.
+        let manifest_path = slab_manifest_path(dir.path());
+        let manifest: BlockStoreSlabManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).unwrap()).unwrap();
+        assert_eq!(
+            manifest.slabs.len() as u64, slabs,
+            "every slab must carry a descriptor before the arms are timed"
+        );
+        drop(store);
+
+        use std::io::BufWriter;
+
+        fn arm(
+            label: &str,
+            path: &std::path::Path,
+            manifest: &BlockStoreSlabManifest,
+            buffered: bool,
+            pretty: bool,
+        ) {
+            let writes_before = manifest_file_writes();
+            let started = std::time::Instant::now();
+            {
+                let file = File::create(path).unwrap();
+                if buffered {
+                    let mut out =
+                        BufWriter::with_capacity(256 * 1024, CountedFileWrites(file));
+                    if pretty {
+                        serde_json::to_writer_pretty(&mut out, manifest).unwrap();
+                    } else {
+                        serde_json::to_writer(&mut out, manifest).unwrap();
+                    }
+                    out.write_all(b"\n").unwrap();
+                    out.flush().unwrap();
+                    let Ok(inner) = out.into_inner() else {
+                        panic!("the buffer must flush before the barrier");
+                    };
+                    inner.0.sync_all().unwrap();
+                } else {
+                    let mut out = CountedFileWrites(file);
+                    if pretty {
+                        serde_json::to_writer_pretty(&mut out, manifest).unwrap();
+                    } else {
+                        serde_json::to_writer(&mut out, manifest).unwrap();
+                    }
+                    out.write_all(b"\n").unwrap();
+                    out.flush().unwrap();
+                    out.0.sync_all().unwrap();
+                }
+            }
+            let ms = started.elapsed().as_secs_f64() * 1e3;
+            let writes = manifest_file_writes() - writes_before;
+            let bytes = fs::metadata(path).unwrap().len();
+            println!("      {label:<24} {ms:>9.2} ms   {writes:>9} writes   {bytes:>10} bytes");
+        }
+
+        println!("  {slabs} slabs:");
+        arm("File + pretty (was)", &dir.path().join("a.json"), &manifest, false, true);
+        arm("File + compact", &dir.path().join("b.json"), &manifest, false, false);
+        arm("BufWriter + pretty", &dir.path().join("c.json"), &manifest, true, true);
+        arm("BufWriter + compact (is)", &dir.path().join("d.json"), &manifest, true, false);
+    }
+
+    #[test]
+    #[ignore]
+    fn what_the_manifest_arrangements_cost() {
+        manifest_arrangement_arm(8_000);
+    }
+
+    #[test]
+    #[ignore]
+    fn what_the_manifest_arrangements_cost_at_eighty_thousand_slabs() {
+        manifest_arrangement_arm(80_000);
+    }
+}
+
+/// WHAT A SHORTER WIRE STRUCT DOES TO AN ALREADY-WRITTEN ROW, driven rather than reasoned about.
+///
+/// `BlockAddressWire` used to carry three slots the in-memory address does not hold -- `rs` (the
+/// routing bucket), `g` (the generation) and `h` (the digest) -- and the stated reason for keeping
+/// them was that the index log packs this struct POSITIONALLY, so deleting a field shortens the
+/// array and shifts every field after it.
+///
+/// THAT COMMENT WAS RIGHT ABOUT THE CASE IT DESCRIBED, and it is quoted here rather than
+/// contradicted, because the obvious reading of its departure is that it was wrong and the nil
+/// slot should come back. Deleting `rs` ALONE does shift `g` and `h` down one, and an
+/// already-written row would then hand its bucket to the generation check and its generation to
+/// the digest parser -- failing while describing the wrong thing. What it did not say is what a
+/// reader does when the row is simply LONGER than the struct, which is the case that actually
+/// arises, and which is measured below.
+///
+/// The four arms are the two encodings this tree uses crossed with the two removals:
+///
+///   * SEVEN -> FIVE is what this change did: `rs` and `h` retired, `g` kept.
+///   * SEVEN -> FOUR is what retiring `g` as well would do, and is measured here so the follow-up
+///     that needs the version stamp can point at the reason rather than restate it.
+#[cfg(test)]
+mod shorter_struct_against_an_existing_row {
+    use serde::{Deserialize, Serialize};
+
+    /// The seven-field shape as it stood, in declaration order.
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct SevenSlots {
+        a: Option<u64>,
+        l: u64,
+        pi: Option<u64>,
+        oi: Option<u64>,
+        rs: Option<u32>,
+        g: Option<u64>,
+        h: Option<u64>,
+    }
+
+    /// THIS CHANGE: `rs` and `h` gone, `g` kept. Note this is NOT a suffix removal -- `g` moves
+    /// from position five to position four -- so the positional path is safe here because of the
+    /// LENGTH check, not because nothing moved.
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct FiveSlots {
+        a: Option<u64>,
+        l: u64,
+        pi: Option<u64>,
+        oi: Option<u64>,
+        g: Option<u64>,
+    }
+
+    /// THE FOLLOW-UP: all three gone. This one IS a suffix removal, because `rs`, `g` and `h` are
+    /// the last three in declaration order.
+    #[derive(Serialize, Deserialize, Debug, PartialEq)]
+    struct FourSlots {
+        a: Option<u64>,
+        l: u64,
+        pi: Option<u64>,
+        oi: Option<u64>,
+    }
+
+    const GENERATION: u64 = 11;
+
+    fn seven() -> SevenSlots {
+        SevenSlots {
+            a: Some(0x0000_0007_0000_002A),
+            l: 4096,
+            pi: Some(GENERATION),
+            oi: Some(0xFEED_FACE_CAFE_BEEF),
+            rs: Some(513),
+            g: Some(GENERATION),
+            h: None,
+        }
+    }
+
+    fn pack_positional<T: Serialize>(value: &T) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut ser = rmp_serde::Serializer::new(&mut out);
+        value.serialize(&mut ser).expect("positional encode");
+        out
+    }
+
+    fn pack_named<T: Serialize>(value: &T) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut ser = rmp_serde::Serializer::new(&mut out).with_struct_map();
+        value.serialize(&mut ser).expect("named encode");
+        out
+    }
+
+    /// THE POSITIONAL PATH -- the index log -- refuses a row longer than the struct, for BOTH
+    /// removals. This is what makes retiring a slot a break that announces itself rather than a
+    /// silent reinterpretation, and it is the arm that would have blocked the change had it
+    /// failed.
+    #[test]
+    fn a_longer_positional_row_is_refused_by_length_for_either_removal() {
+        let packed = pack_positional(&seven());
+        let control: SevenSlots =
+            rmp_serde::from_slice(&packed).expect("its own shape round-trips");
+        assert_eq!(control, seven(), "the control: seven fields still read as seven");
+
+        let five: Result<FiveSlots, _> = rmp_serde::from_slice(&packed);
+        match five {
+            Ok(value) => panic!(
+                "a seven-element positional row decoded SILENTLY into the five-field struct as \
+                 {value:?}, so retiring `rs` and `h` would be a reinterpretation rather than a \
+                 break and the slots must come back"
+            ),
+            Err(error) => println!("  positional, 7 -> 5 (this change): REFUSED with {error}"),
+        }
+
+        let four: Result<FourSlots, _> = rmp_serde::from_slice(&packed);
+        match four {
+            Ok(value) => panic!(
+                "a seven-element positional row decoded SILENTLY into the four-field struct as \
+                 {value:?}"
+            ),
+            Err(error) => println!("  positional, 7 -> 4 (follow-up): REFUSED with {error}"),
+        }
+    }
+
+    /// THE NAMED PATH KEEPS `g` BY NAME, WHICH IS WHY THIS CHANGE NEEDS NO VERSION STAMP.
+    ///
+    /// The served index is a map, so retiring `rs` and `h` drops two keys nothing read. `g` is
+    /// found by its own name wherever it sits, so an already-written index still loads with its
+    /// generation PRESENT -- and presence is the whole meaning, since it becomes
+    /// `ADDRESS_HAS_GENERATION`. Nothing moves, so nothing needs refusing.
+    #[test]
+    fn a_named_row_keeps_g_by_name_which_is_why_this_change_needs_no_stamp() {
+        let packed = pack_named(&seven());
+        let five: FiveSlots = rmp_serde::from_slice(&packed)
+            .expect("a named row tolerates keys the struct stopped declaring");
+        println!("  named, 7 keys -> 5 fields (this change): {five:?}");
+        assert_eq!(
+            five.g,
+            Some(GENERATION),
+            "`g` must survive by NAME -- if it did not, every address from an existing index \
+             would load with no generation and every page handle would move"
+        );
+        assert_eq!(five.a, seven().a, "and the fields that remain keep their values");
+        assert_eq!(five.oi, seven().oi, "including the object id");
+    }
+
+    /// AND WHY RETIRING `g` TOO IS A DIFFERENT CHANGE: the named path drops it in SILENCE.
+    ///
+    /// This is the measurement the follow-up rests on. An index written before that removal would
+    /// load with no generation on any address -- not an error, not a nil to notice, simply absent
+    /// -- and `BlockAddress::generation` would answer `None` for every block, moving every handle
+    /// it resolves through. `engine::SHARD_INDEX_FORMAT_VERSION` is what converts that silent
+    /// misread into a refusal the caller answers by replaying the WAL.
+    #[test]
+    fn a_named_row_drops_g_in_silence_which_is_why_retiring_it_needs_the_stamp() {
+        let packed = pack_named(&seven());
+        let four: FourSlots = rmp_serde::from_slice(&packed)
+            .expect("a named row tolerates keys the struct stopped declaring");
+        println!("  named, 7 keys -> 4 fields (follow-up): {four:?} -- `g` is simply gone");
+        assert_eq!(
+            four.oi,
+            seven().oi,
+            "the remaining values are intact, which is exactly what makes the loss quiet: \
+             nothing about this row looks wrong"
+        );
+    }
+}
+
+/// THE SHARED PAYLOAD OF A RESIDENT ENTRY AND A LOG ROW: where one element of one object
+/// lives.
+///
+/// # WHY IT LIVES HERE AND NOT BESIDE THE MAP THAT HOLDS IT
+///
+/// It began in `engine::hash_field_map` as that map's level-2 value. It is now also the
+/// payload of `index_log::IndexItem`, and that decides the module: `IndexItem` is `pub` in a
+/// `pub` module while `hash_field_map` is PRIVATE, so a public field of a type declared there
+/// cannot compile (E0446). `block_store` is public and already holds the [`BlockAddress`] that
+/// is the whole payload, so the type sits beside the thing it wraps.
+///
+/// MOVED, NOT COPIED. Two structures describing one fact drift -- this is the tree that has
+/// had the same field name mean three things in one file -- and the point of sharing the
+/// payload is that there is ONE place a field's meaning is defined.
+///
+/// # WHY THIS IS A NAMED TYPE AND NOT STILL A BARE ADDRESS
+///
+/// The resident page entry is being RELOCATED into this position. Today an element of a hash is
+/// described twice: once by a [`BlockAddress`] in this map, and once by a 56-byte `BlockIndex` in
+/// the bucket index, keyed by a hash of the object key, the model id, the component and five
+/// address terms. The entry here can be KEY-INDEPENDENT -- the object key is the level-one key and
+/// the element name is the level-two key, so the value does not have to name either -- which is the
+/// whole reason the relocation is worth anything.
+///
+/// This step introduces the type and moves nothing else. That is deliberate: the inner vector is
+/// private precisely so the value can be reconsidered "without another fifty-site rewrite", and
+/// introducing the type is what buys that for the two steps after this one. A single change
+/// carrying the type, the authority move and a format stamp would be unreviewable.
+///
+/// # THE WIDTH, AND WHAT THE NEXT STEP COSTS
+///
+/// 16 bytes today, which is exactly the address: this type adds NOTHING to the value yet, and the
+/// assert below says so rather than leaving it to be believed. The end state is 24 -- one packed
+/// flags byte over the address is 17 bytes of field in an eight-aligned group -- and the
+/// counterfactual is asserted beside the width, because the arithmetic is the claim.
+///
+/// # WHAT IS DELIBERATELY NOT HERE: THE MODEL ID
+///
+/// A `BlockIndex` carries a one-byte `model_id`, and relocating it into this value would cost
+/// nothing in width -- 16 + 1 + 1 still rounds to 24, so the byte is free. It is still wrong.
+/// `rebuild_unserialized_model_maps_from_bucket_index` filters `entry.kind.as_str() != "hash"`
+/// BEFORE inserting here, so every element in this map is hash-kind BY CONSTRUCTION: the map
+/// determines the kind, and storing it in the value would make one fact answerable from two
+/// places. That is the defect #2084 removed, where a log-resident flag was stored beside an
+/// address that already derived it and three sites wrote it without consulting the address at
+/// all. It is also the precedent [`BlockAddress`] set when `routing_bucket` left it: a field that
+/// was a cache of a pure function of the key, whose walk-based readers now take the bucket they
+/// are walking. A reader here takes the kind of the map it is reading.
+///
+/// A free byte is the easiest kind of redundant stored fact to ship, which is why this says so.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(try_from = "BlockAddressWire", into = "BlockAddressWire")]
+pub struct ElementEntry {
+    /// WHERE the element lives: one opaque word, the slab in the high half and the offset in the
+    /// low. See [`BlockAddress`].
+    address: BlockAddress,
+    /// HOW MANY BYTES it covers, and it is held rather than recomputed because
+    /// [`BlockStore::read`] needs it BEFORE it can read: the length is what sizes the read. There
+    /// is no I/O-free way to recover it, which is the whole reason it travels with the address
+    /// instead of being derived at a read site.
+    length: u32,
+    /// WHICH PAGE of the object this is. Sixteen bits because THE ENCODER REFUSES ANYTHING WIDER,
+    /// and CHECKED rather than saturated -- see [`ElementEntry::try_from_wire_parts`] and
+    /// [`narrow_block_id`]. Held for the same reason as the length: the live filter and
+    /// `BlockIndex::log_backed` read it precisely SO THAT they answer with no block read.
+    block_id: u16,
+    /// ABSENCE AS SEMANTICS, WHICH IS WHY THIS IS A BIT AND NOT A ZERO.
+    ///
+    /// Two bits of the eight: whether the block id is set at all, and whether a generation is
+    /// present at all. Neither can be spelled as a sentinel VALUE, and that is the point of the
+    /// byte rather than an accident of it.
+    ///
+    ///   * ZERO IS A LEGAL BLOCK ID, so "block id 0 means no block id" would silently erase a real
+    ///     first page -- and `block_id()` answering `Some(0)` versus `None` is the difference
+    ///     between a block that lives in a slab and one that still lives in the log.
+    ///   * A GENERATION CAN BE ABSENT WHILE AN IDENTITY IS PRESENT. An index written before the
+    ///     generation existed carries a page id and no generation key anywhere, and has always
+    ///     loaded with `generation() == None`. Deriving presence from the identity would hand it a
+    ///     generation it never had and move every key it resolves through, so the PRESENCE comes
+    ///     off the wire and only the VALUE is derived. See [`ElementEntry::generation`].
+    ///
+    /// IN-MEMORY ONLY, AND NEVER A WIRE FIELD. The bit numbering keeps the holes that the retired
+    /// routing-bucket and object-id bits left, because nothing stored depends on it and a hole is
+    /// cheaper to read than a renumbering. `wire_form_survives_the_packing` holds that: it asserts the
+    /// serialized form carries no `present` key at all.
+    present: u8,
+}
+
+/// SIXTEEN BYTES, AND THAT IS THE SAME SIXTEEN THE ADDRESS USED TO COST ON ITS OWN.
+///
+/// This structure is where `length`, `block_id` and `present` went when [`BlockAddress`] became one
+/// word. The width is asserted, and the arithmetic that produces it is asserted beside
+/// `BlockAddress` itself -- the word as an eight-aligned group, these three as the tail -- so
+/// neither width can move without the other being checked.
+///
+/// # WHAT THIS COSTS `IndexItem`, STATED BECAUSE IT IS PARTLY A REVERSAL
+///
+/// `index_log::IndexItem` carried `address`, `size`, `in_log` and `block_id` side by side and they
+/// were CONSOLIDATED into this one payload, because all three of the others are derivations of the
+/// address: `size` is the length, `block_id` is the block id, `in_log` is the block id being
+/// absent. What that bought was ONE place where the meaning of each is defined, and it is the fix
+/// that removed a stored log-resident flag three sites were writing without consulting the address.
+///
+/// THIS CHANGE TAKES PART OF THAT BACK, and deliberately. The three are explicit fields again --
+/// not on the ROW, which is what drifted, but on the payload the row and the resident entry SHARE.
+/// So there is still exactly one place each is defined, and `IndexItem` still holds no copy of any
+/// of them: it reads them through this type. The derivation `in_log == block_id().is_none()` is
+/// still a derivation and still has one home, [`ElementEntry::log_resident`]. What is given up is
+/// the stronger property that the address alone answered everything -- and that property is what
+/// made the address 16 bytes, which is the trade this change is.
+const _: () = assert!(std::mem::size_of::<ElementEntry>() == 16);
+
+impl ElementEntry {
+    /// Build a holder from the parts a caller has.
+    ///
+    /// There is deliberately no digest parameter: the index does not hold one, and a parameter the
+    /// constructor discarded would invite a caller to pass a freshly computed digest believing it
+    /// was kept. The block envelope carries the digest that a read verifies against.
+    ///
+    /// There is deliberately no `generation` parameter either, and for the SAME reason. Every
+    /// production caller passed exactly `block_id.or(object_id)`, so keeping the parameter and
+    /// discarding its VALUE would have invited a caller to pass an independent generation believing
+    /// it was kept. A generation is therefore PRESENT exactly when a block id is present to derive
+    /// it from.
+    ///
+    /// `object_id` IS STILL A PARAMETER AND ONLY ITS PRESENCE IS CONSUMED, which is the one shape
+    /// of "accepted and not kept" this file permits: there is no object id field for a value to
+    /// disagree with, and what the argument decides is a real effect a caller can observe through
+    /// [`ElementEntry::generation`]. Removing it would move 114 call sites to say nothing new.
+    pub fn from_parts(
+        block_slab_id: u64,
+        offset: u64,
+        length: u64,
+        block_id: Option<u64>,
+        object_id: Option<u64>,
+    ) -> Self {
+        match Self::try_from_parts(block_slab_id, offset, length, block_id, object_id) {
+            Ok(entry) => entry,
+            Err(out_of_range) => panic!("{out_of_range}"),
+        }
+    }
+
+    /// THE CHECKED CONSTRUCTOR. See [`BlockAddress::try_from_slab_and_offset`] for the address
+    /// half; the block id is checked here, because it is held here.
+    pub fn try_from_parts(
+        block_slab_id: u64,
+        offset: u64,
+        length: u64,
+        block_id: Option<u64>,
+        _object_id: Option<u64>,
+    ) -> Result<Self, BlockAddressOutOfRange> {
+        // A GENERATION EXISTS EXACTLY WHEN A BLOCK ID DOES, and the round trip is what settled it.
+        //
+        // This read `block_id.is_some() || object_id.is_some()` on the reasoning that a bit set
+        // with no value to go with it was unobservable, since `generation()` answers `None` either
+        // way. THAT WAS WRONG. An entry built with an object id and NO block id carried
+        // `ADDRESS_HAS_GENERATION` while the wire could represent no generation at all -- `g` is
+        // derived from the block id and there is none -- so it decoded back with the bit CLEAR and
+        // the two compared unequal. `index_log::the_address_repeats_round_trip` measured exactly
+        // that: `present: 8` out, `present: 0` back.
+        //
+        // So presence follows the only identity the structure keeps. `object_id` is INERT here.
+        let has_generation = block_id.is_some();
+        Self::try_from_wire_parts(block_slab_id, offset, length, block_id, has_generation)
+    }
+
+    /// The constructor the STORED form uses, which is the only one that may say whether a
+    /// generation is present independently of the identities.
+    ///
+    /// An index written before the generation existed carries a `page_id` and no generation key at
+    /// all, and it has always loaded with `generation() == None`. Deriving presence from the
+    /// identities would hand it a generation it never had, and every key it resolves through would
+    /// move. So the wire says, and only the wire: [`ElementEntry::from_parts`] derives the bit
+    /// because for a freshly built entry the two are the same thing.
+    ///
+    /// The VALUE is still derived either way. [`TryFrom<BlockAddressWire>`] refuses any stored
+    /// generation that would disagree with it, so a `true` here always means a value that matches
+    /// what the writer recorded.
+    pub(crate) fn try_from_wire_parts(
+        block_slab_id: u64,
+        offset: u64,
+        length: u64,
+        block_id: Option<u64>,
+        has_generation: bool,
+    ) -> Result<Self, BlockAddressOutOfRange> {
+        let address = BlockAddress::try_from_slab_and_offset(block_slab_id, offset)?;
+        // A BLOCK ID IS CHECKED, NOT SATURATED, AND IT IS THE ONLY NARROW FIELD THAT HAS TO BE.
+        //
+        // `narrow` saturates a length at `u32::MAX`, which is four times the largest length
+        // `encode_block_record` will accept -- so a saturated length is a value no writer could
+        // have produced and reads as broken. A block id has no such headroom: the encoder ceiling
+        // IS `u16::MAX`, so saturating there would hand a too-large block id the address of the
+        // LARGEST LEGAL BLOCK of the same object, which `decode_block_record`'s block-id arm would
+        // then happily confirm against that block's own record. That is the address-word hazard one
+        // level down, so it takes the address word's answer: refuse.
+        //
+        // AND THE ERROR SAYS WHICH HALF REFUSED. `block_id` is `Some` here and `None` in the
+        // address-word arm above, which is what lets the message blame the block ordinal rather
+        // than the word, or the word rather than the ordinal.
+        if block_id.is_some_and(|value| value > MAX_ADDRESSABLE_BLOCK_ID) {
+            return Err(BlockAddressOutOfRange {
+                block_slab_id,
+                offset,
+                block_id,
+            });
+        }
+        let mut present = 0u8;
+        if block_id.is_some() {
+            present |= ADDRESS_HAS_BLOCK_ID;
+        }
+        if has_generation {
+            present |= ADDRESS_HAS_GENERATION;
+        }
+        Ok(Self {
+            address,
+            length: narrow(length),
+            block_id: block_id.unwrap_or_default() as u16,
+            present,
+        })
+    }
+
+    pub fn from_compact_slab_address(compact_slab_address: u64, length: u64) -> Self {
+        Self::from_parts(
+            compact_extract_slab_id(compact_slab_address) as u64,
+            compact_extract_slab_offset(compact_slab_address) as u64,
+            length,
+            None,
+            None,
+        )
+    }
+
+    pub fn address(&self) -> &BlockAddress {
+        &self.address
+    }
+
+    pub fn address_mut(&mut self) -> &mut BlockAddress {
+        &mut self.address
+    }
+
+    pub fn into_address(self) -> BlockAddress {
+        self.address
+    }
+
+    /// How many bytes this block covers.
+    ///
+    /// Answers in 64 bits, as it always has, over a 32-bit field. See the note on the field for
+    /// what bounds it: the block-record encoder refuses a record wider than
+    /// `BLOCK_RECORD_LENGTH_MASK`, which is a quarter of what this field holds.
+    pub fn length(&self) -> u64 {
+        u64::from(self.length)
+    }
+
+    /// Set the byte count, saturating rather than truncating. See [`narrow`].
+    pub fn set_length(&mut self, value: u64) {
+        self.length = narrow(value);
+    }
+
+    pub fn block_id(&self) -> Option<u64> {
+        (self.present & ADDRESS_HAS_BLOCK_ID != 0).then_some(u64::from(self.block_id))
+    }
+
+    /// PANICS on a block id the encoder would refuse, rather than narrowing it.
+    ///
+    /// Same doctrine as [`ElementEntry::from_parts`]: every caller's value is bounded by
+    /// construction -- the record decoder's comes off the wire as a `u16` already -- and a
+    /// truncated block id names a different block of the same object. See
+    /// [`ElementEntry::try_from_wire_parts`] for why this one cannot saturate.
+    pub fn set_block_id(&mut self, value: Option<u64>) {
+        self.block_id = narrow_block_id(value.unwrap_or_default());
+        self.set_present(ADDRESS_HAS_BLOCK_ID, value.is_some());
+    }
+
+    /// Whether this block still lives in the log rather than in a slab, DERIVED from the block id.
+    ///
+    /// ONE HOME FOR THE DERIVATION, which is what the consolidation on this type bought and what
+    /// this keeps. `block_id()` is `None` exactly while the block is log-resident, so a stored flag
+    /// beside it could only agree or disagree -- and it did both, at three sites each way, before
+    /// the flag was removed.
+    pub fn log_resident(&self) -> bool {
+        self.block_id().is_none()
+    }
+
+    /// THE VALUE IS DERIVED; THE PRESENCE IS STILL A BIT.
+    ///
+    /// Every production write site passed `block_id.or(object_id)` into the field this once
+    /// computes. Measured on a seeded shard, the stored value equalled this expression on 120,080
+    /// of 120,080 live addresses at 80,000 records and 12,008 of 12,008 at 8,000, and differed on
+    /// none. So the eight bytes that held it are gone.
+    ///
+    /// THE BIT STAYS, and it is not a leftover. An index written before the generation existed
+    /// carries an identity and no generation key, and has always answered `None` here; deriving
+    /// presence from the identity would hand it a generation it never had and move every key it
+    /// resolves through. The bit costs nothing -- the presence byte was already here -- and it is
+    /// what lets the oldest stored spelling keep loading unchanged.
+    pub fn generation(&self) -> Option<u64> {
+        if self.present & ADDRESS_HAS_GENERATION == 0 {
+            return None;
+        }
+        self.block_id()
+    }
+
+    fn set_present(&mut self, bit: u8, on: bool) {
+        if on {
+            self.present |= bit;
+        } else {
+            self.present &= !bit;
+        }
+    }
+
+    /// The slab and offset packed into one word, which is what the stored form carries.
+    pub fn address_word(&self) -> u64 {
+        self.address.address_word()
+    }
+
+    /// The offset of this block inside its slab.
+    pub fn offset(&self) -> u64 {
+        self.address.offset()
+    }
+
+    /// The slab this block is in.
+    pub fn block_slab_id(&self) -> u64 {
+        self.address.block_slab_id()
+    }
+
+    /// The slab this block is in, as an `Option` because every caller reads it as one.
+    pub fn slab_id(&self) -> Option<u64> {
+        self.address.slab_id()
+    }
+
+    pub fn compact_slab_id(&self) -> Option<u32> {
+        self.address.compact_slab_id()
+    }
+
+    pub fn compact_slab_offset(&self) -> Option<u32> {
+        self.address.compact_slab_offset()
+    }
+
+    pub fn compact_slab_address(&self) -> Option<u64> {
+        self.address.compact_slab_address()
+    }
+}
+
+/// THE DISPLACED-ENTRY WIDTH, which a doc comment in this file had stale.
+///
+/// The header above priced an insert as "a shift of a 48-byte entry per displaced field". That was
+/// true when the address was 24 bytes; the pair is 40 now. Asserted instead of corrected in prose,
+/// because the prose went stale silently once already.
+///
+/// UNMOVED BY THE WORD SHRINKING, which is the point worth keeping here: the address went from 16
+/// to 8 and this pair did not move, because the seven bytes came here instead.
+const _: () = assert!(std::mem::size_of::<(String, ElementEntry)>() == 40);
