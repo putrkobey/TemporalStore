@@ -1061,3 +1061,1067 @@ fn raft_temporal_raft_rollout_readiness_accepts_only_multi_process_reports() {
         .any(|item| item.contains("meta mutation/WAL persistence/snapshot install/apply fence")));
 }
 
+// shared-corpus: raft_matrixraft_process_rollout_multiplane_report_contract
+#[test]
+fn raft_process_path_readiness_report_maps_remaining_blockers_to_fields() {
+    let data_report = ready_data_node_temporal_raft_rollout_report();
+    let meta_report = ready_meta_temporal_raft_rollout_report();
+    let ready = raft_process_path_readiness_report_from_reports(&data_report, &meta_report);
+    assert!(ready.ready);
+    assert!(ready.multi_process_data_node_and_metaserver_raft);
+    assert!(ready.failover_on_both_planes);
+    assert!(ready.membership_add_remove_under_load);
+    assert!(ready.secondary_lag_and_catchup);
+    assert!(ready.snapshot_restart_after_compaction);
+    assert!(ready.remaining_blockers.is_empty());
+
+    let mut missing_data_failover = ready_data_node_temporal_raft_rollout_report();
+    missing_data_failover.failover_validated = false;
+    let rejected = raft_process_path_readiness_report_from_reports(
+        &missing_data_failover,
+        &ready_meta_temporal_raft_rollout_report(),
+    );
+    assert!(!rejected.ready);
+    assert!(!rejected.failover_on_both_planes);
+    assert!(rejected.remaining_blockers.iter().any(|item| {
+        item.evidence_field == "data_node_report.failover_validated"
+            || item.evidence_field == "final_raft_readiness.failover_on_both_planes"
+    }));
+
+    let mut missing_membership_load = ready_meta_temporal_raft_rollout_report();
+    missing_membership_load
+        .operational_semantics
+        .leader_transfer_under_load_validated = false;
+    let rejected = raft_process_path_readiness_report_from_reports(
+        &ready_data_node_temporal_raft_rollout_report(),
+        &missing_membership_load,
+    );
+    assert!(!rejected.membership_add_remove_under_load);
+    assert!(rejected.remaining_blockers.iter().any(|item| {
+        item.evidence_field
+            == "metaserver_report.operational_semantics.leader_transfer_under_load_validated"
+            || item.evidence_field == "final_raft_readiness.membership_add_remove_under_load"
+    }));
+
+    let mut missing_secondary_catchup = ready_data_node_temporal_raft_rollout_report();
+    missing_secondary_catchup
+        .operational_semantics
+        .healed_follower_catchup_observed = false;
+    let rejected = raft_process_path_readiness_report_from_reports(
+        &missing_secondary_catchup,
+        &ready_meta_temporal_raft_rollout_report(),
+    );
+    assert!(!rejected.secondary_lag_and_catchup);
+    assert!(rejected.remaining_blockers.iter().any(|item| {
+        item.evidence_field
+            == "data_node_report.operational_semantics.healed_follower_catchup_observed"
+            || item.evidence_field == "final_raft_readiness.secondary_lag_and_catchup"
+    }));
+
+    let mut missing_snapshot_rejoin = ready_meta_temporal_raft_rollout_report();
+    missing_snapshot_rejoin
+        .operational_semantics
+        .follower_rejoin_after_compaction_validated = false;
+    let rejected = raft_process_path_readiness_report_from_reports(
+        &ready_data_node_temporal_raft_rollout_report(),
+        &missing_snapshot_rejoin,
+    );
+    assert!(!rejected.snapshot_restart_after_compaction);
+    assert!(rejected.remaining_blockers.iter().any(|item| {
+        item.evidence_field
+            == "metaserver_report.operational_semantics.follower_rejoin_after_compaction_validated"
+            || item.evidence_field == "final_raft_readiness.snapshot_restart_after_compaction"
+    }));
+}
+
+#[test]
+fn raft_atomic_apply_readiness_covers_data_node_atomic_durability() {
+    let readiness = raft_atomic_apply_readiness();
+    assert!(readiness.storage_apply_fence_present);
+    assert!(readiness.wal_fence_recovery_validation_present);
+    assert!(readiness.snapshot_lifecycle_report_present);
+    assert!(readiness.local_contract_ready);
+    assert!(readiness.storage_mutation_atomic_commit_present);
+    assert!(readiness.snapshot_install_atomic_commit_present);
+    assert!(readiness.real_data_node_process_integration_present);
+    assert!(readiness.production_ready);
+    assert!(readiness.missing.is_empty());
+
+    let distributed = distributed_raft_readiness();
+    assert!(distributed.raft_storage_apply_fence_present);
+    assert!(distributed.durable_apply_index_snapshot_integrated);
+    assert!(!distributed
+        .missing
+        .iter()
+        .any(|item| item.contains("atomic applied-index")));
+}
+
+#[test]
+fn raft_metaserver_membership_readiness_reports_real_scheduler_execution() {
+    let readiness = raft_metaserver_membership_readiness();
+    assert!(readiness.topology_membership_plan_present);
+    assert!(readiness.data_raft_membership_apply_present);
+    assert!(readiness.meta_owned_workflow_report_present);
+    assert!(readiness.learner_catchup_promotion_present);
+    assert!(readiness.leader_transfer_voter_remove_present);
+    assert!(readiness.local_workflow_ready);
+    assert!(readiness.networked_scheduler_transport_present);
+    assert!(readiness.persisted_scheduler_task_state_present);
+    assert!(readiness.real_data_node_group_execution_present);
+    assert!(readiness.production_ready);
+    assert!(!readiness
+        .missing
+        .iter()
+        .any(|item| item.contains("learner add")));
+    assert!(!readiness
+        .missing
+        .iter()
+        .any(|item| item.contains("follower lag")));
+
+    let distributed = distributed_raft_readiness();
+    assert!(distributed.metaserver_membership_workflow_present);
+    assert!(distributed.metaserver_driven_membership_present);
+    assert!(!distributed
+        .missing
+        .iter()
+        .any(|item| item.contains("networked Raft groups")));
+}
+
+#[test]
+fn the_report_says_which_transport_this_node_is_running() {
+    use crate::raft::{
+        production_raft_security_from_lookup, raft_transport_security_readiness_for,
+        ProductionRaftSecurityMode,
+    };
+
+    // The `*_present` flags describe the build, so they answer the same on
+    // every deployment -- including one running plaintext. Served at an
+    // unauthenticated /readiness on both the metaserver and the datanode, that
+    // left no way to tell "we can do mTLS" from "this node is doing mTLS".
+    let plaintext = raft_transport_security_readiness_for(
+        ProductionRaftSecurityMode::PlaintextForLocalChaos,
+    );
+    assert_eq!(plaintext.configured_transport_mode, "plaintext_for_local_chaos");
+    // The build-capability flags are unchanged by this: they still describe the
+    // build, and anything reading them keeps the answer it had.
+    assert!(plaintext.mtls_cert_key_ca_validation_present);
+
+    let mtls = raft_transport_security_readiness_for(ProductionRaftSecurityMode::Mtls);
+    assert_eq!(mtls.configured_transport_mode, "mtls");
+
+    // And the default deployment really is the plaintext one, so the two above
+    // are not hypothetical. Read through the lookup rather than the process
+    // environment so a test setting these cannot change the answer.
+    let configured = production_raft_security_from_lookup("token", true, |_| None);
+    assert_eq!(
+        configured.security.mode,
+        ProductionRaftSecurityMode::PlaintextForLocalChaos,
+        "the default transport stopped being plaintext; this test's premise needs revisiting"
+    );
+}
+
+#[test]
+fn raft_transport_security_readiness_covers_service_mtls() {
+    let readiness = raft_transport_security_readiness();
+    assert!(readiness.auth_token_validation_present);
+    assert!(readiness.mtls_cert_key_ca_validation_present);
+    assert!(readiness.authenticated_http_transport_present);
+    assert!(readiness.plaintext_local_chaos_guard_present);
+    assert!(readiness.service_process_mtls_enforcement_present);
+    assert!(readiness.production_ready);
+    assert!(readiness.missing.is_empty());
+
+    let distributed = distributed_raft_readiness();
+    assert!(distributed.production_mtls_transport_present);
+    assert!(!distributed
+        .missing
+        .iter()
+        .any(|item| item.contains("service-process mTLS runtime selection")));
+}
+
+#[test]
+fn raft_external_chaos_readiness_covers_external_faults() {
+    let readiness = raft_external_chaos_readiness();
+    assert!(readiness.local_os_process_restart_failover_present);
+    assert!(readiness.stale_read_partition_heal_present);
+    assert!(readiness.lagging_follower_catchup_present);
+    assert!(readiness.networked_membership_snapshot_present);
+    assert!(readiness.storage_replay_gate_present);
+    assert!(readiness.local_chaos_ready);
+    assert!(readiness.external_packet_loss_present);
+    assert!(readiness.external_disk_pressure_present);
+    assert!(readiness.external_process_chaos_present);
+    assert!(readiness.production_ready);
+    assert!(readiness.missing.is_empty());
+
+    let distributed = distributed_raft_readiness();
+    assert!(distributed.external_chaos_validation_present);
+    assert!(!distributed
+        .missing
+        .iter()
+        .any(|item| item.contains("process-chaos")));
+}
+
+#[test]
+fn local_raft_deployment_mode_is_rejected() {
+    let err = validate_raft_deployment_mode(RaftDeploymentMode::LocalModel).unwrap_err();
+    assert_eq!(err.mode, RaftDeploymentMode::LocalModel);
+    assert!(err
+        .message
+        .contains("local Raft deployment mode is disabled"));
+    assert!(err
+        .message
+        .contains("production distributed Raft is required"));
+    assert!(!err.message.contains("LocalModel"));
+}
+
+#[test]
+fn production_raft_mode_uses_temporal_raft_ready_path_when_adapter_is_enabled() {
+    let err = validate_raft_deployment_mode(RaftDeploymentMode::ProductionDistributed).unwrap_err();
+    assert_eq!(err.mode, RaftDeploymentMode::ProductionDistributed);
+    assert!(!err
+        .missing
+        .iter()
+        .any(|item| item.contains("applied Raft index")));
+    assert!(!err.missing.iter().any(|item| item.contains("learner add")));
+    assert!(err
+        .missing
+        .iter()
+        .any(|item| item.contains("multi-process rollout evidence")));
+    if !cfg!(feature = "temporal-raft-engine") {
+        assert!(err
+            .missing
+            .iter()
+            .any(|item| item.contains("TemporalRaft production engine adapter")));
+    }
+    assert_eq!(require_production_raft_ready().unwrap_err(), err);
+}
+
+#[test]
+fn production_raft_runtime_validates_security_timer_and_chaos_contracts() {
+    let dir = tempfile::tempdir().unwrap();
+    let options = ProductionRaftRuntimeOptions {
+        snapshot_check_interval_ms: 0,
+        engine: ProductionRaftEngineKind::TemporalRaft,
+        shard_id: 91,
+        local_node_id: 1,
+        nodes: vec![
+            ProductionRaftNode {
+                node_id: 1,
+                addr: "127.0.0.1:19101".to_string(),
+            },
+            ProductionRaftNode {
+                node_id: 2,
+                addr: "127.0.0.1:19102".to_string(),
+            },
+            ProductionRaftNode {
+                node_id: 3,
+                addr: "127.0.0.1:19103".to_string(),
+            },
+        ],
+        wal_dir: dir.path().display().to_string(),
+        config: RaftConfig::default(),
+        rpc: RaftRpcRuntimeOptions {
+            max_retries: 1,
+            deadline_ms: 50,
+            ..RaftRpcRuntimeOptions::default()
+        },
+        security: ProductionRaftSecurity::plaintext_for_local_chaos("token"),
+        heartbeat_interval_ms: 5,
+        election_tick_ms: 1,
+        max_catchup_entries_per_heartbeat: 1,
+        allow_plaintext_for_local_chaos: true,
+    };
+
+    let runtime = ProductionRaftRuntime::start(options.clone()).unwrap();
+    runtime.validate_ready().unwrap();
+    assert_eq!(runtime.status().leader_id, 1);
+    let transport = runtime.transport();
+    assert_eq!(transport.metrics().inflight, 0);
+
+    let timer = runtime.start_timer_loop();
+    runtime
+        .cluster()
+        .propose(Command::StringSet {
+            key: "production-raft".to_string(),
+            value: b"ok".to_vec(),
+        })
+        .unwrap();
+    let durability = runtime.data_node_atomic_durability_report();
+    assert!(durability.ready, "{durability:?}");
+    assert!(durability.storage_apply_fence_valid);
+    assert!(durability.storage_mutation_atomic_commit_present);
+    assert!(durability.snapshot_install_atomic_commit_present);
+    assert_eq!(durability.commit_index, durability.wal_commit_index);
+    assert_eq!(durability.applied_index, durability.fence_applied_index);
+    thread::sleep(Duration::from_millis(20));
+    timer.stop();
+    assert!(runtime
+        .cluster()
+        .replication_health(0)
+        .caught_up_voters
+        .contains(&2));
+
+    let chaos = ProductionRaftChaosPlan {
+        shard_id: 91,
+        nodes: options
+            .nodes
+            .iter()
+            .map(|node| ProductionRaftProcessSpec {
+                node_id: node.node_id,
+                addr: node.addr.clone(),
+                wal_dir: format!("{}/node-{}", options.wal_dir, node.node_id),
+                command: "temporalstore-raft-node".to_string(),
+                args: vec!["--serve".to_string()],
+                env: BTreeMap::new(),
+            })
+            .collect(),
+        partition_pairs: vec![(1, 3)],
+        crash_nodes: vec![1],
+        restart_nodes: vec![1],
+    };
+    chaos.validate().unwrap();
+
+    let mut invalid = options.clone();
+    invalid.max_catchup_entries_per_heartbeat = 0;
+    assert!(invalid.validate().is_err());
+
+    let mut invalid = options.clone();
+    invalid.nodes[1].node_id = invalid.nodes[0].node_id;
+    assert!(invalid.validate().is_err());
+
+    let mut invalid = options.clone();
+    invalid.nodes[1].addr = " ".to_string();
+    assert!(invalid.validate().is_err());
+
+    let mut invalid = options.clone();
+    invalid.nodes[1].addr = invalid.nodes[0].addr.clone();
+    assert!(invalid.validate().is_err());
+
+    let mut invalid = options;
+    invalid.allow_plaintext_for_local_chaos = false;
+    assert!(invalid.validate().is_err());
+}
+
+#[test]
+fn production_raft_mtls_requires_readable_nonempty_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = dir.path().join("node.crt");
+    let key = dir.path().join("node.key");
+    let ca = dir.path().join("ca.crt");
+    fs::write(&cert, "cert").unwrap();
+    fs::write(&key, "key").unwrap();
+    fs::write(&ca, "ca").unwrap();
+
+    let security = ProductionRaftSecurity::mtls(
+        "token",
+        cert.display().to_string(),
+        key.display().to_string(),
+        ca.display().to_string(),
+    );
+    security.validate(false).unwrap();
+
+    let empty_key = dir.path().join("empty.key");
+    fs::write(&empty_key, "").unwrap();
+    let security = ProductionRaftSecurity::mtls(
+        "token",
+        cert.display().to_string(),
+        empty_key.display().to_string(),
+        ca.display().to_string(),
+    );
+    assert!(security.validate(false).is_err());
+
+    let missing_ca = dir.path().join("missing-ca.crt");
+    let security = ProductionRaftSecurity::mtls(
+        "token",
+        cert.display().to_string(),
+        key.display().to_string(),
+        missing_ca.display().to_string(),
+    );
+    assert!(security.validate(false).is_err());
+}
+
+#[test]
+fn production_raft_security_env_selects_mtls_runtime_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let cert = dir.path().join("node.crt");
+    let key = dir.path().join("node.key");
+    let ca = dir.path().join("ca.crt");
+    fs::write(&cert, "cert").unwrap();
+    fs::write(&key, "key").unwrap();
+    fs::write(&ca, "ca").unwrap();
+    let env = BTreeMap::from([
+        ("TS_RAFT_SECURITY_MODE".to_string(), "mtls".to_string()),
+        ("TS_RAFT_AUTH_TOKEN".to_string(), "secure-token".to_string()),
+        ("TS_RAFT_CERT_PATH".to_string(), cert.display().to_string()),
+        ("TS_RAFT_KEY_PATH".to_string(), key.display().to_string()),
+        ("TS_RAFT_CA_CERT_PATH".to_string(), ca.display().to_string()),
+        ("TS_RAFT_ALLOW_PLAINTEXT".to_string(), "false".to_string()),
+    ]);
+    let selected =
+        production_raft_security_from_lookup("fallback", true, |key| env.get(key).cloned());
+    assert_eq!(selected.security.mode, ProductionRaftSecurityMode::Mtls);
+    assert!(!selected.allow_plaintext_for_local_chaos);
+    selected.security.validate(false).unwrap();
+
+    let plaintext = production_raft_security_from_lookup("fallback", false, |_| None);
+    assert_eq!(
+        plaintext.security.mode,
+        ProductionRaftSecurityMode::PlaintextForLocalChaos
+    );
+    assert!(!plaintext.allow_plaintext_for_local_chaos);
+    assert!(plaintext
+        .security
+        .validate(plaintext.allow_plaintext_for_local_chaos)
+        .is_err());
+
+    let invalid_mode = BTreeMap::from([
+        ("TS_RAFT_SECURITY_MODE".to_string(), "surprise".to_string()),
+        ("TS_RAFT_AUTH_TOKEN".to_string(), "secure-token".to_string()),
+    ]);
+    let invalid = production_raft_security_from_lookup("fallback", true, |key| {
+        invalid_mode.get(key).cloned()
+    });
+    assert_eq!(invalid.security.mode, ProductionRaftSecurityMode::Mtls);
+    assert!(invalid
+        .security
+        .validate(invalid.allow_plaintext_for_local_chaos)
+        .is_err());
+}
+
+#[test]
+fn raft_security_and_external_chaos_readiness_are_implemented() {
+    let security = raft_transport_security_readiness();
+    assert!(security.production_ready, "{security:?}");
+    assert!(security.service_process_mtls_enforcement_present);
+    assert!(security.missing.is_empty());
+
+    let chaos = raft_external_chaos_readiness();
+    assert!(chaos.production_ready, "{chaos:?}");
+    assert!(chaos.external_packet_loss_present);
+    assert!(chaos.external_disk_pressure_present);
+    assert!(chaos.external_process_chaos_present);
+    assert!(chaos.missing.is_empty());
+}
+
+#[test]
+fn production_raft_runtime_replicates_over_separate_http_nodes() {
+    let dir = tempfile::tempdir().unwrap();
+    let addr1 = free_local_addr();
+    let addr2 = free_local_addr();
+    let addr3 = free_local_addr();
+    let nodes = vec![
+        ProductionRaftNode {
+            node_id: 1,
+            addr: addr1,
+        },
+        ProductionRaftNode {
+            node_id: 2,
+            addr: addr2,
+        },
+        ProductionRaftNode {
+            node_id: 3,
+            addr: addr3,
+        },
+    ];
+    let mut runtimes = Vec::new();
+    for node in &nodes {
+        let runtime = ProductionRaftRuntime::start(ProductionRaftRuntimeOptions {
+            snapshot_check_interval_ms: 0,
+            engine: ProductionRaftEngineKind::TemporalRaft,
+            shard_id: 193,
+            local_node_id: node.node_id,
+            nodes: nodes.clone(),
+            wal_dir: dir
+                .path()
+                .join(format!("node-{}", node.node_id))
+                .display()
+                .to_string(),
+            config: RaftConfig::default(),
+            rpc: RaftRpcRuntimeOptions {
+                max_retries: 2,
+                deadline_ms: 200,
+                ..RaftRpcRuntimeOptions::default()
+            },
+            security: ProductionRaftSecurity::plaintext_for_local_chaos("token"),
+            heartbeat_interval_ms: 20,
+            election_tick_ms: 5,
+            max_catchup_entries_per_heartbeat: 32,
+            allow_plaintext_for_local_chaos: true,
+        })
+        .unwrap();
+        let addr = node.addr.clone();
+        let runtime_for_server = runtime.clone();
+        thread::spawn(move || {
+            crate::http::test_ports::serve_reserved(&addr, move |request| {
+                match (request.method.as_str(), request.path.as_str()) {
+                    ("POST", "/raft/propose") => {
+                        match parse_json::<DistributedRaftProposeRequest>(&request.body) {
+                            Ok(req) => match runtime_for_server.propose(req.command) {
+                                Ok(response) => json_response(
+                                    200,
+                                    &DistributedRaftCommandResponse {
+                                        status: Status::ok(),
+                                        response,
+                                    },
+                                ),
+                                Err(err) => json_response(
+                                    200,
+                                    &DistributedRaftCommandResponse {
+                                        status: Status::error("raft_error", err.to_string()),
+                                        response: CommandResponse::Empty,
+                                    },
+                                ),
+                            },
+                            Err(err) => {
+                                json_response(400, &Status::error("bad_request", err.to_string()))
+                            }
+                        }
+                    }
+                    _ => handle_raft_http(&runtime_for_server.cluster(), request),
+                }
+            })
+            .unwrap()
+        });
+        runtimes.push(runtime);
+    }
+    for node in &nodes {
+        wait_for_http(&node.addr);
+    }
+
+    let response: DistributedRaftCommandResponse = post_json_with_options(
+        &nodes[0].addr,
+        "/raft/propose",
+        &DistributedRaftProposeRequest {
+            command: Command::StringSet {
+                key: "separate-node".to_string(),
+                value: b"ready".to_vec(),
+            },
+        },
+        HttpRequestOptions {
+            connect_timeout_ms: 1_000,
+            io_timeout_ms: 5_000,
+            max_retries: 3,
+        },
+    )
+    .unwrap();
+    assert!(response.status.ok);
+
+    wait_for_replica_value(&runtimes[1], 2, "separate-node", b"ready");
+    wait_for_replica_value(&runtimes[2], 3, "separate-node", b"ready");
+}
+
+// shared-corpus: raft_matrixraft_read_lease_fault_matrix
+#[test]
+fn raft_replica_read_rejects_lagging_follower_and_succeeds_after_catchup() {
+    let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);
+    cluster.set_alive(3, false).unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        })
+        .unwrap();
+    cluster.set_alive(3, true).unwrap();
+
+    assert_eq!(
+        cluster
+            .read_from_replica(
+                3,
+                Command::StringGet {
+                    key: "k".to_string()
+                },
+            )
+            .unwrap_err(),
+        RaftError::ReplicaLagging {
+            replica_id: 3,
+            replica_commit_index: 0,
+            leader_commit_index: 1,
+        }
+    );
+
+    cluster.catch_up(3).unwrap();
+    assert_eq!(
+        cluster
+            .read_from_replica(
+                3,
+                Command::StringGet {
+                    key: "k".to_string()
+                },
+            )
+            .unwrap(),
+        CommandResponse::Bytes {
+            value: Some(b"v".to_vec())
+        }
+    );
+}
+
+#[test]
+fn raft_can_elect_new_leader_and_continue() {
+    let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);
+    cluster.set_alive(1, false).unwrap();
+    cluster.elect_leader(2).unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "k".to_string(),
+            value: b"v2".to_vec(),
+        })
+        .unwrap();
+
+    let response = cluster
+        .read_local(
+            2,
+            Command::StringGet {
+                key: "k".to_string(),
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        response,
+        CommandResponse::Bytes {
+            value: Some(b"v2".to_vec())
+        }
+    );
+    assert_eq!(cluster.commit_index(2).unwrap(), 1);
+    assert_eq!(cluster.commit_index(3).unwrap(), 1);
+}
+
+// shared-corpus: raft_matrixraft_election_controls
+#[test]
+fn raft_tick_election_waits_for_timeout_and_prevotes_before_promotion() {
+    let cluster = RaftCluster::new_single_shard_with_config(
+        1,
+        [1, 2, 3],
+        RaftConfig {
+            election_cycle_tick: 3,
+            enable_pre_vote: true,
+            ..RaftConfig::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        cluster.tick_election().unwrap(),
+        RaftTickOutcome::LeaderAlive { leader_id: 1 }
+    );
+    cluster.set_alive(1, false).unwrap();
+    assert_eq!(
+        cluster.tick_election().unwrap(),
+        RaftTickOutcome::ElectionPending {
+            elapsed_tick: 1,
+            timeout_tick: 3,
+        }
+    );
+    assert_eq!(
+        cluster.tick_election().unwrap(),
+        RaftTickOutcome::ElectionPending {
+            elapsed_tick: 2,
+            timeout_tick: 3,
+        }
+    );
+    assert_eq!(
+        cluster.tick_election().unwrap(),
+        RaftTickOutcome::LeaderElected {
+            leader_id: 2,
+            term: 2,
+        }
+    );
+    assert_eq!(cluster.leader_id(), 2);
+}
+
+// shared-corpus: raft_matrixraft_election_controls
+#[test]
+fn raft_prevote_rejects_candidate_without_quorum() {
+    let cluster = RaftCluster::new_single_shard_with_config(
+        1,
+        [1, 2, 3],
+        RaftConfig {
+            election_cycle_tick: 1,
+            enable_pre_vote: true,
+            ..RaftConfig::default()
+        },
+    )
+    .unwrap();
+    cluster.set_alive(1, false).unwrap();
+    cluster.set_alive(3, false).unwrap();
+    assert_eq!(
+        cluster.tick_election().unwrap(),
+        RaftTickOutcome::PreVoteRejected { candidate_id: 2 }
+    );
+    assert_eq!(cluster.leader_id(), 1);
+    let admin = cluster.matrixraft_runtime_admin_report();
+    assert_eq!(admin.pre_vote_requests, 1);
+    assert_eq!(admin.pre_vote_rejected, 1);
+    assert!(admin.pre_vote_process_evidence_observed);
+    assert!(admin
+        .peer_pipeline_states
+        .iter()
+        .any(|peer| peer.peer_id == 2 && peer.pre_vote_rejections == 1));
+    assert!(admin
+        .blockers
+        .contains(&"election_prohibition_evidence_missing".to_string()));
+}
+
+// shared-corpus: raft_matrixraft_election_controls
+#[test]
+fn raft_election_controls_record_prohibition_offline_and_transfer_timeouts() {
+    let cluster = RaftCluster::new_single_shard_with_config(
+        1,
+        [1, 2, 3],
+        RaftConfig {
+            election_cycle_tick: 1,
+            enable_pre_vote: true,
+            prohibits_election: true,
+            offline_timeout_tick: 5,
+            transfer_timeout_tick: 5,
+            ..RaftConfig::default()
+        },
+    )
+    .unwrap();
+    cluster.add_learner_with_auto_promote(4, true).unwrap();
+
+    cluster.set_alive(1, false).unwrap();
+    cluster.set_alive(3, false).unwrap();
+    assert_eq!(
+        cluster.tick_election().unwrap(),
+        RaftTickOutcome::PreVoteRejected { candidate_id: 2 }
+    );
+    cluster.set_alive(1, true).unwrap();
+    assert_eq!(cluster.elect_leader(4), Err(RaftError::ElectionProhibited));
+    cluster.advance_time_ms(6);
+    cluster.begin_leader_transfer(4).unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "transfer-timeout-under-load".to_string(),
+            value: b"committed-on-old-leader".to_vec(),
+        })
+        .unwrap();
+    cluster.advance_time_ms(6);
+
+    let admin = cluster.matrixraft_runtime_admin_report();
+    assert!(admin.pre_vote_enforced);
+    assert!(admin.election_prohibition_observed);
+    assert!(admin.offline_timeout_observed);
+    assert!(admin.transfer_timeout_observed);
+    assert!(admin.election_controls_enforced);
+    assert!(admin
+        .capability_matrix
+        .iter()
+        .any(|item| item.capability == "pre_vote_election_transfer_controls" && item.ready));
+    assert!(admin
+        .peer_pipeline_states
+        .iter()
+        .any(|peer| peer.peer_id == 3 && peer.offline_timeout_reached));
+    assert!(admin
+        .peer_pipeline_states
+        .iter()
+        .any(|peer| peer.peer_id == 4
+            && peer.auto_promoted_from_learner
+            && peer.election_rejections > 0
+            && peer.transfer_leader_timeouts > 0));
+    assert_eq!(
+        cluster
+            .read_local(
+                1,
+                Command::StringGet {
+                    key: "transfer-timeout-under-load".to_string()
+                },
+            )
+            .unwrap(),
+        CommandResponse::Bytes {
+            value: Some(b"committed-on-old-leader".to_vec())
+        }
+    );
+}
+
+#[test]
+fn raft_status_read_index_and_transfer_leader_match_engine_control_shape() {
+    let cluster = RaftCluster::new_single_shard(1, [1, 2, 3]);
+    cluster
+        .propose(Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        })
+        .unwrap();
+
+    let status = cluster.status();
+    assert_eq!(status.leader_id, 1);
+    assert_eq!(status.commit_index, 1);
+    assert_eq!(status.majority, 2);
+    assert!(status.has_majority);
+    assert!(status.leader_lease_valid);
+    assert_eq!(status.nodes.len(), 3);
+    assert!(status.nodes.iter().all(|node| node.lag == 0));
+
+    let read_index = cluster.read_index(2).unwrap();
+    assert_eq!(read_index.leader_id, 1);
+    assert_eq!(read_index.node_id, 2);
+    assert_eq!(read_index.read_index, 1);
+
+    cluster.transfer_leader(2).unwrap();
+    assert_eq!(cluster.leader_id(), 2);
+    let local = cluster.local_status(2).unwrap();
+    assert_eq!(local.role, RaftRole::Leader);
+    assert_eq!(local.commit_index, 1);
+
+    let metrics = cluster.prometheus_metrics();
+    assert!(metrics.contains("temporalstore_raft_cluster_commit_index{kind=\"data\"} 1"));
+    assert!(metrics.contains("temporalstore_raft_node_lag"));
+}
+
+// shared-corpus: raft_matrixraft_read_safety_policy
+// shared-corpus: raft_matrixraft_read_lease_fault_matrix
+#[test]
+fn raft_leader_lease_expiry_blocks_linearizable_reads_and_writes_until_heartbeat() {
+    let cluster = RaftCluster::new_single_shard_with_config(
+        1,
+        [1, 2, 3],
+        RaftConfig {
+            lease_duration_ms: 10,
+            ..RaftConfig::default()
+        },
+    )
+    .unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "lease-key".to_string(),
+            value: b"before-expiry".to_vec(),
+        })
+        .unwrap();
+    assert!(cluster.status().leader_lease_valid);
+
+    cluster.advance_time_ms(11);
+    assert!(!cluster.status().leader_lease_valid);
+    assert_eq!(cluster.read_index(1), Err(RaftError::LeaderUnavailable));
+    assert_eq!(
+        cluster.propose(Command::StringSet {
+            key: "lease-key".to_string(),
+            value: b"should-not-commit".to_vec(),
+        }),
+        Err(RaftError::LeaderUnavailable)
+    );
+
+    assert_eq!(
+        cluster.tick_election().unwrap(),
+        RaftTickOutcome::LeaderAlive { leader_id: 1 }
+    );
+    assert!(cluster.status().leader_lease_valid);
+    cluster
+        .propose(Command::StringSet {
+            key: "lease-key".to_string(),
+            value: b"after-heartbeat".to_vec(),
+        })
+        .unwrap();
+    assert_eq!(
+        cluster
+            .read_local(
+                1,
+                Command::StringGet {
+                    key: "lease-key".to_string(),
+                },
+            )
+            .unwrap(),
+        CommandResponse::Bytes {
+            value: Some(b"after-heartbeat".to_vec())
+        }
+    );
+}
+
+// shared-corpus: raft_matrixraft_read_lease_fault_matrix
+// shared-corpus: raft_matrixraft_packet_loss_fault_harness
+#[test]
+fn matrixraft_read_safety_fault_matrix_records_partition_and_catchup_evidence() {
+    let cluster = RaftCluster::new_single_shard_with_config(
+        1,
+        [1, 2, 3],
+        RaftConfig {
+            lease_duration_ms: 10,
+            election_cycle_tick: 1,
+            enable_pre_vote: true,
+            ..RaftConfig::default()
+        },
+    )
+    .unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "read-safety".to_string(),
+            value: b"v1".to_vec(),
+        })
+        .unwrap();
+
+    cluster.set_alive(3, false).unwrap();
+    cluster
+        .propose(Command::StringSet {
+            key: "read-safety".to_string(),
+            value: b"v2".to_vec(),
+        })
+        .unwrap();
+    cluster.set_alive(3, true).unwrap();
+    assert_eq!(
+        cluster.read_index(3),
+        Err(RaftError::ReplicaLagging {
+            replica_id: 3,
+            replica_commit_index: 1,
+            leader_commit_index: 2,
+        })
+    );
+    assert_eq!(
+        cluster.check_data_raft_read_policy(
+            3,
+            DataRaftReadPolicy {
+                mode: DataRaftReadMode::BoundedStale,
+                bounded_stale_max_index_lag: 0,
+                ..DataRaftReadPolicy::default()
+            },
+        ),
+        Err(RaftError::ReplicaLagging {
+            replica_id: 3,
+            replica_commit_index: 1,
+            leader_commit_index: 2,
+        })
+    );
+    assert!(cluster
+        .check_data_raft_read_policy(
+            3,
+            DataRaftReadPolicy {
+                mode: DataRaftReadMode::BoundedStale,
+                bounded_stale_max_index_lag: 1,
+                ..DataRaftReadPolicy::default()
+            },
+        )
+        .is_ok());
+
+    assert_eq!(
+        cluster.check_write_authority(3),
+        Err(RaftError::NotLeader { node_id: 3 })
+    );
+    cluster.set_alive(2, false).unwrap();
+    cluster.set_alive(3, false).unwrap();
+    assert_eq!(cluster.read_index(1), Err(RaftError::LeaderUnavailable));
+    assert_eq!(
+        cluster.check_write_authority(1),
+        Err(RaftError::NotLeader { node_id: 1 })
+    );
+    assert_eq!(
+        cluster.propose(Command::StringSet {
+            key: "read-safety".to_string(),
+            value: b"minority-write".to_vec(),
+        }),
+        Err(RaftError::NoMajority {
+            live: 1,
+            required: 2,
+        })
+    );
+
+    cluster.set_alive(2, true).unwrap();
+    cluster.set_alive(3, true).unwrap();
+    assert_eq!(
+        cluster.tick_election().unwrap(),
+        RaftTickOutcome::LeaderAlive { leader_id: 1 }
+    );
+    cluster.catch_up(3).unwrap();
+    assert!(cluster.read_index(3).is_ok());
+    assert!(cluster
+        .check_data_raft_read_policy(
+            3,
+            DataRaftReadPolicy {
+                mode: DataRaftReadMode::BoundedStale,
+                bounded_stale_max_index_lag: 0,
+                ..DataRaftReadPolicy::default()
+            },
+        )
+        .is_ok());
+    cluster
+        .propose(Command::StringSet {
+            key: "read-safety".to_string(),
+            value: b"v3".to_vec(),
+        })
+        .unwrap();
+    assert_eq!(
+        cluster
+            .read_from_replica(
+                3,
+                Command::StringGet {
+                    key: "read-safety".to_string()
+                },
+            )
+            .unwrap(),
+        CommandResponse::Bytes {
+            value: Some(b"v3".to_vec())
+        }
+    );
+
+    cluster.set_alive(1, false).unwrap();
+    cluster.set_alive(3, false).unwrap();
+    assert_eq!(
+        cluster.tick_election().unwrap(),
+        RaftTickOutcome::PreVoteRejected { candidate_id: 2 }
+    );
+    cluster.set_alive(1, true).unwrap();
+    cluster.set_alive(3, true).unwrap();
+    assert!(cluster.read_index(1).is_ok());
+
+    let admin = cluster.matrixraft_runtime_admin_report();
+    let state = cluster.read_safety_runtime_state();
+    assert!(state.stale_leader_lease_rejected > 0);
+    assert!(state.lagging_follower_read_rejected > 0);
+    assert!(state.bounded_stale_read_accepted > 0);
+    assert!(state.bounded_stale_read_rejected > 0);
+    assert!(state.minority_partition_read_rejected > 0);
+    assert!(state.minority_partition_write_rejected > 0);
+    assert!(state.stale_follower_write_rejected > 0);
+    assert!(state.healed_follower_catchup_observed > 0);
+    assert!(admin.stale_follower_read_rejected);
+    assert!(admin.stale_follower_write_rejected);
+    assert!(admin.stale_leader_lease_rejected);
+    assert!(admin.lagging_follower_read_rejected);
+    assert!(admin.bounded_stale_read_accepted);
+    assert!(admin.bounded_stale_read_rejected);
+    assert!(admin.minority_partition_rejected_reads);
+    assert!(admin.minority_partition_rejected_writes);
+    assert!(admin.healed_follower_caught_up);
+    assert!(admin.pre_vote_enforced);
+    assert!(admin.pre_vote_process_evidence_observed);
+    assert!(admin.pre_vote_requests > 0);
+    assert!(admin.pre_vote_rejected > 0);
+    assert_eq!(
+        admin.stale_leader_lease_rejection_count,
+        state.stale_leader_lease_rejected
+    );
+    assert_eq!(
+        admin.lagging_follower_read_rejection_count,
+        state.lagging_follower_read_rejected
+    );
+    assert_eq!(
+        admin.minority_partition_write_rejection_count,
+        state.minority_partition_write_rejected
+    );
+    assert_eq!(
+        admin.healed_follower_catchup_count,
+        state.healed_follower_catchup_observed
+    );
+    assert!(admin.read_index_requests >= 3);
+    assert!(admin.read_index_rejected >= 2);
+    let read_safety_capability = admin
+        .capability_matrix
+        .iter()
+        .find(|item| item.capability == "lease_read_index_pre_vote_semantics")
+        .expect("lease/read-index/pre-vote capability should be reported");
+    assert!(
+        read_safety_capability.ready,
+        "{}",
+        read_safety_capability.detail
+    );
+    assert!(read_safety_capability
+        .detail
+        .contains("stale_write_rejected=true"));
+    assert!(read_safety_capability
+        .detail
+        .contains("minority_read_rejected=true"));
+    assert!(read_safety_capability
+        .detail
+        .contains("minority_write_rejected=true"));
+    assert!(read_safety_capability
+        .detail
+        .contains("healed_catchup=true"));
+}
+
