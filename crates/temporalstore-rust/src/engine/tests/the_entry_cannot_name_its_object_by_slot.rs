@@ -593,3 +593,598 @@ fn load_on(engine: &TemporalEngine, table: &str, load_version: u64) {
     );
 }
 
+fn write(engine: &TemporalEngine, command: Command) {
+    let response = engine.execute(ExecuteRequest {
+        shard_id: SHARD,
+        command,
+    });
+    assert!(response.status.ok, "APPARATUS: write failed: {response:?}");
+}
+
+/// The slot array of one bucket, as `(slot, id)` for the slots that hold an id.
+fn slots_of(engine: &TemporalEngine, routing_bucket: u32) -> BTreeMap<usize, u64> {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&SHARD).expect("shard is loaded");
+    let Some(bucket) = shard.bucket_index.bucket_map.get(&routing_bucket) else {
+        return BTreeMap::new();
+    };
+    (0..bucket.object_index.slot_count())
+        .filter_map(|slot| bucket.object_index.id_at(slot).map(|id| (slot, id)))
+        .collect()
+}
+
+/// The object list of one bucket AS IT SERIALIZES, which is the stored positions.
+fn stored_object_index(engine: &TemporalEngine, routing_bucket: u32) -> Vec<Option<u64>> {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&SHARD).expect("shard is loaded");
+    let bucket = shard
+        .bucket_index
+        .bucket_map
+        .get(&routing_bucket)
+        .expect("APPARATUS: the bucket under test is not resident");
+    serde_json::from_value(
+        serde_json::to_value(&bucket.object_index).expect("an object list serializes"),
+    )
+    .expect("an object list's stored form is a sequence of ids and placeholders")
+}
+
+/// How many entries in one bucket name this object, split by whether each is a tombstone.
+fn entries_naming(engine: &TemporalEngine, routing_bucket: u32, object_id: u64) -> (usize, usize) {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&SHARD).expect("shard is loaded");
+    let Some(bucket) = shard.bucket_index.bucket_map.get(&routing_bucket) else {
+        return (0, 0);
+    };
+    let named = super::BlockObjects::of(&shard.bucket_index);
+    let mut live = 0usize;
+    let mut tombstoned = 0usize;
+    for (handle, block) in &bucket.block_index {
+        if block.object_id(SHARD, named.at(routing_bucket, *handle)) != object_id {
+            continue;
+        }
+        if block.deleted {
+            tombstoned += 1;
+        } else {
+            live += 1;
+        }
+    }
+    (live, tombstoned)
+}
+
+/// The object id of a `(kind, key)` under the shard this module loads.
+fn object_id_of(kind: &str, key: &str) -> u64 {
+    crate::engine::hashing::stable_block_object_id(SHARD, kind, key)
+}
+
+fn routing_bucket_of(key: &str) -> u32 {
+    crate::engine::hashing::block_routing_bucket(key, START_BUCKET, END_BUCKET)
+}
+
+/// Three keys that route to one bucket, with the bucket they route to.
+fn three_keys_in_one_bucket(prefix: &str) -> (u32, String, String, String) {
+    let mut by_bucket: BTreeMap<u32, Vec<String>> = BTreeMap::new();
+    for index in 0..400usize {
+        let key = format!("{prefix}-{index:04}");
+        by_bucket
+            .entry(routing_bucket_of(&key))
+            .or_default()
+            .push(key);
+    }
+    let (routing_bucket, keys) = by_bucket
+        .iter()
+        .find(|(_, keys)| keys.len() >= 3)
+        .map(|(bucket, keys)| (*bucket, keys.clone()))
+        .expect("APPARATUS: no bucket in the stamped range took three of four hundred keys");
+    (
+        routing_bucket,
+        keys[0].clone(),
+        keys[1].clone(),
+        keys[2].clone(),
+    )
+}
+
+// =================================================================================================
+// GROUND 1 -- A SLOT DOES NOT SURVIVE AN ENGINE RELOAD
+// =================================================================================================
+
+/// THE STORED FORM CARRIES THE POSITIONS AND THE LOAD THROWS THEM AWAY, and this test is two
+/// drafts' worth of being wrong about which step does it.
+///
+/// DRAFT ONE asserted that a `SetRemove` frees the tombstoned object's slot. It does not, and it
+/// does not for a good reason: the remove path at `storage_bucket_internals.rs:4086` drops an
+/// object from the list only when NO ENTRY in the bucket names it --
+/// `block_index.values().any(|page| page.object_id(shard_id) == removed_object_id)`, with no
+/// `!page.deleted` filter -- so while a tombstone entry is filed, the id and its slot stay. That
+/// is exactly the invariant a durable ordinal needs, and the in-session path already holds it. The
+/// run printed `after the removal: {0: .., 1: ..}`, unchanged, and the assertion failed.
+///
+/// DRAFT TWO asserted that the LOAD frees the tombstone's slot and leaves the live object's alone,
+/// because `persistence.rs:487` runs `update_bucket_layout` over every bucket and that function
+/// derives its live set as `block_index.values().filter(|page| !page.deleted)`. The first half is
+/// right. The second half is wrong, and the CONTROL is what caught it: the live witness moved from
+/// slot 1 to slot 0 across the same reload.
+///
+/// DRAFT THREE then named the wrong branch for that, and the COUNTER caught it. It asserted a
+/// RECONSTRUCT -- `reconcile_object_index_with_live_blocks` re-inserting from a `BTreeSet<u64>` in
+/// ascending id order -- and the scan reported `rebuilds +5, reconstructs +0,
+/// list_held_an_object_no_block_names +1`. So the load RECONCILED, and the live id still moved. The
+/// branch is not asserted now, for a reason the same reading gives: one load scanned five buckets
+/// and these counters are shard-wide, so a +1 is not attributable to the bucket under test.
+///
+/// SO THE REFUTATION IS WIDER THAN THE ONE THIS MODULE SET OUT TO MAKE, AND SHALLOWER THAN DRAFT
+/// THREE CLAIMED. It is not that a tombstone loses its slot, and it is not a reconstruct. It is
+/// that the array a restart hands back differs from the array that was stored, in the position of
+/// a LIVE id -- so no entry's slot survives a restart, and an ordinal stored on an entry is wrong
+/// after the first one. Both arrays are read directly, which is what the claim rests on.
+///
+/// AND THE STORED FORM IS THE CONTROL, which is what makes this a claim about the LOAD rather than
+/// about the slots being resident after all. `the_slot_survives_a_reload` establishes that the
+/// wire preserves positions; this test re-establishes it on its own fixture by reading the
+/// serialized object list before the reload, so "the positions were written and then discarded" is
+/// measured at both ends rather than at one.
+///
+/// rust-internal: drives SetAdd/SetRemove, a dump and a reload, no external surface
+#[test]
+fn no_entrys_slot_survives_an_engine_reload_so_a_stored_ordinal_cannot_name_an_object() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (routing_bucket, victim, witness, successor) = three_keys_in_one_bucket("reuse");
+    let victim_id = object_id_of("set", &victim);
+    let witness_id = object_id_of("set", &witness);
+    let successor_id = object_id_of("set", &successor);
+    assert_ne!(
+        victim_id, successor_id,
+        "APPARATUS: the victim and the successor hash to one object id, so 'a different object' \
+         is not what a reused slot would be naming"
+    );
+
+    println!("\n=== bucket {routing_bucket} ===");
+    println!("  victim    {victim}  id {victim_id:#018x}  (removed, leaves a tombstone entry)");
+    println!("  witness   {witness}  id {witness_id:#018x}  (live throughout)");
+    println!("  successor {successor}  id {successor_id:#018x}  (added after the reload)");
+
+    let (victim_slot, witness_slot, stored) = {
+        let engine = engine_on(dir.path());
+        load_on(&engine, "slot-reuse", 1);
+
+        // ONE MEMBER EACH, so the victim's removal takes its last live page and nothing else.
+        for key in [&victim, &witness] {
+            write(
+                &engine,
+                Command::SetAdd {
+                    key: key.clone(),
+                    member: b"m0".to_vec(),
+                },
+            );
+        }
+        let filed = slots_of(&engine, routing_bucket);
+        println!("  after the two writes:      {filed:?}");
+        let victim_slot = *filed
+            .iter()
+            .find(|(_, id)| **id == victim_id)
+            .map(|(slot, _)| slot)
+            .expect("APPARATUS: the victim's id is not in the bucket's object list at all");
+        let witness_slot = *filed
+            .iter()
+            .find(|(_, id)| **id == witness_id)
+            .map(|(slot, _)| slot)
+            .expect("APPARATUS: the witness's id is not in the bucket's object list at all");
+        assert_ne!(
+            victim_slot, witness_slot,
+            "APPARATUS: the two objects share slot {victim_slot}, so there is no slot to watch"
+        );
+
+        // THE REMOVAL KEEPS THE SLOT, asserted rather than passed over -- draft one asserted the
+        // opposite, and the unfiltered guard that makes this true is the reason the in-session
+        // path is NOT the one that breaks an ordinal.
+        write(
+            &engine,
+            Command::SetRemove {
+                key: victim.clone(),
+                member: b"m0".to_vec(),
+            },
+        );
+        let after_removal = slots_of(&engine, routing_bucket);
+        let (live_here, tombstoned_here) = entries_naming(&engine, routing_bucket, victim_id);
+        println!("  after the removal:         {after_removal:?}");
+        println!("  the victim's entries: {live_here} live, {tombstoned_here} tombstoned");
+        assert!(
+            tombstoned_here >= 1,
+            "APPARATUS: the removal left the victim {tombstoned_here} tombstone entries, so this \
+             test is not about a tombstone and every assertion below is about the wrong fixture"
+        );
+        assert_eq!(
+            0, live_here,
+            "APPARATUS: the victim still has {live_here} live entries, so its object is still in \
+             the live set and nothing below is about an object with no live page"
+        );
+        assert_eq!(
+            Some(victim_id),
+            after_removal.get(&victim_slot).copied(),
+            "the IN-SESSION removal freed slot {victim_slot}, so the guard at \
+             `storage_bucket_internals.rs:4086` no longer holds a slot while a tombstone names it \
+             and this test's account of which path breaks an ordinal is wrong"
+        );
+
+        // THE CONTROL, AND IT IS THE HALF THAT MAKES THE RELOAD ASSERTION MEAN ANYTHING: the
+        // stored form carries the positions. Taken before the dump, off the object list's own
+        // `Serialize`, so what the reload discards is known to have been written.
+        let stored = stored_object_index(&engine, routing_bucket);
+        println!("  the stored object list:    {stored:?}");
+        assert_eq!(
+            Some(Some(victim_id)),
+            stored.get(victim_slot).copied(),
+            "the stored object list does not carry the victim at position {victim_slot}, so the \
+             positions were never durable here and the reload cannot be said to discard them"
+        );
+        assert_eq!(
+            Some(Some(witness_id)),
+            stored.get(witness_slot).copied(),
+            "the stored object list does not carry the witness at position {witness_slot}, so the \
+             positions were never durable here and the reload cannot be said to discard them"
+        );
+
+        // DUMP, so the base index on disk carries the slots and the tombstone entry.
+        engine
+            .dump_and_reclaim_index_logs_with_min_reclaimable(SHARD, 0)
+            .expect("APPARATUS: the dump did not complete, so the reload reads nothing");
+
+        // AND ONE MORE WRITE, so a delta exists for the load to fold. `update_bucket_layout` runs
+        // on the load path only `if applied`, so a reload with nothing to fold would not reach the
+        // scan under test and would pass for the wrong reason.
+        write(
+            &engine,
+            Command::SetAdd {
+                key: witness.clone(),
+                member: b"m1".to_vec(),
+            },
+        );
+
+        (victim_slot, witness_slot, stored)
+    };
+
+    // THE RELOAD, on a second engine over the same directories, with the scan's own counters read
+    // as a DELTA around it. These counters are process-global and monotonic, so a level is not
+    // attributable to this test and only a subtraction taken around one action is.
+    let before = {
+        let probe = engine_on(dir.path());
+        probe.object_index_divergence_report()
+    };
+    let reloaded = engine_on(dir.path());
+    load_on(&reloaded, "slot-reuse", 2);
+    let after = reloaded.object_index_divergence_report();
+
+    let after_reload = slots_of(&reloaded, routing_bucket);
+    let (live_after, tombstoned_after) = entries_naming(&reloaded, routing_bucket, victim_id);
+    println!("  after the reload:          {after_reload:?}");
+    println!("  the victim's entries: {live_after} live, {tombstoned_after} tombstoned");
+    println!(
+        "  the scan, across the load: rebuilds +{}, reconstructs +{}, list_held_an_object_no_block_names +{}",
+        after.rebuilds.saturating_sub(before.rebuilds),
+        after.reconstructs.saturating_sub(before.reconstructs),
+        after
+            .list_held_an_object_no_block_names
+            .saturating_sub(before.list_held_an_object_no_block_names)
+    );
+
+    // THE ENTRY IS STILL THERE. Without this a freed slot would be free for honest reasons and
+    // nothing durable would be naming it.
+    assert!(
+        tombstoned_after >= 1,
+        "the victim's tombstone entry did not survive the reload, so no durable entry is naming \
+         slot {victim_slot} and its fate harms nothing"
+    );
+
+    // THE REFUTATION, AND IT IS ABOUT THE LIVE OBJECT AS WELL AS THE TOMBSTONED ONE. The stored
+    // array put the witness at `witness_slot`; the reload did not.
+    assert_ne!(
+        Some(witness_id),
+        after_reload.get(&witness_slot).copied(),
+        "the live witness came back at its stored slot {witness_slot}, so this reload preserved \
+         positions and the wider refutation in this test's doc comment does not hold. If this \
+         assertion fails, the narrower tombstone-only ground is the one to re-drive"
+    );
+    assert_ne!(
+        Some(victim_id),
+        after_reload.get(&victim_slot).copied(),
+        "slot {victim_slot} still names the victim after the reload, so the tombstoned object \
+         kept its slot too and nothing here moved at all"
+    );
+    assert_ne!(
+        stored,
+        stored_object_index(&reloaded, routing_bucket),
+        "the object list came back byte-for-byte as it was stored, so the reload preserved it and \
+         the symptom above must have another cause"
+    );
+
+    // AND THE BRANCH IS *NOT* ASSERTED, WHICH IS ITSELF A MEASUREMENT.
+    //
+    // A draft asserted `reconstructs` moved, on the reasoning that only a reconstruct re-hands
+    // every slot. It read `rebuilds +5, reconstructs +0, list_held_an_object_no_block_names +1`:
+    // the load took the RECONCILE branch, and one id was dropped somewhere. FIVE BUCKETS WERE
+    // SCANNED BY THE ONE LOAD, and these counters are shard-wide, so a delta of +1 cannot be
+    // attributed to the bucket under test -- it may have been any of the five. The counters are
+    // printed for the record and nothing is asserted from them, because an assertion on an
+    // unattributable delta would be a claim this fixture cannot support.
+    //
+    // THE REFUTATION DOES NOT NEED THE BRANCH. The stored array and the reloaded array are both
+    // read directly above, and they differ in the position of a LIVE id. Whatever combination of
+    // the reconcile's `remove`, `drop_trailing_placeholders` and `settle`'s collapse-to-`One`
+    // produced it, a stored ordinal is wrong after the restart.
+    // THE DENOMINATOR, WHICH IS THE ONE THING THESE COUNTERS CAN SAY HERE: the scan ran at all
+    // during the load. Without it, a reload that never reached `update_bucket_layout` would look
+    // the same from outside as one that did.
+    assert!(
+        after.rebuilds > before.rebuilds,
+        "the load scanned no bucket at all (rebuilds {} -> {}), so whatever moved the array was \
+         not this scan and the account above is about the wrong code",
+        before.rebuilds,
+        after.rebuilds
+    );
+
+    // AND THE CONSEQUENCE: the next object into this bucket is handed a position a stored ordinal
+    // could already be naming.
+    write(
+        &reloaded,
+        Command::SetAdd {
+            key: successor.clone(),
+            member: b"m0".to_vec(),
+        },
+    );
+    let after_add = slots_of(&reloaded, routing_bucket);
+    println!("  after the successor write: {after_add:?}");
+    let reused: Vec<usize> = after_add
+        .iter()
+        .filter(|(slot, id)| {
+            **id == successor_id && stored.get(**slot).copied().flatten().is_some()
+        })
+        .map(|(slot, _)| *slot)
+        .collect();
+    assert!(
+        !reused.is_empty(),
+        "the successor landed outside every position the stored array had filled, so a stored \
+         ordinal would dangle rather than resolve to the wrong object. Both are fatal, but this \
+         test's account says the stronger thing"
+    );
+    println!(
+        "  the successor took slot(s) {reused:?}, which the stored array had filled with {:?}",
+        reused
+            .iter()
+            .map(|slot| stored.get(*slot).copied().flatten())
+            .collect::<Vec<_>>()
+    );
+
+    println!(
+        "\n  REFUTED: the stored array was {stored:?} and the restart handed back {:?}. A LIVE id \
+         changed position, so no entry's slot survives a restart and an ordinal stored on an entry \
+         names a different object or none.",
+        stored_object_index(&reloaded, routing_bucket)
+    );
+}
+
+// =================================================================================================
+// GROUND 2 -- THE ENTRY IS THE ONLY DURABLE HOME OF THE KEY'S CHARACTERS
+// =================================================================================================
+
+/// A DISTINCTIVE KEY, so a hit is this key and not an incidental byte run.
+const PRESENT_KEY: &str = "zq7-sole-home-key-present-zq7";
+/// THE SAME SHAPE, NEVER WRITTEN. The matcher's negative control.
+const ABSENT_KEY: &str = "zq7-sole-home-key-absent-zq7";
+
+/// rust-internal: serializes this crate's own bucket node and reads its own index log file
+#[test]
+fn the_block_entry_is_the_only_durable_home_of_an_object_keys_characters() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, "sole-home", 1);
+
+    for key in std::iter::once(PRESENT_KEY.to_string())
+        .chain((0..40usize).map(|index| format!("sole-home-filler-{index:04}")))
+    {
+        write(
+            &engine,
+            Command::StringSet {
+                key,
+                value: vec![b'v'; 64],
+            },
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // ARM 1 -- WITHIN THE DURABLE NODE SHAPE, ONLY THE PAGE ROWS CARRY TEXT.
+    //
+    // MEASURED OFF THE SERIALIZED NODE AND NOT OFF THE FIELD LIST, because the field list is prose.
+    // It is also not measured off the FILE: the stored index is COMPRESSED -- `shard-1.index.json`
+    // begins `TSIDX` -- so a byte scan of it finds no key at any width, which is how a first draft
+    // of this test failed its own positive control while the store certainly held the key. The
+    // node's own `Serialize` output is what the compressor is handed, and that is what is measured.
+    // ---------------------------------------------------------------------------------------------
+    let routing_bucket = routing_bucket_of(PRESENT_KEY);
+    let node_wire = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&SHARD).expect("shard is loaded");
+        let bucket = shard
+            .bucket_index
+            .bucket_map
+            .get(&routing_bucket)
+            .expect("APPARATUS: the bucket holding the key under test is not resident");
+        // EVERY OBJECT THIS BUCKET HOLDS, TAKEN FROM THE INDEX'S OWN LOOKUP.
+        //
+        // Naming only the key under test was wrong and the encoder said so on the first run: the
+        // forty filler keys route over the same slot space and at least one of them lands here,
+        // so a list of one left a page unaccounted for. That is the hole `NodeNamedBy` exists to
+        // refuse -- the keyless encode used to write a key naming nothing, once per page, and
+        // return `Ok` -- and it is also why this list is DERIVED rather than written out: a
+        // hand-written one goes stale the next time the fixture's key count or slot range moves.
+        //
+        // THE KEY UNDER TEST IS STILL ASSERTED TO BE AMONG THEM, because the arm below reads the
+        // serialized node for that key's characters and a bucket that did not hold it would make
+        // every row of that search vacuous.
+        let objects: Vec<&str> = shard
+            .bucket_index
+            .object_block_lookup
+            .iter()
+            .filter(|(_, _, refs)| {
+                refs.iter().any(|block_ref| block_ref.routing_bucket == routing_bucket)
+            })
+            .map(|(_, object, _)| object.as_ref())
+            .collect();
+        assert!(
+            objects.iter().any(|object| *object == PRESENT_KEY),
+            "APPARATUS: the bucket this test reads does not hold {PRESENT_KEY}, so the search \
+             below is over a node that never carried it"
+        );
+        serde_json::to_value(crate::engine::state::NodeNamedBy(bucket, &objects))
+            .expect("a bucket node serializes to its stored shape")
+    };
+    let members = node_wire.as_object().expect(
+        "APPARATUS: a bucket node does not serialize as an object, so its members cannot be \
+         taken apart",
+    );
+
+    println!("\n=== WHICH MEMBER OF A STORED BUCKET NODE CARRIES THE KEY'S CHARACTERS ===");
+    let mut carrying: Vec<String> = Vec::new();
+    for (name, value) in members {
+        let text = serde_json::to_string(value).expect("a node member serializes");
+        let has_present = text.contains(PRESENT_KEY);
+        assert!(
+            !text.contains(ABSENT_KEY),
+            "THE MATCHER'S NEGATIVE CONTROL FAILED: member `{name}` contains a key that was never \
+             written, so a hit in this scan does not mean the characters are there"
+        );
+        println!(
+            "  {name:<22} {:>7} bytes  key: {}",
+            text.len(),
+            if has_present { "PRESENT" } else { "absent " }
+        );
+        if has_present {
+            carrying.push(name.clone());
+        }
+    }
+
+    assert!(
+        !carrying.is_empty(),
+        "THE POSITIVE CONTROL FAILED: a key that WAS written is in none of the {} members of the \
+         node that holds it, so this scan cannot tell 'only the page rows carry it' from 'the \
+         scan finds nothing'",
+        members.len()
+    );
+    assert_eq!(
+        vec!["page_index".to_string()],
+        carrying,
+        "the key's characters are carried by {carrying:?} rather than by `block_index` alone, so \
+         the page entry is NOT the only member of a stored node that holds them and this ground \
+         does not hold"
+    );
+
+    // AND WHAT THE OBJECT LIST HOLDS INSTEAD: numbers and nulls. A slot resolves to one of those
+    // for nothing, and `stable_block_object_id` is FNV-1a, so it does not invert back to the
+    // characters. This is why a position-derived ordinal cannot serve a character reader even
+    // where the position is sound.
+    let object_index = members
+        .get("object_index")
+        .expect("APPARATUS: a stored node has no `object_index` member")
+        .as_array()
+        .expect("APPARATUS: `object_index` does not serialize as an array");
+    assert!(
+        !object_index.is_empty(),
+        "APPARATUS: the object list of the bucket under test is empty, so there is no slot to say \
+         anything about"
+    );
+    for element in object_index {
+        assert!(
+            element.is_number() || element.is_null(),
+            "the object list holds {element}, which is neither an id nor a placeholder, so it may \
+             carry something a reader could use for the characters after all"
+        );
+    }
+    let expected = object_id_of("string", PRESENT_KEY);
+    assert!(
+        slots_of(&engine, routing_bucket)
+            .values()
+            .any(|id| *id == expected),
+        "APPARATUS: object {expected:#018x} is not in bucket {routing_bucket}'s list, so the slot \
+         this arm is about does not exist"
+    );
+    println!(
+        "  object_index holds {} slot(s), all ids or placeholders",
+        object_index.len()
+    );
+
+    // ---------------------------------------------------------------------------------------------
+    // ARM 2 -- AND THE INDEX LOG, WHICH IS THE ONLY OTHER DURABLE ARTEFACT THAT CARRIES THE TEXT,
+    // DOES NOT CARRY IT HERE.
+    //
+    // WHAT THIS ARM IS AND IS NOT. `IndexItem::object_key` is an `Arc<str>` and the row really does
+    // hold the characters, so the log has to be accounted for. It is not a second home for two
+    // reasons, and only the second is measured here:
+    //
+    //   * IT IS DOWNSTREAM OF THE FIELD. `collect_command_index_items_for` builds every row from
+    //     the resident entry -- `object_key: page.object_key.clone()` at `engine.rs:3328` -- so a
+    //     row cannot hold what the entry does not. That is a COMPILE-TIME dependency and the
+    //     compiler census is its proof: replacing the field reddens that construction (E0560).
+    //   * IT DOES NOT OUTLIVE A DUMP. `dump_and_reclaim_index_logs_with_min_reclaimable` gives the
+    //     log back once the base index reflects it.
+    //
+    // MEASURED AS CONTENT, NOT AS SIZE. A first draft bounded the log's BYTES against the
+    // characters written and its own control refused the bound: the log read 0 bytes before the
+    // dump as well as after, because this fixture's rows are not on disk until the dump writes
+    // them. So the claim here is the narrow one that the file supports -- the log on disk does not
+    // contain this key -- and the matcher is controlled on both sides: it finds the key in the
+    // `block_index` text above, and finds the never-written key nowhere.
+    // ---------------------------------------------------------------------------------------------
+    engine
+        .dump_and_reclaim_index_logs_with_min_reclaimable(SHARD, 0)
+        .expect("APPARATUS: the dump did not complete, so no reclaim happened");
+
+    let log_path = dir.path().join("indexes").join("shard-1.indexlog.bin");
+    let log = std::fs::read(&log_path).unwrap_or_default();
+    println!("\n=== THE INDEX LOG, AFTER THE DUMP AND THE RECLAIM ===");
+    println!("  {} is {} bytes", log_path.display(), log.len());
+
+    // AND THE VACUITY IS NAMED RATHER THAN HIDDEN. On this fixture the log reads ZERO bytes after
+    // the reclaim, so "it does not carry this key" is satisfied because it carries NOTHING -- which
+    // is the stronger statement and the one actually being made. The length is printed with the
+    // verdict so a fixture that left rows behind would read differently rather than silently turn
+    // this into a content search over a file that happens to be empty.
+    let needle = PRESENT_KEY.as_bytes();
+    let holds_key =
+        needle.len() <= log.len() && log.windows(needle.len()).any(|window| window == needle);
+    assert!(
+        !holds_key,
+        "the index log still carries the key's characters after a reclaim, so it IS a durable \
+         second home for them and this ground does not hold"
+    );
+    println!(
+        "  so the log holds {}",
+        if log.is_empty() {
+            "nothing at all -- the arm above is a vacuity check, which is the stronger claim"
+        } else {
+            "rows, and none of them carries this key"
+        }
+    );
+
+    // THE MATCHER'S POSITIVE CONTROL, over the same code path, against text that DOES hold the
+    // key: without it "not found in the log" is indistinguishable from a matcher that never finds
+    // anything.
+    let block_index_text = serde_json::to_string(
+        members
+            .get("page_index")
+            .expect("APPARATUS: a stored node has no `block_index` member"),
+    )
+    .expect("the page rows serialize");
+    let haystack = block_index_text.as_bytes();
+    assert!(
+        needle.len() <= haystack.len()
+            && haystack
+                .windows(needle.len())
+                .any(|window| window == needle),
+        "THE MATCHER'S POSITIVE CONTROL FAILED: the same byte search does not find the key in the \
+         page rows that Arm 1 just showed carry it, so its absence from the log says nothing"
+    );
+    println!("  the same byte search finds the key in the page rows, so the absence above is real");
+
+    println!(
+        "\n  REFUSED: the characters have one durable home and it is the field this leg removes. A \
+         slot hands a reader {expected:#018x}, which is a hash of them."
+    );
+}

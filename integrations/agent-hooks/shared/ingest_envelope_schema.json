@@ -34,3 +34,147 @@
     },
     "scope": {
       "description": "Access/ownership scope. Optional; null is treated as an empty object. All subfields are optional strings.",
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "properties": {
+        "account_id": { "type": "string" },
+        "tenant_id": { "type": "string" },
+        "team": { "type": "string" },
+        "user_id": { "type": "string" },
+        "session_id": { "type": "string" },
+        "sharing_scope": { "$ref": "#/$defs/sharing_scope" }
+      }
+    },
+    "sharing_scope": {
+      "description": "Sharing visibility. Read from scope.sharing_scope (or top-level); defaults to private_user.",
+      "$ref": "#/$defs/sharing_scope"
+    },
+    "metadata": {
+      "description": "Free-form metadata object. Optional; null is treated as an empty object. May carry ingestion_time_ms and storage_options overrides.",
+      "type": ["object", "null"]
+    },
+    "ingestion_time_ms": {
+      "description": "Ingestion timestamp in epoch milliseconds. Optional; defaults to now. Must be a positive integer (the code also accepts a numeric string/float, coerced via int()).",
+      "type": "integer",
+      "exclusiveMinimum": 0
+    },
+    "expires_at": {
+      "description": "PurchaseMemory per-record TTL (optional). Absolute expiry as unix SECONDS (int/float). Every record produced by this ingestion is stamped ephemeral and stops surfacing from retrieve/get_all once now >= expires_at, is excluded from summaries/rollups, and is lazily purged. Wins over ttl_seconds when both are given. Normalized by apply_memory_envelope_fields into expires_at_ms.",
+      "type": "number"
+    },
+    "ttl_seconds": {
+      "description": "PurchaseMemory relative TTL (optional). expires_at = occurred_at (ingestion_time) + ttl_seconds. Ignored when expires_at is also supplied.",
+      "type": "number"
+    },
+    "retention_cutoff_ts": {
+      "description": "PurchaseMemory scope-level retention cutoff (optional), unix SECONDS. Records in this subject scope whose occurrence time < cutoff are hidden at read-time and reclaimed by the expiry sweep. Persisted as a durable scope marker.",
+      "type": "number"
+    },
+    "identity_key": {
+      "description": "PurchaseMemory keyed-upsert identity (optional). Logical identity of a fact within the scope (e.g. 'user.email', 'subscription.plan'). A later ingest with the same identity_key supersedes or is rank-guarded against the prior value per truth_class.",
+      "type": "string"
+    },
+    "truth_class": {
+      "description": "PurchaseMemory confidence class (optional) for the keyed-upsert rank guard. Mapped to an integer rank via a default table (asserted=3, reported=2, inferred=1, unknown=0), overridable with the MATRIXARK_TRUTH_RANK env JSON. A new write with rank >= the existing keyed record supersedes it; a lower rank is rejected (no-op).",
+      "type": "string"
+    },
+    "storage_options": {
+      "description": "Storage routing hints (storage_mode, oplog_mode, replication_mode, consistency, route, storage_family/family, write_mode, raft_mode, background_write). Validated and canonicalized into storage_route by normalize_storage_options/canonical_storage_route.",
+      "type": "object",
+      "additionalProperties": true
+    },
+    "wait": {
+      "description": "Client-facing flag: block until durable/processed instead of async.",
+      "type": "boolean"
+    },
+    "raw_object_backend": {
+      "description": "Client-facing hint selecting the raw object-store backend for resource bytes.",
+      "type": "string"
+    },
+    "max_skill_bytes": {
+      "description": "Client-facing cap on skill/resource text bytes to ingest.",
+      "type": "integer"
+    },
+    "context_pack_id": { "description": "Passthrough field copied verbatim by normalize_envelope.", "type": "string" },
+    "query_id_hash": { "description": "Passthrough field copied verbatim by normalize_envelope." },
+    "accepted_refs": { "description": "Passthrough field copied verbatim by normalize_envelope." },
+    "rejected_refs": { "description": "Passthrough field copied verbatim by normalize_envelope." },
+    "source_event_ids": { "description": "Passthrough field copied verbatim by normalize_envelope." },
+    "segment_provider": { "description": "Passthrough segmentation control copied verbatim." },
+    "segment_model": { "description": "Passthrough segmentation control copied verbatim." },
+    "segment_model_path": { "description": "Passthrough segmentation control copied verbatim." },
+    "segment_max_new_tokens": { "description": "Passthrough segmentation control copied verbatim." },
+    "segment_provider_fallback": { "description": "Passthrough segmentation control copied verbatim." },
+    "understanding_provider": { "description": "Passthrough provider selector copied verbatim." },
+    "extraction_provider": { "description": "Passthrough provider selector copied verbatim." }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "kind": { "const": "message" } }, "required": ["kind"] },
+      "then": { "required": ["messages"], "properties": { "messages": { "minItems": 1 } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "feedback" } }, "required": ["kind"] },
+      "then": { "required": ["messages"], "properties": { "messages": { "minItems": 1 } } }
+    },
+    {
+      "if": { "properties": { "kind": { "const": "business_data" } }, "required": ["kind"] },
+      "then": { "required": ["messages"], "properties": { "messages": { "minItems": 1 } } }
+    },
+    {
+      "if": { "properties": { "kind": { "enum": ["resource", "skill"] } }, "required": ["kind"] },
+      "then": {
+        "anyOf": [
+          { "required": ["messages"], "properties": { "messages": { "minItems": 1 } } },
+          { "required": ["text"], "properties": { "text": { "minLength": 1 } } },
+          { "required": ["resource_text"], "properties": { "resource_text": { "minLength": 1 } } },
+          { "required": ["raw_uri"], "properties": { "raw_uri": { "minLength": 1 } } }
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "message": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["role", "content"],
+      "properties": {
+        "role": {
+          "description": "Turn author role. Canonical values are user, assistant, tool, system. The normalizer (normalize_message_role) also accepts documented aliases that collapse to a canonical role: human/prompt -> user; agent/ai/bot/llm/model/assistant_response -> assistant; function/function_call_output/custom_tool_call_output/tool_call_output/tool_result/tool_output/tool-output/tooloutput -> tool. Matching is case-insensitive after trimming.",
+          "type": "string",
+          "enum": [
+            "user",
+            "assistant",
+            "tool",
+            "system",
+            "human",
+            "prompt",
+            "assistant_response",
+            "agent",
+            "ai",
+            "bot",
+            "llm",
+            "model",
+            "tool_result",
+            "tool-output",
+            "tooloutput",
+            "tool_output",
+            "function",
+            "function_call_output",
+            "custom_tool_call_output",
+            "tool_call_output"
+          ]
+        },
+        "content": {
+          "description": "Non-empty turn content.",
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
+    "sharing_scope": {
+      "type": "string",
+      "enum": ["private_user", "tenant_shared", "global_shared"]
+    }
+  }
+}

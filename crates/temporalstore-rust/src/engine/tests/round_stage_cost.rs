@@ -445,3 +445,450 @@ fn a_round_costs_the_whole_store_stage_by_stage() {
     );
 
     // EVERY STAGE, NAMED, AT BOTH SIZES. Not a total: a total lets one bounded stage hold down
+    // three unbounded ones, which is the shape this campaign keeps finding.
+    for (name, walks) in WALKS_PER_STAGE {
+        let expected_small = walks * SMALL as u64;
+        let expected_large = walks * LARGE as u64;
+        // The whole-store passes are exact multiples of the store; the two stages that walk the
+        // index carry a fixed overhead of a few hundred entries on top, so the per-record figure
+        // is compared rather than the raw count.
+        let small_per_record = small.entries(name) as f64 / small.store_records as f64;
+        let large_per_record = large.entries(name) as f64 / large.store_records as f64;
+        assert!(
+            (small_per_record - *walks as f64).abs() < 0.1,
+            "stage {name} walked {small_per_record:.3} times the store at {SMALL} records, not \
+             {walks}. A stage that changed its walk count is the finding here, not a number to \
+             update ({} entries, expected about {expected_small})",
+            small.entries(name),
+        );
+        assert!(
+            (large_per_record - *walks as f64).abs() < 0.1,
+            "stage {name} walked {large_per_record:.3} times the store at {LARGE} records against \
+             {small_per_record:.3} at {SMALL}. Differing BETWEEN the sizes means this stage \
+             stopped being proportional to the store and started being proportional to something \
+             else, which is the failure worth a page ({} entries, expected about {expected_large})",
+            large.entries(name),
+        );
+    }
+
+    // The cheaper bucket-index walk, separately, because a stage can be flat in one and growing in
+    // the other and an aggregate of the two would show neither.
+    let compact_visits_small = small.visits("compact") as f64 / small.store_records as f64;
+    let compact_visits_large = large.visits("compact") as f64 / large.store_records as f64;
+    println!(
+        "  compact bucket-index visits: {:.3} -> {:.3} per record",
+        compact_visits_small, compact_visits_large
+    );
+    assert!(
+        compact_visits_small > 3.0 && (compact_visits_small - compact_visits_large).abs() < 0.1,
+        "the compact stage's bucket-index walk moved from {compact_visits_small:.3} to \
+         {compact_visits_large:.3} entries per record across a store five times larger"
+    );
+
+    // THE WALK RESIDUAL, at both sizes. The rows are accumulated in their own atomics and cleared
+    // at every stage boundary; this total is a different counter read once around the whole call,
+    // so the difference is a reading rather than an identity. Zero means no whole-store walk was
+    // made outside a stage; the planted-encode test beside this one is what says a nonzero one
+    // would have been seen.
+    for (label, measured) in [("small", small), ("large", large)] {
+        let rows = measured.total_entries();
+        let seen = measured.whole_call.live_block_entries;
+        println!(
+            "  {label}: whole call walked {seen} entries, stage rows claim {rows}, residual {}",
+            seen as i64 - rows as i64
+        );
+        assert!(
+            seen >= rows,
+            "the stage rows claim {rows} live-page entries at the {label} size and the \
+             independent counter saw {seen}. Rows exceeding it would mean the round walked on \
+             another thread, which this measurement is not built to read"
+        );
+        assert_eq!(
+            seen, rows,
+            "{} live-page entries were walked inside the round and charged to no stage at the \
+             {label} size. That is a whole-store cost with no stage to its name: give it a stage, \
+             or record here which part of the round makes it",
+            seen - rows,
+        );
+    }
+
+    let per_record: u64 = WALKS_PER_STAGE.iter().map(|(_, walks)| walks).sum();
+    let round_per_record = large.total_entries() as f64 / large.store_records as f64;
+    assert!(
+        (round_per_record - per_record as f64).abs() < 0.2,
+        "one round walked the live page set {round_per_record:.3} times at {LARGE} records, not \
+         the {per_record} its stages sum to"
+    );
+}
+
+#[test]
+fn a_round_with_a_fixed_amount_of_work_waiting_still_costs_the_whole_store() {
+    let small = cost(SMALL, FIXED_PENDING);
+    let large = cost(LARGE, FIXED_PENDING);
+    assert_paths_comparable(small, large);
+    print_table("FIXED PENDING WORK", small, large);
+
+    // THE CONTROL FOR THIS ARM, in two halves. The first is its premise: the work waiting is the
+    // same at both sizes.
+    assert_eq!(
+        small.pending, large.pending,
+        "FIXED-PENDING control: the arms wrote {} and {} records before their rounds. Held fixed \
+         is the entire difference between this arm and the all-pending one; without it this IS \
+         the all-pending arm and the comparison below is between a measurement and itself",
+        small.pending, large.pending,
+    );
+    // The second half is the one with teeth, because the premise above is true by construction
+    // and a construction can be wrong. The two regimes must be DIFFERENT MEASUREMENTS: a fixture
+    // that quietly rewrote the whole store here would land on the all-pending arm's figure, and
+    // every conclusion drawn from the pair would be drawn from one arm measured twice.
+    let all_pending_per_store = cost(LARGE, LARGE).total_entries() as f64 / LARGE as f64;
+    let this_per_store = large.total_entries() as f64 / large.store_records as f64;
+    assert!(
+        this_per_store - all_pending_per_store > 5.0,
+        "FIXED-PENDING control: this arm cost {this_per_store:.3} passes over the store and the \
+         all-pending arm cost {all_pending_per_store:.3}. Two regimes that land on the same figure \
+         are one regime, and the fixture stopped distinguishing them"
+    );
+
+    // THE ROUND CANNOT SEE HOW MUCH WORK IS WAITING, which is the mechanism behind everything
+    // below: after {FIXED_PENDING} fresh records the round still reports the WHOLE store dirty.
+    assert_eq!(
+        large.stage("reclaim_wal").dirty_bucket_count,
+        large.store_records,
+        "the round reported {} dirty buckets on a {}-record store after only {FIXED_PENDING} \
+         records were written. If that ever stops being the whole store, the round has gained a \
+         way to tell a small amount of pending work from a large one",
+        large.stage("reclaim_wal").dirty_bucket_count,
+        large.store_records,
+    );
+    assert_eq!(
+        small.slabs, large.slabs,
+        "the two fixed-pending arms hold {} and {} slabs, so the ratio below is not a corpus ratio",
+        small.slabs, large.slabs,
+    );
+
+    // PER RECORD OF STORE: flat. The round costs what the store is.
+    let per_store_small = small.total_entries() as f64 / small.store_records as f64;
+    let per_store_large = large.total_entries() as f64 / large.store_records as f64;
+    assert!(
+        (per_store_small - per_store_large).abs() < 0.5,
+        "with the work held fixed the round cost {per_store_small:.3} passes over the store at {} \
+         records and {per_store_large:.3} at {}. A round whose cost tracked the WORK would fall as \
+         the store grew under an unchanged workload; one that tracks the STORE holds steady, and \
+         holding steady is what is being asserted",
+        small.store_records,
+        large.store_records,
+    );
+
+    // PER RECORD OF WORK: linear in the store. This is the sentence the two regimes exist to let
+    // us say, and the number an operator actually pays.
+    let per_work_small = small.total_entries() as f64 / small.pending as f64;
+    let per_work_large = large.total_entries() as f64 / large.pending as f64;
+    let store_growth = large.store_records as f64 / small.store_records as f64;
+    let work_growth = per_work_large / per_work_small;
+    println!(
+        "  per record of WORK retired: {per_work_small:.3} -> {per_work_large:.3} ({work_growth:.3}x) \
+         while the store grew {store_growth:.3}x"
+    );
+    assert!(
+        (work_growth - store_growth).abs() < 0.3,
+        "retiring one record cost {per_work_small:.3} live-page entries on a {}-record store and \
+         {per_work_large:.3} on a {}-record one: {work_growth:.3}x against a store {store_growth:.3}x \
+         larger. Those two tracking each other is the finding -- the price of doing a fixed amount \
+         of maintenance rises linearly with everything the shard is holding",
+        small.store_records,
+        large.store_records,
+    );
+}
+
+/// Which stages are bounded per cycle, and which simply do all the work they find.
+///
+/// Named individually, because the useful answer is not how many but WHICH. Note what the bounds
+/// bound: `every_maintenance_round_is_bounded_by_default` asserts these are set and non-zero, and
+/// they are -- they bound what a stage CHANGES. Nothing bounds what it READS.
+#[test]
+fn three_round_stages_are_bounded_per_cycle_and_four_walk_the_whole_store() {
+    let small = cost(SMALL, SMALL);
+    let large = cost(LARGE, LARGE);
+
+    for name in BOUNDED_STAGES {
+        let taken = small.stage(name).candidate_count;
+        let grown = large.stage(name).candidate_count;
+        assert!(
+            taken > 0,
+            "stage {name} is named here as bounded, but it took no candidate at all at {SMALL} \
+             records, so this proves nothing about a bound"
+        );
+        assert_eq!(
+            taken, grown,
+            "stage {name} took {taken} candidates at {SMALL} records and {grown} at {LARGE}. A \
+             bound that moves with the store is not a bound"
+        );
+        println!("  {name}: bounded at {taken} candidates at BOTH sizes");
+    }
+    assert_eq!(
+        small.stage("expire").candidate_count,
+        crate::engine::reports::DEFAULT_MAX_EXPIRE_HOT_BUCKETS_PER_ROUND,
+        "expire swept {} buckets rather than the {} its per-round bound allows. A stage that did \
+         not REACH its bound has a cost that is not the bound's, and calling it bounded on that \
+         evidence is unproven",
+        small.stage("expire").candidate_count,
+        crate::engine::reports::DEFAULT_MAX_EXPIRE_HOT_BUCKETS_PER_ROUND,
+    );
+    assert!(
+        crate::engine::reports::DEFAULT_INDEX_GC_MAX_ENTRIES_PER_ROUND > 0,
+        "index_gc's per-round entry bound is zero, which this request's own documentation says \
+         means NO bound; the stage would then be unbounded and this test's name would be wrong"
+    );
+
+    for name in UNBOUNDED_WALKING_STAGES {
+        let s = small.entries(name);
+        let l = large.entries(name);
+        assert!(s > 0, "stage {name} walked nothing at {SMALL} records");
+        let growth = l as f64 / s as f64;
+        assert!(
+            (growth - (LARGE / SMALL) as f64).abs() < 0.1,
+            "stage {name} is named here as having no per-cycle bound: it walked {s} entries at \
+             {SMALL} records and {l} at {LARGE}, a growth of {growth:.3}x where an unbounded stage \
+             grows {}x. If this stage has GAINED a bound, that is good news this test should be \
+             rewritten to record rather than relaxed to accommodate",
+            LARGE / SMALL,
+        );
+        println!("  {name}: unbounded, {growth:.3}x for a {}x store", LARGE / SMALL);
+    }
+}
+
+/// A stage with nothing to do reports a cost of zero that reads exactly like a cheap stage.
+///
+/// Six of the ten rows in the table are zero. This is what separates the ones that are bounded
+/// stages having DONE their work from the ones this fixture never gave any.
+#[test]
+fn every_stage_this_round_measures_had_work_to_do() {
+    let measured = cost(SMALL, SMALL);
+
+    assert!(
+        measured.slabs > 1,
+        "the store is {} slab(s), so compaction and page reclaim have no choice to make and their \
+         figures measure the fixture rather than the round",
+        measured.slabs
+    );
+    assert!(
+        measured.store_records >= SMALL,
+        "the measured store holds {} records, fewer than the {SMALL} written",
+        measured.store_records
+    );
+
+    let expire = measured.stage("expire");
+    assert!(
+        expire.expired_records_removed > 0,
+        "the expire stage removed no record, so its zero is a stage that was idle rather than a \
+         stage that is bounded"
+    );
+    assert!(
+        measured.stage("evict").candidate_count > 0,
+        "the evict stage selected no victim, so its zero is an idle stage"
+    );
+    assert!(
+        measured.stage("prepare").metrics_bucket_count > 0,
+        "the prepare stage saw no routing bucket at all"
+    );
+    assert!(
+        measured.stage("compact").blocks_compacted > 0,
+        "the compact stage compacted nothing, so the six whole-store passes it is charged were \
+         made for no work and the fixture never gave it any"
+    );
+    assert!(
+        measured.stage("reclaim_wal").candidate_count > 0,
+        "the reclaim_wal stage had no undumped record waiting, so this is the idle-shard round \
+         and not the steady one the table describes"
+    );
+    assert!(
+        measured.stage("reap_metrics").metrics_bucket_count > 0,
+        "the reap_metrics stage reported metrics for no bucket, which is the unmeasured zero its \
+         own reason string warns about"
+    );
+    assert!(
+        measured.stage("plan").walk.live_block_entries > 0,
+        "the plan stage walked nothing, so it did not survey the shard and every figure derived \
+         from its summaries below is an unmeasured zero"
+    );
+
+    // THE STAGE SPANS TILE THE ROUND. Each is closed where its work ends and the next begins, and
+    // the round's own duration runs from before the first to after the last -- so the rows can sum
+    // to less than the round (each is truncated to whole milliseconds) and never to more.
+    //
+    // A sum that EXCEEDS the round is one interval charged to two stages, which is exactly the
+    // defect this file was written around: the stage rows are not built in the order the stages
+    // run, and a span closed at a ROW rather than at its WORK gives four stages' cost to a fifth.
+    // The walk counters cannot see that -- the stages it moved between walk nothing -- so this is
+    // the assertion that holds the boundaries in place.
+    let stage_sum: u64 = measured
+        .report
+        .stages
+        .iter()
+        .map(|stage| stage.duration_ms)
+        .sum();
+    println!(
+        "  stage durations sum to {stage_sum} ms of a round that took {} ms",
+        measured.report.duration_ms
+    );
+    assert!(
+        stage_sum <= measured.report.duration_ms,
+        "the stage durations sum to {stage_sum} ms on a round that took {} ms. They tile the \
+         round, so their sum cannot exceed it: a sum that does means one interval is charged to \
+         two stages, and the round's own breakdown -- which is what an operator reads to decide \
+         which stage to bound -- is naming the wrong one",
+        measured.report.duration_ms,
+    );
+
+    // AND WHAT WAS NOT EXERCISED, said out loud. These two stages found nothing to apply in this
+    // fixture, so their zeros in the table are NOT MEASUREMENTS. If a later fixture change gives
+    // them work, this assertion fails and the table's verdict for them has to be re-read -- which
+    // is the right failure, because a stage that starts doing work starts having a cost.
+    for name in UNEXERCISED_STAGES {
+        let stage = measured.stage(name);
+        assert!(
+            !stage.applied,
+            "stage {name} is documented in this file as NOT EXERCISED -- its zero in the table is \
+             an absent measurement rather than a cheap stage -- but it applied work in this run. \
+             Re-measure it and give it a verdict of its own"
+        );
+        println!("  {name}: NOT EXERCISED, its zero is not a measurement");
+    }
+}
+
+/// What a round does that no stage row accounts for, read with an instrument that is neither a
+/// stage row nor a sum of stage rows.
+///
+/// WHY THIS IS NOT A WALK COUNTER. A round can encode the ENTIRE served index -- its own tail does
+/// exactly that once the undumped log has crossed a threshold, after the last stage row is built.
+/// That cost is the whole store, and it materialises no live-page entry and visits no bucket
+/// index, so BOTH walk counters read zero across it: a walk-based residual reports a whole-store
+/// cost as nothing at all. `index_encode_counts` is charged inside `serialize_index`, lives in
+/// another module as a thread-local tally, and no stage row feeds it.
+///
+/// WHY THE SPAN IS WIDER THAN THE ROUND. Measured across the round alone this residual reads ZERO
+/// on this fixture, and a zero is the one reading that cannot be told from an identity -- the
+/// stage rows would look exactly like slices of the counter they are being subtracted from. So the
+/// span is moved to start BEFORE the round, where a real whole-store quantity is placed inside it:
+/// the stage accumulators are cleared when a round starts, so an encode made before the round is
+/// seen by the instrument and by no stage row, which is what an unattributed cost IS. Two rounds
+/// are run, identical but for that planted encode, and the difference between their residuals has
+/// to be the planted encode to the byte.
+#[test]
+fn the_residual_outside_the_round_stage_rows_recovers_a_planted_whole_store_encode() {
+    const RECORDS: usize = 8_000;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = round_engine(dir.path());
+    seed(&engine, 0, RECORDS);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let _warmup = one_round(&engine);
+
+    /// One round's encode residual: what the independent instrument saw, minus what the stage rows
+    /// claim. Never the sum of the rows it audits.
+    fn encode_residual(engine: &TemporalEngine, plant: bool) -> (u64, u64, u64, u64) {
+        crate::engine::reset_index_encode_counts();
+        let planted = if plant {
+            let before = crate::engine::index_encode_counts().encode_bytes_total;
+            // The catalog dump encodes the served index FIRST and only then makes the folded
+            // anchor durable, so what it returns says whether the fold landed rather than whether
+            // the encode happened. The ENCODE is what is being planted, so the encode is what is
+            // measured and required below: taking the boolean for it would leave the plant
+            // unproven in exactly the case where the plant is zero.
+            let _folded = engine.dump_index_catalog(1);
+            crate::engine::index_encode_counts().encode_bytes_total - before
+        } else {
+            0
+        };
+        crate::engine::reset_live_block_scan_entries();
+        crate::engine::reset_bucket_block_index_visits();
+        let report = engine.run_storage_manager_cycle(round_request());
+        assert!(report.errors.is_empty(), "the round errored: {:?}", report.errors);
+        let seen = crate::engine::index_encode_counts();
+        let charged_bytes: u64 = report
+            .stages
+            .iter()
+            .map(|stage| stage.walk.index_encode_bytes)
+            .sum();
+        let charged_encodes: u64 =
+            report.stages.iter().map(|stage| stage.walk.index_encodes).sum();
+        // FLOOR THE INSTRUMENT. A residual read from a counter that counted nothing is not a zero,
+        // it is an absent measurement, and the two are indistinguishable without this line.
+        assert!(
+            seen.encode_bytes_total > 0,
+            "the encode instrument read zero bytes across the whole span, so its residual \
+             measures nothing"
+        );
+        assert!(
+            seen.encode_bytes_total >= charged_bytes,
+            "the stage rows claim {charged_bytes} encoded bytes and the independent instrument \
+             saw {}. Rows exceeding the instrument would mean the round encoded on another \
+             thread, which this measurement is not built to read",
+            seen.encode_bytes_total,
+        );
+        (
+            seen.encode_bytes_total - charged_bytes,
+            seen.encodes_total - charged_encodes,
+            planted,
+            charged_bytes,
+        )
+    }
+
+    // A steady store, so the two rounds below differ only by the plant.
+    seed(&engine, 0, RECORDS);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let (control_bytes, control_encodes, _, control_charged) = encode_residual(&engine, false);
+    seed(&engine, 0, RECORDS);
+    std::thread::sleep(std::time::Duration::from_millis(30));
+    let (planted_span_bytes, planted_span_encodes, planted, treatment_charged) =
+        encode_residual(&engine, true);
+
+    println!(
+        "  CONTROL round: stage rows charged {control_charged} encoded bytes, residual \
+         {control_bytes} bytes / {control_encodes} encode(s)"
+    );
+    println!(
+        "  PLANTED round: stage rows charged {treatment_charged} encoded bytes, residual \
+         {planted_span_bytes} bytes / {planted_span_encodes} encode(s); plant was {planted} bytes"
+    );
+
+    // THE PLANT IS A WHOLE-STORE QUANTITY, not a token. It is the served index of an
+    // 8,000-record shard, which is what the round's own tail writes when its threshold is crossed.
+    assert!(
+        planted > 100_000,
+        "the plant was {planted} bytes on an {RECORDS}-record store. It is supposed to be the \
+         whole served index; something this small means the engine wrote something else and the \
+         recovery below is about the wrong quantity"
+    );
+
+    // EXACT RECOVERY. The residual has to move by the plant and by nothing else.
+    assert_eq!(
+        planted_span_bytes,
+        control_bytes + planted,
+        "the residual did not recover the planted {planted} bytes exactly: it moved from \
+         {control_bytes} to {planted_span_bytes}. A residual that does not move by exactly what is \
+         placed inside it is arithmetic between two views of one number rather than an \
+         independent reading -- and if the two rounds differ in their OWN unattributed encode \
+         this fails here, loudly, which is the right failure"
+    );
+    assert_eq!(
+        planted_span_encodes,
+        control_encodes + 1,
+        "the residual recovered {} planted encodes rather than exactly one",
+        planted_span_encodes - control_encodes,
+    );
+
+    // WHAT THE ROUND ITSELF LEAVES UNATTRIBUTED, reported rather than asserted away. Zero here
+    // means every served-index encode this round made was charged to a stage -- and the plant
+    // above is what says a nonzero one would have been seen.
+    println!(
+        "  the round's OWN unattributed encode on this fixture: {control_bytes} bytes / \
+         {control_encodes} encode(s)"
+    );
+    assert_eq!(
+        control_bytes, 0,
+        "this round left {control_bytes} bytes of served-index encode outside every stage row. \
+         That is a whole-store cost with no stage to its name, which is worth reading rather than \
+         absorbing: give it a stage, or record here which part of the round makes it"
+    );
+}
