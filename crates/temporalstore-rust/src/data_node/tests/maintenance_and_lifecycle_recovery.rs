@@ -5758,3 +5758,5764 @@ fn what_drops_the_shard_cache() {
     );
     let options = StorageManagerOptions {
         enable_memory_reclaim: false,
+        ..StorageManagerOptions::default()
+    };
+    let mut written = 0usize;
+    for round in 0..ROUNDS {
+        let engine = runtime.engine();
+        for index in 0..BATCH {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("whodrops2-{:06}", (written + index) % KEYSPACE),
+                    value: vec![b'v'; 96],
+                },
+            });
+        }
+        written += BATCH;
+        for key_index in 0..KEYSPACE {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: format!("whodrops2-{:06}", key_index),
+                },
+            });
+        }
+        let warm = engine.cache().stats().memory_bytes;
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        let mem_ran = report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "reclaim_memory");
+        let gc_ran = report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "reclaim_page");
+        let gc_removed = report
+            .gc_report
+            .as_ref()
+            .map(|gc| gc.cache_entries_removed)
+            .unwrap_or(0);
+        let slabs = report
+            .gc_report
+            .as_ref()
+            .map(|gc| gc.block_slabs_removed)
+            .unwrap_or(0);
+        eprintln!(
+            "  {round:>5}  {warm:>10}  {mem_ran:>7}  {gc_ran:>6}  {gc_removed:>16}  {slabs:>13}"
+        );
+    }
+}
+
+/// A page-GC round invalidates the slabs it reclaimed, not the whole shard's cache.
+///
+/// `run_gc_inner` opened by calling `invalidate_shard`, which empties every memory, pmem and disk
+/// entry the shard holds. It runs BEFORE the collection, because at that point nothing knows what
+/// will be reclaimed -- so it takes everything, including on a round that goes on to reclaim
+/// nothing at all. The storage-manager cycle has always invalidated per reclaimed slab instead.
+///
+/// `enable_memory_reclaim: false` is load-bearing, not incidental. `reclaim_memory` passes
+/// `invalidate_cache: true` and runs earlier in the round, so when it fires it empties the shard
+/// itself and page GC's drop removes nothing -- measured, zero entries on every round. Two earlier
+/// versions of this guard passed under mutation for exactly that reason: they were watching a
+/// cache that an earlier stage had already emptied. Disabling that stage is what isolates the
+/// behaviour under test. `what_drops_the_shard_cache` prints both arrangements.
+///
+/// The assertion is the invariant that separates them: a round that reclaimed NOTHING must
+/// invalidate nothing. Measured, whole-shard drops 200-400 entries on such a round.
+#[test]
+fn a_block_gc_round_invalidates_only_what_it_reclaimed() {
+    const BATCH: usize = 300;
+    const ROUNDS: usize = 6;
+    const KEYSPACE: usize = 100;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    let options = StorageManagerOptions {
+        enable_memory_reclaim: false,
+        ..StorageManagerOptions::default()
+    };
+
+    let mut written = 0usize;
+    let mut checked_rounds = 0usize;
+    for _ in 0..ROUNDS {
+        let engine = runtime.engine();
+        for index in 0..BATCH {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("cachescope-{:06}", (written + index) % KEYSPACE),
+                    value: vec![b'v'; 96],
+                },
+            });
+        }
+        written += BATCH;
+        // Warm the cache before each round, so a whole-shard drop always has something to take.
+        for key_index in 0..KEYSPACE {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: format!("cachescope-{:06}", key_index),
+                },
+            });
+        }
+        assert!(
+            engine.cache().stats().memory_bytes > 0,
+            "the cache held nothing after reading every key, so this round proves nothing"
+        );
+
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        let Some(gc) = report.gc_report.as_ref() else {
+            continue;
+        };
+        if gc.block_slabs_removed == 0 {
+            checked_rounds += 1;
+            assert_eq!(
+                gc.cache_entries_removed, 0,
+                "a round that reclaimed no slabs invalidated {} cache entries -- that is the \
+                 whole shard being dropped, not what this round collected",
+                gc.cache_entries_removed
+            );
+        }
+    }
+
+    // The denominator. The assertion only fires on rounds that reclaimed nothing, so without one
+    // of those it checked nothing at all.
+    assert!(
+        checked_rounds > 0,
+        "no round reclaimed zero slabs, so the invariant was never exercised"
+    );
+}
+
+/// Does a page-GC round's cost grow with the number of slabs the store holds? Prints.
+///
+///   cargo test -p temporalstore-rust --lib what_a_block_gc_round_walks \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// `gc_slabs_before_with_live_refs` lists every slab file under the block-store root and stats each
+/// one, every round, with no bound and no cursor -- the report's retained + removed IS the walk.
+/// The design it converges on does one zone per round and resumes an in-progress zone from a stored
+/// cursor, so its per-round cost does not grow with the store.
+///
+/// This prints the walk width and the wall time of the call as slabs accumulate, so the question
+/// "does it matter here" is answered with numbers rather than from the shape of the code.
+#[test]
+#[ignore]
+fn what_a_block_gc_round_walks() {
+    const BATCH: usize = 400;
+    const ROUNDS: usize = 12;
+    const KEYSPACE: usize = 200;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    let options = StorageManagerOptions::default();
+
+    eprintln!("  round  slabs_walked  retained  removed  gc_micros");
+    let mut written = 0usize;
+    for round in 0..ROUNDS {
+        let engine = runtime.engine();
+        for index in 0..BATCH {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("gcwalk-{:06}", (written + index) % KEYSPACE),
+                    value: vec![b'v'; 96],
+                },
+            });
+        }
+        written += BATCH;
+        runtime.run_storage_manager_once(1, options.clone());
+
+        // Time the walk directly, with a floor that retains everything, so the measurement is the
+        // SCAN and not the deletion: retain_from 0 makes every slab ineligible.
+        let engine = runtime.engine();
+        let started = std::time::Instant::now();
+        let report = engine
+            .block_store()
+            .gc_slabs_before_with_live_refs(0, std::iter::empty())
+            .expect("gc");
+        let micros = started.elapsed().as_micros();
+        let retained = report.retained_block_slab_ids.len();
+        let removed = report.removed_block_slab_ids.len();
+        let walked = retained + removed;
+        eprintln!("  {round:>5}  {walked:>12}  {retained:>8}  {removed:>7}  {micros:>9}");
+    }
+}
+
+/// How many rounds does eviction need to get back under its memory limit? Prints.
+///
+///   cargo test -p temporalstore-rust --lib how_long_eviction_takes_to_converge \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// `apply_storage_eviction` selects up to `eviction_batch_limit` victims, evicts them once, and
+/// returns -- even when the pressure it just measured is still far above the threshold. It reports
+/// `cooldown: pressure_after >= pressure_before`, so it knows when a round freed nothing, and
+/// nothing acts on that. The design being followed loops instead, taking batches until usage is
+/// back under the limit and stopping on a per-call count budget rather than on the first batch.
+///
+/// Each arm builds its OWN store. A first version shared one runtime across both arms, so the
+/// second arm inherited a cache the first had already drained and reported zeros that meant
+/// nothing.
+///
+/// WHY IT STALLS, which #1555 left open. Not pacing and not selection -- both of those match the
+/// design being followed already:
+///
+///   - pacing: #1555 gave the stage a count budget, so it keeps taking batches while they help.
+///   - selection: `evict_sampler` lives on `ShardState`, so the sampler's cursor and pool persist
+///     across calls. That is the same persistent-iterator shape their `PolicyLru` uses.
+///
+/// The ceiling WAS the MODE, and it has moved. In mode `evict_cache` -- which is the only mode a
+/// memory-pressure round takes -- a victim used to be handled by
+/// `cache.invalidate_slot(shard_id, routing_bucket)` and nothing else, so eviction could free
+/// exactly what was CACHED. Once the cached pages of the eligible buckets were gone another batch
+/// freed nothing, `cooldown` was set, and the loop correctly stopped -- below the cached set, with
+/// every bucket node still whole. Raising the budget, changing the sampler or looping harder could
+/// not move it, because the missing piece was neither pacing nor selection but a per-bucket
+/// load-back path: nothing could drop a bucket node and expect to read it again.
+///
+/// That path exists now -- `release_bucket_blocks` / `reload_released_bucket` -- and `evict_cache`
+/// uses it: a victim is dumped, cleared, and has its page list RELEASED, while the node stays
+/// routable and the next write through it loads the list back from the model maps. The gate counts
+/// the resident bucket index as part of its pressure now, so a round can reduce the thing that
+/// actually grows with the corpus. What this measurement is for has changed with it: the question
+/// is no longer why it cannot converge but how many rounds it takes to.
+#[test]
+#[ignore]
+fn how_long_eviction_takes_to_converge() {
+    const KEYS: usize = 4_000;
+    const ROUNDS: usize = 10;
+
+    fn arm(memory_reclaim: bool) {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let runtime = DataNodeRuntime::new_without_workers_with_options(
+            engine,
+            DataNodeRuntimeOptions {
+                worker_threads: 0,
+                max_queue_depth: 4,
+                max_background_queue_depth: 2,
+            },
+        );
+        {
+            let engine = runtime.engine();
+            for index in 0..KEYS {
+                engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: format!("evictconv-{:08}", index),
+                        value: vec![b'v'; 256],
+                    },
+                });
+            }
+            for index in 0..KEYS {
+                engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: format!("evictconv-{:08}", index),
+                    },
+                });
+            }
+        }
+        let start = runtime.engine().cache().stats().memory_bytes;
+        let threshold = (start / 4).max(1);
+        eprintln!(
+            "  -- enable_memory_reclaim={memory_reclaim}  start={start}  threshold={threshold} --"
+        );
+        eprintln!("  round  gate_open  before  after  victims  cooldown  skipped");
+
+        let options = StorageManagerOptions {
+            enable_evict: true,
+            enable_memory_reclaim: memory_reclaim,
+            eviction_memory_pressure_threshold: threshold,
+            // The shipped bound pinned away: this fixture is about the WIDE gate's threshold.
+            index_resident_limit_bytes: 0,
+            ..StorageManagerOptions::default()
+        };
+        let mut converged: Option<usize> = None;
+        for round in 0..ROUNDS {
+            // Re-warm before each round, so the question is what EVICTION does with a warm cache
+            // rather than what an earlier stage left behind.
+            let engine = runtime.engine();
+            for index in 0..KEYS {
+                engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: format!("evictconv-{:08}", index),
+                    },
+                });
+            }
+            let report = runtime.run_storage_manager_once(1, options.clone());
+            let Some(eviction) = report.eviction.as_ref() else {
+                eprintln!("  {round:>5}  (evict stage did not run)");
+                continue;
+            };
+            eprintln!(
+                "  {round:>5}  {:>9}  {:>6}  {:>5}  {:>7}  {:>8}  {}",
+                eviction.pressure_gate_open,
+                eviction.pressure_before,
+                eviction.pressure_after,
+                eviction.selected_victims.len(),
+                eviction.cooldown,
+                if eviction.skipped_reason.is_empty() {
+                    "-"
+                } else {
+                    eviction.skipped_reason.as_str()
+                },
+            );
+            if eviction.pressure_after < threshold && converged.is_none() {
+                converged = Some(round + 1);
+            }
+        }
+        match converged {
+            Some(n) => eprintln!("  VERDICT: under the limit after {n} round(s)"),
+            None => eprintln!("  VERDICT: still OVER after {ROUNDS} rounds"),
+        }
+    }
+
+    arm(true);
+    arm(false);
+}
+
+/// The round reports what eviction did, including when it declined to do anything.
+///
+/// Every other stage puts its report on `StorageManagerLoopReport`. The evict stage built a full
+/// one -- victims, pressure before and after, `cooldown` for a round that freed nothing, and
+/// `skipped_reason` for a round that never started -- and the loop dropped it, keeping only "did
+/// it run" for `executed_stages`. So the one stage whose purpose is relieving memory was the one
+/// stage whose outcome nobody could see.
+///
+/// That is not cosmetic. On the shipped configuration this stage NEVER opens its gate:
+/// `reclaim_memory` runs earlier in the round and invalidates the whole shard cache, and
+/// eviction's threshold is compared against exactly that cache, so it reads 0 and skips with
+/// `memory_pressure_below_threshold` every time. Measured over ten rounds in
+/// `how_long_eviction_takes_to_converge`. With the report discarded there was no way to learn this
+/// from a running server -- `executed_stages` says "evict" either way.
+#[test]
+fn the_round_reports_what_eviction_did() {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    for index in 0..400usize {
+        let engine = runtime.engine();
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("evictreport-{:06}", index % 100),
+                value: vec![b'v'; 96],
+            },
+        });
+    }
+
+    // Eviction now ships enabled, so the flag here restates the shipped value; the BOUND is
+    // pinned away so the stage acts rather than declining under it on a fixture this size.
+    let options = StorageManagerOptions {
+        enable_evict: true,
+        index_resident_limit_bytes: 0,
+        ..StorageManagerOptions::default()
+    };
+    let report = runtime.run_storage_manager_once(1, options);
+
+    assert!(
+        report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "evict"),
+        "the evict stage did not run, so there is no report to carry: {:?}",
+        report.executed_stages
+    );
+    let eviction = report
+        .eviction
+        .as_ref()
+        .expect("the round ran the evict stage but carried no eviction report");
+
+    // A skipped round must say why. `pressure_gate_open` and `skipped_reason` are the two fields
+    // that distinguish "evicted nothing because there was nothing to evict" from "never looked",
+    // and on the shipped configuration it is always the latter.
+    assert!(
+        eviction.pressure_gate_open || !eviction.skipped_reason.is_empty(),
+        "eviction neither opened its gate nor said why it skipped -- the report cannot be acted on"
+    );
+    assert_eq!(
+        eviction.shard_id, 1,
+        "the report belongs to the shard the round ran for"
+    );
+}
+
+/// What share of a maintenance round is the index-GC gate now? Prints.
+///
+///   cargo test -p temporalstore-rust --lib what_share_of_a_round_is_the_index_gate \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// `storage_index_gc_report` opens with `scan(shard, 0, u64::MAX, u64::MAX)` -- the WHOLE index
+/// log -- and decodes every record twice to compute the ratio that decides whether GC should run
+/// at all. The design being followed estimates the same ratio from a maintained item count and two
+/// running averages: O(1), no scan, no decode.
+///
+/// That was measured once before, at 39 ms for 32,000 records, and DEFERRED -- because WAL reclaim
+/// was costing 21,448 ms in the same round and 39 ms against that is noise. #1516 has since fixed
+/// the frozen reclaim floor that made WAL reclaim cost what it did, so the denominator that
+/// justified deferring is gone. This re-measures the gate as a SHARE of the round rather than in
+/// isolation, because the share is what decides whether it is worth an exact counter.
+///
+/// The fixture deliberately does NOT run a round between writes: the gate's cost only shows on a
+/// log that has been allowed to grow, which is the state it exists to detect.
+#[test]
+#[ignore]
+fn what_share_of_a_round_is_the_index_gate() {
+    eprintln!("  records  index_gc_on_ms  index_gc_off_ms  gate_share");
+    for records in [2_000usize, 8_000, 32_000] {
+        // Two stores built identically, so the only difference is whether the stage runs.
+        let measure = |enable_index_gc: bool| -> u128 {
+            let engine = TemporalEngine::default();
+            engine.load_shard(1);
+            let runtime = DataNodeRuntime::new_without_workers_with_options(
+                engine,
+                DataNodeRuntimeOptions {
+                    worker_threads: 0,
+                    max_queue_depth: 4,
+                    max_background_queue_depth: 2,
+                },
+            );
+            {
+                let engine = runtime.engine();
+                for index in 0..records {
+                    engine.execute(ExecuteRequest {
+                        shard_id: 1,
+                        command: Command::StringSet {
+                            key: format!("idxgate-{:08}", index),
+                            value: vec![b'v'; 64],
+                        },
+                    });
+                }
+            }
+            let options = StorageManagerOptions {
+                enable_index_gc,
+                ..StorageManagerOptions::default()
+            };
+            let started = Instant::now();
+            runtime.run_storage_manager_once(1, options);
+            started.elapsed().as_millis()
+        };
+
+        let on = measure(true);
+        let off = measure(false);
+        let share = if on == 0 {
+            0.0
+        } else {
+            100.0 * (on.saturating_sub(off)) as f64 / on as f64
+        };
+        eprintln!("  {records:>7}  {on:>14}  {off:>15}  {share:>9.1}%");
+    }
+}
+
+/// Can the reclaim_index dump be capped now that the reclaim floor is no longer frozen? Prints.
+///
+///   cargo test -p temporalstore-rust --lib can_the_index_dump_be_capped_now \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// The stage dumps the WHOLE dirty set every round, which `what_share_of_a_round_is_the_index_gate`
+/// measures at ~68% of a round -- 14,579 ms of a 21,365 ms round on a 32,000-record log.
+///
+/// It is unbounded because #1500 tried capping it and index-log reclaim stopped dead: 16,000
+/// records before a round and 16,000 after. The reason given was coverage --
+/// `wal_plan.safe_to_reclaim` needs a durable manifest for every live generation, and the
+/// whole-dirty-set dump is what produced one.
+///
+/// #1516 then fixed the frozen reclaim frontier: a clean bucket no longer pins the floor for ever,
+/// and an unset floor no longer erases it. That is the mechanism that made a bounded dump fail to
+/// advance anything, so the constraint recorded in #1500 may simply no longer hold. This sweeps
+/// the cap and reports BOTH numbers that matter -- what the round costs, and whether the log still
+/// reclaims. A cap that makes rounds cheap by not reclaiming is not a win.
+#[test]
+#[ignore]
+fn can_the_index_dump_be_capped_now() {
+    const BATCH: usize = 2_000;
+    const ROUNDS: usize = 6;
+    // Smaller than BATCH so later rounds overwrite earlier keys and index records actually become
+    // garbage. A first version wrote 12,000 DISTINCT keys and every arm reported 12,000 records
+    // left -- correctly, because with unique keys almost every record is the live version of a
+    // key and there is nothing to reclaim. That fixture cannot tell a working cap from a broken
+    // one.
+    const KEYSPACE: usize = 500;
+
+    fn index_records(engine: &TemporalEngine) -> usize {
+        engine
+            .index_log_store()
+            .scan(1, 0, u64::MAX, u64::MAX)
+            .map(|records| records.len())
+            .unwrap_or(0)
+    }
+
+    eprintln!("     cap   ingested   index_log   round_ms   verdict");
+    for cap in [0usize, 64, 256, 1_024] {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let runtime = DataNodeRuntime::new_without_workers_with_options(
+            engine,
+            DataNodeRuntimeOptions {
+                worker_threads: 0,
+                max_queue_depth: 4,
+                max_background_queue_depth: 2,
+            },
+        );
+        let options = StorageManagerOptions {
+            index_gc_max_dump_buckets_per_round: cap,
+            ..StorageManagerOptions::default()
+        };
+        let mut written = 0usize;
+        let mut total_round_ms = 0u128;
+        for _ in 0..ROUNDS {
+            let engine = runtime.engine();
+            for index in 0..BATCH {
+                engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: format!("dumpcap-{:08}", (written + index) % KEYSPACE),
+                        value: vec![b'v'; 64],
+                    },
+                });
+            }
+            written += BATCH;
+            let started = Instant::now();
+            runtime.run_storage_manager_once(1, options.clone());
+            total_round_ms += started.elapsed().as_millis();
+        }
+        let index = index_records(&runtime.engine());
+        // Reclaiming means the log is a bounded multiple of one batch, not of the total.
+        let verdict = if index < BATCH * 2 {
+            "reclaims"
+        } else if index < written / 2 {
+            "lagging"
+        } else {
+            "STOPPED"
+        };
+        let per_round = total_round_ms / ROUNDS as u128;
+        eprintln!("  {cap:>6}   {written:>8}   {index:>9}   {per_round:>8}   {verdict}");
+    }
+}
+
+/// A capped reclaim_index dump still reclaims the index log.
+///
+/// #1500 capped this dump and index-log reclaim stopped dead -- 16,000 records before a round and
+/// 16,000 after -- so the stage was left dumping the WHOLE dirty set with a comment saying not to
+/// cap it. That is ~68% of a maintenance round: 14,579 ms of a 21,365 ms round on a 32,000-record
+/// log.
+///
+/// The reason it broke was coverage: `wal_plan.safe_to_reclaim` needs a durable manifest for every
+/// live generation, and the whole-dirty-set dump was what produced one. #1516 then fixed the
+/// frozen reclaim frontier -- a clean bucket no longer pins the floor for ever, and an unset floor
+/// no longer erases it -- which is the mechanism that made a bounded dump fail to advance
+/// anything.
+///
+/// So the constraint recorded in #1500 no longer holds, and this is the guard that says so: a
+/// capped dump reclaims as well as an unbounded one.
+///
+/// What it does NOT do, despite being the obvious thing to claim, is detect a re-frozen frontier.
+/// That was checked rather than assumed: reverting #1516's `dirty_object_count > 0` condition
+/// leaves this test PASSING. The fixture overwrites a 500-key space, so every bucket is dirty
+/// every round, `dirty_object_count > 0` holds for all of them, and the condition being reverted
+/// never applies. Catching that regression needs a fixture with CLEAN buckets -- buckets dumped
+/// once and not written again -- which is the state where a clean bucket's stale manifest pins the
+/// floor. Worth building; not built here, and this guard should not be read as covering it.
+#[test]
+fn a_capped_index_dump_still_reclaims() {
+    const BATCH: usize = 2_000;
+    const ROUNDS: usize = 6;
+    // Overwrites, so records genuinely become garbage. With distinct keys almost every record is
+    // the live version of a key, nothing is reclaimable, and both arms below would report the full
+    // count while proving nothing.
+    const KEYSPACE: usize = 500;
+
+    fn run(cap: usize) -> (usize, usize) {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let runtime = DataNodeRuntime::new_without_workers_with_options(
+            engine,
+            DataNodeRuntimeOptions {
+                worker_threads: 0,
+                max_queue_depth: 4,
+                max_background_queue_depth: 2,
+            },
+        );
+        let options = StorageManagerOptions {
+            index_gc_max_dump_buckets_per_round: cap,
+            ..StorageManagerOptions::default()
+        };
+        let mut written = 0usize;
+        for _ in 0..ROUNDS {
+            let engine = runtime.engine();
+            for index in 0..BATCH {
+                engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: format!("dumpcapguard-{:08}", (written + index) % KEYSPACE),
+                        value: vec![b'v'; 64],
+                    },
+                });
+            }
+            written += BATCH;
+            runtime.run_storage_manager_once(1, options.clone());
+        }
+        let remaining = runtime
+            .engine()
+            .index_log_store()
+            .scan(1, 0, u64::MAX, u64::MAX)
+            .map(|records| records.len())
+            .unwrap_or(0);
+        (written, remaining)
+    }
+
+    let (written, unbounded) = run(0);
+    let (_, capped) = run(64);
+
+    // The denominator: the unbounded arm has to reclaim, or "the capped arm matches it" is a
+    // statement about two broken runs.
+    assert!(
+        unbounded < written / 2,
+        "the UNBOUNDED arm did not reclaim ({unbounded} of {written} left), so this fixture cannot \
+         tell whether the cap is what broke anything"
+    );
+    assert!(
+        capped < written / 2,
+        "a capped dump stopped index-log reclaim: {capped} of {written} records left, against \
+         {unbounded} with no cap -- the reclaim floor is not advancing on the bounded path"
+    );
+}
+
+/// A bucket that stopped being written does not pin the reclaim floor for ever.
+///
+/// #1514 measured both logs growing linearly under continuous ingestion while the plan reported
+/// safe=true, full coverage, no blockers -- and a frontier frozen at 2001 for twelve rounds.
+/// #1516 fixed it: the floor is a minimum over DIRTY buckets only, and an unset floor means "no
+/// constraint" rather than zero. It shipped as 14 lines in one file with NO test, which is why
+/// this exists.
+///
+/// The bug needs CLEAN buckets to show itself -- buckets dumped once and never written again. A
+/// dirty-everything fixture cannot reproduce it: every bucket constrains the floor legitimately,
+/// so including clean ones changes nothing. That is not hypothetical; the guard beside this one
+/// (`a_capped_index_dump_still_reclaims`) overwrites a small key space, and reverting #1516 leaves
+/// it passing.
+///
+/// So: write widely, dump everything, then keep writing to a SMALL subset. The buckets left behind
+/// are clean, and their manifests hold sequence numbers from the first phase. Before #1516 those
+/// stale manifests pinned the floor and neither log could ever be reclaimed past them.
+#[test]
+fn a_bucket_that_went_quiet_does_not_pin_the_reclaim_floor() {
+    const WIDE_KEYS: usize = 2_000;
+    const HOT_KEYS: usize = 20;
+    const ROUNDS: usize = 8;
+    const BATCH: usize = 1_000;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+
+    // Phase one: write widely, so many buckets carry a sequence, then dump them all.
+    {
+        let engine = runtime.engine();
+        for index in 0..WIDE_KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("quiet-wide-{:08}", index),
+                    value: vec![b'v'; 64],
+                },
+            });
+        }
+    }
+    runtime.run_storage_manager_once(1, StorageManagerOptions::default());
+
+    // Phase two: keep writing, but only to a handful of keys. Every bucket the wide phase touched
+    // and this one does not is now CLEAN, holding a manifest from phase one.
+    let mut written = 0usize;
+    for _ in 0..ROUNDS {
+        let engine = runtime.engine();
+        for index in 0..BATCH {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("quiet-hot-{:04}", (written + index) % HOT_KEYS),
+                    value: vec![b'v'; 64],
+                },
+            });
+        }
+        written += BATCH;
+        runtime.run_storage_manager_once(1, StorageManagerOptions::default());
+    }
+
+    let engine = runtime.engine();
+    let wal_records = engine
+        .write_ahead_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .map(|records| records.len())
+        .unwrap_or(0);
+    let index_records = engine
+        .index_log_store()
+        .scan(1, 0, u64::MAX, u64::MAX)
+        .map(|records| records.len())
+        .unwrap_or(0);
+
+    // The denominator: phase two has to have written enough that a frozen floor is visible as
+    // growth rather than lost in the noise of phase one.
+    assert!(
+        written >= BATCH * ROUNDS,
+        "phase two wrote {written} records, too few to tell a frozen floor from a moving one"
+    );
+    // Neither log may hold everything phase two wrote. A floor pinned by the quiet buckets from
+    // phase one cannot advance, and both logs then grow with the total.
+    assert!(
+        wal_records < written,
+        "the write-ahead log holds {wal_records} records against {written} written -- a bucket \
+         that went quiet is pinning the reclaim floor"
+    );
+    assert!(
+        index_records < written,
+        "the index log holds {index_records} records against {written} written -- a bucket that \
+         went quiet is pinning the reclaim floor"
+    );
+}
+
+/// Eviction opens its gate, because the cache it measures still exists when it looks.
+///
+/// `apply_storage_eviction` compares `eviction_memory_pressure_threshold` against the shard's
+/// cache bytes. The `reclaim_memory` stage is a blanket whole-shard cache invalidation, and it
+/// used to run FIRST -- so eviction read 0 and skipped with `memory_pressure_below_threshold`
+/// every round, whatever the threshold was. Measured over ten rounds in #1536: the gate never
+/// opened once. Eviction had never evicted anything on a default server, and `executed_stages`
+/// said "evict" either way.
+///
+/// The confusing part is the name. The `ReclaimMemory` our stage is named after CONTAINS expire
+/// and evict and invalidates no cache at all -- there, those two ARE the memory relief. Our
+/// blanket invalidation is a separate mechanism with no counterpart, so there was never an
+/// ordering to match, only an input not to destroy.
+#[test]
+fn eviction_opens_its_gate_when_the_cache_is_still_there() {
+    const KEYS: usize = 1_000;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    {
+        let engine = runtime.engine();
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("evictgate-{:06}", index),
+                    value: vec![b'v'; 128],
+                },
+            });
+        }
+        // Read everything back, so there is a populated cache for the gate to measure.
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: format!("evictgate-{:06}", index),
+                },
+            });
+        }
+    }
+
+    let warm = runtime.engine().cache().stats().memory_bytes;
+    // The denominator. With an empty cache the gate is correct to stay shut and this proves
+    // nothing about ordering.
+    assert!(
+        warm > 0,
+        "the cache held nothing after reading every key back, so the gate has nothing to measure"
+    );
+
+    // A threshold below what the fixture actually built, so a gate reading the real cache must
+    // open and a gate reading a zeroed one cannot.
+    let options = StorageManagerOptions {
+        enable_evict: true,
+        eviction_memory_pressure_threshold: warm / 4,
+        // The shipped bound pinned away: this fixture is about the WIDE gate's threshold.
+        index_resident_limit_bytes: 0,
+        ..StorageManagerOptions::default()
+    };
+    let report = runtime.run_storage_manager_once(1, options);
+    let eviction = report
+        .eviction
+        .as_ref()
+        .expect("the round ran the evict stage but carried no eviction report");
+
+    assert!(
+        eviction.pressure_gate_open,
+        "eviction did not open its gate: it measured {} against a threshold of {} on a cache \
+         holding {warm} bytes, and skipped with {:?} -- an earlier stage has zeroed what it reads",
+        eviction.pressure_before,
+        eviction.memory_pressure_threshold,
+        eviction.skipped_reason,
+    );
+}
+
+/// How long does an expired key survive when the keyspace is large? Prints.
+///
+///   cargo test -p temporalstore-rust --lib how_long_an_expired_key_survives \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// `expires_at_ms` is a `BTreeMap<String, u64>` -- keyed by KEY, with the deadline as the value --
+/// and `expiry_window` walks it in KEY order from a cursor, bounded by a scan budget. The caller
+/// then tests `expires_at <= now` on what came back. So a key whose deadline has passed is found
+/// only when the cursor happens to reach it, and every key that is NOT due is walked and charged
+/// against the same budget on the way.
+///
+/// That makes time-to-expire a function of how many keys carry deadlines, not of how many are
+/// actually due. The design being followed stores TTLs per bucket and keeps a per-bucket MINIMUM,
+/// so a whole bucket that cannot contain anything due is skipped in one comparison and never
+/// loaded.
+///
+/// This measures the consequence directly: a handful of already-expired keys hidden in a large
+/// keyspace of live ones, and how many maintenance rounds pass before they are actually removed.
+/// At 30 s a round, a round count IS a latency.
+#[test]
+#[ignore]
+fn how_long_an_expired_key_survives() {
+    const DUE_KEYS: usize = 10;
+    const MAX_ROUNDS: usize = 60;
+
+    for live_keys in [1_000usize, 10_000, 40_000] {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let runtime = DataNodeRuntime::new_without_workers_with_options(
+            engine,
+            DataNodeRuntimeOptions {
+                worker_threads: 0,
+                max_queue_depth: 4,
+                max_background_queue_depth: 2,
+            },
+        );
+        {
+            let engine = runtime.engine();
+            // Live keys with a long TTL: never due, but every one of them carries a deadline and
+            // so sits in the map the sweep walks.
+            for index in 0..live_keys {
+                engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSetEx {
+                        key: format!("live-{:08}", index),
+                        value: vec![b'v'; 32],
+                        ttl_ms: 3_600_000,
+                    },
+                });
+            }
+            // The keys under test, with a TTL that has already passed by the time the first round
+            // runs. "zzz" so they sort AFTER the live ones -- the cursor has to walk the whole
+            // live set to reach them, which is the cost being measured.
+            for index in 0..DUE_KEYS {
+                engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSetEx {
+                        key: format!("zzz-due-{:04}", index),
+                        value: vec![b'v'; 32],
+                        ttl_ms: 1,
+                    },
+                });
+            }
+        }
+
+        let options = StorageManagerOptions::default();
+        // Count what the SWEEP removed, never a read.
+        //
+        // A `StringGet` on an expired key triggers lazy expiry (`remove_if_expired`), so probing
+        // for presence would delete the very keys under measurement and make the sweep look as
+        // though it had found them. The stat counts only what the sweep itself removed.
+        let before = runtime.stats().expired_records_removed;
+        let mut rounds_until_gone: Option<usize> = None;
+        for round in 0..MAX_ROUNDS {
+            runtime.run_storage_manager_once(1, options.clone());
+            let removed = runtime
+                .stats()
+                .expired_records_removed
+                .saturating_sub(before);
+            if removed >= DUE_KEYS as u64 {
+                rounds_until_gone = Some(round + 1);
+                break;
+            }
+        }
+        match rounds_until_gone {
+            Some(rounds) => eprintln!(
+                "  live_keys={live_keys:>6}  expired after {rounds:>3} round(s)  (~{}s at 30s/round)",
+                rounds * 30
+            ),
+            None => eprintln!(
+                "  live_keys={live_keys:>6}  STILL PRESENT after {MAX_ROUNDS} rounds (~{}s)",
+                MAX_ROUNDS * 30
+            ),
+        }
+    }
+}
+
+/// An expired key is removed in a bounded number of rounds, whatever the keyspace.
+///
+/// The sweep used to walk `expires_at_ms` in KEY order from a cursor, testing deadlines as it
+/// went, so a key that was not due was still walked and charged against the round's scan budget.
+/// Time-to-expire was therefore keyspace/scan_budget rounds: ten expired keys behind 10,000 live
+/// ones survived more than sixty rounds, and behind 40,000 they survived just as long.
+///
+/// `expiry_by_deadline` orders the same deadlines by deadline, so the due keys are a PREFIX and
+/// the walk stops at the first one in the future. Measured after the change: one round at 1,000,
+/// 10,000 and 40,000 live keys alike.
+///
+/// This guards the property that matters -- that the bound does not depend on the keyspace -- by
+/// hiding the due keys behind a large live set and sorting them AFTER it, which is exactly the
+/// arrangement the key-ordered scan was worst at.
+#[test]
+fn an_expired_key_is_removed_in_a_bounded_number_of_rounds() {
+    const LIVE_KEYS: usize = 5_000;
+    const DUE_KEYS: usize = 5;
+    // Generous next to the measured 1, so this fails on a return to keyspace-proportional
+    // latency (which would need ~39 rounds at this size) and not on a round of slack.
+    const ROUND_BUDGET: usize = 3;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    {
+        let engine = runtime.engine();
+        for index in 0..LIVE_KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSetEx {
+                    key: format!("live-{index:08}"),
+                    value: vec![b'v'; 16],
+                    ttl_ms: 3_600_000,
+                },
+            });
+        }
+        // "zzz" so the due keys sort AFTER every live one: a key-ordered cursor has to traverse
+        // the whole live set to reach them.
+        for index in 0..DUE_KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSetEx {
+                    key: format!("zzz-due-{index:04}"),
+                    value: vec![b'v'; 16],
+                    ttl_ms: 1,
+                },
+            });
+        }
+    }
+
+    // Count what the SWEEP removed. A `StringGet` would expire the key lazily on the way through
+    // and make the sweep look as though it had found it.
+    let before = runtime.stats().expired_records_removed;
+    let options = StorageManagerOptions::default();
+    let mut rounds_used = 0usize;
+    for round in 0..ROUND_BUDGET {
+        runtime.run_storage_manager_once(1, options.clone());
+        rounds_used = round + 1;
+        if runtime
+            .stats()
+            .expired_records_removed
+            .saturating_sub(before)
+            >= DUE_KEYS as u64
+        {
+            break;
+        }
+    }
+
+    let removed = runtime
+        .stats()
+        .expired_records_removed
+        .saturating_sub(before);
+    assert!(
+        removed >= DUE_KEYS as u64,
+        "the sweep removed {removed} of {DUE_KEYS} expired keys in {rounds_used} round(s) behind \
+         {LIVE_KEYS} live ones -- time-to-expire is scaling with the keyspace again"
+    );
+}
+
+/// Does a compaction round cost the SHARD or the WORK? Prints.
+///
+///   cargo test -p temporalstore-rust --lib what_a_compaction_round_costs \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// #1465 gave compaction a budget of 2,048 page refs a round, and the round CONTINUES on the same
+/// slab rather than re-rolling, so the work each round does is bounded and makes progress. What
+/// that does not bound is the SCAN: the relocation walks `shard.hashes`, `shard.zsets`,
+/// `shard.lists` and `shard.sets` from the start every round, so a page already sitting on the
+/// target slab is still visited before being skipped.
+///
+/// The design being followed bounds the scan too: it walks `page_compaction_max_slots_per_round`
+/// buckets through a PERSISTENT iterator and resumes where it stopped.
+///
+/// TWO "SKIP THE ROUND" CONDITIONS WERE TRIED AND BOTH REVERTED. Both make this probe read 1 round
+/// and 0 refs at every size -- 3,430 ms down to ~650 at 32,000 keys -- and both are wrong. The
+/// suite is what refused them, and between them they map out why the check is harder than it looks.
+///
+///   1. "every live page is already on the newest slab" -- 14 tests fail. It reads slab
+///      MEMBERSHIP, so it skips a shard whose single slab is mostly garbage.
+///   2. "stale_page_estimate == 0 && live_block_slab_count <= 1" -- 3 tests fail, among them
+///      `feature_compaction_rewrites_shared_packed_block_once`. It reads dead space and spread, and
+///      still misses shards that are fully live, on one slab, and want REPACKING.
+///
+/// Compaction turns out to do three things, and a skip has to respect all of them:
+///
+///   - reclaim dead space inside slabs        (`stale_page_estimate`)
+///   - consolidate so older slabs become dead (`live_block_slab_count`)
+///   - repack page LAYOUT into shared pages   (neither metric sees this)
+///
+/// The third is the one that defeats a cheap check: `feature_compaction_rewrites_shared_packed_block_once`
+/// appends feature points that share a packed page and expects compaction to rewrite it once, with
+/// nothing dead and everything on one slab. Any real fix needs a layout signal -- something like the
+/// model layout reports compaction already produces -- not a density number.
+///
+/// The waste measured above is real and worth fixing. It is not fixable by asking a question about
+/// space alone, which is what both attempts did.
+///
+/// WHERE THE ANSWER ACTUALLY LIVES, found later: the decision is PER OBJECT and belongs to the
+/// MODEL, not to the shard. Their compactor asks one per object and skips on an empty answer:
+///
+///     auto res = ModelManager::CompactPagesHint(model_id, object_blocks[object_id]);
+///     if (block_indexes.empty()) { continue; }   // no need compaction
+///
+/// and a single-page model answers empty unconditionally -- their string model's whole
+/// implementation is `return {};` with the comment "we keep data in single page, so no need do
+/// compaction".
+///
+/// That is why all three global conditions were refused. There is no shard-wide predicate for
+/// "needs compacting", because two objects in the same shard, on the same slab, with the same
+/// staleness, get different answers depending on their model. It also explains why
+/// `feature_compaction_rewrites_shared_packed_block_once` survives a skip that a string would not:
+/// feature objects are packed across pages and genuinely have something to consolidate.
+///
+/// Ours has no such hint. `compact_shard_blocks_with_budgets` walks `strings`, `hashes`, `zsets`,
+/// `lists` and `sets` and relocates every live page, so it rewrites single-page objects that
+/// cannot benefit. Adding the hint is not a small change -- declining to relocate an object leaves
+/// its pages on the old slab, which keeps that slab live and changes what page GC may collect --
+/// but it is the shape the answer has to take, and it is not the shape either attempt above tried.
+///
+/// This measures the difference the only way that separates them -- run compaction until there is
+/// nothing left to move, then time one more round. Whatever that round costs is scan, not work. If
+/// it grows with the shard, the scan is the cost; if it is flat, the budget already bounds
+/// everything that matters and there is nothing to fix here.
+#[test]
+#[ignore]
+fn what_a_compaction_round_costs() {
+    eprintln!("  keys   converge_rounds   idle_round_ms   moved_on_idle_round");
+    for keys in [2_000usize, 8_000, 32_000] {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        for index in 0..keys {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("compactscan-{:08}", index),
+                    field: "f".to_string(),
+                    value: vec![b'v'; 64],
+                },
+            });
+        }
+
+        // Compact until a round moves nothing: that is convergence, and everything after it is
+        // pure scan.
+        let mut converge_rounds = 0usize;
+        for _ in 0..64 {
+            let report = engine
+                .compact_shard_blocks(1)
+                .expect("compaction should succeed");
+            converge_rounds += 1;
+            if report.rewritten_object_blocks == 0 {
+                break;
+            }
+        }
+
+        let started = Instant::now();
+        let idle = engine
+            .compact_shard_blocks(1)
+            .expect("compaction should succeed");
+        let idle_ms = started.elapsed().as_millis();
+        eprintln!(
+            "  {keys:>5}   {converge_rounds:>15}   {idle_ms:>13}   {:>19}",
+            idle.rewritten_object_blocks
+        );
+    }
+}
+
+/// Does compaction keep re-triggering itself on the PERIODIC path? Prints.
+///
+///   cargo test -p temporalstore-rust --lib does_compaction_retrigger_itself \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// `what_a_compaction_round_costs` shows compaction never reaching a fixed point when called
+/// directly: 64 rounds, every one relocating all 2,000 live page refs. The code says why --
+/// "a round that relocated everything closes, and the next starts fresh" -- so a completed round
+/// drops its continuation state and the next rolls a FRESH slab and moves everything again.
+///
+/// Called directly that is merely wasteful. The question that decides whether it matters is
+/// whether the PERIODIC loop keeps reaching it, because that stage only runs under
+/// `stale_block_pressure` -- and rolling a fresh slab is precisely what leaves the previous one
+/// stale. If compaction manufactures the pressure that triggers compaction, the loop rewrites the
+/// whole live set every round for ever; if the gate shuts after a round or two, the direct-call
+/// behaviour is a curiosity and not a defect.
+///
+/// WRITES NOTHING after the fixture: every round below acts on a store that is not changing, so
+/// any repeated work is the loop's own doing.
+///
+/// MEASURED, and the answer is that this probe CANNOT reach the behaviour: `compact_ran` is false
+/// on every round, with an insert-only fixture and with an overwrite-heavy one alike. The gate
+/// counts stale SLABS, not stale pages, and a couple of thousand small records fit inside one
+/// slab -- so no fixture of this size opens it.
+///
+/// What that establishes: the no-fixed-point behaviour `what_a_compaction_round_costs` measures is
+/// reachable through a DIRECT call -- the on-demand cycle and the operator compact RPC -- and is
+/// NOT demonstrated on the periodic loop. The hypothesis that compaction manufactures the
+/// stale-page pressure that re-triggers compaction is UNPROVEN, not confirmed: reaching it needs a
+/// store spanning several slabs, which this fixture deliberately does not build.
+///
+/// Left in place because the negative is worth keeping: anyone reading the direct-call numbers
+/// will want to know whether the periodic path shares them, and the answer so far is that nobody
+/// has shown it does.
+#[test]
+#[ignore]
+fn does_compaction_retrigger_itself() {
+    const KEYS: usize = 2_000;
+    const ROUNDS: usize = 12;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    {
+        let engine = runtime.engine();
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("retrigger-{:08}", index),
+                    field: "f".to_string(),
+                    value: vec![b'v'; 64],
+                },
+            });
+        }
+    }
+
+    eprintln!("  round  compact_ran  rewritten_block_refs  round_ms");
+    let options = StorageManagerOptions::default();
+    let mut rounds_that_compacted = 0usize;
+    let mut total_rewritten = 0usize;
+    for round in 0..ROUNDS {
+        let started = Instant::now();
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        let elapsed = started.elapsed().as_millis();
+        let ran = report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "compact_pages");
+        let rewritten = report
+            .compaction_report
+            .as_ref()
+            .map(|compaction| compaction.rewritten_object_blocks)
+            .unwrap_or(0);
+        if ran {
+            rounds_that_compacted += 1;
+        }
+        total_rewritten += rewritten;
+        eprintln!("  {round:>5}  {ran:>11}  {rewritten:>19}  {elapsed:>8}");
+    }
+    eprintln!(
+        "  VERDICT: compacted on {rounds_that_compacted} of {ROUNDS} rounds, \
+         {total_rewritten} page refs rewritten in total, over a store of {KEYS} that never changed"
+    );
+}
+
+/// The evict stage keeps taking batches while they still help.
+///
+/// The stage used to take ONE batch of `eviction_batch_limit` and return, however far the pressure
+/// still was from the threshold: measured at 16 victims freeing about 4,800 bytes against a
+/// 1,775,000-byte overage, roughly 370 rounds at a round every thirty seconds. The design being
+/// followed loops until usage is back under the limit and stops on a per-call COUNT budget --
+/// `evict_count_limit` 100 against a batch size of 10 -- rather than after the first batch.
+///
+/// `eviction_count_limit` is that budget. What this asserts is that a round actually spends more
+/// than one batch when the pressure warrants it, and that the report describes the STAGE rather
+/// than its final batch: returning the last report alone would show only the unproductive batch
+/// that stopped the loop and hide every victim taken before it.
+#[test]
+fn the_evict_stage_keeps_going_while_batches_still_help() {
+    const KEYS: usize = 3_000;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    {
+        let engine = runtime.engine();
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("evictloop-{index:08}"),
+                    value: vec![b'v'; 128],
+                },
+            });
+        }
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: format!("evictloop-{index:08}"),
+                },
+            });
+        }
+    }
+
+    let warm = runtime.engine().cache().stats().memory_bytes;
+    // The denominator: with an empty cache the gate stays shut and nothing below means anything.
+    assert!(
+        warm > 0,
+        "the cache held nothing after reading every key back, so eviction has nothing to work on"
+    );
+
+    let options = StorageManagerOptions {
+        enable_evict: true,
+        // A threshold far below what the fixture built, so one batch cannot possibly reach it and
+        // the loop has a reason to keep going.
+        eviction_memory_pressure_threshold: warm / 8,
+        // The shipped bound pinned away: this fixture is about the WIDE gate's threshold.
+        index_resident_limit_bytes: 0,
+        ..StorageManagerOptions::default()
+    };
+    let batch_limit = options.eviction_batch_limit;
+    let report = runtime.run_storage_manager_once(1, options);
+    let eviction = report
+        .eviction
+        .as_ref()
+        .expect("the round ran the evict stage but carried no eviction report");
+
+    assert!(
+        eviction.pressure_gate_open,
+        "eviction did not open its gate on a cache of {warm} bytes, so the loop never ran: {:?}",
+        eviction.skipped_reason
+    );
+    assert!(
+        eviction.selected_victims.len() > batch_limit,
+        "the stage took {} victims with a batch limit of {batch_limit} -- it stopped after one \
+         batch while the pressure was still {} against a threshold of {}",
+        eviction.selected_victims.len(),
+        eviction.pressure_after,
+        eviction.memory_pressure_threshold,
+    );
+}
+
+/// Does the PERIODIC loop reach compaction's wasted work? Prints.
+///
+///   cargo test -p temporalstore-rust --lib does_the_periodic_loop_reach_compaction \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// #1547 measured compaction never reaching a fixed point when called directly, and left one
+/// question open: whether the PERIODIC loop ever gets there. Two fixtures failed to open the
+/// stale-page gate and the answer was recorded as UNPROVEN.
+///
+/// This builds the condition deliberately instead of hoping for it. The gate wants a stale SLAB
+/// and `stale_block_slab_pressure` is 1, but a slab is a GiB by default, so no fixture of a
+/// reasonable size rolls one by writing. Rolling explicitly and then overwriting everything leaves
+/// the first slab holding nothing live -- which is a stale slab, cheaply.
+///
+/// Then it runs rounds over a store nobody is writing to, and reports whether compaction keeps
+/// firing. If it does, the direct-call waste is production behaviour and #1547's caveat can be
+/// closed the other way.
+#[test]
+#[ignore]
+fn does_the_periodic_loop_reach_compaction() {
+    const KEYS: usize = 400;
+    const ROUNDS: usize = 10;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    {
+        let engine = runtime.engine();
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("periodiccompact-{index:05}"),
+                    field: "f".to_string(),
+                    value: vec![b'v'; 64],
+                },
+            });
+        }
+        // Force a roll so the writes above sit on a slab that is no longer active, then rewrite
+        // every key so that slab holds nothing live at all.
+        engine
+            .block_store()
+            .roll_slab()
+            .expect("rolling a slab should succeed");
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("periodiccompact-{index:05}"),
+                    field: "f".to_string(),
+                    value: vec![b'w'; 72],
+                },
+            });
+        }
+    }
+
+    eprintln!("  round  compact_ran  rewritten_block_refs  round_ms");
+    let options = StorageManagerOptions::default();
+    let mut rounds_that_compacted = 0usize;
+    let mut total_rewritten = 0usize;
+    for round in 0..ROUNDS {
+        let started = Instant::now();
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        let elapsed = started.elapsed().as_millis();
+        let ran = report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "compact_pages");
+        let rewritten = report
+            .compaction_report
+            .as_ref()
+            .map(|compaction| compaction.rewritten_object_blocks)
+            .unwrap_or(0);
+        if ran {
+            rounds_that_compacted += 1;
+        }
+        total_rewritten += rewritten;
+        eprintln!("  {round:>5}  {ran:>11}  {rewritten:>19}  {elapsed:>8}");
+    }
+    // Does the collector take away the slab each round leaves behind? If it did, the stale
+    // pressure would clear and the next round would have no reason to run. If the count has
+    // climbed with the rounds, compaction is outrunning page GC and that is what sustains it.
+    let slabs_at_end = runtime
+        .engine()
+        .block_store()
+        .slab_ids()
+        .map(|ids| ids.len())
+        .unwrap_or(0);
+    eprintln!(
+        "  VERDICT: compacted on {rounds_that_compacted} of {ROUNDS} rounds, {total_rewritten} \
+         page refs rewritten, over a store that stopped changing before round 0; \
+         {slabs_at_end} slabs remain"
+    );
+    if rounds_that_compacted == 0 {
+        eprintln!(
+            "  NOTE: the gate still did not open, so this says nothing about the periodic path"
+        );
+    }
+}
+
+/// Does a bucket dump cost the BUCKETS it was asked for, or the whole shard? Prints.
+///
+///   cargo test -p temporalstore-rust --lib what_a_bucket_dump_costs \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// `create_bucket_dump_manifest` takes a list of buckets, and `max_dump_buckets_per_round` exists
+/// to bound how many a round takes. But the manifest is built around `export_index_bytes(shard_id)`
+/// -- the WHOLE shard index, serialised and hashed -- whatever that list contains.
+///
+/// The design being followed dumps per slot: `DumpSlotNotInMemory` reads that slot's marked pages
+/// and metas out of the index and writes them without materialising the bucket, so a dump of one
+/// slot costs one slot.
+///
+/// If the cost here is flat in the number of buckets, then bounding the round by bucket count
+/// bounds the wrong thing, and it is the same shape as the expiry scan and the compaction scan:
+/// the WORK is bounded and the SCAN is not.
+#[test]
+#[ignore]
+fn what_a_bucket_dump_costs() {
+    const KEYS: usize = 20_000;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    for index in 0..KEYS {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("dumpcost-{index:08}"),
+                value: vec![b'v'; 64],
+            },
+        });
+    }
+
+    // Which buckets exist, so the counts below ask for real ones.
+    let all_buckets = engine
+        .bucket_storage_summaries(1)
+        .into_iter()
+        .map(|summary| summary.routing_bucket)
+        .collect::<Vec<_>>();
+    eprintln!("  keys={KEYS} buckets={}", all_buckets.len());
+    eprintln!("  buckets_asked   dump_ms");
+
+    for count in [1usize, 8, 64, 512] {
+        if count > all_buckets.len() {
+            continue;
+        }
+        let selected = all_buckets.iter().copied().take(count).collect::<Vec<_>>();
+        let started = Instant::now();
+        let manifest = engine
+            .create_bucket_dump_manifest(1, selected)
+            .expect("dump should succeed");
+        let elapsed = started.elapsed().as_millis();
+        eprintln!("  {count:>13}   {elapsed:>7}");
+        // Keep the manifest alive so the work is not optimised away.
+        assert!(!manifest.manifest_id.is_empty());
+    }
+}
+
+/// Does an index-GC round cost the LOG or the records it removes? Prints.
+///
+///   cargo test -p temporalstore-rust --lib what_an_index_gc_round_costs \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// `index_gc_max_entries_per_round` bounds how many index-log records a round REMOVES -- 256 by
+/// default, reachable since #1524. What it does not bound is the read: the report opens with
+/// `scan(shard_id, 0, u64::MAX, u64::MAX)`, the whole log, every round, and there is no cursor
+/// anywhere to resume from.
+///
+/// The design being followed keeps a persistent `gc_scan_iterator_` and advances it with `Next()`
+/// for `index_gc_max_num_per_round` entries, so a round reads what it is budgeted for and the next
+/// round continues from there rather than starting over.
+///
+/// If the cost here grows with the LOG while the removal stays capped, this is the same shape as
+/// the expiry walk (#1545), the compaction scan (#1547) and the whole-shard dump (#1559): the work
+/// is bounded, the scan is not, and the knob counts the bounded half.
+#[test]
+#[ignore]
+fn what_an_index_gc_round_costs() {
+    eprintln!("  index_records   round_ms   removed");
+    for writes in [2_000usize, 8_000, 32_000] {
+        let engine = TemporalEngine::default();
+        engine.load_shard(1);
+        let runtime = DataNodeRuntime::new_without_workers_with_options(
+            engine,
+            DataNodeRuntimeOptions {
+                worker_threads: 0,
+                max_queue_depth: 4,
+                max_background_queue_depth: 2,
+            },
+        );
+        {
+            let engine = runtime.engine();
+            // Overwrite a bounded key space so records genuinely become garbage and the stage has
+            // something to remove; with distinct keys almost every record is the live version of a
+            // key and the removal would be zero for reasons that say nothing about scan cost.
+            for index in 0..writes {
+                engine.execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: format!("idxscan-{:08}", index % 500),
+                        value: vec![b'v'; 64],
+                    },
+                });
+            }
+        }
+        let before = runtime
+            .engine()
+            .index_log_store()
+            .scan(1, 0, u64::MAX, u64::MAX)
+            .map(|records| records.len())
+            .unwrap_or(0);
+
+        // Only the index stage, so the number is this stage's and not a whole round's.
+        let options = StorageManagerOptions {
+            enable_prepare: false,
+            enable_wal_reclaim: false,
+            enable_memory_reclaim: false,
+            enable_expire: false,
+            enable_block_gc: false,
+            enable_block_compaction: false,
+            enable_metrics_reap: false,
+            ..StorageManagerOptions::default()
+        };
+        let started = Instant::now();
+        runtime.run_storage_manager_once(1, options);
+        let elapsed = started.elapsed().as_millis();
+
+        let after = runtime
+            .engine()
+            .index_log_store()
+            .scan(1, 0, u64::MAX, u64::MAX)
+            .map(|records| records.len())
+            .unwrap_or(0);
+        eprintln!(
+            "  {before:>13}   {elapsed:>8}   {:>7}",
+            before.saturating_sub(after)
+        );
+    }
+}
+
+/// What does the page-GC retain floor authorise, round by round? Prints.
+///
+///   cargo test -p temporalstore-rust --lib what_the_retain_floor_authorises \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// #1563 measured eleven slabs left after ten idle rounds: compaction rolls one a round and page
+/// GC removes none, so `stale_block_pressure` never closes and compaction re-triggers for ever.
+///
+/// The floor is the first suspect. The periodic stage computes it as
+///
+///     stale_block_slab_ids.iter().min().saturating_add(1)
+///
+/// and `stale_block_slab_ids` is every slab NOT in the live set -- so the floor is derived FROM
+/// the stale set. Taking the minimum and adding one authorises deleting slabs strictly below the
+/// OLDEST stale slab, which is at most that one slab, however many are stale.
+///
+/// This prints, per round, how many slabs are stale, what floor that produces, and how many the
+/// collector actually removed. If removed stays at zero while stale climbs, the floor is not the
+/// whole story; if removed is one a round while compaction adds one, it is a treadmill.
+#[test]
+#[ignore]
+fn what_the_retain_floor_authorises() {
+    const KEYS: usize = 400;
+    const ROUNDS: usize = 10;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    {
+        let engine = runtime.engine();
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("retainfloor-{index:05}"),
+                    field: "f".to_string(),
+                    value: vec![b'v'; 64],
+                },
+            });
+        }
+        engine
+            .block_store()
+            .roll_slab()
+            .expect("rolling a slab should succeed");
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("retainfloor-{index:05}"),
+                    field: "f".to_string(),
+                    value: vec![b'w'; 72],
+                },
+            });
+        }
+    }
+
+    eprintln!("  round  slabs  stale  floor  gc_ran  removed");
+    let options = StorageManagerOptions::default();
+    for round in 0..ROUNDS {
+        let plan = runtime
+            .engine()
+            .storage_lifecycle_plan(crate::engine::reports::StorageLifecycleRequest {
+                shard_id: 1,
+                ..Default::default()
+            });
+        let stale = plan.stale_block_slab_ids.len();
+        let floor = plan
+            .stale_block_slab_ids
+            .iter()
+            .min()
+            .map(|id| id.saturating_add(1))
+            .unwrap_or(0);
+        let slabs = runtime
+            .engine()
+            .block_store()
+            .slab_ids()
+            .map(|ids| ids.len())
+            .unwrap_or(0);
+
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        let gc_ran = report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "reclaim_page");
+        let removed = report
+            .gc_report
+            .as_ref()
+            .map(|gc| gc.block_slabs_removed)
+            .unwrap_or(0);
+        eprintln!("  {round:>5}  {slabs:>5}  {stale:>5}  {floor:>5}  {gc_ran:>6}  {removed:>7}");
+    }
+}
+
+/// Why does a stale slab below the retain floor survive? Prints.
+///
+///   cargo test -p temporalstore-rust --lib why_a_stale_slab_below_the_floor_survives \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// #1564 measured the page-GC retain floor freezing at 2 while stale slabs climbed to nine and the
+/// collector removed nothing. The floor freezes because it is `min(stale) + 1`, so it cannot rise
+/// past the oldest stale slab -- but that only explains the freeze if the oldest stale slab is
+/// itself unremovable, and it sits BELOW the floor, which the formula does authorise.
+///
+/// `gc_slabs_before_with_live_refs_selected` keeps a slab below the floor for exactly two reasons,
+/// and the report names both: it is the CURRENT slab, or it is LIVE. And the periodic stage widens
+/// "live" beyond pages -- `run_gc_inner` adds every slab named by a bucket dump manifest:
+///
+///     for manifest in inner.engine.list_bucket_dump_manifests(request.shard_id) {
+///         live_block_slab_ids.extend(manifest.block_slab_ids.iter().copied());
+///     }
+///
+/// So a manifest written before compaction relocated the pages still names the OLD slabs. This
+/// separates the three: live-by-page, live-by-manifest, and current.
+#[test]
+#[ignore]
+fn why_a_stale_slab_below_the_floor_survives() {
+    const KEYS: usize = 400;
+    const ROUNDS: usize = 6;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    {
+        let engine = runtime.engine();
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("whysurvive-{index:05}"),
+                    field: "f".to_string(),
+                    value: vec![b'v'; 64],
+                },
+            });
+        }
+        engine
+            .block_store()
+            .roll_slab()
+            .expect("rolling a slab should succeed");
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("whysurvive-{index:05}"),
+                    field: "f".to_string(),
+                    value: vec![b'w'; 72],
+                },
+            });
+        }
+    }
+
+    eprintln!("  round  slabs  floor  live_by_page  live_by_manifest  manifests  removed  ret_live  ret_current");
+    let options = StorageManagerOptions::default();
+    for round in 0..ROUNDS {
+        let engine = runtime.engine();
+        let plan = engine.storage_lifecycle_plan(crate::engine::reports::StorageLifecycleRequest {
+            shard_id: 1,
+            ..Default::default()
+        });
+        let floor = plan
+            .stale_block_slab_ids
+            .iter()
+            .min()
+            .map(|id| id.saturating_add(1))
+            .unwrap_or(0);
+        let live_by_block = engine.live_block_slab_ids_all_shards();
+        let manifests = engine.list_bucket_dump_manifests(1);
+        let live_by_manifest = manifests
+            .iter()
+            .flat_map(|manifest| manifest.block_slab_ids.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        let slabs = engine
+            .block_store()
+            .slab_ids()
+            .map(|ids| ids.len())
+            .unwrap_or(0);
+
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        let gc = report.gc_report.as_ref();
+        let removed = gc.map(|g| g.block_slabs_removed).unwrap_or(0);
+        let ret_live = gc.map(|g| g.block_slabs_retained_live).unwrap_or(0);
+        eprintln!(
+            "  {round:>5}  {slabs:>5}  {floor:>5}  {:>12}  {:>16}  {:>9}  {removed:>7}  {ret_live:>8}  {:>11}",
+            live_by_block.len(),
+            live_by_manifest.len(),
+            manifests.len(),
+            "-"
+        );
+    }
+}
+
+/// An idle shard stops accumulating slabs: the collector keeps pace with compaction.
+///
+/// The page-GC retain floor is a MIN over the stale slabs, and `run_gc_inner` treats every slab
+/// named by a bucket dump manifest as live. So once a dump exists, the slab it names is stale (its
+/// pages have moved) and retained (the manifest needs it) -- and `min` sat on that slab for ever.
+/// The floor never advanced, every slab compaction rolled afterwards was above it, and the store
+/// grew a slab a round on a shard nobody was writing to: measured at eleven slabs after ten rounds,
+/// with the collector removing nothing after the first.
+///
+/// Same shape as #1516, where a reclaim frontier taken as a min over every bucket was pinned by one
+/// clean bucket. The floor now takes its min over stale slabs that are NOT manifest-pinned, so it
+/// advances past them; they stay protected by the `is_live` check that was already refusing them.
+///
+/// This asserts the property that failed: an idle shard reaches a steady slab count instead of
+/// climbing. It writes NOTHING after the fixture, so any growth is the loop's own doing.
+#[test]
+fn an_idle_shard_stops_accumulating_slabs() {
+    const KEYS: usize = 400;
+    const ROUNDS: usize = 10;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    {
+        let engine = runtime.engine();
+        for index in 0..KEYS {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("idleslabs-{index:05}"),
+                    field: "f".to_string(),
+                    value: vec![b'v'; 64],
+                },
+            });
+        }
+        // Roll, then rewrite HALF: the first slab is left holed -- some live pages, some dead --
+        // which is a stale slab for a few hundred records instead of the gigabyte a natural roll
+        // would need, and is a slab compaction can still do something about.
+        //
+        // It used to rewrite ALL of them, leaving the first slab holding nothing live. That is a
+        // slab only the COLLECTOR can act on: no object has a page there, so there is nothing for
+        // compaction to relocate off it, and the relocation hint now correctly declines the round.
+        // The assertion this test exists for is unchanged; its denominator
+        // (`compacted_rounds > 0`) is what stopped being reachable on the old fixture.
+        engine
+            .block_store()
+            .roll_slab()
+            .expect("rolling a slab should succeed");
+        for index in 0..KEYS / 2 {
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: format!("idleslabs-{index:05}"),
+                    field: "f".to_string(),
+                    value: vec![b'w'; 72],
+                },
+            });
+        }
+    }
+
+    let slabs_before = runtime
+        .engine()
+        .block_store()
+        .slab_ids()
+        .map(|ids| ids.len())
+        .unwrap_or(0);
+    let options = StorageManagerOptions::default();
+    let mut compacted_rounds = 0usize;
+    for _ in 0..ROUNDS {
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        if report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "compact_pages")
+        {
+            compacted_rounds += 1;
+        }
+    }
+    let slabs_after = runtime
+        .engine()
+        .block_store()
+        .slab_ids()
+        .map(|ids| ids.len())
+        .unwrap_or(0);
+
+    // The denominator: if compaction never ran it rolled no slabs, and a flat count would say
+    // nothing about whether the collector can keep up with it.
+    assert!(
+        compacted_rounds > 0,
+        "compaction never ran, so nothing rolled a slab and this measures an idle collector"
+    );
+    // A slab a round would be {ROUNDS} more. Steady state is a small constant; the bound is
+    // deliberately loose so this fails on GROWTH, not on one slab of slack.
+    assert!(
+        slabs_after <= slabs_before + 2,
+        "an idle shard grew from {slabs_before} to {slabs_after} slabs over {ROUNDS} rounds \
+         ({compacted_rounds} of them compacting) -- the collector is not keeping pace, so the \
+         retain floor has stopped advancing again"
+    );
+}
+/// The slab compaction vacated is COLLECTED, so an idle shard's candidate count returns to zero.
+///
+/// THE DEFECT THIS HOLDS SHUT, as measured. #1627 stopped compaction re-triggering itself and
+/// reported this half open: once the drain settles, the emptied slab is never destroyed. In every
+/// settled round, at 8,000 records and again at 80,000:
+///
+///     slabs 2, stale 1, reclaim_candidates 1, relocatable 0
+///
+/// Nothing grows, which is why it was correctly separated -- but the shard keeps a dead slab's
+/// bytes for ever and the candidate count never returns to zero, so any gate keying on it reads a
+/// permanently-open condition.
+///
+/// WHY IT SURVIVED, and it is not the retain floor. The collector RAN in every one of those
+/// rounds and refused: `run_gc_inner` holds back every slab a bucket dump manifest names, and the
+/// newest manifest still named the slab compaction had emptied. #1565 stopped exactly such a slab
+/// freezing the retain FLOOR and said in as many words that it does not make the slab deletable.
+/// A manifest is only ever replaced by a DUMP, a dump is selected from DIRTY buckets, and an idle
+/// shard has none -- so the pin was permanent. `storage_lifecycle_plan` now asks for that dump,
+/// which is the one place both copies of the maintenance round read.
+///
+/// WHAT THIS ASSERTS, IN ORDER. Both denominators first, because either one makes every later
+/// assertion pass for a reason that has nothing to do with the defect: compaction must have run,
+/// and a slab must actually have gone stale inside the window. Then the property -- no vacated
+/// slab is left standing -- which is what a reverted fix breaks. Then by which mechanism, and
+/// WHERE the bytes went: quarantine, not an unlink, which is the delayed-destroy contract the
+/// reclaim stage is written to.
+///
+/// THE PURGE NEEDS ITS AGE INJECTED. Quarantine enforces a ONE HOUR minimum, so a fixture that
+/// waits can only ever watch slabs ENTER delayed destroy; a "purged 0" column from a short run
+/// says nothing BY CONSTRUCTION. The last section calls the age-parameterised purge with 0 rather
+/// than sleeping, which is the same thing an hour later.
+///
+/// WRITES NOTHING after the fixture, so every round below acts on a store that is not changing.
+#[test]
+fn an_idle_shard_collects_the_slab_compaction_vacated() {
+    const RECORDS: usize = 1_200;
+    const ROUNDS: usize = 10;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("vacated-{index:07}"),
+                value: vec![b'v'; 128],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    // Overwrite a third, so the slab compaction drains is genuinely holed and the round it spends
+    // on it is real work rather than a proof that an empty store compacts cheaply.
+    for index in 0..RECORDS / 3 {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("vacated-{index:07}"),
+                value: vec![b'w'; 192],
+            },
+        });
+        assert!(response.status.ok, "overwrite {index}: {:?}", response.status);
+    }
+
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    let engine = runtime.engine();
+    let options = StorageManagerOptions::default();
+
+    let mut compacting_rounds = 0_usize;
+    let mut went_stale = std::collections::BTreeSet::<u64>::new();
+    let mut refresh_rounds = Vec::new();
+    let mut stale_by_round = Vec::new();
+    let mut candidates_by_round = Vec::new();
+    let mut slabs_by_round = Vec::new();
+    let mut slab_bytes_by_round = Vec::new();
+    for round in 0..ROUNDS {
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        if report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "compact_pages")
+        {
+            compacting_rounds += 1;
+        }
+        if report
+            .lifecycle_plan
+            .reasons
+            .iter()
+            .any(|reason| reason == "slot_dump_refresh_after_relocation")
+        {
+            refresh_rounds.push(round);
+        }
+        went_stale.extend(report.lifecycle_plan.stale_block_slab_ids.iter().copied());
+        stale_by_round.push(report.pressure.stale_block_slab_count);
+        candidates_by_round.push(report.pressure.reclaim_candidate_count);
+        slabs_by_round.push(engine.block_store().slab_ids().unwrap_or_default().len());
+        slab_bytes_by_round.push(
+            engine
+                .block_store()
+                .slab_block_counts()
+                .unwrap_or_default()
+                .iter()
+                .map(|(_id, physical_bytes, _count)| *physical_bytes)
+                .sum::<u64>(),
+        );
+    }
+
+    // DENOMINATORS, all three, before anything below is read as clean.
+    assert!(
+        compacting_rounds > 0,
+        "compaction never ran over {ROUNDS} rounds, so no slab was ever vacated and the clean \
+         counts below are about an idle compactor, not a working collector. slabs per round: \
+         {slabs_by_round:?}"
+    );
+    assert!(
+        !went_stale.is_empty(),
+        "no slab went stale over {ROUNDS} rounds ({compacting_rounds} of them compacting), so \
+         there was nothing for the collector to destroy and a zero here is vacuous. stale per \
+         round: {stale_by_round:?}; slabs per round: {slabs_by_round:?}"
+    );
+    // THE PROPERTY. The slab compaction emptied is gone from the store.
+    let slab_ids_after = engine.block_store().slab_ids().unwrap_or_default();
+    let still_standing = went_stale
+        .iter()
+        .copied()
+        .filter(|block_slab_id| slab_ids_after.contains(block_slab_id))
+        .collect::<Vec<_>>();
+    assert!(
+        still_standing.is_empty(),
+        "slabs {still_standing:?} were vacated by compaction and are STILL in the store after \
+         {ROUNDS} rounds with nobody writing. stale per round: {stale_by_round:?}; reclaim \
+         candidates per round: {candidates_by_round:?}; slabs per round: {slabs_by_round:?}; slab \
+         bytes per round: {slab_bytes_by_round:?}"
+    );
+
+    // AND BY WHICH MECHANISM. The property above is the whole requirement; this says the plan
+    // is what met it, so a future change that collects the slab some other way reads as a change
+    // rather than as this still working.
+    assert!(
+        !refresh_rounds.is_empty(),
+        "the vacated slab was collected, but the plan never asked for the dump that releases a \
+         manifest-pinned one -- something else reclaimed it. stale per round: {stale_by_round:?}; \
+         reclaim candidates per round: {candidates_by_round:?}"
+    );
+
+    // WHERE THE BYTES WENT: quarantine, not an unlink. The reclaim stage asks for delayed
+    // destroy so a reader holding a stale address has an hour to stop holding it, and a collector
+    // that started deleting outright would pass the assertion above while breaking that.
+    let quarantined = engine
+        .block_store()
+        .delayed_destroy_slab_ids()
+        .unwrap_or_default();
+    let unaccounted = went_stale
+        .iter()
+        .copied()
+        .filter(|block_slab_id| !quarantined.contains(block_slab_id))
+        .collect::<Vec<_>>();
+    assert!(
+        unaccounted.is_empty(),
+        "slabs {unaccounted:?} left the store without passing through delayed destroy \
+         (quarantine holds {quarantined:?}) -- they were unlinked instead of quarantined"
+    );
+
+    // THE PURGE, WITH ITS AGE INJECTED. Waiting cannot reach this: quarantine enforces an hour.
+    let quarantined_bytes = engine
+        .block_store()
+        .delayed_destroy_slab_reports()
+        .unwrap_or_default()
+        .iter()
+        .map(|report| report.physical_bytes)
+        .sum::<u64>();
+    assert!(
+        quarantined_bytes > 0,
+        "quarantine holds {quarantined:?} but zero bytes, so the purge below would release \
+         nothing and prove nothing"
+    );
+    let purge = engine
+        .block_store()
+        .purge_delayed_destroy_slabs_older_than(0)
+        .expect("purging quarantine should succeed");
+    assert_eq!(
+        purge.purged_physical_bytes, quarantined_bytes,
+        "an aged purge released {} of the {quarantined_bytes} bytes quarantine was holding: \
+         {purge:?}",
+        purge.purged_physical_bytes,
+    );
+
+    let plan_after =
+        engine.storage_lifecycle_plan(crate::engine::reports::StorageLifecycleRequest {
+            shard_id: 1,
+            ..Default::default()
+        });
+    assert!(
+        plan_after.stale_block_slab_ids.is_empty(),
+        "a settled idle shard still reports stale slabs {:?} after the vacated slab was purged",
+        plan_after.stale_block_slab_ids,
+    );
+    assert!(
+        plan_after.reclaim_candidates.is_empty(),
+        "a settled idle shard still reports {} reclaim candidates after the vacated slab was \
+         purged, so the count a future gate keys on never returns to zero: {:?}",
+        plan_after.reclaim_candidates.len(),
+        plan_after.reclaim_candidates,
+    );
+}
+
+/// An idle shard stops growing its index log, because compaction stops running on it.
+///
+/// THE DEFECT THIS HOLDS SHUT, as measured. A cadence fixture that writes 8,000 records,
+/// overwrites a third, STOPS WRITING and runs twelve maintenance rounds. `compact_pages` executed
+/// in all twelve, on a shard nobody was touching, and the index log climbed 63 bytes every one of
+/// them -- 693 bytes over eleven rounds, about 181 KB a day per idle shard at a thirty-second
+/// cadence, unbounded. The same fixture with compaction disabled grew by ZERO bytes, which is what
+/// attributes the growth: compaction relocates pages and persists a fresh index record each round,
+/// and it kept re-triggering itself because the slab it had just emptied was still a reclaim
+/// candidate, and `stale_block_pressure` counts candidates.
+///
+/// So the index log is the INDEPENDENT witness here, and it is the reason this guard asserts on
+/// bytes rather than on the stage list. A stage list can be made to look right by moving the name
+/// out of it; the log only stops growing if the work actually stopped.
+///
+/// WRITES NOTHING after the fixture. Every round below acts on a store that is not changing, so
+/// any growth is the loop's own doing.
+#[test]
+fn an_idle_shard_stops_growing_its_index_log() {
+    const RECORDS: usize = 1_200;
+    const SETTLE_ROUNDS: usize = 6;
+    const IDLE_ROUNDS: usize = 6;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("idle-index-{index:07}"),
+                value: vec![b'v'; 128],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    // Overwrite a third, so compaction has genuine garbage to reclaim and the settle rounds below
+    // are doing real work rather than proving that an empty store compacts cheaply.
+    for index in 0..RECORDS / 3 {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("idle-index-{index:07}"),
+                value: vec![b'w'; 192],
+            },
+        });
+        assert!(response.status.ok, "overwrite {index}: {:?}", response.status);
+    }
+
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    let engine = runtime.engine();
+    let options = StorageManagerOptions::default();
+
+    // Let compaction do the work it legitimately has: drain the slab the overwrites left holed.
+    // That work is bounded -- a round relocates at most COMPACTION_ROUND_BLOCK_REFS refs and this
+    // fixture's live set fits inside one round -- so the settle window does not have to be
+    // generous, only finite.
+    let mut settle_compactions = 0_usize;
+    for _ in 0..SETTLE_ROUNDS {
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        if report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "compact_pages")
+        {
+            settle_compactions += 1;
+        }
+    }
+
+    let index_log_before = engine.index_log_store().log_len_bytes(1);
+    let mut idle_rounds_that_compacted = Vec::new();
+    let mut index_log_by_round = Vec::new();
+    let mut candidates_by_round = Vec::new();
+    for round in 0..IDLE_ROUNDS {
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        if report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "compact_pages")
+        {
+            idle_rounds_that_compacted.push(round);
+        }
+        candidates_by_round.push(report.pressure.reclaim_candidate_count);
+        index_log_by_round.push(engine.index_log_store().log_len_bytes(1));
+    }
+    let index_log_after = engine.index_log_store().log_len_bytes(1);
+
+    // DENOMINATORS. Both of these can make every assertion below hold for a reason that has
+    // nothing to do with the defect.
+    assert!(
+        settle_compactions > 0,
+        "compaction never ran even while the shard had a holed slab to drain, so the flat index \
+         log below says nothing about compaction stopping -- it says the fixture never started it"
+    );
+    assert!(
+        index_log_before > 0,
+        "the index log is empty, so it cannot be observed not to grow"
+    );
+
+    assert_eq!(
+        index_log_after,
+        index_log_before,
+        "the index log of an IDLE shard grew {} bytes over {IDLE_ROUNDS} rounds ({index_log_before} \
+         -> {index_log_after}, {} a round), with nobody writing to it. Per round: \
+         {index_log_by_round:?}; reclaim candidates per round: {candidates_by_round:?}; compaction \
+         ran in rounds {idle_rounds_that_compacted:?}",
+        index_log_after.saturating_sub(index_log_before),
+        index_log_after.saturating_sub(index_log_before) / IDLE_ROUNDS as u64,
+    );
+
+    assert!(
+        idle_rounds_that_compacted.is_empty(),
+        "compaction ran again on an idle shard, in rounds {idle_rounds_that_compacted:?} of \
+         {IDLE_ROUNDS}, after {settle_compactions} settling rounds had already drained it -- it is \
+         re-triggering on its own residue"
+    );
+}
+
+/// The hint the maintenance round takes off its plan is the same answer as asking every object.
+///
+/// The round does not walk the shard to decide whether to compact -- it sums `live_page_refs`
+/// over the reclaim candidates it already built, which costs nothing. The NORMATIVE definition is
+/// the per-object one: for each object, are any of its pages on a slab someone wants emptied?
+/// This holds the cheap form to the normative one, so a change that separates them fails here
+/// rather than in a shipped round.
+///
+/// It also pins the distinction the whole fix rests on. After compaction has drained the holed
+/// slab, that slab is still a reclaim candidate -- it is nothing but dead space until the
+/// collector destroys it -- so `stale_block_pressure` is still open. The hint is nevertheless
+/// zero, because no object has a page left there. That is the difference between "this shard has
+/// stale pages" and "there is something for compaction to move", and no shard-wide predicate can
+/// express it.
+#[test]
+fn the_relocation_hint_agrees_with_the_plan_it_is_taken_from() {
+    const RECORDS: usize = 400;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("hint-agree-{index:05}"),
+                value: vec![b'v'; 128],
+            },
+        });
+    }
+    for index in 0..RECORDS / 2 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("hint-agree-{index:05}"),
+                value: vec![b'w'; 192],
+            },
+        });
+    }
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    let engine = runtime.engine();
+    let options = StorageManagerOptions::default();
+
+    let (_pressure, plan) = runtime.storage_manager_pressure_snapshot(1, &options);
+    let from_plan = crate::engine::compaction_relocatable_block_refs(&plan.reclaim_candidates);
+    let hint = engine.compaction_relocation_hint(1, &plan.reclaim_candidates);
+    assert!(
+        hint.examined_object_count > 0,
+        "the hint saw no objects at all, so agreeing on zero proves nothing: {hint:?}"
+    );
+    assert!(
+        from_plan > 0,
+        "the fixture left nothing to relocate before compaction ran, so the two forms would agree \
+         on zero for the wrong reason: {plan:?}"
+    );
+    assert_eq!(
+        from_plan, hint.relocatable_block_refs,
+        "the round's cheap form and the per-object walk disagree: {from_plan} against {hint:?}"
+    );
+
+    // Now drain it, and ask again.
+    for _ in 0..4 {
+        runtime.run_storage_manager_once(1, options.clone());
+    }
+    let (pressure_after, plan_after) = runtime.storage_manager_pressure_snapshot(1, &options);
+    let from_plan_after =
+        crate::engine::compaction_relocatable_block_refs(&plan_after.reclaim_candidates);
+    let hint_after = engine.compaction_relocation_hint(1, &plan_after.reclaim_candidates);
+    assert_eq!(
+        from_plan_after, hint_after.relocatable_block_refs,
+        "the two forms disagree once the shard is drained: {from_plan_after} against {hint_after:?}"
+    );
+    assert_eq!(
+        hint_after.relocatable_block_refs, 0,
+        "the shard was drained and nobody wrote to it, so no object should have a page on a slab \
+         worth emptying: {hint_after:?}"
+    );
+    assert!(
+        hint_after.examined_object_count > 0,
+        "the objects vanished, so the zero above is not the one this test is about: {hint_after:?}"
+    );
+    let _ = pressure_after;
+}
+
+/// Does the idle shard settle at a corpus ten times bigger? Prints, and asserts. Release only.
+///
+///   cargo test --release -p temporalstore-rust --lib an_idle_shard_settles_at_both_corpus_sizes \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// WHY A SECOND SIZE. At 8,000 records a compaction round relocates the whole live set inside
+/// COMPACTION_ROUND_BLOCK_REFS x 4 rounds, so the drain finishes fast and the shard reaches the
+/// state where the self-retrigger is visible. At 80,000 it takes about forty rounds, and a run of
+/// thirty-two never gets there: it shows source slab 0 -> destination slab 1 in every round, no
+/// fully-stale slab in any round, nothing collected, and slab bytes climbing 60%.
+///
+/// THAT IS NOT A SECOND DEFECT AND THIS SAYS SO IN COLUMNS. It is ONE bounded relocation still in
+/// progress. A round that spends its ref budget stays open and the next resumes onto the same
+/// destination slab -- which is exactly why the source and destination do not advance -- and the
+/// source slab cannot go stale until the last of its live pages has moved. The peak footprint
+/// while that happens is the live set twice over, once on each slab, and it comes back down when
+/// the drain completes and the source is collected.
+///
+/// What the two sizes have in common is the END of the drain, and that is where the defect lives:
+/// the round closes, the shard is as compact as this compactor can make it, and the next round
+/// rolls a fresh slab and moves everything again. This runs each size until the drain is done and
+/// then keeps going with NO WRITER, so the tail is what the assertions read.
+#[test]
+#[ignore]
+fn an_idle_shard_settles_at_both_corpus_sizes() {
+    for records in [8_000usize, 80_000usize] {
+        settle_one_corpus(records);
+    }
+}
+
+fn settle_one_corpus(records: usize) {
+    // Enough rounds for the drain (records / COMPACTION_ROUND_BLOCK_REFS, about 40 at 80,000) plus
+    // a tail. The loop stops early once the tail is established, so the cap only has to be big
+    // enough not to cut the drain short.
+    let max_rounds = records / 1_024 + 24;
+    const TAIL: usize = 8;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    for index in 0..records {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("settle-{index:07}"),
+                value: vec![b'v'; 128],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    for index in 0..records / 3 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("settle-{index:07}"),
+                value: vec![b'w'; 192],
+            },
+        });
+    }
+
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    let engine = runtime.engine();
+    let options = StorageManagerOptions::default();
+
+    eprintln!("  [settle] {records} records written, then NO further writes");
+    eprintln!(
+        "  [settle] {:>5} {:>7} {:>9} {:>9} {:>6} {:>12} {:>6} {:>11} {:>11} {:>10} {:>9} {:>10} \
+{:>9} {:>13}",
+        "round", "compact", "rewritten", "src->dst", "slabs", "slab_bytes", "stale", "candidates",
+        "relocatable", "idx_bytes", "collected", "quarantine", "manifests", "manifest_slabs",
+    );
+
+    let mut rounds_that_compacted = 0usize;
+    let mut last_compacting_round: Option<usize> = None;
+    let mut index_log_by_round: Vec<u64> = Vec::new();
+    let mut slab_bytes_by_round: Vec<u64> = Vec::new();
+    let mut went_stale = std::collections::BTreeSet::<u64>::new();
+    let mut rounds_run = 0usize;
+    for round in 0..max_rounds {
+        rounds_run = round + 1;
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        let compacted = report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "compact_pages");
+        if compacted {
+            rounds_that_compacted += 1;
+            last_compacting_round = Some(round);
+        }
+        let (rewritten, source, destination) = report
+            .compaction_report
+            .as_ref()
+            .map(|compaction| {
+                (
+                    compaction.rewritten_object_blocks,
+                    compaction.previous_block_slab_id,
+                    compaction.compacted_block_slab_id,
+                )
+            })
+            .unwrap_or((0, 0, 0));
+        let slab_ids = engine.block_store().slab_ids().unwrap_or_default();
+        let slab_bytes: u64 = engine
+            .block_store()
+            .slab_block_counts()
+            .unwrap_or_default()
+            .iter()
+            .map(|(_id, physical_bytes, _count)| *physical_bytes)
+            .sum();
+        let relocatable = crate::engine::compaction_relocatable_block_refs(
+            &report.lifecycle_plan.reclaim_candidates,
+        );
+        let index_log_bytes = engine.index_log_store().log_len_bytes(1);
+        index_log_by_round.push(index_log_bytes);
+        slab_bytes_by_round.push(slab_bytes);
+        // What the COLLECTOR did with the slab compaction vacated, beside what compaction did.
+        // `collected` is the reclaim stage's own count, `quarantine` is how many slabs are
+        // sitting in delayed destroy, and the two manifest columns are what used to hold the
+        // slab back: a bucket dump manifest names it, so `run_gc_inner` counts it as live.
+        let collected = report
+            .gc_report
+            .as_ref()
+            .map(|gc| gc.block_slabs_removed)
+            .unwrap_or(0);
+        let quarantined = engine
+            .block_store()
+            .delayed_destroy_slab_ids()
+            .unwrap_or_default();
+        let manifests = engine.list_bucket_dump_manifests(1);
+        let manifest_slabs = manifests
+            .iter()
+            .flat_map(|manifest| manifest.block_slab_ids.iter().copied())
+            .collect::<std::collections::BTreeSet<_>>();
+        went_stale.extend(report.lifecycle_plan.stale_block_slab_ids.iter().copied());
+        eprintln!(
+            "  [settle] {round:>5} {compacted:>7} {rewritten:>9} {:>9} {:>6} {slab_bytes:>12} \
+{:>6} {:>11} {relocatable:>11} {index_log_bytes:>10} {collected:>9} {:>10} {:>9} {:>13}",
+            format!("{source}->{destination}"),
+            slab_ids.len(),
+            report.pressure.stale_block_slab_count,
+            report.pressure.reclaim_candidate_count,
+            quarantined.len(),
+            manifests.len(),
+            format!("{manifest_slabs:?}"),
+        );
+        if round + 1 >= TAIL
+            && last_compacting_round
+                .map(|last| round.saturating_sub(last) >= TAIL)
+                .unwrap_or(false)
+        {
+            break;
+        }
+    }
+
+    // DENOMINATOR. A run where compaction never fired says nothing about it settling.
+    assert!(
+        rounds_that_compacted > 0,
+        "compaction never ran at {records} records, so this measures an idle collector and not a \
+         settled compactor"
+    );
+    let last_compacting_round =
+        last_compacting_round.expect("a compacting round, since one was counted");
+    assert!(
+        rounds_run.saturating_sub(last_compacting_round) > TAIL,
+        "compaction was still running at round {last_compacting_round} of {rounds_run} at \
+         {records} records -- the drain did not finish inside the cap, so the tail below is not a \
+         settled shard. index log per round: {index_log_by_round:?}"
+    );
+
+    let tail_first_index_log = index_log_by_round[rounds_run - TAIL];
+    let tail_last_index_log = index_log_by_round[rounds_run - 1];
+    assert_eq!(
+        tail_first_index_log,
+        tail_last_index_log,
+        "the index log of a SETTLED idle shard at {records} records grew {} bytes over the last \
+         {TAIL} rounds, with nobody writing: {index_log_by_round:?}",
+        tail_last_index_log.saturating_sub(tail_first_index_log),
+    );
+    let tail_first_slab_bytes = slab_bytes_by_round[rounds_run - TAIL];
+    let tail_last_slab_bytes = slab_bytes_by_round[rounds_run - 1];
+    assert!(
+        tail_last_slab_bytes <= tail_first_slab_bytes,
+        "slab bytes of a SETTLED idle shard at {records} records grew from {tail_first_slab_bytes} \
+         to {tail_last_slab_bytes} over the last {TAIL} rounds: {slab_bytes_by_round:?}"
+    );
+
+    // THE COLLECTOR'S HALF, which #1627 measured open and left open: the slab compaction emptied
+    // used to stand for ever, because two retained bucket dump manifests still named it and
+    // `run_gc_inner` counts a manifest-named slab as live. Measured before the fix, in EVERY
+    // settled round at both sizes: slabs 2, stale 1, candidates 1, collected 0, quarantine 0.
+    //
+    // Denominator first: a slab has to have gone stale inside the run, or "none left standing"
+    // is a statement about a shard that never vacated one.
+    assert!(
+        !went_stale.is_empty(),
+        "no slab went stale at {records} records over {rounds_run} rounds, so the collector had \
+         nothing to destroy and the assertion below would hold vacuously"
+    );
+    let slab_ids_after = engine.block_store().slab_ids().unwrap_or_default();
+    let still_standing = went_stale
+        .iter()
+        .copied()
+        .filter(|block_slab_id| slab_ids_after.contains(block_slab_id))
+        .collect::<Vec<_>>();
+    assert!(
+        still_standing.is_empty(),
+        "slabs {still_standing:?} were vacated by compaction at {records} records and are STILL \
+         in the store after {rounds_run} settled rounds with nobody writing. slab bytes per \
+         round: {slab_bytes_by_round:?}"
+    );
+    // Quarantine holds them for an hour, so purge with the age INJECTED rather than waiting --
+    // a short run can otherwise only ever watch slabs ENTER delayed destroy.
+    let purge = engine
+        .block_store()
+        .purge_delayed_destroy_slabs_older_than(0)
+        .expect("purging quarantine should succeed");
+    let plan_after =
+        engine.storage_lifecycle_plan(crate::engine::reports::StorageLifecycleRequest {
+            shard_id: 1,
+            ..Default::default()
+        });
+    eprintln!(
+        "  [settle] {records} records: compacted in {rounds_that_compacted} rounds, last at \
+{last_compacting_round}, then FLAT for {} rounds -- index log {tail_last_index_log} bytes, slab \
+bytes {tail_last_slab_bytes}, vacated {went_stale:?}, purged {:?} releasing {} bytes, reclaim \
+candidates now {}",
+        rounds_run.saturating_sub(last_compacting_round + 1),
+        purge.purged_block_slab_ids,
+        purge.purged_physical_bytes,
+        plan_after.reclaim_candidates.len(),
+    );
+    assert!(
+        plan_after.reclaim_candidates.is_empty(),
+        "a settled idle shard at {records} records still reports {} reclaim candidates once the \
+         vacated slab is purged, so the count never returns to zero: {:?}",
+        plan_after.reclaim_candidates.len(),
+        plan_after.reclaim_candidates,
+    );
+}
+
+/// A shard that has gone quiet must still be able to reclaim its log.
+///
+/// After the first maintenance round every slot is CLEAN -- the dump captured all of them -- and
+/// a clean slot holds no undumped write, so nothing in the shard needs the log retained. The
+/// plan must say so.
+///
+/// It used to say the opposite, and the OVERWRITE in this fixture is what makes it do so. An
+/// overwrite gives the slot a new generation, so the manifest the dump just wrote no longer
+/// matches its current generation fingerprint and no manifest covers it. That drops the slot into
+/// the no-manifest branch, where its `first_dirty_wal_sequence` of 0 -- set to 0 precisely
+/// BECAUSE the dump captured everything -- was read as "cannot name its claim", filed under
+/// `missing_bucket_generations`, and blocked the whole plan with
+/// `slot_generation_without_durable_dump`.
+///
+/// That is the shape #1516 removed from the manifest branch -- a slot that needs nothing deciding
+/// what the log may drop -- surviving one branch over, where it refuses outright rather than
+/// merely pinning the floor.
+///
+/// DENOMINATOR, and it has to be this one. `covered_bucket_count` counts BOTH branches, so it
+/// cannot witness which branch ran: a write-only fixture of the same size reaches
+/// `safe_to_reclaim` through the MANIFEST branch and passes every assertion below whatever the
+/// no-manifest branch does. Measured -- 2,000 records with no overwrite: covered=2000,
+/// uncovered=0, safe=true with this fix reverted. `retained_manifest_ids` is the honest witness:
+/// the manifest branch records the manifest it matched, the no-manifest branch records nothing,
+/// so an EMPTY set plus a non-zero covered count proves every slot took the branch under test.
+#[test]
+fn a_quiet_shard_with_every_bucket_clean_can_reclaim_its_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..2_000usize {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("quiet-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+    }
+    // The overwrite is load-bearing, not decoration. Without it no slot reaches the branch this
+    // test exists for.
+    for index in 0..666usize {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("quiet-{index:06}"),
+                value: vec![b'w'; 64],
+            },
+        });
+    }
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    // One round to dump everything, then the writer stops for good.
+    runtime.run_storage_manager_once(1, StorageManagerOptions::default());
+    let engine = runtime.engine();
+
+    let plan = engine.storage_wal_reclaim_plan(1, Vec::new(), Vec::new());
+
+    // DENOMINATOR, asserted before the property.
+    assert!(
+        plan.current_wal_sequence > 0,
+        "the fixture must leave records in the log, got none: {plan:?}"
+    );
+    let classified = plan
+        .covered_bucket_count
+        .saturating_add(plan.uncovered_bucket_count);
+    assert!(
+        classified > 0,
+        "the fixture must leave slots for the plan to classify, got none: {plan:?}"
+    );
+    assert!(
+        plan.retained_manifest_ids.is_empty(),
+        "every slot must reach the NO-MANIFEST branch for this test to mean anything, but {} \
+         manifest(s) were matched -- the fixture has stopped exercising the branch under test \
+         and would pass with the rule reverted: {:?}",
+        plan.retained_manifest_ids.len(),
+        plan.retained_manifest_ids,
+    );
+
+    assert!(
+        !plan
+            .blocker_reasons
+            .iter()
+            .any(|reason| reason == "slot_generation_without_durable_dump"),
+        "every slot is clean and holds no undumped write, so none of them may be reported as \
+         lacking a durable dump: blockers={:?} uncovered={} covered={}",
+        plan.blocker_reasons,
+        plan.uncovered_bucket_count,
+        plan.covered_bucket_count,
+    );
+    assert_eq!(
+        plan.uncovered_bucket_count, 0,
+        "a clean slot needs nothing retained on its behalf, so it is not uncovered: {plan:?}"
+    );
+    assert!(
+        plan.safe_to_reclaim,
+        "a quiet shard whose every slot is dumped must be reclaimable: {plan:?}"
+    );
+}
+
+/// `reclaim_wal` must not disappear from the stage list while the log is still reclaimable, and
+/// the log must actually shrink.
+///
+/// The stage list is how an operator reads whether maintenance is alive, so the two cases it must
+/// never confuse are "the log is at its floor" and "the stage stopped running". They look
+/// identical from outside: flat `persistent_bytes` either way.
+///
+/// The trigger used to be dump pressure alone -- dirty slots, or undumped records -- which a
+/// shard with no writer never has. So the stage ran in round 0 and never again, with the whole
+/// log still on disk: measured on 8,000 records over twelve rounds, 0 of 10,666 records freed and
+/// `persistent_bytes` flat at 1,344,852 for ever. With both halves fixed the same fixture falls
+/// to 33,413 on the first idle round.
+///
+/// VACUITY. A round whose plan is not reclaimable says nothing about the gate, so the count of
+/// reclaimable rounds is asserted before the gate is. Reverting the plan rule alone takes that
+/// count to zero and kills this test there; reverting the gate alone kills it below.
+#[test]
+fn the_log_reclaim_stage_keeps_running_while_the_log_is_still_reclaimable() {
+    const IDLE_ROUNDS: usize = 6;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..2_000usize {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("cadence-{index:06}"),
+                value: vec![b'v'; 64],
+            },
+        });
+    }
+    // Same reason as the test above: without an overwrite the slots keep a matching manifest and
+    // the quiet shard reclaims through the other branch entirely.
+    for index in 0..666usize {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("cadence-{index:06}"),
+                value: vec![b'w'; 64],
+            },
+        });
+    }
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    // Round 0 dumps. After it the writer is gone and every later round is an idle one.
+    let first = runtime.run_storage_manager_once(1, StorageManagerOptions::default());
+    assert!(
+        first
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "reclaim_wal"),
+        "the first round must run the stage at all: {:?}",
+        first.executed_stages
+    );
+    let bytes_after_first = runtime.engine().wal_store().stats(1).persistent_bytes;
+
+    let mut reclaimable_rounds = 0usize;
+    let mut rounds_missing_the_stage = Vec::new();
+    for round in 0..IDLE_ROUNDS {
+        let engine = runtime.engine();
+        let reclaimable = engine
+            .storage_wal_reclaim_plan(1, Vec::new(), Vec::new())
+            .safe_to_reclaim;
+        drop(engine);
+        let report = runtime.run_storage_manager_once(1, StorageManagerOptions::default());
+        if !reclaimable {
+            continue;
+        }
+        reclaimable_rounds += 1;
+        if !report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "reclaim_wal")
+        {
+            rounds_missing_the_stage.push((round, report.skipped_stages.clone()));
+        }
+    }
+    let bytes_at_end = runtime.engine().wal_store().stats(1).persistent_bytes;
+
+    // DENOMINATOR, asserted before the property. Without it, a plan that never reports the log
+    // reclaimable would make every round above vacuous and this test could not fail.
+    assert!(
+        reclaimable_rounds > 0,
+        "no idle round reported a reclaimable log, so this test proves nothing about the gate -- \
+         the plan, not the gate, is what broke"
+    );
+    assert!(
+        rounds_missing_the_stage.is_empty(),
+        "`reclaim_wal` left the stage list on {} of {reclaimable_rounds} rounds whose log was \
+         still reclaimable, which an operator reads as maintenance having died: {:?}",
+        rounds_missing_the_stage.len(),
+        rounds_missing_the_stage,
+    );
+    // The stage running is the operator-visible half; the log shrinking is the point of it.
+    assert!(
+        bytes_at_end < bytes_after_first,
+        "the idle rounds ran the stage but freed nothing: {bytes_after_first} bytes after the \
+         first round, {bytes_at_end} after {IDLE_ROUNDS} idle ones"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Eviction relieves the memory it can SEE. The bucket index was in none of the numbers that
+// decide whether a shard needs relieving, so the shard that most needed it read as the emptiest.
+// ---------------------------------------------------------------------------------------------
+
+/// A shard whose value is INDEX, not cache, is reported as carrying that memory.
+///
+/// `ShardLoad.memory_bytes` -- the figure the metaserver sums per datanode and sorts placement on
+/// -- was `cache.memory_bytes` alone. Drop the cache on a shard holding 400 records and that
+/// figure reads ZERO while the index it cannot see is still fully resident. The balancer ranked
+/// such a shard as the emptiest node in the fleet and kept sending it work, and the maintenance
+/// round never saw a reason to ask it to evict.
+///
+/// The cache is dropped FIRST and asserted at zero before any claim is made, so the number that
+/// moves below cannot be a cache number -- that is the whole point of the measurement.
+#[test]
+fn a_shard_whose_memory_is_index_not_cache_is_no_longer_reported_as_unloaded() {
+    const KEYS: usize = 400;
+    let dir = tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("indexload-{index:06}"),
+                value: vec![b'v'; 96],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    // Drop the cache FIRST. Whatever is non-zero afterwards is the index.
+    let _ = engine.cache().invalidate_shard(1);
+
+    let stats = engine.get_stats(1).stats.expect("stats for a loaded shard");
+
+    // DENOMINATORS, before any claim. Both halves of this test pass trivially on an empty shard:
+    // nothing cached and nothing indexed reads exactly like the fix working.
+    assert_eq!(
+        stats.string_records, KEYS,
+        "the fixture wrote {} of {KEYS} records, so the measurement below has no subject",
+        stats.string_records
+    );
+    assert!(
+        stats.storage.bucket_index_resident_entries > 0,
+        "no resident buckets: {} -- there is no index here to be blind to",
+        stats.storage.bucket_index_resident_entries
+    );
+    assert!(
+        stats.storage.bucket_index_resident_bytes > 0,
+        "no resident index bytes over {} buckets and {KEYS} records",
+        stats.storage.bucket_index_resident_entries
+    );
+
+    // THE DEFECT, still visible: the cache-only figure reads zero on a shard holding 400 records.
+    assert_eq!(
+        stats.cache.memory_bytes, 0,
+        "the cache did not drop, so the load figure below could be cache bytes rather than index \
+         bytes and this test would prove nothing"
+    );
+
+    // THE FIX: the reported load is non-zero, and on this fixture it is exactly the index.
+    assert!(
+        stats.load_memory_bytes() > 0,
+        "the shard still reports as holding no memory: cache={} index={}",
+        stats.cache.memory_bytes,
+        stats.storage.bucket_index_resident_bytes
+    );
+    assert_eq!(
+        stats.load_memory_bytes(),
+        stats.storage.bucket_index_resident_bytes,
+        "with the cache at zero the reported load must be the index and nothing else"
+    );
+    // And it is the same quantity the eviction gate reads, not a second opinion about it.
+    assert_eq!(
+        stats.storage.bucket_index_resident_bytes,
+        engine.bucket_index_resident_bytes(1),
+        "the published number and the gate's number disagree, which is how two numbers with one \
+         name drift apart"
+    );
+
+    // THE FLOOR AND THE PRESSURE READING ARE NOT THE SAME QUANTITY, and must not be.
+    //
+    // The floor counts NODES, which a release keeps; the pressure reading counts nodes AND the
+    // per-page entries, which a release frees. Gate on the floor and eviction appears to free
+    // nothing, so the gate re-fires for ever; publish only the pressure reading and an operator
+    // loses the figure that does not move under maintenance. If these two are ever equal on a
+    // shard with pages, one of them has stopped being what it claims.
+    assert!(
+        stats.storage.bucket_index_resident_bytes
+            > stats.storage.bucket_index_resident_bytes_floor,
+        "the node-only floor ({}) and the moving pressure reading ({}) came out equal over {} \
+         resident buckets, so they are no longer two different measurements",
+        stats.storage.bucket_index_resident_bytes_floor,
+        stats.storage.bucket_index_resident_bytes,
+        stats.storage.bucket_index_resident_entries
+    );
+
+    // The maintenance round's own snapshot tells the same story.
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    let options = StorageManagerOptions::default();
+    let (pressure, _) = runtime.storage_manager_pressure_snapshot(1, &options);
+    assert_eq!(
+        pressure.cache_memory_bytes, 0,
+        "the snapshot cache term is not zero, so the assertions below are not about the index"
+    );
+    assert_eq!(
+        pressure.bucket_index_resident_bytes, stats.storage.bucket_index_resident_bytes,
+        "the snapshot and the stats path report different index memory for one shard"
+    );
+    assert!(
+        pressure.eviction_memory_pressure_bytes >= pressure.bucket_index_resident_bytes,
+        "the eviction pressure figure ({}) does not even contain the index term ({})",
+        pressure.eviction_memory_pressure_bytes,
+        pressure.bucket_index_resident_bytes
+    );
+    assert!(
+        pressure.total_pressure_score >= pressure.bucket_index_resident_bytes,
+        "total pressure ({}) omits the index ({}), which is the term this change exists to add",
+        pressure.total_pressure_score,
+        pressure.bucket_index_resident_bytes
+    );
+
+    // `cache_memory_bytes` stays CACHE-ONLY on purpose. It gates `reclaim_memory`, which relieves
+    // memory by invalidating cached pages and cannot touch the index; folding index bytes into it
+    // would make that stage fire on a debt it has no way to pay, every round, for ever.
+    assert_ne!(
+        pressure.cache_memory_bytes, pressure.eviction_memory_pressure_bytes,
+        "the cache gate and the eviction gate have become one number; reclaim_memory will now \
+         fire on index pressure it cannot relieve"
+    );
+}
+
+/// The `evict` decision reports the number it gates on, not a copy of its own threshold.
+///
+/// The signal was built as `signal("cache_memory_bytes", eviction_memory_pressure_threshold, 1)`
+/// -- the THRESHOLD passed as the observed value, against a threshold of 1. So it read
+/// `over_threshold` on every round for every shard, said nothing about the shard, and said it
+/// under a name that was not what it held either. A readout that cannot distinguish a shard under
+/// pressure from an empty one is the readiness-report-that-cannot-fail shape.
+#[test]
+fn the_evict_decision_reports_the_pressure_it_gates_on_not_its_own_threshold() {
+    const KEYS: usize = 256;
+    const THRESHOLD: u64 = 7_919; // A prime, so a signal echoing it is unmistakable.
+    let dir = tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("decision-{index:06}"),
+                value: vec![b'v'; 96],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    let options = StorageManagerOptions {
+        enable_evict: true,
+        eviction_memory_pressure_threshold: THRESHOLD,
+        // The shipped bound pinned away: the signal this reads is published against the WIDE
+        // gate's threshold, and with the bound in force the published bar would be the bound.
+        index_resident_limit_bytes: 0,
+        ..StorageManagerOptions::default()
+    };
+    let (pressure, _) = runtime.storage_manager_pressure_snapshot(1, &options);
+    // DENOMINATOR: the observed value has to be capable of differing from the threshold, or the
+    // assertion below cannot fail whatever the code does.
+    assert!(
+        pressure.eviction_memory_pressure_bytes != THRESHOLD,
+        "the fixture pressure happens to equal the threshold ({THRESHOLD}), so this test cannot \
+         tell a reported observation from a reported threshold"
+    );
+
+    let report = runtime.run_storage_manager_once(1, options);
+    let decision = report
+        .pressure_decisions
+        .iter()
+        .find(|decision| decision.stage == "evict")
+        .unwrap_or_else(|| {
+            panic!(
+                "no evict decision in {:?}",
+                report
+                    .pressure_decisions
+                    .iter()
+                    .map(|decision| decision.stage.clone())
+                    .collect::<Vec<_>>()
+            )
+        });
+    let signal = decision
+        .signals
+        .iter()
+        .find(|signal| signal.name == "eviction_memory_pressure_bytes")
+        .unwrap_or_else(|| {
+            panic!(
+                "no eviction_memory_pressure_bytes signal in {:?}",
+                decision
+                    .signals
+                    .iter()
+                    .map(|signal| signal.name.clone())
+                    .collect::<Vec<_>>()
+            )
+        });
+    assert_eq!(
+        signal.threshold, THRESHOLD,
+        "the evict signal is compared against something other than the eviction threshold"
+    );
+    assert_ne!(
+        signal.observed, THRESHOLD,
+        "the evict signal is still reporting its own threshold as the observation"
+    );
+    assert!(
+        signal.observed > 0,
+        "the evict signal observed nothing on a shard holding {KEYS} records"
+    );
+    let index_signal = decision
+        .signals
+        .iter()
+        .find(|signal| signal.name == "bucket_index_resident_bytes")
+        .expect("the index term must be reported on the one stage that can release it");
+    assert!(
+        index_signal.observed > 0,
+        "the index term reads zero on a shard holding {KEYS} records"
+    );
+    assert!(
+        signal.observed >= index_signal.observed,
+        "the eviction pressure ({}) does not contain the index term ({})",
+        signal.observed,
+        index_signal.observed
+    );
+}
+
+/// WHY DEFAULTING THE NINTH STAGE ON IS NOT THE SAME CHANGE AS OPENING ITS GATE, measured.
+///
+/// RESTATED TWICE NOW, NOT RE-GOLDENED, and the history is the argument. This test was
+/// `enable_evict_stays_off_because_its_neighbouring_defaults_would_evict_at_zero_pressure`, then
+/// `enable_evict_stays_off_because_its_gate_reads_other_shards_memory`. It held THREE objections to
+/// flipping `enable_evict` on, in that order, and every one of them has now been settled -- two
+/// retired by work done since, and the third, which is the one that STILL STANDS, settled by not
+/// flipping that flag on its own.
+///
+///   1  `eviction_dump_before_evict` WAS FALSE, so "an evicted dirty bucket keeps pinning the log
+///      it was never written out of". RETIRED: the dump defaults true, on the measurement this
+///      test's own prose asked for -- a release without a dump refuses every candidate (16 of 16,
+///      0 released, in
+///      `data_node::tests::evict_live::what_the_dump_costs_and_which_half_recovers_the_index`).
+///
+///   2  THE GATE'S SIGNAL WAS MOSTLY OTHER SHARDS' MEMORY -- process-wide cache terms from
+///      `MultiLayerCache::stats()` summed with one per-shard index term, so a ten-key shard's gate
+///      read a busy shard's cache and no constant threshold was both safe and effective. RETIRED by
+///      the narrowing: `apply_storage_eviction`'s gate now reads `bucket_index_resident_bytes(shard_id)`
+///      and nothing else, which `the_evict_gate_reads_only_this_shards_own_bytes` is the gate on.
+///      The figures the old prose quoted here belonged to the wide signal and are not restated,
+///      because the signal they measured no longer exists.
+///
+///   3  THE THRESHOLD IS STILL 0, documented as "0 evicts whenever it runs". The gate is
+///      `pressure_before < threshold`, false for every shard that has ever held a record, so the
+///      gate cannot close. THIS OBJECTION IS UNCHANGED, and it is what this test measures.
+///
+/// SO THE CONCLUSION MOVED WITHOUT OBJECTION 3 MOVING. A change that flipped only `enable_evict`
+/// would ship an always-open gate: every loaded shard releasing buckets on every round of the
+/// periodic loop, at a default interval of 30 s, whatever its actual pressure. The change that did
+/// ship pairs the flag with a non-zero `index_resident_limit_bytes`, and the loop takes the HIGHER
+/// of the two bars -- so the bar in force is 64 MiB of this shard's own resident index, not 0, and
+/// the gate closes on every shard under it.
+///
+/// THE TWO ARMS ARE THEREFORE THE TWO CANDIDATE CHANGES, on one fixture under no pressure anyone
+/// would act on:
+///
+///   control    the SHIPPED pair      -> the stage runs, opens the BOUND, and releases nothing
+///   treatment  flip ONLY the flag    -> the gate cannot close, and the round takes victims
+///
+/// The treatment is the finding: it is the measured reason the flag does not ship alone. The
+/// control is what makes it a finding rather than an argument about an unshipped configuration.
+#[test]
+fn the_change_that_moves_only_this_flag_cannot_close_its_gate() {
+    let defaults = StorageManagerOptions::default();
+
+    // The defaults are a DECISION, pinned here so a later edit to the `Default` impl has to come
+    // past this test and its reasoning rather than sliding through as a tidy-up.
+    assert!(
+        defaults.enable_evict,
+        "enable_evict defaults off again; the pairing below is what made ON safe, so revisit both \
+         rather than deleting this assertion"
+    );
+    assert_eq!(
+        defaults.eviction_memory_pressure_threshold, 0,
+        "the eviction threshold is no longer 0, which retires objection 3 above -- the one the \
+         treatment arm below measures. Restate this test against the new threshold rather than \
+         deleting the assertion"
+    );
+    assert!(
+        defaults.index_resident_limit_bytes > defaults.eviction_memory_pressure_threshold,
+        "the bound ({}) is no longer the higher bar over the threshold ({}), so the shipped pair \
+         IS the treatment arm below: an always-open gate on every loaded shard",
+        defaults.index_resident_limit_bytes,
+        defaults.eviction_memory_pressure_threshold
+    );
+    // RESTATED. This asserted `!defaults.eviction_dump_before_evict` and told a future reader to
+    // revisit the enable_evict default if it ever turned on. It has turned on, on the evidence the
+    // doc above names, so the assertion now pins the NEW decision in the same shape: the dump
+    // default is a decision, and moving it again has to come past this test.
+    assert!(
+        defaults.eviction_dump_before_evict,
+        "dump-before-evict no longer defaults on. It was defaulted on because a release WITHOUT a \
+         dump refuses every candidate and releases nothing -- 16 of 16 refused, measured -- so \
+         turning it back off makes `enable_evict` a stage that pays a whole-store walk to recover \
+         nothing. Revisit that measurement rather than deleting this assertion"
+    );
+
+    // THE MEASUREMENT. A shard under no memory pressure anyone would act on.
+    const KEYS: usize = 64;
+    let dir = tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("zeropressure-{index:06}"),
+                value: vec![b'v'; 32],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+
+    // CONTROL, RESTATED: the shipped default REACHES the stage -- it is on -- and the stage
+    // declines, because the bound is the bar. This used to assert `evict_disabled`.
+    let shipped = runtime.run_storage_manager_once(1, StorageManagerOptions::default());
+    let shipped_eviction = shipped
+        .eviction
+        .as_ref()
+        .expect("the ninth stage ships on, so the shipped round reports it");
+    assert_eq!(
+        shipped_eviction.mode, "index_resident_bound",
+        "the shipped default opened the wide gate rather than the bound: mode={} skipped={:?} \
+         executed={:?}",
+        shipped_eviction.mode, shipped.skipped_stages, shipped.executed_stages
+    );
+    assert_eq!(
+        shipped_eviction.skipped_reason, "index_resident_below_bound",
+        "the shipped default acted on a {KEYS}-record shard under no pressure: reason={:?}",
+        shipped_eviction.skipped_reason
+    );
+    assert!(
+        shipped_eviction.selected_victims.is_empty(),
+        "the shipped default took {} victims from a {KEYS}-record shard",
+        shipped_eviction.selected_victims.len()
+    );
+
+    // TREATMENT: the change that flips ONLY `enable_evict` and leaves the bound at 0, which is
+    // what "default the ninth stage on" means if it is done by itself.
+    let would_be_default = StorageManagerOptions {
+        enable_evict: true,
+        index_resident_limit_bytes: 0,
+        ..StorageManagerOptions::default()
+    };
+    let (pressure, _) = runtime.storage_manager_pressure_snapshot(1, &would_be_default);
+    let report = runtime.run_storage_manager_once(1, would_be_default);
+    let eviction = report
+        .eviction
+        .as_ref()
+        .expect("the evict stage must report when it is enabled");
+
+    // PROOF THE TREATMENT RAN, before reading anything out of it.
+    assert!(
+        report.executed_stages.iter().any(|stage| stage == "evict"),
+        "the evict stage did not run, so nothing below measures eviction: executed={:?}",
+        report.executed_stages
+    );
+    assert_eq!(
+        eviction.memory_pressure_threshold, 0,
+        "this round did not use the default threshold, so it is not the round a default-on change \
+         would produce"
+    );
+
+    // AND THE FINDING. With a threshold of 0 the gate cannot close: the comparison is
+    // `pressure_before < 0`, which is false for every shard that has ever existed.
+    assert!(
+        eviction.pressure_gate_open,
+        "the gate declined at threshold 0, which would make this objection moot -- recheck it"
+    );
+    assert_eq!(
+        eviction.skipped_reason, "",
+        "the stage skipped for {:?} rather than evicting, so it did not act at zero pressure",
+        eviction.skipped_reason
+    );
+    assert!(
+        !eviction.selected_victims.is_empty(),
+        "the round took no victims, so default-on would be harmless here and this objection needs \
+         a different fixture: pressure={} threshold={}",
+        eviction.pressure_before,
+        eviction.memory_pressure_threshold
+    );
+    // RESTATED, AND THE RESTATEMENT IS THE POINT. This used to assert `!eviction.dump_before_evict`
+    // and an EMPTY manifest list, and its comment read "a dirty bucket evicted this way keeps
+    // pinning the log it was never written out of". That was true of the round the old defaults
+    // produced. The dump default has moved, so the round a default-on change would produce now
+    // carries the dump flag -- the objection retired, asserted here rather than deleted, so that
+    // turning the dump back off fails HERE as well as on the pinned default above.
+    assert!(
+        eviction.dump_before_evict,
+        "the round a default-on change would produce does not dump first, so the dump default has \
+         moved back and the 'dirty bucket keeps pinning the log' objection is live again"
+    );
+    // AND NO MANIFEST, FOR A REASON THAT IS ASSERTED RATHER THAN ASSUMED. The first restatement of
+    // this test asserted a manifest MUST appear now that the dump defaults on, and it failed here:
+    // 64 victims, dump on, no manifest. The reason is this fixture's own shape, not a broken
+    // default. `create_bucket_dump_manifest` is called only for victims with
+    // `dirty_object_count > 0`, and the CONTROL round above is a full default round -- prepare and
+    // the dump stages included -- so it has already written these buckets out. By the time the
+    // treatment round picks victims they are clean, and a clean bucket has nothing to dump.
+    //
+    // So the honest assertion is the mechanism: every victim is clean, THEREFORE no manifest. That
+    // fails if either half stops being true, and it does not claim a manifest the fixture cannot
+    // produce. The pin on the default itself is `eviction.dump_before_evict` above.
+    let dirty_victims = eviction
+        .selected_victims
+        .iter()
+        .filter(|victim| victim.dirty_object_count > 0)
+        .count();
+    assert_eq!(
+        dirty_victims, 0,
+        "{dirty_victims} of {} victims are dirty, so this round DID have something to dump and the \
+         empty manifest list below is a defect rather than a property of the fixture",
+        eviction.selected_victims.len()
+    );
+    assert!(
+        eviction.dump_manifest_ids.is_empty(),
+        "a dump manifest appeared for {} victims none of which is dirty: {:?}",
+        eviction.selected_victims.len(),
+        eviction.dump_manifest_ids
+    );
+    eprintln!(
+        "  [evict-default] flipping only enable_evict: threshold={} pressure_before={} \
+victims={} dump_manifests={} (no victim is dirty, so there is nothing to dump) -- the gate STILL \
+opens on a shard nobody asked to relieve, because the threshold is {} (snapshot \
+eviction_memory_pressure_bytes={})",
+        eviction.memory_pressure_threshold,
+        eviction.pressure_before,
+        eviction.selected_victims.len(),
+        eviction.dump_manifest_ids.len(),
+        eviction.memory_pressure_threshold,
+        pressure.eviction_memory_pressure_bytes,
+    );
+}
+
+/// What turning it on WOULD buy, and the bar it would have to clear: the periodic loop relieves
+/// INDEX memory and still serves every key.
+///
+/// This is the half of the default decision that is not an objection. The mechanism works: given
+/// a threshold below the shard's real pressure and dump-before-evict on, one round of the loop
+/// releases buckets, the resident index falls, the node-only floor does NOT, and all 400 keys
+/// still read back byte-for-byte through the released buckets.
+///
+/// The reads are COLD -- the cache is invalidated after the round -- because the first version of
+/// the release served every warm read and returned `None` for every cold one. And each value is a
+/// function of its key, so a read that resolved through the WRONG page fails here rather than
+/// passing on a lucky length.
+#[test]
+fn the_periodic_loop_relieves_index_memory_and_still_serves_every_key() {
+    const KEYS: usize = 400;
+    const VALUE_LEN: usize = 96;
+
+    fn keyed_value(index: usize) -> Vec<u8> {
+        let mut value = format!("{index:06}:").into_bytes();
+        value.resize(VALUE_LEN, b'v');
+        value[VALUE_LEN - 1] = (index % 251) as u8;
+        value
+    }
+
+    let dir = tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        16 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    for index in 0..KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("loopevict-{index:06}"),
+                value: keyed_value(index),
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    let engine = runtime.engine();
+
+    // Drop the cache FIRST, so the index bytes below are not cache bytes wearing a new label.
+    let _ = engine.cache().invalidate_shard(1);
+    let index_before = engine.bucket_index_resident_bytes(1);
+    let floor_before = engine
+        .get_stats(1)
+        .stats
+        .expect("stats for a loaded shard")
+        .storage
+        .bucket_index_resident_bytes_floor;
+    // DENOMINATORS.
+    assert!(
+        index_before > 0,
+        "the fixture left no resident index to relieve"
+    );
+    assert!(floor_before > 0, "the fixture left no resident nodes");
+    assert!(
+        engine.released_bucket_index_buckets(1).is_empty(),
+        "the fixture started with buckets already released, so a release below proves nothing"
+    );
+
+    // A threshold BELOW the shard's real pressure, and dump-before-evict on -- the two settings
+    // the shipped defaults do not have. The dump IS now a shipped default; the threshold of 1 is
+    // not, and the shipped BOUND is pinned away because at 64 MiB this 400-key shard declines
+    // under it and releases nothing, which is the opposite of what this test measures.
+    let options = StorageManagerOptions {
+        enable_evict: true,
+        eviction_dump_before_evict: true,
+        eviction_memory_pressure_threshold: 1,
+        index_resident_limit_bytes: 0,
+        ..StorageManagerOptions::default()
+    };
+    let report = runtime.run_storage_manager_once(1, options);
+    assert!(
+        report.executed_stages.iter().any(|stage| stage == "evict"),
+        "the evict stage did not run: executed={:?} skipped={:?}",
+        report.executed_stages,
+        report.skipped_stages
+    );
+
+    let released = engine.released_bucket_index_buckets(1);
+    assert!(
+        !released.is_empty(),
+        "one round of the loop released no buckets, so no index memory could have been relieved"
+    );
+    let index_after = engine.bucket_index_resident_bytes(1);
+    assert!(
+        index_after < index_before,
+        "the round freed no INDEX memory: {index_before} -> {index_after} over {} released buckets",
+        released.len()
+    );
+
+    // THE FLOOR DID NOT MOVE, which is exactly why the pressure reading has to be a different
+    // number. Gate on the floor and this round would read as having freed nothing.
+    let floor_after = engine
+        .get_stats(1)
+        .stats
+        .expect("stats for a loaded shard")
+        .storage
+        .bucket_index_resident_bytes_floor;
+    assert_eq!(
+        floor_after, floor_before,
+        "the node-only floor moved on a release, so it is no longer the stable measurement"
+    );
+
+    // COLD reads. The warm path served correctly even when the cold one did not.
+    let _ = engine.cache().invalidate_shard(1);
+    let mut read = 0usize;
+    let mut matched = 0usize;
+    for index in 0..KEYS {
+        read += 1;
+        let value = match runtime
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: format!("loopevict-{index:06}"),
+                },
+            })
+            .response
+        {
+            CommandResponse::Bytes { value } => value,
+            other => panic!("a string read answered {other:?}"),
+        };
+        assert_eq!(
+            value,
+            Some(keyed_value(index)),
+            "key {index} did not read back through a released bucket"
+        );
+        matched += 1;
+    }
+    assert_eq!(read, KEYS, "the read-back loop did not run {KEYS} times");
+    assert_eq!(matched, KEYS, "only {matched} of {read} keys matched");
+    eprintln!(
+        "  [evict-loop] released {} buckets; index {index_before} -> {index_after} bytes \
+(floor unchanged at {floor_before}); {matched}/{read} keys read back cold",
+        released.len()
+    );
+}
+
+
+
+// ---------------------------------------------------------------------------
+// A dump manifest must hold back every slab the index it installs will need.
+// ---------------------------------------------------------------------------
+
+/// Buckets the slabpin fixture spreads over. Small on purpose, for the same reason #1642's
+/// fixture is: picking keys that land in one chosen bucket of the whole u32 routing space costs
+/// millions of candidate hashes, and the question here is untouched by how finely the shard is
+/// cut.
+const SLABPIN_BUCKETS: u32 = 8;
+
+fn slabpin_load(engine: &TemporalEngine, shard_id: ShardId) {
+    engine.load_shard_with(LoadShardRequest {
+        shard_id,
+        load_version: 0,
+        local_node_id: None,
+        shard_uri: String::new(),
+        start_routing_bucket: 0,
+        end_routing_bucket: SLABPIN_BUCKETS - 1,
+        readonly: false,
+        table_name: String::new(),
+    });
+}
+
+/// Big enough that the page lives in a block slab rather than inside its log record. A value small
+/// enough to ride in the log is served from the log whatever the slabs hold, which would make
+/// every count below say nothing about slabs.
+fn slabpin_value(key: &str) -> Vec<u8> {
+    let mut value = format!("value-{key}-").into_bytes();
+    value.resize(4096, b'v');
+    value
+}
+
+fn slabpin_write(engine: &TemporalEngine, shard_id: ShardId, key: &str) {
+    let response = engine.execute(ExecuteRequest {
+        shard_id,
+        command: Command::StringSet {
+            key: key.to_string(),
+            value: slabpin_value(key),
+        },
+    });
+    assert!(response.status.ok, "write {key} failed: {response:?}");
+}
+
+fn slabpin_reads_back(engine: &TemporalEngine, shard_id: ShardId, key: &str) -> bool {
+    let response = engine.execute(ExecuteRequest {
+        shard_id,
+        command: Command::StringGet {
+            key: key.to_string(),
+        },
+    });
+    response.response
+        == (CommandResponse::Bytes {
+            value: Some(slabpin_value(key)),
+        })
+}
+
+/// Install `manifest` into a target holding the shared page slabs and nothing else, and count the
+/// two halves separately. NOTHING IS READ BEFORE THE INSTALL: a read answers out of the per-key
+/// response cache, so a probe taken while the shard is still empty caches a MISS for that key and
+/// every read after the install returns it -- which reads exactly like a loss, on both halves at
+/// once. That cost two wrong readings of this fixture.
+fn slabpin_restore_counts(
+    label: &str,
+    dir: &std::path::Path,
+    blocks_dir: &std::path::Path,
+    manifest: &BucketDumpManifest,
+    shard_id: ShardId,
+    named_keys: &[String],
+    outside_keys: &[String],
+) -> (bool, usize, usize) {
+    let restored = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.join(format!("{label}-cache")),
+        blocks_dir,
+        dir.join(format!("{label}-indexes")),
+    );
+    assert!(
+        restored.list_bucket_dump_manifests(shard_id).is_empty(),
+        "the {label} restore target was handed a manifest it was supposed to recover without"
+    );
+    slabpin_load(&restored, shard_id);
+    let installed = restored.install_bucket_dump_manifest(manifest).is_ok();
+    let named = named_keys
+        .iter()
+        .filter(|key| slabpin_reads_back(&restored, shard_id, key))
+        .count();
+    let outside = outside_keys
+        .iter()
+        .filter(|key| slabpin_reads_back(&restored, shard_id, key))
+        .count();
+    (installed, named, outside)
+}
+
+/// The collector holds back the slabs a manifest NAMES; the manifest installs a WHOLE-SHARD index.
+///
+/// THE TWO SCOPES THAT DISAGREE. A bucket dump manifest carries `index_bytes` -- the whole-shard
+/// index. #1642 measured that and proved it has to stay whole: install writes the decoded index as
+/// THE durable index for the shard, retention keeps the newest manifest and nothing else, and a
+/// manifest carrying only its own buckets would install a shard missing every bucket it did not
+/// name (measured there: 5/5 named, 0/8 unnamed). It also carries `block_slab_ids`, and that was
+/// only the slabs behind the DUMPED buckets' live page refs.
+///
+/// `block_slab_ids` is the whole of what the collector holds back -- `run_gc_inner` extends its
+/// live slab set with it, `storage_block_gc_dependency_plan` blocks on it, and the page-GC retain
+/// floor steps over it. So a slab holding nothing but UNNAMED-bucket pages was pinned by nothing.
+/// Compaction relocates those pages onto a fresh slab, the old one goes stale, the sweep destroys
+/// it, and the manifest's embedded index still points at it. Neither `validate_bucket_dump_manifest`
+/// nor the install preflight objects, because both filter what they probe down to `bucket_ids`.
+///
+/// MEASURED, BEFORE THE FIX: install still returns Ok, the bucket the manifest NAMES restores
+/// 5/5, and the buckets it does not name restore 0/8.
+///
+/// WHAT THIS BUILDS, and every step of it is load-bearing. The unnamed buckets' keys are written
+/// FIRST, then the slab is rolled, then the named bucket's keys: that is what puts the two halves
+/// on DIFFERENT slabs. Without the roll every slab holds both halves, every slab is named, and the
+/// hazard is unreachable -- so the separation is a denominator, asserted before anything is read.
+///
+/// WHAT IT ASSERTS, IN ORDER. The denominators first, because each one makes every later count
+/// pass for a reason that has nothing to do with the defect: the dump named ONE bucket, the shard
+/// holds others, the two halves are on disjoint slabs, compaction actually vacated the unnamed
+/// half's slabs, and -- the control -- the SAME manifest restores both halves before anything is
+/// collected. Then the property, counting the NAMED and the UNNAMED buckets SEPARATELY: #1642 and
+/// #1637 both found defects where the named half read full and hid a zero in the other half. Then
+/// by which mechanism, which is that the sweep kept the unnamed half's slabs because the manifest
+/// now names them.
+#[test]
+fn a_dump_manifest_holds_back_the_slabs_its_whole_shard_index_will_install() {
+    const SHARD: ShardId = 4;
+    const IN_NAMED: usize = 5;
+    const OUTSIDE: usize = 8;
+    const COMPACTION_ROUNDS: usize = 8;
+
+    let dir = tempfile::tempdir().unwrap();
+    let blocks_dir = dir.path().join("blocks");
+    let source_index_dir = dir.path().join("indexes");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        &blocks_dir,
+        &source_index_dir,
+    );
+    slabpin_load(&engine, SHARD);
+    let named_bucket = engine.routing_bucket_for_key(SHARD, "named-0");
+
+    let mut named_keys = Vec::new();
+    let mut outside_keys = Vec::new();
+    let mut candidate = 0usize;
+    while named_keys.len() < IN_NAMED || outside_keys.len() < OUTSIDE {
+        let key = format!("named-{candidate}");
+        if engine.routing_bucket_for_key(SHARD, &key) == named_bucket {
+            if named_keys.len() < IN_NAMED {
+                named_keys.push(key);
+            }
+        } else if outside_keys.len() < OUTSIDE {
+            outside_keys.push(key);
+        }
+        candidate += 1;
+    }
+
+    // The unnamed buckets' pages go on the slab the store is filling now.
+    for key in outside_keys.iter() {
+        slabpin_write(&engine, SHARD, key);
+    }
+    let outside_slabs = engine
+        .live_block_slab_ids(SHARD)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    // Roll, so the named bucket's pages land somewhere else. This is what makes a slab holding
+    // ONLY unnamed-bucket pages exist at all.
+    engine.block_store().roll_slab().expect("roll a fresh slab");
+    for key in named_keys.iter() {
+        slabpin_write(&engine, SHARD, key);
+    }
+    let named_slabs = engine
+        .live_block_slab_ids(SHARD)
+        .into_iter()
+        .filter(|slab| !outside_slabs.contains(slab))
+        .collect::<BTreeSet<_>>();
+
+    let manifest = engine
+        .create_bucket_dump_manifest(SHARD, vec![named_bucket])
+        .expect("a dump of one bucket should persist");
+
+    // DENOMINATORS. Each one makes everything below vacuous if it does not hold.
+    assert_eq!(
+        manifest.bucket_ids,
+        vec![named_bucket],
+        "the dump was supposed to name ONE bucket and named {:?}; a dump naming every bucket \
+         satisfies everything below without testing anything",
+        manifest.bucket_ids
+    );
+    let shard_buckets = engine
+        .bucket_storage_summaries(SHARD)
+        .into_iter()
+        .map(|summary| summary.routing_bucket)
+        .collect::<BTreeSet<_>>();
+    let unnamed_bucket_count = shard_buckets
+        .iter()
+        .filter(|bucket| **bucket != named_bucket)
+        .count();
+    assert!(
+        unnamed_bucket_count > 0,
+        "every key landed in the dumped bucket, so there are no unnamed buckets to lose (shard \
+         holds buckets {shard_buckets:?}, the dump named {named_bucket})"
+    );
+    assert!(
+        !outside_slabs.is_empty() && !named_slabs.is_empty(),
+        "the roll did not separate the two halves: the unnamed buckets sit on {outside_slabs:?} \
+         and the named bucket on {named_slabs:?}. Sharing a slab makes the manifest name it and \
+         the hazard cannot arise"
+    );
+
+    // THE CONTROL, taken before anything is compacted or swept: the same manifest, installed into
+    // a target holding the shared pages and nothing else, restores BOTH halves. Without it a zero
+    // after the sweep says only that this fixture cannot restore, not that the sweep lost data.
+    let control = slabpin_restore_counts(
+        "control",
+        dir.path(),
+        &blocks_dir,
+        &manifest,
+        SHARD,
+        &named_keys,
+        &outside_keys,
+    );
+    assert_eq!(
+        control,
+        (true, IN_NAMED, OUTSIDE),
+        "the manifest could not restore its own shard before anything was collected \
+         (installed, named, unnamed) = {control:?}, so the counts after the sweep would be \
+         measuring a broken fixture"
+    );
+
+    // COMPACTION, WITH THE ROUNDS COMPUTED FROM THE BUDGET.
+    //
+    // A round relocates at most COMPACTION_ROUND_BLOCK_REFS (2,048) page refs and
+    // COMPACTION_ROUND_BYTES (256 MiB), then stops and leaves the rest to the next one. So the
+    // rounds this fixture needs is ceil(live_page_refs / 2,048), and at IN_NAMED + OUTSIDE = 13
+    // refs that is ONE. This runs COMPACTION_ROUNDS of them -- more than the work needs -- and
+    // checks `pages_left_by_budget` per round, which is what actually says a round FINISHED.
+    // Waiting for a round to relocate nothing never arrives: each round rolls a fresh slab and
+    // moves every live page onto it, so a settled shard still reports a full round's work. That
+    // is what the periodic path's relocation hint is for, and calling compaction directly does
+    // not consult it.
+    let live_block_refs = engine
+        .bucket_storage_summaries(SHARD)
+        .iter()
+        .map(|summary| summary.block_ref_count)
+        .sum::<u64>();
+    let rounds_needed = live_block_refs.div_ceil(2_048).max(1) as usize;
+    assert!(
+        COMPACTION_ROUNDS > rounds_needed,
+        "the fixture holds {live_block_refs} live page refs, which needs {rounds_needed} \
+         compaction round(s); running only {COMPACTION_ROUNDS} would leave pages behind, and a \
+         short run looks exactly like a settled one"
+    );
+    let mut relocated_total = 0usize;
+    for round in 0..COMPACTION_ROUNDS {
+        let report = engine
+            .compact_shard_blocks(SHARD)
+            .expect("compaction should succeed");
+        relocated_total += report.rewritten_block_refs;
+        assert_eq!(
+            report.blocks_left_by_budget, 0,
+            "compaction round {round} stopped on its budget, so the shard is half-moved and the \
+             sweep below acts on it"
+        );
+    }
+    assert!(
+        relocated_total > 0,
+        "compaction relocated nothing over {COMPACTION_ROUNDS} rounds, so no slab was vacated and \
+         every count below is about an idle compactor"
+    );
+    let live_after_compaction = engine
+        .live_block_slab_ids(SHARD)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let still_live = outside_slabs
+        .intersection(&live_after_compaction)
+        .count();
+    assert_eq!(
+        still_live, 0,
+        "compaction left {still_live} of the unnamed buckets' slabs {outside_slabs:?} live (live \
+         now {live_after_compaction:?}), so nothing went stale and only a pin can be tested when \
+         there is something to pin"
+    );
+
+    // THE SWEEP. The same aggressive operator sweep the /gc guard earlier in this file pins:
+    // `run_gc_inner` keeps the live set plus every slab a durable manifest names, and nothing
+    // else -- this is the complement of that guard, on the half it does not cover. The log
+    // frontiers stay unset because the restore target below holds no log of its own -- the dump
+    // is already the only thing that can rebuild the pre-dump state there, so reclaiming this
+    // shard's log would change nothing and only add a variable.
+    let runtime = DataNodeRuntime::new(
+        engine.clone(),
+        DataNodeRuntimeOptions {
+            worker_threads: 1,
+            max_queue_depth: 8,
+            max_background_queue_depth: 8,
+        },
+    );
+    let submitted = runtime.submit_gc(
+        GcRequest {
+            shard_id: SHARD,
+            retain_wal_from_sequence: None,
+            retain_index_log_from_sequence: None,
+            retain_block_slabs_from_id: Some(u64::MAX),
+            block_gc_delayed_destroy: false,
+            block_gc_invalidate_removed_slabs_only: false,
+        },
+        RequestController { timeout_ms: 5000 },
+    );
+    let finished = wait_for_job(&runtime, submitted.job_id);
+    let Some(DataNodeTaskOutput::Gc(output)) = finished.output else {
+        panic!("expected gc output");
+    };
+    assert!(output.status.ok, "{:?}", output.status);
+
+    // A CONTROL ON THE SOURCE. It reads every key back -- its own index points at the slabs
+    // compaction wrote -- so nothing about the STORE is broken and the restore counts below are
+    // about the MANIFEST.
+    let source_named = named_keys
+        .iter()
+        .filter(|key| slabpin_reads_back(&engine, SHARD, key))
+        .count();
+    let source_outside = outside_keys
+        .iter()
+        .filter(|key| slabpin_reads_back(&engine, SHARD, key))
+        .count();
+    assert_eq!(
+        (source_named, source_outside),
+        (IN_NAMED, OUTSIDE),
+        "the source engine lost keys of its own, so the restore below would measure a broken \
+         fixture rather than a broken manifest"
+    );
+
+    // THE PROPERTY. The same manifest, the same restore, after the collector has run.
+    let after = slabpin_restore_counts(
+        "after",
+        dir.path(),
+        &blocks_dir,
+        &manifest,
+        SHARD,
+        &named_keys,
+        &outside_keys,
+    );
+    let remaining = engine
+        .block_store()
+        .slab_ids()
+        .unwrap_or_default()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        after,
+        (true, IN_NAMED, OUTSIDE),
+        "restoring from the manifest after the sweep gave (installed, named, unnamed) = {after:?} \
+         where the same manifest gave {control:?} before it. The shard's live slabs are now \
+         {remaining:?}; the manifest names {:?} and the unnamed buckets' pages are on \
+         {outside_slabs:?}. The middle number is the bucket the dump NAMES and the last is the \
+         {unnamed_bucket_count} bucket(s) it does not -- install still succeeded, because both \
+         validation and the install preflight filter what they probe down to bucket_ids",
+        manifest.block_slab_ids
+    );
+
+    // AND BY WHICH MECHANISM. The slabs behind the unnamed buckets are still in the store,
+    // because the manifest names them. A future change that keeps them some other way reads as a
+    // change rather than as this still working.
+    let destroyed = outside_slabs
+        .iter()
+        .copied()
+        .filter(|slab| !remaining.contains(slab))
+        .collect::<Vec<_>>();
+    assert!(
+        destroyed.is_empty(),
+        "the sweep destroyed {destroyed:?}, slabs holding nothing but unnamed-bucket pages that \
+         the manifest's whole-shard index still points at (manifest names {:?}, store holds \
+         {remaining:?})",
+        manifest.block_slab_ids
+    );
+}
+
+// =================================================================================================
+// LONG RUN: does any subsystem's footprint grow WITHOUT BOUND on a shard nobody writes to?
+// =================================================================================================
+
+/// Mirrors `engine::compaction::COMPACTION_ROUND_BLOCK_REFS`, which is `pub(super)` and so cannot
+/// be named from here.
+///
+/// It is used for ONE thing: computing how many rounds the relocation still owes before a tail
+/// can be read as a trend. A 32-round run of 40 rounds of work looks exactly like a stall, and
+/// the denominator assertion below turns that mistake into a failure with the arithmetic in the
+/// message instead of a wrong verdict in a report.
+const LONG_RUN_COMPACTION_ROUND_BLOCK_REFS: usize = 2_048;
+
+/// `StorageManagerRuntimeOptions::default().interval_ms`, the cadence a server actually runs the
+/// storage manager at. Every per-day figure printed below is a per-round figure times this, and
+/// the cadence is printed beside the figure so the extrapolation can be checked rather than
+/// believed.
+const LONG_RUN_SCHEDULER_INTERVAL_MS: u64 = 1_000;
+const LONG_RUN_ROUNDS_PER_DAY: u64 = 24 * 60 * 60 * 1_000 / LONG_RUN_SCHEDULER_INTERVAL_MS;
+
+/// What a single footprint column did across the tail of a run.
+#[derive(Debug, Clone, PartialEq)]
+enum FootprintVerdict {
+    /// Never moved again after `flat_from`. The ceiling is the value it settled on.
+    ///
+    /// A column that climbs for the first N rounds and then stops is BOUNDED, not growing, and
+    /// `flat_from` is the N.
+    Bounded { flat_from: usize, ceiling: u64 },
+    /// Fell at least once in the tail: the bytes are reclaimed, not accumulated. `period_rounds`
+    /// is tail length over the number of falls, so it is the mean rounds between reclaims.
+    Sawtooth {
+        teeth: usize,
+        period_rounds: f64,
+        floor: u64,
+        ceiling: u64,
+    },
+    /// Never fell in the tail and ended higher than it began. This is the #1565 / #1627 shape.
+    Growing { per_round: f64, per_day: f64 },
+}
+
+impl FootprintVerdict {
+    fn is_growing(&self) -> bool {
+        matches!(self, FootprintVerdict::Growing { .. })
+    }
+
+    fn describe(&self) -> String {
+        match self {
+            FootprintVerdict::Bounded { flat_from, ceiling } => {
+                format!("BOUNDED   flat from tail round {flat_from}, ceiling {ceiling}")
+            }
+            FootprintVerdict::Sawtooth {
+                teeth,
+                period_rounds,
+                floor,
+                ceiling,
+            } => format!(
+                "SAWTOOTH  {teeth} falls, period {period_rounds:.1} rounds, floor {floor}, \
+                 ceiling {ceiling}"
+            ),
+            FootprintVerdict::Growing { per_round, per_day } => format!(
+                "GROWING   {per_round:.1} per round -> {per_day:.0} per day at \
+                 {LONG_RUN_SCHEDULER_INTERVAL_MS} ms/round"
+            ),
+        }
+    }
+}
+
+/// Classify one column from the rounds AFTER the drain.
+///
+/// `tail` is already the post-drain slice, so nothing here can mistake a bounded relocation still
+/// in progress for a trend -- that is the caller's denominator to establish, and it does.
+fn classify_footprint_column(tail: &[u64]) -> FootprintVerdict {
+    let ceiling = tail.iter().copied().max().unwrap_or(0);
+    let floor = tail.iter().copied().min().unwrap_or(0);
+    let mut last_change: Option<usize> = None;
+    let mut falls = 0usize;
+    for index in 1..tail.len() {
+        if tail[index] != tail[index - 1] {
+            last_change = Some(index);
+        }
+        if tail[index] < tail[index - 1] {
+            falls += 1;
+        }
+    }
+    let Some(last_change) = last_change else {
+        return FootprintVerdict::Bounded {
+            flat_from: 0,
+            ceiling,
+        };
+    };
+    if falls > 0 {
+        return FootprintVerdict::Sawtooth {
+            teeth: falls,
+            period_rounds: tail.len() as f64 / falls as f64,
+            floor,
+            ceiling,
+        };
+    }
+    // Rose and then stopped. "Stopped" has to be worth something, so it must hold still for a
+    // quarter of the tail (at least four rounds) before this calls it flat rather than slow.
+    let settled_margin = (tail.len() / 4).max(4);
+    if tail.len().saturating_sub(1).saturating_sub(last_change) >= settled_margin {
+        return FootprintVerdict::Bounded {
+            flat_from: last_change,
+            ceiling,
+        };
+    }
+    let span = tail.len().saturating_sub(1).max(1) as f64;
+    let per_round = (tail[tail.len() - 1] as f64 - tail[0] as f64) / span;
+    FootprintVerdict::Growing {
+        per_round,
+        per_day: per_round * LONG_RUN_ROUNDS_PER_DAY as f64,
+    }
+}
+
+struct LongFootprintRun {
+    records: usize,
+    rounds_run: usize,
+    /// First round of the tail: the point past which the relocation cannot still owe work.
+    tail_start: usize,
+    columns: Vec<(&'static str, Vec<u64>)>,
+    rounds_that_compacted: usize,
+    last_compacting_round: Option<usize>,
+    budget_drain_rounds: usize,
+    buckets_at_end: u64,
+    slabs_that_went_stale: usize,
+    cumulative_removed: u64,
+    cumulative_purged_by_schedule: u64,
+    quarantined_at_end: usize,
+    /// (slabs backdated, purged by the scheduled round, purged by a direct default-age call)
+    injected_age_purge: Option<(usize, usize, usize)>,
+}
+
+impl LongFootprintRun {
+    fn column(&self, name: &str) -> &[u64] {
+        &self
+            .columns
+            .iter()
+            .find(|(column, _)| *column == name)
+            .unwrap_or_else(|| panic!("no column named {name}"))
+            .1
+    }
+
+    fn tail(&self, name: &str) -> &[u64] {
+        &self.column(name)[self.tail_start..]
+    }
+
+    fn verdict(&self, name: &str) -> FootprintVerdict {
+        classify_footprint_column(self.tail(name))
+    }
+}
+
+/// Write a corpus, stop writing, then run maintenance for a long time and record every
+/// subsystem's footprint on every round.
+///
+/// `tail_rounds` is how many rounds run AFTER the relocation budget can possibly still owe work.
+/// The drain itself is not part of the tail: peak footprint during a drain is the live set twice
+/// over, once on each slab, and reading that as a trend is the error #1627 documented.
+fn drive_long_footprint_run(records: usize, tail_rounds: usize, inject_age: bool) -> LongFootprintRun {
+    // How many rounds does the relocation OWE? One round relocates at most
+    // COMPACTION_ROUND_BLOCK_REFS page refs, and the corpus is about one page ref per record, so
+    // the drain needs at least records / budget rounds. Doubled and padded, because a round that
+    // also has to dump, reclaim and prune does not spend its whole ref budget on relocation.
+    let budget_drain_rounds = records.div_ceil(LONG_RUN_COMPACTION_ROUND_BLOCK_REFS);
+    let drain_cap = budget_drain_rounds * 2 + 8;
+    let max_rounds = drain_cap + tail_rounds;
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    for index in 0..records {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("longrun-{index:07}"),
+                value: vec![b'v'; 128],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    // Overwrite a third, so the collectors have genuine garbage. Without it every collector
+    // correctly does nothing and a flat column proves only that nothing happened.
+    for index in 0..records / 3 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("longrun-{index:07}"),
+                value: vec![b'w'; 192],
+            },
+        });
+    }
+
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    let engine = runtime.engine();
+    let options = StorageManagerOptions::default();
+
+    // FROM HERE ON NOTHING WRITES. `objects` is carried as a column so that is checkable rather
+    // than asserted in prose: a run whose object count moves had a writer, and every "did not
+    // grow" verdict below would be about a different experiment.
+    eprintln!(
+        "  [longrun] {records} records written, then NO further writes. relocation budget \
+{LONG_RUN_COMPACTION_ROUND_BLOCK_REFS} refs/round -> the drain owes at least \
+{budget_drain_rounds} rounds; drain allowance {drain_cap}; tail {tail_rounds}; \
+cap {max_rounds}"
+    );
+    eprintln!(
+        "  [longrun] {:>5} {:>11} {:>8} {:>9} {:>6} {:>11} {:>10} {:>8} {:>9} {:>6} {:>8} {:>8} \
+{:>8} {:>7}",
+        "round",
+        "wal_bytes",
+        "wal_seq",
+        "idx_bytes",
+        "slabs",
+        "slab_bytes",
+        "cache_mem",
+        "bkt_idx",
+        "manifests",
+        "dirty",
+        "objects",
+        "removed",
+        "quarant",
+        "purged",
+    );
+
+    let mut wal_bytes = Vec::new();
+    let mut wal_seq = Vec::new();
+    let mut idx_bytes = Vec::new();
+    let mut slabs = Vec::new();
+    let mut slab_bytes_series = Vec::new();
+    let mut cache_mem_series = Vec::new();
+    let mut bkt_idx_series = Vec::new();
+    let mut manifests_series = Vec::new();
+    let mut dirty_series = Vec::new();
+    let mut objects_series = Vec::new();
+    let mut removed_series = Vec::new();
+    let mut quarantine_series = Vec::new();
+    let mut purged_series = Vec::new();
+
+    let mut rounds_that_compacted = 0usize;
+    let mut last_compacting_round: Option<usize> = None;
+    let mut went_stale = std::collections::BTreeSet::<u64>::new();
+    let mut cumulative_removed = 0u64;
+    let mut cumulative_purged = 0u64;
+
+    for round in 0..max_rounds {
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        if report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "compact_pages")
+        {
+            rounds_that_compacted += 1;
+            last_compacting_round = Some(round);
+        }
+        went_stale.extend(report.lifecycle_plan.stale_block_slab_ids.iter().copied());
+
+        let wal = engine.write_ahead_log_store().stats(1);
+        let index_log_bytes = engine.index_log_store().log_len_bytes(1);
+        let slab_ids = engine.block_store().slab_ids().unwrap_or_default();
+        let slab_bytes: u64 = engine
+            .block_store()
+            .slab_block_counts()
+            .unwrap_or_default()
+            .iter()
+            .map(|(_id, physical_bytes, _count)| *physical_bytes)
+            .sum();
+        let cache_mem = engine.cache().stats().memory_bytes;
+        let summaries = engine.bucket_storage_summaries(1);
+        let bkt_idx = summaries.len() as u64;
+        let objects: u64 = summaries.iter().map(|summary| summary.object_count).sum();
+        let dirty = summaries
+            .iter()
+            .filter(|summary| summary.dirty_object_count > 0)
+            .count() as u64;
+        let manifests = engine.list_bucket_dump_manifests(1).len() as u64;
+        let quarantined = engine
+            .block_store()
+            .delayed_destroy_slab_ids()
+            .unwrap_or_default()
+            .len() as u64;
+        cumulative_removed += report
+            .gc_report
+            .as_ref()
+            .map(|gc| gc.block_slabs_removed as u64)
+            .unwrap_or(0);
+        cumulative_purged += report
+            .lifecycle_report
+            .as_ref()
+            .map(|lifecycle| lifecycle.delayed_destroy_purged_slabs.len() as u64)
+            .unwrap_or(0);
+
+        eprintln!(
+            "  [longrun] {round:>5} {:>11} {:>8} {index_log_bytes:>9} {:>6} {slab_bytes:>11} \
+{cache_mem:>10} {bkt_idx:>8} {manifests:>9} {dirty:>6} {objects:>8} {cumulative_removed:>8} \
+{quarantined:>8} {cumulative_purged:>7}",
+            wal.persistent_bytes,
+            wal.last_sequence,
+            slab_ids.len(),
+        );
+
+        wal_bytes.push(wal.persistent_bytes);
+        wal_seq.push(wal.last_sequence);
+        idx_bytes.push(index_log_bytes);
+        slabs.push(slab_ids.len() as u64);
+        slab_bytes_series.push(slab_bytes);
+        cache_mem_series.push(cache_mem);
+        bkt_idx_series.push(bkt_idx);
+        manifests_series.push(manifests);
+        dirty_series.push(dirty);
+        objects_series.push(objects);
+        removed_series.push(cumulative_removed);
+        quarantine_series.push(quarantined);
+        purged_series.push(cumulative_purged);
+    }
+
+    // THE HOUR. Quarantine enforces a one-hour minimum age, so every measurement shorter than an
+    // hour reports "purged 0" BY CONSTRUCTION and says nothing about the mechanism. Backdating the
+    // arrival stamp does NOT shorten the gate -- the purge below still demands the shipped hour --
+    // it makes the slab genuinely old by its own clock. That proves the MECHANISM. Proving the
+    // SCHEDULE is a different claim and needs a different run; see
+    // `a_quarantined_slab_is_purged_after_a_real_hour_of_wall_clock`.
+    let injected_age_purge = inject_age.then(|| {
+        let backdated = engine
+            .block_store()
+            .backdate_delayed_destroy_stamps_for_test(2 * 60 * 60 * 1_000)
+            .expect("backdating the quarantine stamps");
+        let by_round = runtime
+            .run_storage_manager_once(1, options.clone())
+            .lifecycle_report
+            .as_ref()
+            .map(|lifecycle| lifecycle.delayed_destroy_purged_slabs.len())
+            .unwrap_or(0);
+        let directly = engine
+            .block_store()
+            .purge_delayed_destroy_slabs_with_report()
+            .map(|report| report.purged_block_slab_ids.len())
+            .unwrap_or(0);
+        (backdated, by_round, directly)
+    });
+
+    let quarantined_at_end = engine
+        .block_store()
+        .delayed_destroy_slab_ids()
+        .unwrap_or_default()
+        .len();
+    let buckets_at_end = engine.bucket_storage_summaries(1).len() as u64;
+
+    LongFootprintRun {
+        records,
+        rounds_run: max_rounds,
+        tail_start: drain_cap,
+        columns: vec![
+            ("wal_bytes", wal_bytes),
+            ("wal_seq", wal_seq),
+            ("idx_bytes", idx_bytes),
+            ("slabs", slabs),
+            ("slab_bytes", slab_bytes_series),
+            ("cache_mem", cache_mem_series),
+            ("bkt_idx", bkt_idx_series),
+            ("manifests", manifests_series),
+            ("dirty", dirty_series),
+            ("objects", objects_series),
+            ("removed", removed_series),
+            ("quarantine", quarantine_series),
+            ("purged", purged_series),
+        ],
+        rounds_that_compacted,
+        last_compacting_round,
+        budget_drain_rounds,
+        buckets_at_end,
+        slabs_that_went_stale: went_stale.len(),
+        cumulative_removed,
+        cumulative_purged_by_schedule: cumulative_purged,
+        quarantined_at_end,
+        injected_age_purge,
+    }
+}
+
+/// Every denominator this run's verdicts depend on, asserted BEFORE any verdict is read.
+///
+/// A zero from "did not run" and a zero from "ran and did nothing" are different results, and the
+/// only way to keep them apart is to assert the run happened first.
+fn assert_long_run_denominators(run: &LongFootprintRun) {
+    let records = run.records;
+    assert!(
+        run.rounds_run > run.tail_start,
+        "at {records} records the run was {} rounds and the drain allowance alone is {}: there is \
+         no tail to read",
+        run.rounds_run,
+        run.tail_start,
+    );
+    assert!(
+        run.buckets_at_end > 0,
+        "the shard holds no buckets at {records} records, so every column is trivially flat and \
+         every verdict below is vacuous",
+    );
+    assert!(
+        run.rounds_that_compacted > 0,
+        "compaction never ran at {records} records over {} rounds, so this measures an idle \
+         collector rather than a settled compactor",
+        run.rounds_run,
+    );
+    assert!(
+        run.slabs_that_went_stale > 0,
+        "no slab went stale at {records} records over {} rounds, so the collector had nothing to \
+         reclaim and the reclaim columns are vacuous",
+        run.rounds_run,
+    );
+    // THE ARITHMETIC THAT KEEPS A DRAIN FROM READING AS A STALL. The relocation owes
+    // ceil(records / COMPACTION_ROUND_BLOCK_REFS) rounds at minimum; the tail starts past twice
+    // that plus sixteen. If compaction is still firing there, the tail is drain and not trend.
+    let last_compacting_round = run
+        .last_compacting_round
+        .expect("a compacting round, since one was counted");
+    assert!(
+        last_compacting_round < run.tail_start,
+        "compaction was still firing at round {last_compacting_round} at {records} records, and \
+         the tail starts at {}. The relocation owes at least {} rounds from the \
+         {LONG_RUN_COMPACTION_ROUND_BLOCK_REFS}-ref budget; raise the allowance rather than \
+         reading this tail, because a run shorter than the work is indistinguishable from a stall",
+        run.tail_start,
+        run.budget_drain_rounds,
+    );
+    // THE WRITER ACTUALLY STOPPED. Not prose: the object count is a column, and a run where it
+    // moved had a writer.
+    let objects = run.column("objects");
+    let first = objects[0];
+    let last = objects[objects.len() - 1];
+    assert!(first > 0, "the shard holds no objects at {records} records");
+    assert_eq!(
+        first, last,
+        "the live object count moved from {first} to {last} at {records} records: something WROTE \
+         during the rounds, and growth under a writer says nothing",
+    );
+}
+
+/// Print every column's verdict with the arithmetic behind it.
+fn report_long_run_verdicts(run: &LongFootprintRun) {
+    eprintln!(
+        "  [longrun] ---- {} records, tail = rounds {}..{} ({} rounds), \
+{LONG_RUN_ROUNDS_PER_DAY} rounds/day at {LONG_RUN_SCHEDULER_INTERVAL_MS} ms ----",
+        run.records,
+        run.tail_start,
+        run.rounds_run,
+        run.rounds_run - run.tail_start,
+    );
+    for (name, _) in &run.columns {
+        let tail = run.tail(name);
+        let verdict = classify_footprint_column(tail);
+        eprintln!(
+            "  [longrun] {name:>11}  tail {:>12} -> {:>12}  delta {:>12}   {}",
+            tail[0],
+            tail[tail.len() - 1],
+            tail[tail.len() - 1] as i128 - tail[0] as i128,
+            verdict.describe(),
+        );
+    }
+    eprintln!(
+        "  [longrun] cumulative removed {} / quarantined now {} / purged by the schedule {}",
+        run.cumulative_removed, run.quarantined_at_end, run.cumulative_purged_by_schedule,
+    );
+    if let Some((backdated, by_round, directly)) = run.injected_age_purge {
+        eprintln!(
+            "  [longrun] INJECTED AGE: {backdated} quarantined slabs backdated two hours, then the \
+             shipped one-hour purge removed {by_round} in a scheduled round and {directly} on a \
+             direct call",
+        );
+    }
+}
+
+/// THE LONG RUN. Release only, driven by hand.
+///
+///   cargo test --release -p temporalstore-rust --lib the_footprint_stays_bounded_over_a_long_run \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// WHAT THIS ADDS OVER `the_footprint_cadence_over_many_rounds`. That one runs twelve rounds, and
+/// twelve rounds is shorter than the relocation drain at 80,000 records (which owes forty from its
+/// 2,048-ref budget). So the twelve-round table cannot distinguish "growing" from "still moving
+/// the live set", and it cannot reach any time-based threshold at all. This runs past the drain by
+/// arithmetic and then keeps going long enough that a per-round slope is a trend rather than
+/// noise, at BOTH corpus sizes, because #1623's healthy 8k slab column did not generalise to 80k.
+///
+/// WHAT IT DOES NOT DO: wait an hour. Quarantine's one-hour minimum age is crossed here by
+/// backdating the arrival stamp, which proves the MECHANISM under the shipped gate. The SCHEDULE
+/// -- that an unattended node eventually reaches the far side of that hour on its own -- is proved
+/// by `a_quarantined_slab_is_purged_after_a_real_hour_of_wall_clock`, and they are different
+/// claims. Both are here so neither is mistaken for the other.
+#[test]
+#[ignore]
+fn the_footprint_stays_bounded_over_a_long_run() {
+    for records in [8_000usize, 80_000usize] {
+        let run = drive_long_footprint_run(records, 150, true);
+        assert_long_run_denominators(&run);
+        report_long_run_verdicts(&run);
+
+        // The columns that must not grow on a shard with no writer. `slab_bytes` and `slabs` are
+        // allowed to sawtooth -- that IS reclaim working -- but not to climb monotonically.
+        for column in [
+            "wal_bytes",
+            "idx_bytes",
+            "slabs",
+            "slab_bytes",
+            "cache_mem",
+            "bkt_idx",
+            "manifests",
+        ] {
+            let verdict = run.verdict(column);
+            assert!(
+                !verdict.is_growing(),
+                "{column} at {records} records: {} over tail {:?}",
+                verdict.describe(),
+                run.tail(column),
+            );
+        }
+
+        // The quarantine gate, under injected age. The denominator is the backdated count: a
+        // purge of zero because nothing was backdated is not the same result as a purge of zero
+        // because the gate is stuck.
+        let (backdated, by_round, directly) = run
+            .injected_age_purge
+            .expect("the injected-age arm ran, since it was requested");
+        assert!(
+            backdated > 0,
+            "nothing was in quarantine to backdate at {records} records, so the purge result \
+             below is vacuous (cumulative removed {})",
+            run.cumulative_removed,
+        );
+        assert!(
+            by_round + directly > 0,
+            "{backdated} slabs were two hours old and the shipped one-hour purge removed none of \
+             them, by the scheduled round or directly",
+        );
+    }
+}
+
+/// THE SCHEDULE, not the mechanism: left alone for longer than the quarantine minimum age, does a
+/// node purge on its own? Takes over an hour of wall clock. Release only, driven by hand.
+///
+///   cargo test --release -p temporalstore-rust --lib \
+///       a_quarantined_slab_is_purged_after_a_real_hour_of_wall_clock \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// Nothing else in this repo has ever run past `DELAYED_DESTROY_MIN_AGE_MS`, so "purged 0" has
+/// been the only observation available and it has been uninformative by construction. This waits.
+/// The corpus is deliberately small -- the question is a clock, not a scale -- and the rounds are
+/// paced so the run is mostly idle rather than mostly CPU.
+#[test]
+#[ignore]
+fn a_quarantined_slab_is_purged_after_a_real_hour_of_wall_clock() {
+    const RECORDS: usize = 8_000;
+    const PACE: std::time::Duration = std::time::Duration::from_secs(20);
+    // Ten minutes past the gate, so a slow round near the boundary does not decide the result.
+    let wait_for = std::time::Duration::from_millis(60 * 60 * 1_000 + 10 * 60 * 1_000);
+
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    for index in 0..RECORDS {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("hour-{index:07}"),
+                value: vec![b'v'; 128],
+            },
+        });
+    }
+    for index in 0..RECORDS / 3 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("hour-{index:07}"),
+                value: vec![b'w'; 192],
+            },
+        });
+    }
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    let engine = runtime.engine();
+    let options = StorageManagerOptions::default();
+
+    let started = std::time::Instant::now();
+    let mut ever_quarantined = std::collections::BTreeSet::<u64>::new();
+    let mut purged = std::collections::BTreeSet::<u64>::new();
+    let mut rounds = 0usize;
+    eprintln!(
+        "  [hour] {RECORDS} records, then NO further writes. Running rounds every {:?} until {:?} \
+has passed; the quarantine minimum age is one hour.",
+        PACE, wait_for,
+    );
+    while started.elapsed() < wait_for {
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        rounds += 1;
+        ever_quarantined.extend(
+            engine
+                .block_store()
+                .delayed_destroy_slab_ids()
+                .unwrap_or_default(),
+        );
+        if let Some(lifecycle) = report.lifecycle_report.as_ref() {
+            purged.extend(lifecycle.delayed_destroy_purged_slabs.iter().copied());
+        }
+        if rounds % 15 == 0 {
+            eprintln!(
+                "  [hour] {:>6.1} min, round {rounds}: quarantine {:?}, ever quarantined {:?}, \
+purged {:?}",
+                started.elapsed().as_secs_f64() / 60.0,
+                engine.block_store().delayed_destroy_slab_ids().unwrap_or_default(),
+                ever_quarantined,
+                purged,
+            );
+        }
+        std::thread::sleep(PACE);
+    }
+
+    // DENOMINATORS. The elapsed time, the rounds, and something to purge -- in that order,
+    // because a "nothing was purged" from a run that never reached the hour, a run that ran no
+    // rounds, and a run with an empty quarantine are three different findings.
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed.as_millis() as u64 > 60 * 60 * 1_000,
+        "the run lasted {elapsed:?}, less than the one-hour quarantine minimum age, so a purge of \
+         zero would be uninformative by construction",
+    );
+    assert!(rounds > 0, "no maintenance round ran in {elapsed:?}");
+    assert!(
+        !ever_quarantined.is_empty(),
+        "no slab ever entered quarantine over {rounds} rounds and {elapsed:?}, so nothing could \
+         be purged and the assertion below would hold vacuously",
+    );
+    eprintln!(
+        "  [hour] {rounds} rounds over {:.1} min: ever quarantined {ever_quarantined:?}, purged \
+{purged:?}, still in quarantine {:?}",
+        elapsed.as_secs_f64() / 60.0,
+        engine.block_store().delayed_destroy_slab_ids().unwrap_or_default(),
+    );
+    assert!(
+        !purged.is_empty(),
+        "{} slabs sat in quarantine for more than the one-hour minimum age over {rounds} \
+         scheduled rounds and NONE was purged: {ever_quarantined:?}",
+        ever_quarantined.len(),
+    );
+}
+
+/// The in-suite form of the long run: same driver, same verdicts, a corpus small enough to run on
+/// every commit.
+///
+/// WHAT THIS CATCHES that the long run cannot: a regression, today, without an operator
+/// remembering to spend an hour. WHAT IT CANNOT CATCH: a slope too shallow to show inside a short
+/// tail, which is exactly what the ignored long form is for. Both, or neither is worth having.
+///
+/// The quarantine gate is checked in BOTH directions off the one run, because each direction on
+/// its own is passable by a broken store. "A backdated slab is purged" alone still passes if the
+/// age check is deleted outright -- a purge that takes everything takes the backdated ones too --
+/// and "a fresh slab is not purged" alone still passes if the purge never runs at all.
+#[test]
+fn the_footprint_columns_stay_bounded_on_an_idle_shard() {
+    let run = drive_long_footprint_run(4_096, 12, true);
+    assert_long_run_denominators(&run);
+    report_long_run_verdicts(&run);
+
+    for column in [
+        "wal_bytes",
+        "idx_bytes",
+        "slabs",
+        "slab_bytes",
+        "cache_mem",
+        "bkt_idx",
+        "manifests",
+    ] {
+        let verdict = run.verdict(column);
+        assert!(
+            !verdict.is_growing(),
+            "{column} on an idle shard: {} over tail {:?}",
+            verdict.describe(),
+            run.tail(column),
+        );
+    }
+
+    // The dirty set must reach zero and stay there: that is what "the writer stopped" means to the
+    // store manager, and a non-zero dirty column would mean every reclaim above was being taken
+    // against a moving target.
+    let dirty_tail = run.tail("dirty");
+    assert!(
+        dirty_tail.iter().all(|dirty| *dirty == 0),
+        "buckets stayed dirty with no writer: {dirty_tail:?}",
+    );
+
+    // DIRECTION ONE: a slab quarantined moments ago is NOT purged by the scheduled rounds. The
+    // denominator is the quarantine column at the last round before any age was injected -- with
+    // an empty quarantine the zero below is a statement about a shard that reclaimed nothing.
+    let quarantine = run.column("quarantine");
+    let quarantined_before_injection = quarantine[quarantine.len() - 1];
+    assert!(
+        quarantined_before_injection > 0,
+        "nothing was in quarantine after {} rounds, so both directions of the age gate are \
+         vacuous here (cumulative removed {})",
+        run.rounds_run,
+        run.cumulative_removed,
+    );
+    assert_eq!(
+        run.cumulative_purged_by_schedule, 0,
+        "slabs quarantined moments ago were purged over {} scheduled rounds: the one-hour minimum \
+         age is not being enforced, and a reader holding a stale address dangles at a deleted slab",
+        run.rounds_run,
+    );
+
+    // DIRECTION TWO: the same slab, aged past the shipped hour, IS purged.
+    let (backdated, by_round, directly) = run
+        .injected_age_purge
+        .expect("the injected-age arm ran, since it was requested");
+    assert!(
+        backdated > 0,
+        "nothing was backdated, so the purge result is vacuous (cumulative removed {})",
+        run.cumulative_removed,
+    );
+    assert!(
+        by_round + directly > 0,
+        "{backdated} slabs were two hours old and the shipped one-hour purge removed none",
+    );
+    assert_eq!(
+        run.quarantined_at_end, 0,
+        "quarantine still holds slabs after the aged purge: {backdated} backdated, {by_round} \
+         purged by the round, {directly} purged directly",
+    );
+}
+
+/// The fixture the two rounds above and below are measured on: a shard spanning several slabs
+/// with dead space on exactly ONE of them.
+///
+/// Returned as a runtime because every caller wants the maintenance round's plan, which is where
+/// the drain set comes from. `holed_batch` names which batch gets overwritten.
+#[cfg(test)]
+fn drain_fixture(
+    dir: &std::path::Path,
+    batches: usize,
+    keys_per_batch: usize,
+    holed_keys: usize,
+) -> (DataNodeRuntime, BTreeSet<u64>) {
+    let engine = TemporalEngine::with_local_dirs(
+        8 * 1024 * 1024,
+        dir.join("cache"),
+        dir.join("blocks"),
+        dir.join("indexes"),
+    );
+    engine.load_shard(1);
+    for batch in 0..batches {
+        for index in 0..keys_per_batch {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("drain-{batch}-{index:05}"),
+                    value: vec![b'v'; 256],
+                },
+            });
+            assert!(
+                response.status.ok,
+                "write {batch}/{index}: {:?}",
+                response.status
+            );
+        }
+        // An explicit target rather than the process-wide one: no env var is touched, so no other
+        // test in this process inherits a small slab.
+        engine
+            .block_store()
+            .prepare_next_slab_with_target(1)
+            .expect("rolling a slab between batches should succeed");
+    }
+    let slabs = engine
+        .live_block_slab_ids(1)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    // Hole ONE slab: an overwrite writes a fresh page on the CURRENT slab and leaves the old page
+    // on batch 0's slab dead. Nothing else in the shard acquires dead space.
+    for index in 0..holed_keys {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("drain-0-{index:05}"),
+                value: vec![b'w'; 320],
+            },
+        });
+        assert!(response.status.ok, "overwrite {index}: {:?}", response.status);
+    }
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    (runtime, slabs)
+}
+
+/// A DRAINING round moves the pages on the slabs it was asked to empty, and leaves the rest.
+///
+/// This is the round the periodic loop now issues. The direct form above still relocates
+/// everything -- an operator instruction is not a suggestion -- and the two are measured on the
+/// SAME fixture so the difference is the selection rule and nothing else.
+///
+/// FOUR HALVES, ASSERTED SEPARATELY, because each of them going to zero looks like success in a
+/// combined count: what the round moved, what it declined, what it left for want of budget, and
+/// whether the holed slab actually went stale. A round that moved NOTHING would satisfy "moved no
+/// more than the drain set" perfectly.
+#[test]
+fn a_draining_round_moves_only_the_blocks_on_the_slabs_it_was_asked_to_empty() {
+    const BATCHES: usize = 6;
+    const KEYS_PER_BATCH: usize = 200;
+    const HOLED_KEYS: usize = 20;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, slabs_before) =
+        drain_fixture(dir.path(), BATCHES, KEYS_PER_BATCH, HOLED_KEYS);
+    let engine = runtime.engine();
+    let options = StorageManagerOptions::default();
+    let (_pressure, plan) = runtime.storage_manager_pressure_snapshot(1, &options);
+    let drain_slabs = crate::engine::compaction_drain_block_slab_ids(&plan.reclaim_candidates);
+    let relocatable = crate::engine::compaction_relocatable_block_refs(&plan.reclaim_candidates);
+    let live_block_refs = engine
+        .bucket_storage_summaries(1)
+        .iter()
+        .map(|summary| summary.block_ref_count)
+        .sum::<u64>();
+
+    // DENOMINATORS. Each of these makes every count below trivially true for a reason that has
+    // nothing to do with the selection rule.
+    assert!(
+        slabs_before.len() >= BATCHES,
+        "the fixture rolled {} slab(s) for {BATCHES} batches ({slabs_before:?}); with one slab \
+         the drain set IS the live set and there is nothing to select",
+        slabs_before.len()
+    );
+    assert_eq!(
+        drain_slabs.len(),
+        1,
+        "the overwrites holed {} slabs ({drain_slabs:?}) rather than one",
+        drain_slabs.len()
+    );
+    assert!(
+        relocatable > 0,
+        "no object holds a page on the holed slab, so the round below has nothing to drain: \
+         {plan:?}"
+    );
+    assert!(
+        live_block_refs > relocatable * 2,
+        "the shard holds {live_block_refs} live page refs and {relocatable} of them are on the \
+         holed slab; without a wide margin, draining and relocating everything are the same act"
+    );
+
+    let report = engine
+        .compact_shard_blocks_draining(1, drain_slabs.clone())
+        .expect("a draining round should succeed");
+
+    // HALF ONE: it moved the drain set, all of it, and nothing else.
+    assert_eq!(
+        report.rewritten_block_refs as u64, relocatable,
+        "the draining round moved {} page refs where the plan named {relocatable} on the slabs it \
+         was asked to empty ({drain_slabs:?})",
+        report.rewritten_block_refs
+    );
+    // HALF TWO: it actually DECLINED pages. Without this, moving the drain set and moving
+    // everything are indistinguishable here.
+    assert!(
+        report.blocks_left_off_drain_set > 0,
+        "the round declined no pages at all, so it cannot be shown to have selected anything: it \
+         moved {} of {live_block_refs} live refs",
+        report.rewritten_block_refs
+    );
+    assert_eq!(
+        report.blocks_left_off_drain_set as u64 + report.rewritten_block_refs as u64,
+        live_block_refs,
+        "the round moved {} and declined {}, which does not account for the shard's \
+         {live_block_refs} live refs -- some page was neither considered nor moved",
+        report.rewritten_block_refs,
+        report.blocks_left_off_drain_set
+    );
+    // HALF THREE: declining is not "unfinished". A round kept open by pages nobody will ever want
+    // moved never closes, which is the termination hazard this ordering exists to avoid.
+    assert_eq!(
+        report.blocks_left_by_budget, 0,
+        "the round reports {} pages left for want of budget after declining {} off the drain set \
+         -- the two are being counted together, and a round that reports unfinished for ever \
+         re-runs for ever",
+        report.blocks_left_by_budget, report.blocks_left_off_drain_set
+    );
+
+    // HALF FOUR: the point of the whole exercise -- the holed slab is now empty and the dense
+    // ones are untouched.
+    let slabs_after = engine
+        .live_block_slab_ids(1)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for drained in &drain_slabs {
+        assert!(
+            !slabs_after.contains(drained),
+            "slab {drained} was drained but still holds live pages ({slabs_after:?})"
+        );
+    }
+    let untouched = slabs_before
+        .iter()
+        .filter(|slab| !drain_slabs.contains(slab))
+        .filter(|slab| slabs_after.contains(slab))
+        .count();
+    assert!(
+        untouched > 0,
+        "every slab of the fixture was vacated, so the round did not leave the dense ones alone: \
+         before {slabs_before:?}, drained {drain_slabs:?}, after {slabs_after:?}"
+    );
+
+    // AND IT TERMINATES. Nobody wrote to the shard, so a second plan must find nothing left to
+    // relocate -- that is the gate the periodic loop reads, and a non-zero here is the
+    // self-retrigger coming back in a new shape.
+    let (_pressure_after, plan_after) = runtime.storage_manager_pressure_snapshot(1, &options);
+    let relocatable_after =
+        crate::engine::compaction_relocatable_block_refs(&plan_after.reclaim_candidates);
+    assert_eq!(
+        relocatable_after, 0,
+        "after draining the only holed slab, {relocatable_after} page refs still sit on a slab \
+         someone wants emptied, so the loop would compact again on an idle shard: {plan_after:?}"
+    );
+
+    // EVERY VALUE STILL READS, on both sides of the selection: the moved half and the declined
+    // half. A selection rule that drops a page reads exactly like one that is simply cheaper.
+    for index in 0..KEYS_PER_BATCH {
+        let expected = if index < HOLED_KEYS {
+            vec![b'w'; 320]
+        } else {
+            vec![b'v'; 256]
+        };
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: format!("drain-0-{index:05}"),
+            },
+        });
+        assert_eq!(
+            response.response,
+            CommandResponse::Bytes {
+                value: Some(expected)
+            },
+            "drain-0-{index:05} did not read back after the draining round"
+        );
+    }
+    for batch in 1..BATCHES {
+        for index in 0..KEYS_PER_BATCH {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: format!("drain-{batch}-{index:05}"),
+                },
+            });
+            assert_eq!(
+                response.response,
+                CommandResponse::Bytes {
+                    value: Some(vec![b'v'; 256])
+                },
+                "drain-{batch}-{index:05} did not read back after the draining round"
+            );
+        }
+    }
+}
+
+/// The two selection rules driven to SETTLEMENT at both corpus sizes, in columns. Release only.
+///
+///   cargo test --release -p temporalstore-rust --lib \
+///       what_the_two_selection_rules_move_at_both_corpus_sizes -- --ignored --nocapture \
+///       --test-threads=1
+///
+/// PER ROUND IS THE WRONG UNIT and measuring it that way reads as no difference at all: a round
+/// relocates at most COMPACTION_ROUND_BLOCK_REFS (2,048) refs whichever rule it uses, so at 8,000
+/// records the direct round reports 2,048 and the draining round 980, and the direct arm looks
+/// only twice as expensive. It is not twice -- it is 2,048 four times over against 980 once.
+/// The comparable quantity is the TOTAL relocated to reach a settled shard, and the round count
+/// each needs is arithmetic off the budget, not something to discover by watching for a zero.
+///
+/// WHY A SECOND SIZE. The amplification grows with the LIVE SET and not with the garbage: a
+/// direct settlement rewrites every live page whatever the hole cost, so ten times the corpus is
+/// ten times the work to recover the same twenty pages, while the draining settlement is the size
+/// of the holed slab either way. An 8,000-record reading would not have generalised.
+///
+/// Both arms build their OWN fixture, so the direct arm is never measuring a shard the draining
+/// arm already drained.
+#[test]
+#[ignore]
+fn what_the_two_selection_rules_move_at_both_corpus_sizes() {
+    const BATCHES: usize = 8;
+    const HOLED_KEYS: usize = 20;
+    const BUDGET: u64 = 2_048;
+
+    println!(
+        "{:>8} {:>6} {:>6} {:>8} {:>9} {:>7} {:>9} {:>7} {:>7}",
+        "records", "slabs", "drain", "onslab", "directref", "rounds", "drainref", "rounds", "ratio"
+    );
+    for records in [8_000_usize, 80_000_usize] {
+        let keys_per_batch = records / BATCHES;
+        let options = StorageManagerOptions::default();
+
+        // ARM ONE: the direct rule, run until a round leaves nothing for want of budget. The
+        // rounds it needs is ceil(live refs / budget), computed BEFORE the loop so a short run
+        // cannot be mistaken for a settled one.
+        let direct_dir = tempfile::tempdir().unwrap();
+        let (direct_runtime, direct_slabs) =
+            drain_fixture(direct_dir.path(), BATCHES, keys_per_batch, HOLED_KEYS);
+        let direct_engine = direct_runtime.engine();
+        let (_p, direct_plan) = direct_runtime.storage_manager_pressure_snapshot(1, &options);
+        let drain_slabs =
+            crate::engine::compaction_drain_block_slab_ids(&direct_plan.reclaim_candidates);
+        let relocatable =
+            crate::engine::compaction_relocatable_block_refs(&direct_plan.reclaim_candidates);
+        let live_block_refs = direct_engine
+            .bucket_storage_summaries(1)
+            .iter()
+            .map(|summary| summary.block_ref_count)
+            .sum::<u64>();
+        let direct_rounds_needed = live_block_refs.div_ceil(BUDGET).max(1);
+        let mut direct_refs = 0_u64;
+        let mut direct_rounds = 0_u64;
+        loop {
+            let round = direct_engine
+                .compact_shard_blocks(1)
+                .expect("a direct round should succeed");
+            direct_refs += round.rewritten_block_refs as u64;
+            direct_rounds += 1;
+            if round.blocks_left_by_budget == 0 {
+                break;
+            }
+            assert!(
+                direct_rounds <= direct_rounds_needed + 2,
+                "{records}: the direct arm ran {direct_rounds} rounds where the budget predicts \
+                 {direct_rounds_needed} for {live_block_refs} live refs, so it is not converging"
+            );
+        }
+
+        // ARM TWO: the draining rule, run until the plan has nothing left on a slab anyone wants
+        // emptied. That zero is the gate the periodic loop reads, so reaching it IS settlement --
+        // unlike the direct arm, which reports a full round's work on a settled shard for ever.
+        let draining_dir = tempfile::tempdir().unwrap();
+        let (draining_runtime, _) =
+            drain_fixture(draining_dir.path(), BATCHES, keys_per_batch, HOLED_KEYS);
+        let draining_engine = draining_runtime.engine();
+        let draining_rounds_needed = relocatable.div_ceil(BUDGET).max(1);
+        let mut draining_refs = 0_u64;
+        let mut draining_rounds = 0_u64;
+        loop {
+            let (_p2, plan) = draining_runtime.storage_manager_pressure_snapshot(1, &options);
+            let left = crate::engine::compaction_relocatable_block_refs(&plan.reclaim_candidates);
+            if left == 0 {
+                break;
+            }
+            let set = crate::engine::compaction_drain_block_slab_ids(&plan.reclaim_candidates);
+            let round = draining_engine
+                .compact_shard_blocks_draining(1, set)
+                .expect("a draining round should succeed");
+            draining_refs += round.rewritten_block_refs as u64;
+            draining_rounds += 1;
+            assert!(
+                draining_rounds <= draining_rounds_needed + 2,
+                "{records}: the draining arm ran {draining_rounds} rounds where the budget \
+                 predicts {draining_rounds_needed} for {relocatable} refs on the holed slab, so \
+                 it is not converging"
+            );
+        }
+
+        println!(
+            "{:>8} {:>6} {:>6} {:>8} {:>9} {:>7} {:>9} {:>7} {:>6.1}x",
+            records,
+            direct_slabs.len(),
+            drain_slabs.len(),
+            relocatable,
+            direct_refs,
+            direct_rounds,
+            draining_refs,
+            draining_rounds,
+            direct_refs as f64 / (draining_refs.max(1) as f64),
+        );
+
+        // DENOMINATORS at each size, so a column of zeroes cannot read as a clean result.
+        assert_eq!(
+            drain_slabs.len(),
+            1,
+            "{records}: the fixture holed {} slabs rather than one",
+            drain_slabs.len()
+        );
+        assert!(
+            relocatable > 0 && direct_refs > 0 && draining_refs > 0,
+            "{records}: an arm moved nothing -- on-slab {relocatable}, direct {direct_refs}, \
+             draining {draining_refs}"
+        );
+        // THE CLAIM, at BOTH sizes and asserted as separate halves: the draining settlement costs
+        // the size of the HOLE, and the direct settlement costs the size of the STORE.
+        assert_eq!(
+            draining_refs, relocatable,
+            "{records}: draining settled at {draining_refs} refs where the holed slab carried \
+             {relocatable}"
+        );
+        assert!(
+            direct_refs >= live_block_refs,
+            "{records}: the direct settlement moved {direct_refs} of {live_block_refs} live \
+             refs, so it did not rewrite the whole live set and is not the rule being compared"
+        );
+        assert_eq!(
+            direct_rounds, direct_rounds_needed,
+            "{records}: the direct arm took {direct_rounds} rounds where the budget predicts \
+             {direct_rounds_needed}"
+        );
+        assert_eq!(
+            draining_rounds, draining_rounds_needed,
+            "{records}: the draining arm took {draining_rounds} rounds where the budget \
+             predicts {draining_rounds_needed}"
+        );
+    }
+}
+
+/// WHAT A DIRECT ROUND MOVES, MEASURED AGAINST WHAT MOVING IT RECOVERS.
+///
+/// A relocation recovers space only for the slab it VACATES. `compact_block_addresses` copies a
+/// page's bytes verbatim and appends them elsewhere, so a page moved off a slab with no dead
+/// space comes out byte for byte what it went in as, on a different slab -- and the slab it left
+/// is now entirely dead. Same live bytes, one more emptied slab for the collector to destroy.
+///
+/// The set worth moving is already named: `compaction_drain_block_slab_ids` is the slabs carrying
+/// dead space that objects still hold pages on, and `compaction_relocatable_block_refs` counts the
+/// pages on them. `compact_shard_blocks` -- the operator RPC, the on-demand cycle and the suite --
+/// does not consult it and relocates every live page, BY INSTRUCTION. This records that, and it
+/// is the control for the draining round below.
+///
+/// At suite scale the distinction has been invisible, which is why it was never measured: a few
+/// thousand small records fit in ONE slab against the 1 GiB target, so "every live page" and "the
+/// pages on the holed slab" are the same set. The fixture rolls between batches so the shard
+/// spans slabs, and holes exactly one of them.
+#[test]
+fn a_direct_round_relocates_every_live_block_not_only_the_blocks_on_holed_slabs() {
+    const BATCHES: usize = 6;
+    const KEYS_PER_BATCH: usize = 200;
+    const HOLED_KEYS: usize = 20;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, slabs_before) = drain_fixture(dir.path(), BATCHES, KEYS_PER_BATCH, HOLED_KEYS);
+    let engine = runtime.engine();
+    let options = StorageManagerOptions::default();
+    let (_pressure, plan) = runtime.storage_manager_pressure_snapshot(1, &options);
+    let drain_slabs = crate::engine::compaction_drain_block_slab_ids(&plan.reclaim_candidates);
+    let relocatable = crate::engine::compaction_relocatable_block_refs(&plan.reclaim_candidates);
+    let live_block_refs = engine
+        .bucket_storage_summaries(1)
+        .iter()
+        .map(|summary| summary.block_ref_count)
+        .sum::<u64>();
+
+    // DENOMINATORS, before any ratio: several slabs, exactly one of them holed, something on it.
+    assert!(
+        slabs_before.len() >= BATCHES,
+        "the fixture rolled {} slab(s) for {BATCHES} batches ({slabs_before:?}), so the shard \
+         does not span slabs and the two counts below cannot differ",
+        slabs_before.len()
+    );
+    assert_eq!(
+        drain_slabs.len(),
+        1,
+        "the overwrites holed {} slabs ({drain_slabs:?}) rather than one, so the ratio below is \
+         not the one this test is about",
+        drain_slabs.len()
+    );
+    assert!(
+        relocatable > 0,
+        "no object holds a page on the holed slab, so the round below has nothing to drain and \
+         what it reports is about an idle compactor: {plan:?}"
+    );
+    assert!(
+        live_block_refs > relocatable,
+        "the shard holds {live_block_refs} live page refs and {relocatable} of them are on the \
+         holed slab; with those equal, relocating everything and draining the holed slab are the \
+         same act"
+    );
+
+    let report = engine
+        .compact_shard_blocks(1)
+        .expect("a compaction round should succeed");
+    assert_eq!(
+        report.blocks_left_by_budget, 0,
+        "the round stopped on its budget, so what it moved is a budget artefact rather than its \
+         selection rule"
+    );
+
+    // THE TWO HALVES, SEPARATELY. One says the round moved the whole live set; the other says the
+    // set that moving recovers anything for is far smaller. A single ratio would hide either half
+    // going to zero.
+    assert!(
+        report.rewritten_block_refs as u64 >= live_block_refs,
+        "the direct form is documented to relocate every live page: it moved {} of \
+         {live_block_refs}",
+        report.rewritten_block_refs
+    );
+    assert_eq!(
+        report.blocks_left_off_drain_set, 0,
+        "a direct round declines nothing -- it was given no drain set -- yet it left {} pages \
+         off one",
+        report.blocks_left_off_drain_set
+    );
+    assert!(
+        report.rewritten_block_refs as u64 > relocatable * 2,
+        "the round moved {} page refs where {relocatable} sit on the only slab that carries dead \
+         space, across {} slabs. Equal counts would mean it is already moving just the drain set",
+        report.rewritten_block_refs,
+        slabs_before.len()
+    );
+}
+
+/// The PERIODIC round is the one that drains. Without this the wiring is untested: both
+/// selection rules exist and compile, and nothing says which one the loop actually issues.
+///
+/// The fixture is the one the two rounds above use, so the expected numbers are the same, and
+/// the round here is driven through `run_storage_manager_once` -- the real maintenance path,
+/// gate and all -- rather than by calling a compaction entry point directly.
+///
+/// HALVES SEPARATELY: that compaction RAN (a loop which skipped the stage leaves the dense slabs
+/// alone for the wrong reason, and that is exactly what this would otherwise read as success),
+/// that the holed slab was drained, and that the dense slabs were left where they were.
+#[test]
+fn the_periodic_round_drains_the_holed_slab_and_leaves_the_dense_ones() {
+    const BATCHES: usize = 6;
+    const KEYS_PER_BATCH: usize = 200;
+    const HOLED_KEYS: usize = 20;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (runtime, slabs_before) = drain_fixture(dir.path(), BATCHES, KEYS_PER_BATCH, HOLED_KEYS);
+    let engine = runtime.engine();
+    let options = StorageManagerOptions::default();
+    let (_pressure, plan) = runtime.storage_manager_pressure_snapshot(1, &options);
+    let drain_slabs = crate::engine::compaction_drain_block_slab_ids(&plan.reclaim_candidates);
+    let relocatable = crate::engine::compaction_relocatable_block_refs(&plan.reclaim_candidates);
+    let live_block_refs = engine
+        .bucket_storage_summaries(1)
+        .iter()
+        .map(|summary| summary.block_ref_count)
+        .sum::<u64>();
+    assert_eq!(
+        drain_slabs.len(),
+        1,
+        "the fixture holed {} slabs ({drain_slabs:?}) rather than one",
+        drain_slabs.len()
+    );
+    assert!(
+        relocatable > 0 && live_block_refs > relocatable * 2,
+        "the fixture left {relocatable} refs on the holed slab of {live_block_refs} live, which is \
+         not a wide enough margin for the counts below to mean anything"
+    );
+
+    let report = runtime.run_storage_manager_once(1, options.clone());
+
+    // DENOMINATOR: the stage ran. A loop that skipped compaction leaves every dense slab alone
+    // too, and would satisfy the second half below perfectly.
+    assert!(
+        report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "compact_pages"),
+        "the maintenance round did not compact, so nothing below is about the selection rule: \
+         executed {:?}, skipped {:?}",
+        report.executed_stages,
+        report.skipped_stages
+    );
+    let compaction = report
+        .compaction_report
+        .as_ref()
+        .expect("the round reported running compaction, so it must carry its report");
+    assert_eq!(
+        compaction.compacted_objects as u64, relocatable,
+        "the periodic round moved {} page refs where the plan named {relocatable} on the slab it \
+         wanted emptied -- the loop is still issuing a whole-shard relocation",
+        compaction.compacted_objects
+    );
+
+    // The dense slabs are still live; the holed one is not.
+    let slabs_after = engine
+        .live_block_slab_ids(1)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    for drained in &drain_slabs {
+        assert!(
+            !slabs_after.contains(drained),
+            "the periodic round left slab {drained} holding live pages ({slabs_after:?})"
+        );
+    }
+    let untouched = slabs_before
+        .iter()
+        .filter(|slab| !drain_slabs.contains(slab))
+        .filter(|slab| slabs_after.contains(slab))
+        .count();
+    assert!(
+        untouched >= BATCHES - 1,
+        "the periodic round vacated slabs it had no reason to: {untouched} of the {} dense slabs \
+         are still live (before {slabs_before:?}, drained {drain_slabs:?}, after {slabs_after:?})",
+        BATCHES - 1
+    );
+}
+
+#[test]
+// shared-corpus: storage_dump_load_recovery storage_cache_refill;
+fn a_maintenance_round_counts_as_a_run_on_the_path_the_server_actually_uses() {
+    // The scrape exports ONE number for storage-manager activity:
+    // temporalstore_data_node_runtime_jobs_total{kind="storage_manager"}, which reads
+    // `storage_manager_runs`. Two paths drive maintenance and they disagreed about that field.
+    // The queued path counts a run AND a round; the periodic scheduler counted only a round.
+    //
+    // A server started as shipped drives maintenance from the scheduler and never queues a
+    // storage-manager task, so the exported counter sat at zero while maintenance ran every
+    // thirty seconds -- a number an operator cannot act on, because a working loop and a stopped
+    // one both read zero.
+    //
+    // The two fields are asserted APART. Counting them together hid this: the pair moved, and it
+    // was only ever the unexported one moving.
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_for_test(engine.clone(), 8);
+
+    for (key, value) in [
+        ("run-count-a", b"one".to_vec()),
+        ("run-count-a", b"two".to_vec()),
+        ("run-count-b", b"three".to_vec()),
+    ] {
+        let response = runtime.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: key.to_string(),
+                value,
+            },
+        });
+        assert!(response.status.ok, "{response:?}");
+    }
+
+    // ---- Denominator: nothing has run yet, so a later "it climbed" is not reading a head start.
+    let before = runtime.stats();
+    assert_eq!(
+        before.storage_manager_runs, 0,
+        "premise: no run counted before the first round"
+    );
+    assert_eq!(
+        before.storage_manager_loops, 0,
+        "premise: no round counted before the first round"
+    );
+
+    let options = StorageManagerOptions {
+        max_dump_buckets_per_round: 16,
+        min_undumped_wal_records: 1,
+        dirty_bucket_pressure: 1,
+        ..StorageManagerOptions::default()
+    };
+    let report = runtime.run_storage_manager_once(1, options.clone());
+
+    // ---- Denominator: the round did work, so counting it is counting something.
+    assert!(report.status.ok, "{report:?}");
+    assert!(
+        !report.executed_stages.is_empty(),
+        "premise: the round executed at least one stage, got {:?}",
+        report.executed_stages
+    );
+
+    // ---- Half one: the EXPORTED field. This is the half that stood at zero.
+    let after = runtime.stats();
+    assert_eq!(
+        after.storage_manager_runs, 1,
+        "the scheduler ran a maintenance round and {} runs were counted -- this is the field the \
+         scrape exports, so the only exported sign of maintenance would stay flat while it ran",
+        after.storage_manager_runs
+    );
+
+    // ---- Half two: the UNEXPORTED field. This half was always right, and moving alone is what
+    // made the surface look alive from inside the process and dead from outside it.
+    assert_eq!(
+        after.storage_manager_loops, 1,
+        "the round counter must still count the round, got {}",
+        after.storage_manager_loops
+    );
+
+    // ---- The two must not drift apart again across rounds.
+    runtime.run_storage_manager_once(1, options.clone());
+    runtime.run_storage_manager_once(1, options);
+    let later = runtime.stats();
+    assert_eq!(later.storage_manager_loops, 3, "three rounds were driven");
+    assert_eq!(
+        later.storage_manager_runs, later.storage_manager_loops,
+        "every round on this path is a run of the storage manager: {} runs against {} rounds",
+        later.storage_manager_runs, later.storage_manager_loops
+    );
+
+    // ---- And the export still reads the field this test just moved. The renderer lives in the
+    // server binary, which this suite does not link, so the link is pinned by reading it. Without
+    // this, someone could point the metric at a different field and both halves above would still
+    // pass while the scrape went flat again.
+    let renderer = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src")
+        .join("bin")
+        .join("server")
+        .join("metrics.rs");
+    let text = std::fs::read_to_string(&renderer)
+        .unwrap_or_else(|err| panic!("cannot read {}: {err}", renderer.display()));
+    assert!(
+        text.len() > 1000,
+        "premise: read the renderer, not an empty file -- got {} bytes",
+        text.len()
+    );
+    assert!(
+        text.contains("temporalstore_data_node_runtime_jobs_total"),
+        "premise: this is the file that renders the job counters"
+    );
+    assert!(
+        text.contains("(\"storage_manager\", stats.storage_manager_runs)"),
+        "the exported storage_manager job counter must read storage_manager_runs, the field the \
+         scheduler increments; if this moved, the scrape no longer reports what this test proved"
+    );
+}
+
+/// A stub role source, so a test can put the node in any one of the three states by hand.
+#[derive(Debug)]
+struct FixedShardLeadership(ShardLeadership);
+
+impl ShardLeadershipSource for FixedShardLeadership {
+    fn shard_leadership(&self, _shard_id: ShardId) -> ShardLeadership {
+        self.0
+    }
+}
+
+/// One arm of the role guard: a fixture that genuinely compacts, run under one leadership state.
+///
+/// Returns (rounds, rounds that ran `compact_pages`, page refs relocated, bytes relocated,
+/// rounds whose skip list names the role). The denominators are returned rather than folded in,
+/// because the two halves of this guard fail in opposite directions and a single combined count
+/// can read full for one while the other is zero.
+fn run_compaction_rounds_under_role(
+    role: Option<ShardLeadership>,
+    batch: usize,
+    keyspace: usize,
+    rounds: usize,
+) -> (usize, usize, usize, u64, usize) {
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    if let Some(role) = role {
+        runtime.set_shard_leadership_source(Arc::new(FixedShardLeadership(role)));
+    }
+    let options = StorageManagerOptions::default();
+    let mut written = 0usize;
+    let mut compacted_rounds = 0usize;
+    let mut relocated_refs = 0usize;
+    let mut relocated_bytes = 0u64;
+    let mut role_skipped_rounds = 0usize;
+    for _ in 0..rounds {
+        let engine = runtime.engine();
+        for index in 0..batch {
+            // Overwrites a fixed key space, so earlier versions become dead pages. An
+            // insert-only load leaves nothing stale and compaction never fires, which would
+            // make every number below a measurement of nothing.
+            engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: format!("role-{:08}", (written + index) % keyspace),
+                    value: vec![b'v'; 96],
+                },
+            });
+        }
+        written += batch;
+        let report = runtime.run_storage_manager_once(1, options.clone());
+        if report
+            .executed_stages
+            .iter()
+            .any(|stage| stage == "compact_pages")
+        {
+            compacted_rounds += 1;
+        }
+        if report
+            .skipped_stages
+            .iter()
+            .any(|stage| stage == "compact_pages_not_leading")
+        {
+            role_skipped_rounds += 1;
+        }
+        if let Some(compaction) = report.compaction_report.as_ref() {
+            // compacted_objects carries the shard report rewritten_block_refs.
+            relocated_refs += compaction.compacted_objects;
+            relocated_bytes += compaction.relocated_bytes;
+        }
+    }
+    (
+        rounds,
+        compacted_rounds,
+        relocated_refs,
+        relocated_bytes,
+        role_skipped_rounds,
+    )
+}
+
+/// A node that does not lead a shard must not rewrite that shard's live set.
+///
+/// THREE STATES, ASSERTED SEPARATELY, EACH WITH ITS OWN DENOMINATOR. A guard that only checks
+/// the follower half cannot tell "skipped because this node follows" from "compaction never ran
+/// in this fixture at all" -- both read as zero -- so the leading half is what makes the zero
+/// mean something, and the unknown half is what stops the fix from being worse than the waste
+/// it removes.
+///
+///   leading      -> compacts. The positive control.
+///   not leading  -> skips, and SAYS why. The behaviour being bought.
+///   unknown      -> compacts. The failure mode this change risks: the storage maintenance
+///                   scheduler is constructed before consensus is, and on a standalone node
+///                   consensus is never constructed at all. A check that read "I cannot tell"
+///                   as "I am a follower" would switch page compaction off everywhere, which is
+///                   far more damage than the waste.
+///
+/// Mutation-verified, one mutation per half:
+///   * gate loses `leadership_permits_compaction`  -> the not-leading half fails (compacted 8/8).
+///   * gate becomes an unconditional skip           -> the leading half fails (compacted 0/8).
+///   * `is_known_not_leading` also matches Unknown  -> the unknown half fails (compacted 0/8).
+#[test]
+fn a_node_that_does_not_lead_a_shard_does_not_rewrite_its_live_set() {
+    const BATCH: usize = 2_000;
+    const ROUNDS: usize = 8;
+    // Smaller than BATCH, so every round overwrites keys earlier rounds wrote.
+    const KEYSPACE: usize = 500;
+
+    // No source attached at all is the same state the scheduler sees before consensus exists.
+    let engine = TemporalEngine::default();
+    engine.load_shard(1);
+    let bare = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    assert_eq!(
+        bare.shard_leadership(1),
+        ShardLeadership::Unknown,
+        "a runtime with no leadership source must answer Unknown, never NotLeading"
+    );
+
+    let (leading_rounds, leading_compacted, leading_refs, leading_bytes, leading_role_skips) =
+        run_compaction_rounds_under_role(Some(ShardLeadership::Leading), BATCH, KEYSPACE, ROUNDS);
+    let (
+        follower_rounds,
+        follower_compacted,
+        follower_refs,
+        follower_bytes,
+        follower_role_skips,
+    ) = run_compaction_rounds_under_role(
+        Some(ShardLeadership::NotLeading),
+        BATCH,
+        KEYSPACE,
+        ROUNDS,
+    );
+    let (unknown_rounds, unknown_compacted, unknown_refs, unknown_bytes, unknown_role_skips) =
+        run_compaction_rounds_under_role(None, BATCH, KEYSPACE, ROUNDS);
+
+    eprintln!(
+        "  leading      compacted={leading_compacted}/{leading_rounds} refs={leading_refs} \
+         bytes={leading_bytes} role_skips={leading_role_skips}"
+    );
+    eprintln!(
+        "  not_leading  compacted={follower_compacted}/{follower_rounds} refs={follower_refs} \
+         bytes={follower_bytes} role_skips={follower_role_skips}"
+    );
+    eprintln!(
+        "  unknown      compacted={unknown_compacted}/{unknown_rounds} refs={unknown_refs} \
+         bytes={unknown_bytes} role_skips={unknown_role_skips}"
+    );
+
+    // HALF ONE: leading. Without this the follower's zero below is unattributable.
+    assert!(
+        leading_compacted > 0,
+        "a leading node must still compact: ran {leading_compacted} of {leading_rounds} rounds"
+    );
+    assert!(
+        leading_refs > 0 && leading_bytes > 0,
+        "a leading node must relocate something: refs={leading_refs} bytes={leading_bytes} over \
+         {leading_rounds} rounds"
+    );
+    assert_eq!(
+        leading_role_skips, 0,
+        "a leading node must never record the role skip: {leading_role_skips} of \
+         {leading_rounds} rounds did"
+    );
+
+    // HALF TWO: not leading. Zero work, and a named reason for it.
+    assert_eq!(
+        follower_compacted, 0,
+        "a node that does not lead must not compact: ran {follower_compacted} of \
+         {follower_rounds} rounds"
+    );
+    assert_eq!(
+        (follower_refs, follower_bytes),
+        (0, 0),
+        "a node that does not lead must relocate nothing: refs={follower_refs} \
+         bytes={follower_bytes} over {follower_rounds} rounds"
+    );
+    assert_eq!(
+        follower_role_skips, follower_rounds,
+        "every round on a non-leading node must name the role as the skip reason: \
+         {follower_role_skips} of {follower_rounds} did"
+    );
+
+    // HALF THREE: unknown. The state the scheduler is in before consensus exists, and the state
+    // every standalone node stays in for ever.
+    assert!(
+        unknown_compacted > 0,
+        "an UNKNOWN role must not disable compaction -- the scheduler starts before consensus \
+         does, and a standalone node has none at all: ran {unknown_compacted} of \
+         {unknown_rounds} rounds"
+    );
+    assert!(
+        unknown_refs > 0 && unknown_bytes > 0,
+        "an UNKNOWN role must still relocate: refs={unknown_refs} bytes={unknown_bytes} over \
+         {unknown_rounds} rounds"
+    );
+    assert_eq!(
+        unknown_role_skips, 0,
+        "an UNKNOWN role must never record the role skip: {unknown_role_skips} of \
+         {unknown_rounds} rounds did"
+    );
+}
+
+/// What does a node that leads nothing throw away per round? Prints.
+///
+///   cargo test -p temporalstore-rust --lib what_a_follower_rewrites_per_round \
+///       -- --ignored --nocapture --test-threads=1
+///
+/// Measured against TODAY's compaction, not the one that rewrote the whole live set every round:
+/// since #1687 a round relocates only the pages sitting on the slabs the reclaim plan picked, so
+/// these are the post-fix numbers and they are still entirely wasted on a node whose clients
+/// cannot see the layout.
+///
+/// MEASURED, 16-core WSL box, load average under 5 throughout, a 500-key live set overwritten
+/// by 2,000 writes a round:
+///
+///     records   rounds   compacted   page refs   bytes relocated   bytes/round
+///      8,000       4        4/4         2,000         216,000         54,000
+///     80,000      40       40/40       20,000       2,160,000         54,000
+///
+/// The not-leading arm is the control and reads ZERO on every column at both scales, over
+/// denominators of 4 and 40 rounds; without it a zero here would be indistinguishable from a
+/// fixture that never generated compaction pressure.
+///
+/// READ THE THIRD COLUMN FIRST. Compaction fired in EVERY round of both runs, on a shard whose
+/// only activity is overwriting the same 500 keys. Since #1687 a round is bounded by the live
+/// pages on the slabs the reclaim plan picked, so its cost is flat in the record count -- but
+/// it recurs for ever, once per scheduler tick, and at the shipped thirty-second interval that
+/// is 54 KB relocated and 500 pages rewritten per shard per tick, about 155 MB a day per idle
+/// shard, plus the index record each round persists. None of it is visible to a client of a
+/// node that leads nothing.
+#[test]
+#[ignore]
+fn what_a_follower_rewrites_per_round() {
+    const BATCH: usize = 2_000;
+
+    // TWO AXES, because one of them alone says the wrong thing.
+    //
+    // A fixed live set shows the RECURRENCE: the round costs the same every thirty seconds for
+    // ever, on a shard nobody is even writing to unusually hard. Growing the record count under
+    // a fixed live set does NOT make a round more expensive, and a table that only did that
+    // would suggest the waste is bounded -- it is not, it is unbounded in TIME.
+    //
+    // A live set proportional to the shard shows the other half: what one round costs is the
+    // live set sitting on the slabs the reclaim plan picked, so a bigger shard pays more PER
+    // ROUND as well as for ever.
+    const KEYSPACE: usize = 500;
+
+    eprintln!(
+        "  records  role         rounds  compacted  page_refs  relocated_bytes  bytes_per_round"
+    );
+    for rounds in [4usize, 40usize] {
+        let records = BATCH * rounds;
+        for (label, role) in [
+            ("leading", Some(ShardLeadership::Leading)),
+            ("not_leading", Some(ShardLeadership::NotLeading)),
+        ] {
+            let (denominator, compacted, refs, bytes, _) =
+                run_compaction_rounds_under_role(role, BATCH, KEYSPACE, rounds);
+            let per_round = if denominator == 0 {
+                0
+            } else {
+                bytes / denominator as u64
+            };
+            eprintln!(
+                "  {records:>7}  {label:<11}  {denominator:>6}  {compacted:>9}  {refs:>9}  \
+                 {bytes:>15}  {per_round:>15}"
+            );
+        }
+    }
+}
+
+/// RECLAIM MUST NOT RUN AGAINST A HALF-REPLAYED INDEX.
+///
+/// run_storage_manager_cycle refuses to run while a shard is recovering, and its own comment
+/// says why: the cycle mutates shard state, and a reclaim round interleaved with an in-flight
+/// WAL replay observes a half-reconstructed index and can reclaim something still live.
+///
+/// run_gc_inner -- the reclaim that BOTH the periodic storage-manager loop and the operator
+/// reclaim RPC actually run -- had no such check, and a recovering shard reaches both callers.
+/// load_shard_with publishes the shard into the shards map BEFORE it replays the WAL, and
+/// loaded_shard_ids() reads that map without consulting the recovery flag.
+///
+/// The sharpest exposure is the LOG, not the slabs. run_gc_inner also reclaims the write-ahead
+/// log, and a shard that has never dumped gets an UNPROVEN durable anchor whose through_sequence
+/// is u64::MAX -- no clamp at all. So a reclaim taken during the recovery window deletes the
+/// very records replay has not applied yet. Slabs at least have quarantine to be restored from;
+/// the log has nothing.
+///
+/// async_storage is what makes the served index genuinely partial: the write lands in the WAL
+/// and page/index materialization is deferred to replay, so the index on disk does not contain
+/// these records at all.
+///
+/// The halves are asserted SEPARATELY -- what the reclaim removed, and what survived -- because
+/// a test that only counted survivors would pass if the round had removed nothing for an
+/// unrelated reason, and a total can pass when two errors cancel.
+#[test]
+fn reclaim_is_refused_while_the_shard_is_recovering() {
+    const RECORDS: usize = 32;
+
+    let dir = tempfile::tempdir().unwrap();
+    let block_dir = dir.path().join("blocks");
+    let index_dir = dir.path().join("indexes");
+
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache-a"),
+        &block_dir,
+        &index_dir,
+    );
+    engine.load_shard(1);
+    assert!(
+        engine
+            .set_config(crate::control::SetConfigRequest {
+                shard_id: 1,
+                config: crate::control::Config {
+                    version: 2,
+                    async_storage: true,
+                    ..crate::control::Config::default()
+                },
+            })
+            .ok
+    );
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("recovery-{index:03}"),
+                value: format!("value-{index:03}").into_bytes(),
+            },
+        });
+        assert!(response.status.ok, "write {index} failed: {response:?}");
+    }
+    let wal_writes = engine.write_ahead_log_store().stats(1).writes;
+    let block_writes = engine.block_store().stats().writes;
+    assert_eq!(
+        block_writes, 0,
+        "NON-VACUITY: async_storage must defer every block write, so the served index cannot already hold these records; block_writes={block_writes}"
+    );
+    assert!(
+        wal_writes >= RECORDS as u64,
+        "NON-VACUITY: all {RECORDS} records must be in the log; wal_writes={wal_writes}"
+    );
+    drop(engine);
+
+    let restarted = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache-b"),
+        &block_dir,
+        &index_dir,
+    );
+    let watermark = restarted.test_publish_recovering_shard(1);
+    let last_sequence = restarted.write_ahead_log_store().stats(1).last_sequence;
+    assert!(
+        last_sequence > 0,
+        "NON-VACUITY: the log must hold something to reclaim; last_sequence={last_sequence}"
+    );
+
+    let cycle = restarted.run_storage_manager_cycle(StorageManagerCycleRequest {
+        shard_id: 1,
+        enable_wal_reclaim: true,
+        enable_block_reclaim: true,
+        ..StorageManagerCycleRequest::default()
+    });
+    assert!(
+        !cycle.completed,
+        "CONTROL: the guarded cycle must refuse while the shard is recovering: {cycle:?}"
+    );
+
+    let runtime = DataNodeRuntime::new(
+        restarted.clone(),
+        DataNodeRuntimeOptions {
+            worker_threads: 1,
+            max_queue_depth: 8,
+            max_background_queue_depth: 8,
+        },
+    );
+    let submitted = runtime.submit_gc(
+        GcRequest {
+            shard_id: 1,
+            retain_wal_from_sequence: Some(last_sequence.saturating_add(1)),
+            retain_index_log_from_sequence: None,
+            retain_block_slabs_from_id: Some(u64::MAX),
+            block_gc_delayed_destroy: false,
+            block_gc_invalidate_removed_slabs_only: false,
+        },
+        RequestController { timeout_ms: 5_000 },
+    );
+    let finished = wait_for_job(&runtime, submitted.job_id);
+    let Some(DataNodeTaskOutput::Gc(output)) = finished.output else {
+        panic!("expected gc output");
+    };
+    println!(
+        "MEASURED-RECLAIM status_ok={} wal_records_removed={} block_slabs_removed={} last_sequence={last_sequence}",
+        output.status.ok, output.wal_records_removed, output.block_slabs_removed
+    );
+
+    // HALF ONE, asserted BEFORE recovery is finished. What did the reclaim take? Checked here
+    // so the first failure is a NUMBER rather than a panic out of replay: with the log already
+    // holed, finishing recovery aborts with a replay-hole status and the count below would never
+    // be reported.
+    assert_eq!(
+        output.wal_records_removed, 0,
+        "a reclaim ran during replay and deleted {} log records that replay had not applied yet",
+        output.wal_records_removed
+    );
+    assert_eq!(
+        output.block_slabs_removed, 0,
+        "a reclaim ran during replay and destroyed {} slabs",
+        output.block_slabs_removed
+    );
+
+    restarted.test_finish_recovery(1, watermark);
+    let mut readable = 0usize;
+    for index in 0..RECORDS {
+        let response = restarted.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: format!("recovery-{index:03}"),
+            },
+        });
+        if let CommandResponse::Bytes { value: Some(value) } = response.response {
+            if value == format!("value-{index:03}").into_bytes() {
+                readable += 1;
+            }
+        }
+    }
+    println!("MEASURED-SURVIVORS records_written={RECORDS} records_readable={readable}");
+
+    assert_eq!(
+        readable, RECORDS,
+        "only {readable} of {RECORDS} records survived a reclaim taken during replay"
+    );
+}
+
+/// THE DATA NODE'S MAINTENANCE ROUND DOES NOT READ THE LOGS EITHER.
+///
+/// There are TWO pressure snapshots, not one. The engine's cycle takes one and this runtime takes
+/// its own, and both used to reach `storage_log_compatibility_report` -- whose `wal_records` and
+/// `index_log_records` are each a `record_count()`, a walk of the whole log that decodes every
+/// record in it -- to read two byte figures out of it.
+///
+/// A guard covering one of two live copies lets the other keep the cost, so this is the same
+/// assertion as `a_round_no_longer_decodes_both_logs_end_to_end` made against the copy that test
+/// cannot reach: that one drives `TemporalEngine::run_storage_manager_cycle`, this one drives
+/// `DataNodeRuntime::storage_manager_pressure_snapshot`, and only reverting BOTH call sites is
+/// invisible to both.
+///
+/// `bytes_read` is incremented inside `scan_collect`, the one walk every scan of the log shares,
+/// so a reader added to either log cannot avoid moving it. The store handles are cloned before the
+/// engine is moved into the runtime, and `raw_stats` is the accessor that does not itself scan.
+#[test]
+fn the_data_node_pressure_snapshot_does_not_read_either_log() {
+    const RECORDS: usize = 2_000;
+    const VALUE_BYTES: usize = 512;
+
+    let dir = tempfile::tempdir().unwrap();
+    let engine = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+
+    // Incompressible, one log record per object. A repeated byte compresses to almost nothing, so
+    // a corpus built from one puts a fraction of the log on disk that its record count implies and
+    // the planted control below would have nothing to recover.
+    let mut state = 0x2545_F491_4F6C_DD1D_u64;
+    for index in 0..RECORDS {
+        let value = (0..VALUE_BYTES)
+            .map(|_| {
+                state ^= state >> 12;
+                state ^= state << 25;
+                state ^= state >> 27;
+                state.wrapping_mul(0x2545_F491_4F6C_DD1D) as u8
+            })
+            .collect::<Vec<u8>>();
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("pressure-{index:06}"),
+                value,
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+
+    // Cloned handles onto the same logs: the engine itself is about to move into the runtime.
+    let wal = engine.write_ahead_log_store();
+    let index_log = engine.index_log_store();
+
+    // THE INSTRUMENT'S OWN CONTROL. Reading it twice, with nothing between, must not move it.
+    assert_eq!(
+        wal.raw_stats(1).bytes_read,
+        wal.raw_stats(1).bytes_read,
+        "reading the byte counter moved it, so every delta below is this accessor's own work"
+    );
+
+    // PLANTED, AND RECOVERED. A deliberate whole-log count must move the counter by about the
+    // log's size, or a zero below would be a counter that has stopped rather than a walk that has
+    // gone.
+    let log_bytes = wal.stats(1).bytes_written;
+    let before = wal.raw_stats(1).bytes_read;
+    let counted = wal.record_count(1).expect("record count");
+    let planted = wal.raw_stats(1).bytes_read - before;
+    assert!(
+        counted >= RECORDS,
+        "{RECORDS} objects written one log record each, and the log counted {counted}"
+    );
+    assert!(
+        planted >= log_bytes / 2,
+        "a deliberate whole-log count moved the counter by {planted} against {log_bytes} bytes \
+         written. The counter is not counting the walk, so the zero below would mean nothing"
+    );
+
+    let runtime = DataNodeRuntime::new_without_workers_with_options(
+        engine,
+        DataNodeRuntimeOptions {
+            worker_threads: 0,
+            max_queue_depth: 4,
+            max_background_queue_depth: 2,
+        },
+    );
+    let options = StorageManagerOptions::default();
+
+    let wal_before = wal.raw_stats(1).bytes_read;
+    let index_before = index_log.stats(1).bytes_read;
+    let (pressure, _plan) = runtime.storage_manager_pressure_snapshot(1, &options);
+    let wal_read = wal.raw_stats(1).bytes_read - wal_before;
+    let index_read = index_log.stats(1).bytes_read - index_before;
+
+    println!(
+        "  {RECORDS} records, {log_bytes} B of log: a deliberate count read {planted} B; the \
+         pressure snapshot read {wal_read} B of log and {index_read} B of index log"
+    );
+
+    // THE DENOMINATOR. A snapshot that computed nothing reads nothing, and would satisfy the
+    // result below without the result meaning anything.
+    assert!(
+        pressure.undumped_wal_records >= 1,
+        "the snapshot reports {} undumped log records, so it did not survey this shard and the \
+         zeros below are about nothing",
+        pressure.undumped_wal_records
+    );
+
+    // THE RESULT.
+    assert_eq!(
+        wal_read, 0,
+        "the data node's pressure snapshot decoded {wal_read} bytes of the write-ahead log. It is \
+         supposed to answer from `stats()` -- piece headers and accumulated counters -- and never \
+         from the records"
+    );
+    assert_eq!(
+        index_read, 0,
+        "the data node's pressure snapshot decoded {index_read} bytes of the index log"
+    );
+}
