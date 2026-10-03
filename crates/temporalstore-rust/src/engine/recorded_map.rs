@@ -438,3 +438,884 @@ where
         // records, and `container_tombstone_entry::a_re_add_clears_the_tombstone_entry_so_churn_on_
         // one_element_does_not_accumulate` is the arm that holds the difference at one live and one
         // tombstone per cycle.
+        super::storage_bucket_internals::drop_live_object_entries(shard, K::KIND, object_key);
+    }
+    removed || dropped
+}
+
+/// Drop a recorded object's whole element map.
+///
+/// TAKES the deletion witness rather than minting one, because ONE object deletion authorises a
+/// drop in EVERY recorded map. `delete_record_exact` marks once and hands a clone to each kind;
+/// minting per kind would file a second record of one deletion, and `mark_bucket_index_object_deleted`
+/// settles a released bucket by reading the block's address out of the model map WHILE THE MAP STILL
+/// HOLDS IT, so the mark must also precede every drop. That is the one call site in the engine where
+/// a token is threaded, and it is threaded because one record genuinely authorises several mutations.
+pub(super) fn drop_object<K: RecordedKind>(
+    shard: &mut ShardState,
+    object_key: &str,
+    filed: ObjectDeletionFiled,
+) -> bool {
+    K::resident(shard).remove_object(RecordedObjectRemoval::<K> {
+        filed,
+        object_key: object_key.to_string(),
+        kind: std::marker::PhantomData,
+    })
+}
+
+/// Removing one element needs the level-2 container to be able to remove one, which `ElementMap`
+/// does not require -- it is the FOLD's trait and a fold only inserts.
+///
+/// Declared here rather than widened onto `ElementMap` so that the fold's contract stays the fold's
+/// contract: a kind that can be folded into but never has an element removed is a legitimate shape,
+/// and widening would have forced it to implement something no caller needs.
+pub(super) trait RemovableElementMap: ElementMap {
+    fn remove_element(&mut self, element: &Self::Element) -> bool;
+    fn is_empty_map(&self) -> bool;
+}
+
+// ---------------------------------------------------------------------------------------------
+// READS. Plain delegation: no allocation, no copy, no clone.
+// ---------------------------------------------------------------------------------------------
+
+impl<K: RecordedKind> RecordedMap<K> {
+    /// Move this object's entry onto the shared key handle the page index owns, returning whether
+    /// anything moved.
+    ///
+    /// A DECLARED OPERATION RATHER THAN A `&mut` ACCESSOR. The invariant this module exists to
+    /// hold is that the complete set of things which can change `entries` is declared here; an
+    /// accessor handing out `&mut` would end that, and `recorded_map_invariant` would fail. So
+    /// adoption is one named operation with one job.
+    ///
+    /// It re-keys and does not touch the value, so it cannot change what any read answers -- the
+    /// text is equal by definition, or the lookup that found it would not have. What changes is
+    /// how many allocations hold that text: before this existed, all four kinds owned their own
+    /// copy of a key the adopted maps already shared.
+    ///
+    /// Call it AFTER the page is filed. Before that the page index holds no handle to borrow, the
+    /// caller has nothing to pass, and the entry keeps the copy it minted at its write site --
+    /// which is exactly how a wired sharing mechanism went 0 for 40,040 once before.
+    pub(super) fn adopt_key(&mut self, object_key: &str, canonical: &ModelKey) -> bool {
+        let moves = match self.entries.get_key_value(object_key) {
+            Some((held, _)) => !std::sync::Arc::ptr_eq(held, canonical),
+            None => false,
+        };
+        if !moves {
+            return false;
+        }
+        match self.entries.remove(object_key) {
+            Some(value) => {
+                self.entries.insert(std::sync::Arc::clone(canonical), value);
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub(super) fn get(&self, object_key: &str) -> Option<&K::Elements> {
+        self.entries.get(object_key)
+    }
+
+    /// Point every ELEMENT name in every entry at the pool's copy, and answer how many moved.
+    ///
+    /// Declared here for the same reason `adopt_key` is: `entries` is private to this module,
+    /// so the decode pass cannot reach into it from outside. Only `hashes` has a pooled element
+    /// name today -- the other three kinds are keyed by bytes -- so this is bounded by the
+    /// trait rather than written per kind.
+    pub(super) fn adopt_element_names(
+        &mut self,
+        pool: &mut std::collections::HashSet<std::sync::Arc<str>>,
+    ) -> usize
+    where
+        K::Elements: PoolableElementNames,
+    {
+        self.entries
+            .values_mut()
+            .map(|elements| elements.adopt_element_names(pool))
+            .sum()
+    }
+
+    pub(super) fn contains_key(&self, object_key: &str) -> bool {
+        self.entries.contains_key(object_key)
+    }
+
+    pub(super) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(super) fn keys(&self) -> impl Iterator<Item = &ModelKey> {
+        self.entries.keys()
+    }
+
+    pub(super) fn values(&self) -> impl Iterator<Item = &K::Elements> {
+        self.entries.values()
+    }
+
+    pub(super) fn iter(&self) -> impl Iterator<Item = (&ModelKey, &K::Elements)> {
+        self.entries.iter()
+    }
+
+    /// IMMUTABLE access to the whole map, for a serde adapter that has to hand the inner shape to
+    /// an existing codec module.
+    ///
+    /// This is a READ and not an escape hatch: nothing can be written through a `&`, and the
+    /// surface test's matcher is anchored on `&mut` returns for exactly that reason. `sets` and
+    /// `zsets` need it because their field carried a `with =` codec that a `transparent` wrapper
+    /// would have silently changed.
+    pub(super) fn entries(&self) -> &HashMap<ModelKey, K::Elements> {
+        &self.entries
+    }
+
+    /// THE PAGE THIS WRITE VACATES, or nothing when it vacates none.
+    ///
+    /// `Some` only when all three hold:
+    ///
+    ///   * the map already holds `element`, so this is a REWRITE and not a first write;
+    ///   * the address it holds names a DIFFERENT page from the one the write is landing on -- a
+    ///     rewrite that lands back on its own page is superseded through the landing key and needs
+    ///     nothing extra;
+    ///   * and NO OTHER element of the same object is still on the page being left, because an
+    ///     entry under the gate stands for the PAGE and a page with a sibling still on it is still
+    ///     live.
+    ///
+    /// ASKED BEFORE THE MUTATION, which is the only reason it can be asked at all: the caller files
+    /// the record first, so the map still holds the pre-write address here.
+    ///
+    /// THE SCAN IS THE SAME ORDER AS WHAT THE FILER ALREADY PAYS. The third test is a
+    /// short-circuiting `any` over ONE OBJECT's elements, where `upsert_bucket_index_block_inner`
+    /// already walks the whole BUCKET's pages twice per write -- once to decide whether the object
+    /// still has a page there and once for the tombstone probe. One object's elements are a subset
+    /// of its bucket's pages, so this does not change the order of a container write.
+    pub(super) fn block_an_element_vacates(
+        &self,
+        object_key: &str,
+        element: &<K::Elements as ElementMap>::Element,
+        landing: &ElementEntry,
+    ) -> Option<ElementEntry>
+    where
+        K::Elements: AddressedElementMap,
+    {
+        let elements = self.entries.get(object_key)?;
+        let previous = elements.element_address(element)?;
+        if super::live_block_key(previous) == super::live_block_key(landing) {
+            return None;
+        }
+        if elements.any_element_other_than_at(element, previous) {
+            return None;
+        }
+        Some(previous.clone())
+    }
+}
+
+impl<'a, K: RecordedKind> IntoIterator for &'a RecordedMap<K> {
+    type Item = (&'a ModelKey, &'a K::Elements);
+    type IntoIter = std::collections::hash_map::Iter<'a, ModelKey, K::Elements>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.iter()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE RECORDED MUTATORS. PRIVATE, which is the second half of the invariant: `entries` being
+// private stops a direct write, and these being private stop a write through a proof someone got
+// hold of. The only callers are the operations above, each of which has already recorded.
+// ---------------------------------------------------------------------------------------------
+
+impl<K: RecordedKind> RecordedMap<K> {
+    fn install(&mut self, recorded: RecordedElement<K>) {
+        let RecordedElement {
+            filed: _,
+            object_key,
+            element,
+            value,
+        } = recorded;
+        self.entries
+            .entry(std::sync::Arc::from(&object_key[..]))
+            .or_default()
+            .insert_element(element, value);
+    }
+
+    /// Drop a recorded element, and the key with it when that element was its last.
+    ///
+    /// THE KEY GOES WHEN THE ELEMENT MAP EMPTIES, and that is not tidiness. `record_exists_exact`
+    /// ORs each model map's `contains_key` in beside its bucket-index answer, so an empty element
+    /// map under a live key is a key that EXISTS answers 1 for while every listing answers empty
+    /// for -- and `CommonExpire` gates on the same function, so it accepted a deadline for such a
+    /// key and `ttl_ms` then reported that deadline instead of the -2 of a missing key.
+    ///
+    /// Written once here, which is the point: it used to be a rule four arms had to remember, and
+    /// the note at `HashDelete` said in a parenthesis that sets did not need it. They did.
+    fn remove_element(&mut self, recorded: RecordedElementRemoval<K>) -> bool
+    where
+        K::Elements: RemovableElementMap,
+    {
+        let RecordedElementRemoval {
+            object_key,
+            element,
+        } = recorded;
+        let Some(elements) = self.entries.get_mut(&object_key[..]) else {
+            return false;
+        };
+        let removed = elements.remove_element(&element);
+        if elements.is_empty_map() {
+            self.entries.remove(&object_key[..]);
+        }
+        removed
+    }
+
+    fn remove_object(&mut self, recorded: RecordedObjectRemoval<K>) -> bool {
+        self.entries.remove(&recorded.object_key[..]).is_some()
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE EXCEPTIONS. Each mutates WITHOUT a record because on that path the durable record is the
+// SOURCE of the change. None hands out `&mut` to the map. Three are shared; two are per-kind and
+// gated by a marker trait, so a kind that does not declare one cannot call it.
+// ---------------------------------------------------------------------------------------------
+
+impl<K: RecordedKind> RecordedMap<K> {
+    /// SHARED EXCEPTION 1 -- THE DECODE, which is where a stored map comes back.
+    ///
+    /// Deserialization is not a recorded mutation: the decode IS the record. This was INVISIBLE
+    /// while each kind had its own container -- `hashes` got it from `#[serde(transparent)]` and
+    /// `sets` from a hand-written impl, so neither named it -- and collapsing the two is what
+    /// surfaced it as a path. Naming it is strictly better than a derive doing it silently.
+    pub(super) fn from_decoded(entries: HashMap<ModelKey, K::Elements>) -> Self {
+        Self { entries }
+    }
+
+    /// SHARED EXCEPTION 2 -- THE RECONCILE, where the durable index DECIDES and this map is the
+    /// derived view of it.
+    ///
+    /// The persisted map is the OLDER of the two inputs and supplies only what the derived view
+    /// could not produce, which is why the merge inserts where ABSENT rather than overwriting:
+    /// letting the older map win would invert the rule `durable_outranks_derived` exists to hold.
+    /// Logging here would be backwards -- the record is what this read FROM.
+    pub(super) fn reconcile_from_durable(
+        &mut self,
+        derived: HashMap<ModelKey, K::Elements>,
+        live: &HashSet<LiveBlockKey>,
+        resurrections_refused: &mut usize,
+    ) where
+        K::Elements: IntoIterator<
+            Item = (
+                <K::Elements as ElementMap>::Element,
+                <K::Elements as ElementMap>::Value,
+            ),
+        >,
+        <K::Elements as ElementMap>::Element: std::hash::Hash + Eq + Clone,
+        // `fill_absent_elements` drops a durable element whose page the settled index does not
+        // hold, and it asks the VALUE for that address -- so the live-page filter needs this too.
+        <K::Elements as ElementMap>::Value: super::CarriedValue,
+    {
+        let persisted = std::mem::take(&mut self.entries);
+        self.entries = super::storage_bucket_internals::fill_absent_elements(
+            derived,
+            persisted,
+            live,
+            resurrections_refused,
+        );
+    }
+
+    /// SHARED EXCEPTION 3 -- THE DELTA FOLD, where the carried blob IS the record.
+    ///
+    /// The carry is the newer statement, so here it WINS a collision -- the opposite of the
+    /// reconcile above, which is why these are two methods and not one with a flag.
+    pub(super) fn fold_carried_elements(
+        &mut self,
+        object_key: &str,
+        carried: Option<&serde_json::Value>,
+        live: &HashSet<LiveBlockKey>,
+        skipped: &mut usize,
+    ) where
+        <K::Elements as ElementMap>::Value: super::CarriedValue,
+    {
+        super::merge_container_elements(&mut self.entries, object_key, carried, live, skipped);
+    }
+
+    /// SHARED EXCEPTION 4 -- WAL REPLAY OF A REMOVAL THAT IS ALREADY IN THE RECORD.
+    ///
+    /// Recovery is REPLAYING a removal the log already holds. Recording it again would write the
+    /// recovery itself into the log as a fresh removal, so the next replay would have two removals
+    /// where the store had one. Deliberately narrow: one element of one object, and it cannot
+    /// install or drop a key.
+    pub(super) fn replay_remove_element(
+        &mut self,
+        object_key: &str,
+        element: &<K::Elements as ElementMap>::Element,
+    ) -> bool
+    where
+        K::Elements: RemovableElementMap,
+    {
+        self.entries
+            .get_mut(object_key)
+            .map(|elements| elements.remove_element(element))
+            .unwrap_or(false)
+    }
+
+    /// SHARED EXCEPTION 5 -- COMPACTION REWRITES WHERE A PAGE LIVES, NEVER WHICH PAGES LIVE.
+    ///
+    /// The move is what the compactor records; the address rewrite is bookkeeping that follows it,
+    /// and a record of its own would say a page was installed when none was.
+    ///
+    /// Narrowed by the lend: each item yields the object key and an [`ElementValuesMut`], which
+    /// lends `&mut` to the VALUES and nothing else -- no insert, no remove, no retain -- so this
+    /// provably cannot change the membership of the map, only where its members point. That is
+    /// strictly less than the `iter_mut` it replaces.
+    pub(super) fn element_values_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&str, ElementValuesMut<'_, K>)> {
+        self.entries
+            .iter_mut()
+            .map(|(object_key, elements)| (&**object_key, ElementValuesMut { elements }))
+    }
+}
+
+/// PER-KIND EXCEPTION, hash only.
+impl<K: ReplaysInstallsUnrecorded> RecordedMap<K> {
+    /// Recovery installs an element and files NOTHING, because this kind has a replay arm that
+    /// files no OUTCOME record of its own: the log item being replayed IS the record.
+    ///
+    /// CORRECTED: this said the arm's block "is never registered in the bucket index", and that is
+    /// false -- the index does hold an entry for it. What the arm does not do is file an outcome,
+    /// which is the thing this exception exempts it from.
+    ///
+    /// GATED BY A MARKER TRAIT, so a kind that has not declared the path cannot call this. `sets`
+    /// has not: its replay arm re-files its block and goes through [`install_element`] like any
+    /// other recorded write. That asymmetry is what two concrete containers established.
+    pub(super) fn replay_install_element(
+        &mut self,
+        object_key: &str,
+        element: <K::Elements as ElementMap>::Element,
+        value: <K::Elements as ElementMap>::Value,
+    ) {
+        self.entries
+            .entry(std::sync::Arc::from(object_key))
+            .or_default()
+            .insert_element(element, value);
+    }
+}
+
+/// PER-KIND EXCEPTION, every kind whose level-2 container is a B-tree.
+impl<K: RepacksAfterDecode> RecordedMap<K> {
+    /// Repack each element map a decode filled one entry at a time.
+    ///
+    /// `serde`'s `Deserialize` for `BTreeMap` inserts in a loop over bytes written in key order, so
+    /// every nested map in a decoded index is built by ASCENDING insertion -- the one order that
+    /// leaves a B-tree half empty, because each full leaf splits and the left half is never filled
+    /// again. NOTHING IS RECORDED BECAUSE NOTHING CHANGES: the same elements map to the same values
+    /// afterwards, only the node occupancy moves.
+    ///
+    /// GATED, and `hashes` does not declare it: `HashFieldMap` is a sorted vector whose length is
+    /// its capacity, so it has no half-empty nodes. This site was named by the COMPILER rather than
+    /// by a survey -- `repack_decoded_btrees` reaches the field by destructuring the whole
+    /// `ShardState`, so it has no `.sets` for any name-based search to find.
+    pub(super) fn repack_decoded(&mut self)
+    where
+        K::Elements: RepackableElementMap,
+    {
+        for elements in self.entries.values_mut() {
+            elements.repack();
+        }
+    }
+}
+
+/// What a repack needs of a level-2 container, so the exception above does not have to know which
+/// concrete B-tree it is holding.
+pub(super) trait RepackableElementMap: ElementMap {
+    fn repack(&mut self);
+}
+
+/// A lend of one object's element VALUES, and of nothing else.
+///
+/// It exists so the compaction exception cannot change membership: there is no `insert`, no
+/// `remove`, no `retain`, and no way to recover the `&mut K::Elements` it holds.
+pub(super) struct ElementValuesMut<'a, K: RecordedKind> {
+    elements: &'a mut K::Elements,
+}
+
+impl<K: RecordedKind> ElementValuesMut<'_, K> {
+    pub(super) fn iter_mut(
+        &mut self,
+    ) -> impl Iterator<
+        Item = (
+            &<K::Elements as ElementMap>::Element,
+            &mut <K::Elements as ElementMap>::Value,
+        ),
+    >
+    where
+        K::Elements: IterableMutElementMap,
+    {
+        self.elements.iter_values_mut()
+    }
+}
+
+/// What the compaction walk needs of a level-2 container.
+pub(super) trait IterableMutElementMap: ElementMap {
+    fn iter_values_mut(
+        &mut self,
+    ) -> impl Iterator<Item = (&Self::Element, &mut Self::Value)>;
+}
+
+/// WHICH PAGE AN ELEMENT IS MOVING OFF, read from the map that is keyed BY THE ELEMENT.
+///
+/// # WHY THE FILER CANNOT WORK THIS OUT FOR ITSELF
+///
+/// Under one entry a page an index entry carries NO element name, so the entry a rewrite
+/// supersedes cannot be picked out by naming the element. Keying the supersede on the address the
+/// write LANDS AT finds the entry over the page it lands on -- which is right for an element
+/// appended to a page that already has an entry, and finds NOTHING AT ALL for an element rewritten
+/// IN PLACE, because a rewrite is written to a NEW address.
+///
+/// MEASURED, not reasoned: with the supersede keyed on the landing address alone, a gated hash
+/// served ONE ELEMENT MORE than was ever written -- out of the stale live entry the rewrite did not
+/// supersede -- and a zset rescore left TWO live entries for one member at one score. `set` and
+/// `list` are immune only because neither can rewrite an element in place.
+///
+/// THE CALLER DOES KNOW. A write that overwrites an element has that element's PREVIOUS address in
+/// the resident map, which is keyed by the element and still holds the old address at filing time:
+/// [`install_element`] files the record BEFORE it mutates the map. This trait is how the generic
+/// emitter asks for it without naming a concrete container.
+///
+/// # AND THE PREVIOUS ADDRESS ALONE IS NOT THE ANSWER
+///
+/// An entry under the gate stands for a PAGE, not for an element. Retiring the entry over the page
+/// an element vacates is WRONG whenever a SIBLING element of the same object is still on that page:
+/// the page is still live, and its entry is what keeps the siblings reachable. So the question has
+/// two halves, and [`AddressedElementMap::any_element_other_than_at`] is the second.
+pub(super) trait AddressedElementMap: ElementMap {
+    /// The address this map currently holds for `element`, if it holds the element at all.
+    fn element_address(&self, element: &Self::Element) -> Option<&ElementEntry>;
+
+    /// Whether any element OTHER THAN `skip` currently sits on the page `page` names.
+    ///
+    /// Compared by PAGE KEY -- slab, offset and length -- and not by the whole address, because
+    /// that triple is what an index entry's identity is under the gate.
+    fn any_element_other_than_at(&self, skip: &Self::Element, block: &ElementEntry) -> bool;
+}
+
+// =============================================================================================
+// THE KINDS. Each is a zero-sized marker plus the three or four facts that distinguish it, and the
+// per-kind exception markers it declares. This is the whole per-kind surface: everything else above
+// is written once.
+// =============================================================================================
+
+/// `shard.hashes` -- field name to block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct HashKind;
+
+impl RecordedKind for HashKind {
+    type Elements = super::hash_field_map::HashFieldMap;
+    const KIND: &'static str = "hash";
+
+    /// THE PLAIN MAP, which is what this field always was: a `#[serde(default)]` map of
+    /// `String` to `HashFieldMap`, and `HashFieldMap` itself round-trips through the same MAP shape
+    /// the bare `HashMap` used. So the bytes are unchanged by construction.
+    fn serialize_entries<S>(
+        entries: &HashMap<ModelKey, Self::Elements>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde::Serialize::serialize(entries, serializer)
+    }
+
+    fn deserialize_entries<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<ModelKey, Self::Elements>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::Deserialize::deserialize(deserializer)
+    }
+
+    fn resident(shard: &mut ShardState) -> &mut RecordedMap<Self> {
+        &mut shard.hashes
+    }
+
+    /// A hash field's value is its address, which the outcome already carries whole. Nothing else
+    /// to say.
+    fn outcome_value(_value: &<Self::Elements as ElementMap>::Value) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// HASH DECLARES THE REPLAY-INSTALL PATH, and it is the only kind that does.
+///
+/// Recovery's `context_node` arm installs a hash element and files no record of its own, because the
+/// log item being replayed is already the record. (Not because the index lacks an entry for the
+/// block -- it has one; see the method's own note.)
+impl ReplaysInstallsUnrecorded for HashKind {}
+
+// AND IT DELIBERATELY DOES NOT DECLARE `RepacksAfterDecode`: `HashFieldMap` is a sorted vector
+// whose length IS its capacity below its growth threshold, so a decode leaves it exactly packed.
+
+/// `shard.sets` -- member bytes to block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SetKind;
+
+impl RecordedKind for SetKind {
+    type Elements = std::collections::BTreeMap<Vec<u8>, ElementEntry>;
+    const KIND: &'static str = "set";
+
+    /// `set_index_serde`, WHICH IS THE CODEC THIS FIELD HAS ALWAYS USED, and the one the first
+    /// version of the generic type silently dropped.
+    ///
+    /// A member is `Vec<u8>` and a JSON object key is a string, so a plain map encoding does not
+    /// round-trip -- three reload tests said so. This module encodes each set's members as a
+    /// sequence of pairs instead, and it also sorts the outer keys into a `BTreeMap`, which is why
+    /// this field's encoding is deterministic where `hashes`'s is not.
+    fn serialize_entries<S>(
+        entries: &HashMap<ModelKey, Self::Elements>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        super::set_index_serde::serialize(entries, serializer)
+    }
+
+    fn deserialize_entries<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<ModelKey, Self::Elements>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        super::set_index_serde::deserialize(deserializer)
+    }
+
+    fn resident(shard: &mut ShardState) -> &mut RecordedMap<Self> {
+        &mut shard.sets
+    }
+
+    /// A set member's value is its address, which the outcome already carries whole. Nothing else
+    /// to say.
+    fn outcome_value(_value: &<Self::Elements as ElementMap>::Value) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// SET DECLARES THE POST-DECODE REPACK, because its level-2 container is a B-tree.
+impl RepacksAfterDecode for SetKind {}
+
+// AND IT DELIBERATELY DOES NOT DECLARE `ReplaysInstallsUnrecorded`: its replay arm re-files the
+// block through the bucket index before installing, so it goes through `install_element` like any
+// other recorded write. One exception each way, and neither was predictable from the other kind.
+
+/// `shard.zsets` -- member bytes to a score-and-block pair.
+///
+/// THE ONE MOST LIKELY TO HAVE RESISTED, AND IT DID NOT. A zset element is a member AND a score, so
+/// a composite key would have been the obvious guess -- and it is wrong: the score lives in the
+/// VALUE, `(u64, BlockAddress)`, because the map is ordered by member and the score is what the
+/// member maps to. So the blanket `ElementMap for BTreeMap<E, V>` covers it with no new bound, and
+/// `CarriedValue for (u64, BlockAddress)` already existed, so the fold needed nothing either.
+///
+/// Nothing was widened to fit this kind. That matters: a trait grown to fit one kind is how a
+/// generic type acquires a member that belongs to nobody.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ZSetKind;
+
+impl RecordedKind for ZSetKind {
+    type Elements = std::collections::BTreeMap<Vec<u8>, (u64, ElementEntry)>;
+    const KIND: &'static str = "zset";
+
+    /// `zset_index_serde`, for the same reason `sets` needs its own: a member is `Vec<u8>` and a
+    /// JSON object key is a string. STATED rather than inherited -- the codec is a required
+    /// associated function with no default precisely so a new kind cannot acquire the wrong one in
+    /// silence, which is the defect a blanket impl produced for `sets`.
+    fn serialize_entries<S>(
+        entries: &HashMap<ModelKey, Self::Elements>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        super::zset_index_serde::serialize(entries, serializer)
+    }
+
+    fn deserialize_entries<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<ModelKey, Self::Elements>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        super::zset_index_serde::deserialize(deserializer)
+    }
+
+    fn resident(shard: &mut ShardState) -> &mut RecordedMap<Self> {
+        &mut shard.zsets
+    }
+
+    /// EIGHT BIG-ENDIAN BYTES OF THE BIASED SCORE -- the one kind that answers `Some` here, and
+    /// the whole reason the function exists. `component` no longer spells this; replay's only
+    /// other source for a zset insert's score, so a value-less install on that path is a replay
+    /// that cannot recover what the write did and must refuse rather than guess (see
+    /// `lifecycle`'s `"zset"` replay arm).
+    fn outcome_value(value: &<Self::Elements as ElementMap>::Value) -> Option<Vec<u8>> {
+        Some(value.0.to_be_bytes().to_vec())
+    }
+}
+
+/// A B-TREE LEVEL-2 CONTAINER, SO IT REPACKS. Declared, not inherited.
+impl RepacksAfterDecode for ZSetKind {}
+
+// AND IT DOES NOT DECLARE `ReplaysInstallsUnrecorded`: recovery's `zset` arm re-files its block
+// through `upsert_bucket_index_block` before installing, so it goes through the recorded path.
+// Read from the arm rather than assumed.
+
+/// `shard.lists` -- a biased sequence number to a block.
+///
+/// THIS KIND FOLDS IN FOR UNIFORMITY, NOT FOR BYTES, and the body of its change says so in those
+/// words. #2087 measured the list shape at **499.5 moves per insert**, which is n/2 by construction
+/// for a left push into a vector-backed run and 45.4x a B-tree's bound. Nothing here changes that
+/// and nothing here should be read as claiming it does.
+///
+/// WHAT IT DOES GET is the invariant every other kind now has, plus one latent defect closed by
+/// construction -- see the note on `ListPush` in `execute_on_shard`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ListKind;
+
+impl RecordedKind for ListKind {
+    type Elements = std::collections::BTreeMap<i64, ElementEntry>;
+    const KIND: &'static str = "list";
+
+    /// THE PLAIN MAP, which is what this field always was -- a `#[serde(default)]` map with no
+    /// `with =`. An `i64` key has a string form a JSON object can carry, which is exactly why this
+    /// kind never needed the codec `sets` and `zsets` do. Stated explicitly all the same.
+    fn serialize_entries<S>(
+        entries: &HashMap<ModelKey, Self::Elements>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serde::Serialize::serialize(entries, serializer)
+    }
+
+    fn deserialize_entries<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<ModelKey, Self::Elements>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        serde::Deserialize::deserialize(deserializer)
+    }
+
+    fn resident(shard: &mut ShardState) -> &mut RecordedMap<Self> {
+        &mut shard.lists
+    }
+
+    /// A list element's value is its address, which the outcome already carries whole. Nothing
+    /// else to say.
+    fn outcome_value(_value: &<Self::Elements as ElementMap>::Value) -> Option<Vec<u8>> {
+        None
+    }
+}
+
+/// A B-TREE LEVEL-2 CONTAINER, SO IT REPACKS.
+impl RepacksAfterDecode for ListKind {}
+
+// AND IT DOES NOT DECLARE `ReplaysInstallsUnrecorded`: recovery's `list` arm re-files its block too.
+
+// =============================================================================================
+// WHAT THE LEVEL-2 CONTAINERS HAVE TO SUPPLY. Three small traits, each declared beside the
+// operation that needs it rather than widened onto `ElementMap` -- which is the FOLD's trait, and
+// a fold only ever inserts.
+// =============================================================================================
+
+/// AN ELEMENT MAP WHOSE ELEMENT NAME CAN COME FROM A POOL.
+///
+/// One implementor, and that is the point of the trait rather than an argument against it: it
+/// is what keeps the decode pass from naming `hashes` directly and from needing a `match` on
+/// the kind. The other three kinds are keyed by BYTES, which no pool of strings can hold.
+pub(super) trait PoolableElementNames {
+    fn adopt_element_names(
+        &mut self,
+        pool: &mut std::collections::HashSet<std::sync::Arc<str>>,
+    ) -> usize;
+}
+
+impl PoolableElementNames for super::hash_field_map::HashFieldMap {
+    fn adopt_element_names(
+        &mut self,
+        pool: &mut std::collections::HashSet<std::sync::Arc<str>>,
+    ) -> usize {
+        self.adopt_field_names(pool)
+    }
+}
+
+impl RemovableElementMap for super::hash_field_map::HashFieldMap {
+    fn remove_element(&mut self, element: &super::hash_field_map::FieldName) -> bool {
+        self.remove(&element[..]).is_some()
+    }
+    fn is_empty_map(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl<E, V> RemovableElementMap for std::collections::BTreeMap<E, V>
+where
+    E: Ord + serde::de::DeserializeOwned,
+    V: serde::de::DeserializeOwned,
+{
+    fn remove_element(&mut self, element: &E) -> bool {
+        self.remove(element).is_some()
+    }
+    fn is_empty_map(&self) -> bool {
+        self.is_empty()
+    }
+}
+
+impl<E, V> RepackableElementMap for std::collections::BTreeMap<E, V>
+where
+    E: Ord + serde::de::DeserializeOwned,
+    V: serde::de::DeserializeOwned,
+{
+    fn repack(&mut self) {
+        super::state::repack_btree_map(self);
+    }
+}
+
+impl IterableMutElementMap for super::hash_field_map::HashFieldMap {
+    fn iter_values_mut(&mut self) -> impl Iterator<Item = (&super::hash_field_map::FieldName, &mut ElementEntry)> {
+        self.iter_mut()
+    }
+}
+
+impl<E, V> IterableMutElementMap for std::collections::BTreeMap<E, V>
+where
+    E: Ord + serde::de::DeserializeOwned,
+    V: serde::de::DeserializeOwned,
+{
+    fn iter_values_mut(&mut self) -> impl Iterator<Item = (&E, &mut V)> {
+        self.iter_mut()
+    }
+}
+
+impl AddressedElementMap for super::hash_field_map::HashFieldMap {
+    fn element_address(&self, element: &super::hash_field_map::FieldName) -> Option<&ElementEntry> {
+        self.get(&element[..])
+    }
+
+    fn any_element_other_than_at(&self, skip: &super::hash_field_map::FieldName, block: &ElementEntry) -> bool {
+        let block = super::live_block_key(block);
+        // COMPARED BY TEXT, NOT BY HANDLE. Two handles for one field name are equal strings
+        // and unequal pointers, and `Arc<str>`'s `PartialEq` compares the strings -- but an
+        // explicit slice comparison says so at the site rather than relying on the reader
+        // knowing which of the two it is.
+        self.iter().any(|(field, address)| {
+            field[..] != skip[..] && super::live_block_key(address) == block
+        })
+    }
+}
+
+/// `sets`, `zsets` and `lists`, through the one bound that tells a level-2 value where its page is.
+///
+/// `CarriedValue` is already the trait that answers "which address does this value name" -- the
+/// delta fold reads it to decide whether a carried element's block is still there. Reusing it is
+/// what keeps a zset's `(score, page)` from needing an arm of its own here: the pair already
+/// declares which half is the page.
+impl<E, V> AddressedElementMap for std::collections::BTreeMap<E, V>
+where
+    E: Ord + serde::de::DeserializeOwned,
+    V: serde::de::DeserializeOwned + super::CarriedValue,
+{
+    fn element_address(&self, element: &E) -> Option<&ElementEntry> {
+        self.get(element).map(super::CarriedValue::carried_address)
+    }
+
+    fn any_element_other_than_at(&self, skip: &E, block: &ElementEntry) -> bool {
+        let block = super::live_block_key(block);
+        self.iter().any(|(element, value)| {
+            element != skip
+                && super::live_block_key(super::CarriedValue::carried_address(value)) == block
+        })
+    }
+}
+
+// =============================================================================================
+// THE WIRE. One impl pair, generic, delegating to whatever codec the kind's field already named.
+//
+// THE CODEC IS A REQUIRED ASSOCIATED FUNCTION, NOT A BLANKET IMPL, and the reason is a regression
+// this change introduced and its own gate caught. The first version had one blanket `Serialize`
+// calling `self.entries.serialize(..)`. That is right for `hashes`, a plain `#[serde(default)]` map,
+// and WRONG for `sets`, whose field carried `with = "super::set_index_serde"` exactly because a
+// `BTreeMap<Vec<u8>, _>` has no JSON object-key representation. The collapse dropped that codec --
+// `set_index_serde` was left referenced only from comments -- and three reload tests failed:
+// `conformance_random_sequences_never_panic_and_survive_reload`,
+// `container_block_element_key::a_framed_block_reads_back_after_a_reload` and
+// `container_block_ordinal::a_reloaded_container_still_reads_every_element`.
+//
+// With the codec required per kind, a kind added later cannot inherit a wrong default. Each one
+// names its encoding, the bytes are identical by construction rather than by resemblance, and no
+// format stamp moves.
+// =============================================================================================
+
+impl<K: RecordedKind> serde::Serialize for RecordedMap<K> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        K::serialize_entries(&self.entries, serializer)
+    }
+}
+
+impl<'de, K: RecordedKind> serde::Deserialize<'de> for RecordedMap<K> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(Self::from_decoded(K::deserialize_entries(deserializer)?))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// TEST FIXTURES. `#[cfg(test)]`, so none of this exists in a shipped binary, and each is named
+// `_for_test` so a production use cannot be mistaken for an ordinary write.
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(test)]
+impl<K: RecordedKind> RecordedMap<K> {
+    pub(super) fn insert_element_for_test(
+        &mut self,
+        object_key: &str,
+        element: <K::Elements as ElementMap>::Element,
+        value: <K::Elements as ElementMap>::Value,
+    ) {
+        self.entries
+            .entry(std::sync::Arc::from(object_key))
+            .or_default()
+            .insert_element(element, value);
+    }
+
+    pub(super) fn insert_elements_for_test(&mut self, object_key: &str, elements: K::Elements) {
+        self.entries.insert(std::sync::Arc::from(object_key), elements);
+    }
+
+    pub(super) fn remove_for_test(&mut self, object_key: &str) -> Option<K::Elements> {
+        self.entries.remove(object_key)
+    }
+
+    pub(super) fn clear_for_test(&mut self) {
+        self.entries.clear();
+    }
+
+    pub(super) fn elements_mut_for_test(&mut self, object_key: &str) -> Option<&mut K::Elements> {
+        self.entries.get_mut(object_key)
+    }
+
+    pub(super) fn take_for_test(&mut self) -> HashMap<ModelKey, K::Elements> {
+        std::mem::take(&mut self.entries)
+    }
+
+    pub(super) fn restore_for_test(&mut self, entries: HashMap<ModelKey, K::Elements>) {
+        self.entries = entries;
+    }
+}
