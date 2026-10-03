@@ -30,3 +30,35 @@
       }
     ]
   },
+  {
+    "sample_id": "longmem_fixture_2",
+    "haystack_session_ids": ["week_1", "week_4", "week_8"],
+    "haystack_dates": ["2025-04-01", "2025-04-28", "2025-05-30"],
+    "haystack_sessions": [
+      [
+        {"speaker": "user", "text": "The launch checklist originally used the blue deployment notebook."},
+        {"speaker": "assistant", "text": "I noted the blue deployment notebook for launch work."}
+      ],
+      [
+        {"speaker": "user", "text": "We replaced the blue deployment notebook with the amber runbook for launch."},
+        {"speaker": "assistant", "text": "The amber runbook supersedes the blue deployment notebook."}
+      ],
+      [
+        {"speaker": "user", "text": "The postmortem root cause was a stale cache token in the proxy layer."},
+        {"speaker": "assistant", "text": "Root cause: stale cache token in the proxy layer."}
+      ]
+    ],
+    "qa": [
+      {
+        "question": "Which launch document should be used now?",
+        "answers": ["amber runbook"],
+        "reasoning_type": "memory_update"
+      },
+      {
+        "question": "What was the postmortem root cause?",
+        "answer": "stale cache token",
+        "reasoning_type": "temporal_reasoning"
+      }
+    ]
+  }
+]
