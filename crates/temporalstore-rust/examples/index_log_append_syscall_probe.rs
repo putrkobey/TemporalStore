@@ -26,3 +26,31 @@ fn small_item(bucket: u32, key: &str) -> IndexItem {
 
 fn main() {
     let mut args = std::env::args().skip(1);
+    let dir = args.next().expect("usage: <dir> <records>");
+    let records: usize = args.next().expect("usage: <dir> <records>").parse().unwrap();
+
+    // Build every record BEFORE the store exists, so the fixture's own allocation and
+    // formatting are outside the region the append arm is compared on. They are identical
+    // per record in both arms anyway; this keeps the difference to the appends alone.
+    let mut batches = Vec::with_capacity(records);
+    let mut value = 0usize;
+    while value < records {
+        // ZERO-PADDED: an unpadded key is one character longer at 10,000 than at 1,000, which
+        // would put fixture bytes into a number that is measuring the code.
+        batches.push(vec![small_item(
+            (value % 64) as u32,
+            &format!("tenant/1/object/{value:08}/00"),
+        )]);
+        value += 1;
+    }
+
+    let store = LocalIndexLogStore::new(&dir);
+    let mut taken = 0usize;
+    for items in batches {
+        store
+            .append_delta(1, items, Vec::new(), None, None, false, false)
+            .unwrap();
+        taken += 1;
+    }
+    println!("appended {taken}");
+}
