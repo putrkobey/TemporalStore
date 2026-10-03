@@ -130,3 +130,135 @@ pub(crate) fn windowed_sum_series(
 ) -> i64 {
     let series_len = series.len();
     let stale = rollups
+        .get(key)
+        .map(|entry| entry.built_len != series_len)
+        .unwrap_or(true);
+    if stale {
+        rollups.insert(
+            key.to_string(),
+            RollupEntry {
+                cells: build(series),
+                built_len: series_len,
+            },
+        );
+    }
+    let empty_cells = BTreeMap::new();
+    let cells = rollups.get(key).map(|e| &e.cells).unwrap_or(&empty_cells);
+    range_sum(cells, series, start_ms, end_ms)
+}
+
+/// Sum-family windowed aggregate over the control-state counter series (O(levels)).
+pub(crate) fn windowed_sum(shard: &mut ShardState, key: &str, start_ms: u64, end_ms: u64) -> i64 {
+    let empty_series = BTreeMap::new();
+    // TWO DISJOINT FIELD BORROWS, NOT TWO DOOR CALLS. A door takes `&mut self` and borrows the
+    // whole shard, which conflicts with the `&shard.control_state` this series came from;
+    // `rollups` and `control_state` are separate fields, so reaching them directly keeps the
+    // disjointness the old pair of fields had. The alternative was cloning the series on a
+    // read path, which is the wrong trade for a borrow problem.
+    // BOTH SIDES AS FIELDS NOW. The note above applied to the rollup table; the series is
+    // behind a door too since the counter maps merged, so the same disjointness argument has to
+    // cover it -- `counter_series` and `rollups` are separate fields, and a door call on either
+    // would borrow the whole shard and conflict with the other.
+    let series = super::state::counters_ref(
+        &shard.side_tables,
+        super::state::SideTable::ControlStateCounters,
+    )
+    .and_then(|table| table.get(key))
+    .unwrap_or(&empty_series);
+    let table = shard
+        .rollups
+        .entry(super::state::RollupDomain::ControlState)
+        .or_default();
+    windowed_sum_series(table, series, key, start_ms, end_ms)
+}
+
+/// Sum-family windowed aggregate over the feature numeric view (`feature_values`), served by
+/// the same rollup primitive. Callers must have populated `feature_values[key]` first.
+pub(crate) fn feature_windowed_sum(shard: &mut ShardState, key: &str, start_ms: u64, end_ms: u64) -> i64 {
+    let empty_series = BTreeMap::new();
+    // Disjoint field borrows, as in `windowed_sum` above and for the same reason.
+    let series = super::state::counters_ref(
+        &shard.side_tables,
+        super::state::SideTable::FeatureCounters,
+    )
+    .and_then(|table| table.get(key))
+    .unwrap_or(&empty_series);
+    let table = shard
+        .rollups
+        .entry(super::state::RollupDomain::Feature)
+        .or_default();
+    windowed_sum_series(table, series, key, start_ms, end_ms)
+}
+
+/// Drop a feature key's numeric view + rollup (on delete/expire).
+pub(crate) fn feature_forget(shard: &mut ShardState, key: &str) {
+    shard.feature_rollups_mut().remove(key);
+    shard.feature_values_mut().remove(key);
+}
+
+/// Clear all feature numeric views + rollups (on reconcile) so they rebuild lazily.
+pub(crate) fn feature_clear_all(shard: &mut ShardState) {
+    shard.feature_rollups_mut().clear();
+    shard.feature_values_mut().clear();
+}
+
+/// Drop a key's rollup index (on delete/expire) so a later re-creation rebuilds cleanly.
+pub(crate) fn forget(shard: &mut ShardState, key: &str) {
+    shard.control_state_rollups_mut().remove(key);
+}
+
+/// Clear all rollup indexes (on reconcile) so they lazily rebuild from the authoritative
+/// control_state series that reconcile just materialized.
+pub(crate) fn clear_all(shard: &mut ShardState) {
+    shard.control_state_rollups_mut().clear();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn brute(series: &BTreeMap<u64, i64>, start: u64, end: u64) -> i64 {
+        series.range(start..=end).map(|(_, v)| *v).sum()
+    }
+
+    #[test]
+    fn range_sum_matches_raw_scan_across_windows() {
+        // deterministic long series across ~3 days at mixed granularities
+        let mut series = BTreeMap::new();
+        let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            state
+        };
+        for _ in 0..4000 {
+            let ts = next() % (3 * 86_400_000);
+            let amount = (next() % 21) as i64 - 10; // -10..=10
+            *series.entry(ts).or_default() += amount;
+        }
+        let cells = build(&series);
+        let windows = [
+            (0u64, 999u64),
+            (0, 60_000),
+            (500, 3_600_000),
+            (0, 86_400_000),
+            (1_000, 7 * 86_400_000),
+            (37_000_000, 91_000_000),
+            (0, 3 * 86_400_000),
+        ];
+        for (s, e) in windows {
+            assert_eq!(range_sum(&cells, &series, s, e), brute(&series, s, e), "window {s}..={e}");
+        }
+    }
+
+    #[test]
+    fn incremental_fold_equals_full_rebuild() {
+        let mut series = BTreeMap::new();
+        let mut cells = BTreeMap::new();
+        let increments = [(10u64, 3i64), (10, 4), (1_500, 2), (65_000, 9), (10, -1), (90_000_000, 5)];
+        for (ts, amt) in increments {
+            *series.entry(ts).or_default() += amt;
+            fold_cells(&mut cells, ts, amt);
+        }
+        assert_eq!(cells, build(&series));
+    }
+}

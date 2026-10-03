@@ -739,3 +739,744 @@ fn the_new_reader_reads_the_old_formats_bytes_and_rebuilds_the_identity_it_carri
     // ---- EVERY PAGE, AND THE IDENTITY IT CAME BACK WITH ----
     let blocks = super::blocks_with_identity(&decoded.bucket_index);
     let mut rebuilt: Vec<(String, String)> = blocks
+        .iter()
+        .map(|(_, _, object_key, block)| {
+            (object_key.to_string(), block.model_id.as_str().to_string())
+        })
+        .collect();
+    rebuilt.sort();
+    println!("\n=== a pre-change store, decoded and re-identified by this binary ===");
+    for row in &rebuilt {
+        println!("  {row:?}");
+    }
+
+    // THE EXPECTATION IS WHAT THE OLD ENTRIES SPELL, written out independently of the fixture text
+    // -- three rows, one per page, which is the set `an_ungated_store_is_refused_before_it_is_served`
+    // counts in the same bytes.
+    let expected: Vec<(String, String)> = {
+        let mut rows = vec![
+            ("ungated/hash".to_string(), "hash".to_string()),
+            ("ungated/hash".to_string(), "hash".to_string()),
+            ("ungated/zset".to_string(), "zset".to_string()),
+        ];
+        rows.sort();
+        rows
+    };
+    assert_eq!(
+        expected.len(),
+        rebuilt.len(),
+        "[CLAUSE old-bytes-rebuild-exactly] the fixture holds {} page(s) and {} came back",
+        expected.len(),
+        rebuilt.len()
+    );
+    for (at, (want, got)) in expected.iter().zip(rebuilt.iter()).enumerate() {
+        assert_eq!(
+            want, got,
+            "[CLAUSE old-bytes-rebuild-exactly] page {at} came back with the identity {got:?} \
+             where the stored entry spelled {want:?} -- a reconstruction that disagrees with what \
+             the old binary wrote is data loss wearing an optimisation's clothes"
+        );
+    }
+
+    // ---- THE CONTROL: THE COMPARISON MUST BE ABLE TO FAIL ----
+    let mut injected = rebuilt.clone();
+    injected[0].0.push('Z');
+    assert_ne!(
+        injected, rebuilt,
+        "[CLAUSE old-bytes-rebuild-exactly] the comparison cannot report a difference when one is \
+         injected, so the equalities above are equalities it cannot distinguish from inequalities"
+    );
+
+    // ---- AND THE COMPONENT-BEARING KEY IS THE CASE THIS FIXTURE EXISTS FOR ----
+    assert!(
+        bytes.contains("hash:ungated/hash:f0:0:0:27:0:0"),
+        "[CLAUSE old-bytes-carry-the-fields] the fixture carries no element-named page key, so the \
+         split that could have read an object key short is not exercised"
+    );
+    let named = crate::index_log::block_ref_key_parts("hash:ungated/hash:f0:0:0:27:0:0")
+        .expect("an element-named key from a real pre-change store must parse");
+    assert_eq!(
+        ("hash", "ungated/hash", "f0"),
+        (named.kind, named.object_key, named.component),
+        "[CLAUSE old-bytes-rebuild-exactly] an element-named key splits in the wrong place, so a \
+         pre-change store's object keys would come back short"
+    );
+}
+
+// =================================================================================================
+// THE FIELD THAT CANNOT GO: THE PRESENCE BITS
+// =================================================================================================
+
+/// THE PRESENCE BITS OF AN ADDRESS ARE NOT IN THE KEY IT RENDERS, SO `address` STAYS.
+///
+/// # THE NON-INJECTIVITY, BY CONSTRUCTION RATHER THAN BY A CORPUS
+///
+/// A corpus can only say that two states did not COLLIDE in that corpus. This builds the three
+/// states and renders their keys, so the collision is a property of the renderer and not of a
+/// fixture:
+///
+///   * a LOG-RESIDENT page -- `block_id` absent, which is the shape a staged page has before a
+///     dump, and which `log_backed()` is the derivation of;
+///   * the FIRST page of an object in a slab, built the way every production site builds one, so
+///     `block_id` is `Some(0)` and the generation is present;
+///   * the same address with the generation bit CLEAR, which is the shape an index written before
+///     the generation existed loads as -- the one state `try_from_wire_parts` exists to let the
+///     wire state independently of the identity.
+///
+/// All three render ONE key. `unwrap_or_default()` on each of `block_id()` and `generation()` is
+/// where the bits go, and zero is a legal value of both -- which is precisely the reason the
+/// presence lives in a byte rather than in a sentinel, stated beside the field itself.
+///
+/// # WHY GUESSING EITHER BIT IS DATA LOSS AND NOT AN APPROXIMATION
+///
+/// `generation` is hashed into `block_index_handle` and rendered into the block-ref key, and those
+/// handles are written to disk inside the lookup's refs -- so deriving a different value re-keys
+/// every page and points the stored refs at nothing. `block_id`'s absence IS log-residency, so
+/// guessing it present claims a slab for a block that is still in the log, and a read then goes
+/// looking on a slab for bytes that are not there.
+///
+/// # AND THE REACHABILITY IS MEASURED, NOT ARGUED
+///
+/// The second arm asserts the two states are both ordinary: a constructor that production calls
+/// produces each, and the pair that renders identically differs in `log_backed()` -- which has
+/// five production readers, so the two are not interchangeable anywhere.
+///
+/// rust-internal: asserts a property of this crate's address codec, no product behaviour
+#[test]
+fn the_presence_bits_of_an_address_are_not_in_the_key_it_renders() {
+    use crate::block_store::ElementEntry;
+
+    const SLAB: u64 = 42;
+    const OFFSET: u64 = 1_048_576;
+    const LENGTH: u64 = 4_096;
+
+    // THE THREE STATES, each built through the constructor the state it represents comes from.
+    let log_resident = ElementEntry::from_parts(SLAB, OFFSET, LENGTH, None, None);
+    let first_block_in_a_slab = ElementEntry::from_parts(SLAB, OFFSET, LENGTH, Some(0), None);
+    let first_block_with_no_generation =
+        ElementEntry::try_from_wire_parts(SLAB, OFFSET, LENGTH, Some(0), false)
+            .expect("the wire constructor accepts a present block id with no generation");
+
+    // VACUITY FIRST: the three must really be three.
+    assert!(
+        log_resident.block_id().is_none(),
+        "[CLAUSE presence-is-not-in-the-key] the log-resident fixture carries a block id, so the \
+         first of the three states is not represented"
+    );
+    assert_eq!(
+        Some(0),
+        first_block_in_a_slab.block_id(),
+        "[CLAUSE presence-is-not-in-the-key] the slab-backed fixture is not the FIRST page, so the \
+         collision this arm is about is not the one being measured"
+    );
+    assert_eq!(
+        Some(0),
+        first_block_in_a_slab.generation(),
+        "[CLAUSE presence-is-not-in-the-key] the slab-backed fixture has no generation, so the \
+         third state below is not distinct from it"
+    );
+    assert_eq!(
+        None,
+        first_block_with_no_generation.generation(),
+        "[CLAUSE presence-is-not-in-the-key] the generation-free fixture carries one"
+    );
+    assert_ne!(
+        log_resident, first_block_in_a_slab,
+        "[CLAUSE presence-is-not-in-the-key] two of the three states compare EQUAL, so there is no \
+         information for a key to lose"
+    );
+    assert_ne!(
+        first_block_in_a_slab, first_block_with_no_generation,
+        "[CLAUSE presence-is-not-in-the-key] two of the three states compare EQUAL"
+    );
+
+    // AND THE THREE RENDER ONE KEY.
+    let keys: Vec<String> = [&log_resident, &first_block_in_a_slab, &first_block_with_no_generation]
+        .iter()
+        .map(|address| {
+            let block = crate::engine::state::BlockIndex {
+                model_id: crate::engine::storage_bucket_internals::StoredModelKind::String,
+                address: (*address).clone(),
+                dirty: false,
+                deleted: false,
+            };
+            crate::engine::state::block_index_written_key("k", &block)
+        })
+        .collect();
+    println!("\n=== three distinct addresses, one rendered key ===");
+    for (which, key) in ["log-resident", "first page in a slab", "no generation"]
+        .iter()
+        .zip(keys.iter())
+    {
+        println!("  {which:<22} -> {key}");
+    }
+    assert_eq!(
+        keys[0], keys[1],
+        "[CLAUSE presence-is-not-in-the-key] a log-resident address and the first page of an \
+         object in a slab render DIFFERENT keys, so the block-id presence bit IS recoverable from \
+         the key and `address` could be reconstructed after all -- which would make this whole \
+         arm, and the decision to keep the field, wrong"
+    );
+    assert_eq!(
+        keys[1], keys[2],
+        "[CLAUSE presence-is-not-in-the-key] the generation presence bit reaches the key, so it is \
+         recoverable and this arm is wrong about the second bit"
+    );
+
+    // THE CONTROL: the renderer is not simply constant. An address whose block id is non-zero must
+    // render a DIFFERENT key, or the three equalities above say nothing.
+    let later_block = ElementEntry::from_parts(SLAB, OFFSET, LENGTH, Some(3), None);
+    let later_key = crate::engine::state::block_index_written_key(
+        "k",
+        &crate::engine::state::BlockIndex {
+            model_id: crate::engine::storage_bucket_internals::StoredModelKind::String,
+            address: later_block,
+            dirty: false,
+            deleted: false,
+        },
+    );
+    assert_ne!(
+        keys[0], later_key,
+        "[CLAUSE presence-is-not-in-the-key] a block id of 3 renders the same key as an absent \
+         one, so the renderer ignores the slot entirely and the equalities above are vacuous"
+    );
+
+    // AND THE TWO COLLIDING STATES ARE NOT INTERCHANGEABLE, which is what makes the collision a
+    // data-loss bug rather than a representation detail.
+    let as_block = |address: &ElementEntry| crate::engine::state::BlockIndex {
+        model_id: crate::engine::storage_bucket_internals::StoredModelKind::String,
+        address: address.clone(),
+        dirty: false,
+        deleted: false,
+    };
+    assert_ne!(
+        as_block(&log_resident).log_backed(),
+        as_block(&first_block_in_a_slab).log_backed(),
+        "[CLAUSE presence-is-not-in-the-key] the two states that render one key answer the SAME \
+         log-residency, so nothing downstream could tell them apart and the loss would be free"
+    );
+    // AND THE SECOND BIT IS SHARPER THAN THE FIRST DRAFT OF THIS ARM CLAIMED, WHICH IS WHY THE
+    // MEASUREMENT IS HERE RATHER THAN THE CLAIM.
+    //
+    // This asserted that the generation presence bit reaches `block_index_handle`, so that losing
+    // it would re-key a page. IT DOES NOT, at a block id of 0: the handle hashes
+    // `generation().unwrap_or_default()`, exactly as the key renders it, so `Some(0)` and `None`
+    // hash the same word -- measured here, 1416957377325452083 both ways on the first run of this
+    // arm. The claim was read off the field's own doc ("the generation is hashed into
+    // `block_index_handle`"), which is true of its VALUE and not of its presence at zero.
+    //
+    // So the bit whose loss is OBSERVABLE is the block id's, through `log_backed()`, which the
+    // assertion above this one is about. The generation bit is asserted here as what it is -- at a
+    // block id of 0 it reaches neither the key nor the handle -- and the control below is what says
+    // it is nonetheless load-bearing where it CAN be seen, so this is not an argument for dropping
+    // it either.
+    let handle_with_generation =
+        crate::engine::state::block_index_handle("k", &as_block(&first_block_in_a_slab));
+    let handle_without =
+        crate::engine::state::block_index_handle("k", &as_block(&first_block_with_no_generation));
+    println!(
+        "  generation bit at block id 0: handle {handle_with_generation} with it, \
+         {handle_without} without -- it reaches neither the key nor the handle THERE"
+    );
+    assert_eq!(
+        handle_with_generation, handle_without,
+        "[CLAUSE presence-is-not-in-the-key] the generation presence bit DOES reach the handle at a \
+         block id of 0, so the note above is wrong and the bit is recoverable from the refs after \
+         all"
+    );
+    // THE CONTROL ON THAT: the generation's VALUE does reach both, so the bit is not dead weight
+    // and the arm above is not an argument for retiring it.
+    let later_with = ElementEntry::from_parts(SLAB, OFFSET, LENGTH, Some(3), None);
+    let later_without = ElementEntry::try_from_wire_parts(SLAB, OFFSET, LENGTH, Some(3), false)
+        .expect("the wire constructor accepts a present block id with no generation");
+    assert_ne!(
+        crate::engine::state::block_index_written_key("k", &as_block(&later_with)),
+        crate::engine::state::block_index_written_key("k", &as_block(&later_without)),
+        "[CLAUSE presence-is-not-in-the-key] the generation presence bit reaches no key at ANY \
+         block id, which would make it unobservable everywhere -- it reaches the key at a non-zero \
+         block id, which is what makes it a stored fact rather than a leftover"
+    );
+    assert_ne!(
+        crate::engine::state::block_index_handle("k", &as_block(&later_with)),
+        crate::engine::state::block_index_handle("k", &as_block(&later_without)),
+        "[CLAUSE presence-is-not-in-the-key] the generation presence bit reaches no handle at any \
+         block id"
+    );
+}
+
+// =================================================================================================
+// THE PRICE ON THE SHIPPED ARTEFACT
+// =================================================================================================
+
+/// WHAT THE ENTRY'S RESTATEMENT COSTS THE SHIPPED CONTAINER, AT THE SHIPPED ROUTING RANGE.
+///
+/// # NOT A COUNTERFACTUAL
+///
+/// #2350's table was a byte-weight counterfactual: a doctored `serde_json::Value` re-encoded. This
+/// is the production encoder on the production path, before and after, at the same corpus and the
+/// same range -- so the only thing the two readings differ in is the change. The BEFORE figures are
+/// pinned below as constants captured from this same module run on `ea5b278a9`, which is what makes
+/// the delta a measurement rather than a memory.
+///
+/// # WHICH SURFACE EVERY NUMBER IS ON
+///
+/// Four are printed and they are not interchangeable: the JSON stream, the msgpack payload, the
+/// SHIPPED container (codec 2), and the codec-1 container that #2350's prediction was taken on.
+/// The prediction is checked against the codec-1 arm because that is the arm it was made on.
+///
+/// Two key shapes, because a padded corpus is a lower bound on every compressed figure and a
+/// scattered one an upper bound, and #2350 took every figure on both for exactly that reason.
+///
+/// rust-internal: measures this crate's own index codec, no product behaviour
+#[test]
+fn what_the_entry_restating_its_key_costs_the_shipped_container() {
+    println!(
+        "\n################ THE ENTRY'S RESTATEMENT, PRICED ON THE SHIPPED ARTEFACT ################"
+    );
+    println!(
+        "  BEFORE is this module run on `ea5b278a9` with the production change absent and nothing \
+         else different -- same corpus, same range, same fixture code. The deltas below are a \
+         measurement of the change and not of a doctoring instrument."
+    );
+    println!(
+        "  {:<10} {:>12} {:>12} {:>12} {:>12} {:>12}",
+        "shape", "surface", "before", "after", "saved", "share"
+    );
+    let mut checked = 0usize;
+    for (shape, before) in [
+        (KeyShape::Padded, BEFORE_PADDED),
+        (KeyShape::Scattered, BEFORE_SCATTERED),
+    ] {
+        let seeded = seed(HEADLINE_KEYS, PUBLISHED_WIDTH, shape, SHIPPED_END_BUCKET);
+        let surfaces = seeded.surfaces();
+        surfaces.report("shipped range 0..1023");
+        let n = HEADLINE_KEYS as f64;
+        for (label, was, now) in [
+            ("stream", before.stream, surfaces.stream),
+            ("slot_index", before.slot_index, surfaces.slot_index_stream),
+            ("payload", before.payload, surfaces.payload),
+            ("container c2", before.container, surfaces.container),
+            ("container c1", before.json_container, surfaces.json_container),
+        ] {
+            println!(
+                "  {:<10} {label:>12} {:>12.3} {:>12.3} {:>12.3} {:>11.2}%",
+                shape.label(),
+                was as f64 / n,
+                now as f64 / n,
+                (was - now) as f64 / n,
+                100.0 * (was - now) as f64 / was as f64
+            );
+            assert!(
+                now < was,
+                "[CLAUSE the-entry-side-pays-on-the-artefact] on {} keys the {label} surface is \
+                 {now} B after against {was} B before, so this change did not make it smaller -- a \
+                 flip on any of the five surfaces is the finding changing rather than the fixture",
+                shape.label()
+            );
+            checked += 1;
+        }
+        // ---- THE STREAM SAVING IS EXACTLY THE 50.0 B/OBJECT #2350 PREDICTED ----
+        //
+        // 30.0 for `entry/object_key` and 20.0 for `entry/model_id`, each the quoted field name,
+        // its colon, its value and its separator. An EXACT clause, not a tolerance: the stream is
+        // the one surface that partitions, these are whole fields, and nothing rounds.
+        let stream_saved = (before.stream - surfaces.stream) as f64 / n;
+        assert!(
+            (stream_saved - PREDICTED_STREAM_SAVING).abs() < 1e-9,
+            "[CLAUSE the-prediction-closes] the stream saving on {} keys is {stream_saved:.6} \
+             B/object against the {PREDICTED_STREAM_SAVING:.1} #2350 predicted for these two \
+             fields; a difference here is bytes leaving that nobody named, or a field this change \
+             did not mean to touch",
+            shape.label()
+        );
+        // ---- AND THE CONTAINER SAVING AGAINST THE PREDICTED BAND, WHICH IT UNDERSHOOTS ----
+        //
+        // #2350 predicted +2.34 to +2.96 for `object_key` and +0.26 to +0.37 for `model_id` on the
+        // codec-1 container, which is +2.60 to +3.33 for the pair. Measured: 2.418 padded and
+        // 3.177 scattered -- UNDER the band at both ends, by 0.18 and 0.15 B/object.
+        //
+        // THE DIRECTION OF THE MISS IS WORTH MORE THAN THE SIZE OF IT. The counterfactual was a
+        // delta between two `serde_json::Value` re-encodes, and a `Value` writes its keys SORTED
+        // while the struct writes declaration order -- #2350 measured that reordering alone moving
+        // a compressed size 5%, and named its container arms a proxy good to within 15%. A
+        // counterfactual on a re-ordered document therefore prices a removal 5-7% optimistically,
+        // and that is the whole of this gap. The clause is a BAND and not an equality for exactly
+        // that reason, and it is asserted on both ends.
+        let container_saved = (before.json_container - surfaces.json_container) as f64 / n;
+        assert!(
+            (2.0..=3.33).contains(&container_saved),
+            "[CLAUSE the-prediction-closes] the codec-1 container saving on {} keys is \
+             {container_saved:.3} B/object, outside the 2.0 to 3.33 this change was costed \
+             against (#2350's +2.60 to +3.33 for the pair, less the 5-7% a `Value`-rebuilt \
+             counterfactual overstates by)",
+            shape.label()
+        );
+        drop(seeded);
+    }
+    assert_eq!(
+        10, checked,
+        "[CLAUSE the-entry-side-pays-on-the-artefact] {checked} surface(s) were compared rather \
+         than five on each of two key shapes"
+    );
+    println!(
+        "\n  THE SHIPPED CODEC IS THE SMALLER SAVING, AND IT IS THE ONE THAT MATTERS. Codec 2 is \
+         what production writes; #2350's prediction was taken on codec 1 because that is the arm a \
+         counterfactual can re-encode byte-for-byte. The two disagree by about 0.5 B/object here, \
+         so a figure quoted on codec 1 is optimistic about the artefact by that much."
+    );
+}
+
+/// The five surfaces of one key shape, as a single reading.
+struct Before {
+    stream: usize,
+    slot_index: usize,
+    payload: usize,
+    container: usize,
+    json_container: usize,
+}
+
+/// WHAT THIS CORPUS WEIGHED BEFORE THE CHANGE, AND WHERE THE NUMBERS CAME FROM.
+///
+/// Captured by running THIS MODULE on `ea5b278a9` with the production change absent -- the
+/// measurement module committed first and the entry's two fields still written -- so the before and
+/// the after differ in the change and in nothing else. Not a doctored `serde_json::Value`: the
+/// production encoder on the production path, at 8,000 objects in 1,024 buckets on `0..1023`, with
+/// the amortised regime asserted on both readings.
+///
+/// A CONSTANT AND NOT A SECOND FIXTURE RUN, deliberately. The alternative is to build the old shape
+/// here, and the old shape is what this change deletes: a fixture that could still produce it would
+/// be a second encoder to keep agreeing with the first, which is the hazard this file's own
+/// `serialize_block_index` keeps a record of.
+const BEFORE_PADDED: Before = Before {
+    stream: 2_283_431,
+    slot_index: 1_810_793,
+    payload: 1_587_811,
+    container: 250_657,
+    json_container: 258_432,
+};
+
+const BEFORE_SCATTERED: Before = Before {
+    stream: 2_282_145,
+    slot_index: 1_809_507,
+    payload: 1_587_853,
+    container: 328_520,
+    json_container: 336_433,
+};
+
+/// The stream saving #2350 priced for these two fields: 30.0 for `object_key`, 20.0 for `model_id`.
+const PREDICTED_STREAM_SAVING: f64 = 50.0;
+
+// =================================================================================================
+// CORRECTNESS ACROSS A RELOAD
+// =================================================================================================
+
+/// EVERY OBJECT IS STILL FINDABLE AND READS BACK BYTE-IDENTICAL, ACROSS A DROP AND A RELOAD.
+///
+/// # THE DIRECTION NOTHING REPORTS
+///
+/// A page the load path cannot find does not fail: the block is still on its slab and nothing looks
+/// for it. So the assertion is a COUNT equal to the corpus with zero missing and zero wrong, taken
+/// after the engine is dropped and a second one is pointed at the same directories -- not a spot
+/// check and not a non-emptiness.
+///
+/// # WITH A NEGATIVE CONTROL IN THE SAME MOMENT
+///
+/// A key never written must read ABSENT on the same build at the same instant, or a reader that
+/// answered every lookup would pass every assertion above.
+///
+/// # AND THE RELOAD IS ASSERTED TO HAVE READ THE INDEX, WHICH A PLANT IS WHY
+///
+/// This arm was planted on: the reconstruction was made to answer a CONSTANT kind for every page,
+/// and this test PASSED. Two things were wrong with it and both are fixed here rather than noted.
+///
+///   1. IT NEVER ASSERTED WHICH PATH THE RELOAD TOOK. "The base index file is non-empty on disk" is
+///      not "the base index was read": `load_index_inner` answers `Ok(None)` for a stale stamp, an
+///      undecodable image and an absent file alike, and the caller then replays the log -- slower,
+///      correct, and reading not one stored page entry. `index_load_path_counts` is asserted
+///      instead, as the four-tuple it is, with `accepted` non-zero and `refused_stale` and
+///      `undecodable` at zero over the same reset window.
+///   2. A STRING READ DOES NOT GO THROUGH THE PAGE INDEX'S KIND. A `StringGet` resolves through
+///      the string row in `objects`, so 600 correct reads said nothing about the `model_id` the
+///      bucket's page entries came back with. The identities are therefore compared DIRECTLY,
+///      page by page, against what the pre-unload engine held -- which is the comparison the plant
+///      walked straight through.
+///
+/// rust-internal: drives this crate's own reload path, no product behaviour
+#[test]
+fn a_reload_reads_every_object_back_and_a_key_never_written_is_absent() {
+    use crate::engine::persistence::{index_load_path_counts, reset_index_load_path_counts};
+    const OBJECTS: usize = 600;
+    const WIDTH: usize = PUBLISHED_WIDTH;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cache = dir.path().join("cache");
+    let blocks = dir.path().join("blocks");
+    let indexes = dir.path().join("indexes");
+
+    let index_path = indexes.join(format!("shard-{SHARD}.index.json"));
+    let mut expected: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    // THE IDENTITY OF EVERY PAGE AS THE WRITER HELD IT, so the reload can be compared against it
+    // rather than against itself. Keyed by the handle, which is what the map files a page under in
+    // both processes.
+    let mut identities_before: BTreeMap<u64, (String, String)> = BTreeMap::new();
+    {
+        let engine =
+            TemporalEngine::with_local_dirs(64, cache.clone(), blocks.clone(), indexes.clone());
+        let response = engine.load_shard_with(crate::control::LoadShardRequest {
+            shard_id: SHARD,
+            table_name: "the-key-a-page-is-filed-under".to_string(),
+            shard_uri: "local://the-key-a-page-is-filed-under/41".to_string(),
+            start_routing_bucket: 0,
+            end_routing_bucket: SHIPPED_END_BUCKET,
+            readonly: false,
+            load_version: 1,
+            local_node_id: Some(1),
+        });
+        assert!(response.status.ok, "[CLAUSE reload-reads-everything] the seed shard must load");
+        for ordinal in 0..OBJECTS {
+            let key = key_text(ordinal, WIDTH, KeyShape::Scattered);
+            // A DISTINCT VALUE PER KEY, so a reader that served one object's bytes for another's
+            // lookup is a FAILURE here rather than a pass.
+            let value: Vec<u8> = format!("value-for-{key}-{ordinal}").into_bytes();
+            let response = engine.execute(ExecuteRequest {
+                shard_id: SHARD,
+                command: Command::StringSet { key: key.clone(), value: value.clone() },
+            });
+            assert!(response.status.ok, "the seed must ack at {ordinal}: {response:?}");
+            expected.insert(key, value);
+        }
+        {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&SHARD).expect("shard is loaded");
+            for (_, handle, object_key, block) in super::blocks_with_identity(&shard.bucket_index) {
+                identities_before.insert(
+                    handle,
+                    (object_key.to_string(), block.model_id.as_str().to_string()),
+                );
+            }
+        }
+        assert_eq!(
+            OBJECTS,
+            identities_before.len(),
+            "[CLAUSE reload-reads-everything] the writer held {} page identity(ies) for {OBJECTS} \
+             object(s), so the comparison after the reload is not over the corpus",
+            identities_before.len()
+        );
+
+        // UNLOADED RATHER THAN DROPPED, so the base index is MATERIALIZED on disk: a dropped engine
+        // leaves whatever the last dump wrote, and a reload that replayed the log instead would
+        // exercise the WAL path and say nothing about the stored page entries.
+        engine.unload_shard(SHARD);
+        let written = std::fs::metadata(&index_path)
+            .map(|meta| meta.len())
+            .unwrap_or_default();
+        assert!(
+            written > 0,
+            "[CLAUSE reload-reads-everything] the unload wrote no base index at {index_path:?}, so \
+             the reload below would replay the log and this arm would not read a stored page entry \
+             at all"
+        );
+        println!("[reload-reads-everything] the unload wrote a {written}-byte base index");
+    }
+
+    // --- THE RELOAD: a second engine on the same directories. ---
+    reset_index_load_path_counts();
+    let engine = TemporalEngine::with_local_dirs(64, cache, blocks, indexes);
+    let response = engine.load_shard_with(crate::control::LoadShardRequest {
+        shard_id: SHARD,
+        table_name: "the-key-a-page-is-filed-under".to_string(),
+        shard_uri: "local://the-key-a-page-is-filed-under/41".to_string(),
+        start_routing_bucket: 0,
+        end_routing_bucket: SHIPPED_END_BUCKET,
+        readonly: false,
+        load_version: 1,
+        local_node_id: Some(1),
+    });
+    assert!(
+        response.status.ok,
+        "[CLAUSE reload-reads-everything] the reloaded shard must load: {:?}",
+        response.status
+    );
+
+    // --- THE DECODE ITSELF, BEFORE ANY REBUILD PASS TOUCHES IT ---
+    //
+    // THIS ARM EXISTS BECAUSE A PLANT WALKED THROUGH THE ONE BELOW IT. The reconstruction was made
+    // to answer a CONSTANT kind for every page and the whole reload arm -- 600 reads, the accepted
+    // counter, and a page-by-page identity comparison on the LIVE index after the load -- passed.
+    // So the live index after a load is not where the reconstruction's answer survives: the load
+    // path has rebuild passes over the bucket index, and for a string store the authoritative map
+    // is `objects`, so a wrong `model_id` on a decoded page entry is overwritten before anything
+    // can see it.
+    //
+    // THAT IS A FACT ABOUT THE GUARD'S REACH AND NOT A REASON TO WEAKEN THE CLAIM. The decode is
+    // where the reconstruction's answer IS observable, so it is read here: the bytes the unload
+    // wrote, through `decode_index_bytes`, with every page's rebuilt identity compared against what
+    // the writer held -- which is what the plant moves and what this arm fails on.
+    {
+        let stored = std::fs::read(&index_path)
+            .expect("the unload wrote a base index and this arm just asserted it non-empty");
+        let decoded = crate::engine::decode_index_bytes(&stored).expect(
+            "[CLAUSE the-decode-rebuilds-every-identity] the bytes this binary wrote must decode \
+             through the same door every reader goes through",
+        );
+        let mut at_the_decode: BTreeMap<u64, (String, String)> = BTreeMap::new();
+        for (_, handle, object_key, block) in super::blocks_with_identity(&decoded.bucket_index) {
+            at_the_decode.insert(
+                handle,
+                (object_key.to_string(), block.model_id.as_str().to_string()),
+            );
+        }
+        println!(
+            "[the-decode-rebuilds-every-identity] {} page identity(ies) came straight out of the \
+             decode",
+            at_the_decode.len()
+        );
+        assert_eq!(
+            identities_before, at_the_decode,
+            "[CLAUSE the-decode-rebuilds-every-identity] a page came out of the DECODE under a \
+             different object key or kind than the writer held. The identity is read back out of \
+             the stored key now, so this is the reconstruction being wrong -- and it is read here \
+             rather than off the live index after a load, because the load's rebuild passes \
+             overwrite it and a plant proved they do"
+        );
+    }
+
+    // --- THE PROBE ENTERED ITS REGIME: THE INDEX WAS READ, NOT REPLAYED AROUND. ---
+    //
+    // BOUND BY POSITION AGAINST THE SIGNATURE, which is (accepted, refused_stale, absent,
+    // undecodable). A tuple and not a sum, because a sum cannot tell a store that read its index
+    // from one that replayed -- and replaying reads not one stored page entry, so every assertion
+    // below it would be about the write-ahead log instead.
+    let (accepted, refused_stale, _absent, undecodable) = index_load_path_counts();
+    println!(
+        "[reload-reads-everything] load paths after the reload: accepted={accepted} \
+         refused_stale={refused_stale} undecodable={undecodable}"
+    );
+    assert!(
+        accepted > 0,
+        "[CLAUSE the-index-was-read] the reload accepted no base index (accepted={accepted}, \
+         refused_stale={refused_stale}, undecodable={undecodable}), so it rebuilt from the log and \
+         read no stored page entry -- every assertion below would be about the write-ahead log"
+    );
+    assert_eq!(
+        (0, 0),
+        (refused_stale, undecodable),
+        "[CLAUSE the-index-was-read] the reload refused {refused_stale} image(s) as stale and \
+         found {undecodable} undecodable; an accepted load beside a refused one would make the \
+         clause above pass over a store that also replayed"
+    );
+
+    // --- AND EVERY PAGE CAME BACK WITH THE IDENTITY THE WRITER HELD. ---
+    //
+    // THE COMPARISON A PLANT WALKED THROUGH WITHOUT THIS. A `StringGet` resolves through the string
+    // row and not through the page index's kind, so the 600 reads below are silent about the
+    // `model_id` the reconstruction produces. This is the arm that is not.
+    {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&SHARD).expect("shard is loaded");
+        let mut after: BTreeMap<u64, (String, String)> = BTreeMap::new();
+        for (_, handle, object_key, block) in super::blocks_with_identity(&shard.bucket_index) {
+            after.insert(
+                handle,
+                (object_key.to_string(), block.model_id.as_str().to_string()),
+            );
+        }
+        assert_eq!(
+            identities_before.len(),
+            after.len(),
+            "[CLAUSE reload-rebuilds-every-identity] {} page identity(ies) were written and {} came \
+             back",
+            identities_before.len(),
+            after.len()
+        );
+        assert_eq!(
+            identities_before, after,
+            "[CLAUSE reload-rebuilds-every-identity] a page came back under a different object key \
+             or a different kind than the writer held -- the identity is reconstructed from the \
+             stored key now, so a disagreement here is the reconstruction being wrong"
+        );
+        // THE CONTROL: the comparison must be able to fail.
+        let mut injected = after.clone();
+        if let Some((_, row)) = injected.iter_mut().next() {
+            row.1.push('Z');
+        }
+        assert_ne!(
+            injected, identities_before,
+            "[CLAUSE reload-rebuilds-every-identity] the comparison cannot report a difference when \
+             one is injected"
+        );
+    }
+
+    let mut found = 0usize;
+    let mut missing: Vec<String> = Vec::new();
+    let mut wrong: Vec<String> = Vec::new();
+    for (key, want) in &expected {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringGet { key: key.clone() },
+        });
+        match response.response {
+            crate::types::CommandResponse::Bytes { value: Some(ref got) } if got == want => {
+                found += 1
+            }
+            crate::types::CommandResponse::Bytes { value: Some(_) } => wrong.push(key.clone()),
+            crate::types::CommandResponse::Bytes { value: None } => missing.push(key.clone()),
+            ref other => panic!(
+                "[CLAUSE reload-reads-everything] a string read answered {other:?} rather than \
+                 bytes, so this walk is not reading objects back at all"
+            ),
+        }
+    }
+    println!(
+        "[reload-reads-everything] {found} of {} object(s) read back byte-identical after a drop \
+         and a reload; {} missing, {} wrong",
+        expected.len(),
+        missing.len(),
+        wrong.len()
+    );
+    assert!(
+        missing.is_empty(),
+        "[CLAUSE reload-reads-everything] {} object(s) were not found after the reload, first \
+         {:?} -- a page filed under a reconstructed identity that is wrong is exactly this",
+        missing.len(),
+        missing.iter().take(5).collect::<Vec<_>>()
+    );
+    assert!(
+        wrong.is_empty(),
+        "[CLAUSE reload-reads-everything] {} object(s) read back DIFFERENT bytes, first {:?}",
+        wrong.len(),
+        wrong.iter().take(5).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        expected.len(),
+        found,
+        "[CLAUSE reload-reads-everything] {found} of {} read back",
+        expected.len()
+    );
+    assert_eq!(
+        OBJECTS, found,
+        "[CLAUSE reload-reads-everything] the corpus was {OBJECTS} and {found} were checked"
+    );
+
+    // --- THE NEGATIVE CONTROL, SAME BUILD, SAME MOMENT. ---
+    let never_written = key_text(OBJECTS + 50_000, WIDTH, KeyShape::Scattered);
+    assert!(
+        !expected.contains_key(&never_written),
+        "[CLAUSE reload-reads-everything] the control key was written by the seed, so it cannot \
+         say what an absent key does"
+    );
+    let control = engine.execute(ExecuteRequest {
+        shard_id: SHARD,
+        command: Command::StringGet { key: never_written.clone() },
+    });
+    assert!(
+        matches!(
+            control.response,
+            crate::types::CommandResponse::Bytes { value: None }
+        ),
+        "[CLAUSE reload-reads-everything] the key {never_written:?} was never written and the \
+         store answered with bytes, so the {found} reads above are not evidence that anything was \
+         found correctly"
+    );
+    println!("[reload-reads-everything] a key never written reads absent on the same build");
+}
