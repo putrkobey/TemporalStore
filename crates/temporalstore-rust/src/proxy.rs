@@ -4850,3 +4850,4855 @@ mod tests {
 
         meta.register_server(crate::meta::RegisterServerRequest {
             registered_at_ms: 0,
+            numa_nodes: Vec::new(),
+            server_addr: test_addr(18_341),
+            node_id: 2,
+            location: "zone-b".to_string(),
+            binary_version: "v-b".to_string(),
+        });
+        meta.register(RegisterShardRequest {
+            registered_at_ms: 0,
+            shard_id: 1,
+            server_addr: test_addr(18_341),
+        });
+
+        assert!(
+            proxy_a
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: "proxy-a-after".to_string(),
+                        value: b"a-after".to_vec(),
+                    },
+                })
+                .status
+                .ok
+        );
+
+        proxy_b
+            .client()
+            .insert_cached_route_for_test(1, "127.0.0.1:1");
+        assert!(
+            proxy_b
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringSet {
+                        key: "proxy-b-after".to_string(),
+                        value: b"b-after".to_vec(),
+                    },
+                })
+                .status
+                .ok
+        );
+
+        assert_eq!(
+            engine_a
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "proxy-a-before".to_string(),
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"a-before".to_vec())
+            }
+        );
+        assert_eq!(
+            engine_a
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "proxy-b-before".to_string(),
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"b-before".to_vec())
+            }
+        );
+        for (key, value) in [
+            ("proxy-a-after", b"a-after".to_vec()),
+            ("proxy-b-after", b"b-after".to_vec()),
+        ] {
+            assert_eq!(
+                engine_b
+                    .execute(ExecuteRequest {
+                        shard_id: 1,
+                        command: Command::StringGet {
+                            key: key.to_string(),
+                        },
+                    })
+                    .response,
+                CommandResponse::Bytes { value: Some(value) }
+            );
+        }
+        assert_eq!(
+            engine_a
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "proxy-a-after".to_string(),
+                    },
+                })
+                .response,
+            CommandResponse::Bytes { value: None }
+        );
+
+        let preflight_a = proxy_a.preflight_report();
+        assert!(!preflight_a.topology_cache_stale, "{preflight_a:?}");
+        assert_eq!(preflight_a.client.topology_cache.route_count, 1);
+        assert!(preflight_a.client.route_refreshes >= 2, "{preflight_a:?}");
+        let route_a = preflight_a.client.topology_cache.routes.first().unwrap();
+        assert_eq!(route_a.primary_addr, test_addr(18_341));
+
+        let preflight_b = proxy_b.preflight_report();
+        assert!(!preflight_b.topology_cache_stale, "{preflight_b:?}");
+        assert_eq!(preflight_b.client.topology_cache.route_count, 1);
+        assert!(preflight_b.client.route_refreshes >= 2, "{preflight_b:?}");
+        let route_b = preflight_b.client.topology_cache.routes.first().unwrap();
+        assert_eq!(route_b.primary_addr, test_addr(18_341));
+    }
+
+    #[test]
+    fn proxy_preflight_reports_degraded_bad_request_state() {
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            namespace: "ns".to_string(),
+            ..ProxyOptions::default()
+        });
+
+        let (code, _) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/execute".to_string(),
+            body: b"not-json".to_vec(),
+        });
+        assert_eq!(code, 400);
+
+        let preflight = proxy.preflight_report();
+        assert!(!preflight.status.ok);
+        assert_eq!(preflight.status.code, "degraded");
+        assert_eq!(preflight.namespace, "ns");
+        assert_eq!(preflight.stats.bad_requests, 1);
+        assert_eq!(preflight.degraded_reasons, vec!["bad_requests"]);
+
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "GET".to_string(),
+            path: "/ProxyService/Preflight".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 200);
+        let routed = parse_json::<ProxyPreflightReport>(&body).unwrap();
+        assert_eq!(routed.stats.bad_requests, 1);
+    }
+
+    /// A drain and a shed are both policy refusals, and an operator has to tell them apart.
+    ///
+    /// `serving_mode` taking a proxy out is a decision someone made. `drop_percent` shedding is
+    /// the proxy protecting itself under load. Both used to land only in `admission_rejections`,
+    /// with the policy arm of `reject` explicitly doing nothing -- so the only way to see a
+    /// policy refusal at all was to subtract the account and in-flight counters from the total,
+    /// and no amount of subtraction separates a drain from a shed.
+    ///
+    /// Asserted through `policy_report`, which is the surface an operator actually reads, so this
+    /// covers the counter and its exposure together.
+    #[test]
+    fn a_drain_and_a_shed_are_counted_apart() {
+        let drained = scoped_proxy(ProxyOptions {
+            serving_mode: ProxyServingMode::NotServing,
+            ..ProxyOptions::default()
+        });
+        let refused = drained.execute(ExecuteRequest {
+            shard_id: 1,
+            command: read_command(),
+        });
+        assert_eq!(refused.status.code, "proxy_not_serving", "{:?}", refused.status);
+        let report = drained.policy_report();
+        assert_eq!(report.serving_rejections, 1, "a drain must count as a drain");
+        assert_eq!(report.drop_rejections, 0, "a drain is not a shed");
+        assert_eq!(report.admission_rejections, 1, "and it is still one refusal in total");
+
+        let shedding = scoped_proxy(ProxyOptions {
+            drop_percent: 100,
+            ..ProxyOptions::default()
+        });
+        let dropped = shedding.execute(ExecuteRequest {
+            shard_id: 1,
+            command: read_command(),
+        });
+        assert_eq!(
+            dropped.status.code, "proxy_traffic_dropped",
+            "{:?}",
+            dropped.status
+        );
+        let report = shedding.policy_report();
+        assert_eq!(report.drop_rejections, 1, "a shed must count as a shed");
+        assert_eq!(report.serving_rejections, 0, "a shed is not a drain");
+
+        // The total still accounts for exactly its parts. Without this the two new counters
+        // could double-count or miss a path and each assertion above would still pass.
+        assert_eq!(
+            report.admission_rejections,
+            report.account_rejections
+                + report.inflight_rejections
+                + report.serving_rejections
+                + report.drop_rejections,
+            "the refusal total stopped being the sum of the reasons for it: {report:?}"
+        );
+    }
+
+    fn read_command() -> Command {
+        Command::StringGet {
+            key: "k".to_string(),
+        }
+    }
+
+    fn write_command() -> Command {
+        Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        }
+    }
+
+    fn scoped_proxy(options: ProxyOptions) -> ProxyService {
+        ProxyService::new(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            ..options
+        })
+    }
+
+    #[test]
+    fn proxy_account_scope_rejects_foreign_namespaces() {
+        let proxy = scoped_proxy(ProxyOptions {
+            ingestion_account: "tenant-a".to_string(),
+            enforce_ingestion_account: true,
+            ..ProxyOptions::default()
+        });
+
+        let denied = proxy.table_execute(ProxyTableExecuteRequest {
+            namespace: "tenant-b".to_string(),
+            table_name: "t".to_string(),
+            command: read_command(),
+        });
+        assert_eq!(denied.status.code, "proxy_account_denied");
+
+        let denied_open = proxy.open_table(ProxyOpenTableRequest {
+            namespace: "tenant-b".to_string(),
+            table_name: "t".to_string(),
+            pin_primary: None,
+            replica_read_policy: None,
+        });
+        assert_eq!(denied_open.status.code, "proxy_account_denied");
+        assert!(denied_open.options.is_none());
+
+        let policy = proxy.policy_report();
+        assert_eq!(policy.account_rejections, 2);
+        assert_eq!(policy.admission_rejections, 2);
+        assert!(policy.enforce_ingestion_account);
+        assert_eq!(policy.ingestion_account, "tenant-a");
+
+        assert!(proxy
+            .preflight_report()
+            .degraded_reasons
+            .iter()
+            .any(|reason| reason == "account_rejections"));
+
+        // The proxy's own account still reaches routing, where the unreachable
+        // metaserver -- not admission -- is what fails it.
+        let allowed = proxy.table_execute(ProxyTableExecuteRequest {
+            namespace: "tenant-a".to_string(),
+            table_name: "t".to_string(),
+            command: read_command(),
+        });
+        assert_ne!(allowed.status.code, "proxy_account_denied");
+        assert_eq!(proxy.policy_report().account_rejections, 2);
+    }
+
+    #[test]
+    fn proxy_account_enforcement_without_an_account_fails_closed() {
+        let proxy = scoped_proxy(ProxyOptions {
+            enforce_ingestion_account: true,
+            ..ProxyOptions::default()
+        });
+
+        let response = proxy.table_execute(ProxyTableExecuteRequest {
+            namespace: "anything".to_string(),
+            table_name: "t".to_string(),
+            command: read_command(),
+        });
+        assert_eq!(response.status.code, "proxy_account_not_configured");
+        assert_eq!(proxy.policy_report().account_rejections, 1);
+    }
+
+    #[test]
+    fn proxy_account_scope_is_off_by_default() {
+        let proxy = scoped_proxy(ProxyOptions {
+            ingestion_account: "tenant-a".to_string(),
+            ..ProxyOptions::default()
+        });
+        let response = proxy.table_execute(ProxyTableExecuteRequest {
+            namespace: "tenant-b".to_string(),
+            table_name: "t".to_string(),
+            command: read_command(),
+        });
+        assert_ne!(response.status.code, "proxy_account_denied");
+        assert_eq!(proxy.policy_report().account_rejections, 0);
+    }
+
+    #[test]
+    fn a_zero_inflight_quota_admits_everything_because_that_is_the_default() {
+        // `max_inflight_requests` and `max_inflight_write_requests` default to 0, and 0 here means
+        // NO LIMIT -- so this is what every deployment that never sets a quota runs.
+        //
+        // The engine's admission limits use the opposite convention: a limit of 0 there refuses
+        // the request ("<label> is zero"). Both are right where they are -- the engine only holds
+        // limits somebody configured, while these two are zero until somebody does -- but the
+        // conventions are opposite on two admission paths, and carrying one across would make
+        // every default deployment refuse all traffic. Nothing asserted this direction before.
+        let proxy = scoped_proxy(ProxyOptions {
+            max_inflight_requests: 0,
+            max_inflight_write_requests: 0,
+            ..ProxyOptions::default()
+        });
+        let commands = [Command::StringSet {
+            key: "k".to_string(),
+            value: b"v".to_vec(),
+        }];
+
+        // Hold them all at once: a quota that counted would refuse long before this.
+        let mut held = Vec::new();
+        for _ in 0..256 {
+            match proxy.admit(Some("ns"), &commands) {
+                Ok(guard) => held.push(guard),
+                Err(status) => panic!(
+                    "a zero quota must admit everything, refused after {} with {}",
+                    held.len(),
+                    status.code
+                ),
+            }
+        }
+        assert_eq!(held.len(), 256);
+        drop(held);
+
+        // Positive control: with a real limit the same calls ARE refused, so the assertion above
+        // is not passing because admission stopped working.
+        let bounded = scoped_proxy(ProxyOptions {
+            max_inflight_requests: 1,
+            ..ProxyOptions::default()
+        });
+        let first = bounded.admit(Some("ns"), &commands).expect("first fits");
+        let second = bounded.admit(Some("ns"), &commands);
+        assert!(
+            second.is_err(),
+            "a limit of one must refuse the second while the first is held"
+        );
+        drop(first);
+        assert!(
+            bounded.admit(Some("ns"), &commands).is_ok(),
+            "and admit again once the slot is released"
+        );
+    }
+
+    #[test]
+    fn proxy_inflight_quota_rejects_only_while_slots_are_held() {
+        let proxy = scoped_proxy(ProxyOptions {
+            max_inflight_requests: 1,
+            ..ProxyOptions::default()
+        });
+
+        let held = proxy
+            .admit(None, std::slice::from_ref(&read_command()))
+            .expect("first request is admitted");
+        assert_eq!(proxy.inflight_snapshot(), (1, 0));
+
+        let status = proxy
+            .admit(None, std::slice::from_ref(&read_command()))
+            .expect_err("the single slot is taken");
+        assert_eq!(status.code, "proxy_inflight_quota_exceeded");
+        assert_eq!(proxy.inflight_snapshot(), (1, 0));
+
+        drop(held);
+        assert_eq!(proxy.inflight_snapshot(), (0, 0));
+        proxy
+            .admit(None, std::slice::from_ref(&read_command()))
+            .expect("the slot is released with the guard");
+
+        let policy = proxy.policy_report();
+        assert_eq!(policy.inflight_rejections, 1);
+        assert_eq!(policy.admission_rejections, 1);
+        assert_eq!(policy.max_inflight_requests, 1);
+    }
+
+    /// A body shaped the way the published spec describes is one the proxy can parse.
+    ///
+    /// The key fields are READ OUT OF THE SPEC, not written here. The spec used to name the field
+    /// `table` while every proxy request type names it `table_name`, with no serde alias, so a
+    /// reader following the document got `400 missing field table_name` on their first call. A
+    /// hand-written body in this test would only ever have restated whichever name I typed.
+    ///
+    /// Driven through `handle` rather than reasoned about: a struct field is not proof of what a
+    /// route accepts.
+    #[test]
+    fn a_body_shaped_like_the_published_spec_parses() {
+        let spec_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sdk/proxy/openapi.yaml");
+        let spec = std::fs::read_to_string(&spec_path).expect("the published proxy spec");
+
+        // `KeyRequest` is the shape nearly every documented command builds on.
+        let anchor = spec.find("    KeyRequest:").expect("the spec defines KeyRequest");
+        let mut fields: Vec<String> = Vec::new();
+        let mut in_props = false;
+        for line in spec[anchor..].lines().skip(1) {
+            if line.starts_with("    ") && !line.starts_with("     ") {
+                break;
+            }
+            if line.trim() == "properties:" {
+                in_props = true;
+                continue;
+            }
+            if in_props {
+                if let Some(name) = line.trim().strip_suffix(':') {
+                    if !name.is_empty() && line.starts_with("        ") {
+                        fields.push(name.to_string());
+                    }
+                }
+            }
+        }
+        assert!(
+            fields.len() >= 3,
+            "read {fields:?} out of the spec's KeyRequest; with fewer than three this test would              be posting an empty body and proving nothing"
+        );
+
+        let body = format!(
+            "{{{}}}",
+            fields
+                .iter()
+                .map(|f| format!("\"{f}\":\"x\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+
+        let proxy = scoped_proxy(ProxyOptions::default());
+        let (code, answered) = proxy.handle(crate::proxy::HttpRequest {
+            method: "POST".to_string(),
+            path: "/ProxyService/Get".to_string(),
+            body: body.clone().into_bytes(),
+        });
+        let text = String::from_utf8_lossy(&answered).to_string();
+        assert!(
+            !text.contains("bad_request"),
+            "a body built from the spec's own KeyRequest fields ({body}) is rejected by the route              the spec documents: {code} {text}"
+        );
+    }
+
+    /// Every field the spec documents for the context routes is a field those routes read.
+    ///
+    /// The other two guards cannot see this one. Every field of the context requests is
+    /// `#[serde(default)]`, so serde IGNORES a name it does not know rather than rejecting it. A
+    /// misspelt field in the published document produces no error at all -- it silently drops the
+    /// caller's data, which is worse than a 400 because nothing reports it.
+    ///
+    /// Two sided, because either side can be the one that moved:
+    ///   - a body with known-good keys is parsed and its VALUES are asserted to have landed, so a
+    ///     rename in the Rust type fails here;
+    ///   - the names the spec documents are asserted to be exactly that body's keys, so a typo in
+    ///     the document fails here.
+    #[test]
+    fn the_documented_context_fields_are_fields_the_routes_read() {
+        let ingest_body = serde_json::json!({
+            "scope": {"tenant_id": "t", "account_id": "a", "user_id": "u", "session_id": "s"},
+            "messages": [{"role": "user", "content": "c", "timestamp_ms": 7, "title": "ti"}],
+            "sources": [{}],
+            "records": [{}],
+            "query": "q",
+            "start_time_ms": 11,
+            "end_time_ms": 22,
+            "max_events": 3,
+            "provider": {}
+        });
+        // Parsed from BYTES, not from a `Value`: the request borrows from the body it was
+        // parsed out of, so it needs a buffer to point at.
+        let ingest_bytes = serde_json::to_vec(&ingest_body).expect("the ingest body serialises");
+        let ingest: context::ProxyContextIngestRequest =
+            serde_json::from_slice(&ingest_bytes).expect("the known-good ingest body parses");
+        // The values landed, so these names are the ones serde matches on.
+        assert_eq!(ingest.query, "q");
+        assert_eq!(ingest.start_time_ms, 11);
+        assert_eq!(ingest.end_time_ms, 22);
+        assert_eq!(ingest.max_events, Some(3));
+        assert_eq!(ingest.scope.tenant_id, "t");
+        assert_eq!(ingest.scope.session_id, "s");
+        assert_eq!(ingest.messages.len(), 1);
+        assert_eq!(ingest.messages[0].role, "user");
+        assert_eq!(ingest.messages[0].content, "c");
+        assert_eq!(ingest.sources.len(), 1);
+        assert_eq!(ingest.records.len(), 1);
+        assert!(ingest.provider.is_some());
+
+        let retrieve_body = serde_json::json!({
+            "scope": {"tenant_id": "t", "account_id": "a", "user_id": "u", "session_id": "s"},
+            "query": "q",
+            "start_time_ms": 11,
+            "end_time_ms": 22,
+            "max_events": 3,
+            "node_hashes": [5],
+            "provider": {}
+        });
+        let retrieve: context::ProxyContextRetrieveRequest =
+            serde_json::from_value(retrieve_body.clone()).expect("the known-good retrieve body parses");
+        assert_eq!(retrieve.query, "q");
+        assert_eq!(retrieve.start_time_ms, 11);
+        assert_eq!(retrieve.end_time_ms, 22);
+        assert_eq!(retrieve.max_events, Some(3));
+        assert_eq!(retrieve.node_hashes, vec![5]);
+        assert_eq!(retrieve.scope.user_id, "u");
+        assert!(retrieve.provider.is_some());
+
+        // Now the document has to name exactly those fields, and no others.
+        let spec_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sdk/proxy/openapi.yaml");
+        let spec = std::fs::read_to_string(&spec_path).expect("the published proxy spec");
+        let documented = |schema: &str| -> Vec<String> {
+            let head = format!("    {schema}:");
+            let start = spec.find(&head).unwrap_or_else(|| panic!("the spec defines {schema}"));
+            let mut names = Vec::new();
+            let mut in_props = false;
+            for line in spec[start..].lines().skip(1) {
+                if line.starts_with("    ") && !line.starts_with("     ") {
+                    break;
+                }
+                if line.trim() == "properties:" {
+                    in_props = true;
+                    continue;
+                }
+                if in_props && line.starts_with("        ") && !line.starts_with("         ") {
+                    if let Some(name) = line.trim().strip_suffix(':') {
+                        names.push(name.to_string());
+                    }
+                }
+            }
+            names.sort();
+            names
+        };
+        let keys_of = |value: &serde_json::Value| -> Vec<String> {
+            let mut names: Vec<String> =
+                value.as_object().expect("object").keys().cloned().collect();
+            names.sort();
+            names
+        };
+
+        for (schema, body) in [
+            ("ContextIngestRequest", &ingest_body),
+            ("ContextRetrieveRequest", &retrieve_body),
+            ("ContextScope", &ingest_body["scope"]),
+        ] {
+            let listed = documented(schema);
+            assert!(
+                !listed.is_empty(),
+                "read no properties for {schema}, so this test would be checking nothing"
+            );
+            assert_eq!(
+                listed,
+                keys_of(body),
+                "the spec's {schema} does not name the fields the route reads, and serde drops a                  name it does not know without saying so"
+            );
+        }
+    }
+
+    // THE PYTHON SDK CROSS-CHECK IS GONE WITH THE SDK, AND THAT IS A LOSS, NOT A TIDY-UP.
+    //
+    // `every_proxy_route_the_python_sdk_calls_is_served` read `sdk/python/temporalstore/` and
+    // asserted that every path the shipped client POSTs to is a path this dispatcher knows. Its
+    // own doc said why it had to live here: nothing in this repo compiles the SDK, so a route
+    // renamed on one side and not the other failed at the USER and nowhere else.
+    //
+    // The SDK now lives in the Python repository and the route table lives here, so the check
+    // cannot run in either repository alone -- it needs both trees at once. Deleting it is
+    // therefore giving something up, and it is recorded here rather than in a commit message so
+    // that whoever reinstates the pairing (a submodule, a vendored copy of the two client files,
+    // or a cross-repo job) finds the reason it was needed.
+
+
+    /// Every route the operational surface report claims is covered is one the proxy answers.
+    ///
+    /// Each entry carries `covered: true`, and the helper that builds them sets that literal --
+    /// nothing checks it. So the report asserts coverage of ten surfaces and twenty route names on
+    /// the strength of a hardcoded `true`, which is the same shape as the published spec claiming
+    /// five routes that answered 404.
+    ///
+    /// This makes the claim mean something: the report is read from the running proxy, and every
+    /// route it names is put to the dispatcher.
+    #[test]
+    fn the_operational_surface_only_claims_routes_the_proxy_serves() {
+        let proxy = scoped_proxy(ProxyOptions::default());
+        let (code, body) = proxy.handle(crate::proxy::HttpRequest {
+            method: "GET".to_string(),
+            path: "/proxy/operational_surface".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 200, "the report must answer, or this test checks nothing");
+        let report: ProxyOperationalSurfaceReport =
+            parse_json(&body).expect("the operational surface report parses");
+
+        assert!(
+            report.entries.len() >= 5,
+            "the report listed {} entries; with fewer than five this test would be checking              almost nothing",
+            report.entries.len()
+        );
+
+        let mut unserved: Vec<String> = Vec::new();
+        for entry in &report.entries {
+            for route in [entry.rust_native_route.as_str(), entry.rust_alias.as_str()] {
+                if route.is_empty() || !route.starts_with('/') {
+                    continue;
+                }
+                // A route the dispatcher knows answers something other than 404 to one of these.
+                let get = proxy
+                    .handle(crate::proxy::HttpRequest {
+                        method: "GET".to_string(),
+                        path: route.to_string(),
+                        body: Vec::new(),
+                    })
+                    .0;
+                let post = proxy
+                    .handle(crate::proxy::HttpRequest {
+                        method: "POST".to_string(),
+                        path: route.to_string(),
+                        body: b"{}".to_vec(),
+                    })
+                    .0;
+                if get == 404 && post == 404 {
+                    unserved.push(format!("{} -> {route}", entry.native_surface));
+                }
+            }
+        }
+
+        assert!(
+            unserved.is_empty(),
+            "the operational surface reports covered: true for {} route(s) the proxy answers 404              for: {unserved:#?}",
+            unserved.len()
+        );
+    }
+
+    /// Every route the published proxy API documents is one the proxy actually answers.
+    ///
+    /// `sdk/proxy/openapi.yaml` is the contract an outside user builds against -- it ships in the
+    /// open-source repo and is the only description of this surface they have. A path in it that
+    /// the dispatcher does not know answers 404, and nothing in the tree noticed, because the spec
+    /// is a document and the routes are code.
+    ///
+    /// This drives the REAL dispatcher rather than comparing two lists: a route is "served" if
+    /// `handle` gives it anything other than 404. A 400 for an empty body counts -- the question
+    /// is whether the route exists, not whether `{}` satisfies it.
+    #[test]
+    fn every_documented_proxy_route_is_served() {
+        let spec_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../sdk/proxy/openapi.yaml");
+        let spec = std::fs::read_to_string(&spec_path)
+            .unwrap_or_else(|err| panic!("the published proxy spec must be readable at {spec_path:?}: {err}"));
+
+        // The `paths:` block, whose two-space keys are the routes and four-space keys the methods.
+        let mut documented: Vec<(String, String)> = Vec::new();
+        let mut in_paths = false;
+        let mut route = String::new();
+        for line in spec.lines() {
+            if line.starts_with("paths:") {
+                in_paths = true;
+                continue;
+            }
+            if !in_paths {
+                continue;
+            }
+            if !line.is_empty() && !line.starts_with(' ') {
+                break;
+            }
+            let trimmed = line.trim_end();
+            if let Some(rest) = trimmed.strip_prefix("  /") {
+                if !trimmed.starts_with("    ") {
+                    if let Some(name) = rest.strip_suffix(':') {
+                        route = format!("/{name}");
+                    }
+                    continue;
+                }
+            }
+            if let Some(rest) = trimmed.strip_prefix("    ") {
+                if let Some(method) = rest.strip_suffix(':') {
+                    let upper = method.to_ascii_uppercase();
+                    if matches!(upper.as_str(), "GET" | "POST" | "PUT" | "DELETE") && !route.is_empty() {
+                        documented.push((upper, route.clone()));
+                    }
+                }
+            }
+        }
+
+        assert!(
+            documented.len() >= 15,
+            "the spec parse found only {} routes, so this test would pass by finding nothing",
+            documented.len()
+        );
+
+        let proxy = scoped_proxy(ProxyOptions::default());
+        let mut missing: Vec<String> = Vec::new();
+        for (method, path) in &documented {
+            let (code, _) = proxy.handle(crate::proxy::HttpRequest {
+                method: method.clone(),
+                path: path.clone(),
+                body: b"{}".to_vec(),
+            });
+            if code == 404 {
+                missing.push(format!("{method} {path}"));
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "the published proxy spec documents {} route(s) the proxy answers 404 for, so anyone              building against it gets a 404: {missing:?}",
+            missing.len()
+        );
+    }
+
+    /// Extract forwards its sources in one order: the messages, then `sources`, then `records`.
+    ///
+    /// The array is assembled from three origins and is heterogeneous -- built chat sources next
+    /// to values the caller shaped itself -- so it is exactly the kind of thing a rewrite
+    /// reorders without failing anything. Nothing held the order before this. Read off the
+    /// payload the proxy actually forwards, because that is what the datanode sees.
+    #[test]
+    fn extract_forwards_its_sources_in_one_order() {
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&captured);
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(listener) => listener,
+                Err(_) => return,
+            };
+            let bound = match listener.local_addr() {
+                Ok(addr) => addr.to_string(),
+                Err(_) => return,
+            };
+            if addr_tx.send(bound).is_err() {
+                return;
+            }
+            let body = br#"{"status":{"ok":true,"code":"ok","message":""},"responses":[]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                body.len()
+            );
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut scratch = [0u8; 8192];
+                loop {
+                    use std::io::{Read as _, Write as _};
+                    match stream.read(&mut scratch) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            sink.lock()
+                                .expect("capture lock")
+                                .extend_from_slice(&scratch[..read]);
+                            if stream.write_all(head.as_bytes()).is_err()
+                                || stream.write_all(body).is_err()
+                            {
+                                break;
+                            }
+                            let _ = stream.flush();
+                        }
+                    }
+                }
+            }
+        });
+        let backend = addr_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the capturing backend must report its address");
+
+        let proxy = scoped_proxy(ProxyOptions::default());
+        proxy
+            .client()
+            .insert_cached_route_for_test(proxy.context_shard_id(0), backend.clone());
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "scope": {"tenant_id": "t", "account_id": "a", "user_id": "u", "session_id": "s"},
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "assistant", "content": "second"}
+            ],
+            "sources": [{"source_kind": "resource", "mark": "from sources"}],
+            "records": [{"source_kind": "resource", "mark": "from records"}],
+            "query": "q"
+        }))
+        .expect("body");
+
+        let (code, answered) = proxy.handle(crate::proxy::HttpRequest {
+            method: "POST".to_string(),
+            path: "/context/extract".to_string(),
+            body,
+        });
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&answered));
+
+        let forwarded =
+            String::from_utf8_lossy(&captured.lock().expect("capture lock")).to_string();
+        let body_at = forwarded
+            .find("\r\n\r\n")
+            .map(|at| at + 4)
+            .expect("the forwarded request has a header terminator");
+        let request: serde_json::Value = serde_json::from_str(forwarded[body_at..].trim_end())
+            .expect("the forwarded body is JSON");
+        let sources = request["sources"]
+            .as_array()
+            .expect("the forwarded body carries sources");
+
+        assert_eq!(sources.len(), 4, "sources: {sources:?}");
+        // The two built from messages come first, in message order.
+        for (idx, expected_body) in [(0usize, "first"), (1, "second")] {
+            assert_eq!(sources[idx]["source_kind"], "chat");
+            assert_eq!(sources[idx]["body"], expected_body);
+            let id = sources[idx]["source_id"]
+                .as_str()
+                .expect("a chat source carries an id");
+            assert!(
+                id.starts_with("chat:") && id.ends_with(&format!(":s:{idx}")),
+                "the chat source id lost its shape or its index: {id}"
+            );
+        }
+        // Then what the caller supplied, sources before records, each exactly as it arrived.
+        assert_eq!(
+            sources[2]["mark"], "from sources",
+            "a caller-supplied source moved or was rewritten"
+        );
+        assert_eq!(
+            sources[3]["mark"], "from records",
+            "records must follow sources, unchanged"
+        );
+    }
+    /// A raw event's title falls back the way it always did: its own, then the role, then
+    /// "message".
+    ///
+    /// The title is borrowed rather than owned now -- the record it feeds takes `&str`, so the
+    /// `String` only ever existed to be pointed at, and it cost one allocation per message.
+    /// Collapsing three branches into borrows is exactly the change that quietly reorders a
+    /// fallback, so this reads the titles out of the payload the proxy actually forwards.
+    #[test]
+    fn a_raw_events_title_falls_back_as_it_did() {
+        let captured: std::sync::Arc<std::sync::Mutex<Vec<u8>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = std::sync::Arc::clone(&captured);
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel::<String>();
+        std::thread::spawn(move || {
+            let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+                Ok(listener) => listener,
+                Err(_) => return,
+            };
+            let bound = match listener.local_addr() {
+                Ok(addr) => addr.to_string(),
+                Err(_) => return,
+            };
+            if addr_tx.send(bound).is_err() {
+                return;
+            }
+            let body = br#"{"status":{"ok":true,"code":"ok","message":""},"responses":[]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                body.len()
+            );
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut scratch = [0u8; 8192];
+                loop {
+                    use std::io::{Read as _, Write as _};
+                    match stream.read(&mut scratch) {
+                        Ok(0) | Err(_) => break,
+                        Ok(read) => {
+                            sink.lock()
+                                .expect("capture lock")
+                                .extend_from_slice(&scratch[..read]);
+                            if stream.write_all(head.as_bytes()).is_err()
+                                || stream.write_all(body).is_err()
+                            {
+                                break;
+                            }
+                            let _ = stream.flush();
+                        }
+                    }
+                }
+            }
+        });
+        let backend = addr_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the capturing backend must report its address");
+
+        let proxy = scoped_proxy(ProxyOptions::default());
+        proxy
+            .client()
+            .insert_cached_route_for_test(proxy.context_shard_id(0), backend.clone());
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "scope": {"tenant_id": "t", "account_id": "a", "user_id": "u", "session_id": "s"},
+            "messages": [
+                {"role": "user", "content": "one", "title": "its own"},
+                {"role": "assistant", "content": "two"},
+                {"role": "", "content": "three"}
+            ]
+        }))
+        .expect("body");
+
+        let (code, answered) = proxy.handle(crate::proxy::HttpRequest {
+            method: "POST".to_string(),
+            path: "/context/ingest".to_string(),
+            body,
+        });
+        assert_eq!(code, 200, "{}", String::from_utf8_lossy(&answered));
+
+        let forwarded =
+            String::from_utf8_lossy(&captured.lock().expect("capture lock")).to_string();
+        assert!(
+            !forwarded.is_empty(),
+            "nothing was forwarded, so this test read no titles at all"
+        );
+
+        // The record is base64 inside the command's entries, so the titles are decoded rather
+        // than matched as substrings.
+        let body_at = forwarded
+            .find("\r\n\r\n")
+            .map(|at| at + 4)
+            .expect("the forwarded request has a header terminator");
+        let request: serde_json::Value = serde_json::from_str(forwarded[body_at..].trim_end())
+            .expect("the forwarded body is JSON");
+        let entries = request["command"]["entries"]
+            .as_array()
+            .expect("the command carries entries");
+        let mut titles: Vec<String> = Vec::new();
+        for entry in entries {
+            let encoded = entry[1].as_str().expect("the entry value is a string");
+            let decoded = {
+                use base64::Engine as _;
+                base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .expect("the entry value is base64")
+            };
+            let record: serde_json::Value =
+                serde_json::from_slice(&decoded).expect("the record is JSON");
+            titles.push(
+                record["title"]
+                    .as_str()
+                    .expect("the record carries a title")
+                    .to_string(),
+            );
+        }
+
+        assert_eq!(
+            titles,
+            vec![
+                "its own".to_string(),
+                "assistant".to_string(),
+                "message".to_string()
+            ],
+            "the title fallback moved: its own title, then the role, then the constant"
+        );
+    }
+
+    /// A batch gets one answer per command, or it is refused.
+    ///
+    /// A backend that returns fewer used to come back as `ok` with a SHORT array. A caller indexing
+    /// its own commands then reads someone else's answer, or none, and nothing tells it: the
+    /// status says ok and the array is simply shorter than what it sent.
+    ///
+    /// The client's multi-shard path has always refused this ("batch response length mismatch").
+    /// The single-shard forward the proxy uses did not, so the guard existed on one path only.
+    #[test]
+    fn a_batch_answer_must_cover_every_command() {
+        // A backend answering exactly `answers` responses, whatever it is asked.
+        fn backend_answering(answers: usize) -> String {
+            let body = serde_json::to_vec(&BatchExecuteResponse {
+                status: Status::ok(),
+                responses: (0..answers)
+                    .map(|_| ExecuteResponse {
+                        status: Status::ok(),
+                        response: CommandResponse::Empty,
+                    })
+                    .collect(),
+            })
+            .expect("canned batch response");
+            let mut canned = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                body.len()
+            )
+            .into_bytes();
+            canned.extend_from_slice(&body);
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            std::thread::spawn(move || {
+                let listener = match std::net::TcpListener::bind("127.0.0.1:0") {
+                    Ok(listener) => listener,
+                    Err(_) => return,
+                };
+                let bound = match listener.local_addr() {
+                    Ok(addr) => addr.to_string(),
+                    Err(_) => return,
+                };
+                if tx.send(bound).is_err() {
+                    return;
+                }
+                for stream in listener.incoming().flatten() {
+                    let mut stream = stream;
+                    let mut scratch = [0u8; 16384];
+                    loop {
+                        use std::io::{Read as _, Write as _};
+                        match stream.read(&mut scratch) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {
+                                if stream.write_all(&canned).is_err() {
+                                    break;
+                                }
+                                let _ = stream.flush();
+                            }
+                        }
+                    }
+                }
+            });
+            rx.recv_timeout(Duration::from_secs(5))
+                .expect("the backend must report its address")
+        }
+
+        // Returns the answer AND how far the backend-error counter moved, because a refusal the
+        // caller sees but no operator can is only half a fix.
+        let send_five = |addr: &str| -> (BatchExecuteResponse, u64) {
+            let proxy = scoped_proxy(ProxyOptions::default());
+            proxy.client().insert_cached_route_for_test(1, addr.to_string());
+            let before = proxy.info().stats.backend_errors;
+            let body = serde_json::to_vec(&BatchExecuteRequest {
+                shard_id: 1,
+                commands: (0..5)
+                    .map(|i| Command::StringGet { key: format!("k{i}") })
+                    .collect(),
+            })
+            .expect("batch body");
+            let (code, answered) = proxy.handle(crate::proxy::HttpRequest {
+                method: "POST".to_string(),
+                path: "/batch_execute".to_string(),
+                body,
+            });
+            assert_eq!(code, 200, "{}", String::from_utf8_lossy(&answered));
+            let moved = proxy.info().stats.backend_errors - before;
+            (
+                parse_json::<BatchExecuteResponse>(&answered).expect("the reply parses"),
+                moved,
+            )
+        };
+
+        // The positive control, and it is not optional: a backend that answers every command must
+        // still succeed, or the check below would pass by refusing everything.
+        let (complete, complete_errors) = send_five(&backend_answering(5));
+        assert!(complete.status.ok, "{:?}", complete.status);
+        assert_eq!(complete.responses.len(), 5);
+        assert_eq!(
+            complete_errors, 0,
+            "a backend that answered every command is not a backend error"
+        );
+
+        let (short, short_errors) = send_five(&backend_answering(2));
+        assert!(
+            !short.status.ok,
+            "a batch answered 2 of 5 came back ok with {} responses; a caller indexing its own              commands reads the wrong answers and is told nothing",
+            short.responses.len()
+        );
+        assert_eq!(short.status.code, "bad_response");
+        assert!(
+            short.status.message.contains('5') && short.status.message.contains('2'),
+            "the refusal should say how many were sent and how many came back: {}",
+            short.status.message
+        );
+        assert_eq!(
+            short_errors, 1,
+            "a datanode answering short is misbehaving, and an operator sees nothing unless it              lands on the backend-error counter"
+        );
+    }
+
+    #[test]
+    fn proxy_write_quota_leaves_read_capacity_free() {
+        let proxy = scoped_proxy(ProxyOptions {
+            max_inflight_write_requests: 1,
+            ..ProxyOptions::default()
+        });
+
+        let held = proxy
+            .admit(None, std::slice::from_ref(&write_command()))
+            .expect("first write is admitted");
+        assert_eq!(proxy.inflight_snapshot(), (1, 1));
+
+        let status = proxy
+            .admit(None, std::slice::from_ref(&write_command()))
+            .expect_err("the single write slot is taken");
+        assert_eq!(status.code, "proxy_write_inflight_quota_exceeded");
+        // The rejected write must not leak a slot in the shared total.
+        assert_eq!(proxy.inflight_snapshot(), (1, 1));
+
+        let reader = proxy
+            .admit(None, std::slice::from_ref(&read_command()))
+            .expect("reads are unaffected by the write quota");
+        assert_eq!(proxy.inflight_snapshot(), (2, 1));
+
+        drop(reader);
+        drop(held);
+        assert_eq!(proxy.inflight_snapshot(), (0, 0));
+        assert_eq!(proxy.policy_report().inflight_rejections, 1);
+    }
+
+    #[test]
+    fn proxy_unlimited_quotas_never_reject() {
+        let proxy = scoped_proxy(ProxyOptions::default());
+        let mut guards = Vec::new();
+        for _ in 0..64 {
+            guards.push(
+                proxy
+                    .admit(None, std::slice::from_ref(&write_command()))
+                    .expect("the default configuration is unlimited"),
+            );
+        }
+        assert_eq!(proxy.inflight_snapshot(), (64, 64));
+        drop(guards);
+        assert_eq!(proxy.inflight_snapshot(), (0, 0));
+        assert_eq!(proxy.policy_report().inflight_rejections, 0);
+    }
+
+    #[test]
+    fn proxy_pin_primary_reads_defaults_on_and_is_reported() {
+        let proxy = scoped_proxy(ProxyOptions::default());
+        let policy = proxy.policy_report();
+        assert!(policy.pin_primary_reads);
+
+        let follower_reads = scoped_proxy(ProxyOptions {
+            pin_primary_reads: false,
+            ..ProxyOptions::default()
+        });
+        assert!(!follower_reads.policy_report().pin_primary_reads);
+        assert_ne!(
+            proxy_config_version(&proxy.options()),
+            proxy_config_version(&follower_reads.options()),
+            "the read-routing policy has to move config_version so a rollout can confirm it"
+        );
+    }
+
+    #[test]
+    fn proxy_metrics_expose_admission_quotas() {
+        let proxy = scoped_proxy(ProxyOptions {
+            max_inflight_requests: 8,
+            max_inflight_write_requests: 2,
+            enforce_ingestion_account: true,
+            ingestion_account: "tenant-a".to_string(),
+            ..ProxyOptions::default()
+        });
+        let _ = proxy.table_execute(ProxyTableExecuteRequest {
+            namespace: "tenant-b".to_string(),
+            table_name: "t".to_string(),
+            command: read_command(),
+        });
+
+        let metrics = proxy.prometheus_metrics();
+        assert!(metrics
+            .contains("temporalstore_proxy_requests_total{kind=\"account_rejection\"} 1"));
+        assert!(metrics.contains("temporalstore_proxy_inflight_limit{kind=\"total\"} 8"));
+        assert!(metrics.contains("temporalstore_proxy_inflight_limit{kind=\"write\"} 2"));
+        assert!(metrics.contains("temporalstore_proxy_inflight_requests{kind=\"total\"} 0"));
+        assert!(metrics.contains("temporalstore_proxy_account_enforcement 1"));
+        assert!(metrics.contains("temporalstore_proxy_pin_primary_reads 1"));
+    }
+
+    use serde_json::json;
+
+    fn context_scope(account: &str, tenant: &str) -> context::ProxyContextScope {
+        context::ProxyContextScope {
+            tenant_id: tenant.to_string(),
+            account_id: account.to_string(),
+            user_id: String::new(),
+            session_id: "s1".to_string(),
+        }
+    }
+
+    fn context_ingest_body(account: &str, tenant: &str) -> Vec<u8> {
+        serde_json::to_vec(&json!({
+            "scope": {"account_id": account, "tenant_id": tenant, "session_id": "s1"},
+            "messages": [{"role": "user", "content": "hello"}],
+        }))
+        .unwrap()
+    }
+
+    fn post(proxy: &ProxyService, path: &str, body: Vec<u8>) -> (u16, Vec<u8>) {
+        proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: path.to_string(),
+            body,
+        })
+    }
+
+    #[test]
+    fn context_routes_honour_account_scope() {
+        let proxy = scoped_proxy(ProxyOptions {
+            ingestion_account: "tenant-a".to_string(),
+            enforce_ingestion_account: true,
+            ..ProxyOptions::default()
+        });
+
+        let (code, body) = post(
+            &proxy,
+            "/context/ingest",
+            context_ingest_body("tenant-b", "t"),
+        );
+        assert_eq!(code, 403);
+        assert!(String::from_utf8_lossy(&body).contains("proxy_account_denied"));
+
+        let (code, _) = post(
+            &proxy,
+            "/context/retrieve",
+            serde_json::to_vec(&json!({
+                "scope": {"account_id": "tenant-b", "tenant_id": "t", "session_id": "s1"},
+                "query": "q",
+            }))
+            .unwrap(),
+        );
+        assert_eq!(code, 403);
+        assert_eq!(proxy.policy_report().account_rejections, 2);
+    }
+
+    #[test]
+    fn a_config_push_replaces_the_client_a_thread_already_holds() {
+        // `table_for_request` reads the client through a per-thread snapshot. A config push
+        // builds a NEW client -- new meta address, new namespace, new timeouts -- so a thread
+        // still holding the old one would keep talking to whatever the proxy was pointed at
+        // before the push.
+        let proxy = scoped_proxy(ProxyOptions::default());
+        let before = proxy.snapshot_meta_addr();
+        assert_eq!(
+            before.as_deref(),
+            Some("127.0.0.1:1"),
+            "the snapshot starts on the configured address"
+        );
+
+        let mut pushed = (*proxy.options()).clone();
+        pushed.meta_addr = "127.0.0.1:2".to_string();
+        assert!(proxy.update_options_report(pushed).applied);
+
+        assert_eq!(
+            proxy.snapshot_meta_addr().as_deref(),
+            Some("127.0.0.1:2"),
+            "the push must replace the client this thread already held -- the old address here              means requests keep going to the proxy's previous metaserver"
+        );
+    }
+
+    #[test]
+    fn a_preflight_says_whether_the_configured_metaserver_is_the_leader() {
+        // A proxy holds ONE meta_addr. Pointed at a follower it gets `meta_not_ready` for
+        // control-plane work, and before this the report showed that as its own degradation with
+        // nothing naming the cause. `scoped_proxy` points at a closed port, so this covers the
+        // case that matters most for the claim: when the metaserver cannot be asked, the report
+        // must say it does not know rather than assert a leader.
+        let proxy = scoped_proxy(ProxyOptions::default());
+        let report = proxy.preflight_report();
+
+        assert!(
+            report.meta_leader.is_none(),
+            "an unreachable metaserver must leave the leader unknown, not invented"
+        );
+        assert!(
+            !report.meta_addr_is_leader,
+            "not knowing the leader is not the same as being it"
+        );
+    }
+
+    #[test]
+    fn the_heartbeat_interval_is_configuration_and_a_push_moves_it() {
+        // It used to be an environment variable read once in `main`, so it appeared in no report
+        // and no push could change it -- the one knob that needed a restart. These assertions are
+        // what "it is configuration now" means: it is in the document, a push moves it, and the
+        // default is what `main` passed before, so nothing changed for anyone not setting it.
+        let proxy = scoped_proxy(ProxyOptions::default());
+        assert_eq!(
+            proxy.options().heartbeat_interval_ms,
+            10_000,
+            "the default must stay what main passed, or moving it changes behaviour"
+        );
+
+        let before = proxy_config_version(&proxy.options());
+        let mut pushed = (*proxy.options()).clone();
+        pushed.heartbeat_interval_ms = 2_500;
+        let report = proxy.update_options_report(pushed);
+        assert!(report.applied, "the push must apply: {report:?}");
+        assert_eq!(proxy.options().heartbeat_interval_ms, 2_500);
+
+        // The loop reads through the options snapshot, which only refreshes when the version
+        // moves. If the interval were not part of the hashed document the loop would keep the
+        // old beat while the report claimed the new one.
+        assert_ne!(
+            before,
+            proxy_config_version(&proxy.options()),
+            "changing the interval must move the config version, or the running loop never sees it"
+        );
+    }
+
+    #[test]
+    fn a_config_push_reaches_a_context_path_that_already_served() {
+        // `admit_context` reads the options through the per-thread snapshot, which is only
+        // refreshed when the config version moves. A thread that has already admitted a context
+        // request holds a snapshot; if the push does not reach it, an operator disables writes,
+        // the config report agrees, and this path keeps accepting them.
+        let proxy = scoped_proxy(ProxyOptions::default());
+        let scope = context_scope("acct", "t");
+
+        assert!(
+            proxy.admit_context(&scope, true).is_ok(),
+            "a serving proxy admits a context write"
+        );
+
+        // Same thread, so the snapshot taken above is the one in hand.
+        let mut pushed = (*proxy.options()).clone();
+        pushed.serving_mode = ProxyServingMode::WriteDisabled;
+        let report = proxy.update_options_report(pushed);
+        assert!(report.applied, "the push must be applied: {report:?}");
+
+        let refused = proxy.admit_context(&scope, true);
+        assert!(
+            refused.is_err(),
+            "a context write must be refused after writes are disabled -- admitting here means              the push did not reach the snapshot this thread already held"
+        );
+
+        // And back, so this cannot pass by the snapshot being stuck on the refusing value.
+        let mut restored = (*proxy.options()).clone();
+        restored.serving_mode = ProxyServingMode::Serving;
+        assert!(proxy.update_options_report(restored).applied);
+        assert!(
+            proxy.admit_context(&scope, true).is_ok(),
+            "restoring the mode must reach this path too"
+        );
+    }
+
+    #[test]
+    fn context_routes_honour_drain_and_write_disable() {
+        let drained = scoped_proxy(ProxyOptions {
+            serving_mode: ProxyServingMode::NotServing,
+            ..ProxyOptions::default()
+        });
+        let (code, body) = post(
+            &drained,
+            "/context/ingest",
+            context_ingest_body("acct", "t"),
+        );
+        assert_eq!(code, 503);
+        assert!(String::from_utf8_lossy(&body).contains("proxy_not_serving"));
+
+        let readonly = scoped_proxy(ProxyOptions {
+            serving_mode: ProxyServingMode::Readonly,
+            ..ProxyOptions::default()
+        });
+        let (code, body) = post(
+            &readonly,
+            "/context/extract",
+            context_ingest_body("acct", "t"),
+        );
+        assert_eq!(code, 503);
+        assert!(String::from_utf8_lossy(&body).contains("proxy_write_disabled"));
+
+        // A read-only proxy still serves retrieval; it fails on the unreachable
+        // shard rather than on admission.
+        let (_, body) = post(
+            &readonly,
+            "/context/retrieve",
+            serde_json::to_vec(&json!({
+                "scope": {"account_id": "acct", "tenant_id": "t", "session_id": "s1"},
+                "query": "q",
+            }))
+            .unwrap(),
+        );
+        let body = String::from_utf8_lossy(&body).to_string();
+        assert!(!body.contains("proxy_write_disabled"), "{body}");
+        assert!(!body.contains("proxy_not_serving"), "{body}");
+    }
+
+    #[test]
+    fn the_metrics_report_lists_exactly_what_the_endpoint_emits() {
+        // The list in this report was written by hand and had fallen eight families behind
+        // the endpoint -- including every admission metric, so a dashboard built from the
+        // report showed no in-flight quota, no account enforcement and no read pinning. It is
+        // now read back off the rendered output, and this pins that it stays that way.
+        let proxy = scoped_proxy(ProxyOptions::default());
+        let emitted = proxy_metric_families_from(&proxy.prometheus_metrics());
+        let report = proxy.metrics_parity_report();
+
+        assert_eq!(
+            report.rust_prometheus_families, emitted,
+            "the report must list what the endpoint actually publishes"
+        );
+        assert!(
+            emitted.len() >= 17,
+            "expected the full family set, saw {}: {emitted:?}",
+            emitted.len()
+        );
+        for family in [
+            "temporalstore_proxy_inflight_requests",
+            "temporalstore_proxy_inflight_limit",
+            "temporalstore_proxy_account_enforcement",
+            "temporalstore_proxy_pin_primary_reads",
+        ] {
+            assert!(
+                report.rust_prometheus_families.iter().any(|f| f == family),
+                "{family} is published but was missing from the report"
+            );
+        }
+
+        // The other half: a mapping that names a family nothing emits is a dashboard wired to
+        // a metric that will never arrive. Derived lists cannot catch that -- mappings carry
+        // external panel names and stay hand-written -- so check them against reality here.
+        for mapping in &report.mappings {
+            assert!(
+                emitted.contains(&mapping.rust_prometheus_family),
+                "mapping for panel {:?} names {:?}, which the endpoint does not emit",
+                mapping.grafana_panel,
+                mapping.rust_prometheus_family
+            );
+        }
+    }
+
+    #[test]
+    fn the_ports_report_distinguishes_what_is_bound_from_what_is_advertised() {
+        // Behind NAT or a container port mapping these are deliberately different, and that
+        // is exactly when someone asks the proxy what it is listening on. The report used to
+        // derive both numbers from the advertised address and answer the advertised one.
+        let mapped = scoped_proxy(ProxyOptions {
+            proxy_addr: "10.1.2.3:9000".to_string(),
+            listen_addr: "0.0.0.0:17000".to_string(),
+            ..ProxyOptions::default()
+        });
+        let ports = mapped.ports_report();
+        assert_eq!(ports.listen_addr, "0.0.0.0:17000", "what the socket is bound to");
+        assert_eq!(ports.listen_port, 17_000);
+        assert_eq!(ports.announce_addr, "10.1.2.3:9000", "what other nodes are told to use");
+        assert_eq!(ports.announce_port, 9_000);
+
+        // The ordinary case: nothing is mapped, so both answers are the same and the report
+        // reads exactly as it did before.
+        let plain = scoped_proxy(ProxyOptions {
+            proxy_addr: "127.0.0.1:17123".to_string(),
+            ..ProxyOptions::default()
+        });
+        let ports = plain.ports_report();
+        assert_eq!(ports.listen_addr, "127.0.0.1:17123");
+        assert_eq!(ports.announce_addr, "127.0.0.1:17123");
+        assert_eq!(ports.listen_port, 17_123);
+        assert_eq!(ports.announce_port, 17_123);
+    }
+
+    #[test]
+    fn a_metaserver_that_keeps_saying_not_found_is_not_hammered() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // not_found means "I do not know this proxy", and registering again is the right
+        // answer -- but it was being retried on every heartbeat. A metaserver stuck on
+        // not_found then takes a registration AND a second heartbeat from every proxy, every
+        // interval, which is the heaviest load at the moment it is least able to serve it.
+        let registers = std::sync::Arc::new(AtomicUsize::new(0));
+        let heartbeats = std::sync::Arc::new(AtomicUsize::new(0));
+        let addr = test_addr(18_394);
+        let r = registers.clone();
+        let h = heartbeats.clone();
+        let addr_for_thread = addr.clone();
+        std::thread::spawn(move || {
+            serve_reserved(&addr_for_thread, move |request| {
+                match request.path.as_str() {
+                    "/proxies/heartbeat" => {
+                        h.fetch_add(1, Ordering::SeqCst);
+                        crate::http::json_response(
+                            200,
+                            &ProxyHeartbeatResponse {
+                                status: Status::error("not_found", "unknown proxy"),
+                                config_changed: false,
+                                namespace: String::new(),
+                                config_version: 0,
+                                serving_mode: "serving".to_string(),
+                                drop_percent: None,
+                            },
+                        )
+                    }
+                    "/proxies/register" => {
+                        r.fetch_add(1, Ordering::SeqCst);
+                        crate::http::json_response(
+                            200,
+                            &AckResponse {
+                                status: Status::error("still_unknown", "no"),
+                            },
+                        )
+                    }
+                    _ => crate::http::json_response(404, &Status::error("not_found", "no route")),
+                }
+            })
+            .unwrap();
+        });
+        wait_for_http(&addr);
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: addr.clone(),
+            ..ProxyOptions::default()
+        });
+        for _ in 0..6 {
+            let _ = proxy.heartbeat_to_meta();
+        }
+        assert_eq!(
+            registers.load(Ordering::SeqCst),
+            1,
+            "six heartbeats against a not_found metaserver should attempt registration once,              not once each"
+        );
+        assert_eq!(heartbeats.load(Ordering::SeqCst), 6, "heartbeats themselves continue");
+        assert_eq!(
+            proxy.info().stats.auto_register_throttled, 5,
+            "the attempts not made should be counted, not silently dropped"
+        );
+
+        // Zero restores the older behaviour exactly, so the escape hatch cannot rot.
+        registers.store(0, Ordering::SeqCst);
+        let eager = ProxyService::new(ProxyOptions {
+            meta_addr: addr,
+            auto_register_min_interval_ms: 0,
+            ..ProxyOptions::default()
+        });
+        for _ in 0..4 {
+            let _ = eager.heartbeat_to_meta();
+        }
+        assert_eq!(
+            registers.load(Ordering::SeqCst),
+            4,
+            "with the interval at zero every heartbeat should try to register"
+        );
+    }
+
+    #[test]
+    fn every_proxy_counter_is_exposed_on_the_metrics_endpoint() {
+        // A counter nobody can read is a counter nobody acts on. topology_checks_skipped was
+        // added and never exposed, so the round-trips it was counting stayed invisible.
+        //
+        // The destructuring below has NO `..` rest pattern on purpose: adding a field to
+        // ProxyStats stops this test compiling until whoever added it says where it surfaces.
+        // That is the only guard that survives someone forgetting -- a hand-kept list of
+        // metric names would drift exactly the way this one already did.
+        let ProxyStats {
+            execute_requests,
+            batch_execute_requests,
+            bad_requests,
+            context_ingest_requests,
+            context_extract_requests,
+            context_retrieve_requests,
+            admission_rejections,
+            account_rejections,
+            inflight_rejections,
+            serving_rejections,
+            drop_rejections,
+            heartbeat_total,
+            heartbeat_slow_total,
+            auto_register_total,
+            auto_register_throttled,
+            writes_of_unknown_outcome,
+            route_cache_hits,
+            route_cache_misses,
+            route_refreshes,
+            topology_checks_skipped,
+            topology_check_failures,
+            backend_errors,
+            continuous_backend_failures,
+            metaserver_errors,
+        } = ProxyStats::default();
+
+        // Field -> the label it is published under. Values are only here so the destructured
+        // bindings are used; what is asserted is that each label reaches the endpoint.
+        let published: [(&str, u64); 24] = [
+            ("kind=\"execute\"", execute_requests),
+            ("kind=\"batch_execute\"", batch_execute_requests),
+            ("kind=\"bad_request\"", bad_requests),
+            ("kind=\"context_ingest\"", context_ingest_requests),
+            ("kind=\"context_extract\"", context_extract_requests),
+            ("kind=\"context_retrieve\"", context_retrieve_requests),
+            ("kind=\"admission_rejection\"", admission_rejections),
+            ("kind=\"account_rejection\"", account_rejections),
+            ("kind=\"inflight_rejection\"", inflight_rejections),
+            ("kind=\"serving_rejection\"", serving_rejections),
+            ("kind=\"drop_rejection\"", drop_rejections),
+            ("kind=\"heartbeat\"", heartbeat_total),
+            ("kind=\"heartbeat_slow\"", heartbeat_slow_total),
+            ("kind=\"auto_register\"", auto_register_total),
+            ("kind=\"auto_register_throttled\"", auto_register_throttled),
+            ("kind=\"write_of_unknown_outcome\"", writes_of_unknown_outcome),
+            ("kind=\"hit\"", route_cache_hits),
+            ("kind=\"miss\"", route_cache_misses),
+            ("kind=\"refresh\"", route_refreshes),
+            ("kind=\"topology_check_skipped\"", topology_checks_skipped),
+            ("kind=\"topology_check_failed\"", topology_check_failures),
+            ("kind=\"backend_error\"", backend_errors),
+            ("kind=\"continuous_backend_failure\"", continuous_backend_failures),
+            ("kind=\"metaserver_error\"", metaserver_errors),
+        ];
+
+        let proxy = scoped_proxy(ProxyOptions::default());
+        let metrics = proxy.prometheus_metrics();
+        let missing: Vec<&str> = published
+            .iter()
+            .map(|(label, _)| *label)
+            .filter(|label| !metrics.contains(label))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these counters never reach /metrics: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn a_partial_config_push_keeps_every_field_it_does_not_mention() {
+        let proxy = scoped_proxy(ProxyOptions {
+            serving_mode: ProxyServingMode::NotServing,
+            location: "zone-a".to_string(),
+            heartbeat_timeout_ms: 9_000,
+            max_inflight_requests: 7,
+            ingestion_account: "tenant-a".to_string(),
+            enforce_ingestion_account: true,
+            ..ProxyOptions::default()
+        });
+
+        // A push that mentions one field. Everything else must survive it. The dangerous one
+        // is serving_mode: this proxy has been DRAINED, and taking the default would put it
+        // back into service without saying so.
+        // meta_addr is supplied here on purpose: without it the body would simply fail to
+        // parse, and this test is about the fields that parse FINE and quietly reset.
+        let (code, _) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/proxy/config".to_string(),
+            body: br#"{"meta_addr": "127.0.0.1:1", "drop_percent": 5}"#.to_vec(),
+        });
+        assert_eq!(code, 200);
+
+        let after = proxy.config_snapshot();
+        assert_eq!(after.drop_percent, 5, "the field that WAS supplied must apply");
+        assert_eq!(
+            after.serving_mode,
+            ProxyServingMode::NotServing,
+            "a drained proxy must not silently start serving again"
+        );
+        assert_eq!(after.location, "zone-a", "locality decides which replica reads go to");
+        assert_eq!(after.heartbeat_timeout_ms, 9_000);
+        assert_eq!(after.max_inflight_requests, 7);
+        assert_eq!(after.ingestion_account, "tenant-a");
+        assert!(after.enforce_ingestion_account);
+        assert_eq!(after.meta_addr, "127.0.0.1:1");
+
+
+        // Supplying a field still overrides it -- carrying forward must not become ignoring.
+        let (code, _) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/proxy/config".to_string(),
+            body: br#"{"serving_mode": "serving", "location": "zone-b"}"#.to_vec(),
+        });
+        assert_eq!(code, 200);
+        let after = proxy.config_snapshot();
+        assert_eq!(after.serving_mode, ProxyServingMode::Serving);
+        assert_eq!(after.location, "zone-b");
+        assert_eq!(after.drop_percent, 5, "the earlier push is still in effect");
+
+        // Malformed bodies still fail rather than merging into nonsense.
+        let (code, _) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/proxy/config".to_string(),
+            body: b"not json".to_vec(),
+        });
+        assert_eq!(code, 400);
+
+        // And a field with no default of its own now survives being left out, so a partial
+        // push no longer has to restate the whole document just to be accepted.
+        let (code, _) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/proxy/config".to_string(),
+            body: br#"{"drop_percent": 6}"#.to_vec(),
+        });
+        assert_eq!(code, 200, "omitting a required field must carry it forward, not 400");
+        let after = proxy.config_snapshot();
+        assert_eq!(after.meta_addr, "127.0.0.1:1");
+        assert_eq!(after.drop_percent, 6);
+        assert_eq!(after.location, "zone-b", "and the rest still carries");
+    }
+
+    #[test]
+    fn shard_lookup_and_topology_refresh_are_bounded_by_the_inflight_quota() {
+        // Both reach the metaserver, and neither took a slot. max_inflight_requests capped
+        // execute and the context routes while an unbounded number of these went straight
+        // through -- so a client stampede was amplified onto the metaserver by the component
+        // whose job is to shield it.
+        let proxy = scoped_proxy(ProxyOptions {
+            max_inflight_requests: 1,
+            ..ProxyOptions::default()
+        });
+        let held = proxy
+            .admit_context(&context_scope("acct", "t"), false)
+            .expect("first request is admitted");
+        assert_eq!(proxy.inflight_snapshot(), (1, 0));
+
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "GET".to_string(),
+            path: "/shards/1".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 429, "a shard lookup must take the quota");
+        assert!(String::from_utf8_lossy(&body).contains("proxy_inflight_quota_exceeded"));
+
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/proxy/topology/refresh".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 429, "a topology refresh must take the quota");
+        assert!(String::from_utf8_lossy(&body).contains("proxy_inflight_quota_exceeded"));
+
+        drop(held);
+        assert_eq!(proxy.inflight_snapshot(), (0, 0));
+
+        // Releasing matters more than acquiring: a slot leaked on the way out would wedge the
+        // proxy shut, which is worse than the unbounded route this replaces. The metaserver
+        // here is unreachable, so these take the error path -- exactly where a leak would hide.
+        for _ in 0..3 {
+            let _ = proxy.handle(HttpRequest {
+                method: "GET".to_string(),
+                path: "/shards/1".to_string(),
+                body: Vec::new(),
+            });
+            let _ = proxy.handle(HttpRequest {
+                method: "POST".to_string(),
+                path: "/proxy/topology/refresh".to_string(),
+                body: Vec::new(),
+            });
+        }
+        assert_eq!(
+            proxy.inflight_snapshot(),
+            (0, 0),
+            "every slot must come back, including on the failure path"
+        );
+    }
+
+    #[test]
+    fn draining_stops_shard_lookups_but_still_allows_a_topology_refresh() {
+        // Drain means stop answering clients, and a shard lookup is a client asking where to
+        // go. A topology refresh is not client traffic -- it is how an operator makes the
+        // proxy notice a change, and a drained proxy is exactly when that is wanted, so it
+        // stays available on purpose.
+        let drained = scoped_proxy(ProxyOptions {
+            serving_mode: ProxyServingMode::NotServing,
+            ..ProxyOptions::default()
+        });
+
+        let (code, body) = drained.handle(HttpRequest {
+            method: "GET".to_string(),
+            path: "/shards/1".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 503);
+        assert!(String::from_utf8_lossy(&body).contains("proxy_not_serving"));
+
+        let (code, body) = drained.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/proxy/topology/refresh".to_string(),
+            body: Vec::new(),
+        });
+        assert_ne!(code, 503, "an operator must still be able to refresh a drained proxy");
+        assert!(
+            !String::from_utf8_lossy(&body).contains("proxy_not_serving"),
+            "topology refresh must not be gated on serving mode"
+        );
+    }
+
+    #[test]
+    fn context_routes_share_the_inflight_quota() {
+        let proxy = scoped_proxy(ProxyOptions {
+            max_inflight_requests: 1,
+            ..ProxyOptions::default()
+        });
+        let held = proxy
+            .admit_context(&context_scope("acct", "t"), true)
+            .expect("first context request is admitted");
+        assert_eq!(proxy.inflight_snapshot(), (1, 1));
+
+        let (code, body) = post(&proxy, "/context/ingest", context_ingest_body("acct", "t"));
+        assert_eq!(code, 429);
+        assert!(String::from_utf8_lossy(&body).contains("proxy_inflight_quota_exceeded"));
+
+        drop(held);
+        assert_eq!(proxy.inflight_snapshot(), (0, 0));
+        assert_eq!(proxy.policy_report().inflight_rejections, 1);
+    }
+
+    #[test]
+    fn config_push_without_admission_fields_keeps_account_enforcement() {
+        let proxy = scoped_proxy(ProxyOptions {
+            ingestion_account: "tenant-a".to_string(),
+            enforce_ingestion_account: true,
+            max_inflight_requests: 4,
+            pin_primary_reads: false,
+            ..ProxyOptions::default()
+        });
+
+        // A config push shaped before these options existed.
+        let (code, _) = post(
+            &proxy,
+            "/proxy/config",
+            serde_json::to_vec(&json!({
+                "meta_addr": "127.0.0.1:1",
+                "proxy_addr": "127.0.0.1:17000",
+                "route_cache_ttl_ms": 1000,
+                "connect_timeout_ms": 200,
+                "io_timeout_ms": 200,
+                "max_retries": 0,
+                "refresh_route_on_backend_error": true,
+                "backend_continuous_failed_time_ms": 10000,
+                "drop_percent": 5,
+            }))
+            .unwrap(),
+        );
+        assert_eq!(code, 200);
+
+        let policy = proxy.policy_report();
+        assert!(policy.enforce_ingestion_account, "enforcement must survive");
+        assert_eq!(policy.ingestion_account, "tenant-a");
+        assert_eq!(policy.max_inflight_requests, 4);
+        assert!(!policy.pin_primary_reads);
+        assert_eq!(policy.drop_percent, 5, "supplied fields still apply");
+
+        // An explicit key does change it.
+        let (code, _) = post(
+            &proxy,
+            "/proxy/config",
+            serde_json::to_vec(&json!({
+                "meta_addr": "127.0.0.1:1",
+                "route_cache_ttl_ms": 1000,
+                "connect_timeout_ms": 200,
+                "io_timeout_ms": 200,
+                "max_retries": 0,
+                "refresh_route_on_backend_error": true,
+                "backend_continuous_failed_time_ms": 10000,
+                "enforce_ingestion_account": false,
+            }))
+            .unwrap(),
+        );
+        assert_eq!(code, 200);
+        assert!(!proxy.policy_report().enforce_ingestion_account);
+    }
+
+    #[test]
+    fn proxy_control_plane_timeout_is_not_the_command_timeout() {
+        // A metaserver that pauses briefly must not cost a healthy proxy its liveness.
+        // The command path is sized for a data hop (200ms); heartbeats get their own budget.
+        let options = ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            ..ProxyOptions::default()
+        };
+        assert_eq!(options.io_timeout_ms, 200);
+        assert_eq!(options.heartbeat_timeout_ms, 5_000);
+        assert_eq!(options.http_options().io_timeout_ms, 200);
+        assert_eq!(options.control_http_options().io_timeout_ms, 5_000);
+
+        // A deployment that widens the command timeout past the heartbeat budget keeps the
+        // wider one -- the control plane is never given LESS room than the data path.
+        let slow_backend = ProxyOptions {
+            io_timeout_ms: 9_000,
+            ..options.clone()
+        };
+        assert_eq!(slow_backend.control_http_options().io_timeout_ms, 9_000);
+
+        // It is part of the config hash, so a rollout can confirm the change landed.
+        assert_ne!(
+            proxy_config_version(&options),
+            proxy_config_version(&ProxyOptions {
+                heartbeat_timeout_ms: 30_000,
+                ..options
+            })
+        );
+    }
+
+    #[test]
+    fn proxy_heartbeat_reports_boot_time_so_a_restart_is_visible() {
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            proxy_addr: "127.0.0.1:17000".to_string(),
+            ..ProxyOptions::default()
+        });
+        let info = proxy.info();
+        assert!(info.boot_time_ms > 0, "proxy knows when it started");
+
+        // A restarted process reports a different boot time on the same address, which is the
+        // only signal the metaserver gets: the address never changes and the heartbeats never
+        // stop, so without this an in-place reboot is invisible.
+        let restarted = ProxyService::new(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            proxy_addr: "127.0.0.1:17000".to_string(),
+            ..ProxyOptions::default()
+        });
+        assert_eq!(restarted.info().meta_addr, info.meta_addr);
+        assert!(restarted.info().boot_time_ms >= info.boot_time_ms);
+    }
+
+    #[test]
+    fn proxy_forgets_config_when_the_metaserver_rejects_it_but_not_when_it_is_unreachable() {
+        // Explicit rejection: the metaserver answered and said no. The proxy must stop acting
+        // on a grant that has been withdrawn.
+        let rejected = ProxyService::new(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            namespace: "granted-ns".to_string(),
+            config_version: 7,
+            ..ProxyOptions::default()
+        });
+        rejected.clear_config_authority();
+        let after = rejected.config_snapshot();
+        assert!(after.namespace.is_empty());
+        assert_eq!(after.config_version, 0);
+
+        // Clearing twice is a no-op, so a proxy that is being rejected every few milliseconds
+        // does not churn its config version on every beat.
+        let before_version = proxy_config_version(&rejected.config_snapshot());
+        rejected.clear_config_authority();
+        assert_eq!(
+            proxy_config_version(&rejected.config_snapshot()),
+            before_version
+        );
+
+        // Transport failure: an unreachable metaserver must NOT cost the proxy its config.
+        // heartbeat_to_meta against a dead address takes the Err branch.
+        let unreachable = ProxyService::new(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            namespace: "granted-ns".to_string(),
+            config_version: 7,
+            ..ProxyOptions::default()
+        });
+        let response = unreachable.heartbeat_to_meta();
+        assert!(!response.status.ok);
+        let kept = unreachable.config_snapshot();
+        assert_eq!(kept.namespace, "granted-ns");
+        assert_eq!(kept.config_version, 7);
+    }
+    #[test]
+    fn open_table_is_bounded_by_the_inflight_quota() {
+        let proxy = scoped_proxy(ProxyOptions {
+            max_inflight_requests: 1,
+            ..ProxyOptions::default()
+        });
+
+        // Opening a table is a metaserver round-trip, so it must consume a slot. Holding the
+        // only one means the next open is refused rather than making an unbounded number of
+        // concurrent metaserver calls.
+        let held = proxy
+            .admit(None, std::slice::from_ref(&read_command()))
+            .expect("first request is admitted");
+        assert_eq!(proxy.inflight_snapshot(), (1, 0));
+
+        let refused = proxy.open_table(ProxyOpenTableRequest {
+            namespace: "ns".to_string(),
+            table_name: "t".to_string(),
+            pin_primary: None,
+            replica_read_policy: None,
+        });
+        assert_eq!(refused.status.code, "proxy_inflight_quota_exceeded");
+        assert!(refused.options.is_none());
+        assert_eq!(proxy.policy_report().inflight_rejections, 1);
+
+        // The slot is released with the guard, and open_table releases its own slot too --
+        // otherwise a single open would permanently consume capacity.
+        drop(held);
+        assert_eq!(proxy.inflight_snapshot(), (0, 0));
+        let attempted = proxy.open_table(ProxyOpenTableRequest {
+            namespace: "ns".to_string(),
+            table_name: "t".to_string(),
+            pin_primary: None,
+            replica_read_policy: None,
+        });
+        assert_ne!(attempted.status.code, "proxy_inflight_quota_exceeded");
+        assert_eq!(
+            proxy.inflight_snapshot(),
+            (0, 0),
+            "open_table must not leak its slot"
+        );
+    }
+
+    #[test]
+    fn open_table_is_refused_while_the_proxy_is_drained() {
+        let drained = scoped_proxy(ProxyOptions {
+            serving_mode: ProxyServingMode::NotServing,
+            ..ProxyOptions::default()
+        });
+        let response = drained.open_table(ProxyOpenTableRequest {
+            namespace: "ns".to_string(),
+            table_name: "t".to_string(),
+            pin_primary: None,
+            replica_read_policy: None,
+        });
+        assert_eq!(response.status.code, "proxy_not_serving");
+
+        // A read-only proxy still opens tables: reads are still served, and open_table does
+        // not write anything.
+        let readonly = scoped_proxy(ProxyOptions {
+            serving_mode: ProxyServingMode::Readonly,
+            ..ProxyOptions::default()
+        });
+        let response = readonly.open_table(ProxyOpenTableRequest {
+            namespace: "ns".to_string(),
+            table_name: "t".to_string(),
+            pin_primary: None,
+            replica_read_policy: None,
+        });
+        assert_ne!(response.status.code, "proxy_not_serving");
+        assert_ne!(response.status.code, "proxy_write_disabled");
+    }
+    #[test]
+    fn context_routes_are_counted_so_gateway_traffic_is_visible() {
+        let proxy = scoped_proxy(ProxyOptions::default());
+
+        // These three routes are the only ones the context gateway calls. Without their own
+        // counters a proxy saturated by gateway traffic reports execute/batch_execute at zero
+        // and reads as idle.
+        let _ = post(&proxy, "/context/ingest", context_ingest_body("acct", "t"));
+        let _ = post(&proxy, "/context/ingest", context_ingest_body("acct", "t"));
+        let _ = post(&proxy, "/context/extract", context_ingest_body("acct", "t"));
+        let _ = post(
+            &proxy,
+            "/context/retrieve",
+            serde_json::to_vec(&json!({
+                "scope": {"account_id": "acct", "tenant_id": "t", "session_id": "s1"},
+                "query": "q",
+            }))
+            .unwrap(),
+        );
+
+        let stats = proxy.preflight_report().stats;
+        assert_eq!(stats.context_ingest_requests, 2);
+        assert_eq!(stats.context_extract_requests, 1);
+        assert_eq!(stats.context_retrieve_requests, 1);
+        // Counted separately from command traffic, not folded into it.
+        assert_eq!(stats.execute_requests, 0);
+
+        let metrics = proxy.prometheus_metrics();
+        assert!(metrics.contains("temporalstore_proxy_requests_total{kind=\"context_ingest\"} 2"));
+        assert!(metrics.contains("temporalstore_proxy_requests_total{kind=\"context_extract\"} 1"));
+        assert!(metrics.contains("temporalstore_proxy_requests_total{kind=\"context_retrieve\"} 1"));
+    }
+
+    #[test]
+    fn context_requests_are_counted_even_when_refused() {
+        // Offered load is what an operator needs to see. A proxy rejecting everything is
+        // still being asked for work, and a counter that only advanced on success would make
+        // a fully-drained proxy look idle rather than overloaded.
+        let drained = scoped_proxy(ProxyOptions {
+            serving_mode: ProxyServingMode::NotServing,
+            ..ProxyOptions::default()
+        });
+        let (code, _) = post(&drained, "/context/ingest", context_ingest_body("acct", "t"));
+        assert_eq!(code, 503);
+        assert_eq!(drained.preflight_report().stats.context_ingest_requests, 1);
+    }
+    #[test]
+    fn refresh_route_on_backend_error_flag_reaches_the_client() {
+        // The proxy accepted this option, defaulted it, read it from the environment and
+        // folded it into the config hash -- while never passing it to the client, which
+        // refreshed unconditionally. Setting it to false changed nothing and reported
+        // nothing. Pin that it is actually carried now.
+        let on = ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            ..ProxyOptions::default()
+        };
+        assert!(on.refresh_route_on_backend_error, "default stays on");
+
+        let off = ProxyOptions {
+            refresh_route_on_backend_error: false,
+            ..on.clone()
+        };
+        // It already moved the config hash, which is how a rollout notices the change; the
+        // point of this test is the half that was missing.
+        assert_ne!(proxy_config_version(&on), proxy_config_version(&off));
+
+        let proxy_on = ProxyService::new(on);
+        let proxy_off = ProxyService::new(off);
+        assert!(proxy_on.client_options_snapshot().refresh_route_on_backend_error);
+        assert!(!proxy_off.client_options_snapshot().refresh_route_on_backend_error);
+    }
+
+    #[test]
+    fn every_option_a_config_push_can_change_is_noticed() {
+        // Whether a pushed config is applied is decided by comparing its version to the
+        // running one. That version was hashed from a hand-listed subset of the options,
+        // and the list had fallen behind: `context_shard_count`, `context_first_shard_id`,
+        // `context_io_timeout_ms`, `service_registry_ttl_ms` and `listen_addr` were all
+        // missing, so a push that changed only one of them produced the same version and
+        // was answered "unchanged" -- telling the operator, in the report, that their
+        // change was a no-op.
+        //
+        // Rather than list the fields again here -- which is the mistake being fixed --
+        // this walks the serialized options and changes each one in turn, so a field
+        // added later is covered without anyone editing this test.
+        //
+        // The proxy is built from exactly this baseline. An earlier version of this test
+        // built it with a helper that overrode meta_addr, so every push differed in a
+        // field that IS hashed, every assertion passed, and the test proved nothing. The
+        // guard below is what catches that: if pushing the baseline back is treated as a
+        // change, the comparison is not being exercised at all.
+        let baseline = ProxyOptions {
+            config_version: 0,
+            meta_addr: "127.0.0.1:1".to_string(),
+            ..ProxyOptions::default()
+        };
+        let unchanged =
+            ProxyService::new(baseline.clone()).update_options_report(baseline.clone());
+        assert!(
+            !unchanged.applied,
+            "pushing an identical config must be a no-op, or the assertions below pass \
+             without testing anything (reason: {})",
+            unchanged.reason
+        );
+
+        let serde_json::Value::Object(fields) = serde_json::to_value(&baseline).unwrap() else {
+            panic!("options serialize as an object");
+        };
+
+        let mut checked = 0;
+        for (name, value) in fields {
+            // config_version IS the version, so changing it is not a content change.
+            if name == "config_version" {
+                continue;
+            }
+            let candidates: Vec<serde_json::Value> = match &value {
+                serde_json::Value::Bool(flag) => vec![serde_json::Value::Bool(!flag)],
+                serde_json::Value::Number(number) => {
+                    vec![serde_json::Value::from(number.as_u64().unwrap_or(0) + 1)]
+                }
+                serde_json::Value::String(text) => vec![
+                    serde_json::Value::from(format!("{text}-changed")),
+                    // enum-valued fields reject arbitrary text; offer real alternatives
+                    serde_json::Value::from("not_serving"),
+                    serde_json::Value::from("draining"),
+                ],
+                other => panic!("teach this test how to change {name} (it is {other})"),
+            };
+
+            let changed = candidates
+                .into_iter()
+                .filter_map(|candidate| {
+                    let serde_json::Value::Object(mut document) =
+                        serde_json::to_value(&baseline).unwrap()
+                    else {
+                        return None;
+                    };
+                    document.insert(name.clone(), candidate);
+                    serde_json::from_value::<ProxyOptions>(serde_json::Value::Object(document)).ok()
+                })
+                .find(|candidate| candidate != &baseline)
+                .unwrap_or_else(|| {
+                    panic!("could not produce a changed value for {name}; teach this test about it")
+                });
+
+            let proxy = ProxyService::new(baseline.clone());
+            let report = proxy.update_options_report(changed);
+            assert!(
+                report.applied,
+                "a config push changing {name} must be applied, not answered \"{}\"",
+                report.reason
+            );
+            checked += 1;
+        }
+        assert!(
+            checked >= 20,
+            "expected to exercise every option; only walked {checked}"
+        );
+    }
+    #[test]
+    fn proxy_location_reaches_replica_selection() {
+        // The proxy has always accepted a location, reported it to the metaserver and shown
+        // it in its own status -- but never handed it to the client, whose `local_location`
+        // is the fallback used when a table does not name a preferred_location, and which is
+        // what actually picks a replica. So a proxy told it lives in zone-a read cross-zone.
+        let located = ProxyService::new(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            location: "zone-a".to_string(),
+            ..ProxyOptions::default()
+        });
+        assert_eq!(located.client_options_snapshot().local_location, "zone-a");
+
+        // An unset location stays unset rather than inventing a preference.
+        let unlocated = ProxyService::new(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            ..ProxyOptions::default()
+        });
+        assert!(unlocated.client_options_snapshot().local_location.is_empty());
+
+        // A config push that changes the location has to reach the client too, otherwise the
+        // proxy would report one location and route by another.
+        let _ = located.update_options_report(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            location: "zone-b".to_string(),
+            config_version: 99,
+            ..ProxyOptions::default()
+        });
+        assert_eq!(located.client_options_snapshot().local_location, "zone-b");
+    }
+    #[test]
+    fn context_shards_follow_the_cluster_unless_told_otherwise() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // The count used to default to 1, so a proxy in front of a multi-shard cluster put
+        // every tenant's context on one shard -- silently, with six or seven shards idle and
+        // no error to notice. It now follows the cluster unless a value is configured.
+        let stats_calls = std::sync::Arc::new(AtomicUsize::new(0));
+        let addr = test_addr(18_404);
+        let calls = stats_calls.clone();
+        let addr_for_thread = addr.clone();
+        std::thread::spawn(move || {
+            serve_reserved(&addr_for_thread, move |request| match request.path.as_str() {
+                "/shards" => {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    crate::http::json_response(
+                        200,
+                        &crate::meta::ListShardsResponse {
+                            status: Status::ok(),
+                            shards: (1..=8)
+                                .map(|shard_id| crate::meta::ShardListEntry {
+                                    shard_id,
+                                    server_addr: "127.0.0.1:1".to_string(),
+                                    namespace: "ns".to_string(),
+                                    table_name: "tbl".to_string(),
+                                    latest_snapshot: None,
+                                    state: crate::meta::MetaEntityState::Normal,
+                                    // This stub does not model a datanode
+                                    // reporting what it holds.
+                                    owner_reports_loaded: None,
+                                    // Nor a pin, nor when the shard joined.
+                                    preferred_location: String::new(),
+                                    registered_at_ms: 0,
+                                })
+                                .collect(),
+                            next_after_shard_id: None,
+                        },
+                    )
+                }
+                "/proxies/heartbeat" => crate::http::json_response(
+                    200,
+                    &ProxyHeartbeatResponse {
+                        status: Status::ok(),
+                        config_changed: false,
+                        namespace: String::new(),
+                        config_version: 0,
+                        serving_mode: "serving".to_string(),
+                        drop_percent: None,
+                    },
+                ),
+                _ => crate::http::json_response(404, &Status::error("not_found", "no route")),
+            })
+            .unwrap();
+        });
+        wait_for_http(&addr);
+
+        // Before the first heartbeat the cluster count is unknown, so it behaves as it always
+        // did rather than guessing. Degrading to the old answer beats degrading to none.
+        let following = ProxyService::new(ProxyOptions {
+            meta_addr: addr.clone(),
+            ..ProxyOptions::default()
+        });
+        assert_eq!(following.effective_context_shard_count(), 1);
+        assert_eq!(
+            following.context_shard_count_source(),
+            "fallback_until_cluster_known"
+        );
+
+        // One heartbeat is enough to learn it.
+        let _ = following.heartbeat_to_meta();
+        assert_eq!(
+            following.effective_context_shard_count(),
+            8,
+            "a proxy in front of an eight-shard cluster should spread context over eight"
+        );
+        assert_eq!(following.context_shard_count_source(), "cluster");
+        assert_eq!(
+            following.policy_report().context_shard_count,
+            8,
+            "the effective value has to be visible, since it used to be a silent 1"
+        );
+
+        // Tenants actually land on more than one shard now.
+        let mut landed = std::collections::BTreeSet::new();
+        for i in 0..64 {
+            let scope = context::ProxyContextScope {
+                tenant_id: format!("tenant-{i}"),
+                account_id: "acct".to_string(),
+                ..Default::default()
+            };
+            landed.insert(following.context_shard_id(context::context_tenant_hash(&scope)));
+        }
+        assert!(
+            landed.len() > 1,
+            "64 tenants over 8 shards should not all land on one, saw {landed:?}"
+        );
+
+        // A cluster whose shard ids are NOT a contiguous run from the first id cannot be
+        // addressed by "first + hash % count" -- the arithmetic would name ids that do not
+        // exist. Adopting the count there would be worse than the single-shard default it
+        // replaces, so it is refused and the reason is reported.
+        let gapped = test_addr(18_406);
+        let gapped_for_thread = gapped.clone();
+        std::thread::spawn(move || {
+            serve_reserved(&gapped_for_thread, move |request| match request.path.as_str() {
+                "/shards" => crate::http::json_response(
+                    200,
+                    &crate::meta::ListShardsResponse {
+                        status: Status::ok(),
+                        // 1-4 and 100-103: eight shards, not eight consecutive ids.
+                        shards: (1..=4)
+                            .chain(100..=103)
+                            .map(|shard_id| crate::meta::ShardListEntry {
+                                shard_id,
+                                server_addr: "127.0.0.1:1".to_string(),
+                                namespace: "ns".to_string(),
+                                table_name: "tbl".to_string(),
+                                latest_snapshot: None,
+                                state: crate::meta::MetaEntityState::Normal,
+                                // This stub does not model a datanode reporting
+                                // what it holds.
+                                owner_reports_loaded: None,
+                                // Nor a pin, nor when the shard joined.
+                                preferred_location: String::new(),
+                                registered_at_ms: 0,
+                            })
+                            .collect(),
+                        next_after_shard_id: None,
+                    },
+                ),
+                "/proxies/heartbeat" => crate::http::json_response(
+                    200,
+                    &ProxyHeartbeatResponse {
+                        status: Status::ok(),
+                        config_changed: false,
+                        namespace: String::new(),
+                        config_version: 0,
+                        serving_mode: "serving".to_string(),
+                        drop_percent: None,
+                    },
+                ),
+                _ => crate::http::json_response(404, &Status::error("not_found", "no route")),
+            })
+            .unwrap();
+        });
+        wait_for_http(&gapped);
+
+        let scattered = ProxyService::new(ProxyOptions {
+            meta_addr: gapped,
+            ..ProxyOptions::default()
+        });
+        let _ = scattered.heartbeat_to_meta();
+        assert_eq!(
+            scattered.effective_context_shard_count(),
+            1,
+            "a count that would address shards 5-8, which do not exist, must not be adopted"
+        );
+        assert_eq!(
+            scattered.context_shard_count_source(),
+            "fallback_cluster_shards_not_contiguous",
+            "and the reason has to be visible, not inferred from failures"
+        );
+
+        // A configured value still wins, and needs no cluster lookup at all.
+        let before = stats_calls.load(Ordering::SeqCst);
+        let configured = ProxyService::new(ProxyOptions {
+            meta_addr: addr.clone(),
+            context_shard_count: 4,
+            ..ProxyOptions::default()
+        });
+        let _ = configured.heartbeat_to_meta();
+        assert_eq!(configured.effective_context_shard_count(), 4);
+        assert_eq!(configured.context_shard_count_source(), "configured");
+        assert_eq!(
+            stats_calls.load(Ordering::SeqCst),
+            before,
+            "an explicitly configured count must not ask the cluster anything"
+        );
+    }
+
+    #[test]
+    fn a_drained_proxy_fails_its_readiness_probe() {
+        // The runbook points operators at GET /readiness for exactly this, and it used to
+        // answer with a build-wide capability report: the same bytes on every process, with a
+        // hardcoded 200. So a proxy that had been drained -- refusing every request with
+        // proxy_not_serving -- reported itself ready, and anything using the probe to decide
+        // where to send traffic kept sending it. The drain control was defeated by the probe
+        // meant to honour it.
+        let drained = scoped_proxy(ProxyOptions {
+            serving_mode: ProxyServingMode::NotServing,
+            ..ProxyOptions::default()
+        });
+        let (status, body) = drained.handle(HttpRequest {
+            method: "GET".to_string(),
+            path: "/readiness".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(
+            status, 503,
+            "a drained proxy must fail its probe, or draining it does not take it \
+             out of rotation"
+        );
+        let parsed = parse_json::<ProxyReadinessResponse>(&body).expect("readiness body parses");
+        assert!(!parsed.serving);
+        assert_eq!(parsed.serving_mode, ProxyServingMode::NotServing);
+
+        // Serving answers 200, and so does read-only: it still serves reads, and failing its
+        // probe would pull a proxy doing useful work out of rotation. The flags carry the
+        // distinction for anyone who needs it.
+        for (mode, expect_writes) in [
+            (ProxyServingMode::Serving, true),
+            (ProxyServingMode::Degraded, true),
+            (ProxyServingMode::Readonly, false),
+            (ProxyServingMode::WriteDisabled, false),
+        ] {
+            let proxy = scoped_proxy(ProxyOptions {
+                serving_mode: mode,
+                ..ProxyOptions::default()
+            });
+            let (status, body) = proxy.handle(HttpRequest {
+                method: "GET".to_string(),
+                path: "/readiness".to_string(),
+                body: Vec::new(),
+            });
+            assert_eq!(status, 200, "{mode:?} serves reads and must pass its probe");
+            let parsed =
+                parse_json::<ProxyReadinessResponse>(&body).expect("readiness body parses");
+            assert!(parsed.serving, "{mode:?} should report serving");
+            assert_eq!(
+                parsed.serving_writes, expect_writes,
+                "{mode:?} should report serving_writes as {expect_writes}"
+            );
+            // The capability report is still carried, so anything already reading those fields
+            // keeps working rather than being broken by this.
+            assert!(
+                !parsed.production.areas.is_empty(),
+                "the capability report must still be included"
+            );
+        }
+    }
+
+    #[test]
+    fn every_serving_mode_states_what_it_actually_refuses() {
+        // Five modes, three behaviours. The pairs that mean the same thing are not obvious from
+        // their names -- Degraded in particular reads like a restriction and is not one, it
+        // accepts exactly what Serving accepts. This pins the real matrix so the documentation
+        // beside the enum cannot drift away from it, and so that anyone narrowing one mode has
+        // to decide what happens to the mode it is currently a synonym for.
+        let cases = [
+            (ProxyServingMode::Serving, true, true),
+            (ProxyServingMode::Degraded, true, true),
+            (ProxyServingMode::Readonly, true, false),
+            (ProxyServingMode::WriteDisabled, true, false),
+            (ProxyServingMode::NotServing, false, false),
+        ];
+
+        for (mode, reads_allowed, writes_allowed) in cases {
+            let proxy = scoped_proxy(ProxyOptions {
+                serving_mode: mode,
+                ..ProxyOptions::default()
+            });
+
+            let read = proxy.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: "k".to_string(),
+                },
+            });
+            let read_refused = read.status.code == "proxy_not_serving"
+                || read.status.code == "proxy_write_disabled";
+            assert_eq!(
+                !read_refused, reads_allowed,
+                "{mode:?}: reads_allowed should be {reads_allowed}, got status {:?}",
+                read.status.code
+            );
+
+            let write = proxy.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "k".to_string(),
+                    value: b"v".to_vec(),
+                },
+            });
+            let write_refused = write.status.code == "proxy_not_serving"
+                || write.status.code == "proxy_write_disabled";
+            assert_eq!(
+                !write_refused, writes_allowed,
+                "{mode:?}: writes_allowed should be {writes_allowed}, got status {:?}",
+                write.status.code
+            );
+
+            // The report has to agree with what admission actually did, or an operator reading
+            // the status surface is told one thing while traffic experiences another.
+            let policy = proxy.policy_report();
+            assert_eq!(
+                policy.serving_writes, writes_allowed,
+                "{mode:?}: the policy report disagrees with admission about writes"
+            );
+            assert_eq!(
+                policy.serving_reads, reads_allowed,
+                "{mode:?}: the policy report disagrees with admission about reads"
+            );
+        }
+    }
+
+    #[test]
+    fn drop_percent_refuses_the_same_keys_every_time_including_writes() {
+        // drop_percent reads like a load-shedding knob and is not one. The decision comes from
+        // a hash of the routing key, so at 50 it is not "half the requests" -- it is "half the
+        // keys, always", writes included. A caller that treats the refusal as transient and
+        // retries is refused identically forever, which is why the message now says so.
+        let proxy = scoped_proxy(ProxyOptions {
+            drop_percent: 50,
+            ..ProxyOptions::default()
+        });
+
+        // Find one refused key and one accepted key, then show each is stable.
+        let mut refused = None;
+        let mut accepted = None;
+        for i in 0..200 {
+            let key = format!("key-{i}");
+            let dropped = proxy
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet { key: key.clone() },
+                })
+                .status
+                .code
+                == "proxy_traffic_dropped";
+            if dropped && refused.is_none() {
+                refused = Some(key);
+            } else if !dropped && accepted.is_none() {
+                accepted = Some(key);
+            }
+            if refused.is_some() && accepted.is_some() {
+                break;
+            }
+        }
+        let refused = refused.expect("at 50 percent some key is refused");
+        let accepted = accepted.expect("at 50 percent some key is not refused");
+
+        for attempt in 0..5 {
+            let response = proxy.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: refused.clone(),
+                },
+            });
+            assert_eq!(
+                response.status.code, "proxy_traffic_dropped",
+                "attempt {attempt} on a refused key must be refused again -- the decision \
+                 is per key, not per request"
+            );
+            assert!(
+                response.status.message.contains("will not succeed"),
+                "the refusal must say retrying this key is pointless, got {:?}",
+                response.status.message
+            );
+        }
+
+        // Writes are refused on the same basis as reads. The refusal is explicit rather than a
+        // silent discard, but it is a refusal, and it is permanent for that key.
+        let write = proxy.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: refused.clone(),
+                value: b"v".to_vec(),
+            },
+        });
+        assert_eq!(
+            write.status.code, "proxy_traffic_dropped",
+            "drop_percent applies to writes, not only reads"
+        );
+
+        // And a key on the other side of the hash is never refused.
+        for _ in 0..5 {
+            assert_ne!(
+                proxy
+                    .execute(ExecuteRequest {
+                        shard_id: 1,
+                        command: Command::StringGet {
+                            key: accepted.clone()
+                        },
+                    })
+                    .status
+                    .code,
+                "proxy_traffic_dropped",
+                "an accepted key must stay accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_policy_blocks_writes_not_serving_and_drop_percent() {
+        let readonly = ProxyService::new(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            serving_mode: ProxyServingMode::Readonly,
+            ..ProxyOptions::default()
+        });
+        let write = readonly.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "k".to_string(),
+                value: b"v".to_vec(),
+            },
+        });
+        assert_eq!(write.status.code, "proxy_write_disabled");
+        assert_eq!(readonly.policy_report().admission_rejections, 1);
+        let preflight = readonly.preflight_report();
+        assert_eq!(preflight.policy.serving_mode, ProxyServingMode::Readonly);
+        assert!(!preflight.policy.serving_writes);
+        assert!(preflight
+            .degraded_reasons
+            .iter()
+            .any(|reason| reason == "admission_rejections"));
+        assert!(preflight
+            .degraded_reasons
+            .iter()
+            .any(|reason| reason == "serving_mode:Readonly"));
+
+        let not_serving = ProxyService::new(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            serving_mode: ProxyServingMode::NotServing,
+            ..ProxyOptions::default()
+        });
+        let read = not_serving.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: "k".to_string(),
+            },
+        });
+        assert_eq!(read.status.code, "proxy_not_serving");
+        assert!(not_serving.policy_report().rejecting_all);
+
+        let dropper = ProxyService::new(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            drop_percent: 100,
+            ..ProxyOptions::default()
+        });
+        let dropped = dropper.table_batch_execute(ProxyTableBatchExecuteRequest {
+            namespace: "ns".to_string(),
+            table_name: "tbl".to_string(),
+            commands: vec![Command::StringGet {
+                key: "drop-me".to_string(),
+            }],
+        });
+        assert_eq!(dropped.status.code, "proxy_traffic_dropped");
+
+        let (code, body) = dropper.handle(HttpRequest {
+            method: "GET".to_string(),
+            path: "/ProxyService/GetPolicy".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 200);
+        let policy = parse_json::<ProxyPolicyReport>(&body).unwrap();
+        assert_eq!(policy.drop_percent, 100);
+        assert_eq!(policy.admission_rejections, 1);
+    }
+
+    #[test]
+    fn proxy_admin_aliases_expose_info_config_and_client_preflight() {
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            proxy_addr: "127.0.0.1:17000".to_string(),
+            namespace: "ns".to_string(),
+            ..ProxyOptions::default()
+        });
+
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "GET".to_string(),
+            path: "/ProxyService/GetInfo".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 200);
+        let info = parse_json::<ProxyInfo>(&body).unwrap();
+        assert_eq!(info.meta_addr, "127.0.0.1:1");
+
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "GET".to_string(),
+            path: "/ProxyService/GetConfig".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 200);
+        let config = parse_json::<ProxyOptions>(&body).unwrap();
+        assert_eq!(config.namespace, "ns");
+
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "GET".to_string(),
+            path: "/ProxyService/ClientPreflight".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 200);
+        let client = parse_json::<crate::ClientPreflightReport>(&body).unwrap();
+        assert!(client.status.ok);
+        assert_eq!(client.proxy_addr, "127.0.0.1:17000");
+    }
+
+    // shared-corpus: control_proxy_operational_surface_aliases
+    #[test]
+    fn proxy_operational_surface_aliases_cover_admin_config_heartbeat_status() {
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: "127.0.0.1:1".to_string(),
+            proxy_addr: "127.0.0.1:17123".to_string(),
+            namespace: "ns".to_string(),
+            location: "iad".to_string(),
+            ..ProxyOptions::default()
+        });
+
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "GET".to_string(),
+            path: "/ProxyService/GetPorts".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 200);
+        let ports = parse_json::<ProxyPortsReport>(&body).unwrap();
+        assert_eq!(ports.listen_port, 17_123);
+        assert_eq!(ports.announce_port, 17_123);
+
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "GET".to_string(),
+            path: "/ProxyService/GetConsulNames".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 200);
+        let names = parse_json::<ProxyConsulNamesReport>(&body).unwrap();
+        assert!(!names.legacy_consul_in_scope);
+        assert_eq!(
+            names.rust_service_registry_names,
+            vec!["temporalstore-proxy/ns/iad".to_string()]
+        );
+
+        proxy.record_service_discovery_registration(&Status::ok());
+        assert!(proxy.service_discovery_report().registered);
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/ProxyService/NotifyStop".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 200);
+        let notify = parse_json::<ProxyNotifyStopReport>(&body).unwrap();
+        assert!(notify.status.ok);
+        assert!(!notify.metaserver_notify_supported);
+        assert!(notify.local_registry_marked_stopped);
+        assert!(!proxy.service_discovery_report().registered);
+
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "GET".to_string(),
+            path: "/ProxyService/GetOperationalSurface".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 200);
+        let report = parse_json::<ProxyOperationalSurfaceReport>(&body).unwrap();
+        assert!(report.status.ok);
+        assert!(!report.legacy_brpc_thrift_in_scope);
+        assert!(report.rust_native_aliases_ready);
+        for expected in [
+            "Proxy::GetAnnouncePort / Proxy::GetListenPort",
+            "Proxy::GetConfig",
+            "Proxy::UpdateConfig",
+            "HeartBeat::InitHeartbeatRequest / SendHeartbeat",
+            "HeartBeat::HandleHeartbeatResponse",
+            "HeartBeat::RegisterService / Proxy::GetConsulNames",
+            "HeartBeat::SendStopSignal",
+            "TemporalStoreThriftService command dispatch",
+            "TemporalStoreThriftService admission/inflight checks",
+            "proxy metrics/status",
+        ] {
+            assert!(
+                report
+                    .entries
+                    .iter()
+                    .any(|entry| entry.native_surface == expected && entry.covered),
+                "missing operational surface entry for {expected}: {report:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn proxy_service_aliases_delegate_to_client_execution_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        start_server(test_addr(18_321), engine.clone());
+        let meta = crate::meta::SingleNodeMeta::default();
+        assert!(
+            meta.add_table(AddTableRequest {
+                namespace: "ns".to_string(),
+                table_name: "tbl".to_string(),
+                first_shard_id: 1,
+                shard_count: 1,
+                replica_count: 1,
+                partition_version: 0,
+                serving_options: crate::meta::TableServingOptions::default(),
+            })
+            .status
+            .ok
+        );
+        assert!(
+            meta.register(RegisterShardRequest {
+                registered_at_ms: 0,
+                shard_id: 1,
+                server_addr: test_addr(18_321),
+            })
+            .status
+            .ok
+        );
+        start_meta_service(test_addr(18_322), meta);
+        wait_for_http(&test_addr(18_321));
+        wait_for_http(&test_addr(18_322));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_322),
+            route_cache_ttl_ms: 60_000,
+            ..ProxyOptions::default()
+        });
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/ProxyService/ExecuteCmd".to_string(),
+            body: serde_json::to_vec(&ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet {
+                    key: "native-proxy-alias".to_string(),
+                    value: b"via-proxy-service".to_vec(),
+                },
+            })
+            .unwrap(),
+        });
+        assert_eq!(code, 200);
+        let response = parse_json::<ExecuteResponse>(&body).unwrap();
+        assert!(response.status.ok);
+
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/ProxyService/BatchExecuteCmd".to_string(),
+            body: serde_json::to_vec(&BatchExecuteRequest {
+                shard_id: 1,
+                commands: vec![
+                    Command::StringGet {
+                        key: "native-proxy-alias".to_string(),
+                    },
+                    Command::HashSet {
+                        key: "native-proxy-hash".to_string(),
+                        field: "field".to_string(),
+                        value: b"value".to_vec(),
+                    },
+                    Command::HashGet {
+                        key: "native-proxy-hash".to_string(),
+                        field: "field".to_string(),
+                    },
+                ],
+            })
+            .unwrap(),
+        });
+        assert_eq!(code, 200);
+        let response = parse_json::<BatchExecuteResponse>(&body).unwrap();
+        assert!(response.status.ok);
+        assert!(response.responses.iter().all(|item| item.status.ok));
+        assert_eq!(
+            response
+                .responses
+                .into_iter()
+                .map(|item| item.response)
+                .collect::<Vec<_>>(),
+            vec![
+                CommandResponse::Bytes {
+                    value: Some(b"via-proxy-service".to_vec())
+                },
+                CommandResponse::Empty,
+                CommandResponse::Bytes {
+                    value: Some(b"value".to_vec())
+                },
+            ]
+        );
+
+        let command_alias = |path: &str, body: Vec<u8>| {
+            let (code, body) = proxy.handle(HttpRequest {
+                method: "POST".to_string(),
+                path: path.to_string(),
+                body,
+            });
+            assert_eq!(code, 200, "{path} should return HTTP 200");
+            parse_json::<ExecuteResponse>(&body).unwrap()
+        };
+        assert!(
+            command_alias(
+                "/ProxyService/Set",
+                serde_json::to_vec(&ProxySetCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-command".to_string(),
+                    value: b"command-value".to_vec(),
+                })
+                .unwrap(),
+            )
+            .status
+            .ok
+        );
+        assert_eq!(
+            command_alias(
+                "/ProxyService/Get",
+                serde_json::to_vec(&ProxyKeyCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-command".to_string(),
+                })
+                .unwrap(),
+            )
+            .response,
+            CommandResponse::Bytes {
+                value: Some(b"command-value".to_vec())
+            }
+        );
+        assert!(
+            command_alias(
+                "/ProxyService/HSet",
+                serde_json::to_vec(&ProxyHashSetCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-h".to_string(),
+                    field: "single".to_string(),
+                    value: b"single-value".to_vec(),
+                })
+                .unwrap(),
+            )
+            .status
+            .ok
+        );
+        assert_eq!(
+            command_alias(
+                "/ProxyService/HGet",
+                serde_json::to_vec(&ProxyHashCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-h".to_string(),
+                    field: "single".to_string(),
+                })
+                .unwrap(),
+            )
+            .response,
+            CommandResponse::Bytes {
+                value: Some(b"single-value".to_vec())
+            }
+        );
+        assert!(
+            command_alias(
+                "/ProxyService/HDel",
+                serde_json::to_vec(&ProxyHashCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-h".to_string(),
+                    field: "single".to_string(),
+                })
+                .unwrap(),
+            )
+            .status
+            .ok
+        );
+        assert_eq!(
+            command_alias(
+                "/ProxyService/HGet",
+                serde_json::to_vec(&ProxyHashCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-h".to_string(),
+                    field: "single".to_string(),
+                })
+                .unwrap(),
+            )
+            .response,
+            CommandResponse::Bytes { value: None }
+        );
+        assert!(
+            command_alias(
+                "/ProxyService/HMSet",
+                serde_json::to_vec(&ProxyHashMultiSetCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-hm".to_string(),
+                    entries: vec![
+                        ("a".to_string(), b"1".to_vec()),
+                        ("b".to_string(), b"2".to_vec()),
+                    ],
+                })
+                .unwrap(),
+            )
+            .status
+            .ok
+        );
+        assert_eq!(
+            command_alias(
+                "/ProxyService/HMGet",
+                serde_json::to_vec(&ProxyHashMultiGetCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-hm".to_string(),
+                    fields: vec!["a".to_string(), "missing".to_string()],
+                })
+                .unwrap(),
+            )
+            .response,
+            CommandResponse::Values {
+                values: vec![Some(b"1".to_vec()), None]
+            }
+        );
+        assert_eq!(
+            command_alias(
+                "/ProxyService/HGetAll",
+                serde_json::to_vec(&ProxyKeyCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-hm".to_string(),
+                })
+                .unwrap(),
+            )
+            .response,
+            CommandResponse::HashEntries {
+                entries: vec![
+                    ("a".to_string(), b"1".to_vec()),
+                    ("b".to_string(), b"2".to_vec()),
+                ]
+            }
+        );
+        assert_eq!(
+            command_alias(
+                "/ProxyService/HLen",
+                serde_json::to_vec(&ProxyKeyCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-hm".to_string(),
+                })
+                .unwrap(),
+            )
+            .response,
+            CommandResponse::Integer { value: 2 }
+        );
+        assert!(
+            command_alias(
+                "/ProxyService/SAdd",
+                serde_json::to_vec(&ProxySetMemberCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-set".to_string(),
+                    member: b"member-a".to_vec(),
+                })
+                .unwrap(),
+            )
+            .status
+            .ok
+        );
+        assert_eq!(
+            command_alias(
+                "/ProxyService/SMembers",
+                serde_json::to_vec(&ProxyKeyCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-set".to_string(),
+                })
+                .unwrap(),
+            )
+            .response,
+            CommandResponse::Members {
+                members: vec![b"member-a".to_vec()]
+            }
+        );
+        assert!(
+            command_alias(
+                "/ProxyService/Expire",
+                serde_json::to_vec(&ProxyExpireCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-command".to_string(),
+                    ttl_ms: 60_000,
+                })
+                .unwrap(),
+            )
+            .status
+            .ok
+        );
+        let ttl_response = command_alias(
+            "/ProxyService/Ttl",
+            serde_json::to_vec(&ProxyKeyCommandRequest {
+                namespace: "ns".to_string(),
+                table_name: "tbl".to_string(),
+                key: "native-proxy-command".to_string(),
+            })
+            .unwrap(),
+        )
+        .response;
+        match ttl_response {
+            CommandResponse::Integer { value } => {
+                assert!(value > 0);
+                assert!(value <= 60_000);
+            }
+            other => panic!("unexpected ttl response: {other:?}"),
+        }
+        assert!(
+            command_alias(
+                "/ProxyService/Delete",
+                serde_json::to_vec(&ProxyKeyCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-command".to_string(),
+                })
+                .unwrap(),
+            )
+            .status
+            .ok
+        );
+        assert_eq!(
+            command_alias(
+                "/ProxyService/Get",
+                serde_json::to_vec(&ProxyKeyCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-command".to_string(),
+                })
+                .unwrap(),
+            )
+            .response,
+            CommandResponse::Bytes { value: None }
+        );
+        assert!(
+            command_alias(
+                "/ProxyService/FeatureAdd",
+                serde_json::to_vec(&ProxyFeatureAddCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-feature".to_string(),
+                    policy: None,
+                    points: vec![crate::types::FeaturePoint {
+                        timestamp_ms: 10,
+                        value: b"7".to_vec(),
+                    }],
+                })
+                .unwrap(),
+            )
+            .status
+            .ok
+        );
+        assert!(
+            command_alias(
+                "/ProxyService/ControlStateHset",
+                serde_json::to_vec(&ProxyControlStateHsetCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "native-proxy-control_state".to_string(),
+                    timestamp_ms: 10,
+                    amount: 5,
+                })
+                .unwrap(),
+            )
+            .status
+            .ok
+        );
+        let info = proxy.info();
+        assert_eq!(info.stats.execute_requests, 19);
+        assert_eq!(info.stats.batch_execute_requests, 1);
+        assert!(info.stats.route_cache_hits >= 1);
+    }
+
+    #[test]
+    fn proxy_config_update_noops_on_same_namespace_and_version_like_native() {
+        let options = ProxyOptions {
+            namespace: "ns-a".to_string(),
+            meta_addr: "127.0.0.1:1".to_string(),
+            route_cache_ttl_ms: 60_000,
+            ..ProxyOptions::default()
+        };
+        let proxy = ProxyService::new(options.clone());
+
+        let unchanged = proxy.update_options_report(options.clone());
+        assert!(unchanged.status.ok);
+        assert!(!unchanged.applied);
+        assert_eq!(unchanged.reason, "unchanged");
+        assert_eq!(unchanged.previous_namespace, "ns-a");
+        assert_eq!(unchanged.new_namespace, "ns-a");
+        assert_eq!(
+            unchanged.previous_config_version,
+            unchanged.new_config_version
+        );
+        assert_eq!(proxy.options().route_cache_ttl_ms, 60_000);
+
+        let changed = proxy.update_options_report(ProxyOptions {
+            namespace: "ns-b".to_string(),
+            ..options
+        });
+        assert!(changed.status.ok);
+        assert!(changed.applied);
+        assert_eq!(changed.reason, "config_changed");
+        assert_eq!(changed.previous_namespace, "ns-a");
+        assert_eq!(changed.new_namespace, "ns-b");
+        assert_eq!(proxy.options().namespace, "ns-b");
+    }
+
+    #[test]
+    fn proxy_refreshes_route_after_backend_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        start_server(test_addr(18_312), engine.clone());
+        start_meta(test_addr(18_313), test_addr(18_312));
+        wait_for_http(&test_addr(18_313));
+        wait_for_http(&test_addr(18_312));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_313),
+            route_cache_ttl_ms: 60_000,
+            connect_timeout_ms: 50,
+            io_timeout_ms: 200,
+            ..ProxyOptions::default()
+        });
+        proxy
+            .client()
+            .insert_cached_route_for_test(1, "127.0.0.1:1");
+
+        let response = proxy.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "k".to_string(),
+                value: b"v".to_vec(),
+            },
+        });
+        assert!(response.status.ok);
+        let info = proxy.info();
+        assert_eq!(info.stats.backend_errors, 1);
+        assert_eq!(info.stats.route_refreshes, 1);
+    }
+
+    #[test]
+    fn proxy_skips_cached_backend_after_continuous_failure_threshold() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        start_server(test_addr(18_316), engine.clone());
+        start_meta(test_addr(18_317), test_addr(18_316));
+        wait_for_http(&test_addr(18_317));
+        wait_for_http(&test_addr(18_316));
+
+        let bad_server = "127.0.0.1:1".to_string();
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_317),
+            route_cache_ttl_ms: 60_000,
+            backend_continuous_failed_time_ms: 5,
+            connect_timeout_ms: 50,
+            io_timeout_ms: 200,
+            ..ProxyOptions::default()
+        });
+        proxy
+            .client()
+            .insert_cached_route_for_test(1, bad_server.clone());
+        proxy
+            .client()
+            .insert_backend_failure_for_test(bad_server, 20, 10, 3);
+
+        let response = proxy.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "k".to_string(),
+                value: b"v".to_vec(),
+            },
+        });
+        assert!(response.status.ok);
+        assert_eq!(
+            proxy
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet {
+                        key: "k".to_string(),
+                    },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"v".to_vec())
+            }
+        );
+        let info = proxy.info();
+        assert_eq!(info.stats.backend_errors, 0);
+        assert_eq!(info.stats.continuous_backend_failures, 1);
+        assert!(info.stats.route_refreshes >= 1);
+        assert!(info.stats.route_cache_hits >= 1);
+    }
+
+    #[test]
+    fn proxy_table_execute_opens_topology_and_routes_by_key() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let engine_a = TemporalEngine::with_local_dirs(
+            1024,
+            dir_a.path().join("cache"),
+            dir_a.path().join("blocks"),
+            dir_a.path().join("indexes"),
+        );
+        engine_a.load_shard(1);
+        start_server(test_addr(18_318), engine_a.clone());
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let engine_b = TemporalEngine::with_local_dirs(
+            1024,
+            dir_b.path().join("cache"),
+            dir_b.path().join("blocks"),
+            dir_b.path().join("indexes"),
+        );
+        engine_b.load_shard(2);
+        start_server(test_addr(18_319), engine_b.clone());
+
+        let meta = crate::meta::SingleNodeMeta::default();
+        assert!(
+            meta.add_table(AddTableRequest {
+                namespace: "ns".to_string(),
+                table_name: "tbl".to_string(),
+                first_shard_id: 1,
+                shard_count: 2,
+                replica_count: 1,
+                partition_version: 0,
+                serving_options: crate::meta::TableServingOptions::default(),
+            })
+            .status
+            .ok
+        );
+        assert!(
+            meta.register(RegisterShardRequest {
+                registered_at_ms: 0,
+                shard_id: 1,
+                server_addr: test_addr(18_318),
+            })
+            .status
+            .ok
+        );
+        assert!(
+            meta.register(RegisterShardRequest {
+                registered_at_ms: 0,
+                shard_id: 2,
+                server_addr: test_addr(18_319),
+            })
+            .status
+            .ok
+        );
+        start_meta_service(test_addr(18_320), meta);
+        wait_for_http(&test_addr(18_318));
+        wait_for_http(&test_addr(18_319));
+        wait_for_http(&test_addr(18_320));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_320),
+            route_cache_ttl_ms: 60_000,
+            ..ProxyOptions::default()
+        });
+        let opened = proxy.open_table(ProxyOpenTableRequest {
+            namespace: "ns".to_string(),
+            table_name: "tbl".to_string(),
+            pin_primary: None,
+            replica_read_policy: None,
+        });
+        assert!(opened.status.ok);
+        assert_eq!(
+            opened.options,
+            Some(ProxyTableOptionsView {
+                first_shard_id: 1,
+                shard_count: 2,
+                pin_primary: true,
+                replica_read_policy: ProxyReplicaReadPolicy::PinPrimary,
+                preferred_location: String::new(),
+                drop_percent: 0,
+            })
+        );
+
+        let key = key_for_shard(2);
+        assert!(
+            proxy
+                .table_execute(ProxyTableExecuteRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    command: Command::StringSet {
+                        key: key.clone(),
+                        value: b"v2".to_vec(),
+                    },
+                })
+                .status
+                .ok
+        );
+        assert_eq!(
+            engine_b
+                .execute(ExecuteRequest {
+                    shard_id: 2,
+                    command: Command::StringGet { key: key.clone() },
+                })
+                .response,
+            CommandResponse::Bytes {
+                value: Some(b"v2".to_vec())
+            }
+        );
+        assert_eq!(
+            engine_a
+                .execute(ExecuteRequest {
+                    shard_id: 1,
+                    command: Command::StringGet { key },
+                })
+                .response,
+            CommandResponse::Bytes { value: None }
+        );
+        assert!(proxy.info().route_cache_size >= 2);
+    }
+
+    #[test]
+    fn proxy_detects_and_refreshes_stale_topology_cache() {
+        let meta = crate::meta::SingleNodeMeta::default();
+        assert!(
+            meta.add_table(AddTableRequest {
+                namespace: "ns".to_string(),
+                table_name: "tbl".to_string(),
+                first_shard_id: 1,
+                shard_count: 1,
+                replica_count: 1,
+                partition_version: 0,
+                serving_options: crate::meta::TableServingOptions::default(),
+            })
+            .status
+            .ok
+        );
+        assert!(
+            meta.register(RegisterShardRequest {
+                registered_at_ms: 0,
+                shard_id: 1,
+                server_addr: test_addr(18_321),
+            })
+            .status
+            .ok
+        );
+        let meta_addr = free_local_addr();
+        start_meta_service(meta_addr.clone(), meta.clone());
+        wait_for_http(&meta_addr);
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr,
+            route_cache_ttl_ms: 60_000,
+            ..ProxyOptions::default()
+        });
+        let opened = proxy.open_table(ProxyOpenTableRequest {
+            namespace: "ns".to_string(),
+            table_name: "tbl".to_string(),
+            pin_primary: None,
+            replica_read_policy: None,
+        });
+        assert!(opened.status.ok, "{opened:?}");
+        assert!(!proxy.preflight_report().topology_cache_stale);
+
+        assert!(
+            meta.update_table(UpdateTableRequest {
+                namespace: "ns".to_string(),
+                table_name: "tbl".to_string(),
+                shard_count: Some(1),
+                replica_count: Some(1),
+                first_shard_id: None,
+                partition_version: None,
+                serving_options: Some(crate::meta::TableServingOptionsPatch {
+                    drop_percent: Some(1),
+                    ..crate::meta::TableServingOptionsPatch::default()
+                }),
+            })
+            .status
+            .ok
+        );
+
+        let stale = proxy.preflight_report();
+        assert!(stale.topology_cache_stale);
+        assert!(stale
+            .degraded_reasons
+            .contains(&"topology_cache_stale".to_string()));
+
+        let refresh = proxy.refresh_topology_from_meta();
+        assert!(refresh.status.ok, "{refresh:?}");
+        let report = refresh.report.unwrap();
+        assert_eq!(report.refreshed_tables, vec!["ns/tbl"]);
+        assert!(!proxy.preflight_report().topology_cache_stale);
+
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/proxy/topology/refresh".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 200);
+        let routed = parse_json::<ProxyTopologyRefreshResponse>(&body).unwrap();
+        assert!(routed.status.ok);
+    }
+
+    #[test]
+    fn proxy_heartbeat_auto_registers_when_metaserver_returns_not_found() {
+        let meta = crate::meta::SingleNodeMeta::default();
+        let meta_addr = test_addr(18_314);
+        std::thread::spawn({
+            let meta = meta.clone();
+            move || {
+                serve_reserved(&meta_addr, move |request| {
+                    match (request.method.as_str(), request.path.as_str()) {
+                        ("POST", "/proxies/heartbeat") => {
+                            let req = parse_json::<ProxyHeartbeatRequest>(&request.body).unwrap();
+                            json_response(200, &meta.proxy_heartbeat(req))
+                        }
+                        ("POST", "/proxies/register") => {
+                            let req = parse_json::<RegisterProxyRequest>(&request.body).unwrap();
+                            json_response(200, &meta.register_proxy(req))
+                        }
+                        _ => json_response(404, &Status::error("not_found", "not found")),
+                    }
+                })
+                .unwrap();
+            }
+        });
+        wait_for_http(&test_addr(18_314));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_314),
+            proxy_addr: "proxy-a".to_string(),
+            namespace: "ns".to_string(),
+            location: "zone-a".to_string(),
+            binary_version: "v1".to_string(),
+            ..ProxyOptions::default()
+        });
+        let response = proxy.heartbeat_to_meta();
+        assert!(response.status.ok);
+        let info = proxy.info();
+        assert_eq!(info.stats.heartbeat_total, 1);
+        assert_eq!(info.stats.auto_register_total, 1);
+        let discovery = proxy.service_discovery_report();
+        assert!(discovery.registered);
+        assert!(!discovery.stale);
+        assert_eq!(discovery.service_name, "temporalstore-proxy");
+        assert_eq!(discovery.stats.registration_success_total, 1);
+        assert_eq!(discovery.stats.heartbeat_success_total, 1);
+
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "GET".to_string(),
+            path: "/proxy/service_discovery".to_string(),
+            body: Vec::new(),
+        });
+        assert_eq!(code, 200);
+        let routed = parse_json::<ProxyServiceDiscoveryReport>(&body).unwrap();
+        assert!(routed.registered);
+        assert!(!routed.stale);
+    }
+
+    #[test]
+    fn proxy_heartbeat_applies_metaserver_config_version_like_native() {
+        let meta = crate::meta::SingleNodeMeta::default();
+        meta.register_proxy(RegisterProxyRequest {
+            registered_at_ms: 0,
+            proxy_addr: "proxy-config".to_string(),
+            namespace: "serving-ns".to_string(),
+            location: "zone-a".to_string(),
+            config_version: 9,
+            binary_version: "v-meta".to_string(),
+        });
+        let meta_addr = test_addr(18_326);
+        std::thread::spawn({
+            let meta = meta.clone();
+            move || {
+                serve_reserved(&meta_addr, move |request| {
+                    match (request.method.as_str(), request.path.as_str()) {
+                        ("POST", "/proxies/heartbeat") => {
+                            let req = parse_json::<ProxyHeartbeatRequest>(&request.body).unwrap();
+                            json_response(200, &meta.proxy_heartbeat(req))
+                        }
+                        _ => json_response(404, &Status::error("not_found", "not found")),
+                    }
+                })
+                .unwrap();
+            }
+        });
+        wait_for_http(&test_addr(18_326));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_326),
+            proxy_addr: "proxy-config".to_string(),
+            namespace: "stale-ns".to_string(),
+            config_version: 1,
+            route_cache_ttl_ms: 60_000,
+            ..ProxyOptions::default()
+        });
+        let response = proxy.heartbeat_to_meta();
+        assert!(response.status.ok);
+        assert!(response.config_changed);
+
+        let options = proxy.options();
+        assert_eq!(options.namespace, "serving-ns");
+        assert_eq!(options.config_version, 9);
+        assert_eq!(options.serving_mode, ProxyServingMode::Serving);
+        assert_eq!(options.drop_percent, 0);
+        assert_eq!(proxy_config_version(&options), 9);
+        assert_eq!(proxy.info().stats.heartbeat_total, 1);
+    }
+
+    #[test]
+    fn proxy_heartbeat_applies_metaserver_serving_policy_transition() {
+        let meta = crate::meta::SingleNodeMeta::default();
+        meta.register_proxy(RegisterProxyRequest {
+            registered_at_ms: 0,
+            proxy_addr: "proxy-frozen-policy".to_string(),
+            namespace: "policy-ns".to_string(),
+            location: "zone-a".to_string(),
+            config_version: 5,
+            binary_version: "v-meta".to_string(),
+        });
+        meta.freeze_proxy(crate::meta::StateChangeRequest {
+            reason: crate::meta::FreezeReason::Unspecified,
+            endpoint: "proxy-frozen-policy".to_string(),
+            freeze_cooldown_ms: 0,
+        });
+        let meta_addr = test_addr(18_327);
+        std::thread::spawn({
+            let meta = meta.clone();
+            move || {
+                serve_reserved(&meta_addr, move |request| {
+                    match (request.method.as_str(), request.path.as_str()) {
+                        ("POST", "/proxies/heartbeat") => {
+                            let req = parse_json::<ProxyHeartbeatRequest>(&request.body).unwrap();
+                            json_response(200, &meta.proxy_heartbeat(req))
+                        }
+                        _ => json_response(404, &Status::error("not_found", "not found")),
+                    }
+                })
+                .unwrap();
+            }
+        });
+        wait_for_http(&test_addr(18_327));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_327),
+            proxy_addr: "proxy-frozen-policy".to_string(),
+            namespace: "policy-ns".to_string(),
+            config_version: 5,
+            serving_mode: ProxyServingMode::Serving,
+            route_cache_ttl_ms: 60_000,
+            ..ProxyOptions::default()
+        });
+        let response = proxy.heartbeat_to_meta();
+        assert_eq!(response.status.code, "resource_frozen");
+        assert_eq!(response.serving_mode, "not_serving");
+        let options = proxy.options();
+        assert_eq!(options.serving_mode, ProxyServingMode::NotServing);
+
+        let rejected = proxy.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: "blocked".to_string(),
+            },
+        });
+        assert_eq!(rejected.status.code, "proxy_not_serving");
+    }
+
+    #[test]
+    fn proxy_background_heartbeat_loop_auto_registers() {
+        let meta = crate::meta::SingleNodeMeta::default();
+        let meta_addr = test_addr(18_315);
+        std::thread::spawn({
+            let meta = meta.clone();
+            move || {
+                serve_reserved(&meta_addr, move |request| {
+                    match (request.method.as_str(), request.path.as_str()) {
+                        ("POST", "/proxies/heartbeat") => {
+                            let req = parse_json::<ProxyHeartbeatRequest>(&request.body).unwrap();
+                            json_response(200, &meta.proxy_heartbeat(req))
+                        }
+                        ("POST", "/proxies/register") => {
+                            let req = parse_json::<RegisterProxyRequest>(&request.body).unwrap();
+                            json_response(200, &meta.register_proxy(req))
+                        }
+                        _ => json_response(404, &Status::error("not_found", "not found")),
+                    }
+                })
+                .unwrap();
+            }
+        });
+        wait_for_http(&test_addr(18_315));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_315),
+            proxy_addr: "proxy-loop".to_string(),
+            namespace: "ns".to_string(),
+            ..ProxyOptions::default()
+        });
+        let _loop = proxy.start_heartbeat_loop();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            let stats = proxy.info().stats;
+            if stats.heartbeat_total > 0 && stats.auto_register_total > 0 {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("proxy heartbeat loop did not register and heartbeat");
+    }
+
+    fn start_server(addr: String, engine: TemporalEngine) {
+        std::thread::spawn(move || {
+            serve_reserved(&addr, move |request| {
+                match (request.method.as_str(), request.path.as_str()) {
+                    ("POST", "/execute") => {
+                        let req = parse_json::<ExecuteRequest>(&request.body).unwrap();
+                        json_response(200, &engine.execute(req))
+                    }
+                    ("POST", "/batch_execute") => {
+                        let req = parse_json::<BatchExecuteRequest>(&request.body).unwrap();
+                        json_response(200, &engine.batch_execute(req))
+                    }
+                    _ => json_response(404, &Status::error("not_found", "not found")),
+                }
+            })
+            .unwrap();
+        });
+    }
+
+    fn start_meta(addr: String, server_addr: String) {
+        std::thread::spawn(move || {
+            serve_reserved(&addr, move |request| {
+                match (request.method.as_str(), request.path.as_str()) {
+                    ("GET", "/shards/1") => json_response(
+                        200,
+                        &GetShardResponse {
+                            status: Status::ok(),
+                            location: Some(ShardLocation {
+                                registered_at_ms: 0,
+                                preferred_location: String::new(),
+                                state: crate::meta::MetaEntityState::Normal,
+                                shard_id: 1,
+                                server_addr: server_addr.clone(),
+                                latest_snapshot: None,
+                            }),
+                        },
+                    ),
+                    _ => json_response(404, &Status::error("not_found", "not found")),
+                }
+            })
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn a_timed_out_request_on_a_pooled_socket_is_not_resent() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // The keep-alive pool reconnects and sends again when a pooled socket fails, which is
+        // right when the server had reaped that socket -- nothing was served on it. It was
+        // also doing it when the peer simply stopped answering, which sends the request a
+        // second time even though the first may have been processed. One layer below the
+        // routing guard, and it would undo that guard from underneath.
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let addr = test_addr(18_392);
+        let h = hits.clone();
+        let addr_for_thread = addr.clone();
+        std::thread::spawn(move || {
+            serve_reserved(&addr_for_thread, move |_request| {
+                // First exchange answers immediately, so the socket lands in the pool.
+                // Everything after that accepts the request and goes quiet.
+                if h.fetch_add(1, Ordering::SeqCst) > 0 {
+                    std::thread::sleep(Duration::from_millis(700));
+                }
+                crate::http::json_response(200, &Status::ok())
+            })
+            .unwrap();
+        });
+        wait_for_http(&addr);
+
+        let options = HttpRequestOptions {
+            connect_timeout_ms: 200,
+            io_timeout_ms: 120,
+            max_retries: 0,
+        };
+        // Warm the pool: this must succeed and leave a keep-alive socket for this thread.
+        crate::http::request_bytes_with_options(
+            &addr,
+            "POST",
+            "/warm",
+            b"{}",
+            "application/json",
+            options,
+        )
+        .expect("first exchange should succeed and pool its socket");
+
+        let before = hits.load(Ordering::SeqCst);
+        let _ = crate::http::request_bytes_with_options(
+            &addr,
+            "POST",
+            "/slow",
+            b"{}",
+            "application/json",
+            options,
+        );
+        // Leave room for a second attempt to arrive, so this fails loudly rather than racing.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            hits.load(Ordering::SeqCst) - before,
+            1,
+            "a request that timed out on a pooled socket must not be sent again on a fresh one"
+        );
+    }
+
+    #[test]
+    fn the_proxy_names_every_client_error_it_can_return() {
+        // The mapping has no `_` arm, so adding a `ClientError` variant stops the build until
+        // someone decides what the caller is told. This pins what the existing ones say, and in
+        // particular that a caller's own bad request is not reported as a server-side failure --
+        // there is nothing on this side to retry for it.
+        use crate::client::ClientError;
+
+        assert_eq!(
+            proxy_client_error_code(&ClientError::InvalidRequest("bad".to_string())),
+            "invalid_request",
+            "a request the caller got wrong is the caller's to fix"
+        );
+        assert_eq!(
+            proxy_client_error_code(&ClientError::WriteOutcomeUnknown(
+                "unknown".to_string()
+            )),
+            "write_outcome_unknown",
+            "kept distinct so a caller does not retry a write that may have applied"
+        );
+        assert_eq!(
+            proxy_client_error_code(&ClientError::Status("refused".to_string())),
+            "server_error"
+        );
+
+        // The two that share `server_error` are not the same condition, so if either is ever
+        // given its own code this says which one moved.
+        assert_eq!(
+            proxy_client_error_code(&ClientError::Status("x".to_string())),
+            proxy_client_error_code(&ClientError::UnexpectedResponse {
+                operation: "exists",
+                response: CommandResponse::Empty,
+            }),
+            "a backend refusal and an unparseable answer both read as server_error today"
+        );
+    }
+
+    #[test]
+    fn a_caller_can_tell_an_unknown_write_from_a_failed_one() {
+        // The counter added alongside this tells an OPERATOR how many writes are unaccounted
+        // for. It does not help the application holding the error, and that application has
+        // the same decision the client had: retry, or not. Retrying a write that already
+        // applied is how it gets applied twice -- the exact thing the client stopped doing
+        // internally. Handing back the same "server_error" for both cases pushes that bug one
+        // layer out.
+        let slow = test_addr(18_402);
+        let slow_for_thread = slow.clone();
+        std::thread::spawn(move || {
+            serve_reserved(&slow_for_thread, move |_request| {
+                std::thread::sleep(Duration::from_millis(500));
+                crate::http::json_response(200, &Status::ok())
+            })
+            .unwrap();
+        });
+        start_meta(test_addr(18_403), slow.clone());
+        wait_for_http(&test_addr(18_403));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_403),
+            route_cache_ttl_ms: 60_000,
+            connect_timeout_ms: 200,
+            io_timeout_ms: 120,
+            ..ProxyOptions::default()
+        });
+        let response = proxy.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "k".to_string(),
+                value: b"v".to_vec(),
+            },
+        });
+        assert!(!response.status.ok);
+        assert_eq!(
+            response.status.code, "write_outcome_unknown",
+            "a caller must be able to see that retrying this write is not free"
+        );
+
+        // A read that fails the same way is NOT unknown -- repeating a read cannot change
+        // anything, so it keeps the ordinary code and callers keep retrying it freely.
+        let response = proxy.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: "k".to_string(),
+            },
+        });
+        assert!(!response.status.ok);
+        assert_ne!(
+            response.status.code, "write_outcome_unknown",
+            "a read is always safe to repeat and must not be labelled unknown"
+        );
+    }
+
+    #[test]
+    fn writes_of_unknown_outcome_are_counted_separately_from_ordinary_failures() {
+        // After a write stopped being replayed on timeout, "backend_errors" stopped being
+        // enough to reason about. A refused connection is harmless -- the write never landed
+        // and it was retried. A timeout is not: the write may have been applied and nothing
+        // retried it. Those two were indistinguishable in the counters, so nobody could
+        // answer the one question that matters after an incident: did any writes end up in a
+        // state we cannot determine?
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        let slow = test_addr(18_396);
+        let slow_for_thread = slow.clone();
+        std::thread::spawn(move || {
+            serve_reserved(&slow_for_thread, move |_request| {
+                std::thread::sleep(Duration::from_millis(500));
+                crate::http::json_response(200, &Status::ok())
+            })
+            .unwrap();
+        });
+        start_meta(test_addr(18_397), slow.clone());
+        wait_for_http(&test_addr(18_397));
+
+        let timing_out = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_397),
+            route_cache_ttl_ms: 60_000,
+            connect_timeout_ms: 200,
+            io_timeout_ms: 120,
+            ..ProxyOptions::default()
+        });
+        let _ = timing_out.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "k".to_string(),
+                value: b"v".to_vec(),
+            },
+        });
+        assert_eq!(
+            timing_out.info().stats.writes_of_unknown_outcome, 1,
+            "a write that timed out is a write nobody can account for"
+        );
+
+        // A refused connection is the opposite case and must NOT be counted: it proves the
+        // write never arrived, and it was replayed onto a healthy datanode.
+        start_server(test_addr(18_398), engine.clone());
+        start_meta(test_addr(18_399), test_addr(18_398));
+        wait_for_http(&test_addr(18_399));
+        wait_for_http(&test_addr(18_398));
+        let refused = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_399),
+            route_cache_ttl_ms: 60_000,
+            connect_timeout_ms: 50,
+            io_timeout_ms: 200,
+            ..ProxyOptions::default()
+        });
+        refused.client().insert_cached_route_for_test(1, "127.0.0.1:1");
+        let response = refused.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "k".to_string(),
+                value: b"v".to_vec(),
+            },
+        });
+        assert!(response.status.ok, "a refused write is replayed and should succeed");
+        assert_eq!(
+            refused.info().stats.writes_of_unknown_outcome, 0,
+            "a refused write provably never arrived, so it is not unknown"
+        );
+    }
+
+    #[test]
+    fn a_write_whose_outcome_is_unknown_is_not_sent_twice() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // A datanode that accepts the request and then stops answering. That is the case
+        // that matters: the connection succeeded, the request was delivered, and the client
+        // is left not knowing whether it was applied.
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let slow = test_addr(18_390);
+        let h = hits.clone();
+        let slow_for_thread = slow.clone();
+        std::thread::spawn(move || {
+            serve_reserved(&slow_for_thread, move |_request| {
+                h.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(500));
+                json_response(200, &Status::ok())
+            })
+            .unwrap();
+        });
+        start_meta(test_addr(18_391), slow.clone());
+        wait_for_http(&test_addr(18_391));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_391),
+            route_cache_ttl_ms: 60_000,
+            connect_timeout_ms: 200,
+            io_timeout_ms: 120,
+            ..ProxyOptions::default()
+        });
+
+        hits.store(0, Ordering::SeqCst);
+        let _ = proxy.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: "counted".to_string(),
+                value: b"v".to_vec(),
+            },
+        });
+        // Leave time for a second attempt to land, so this fails loudly rather than racing.
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a write that timed out must not be sent again -- the timeout says the datanode \
+             stopped answering, not that it never received the write"
+        );
+
+        // A read is a different matter: repeating it cannot change anything, so the
+        // refresh-and-retry still applies. Pinned so the guard cannot quietly widen.
+        hits.store(0, Ordering::SeqCst);
+        let _ = proxy.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringGet {
+                key: "counted".to_string(),
+            },
+        });
+        std::thread::sleep(Duration::from_millis(400));
+        assert!(
+            hits.load(Ordering::SeqCst) >= 2,
+            "a read should still be retried after a backend failure, saw {}",
+            hits.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn topology_check_stays_off_the_request_path() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let topo_posts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        start_server(test_addr(18_384), engine.clone());
+
+        let meta = crate::meta::SingleNodeMeta::default();
+        meta.register_server(crate::meta::RegisterServerRequest {
+            registered_at_ms: 0,
+            numa_nodes: Vec::new(),
+            server_addr: test_addr(18_384),
+            node_id: 1,
+            location: "zone-a".to_string(),
+            binary_version: "v-a".to_string(),
+        });
+        meta.register(RegisterShardRequest {
+            registered_at_ms: 0,
+            shard_id: 1,
+            server_addr: test_addr(18_384),
+        });
+
+        let addr = test_addr(18_385);
+        let tp = topo_posts.clone();
+        let m = meta.clone();
+        std::thread::spawn(move || {
+            serve_reserved(&addr, move |request| {
+                match (request.method.as_str(), request.path.as_str()) {
+                    ("GET", path) if path.starts_with("/shards/") => {
+                        let shard_id =
+                            path.trim_start_matches("/shards/").parse().unwrap_or_default();
+                        json_response(200, &m.get(shard_id))
+                    }
+                    ("POST", "/tables/topology") => {
+                        let req = parse_json::<GetTableTopologyRequest>(&request.body).unwrap();
+                        json_response(200, &m.get_table_topology(req))
+                    }
+                    ("POST", "/meta/topology_version") => {
+                        tp.fetch_add(1, Ordering::SeqCst);
+                        let req = parse_json::<TopologyVersionRequest>(&request.body).unwrap();
+                        json_response(200, &m.topology_version_report(req))
+                    }
+                    _ => json_response(404, &Status::error("not_found", "not found")),
+                }
+            })
+            .unwrap();
+        });
+        wait_for_http(&test_addr(18_384));
+        wait_for_http(&test_addr(18_385));
+
+        let run = |options: ProxyOptions| {
+            let proxy = ProxyService::new(options);
+            for i in 0..10 {
+                assert!(
+                    proxy
+                        .execute(ExecuteRequest {
+                            shard_id: 1,
+                            command: Command::StringSet {
+                                key: format!("k{i}"),
+                                value: b"v".to_vec(),
+                            },
+                        })
+                        .status
+                        .ok
+                );
+            }
+        };
+
+        // Default interval: the burst shares one check instead of paying a metaserver
+        // round-trip each. This is the whole point -- the metaserver was synchronously in
+        // the path of every request, and its latency was added to every operation.
+        topo_posts.store(0, Ordering::SeqCst);
+        run(ProxyOptions {
+            meta_addr: test_addr(18_385),
+            route_cache_ttl_ms: 60_000,
+            ..ProxyOptions::default()
+        });
+        let throttled = topo_posts.load(Ordering::SeqCst);
+        assert!(
+            throttled <= 2,
+            "10 requests inside the interval should share a check, made {throttled}"
+        );
+
+        // Zero restores the older behaviour exactly, for anyone who wants a check per
+        // request. Asserted so the escape hatch cannot rot.
+        topo_posts.store(0, Ordering::SeqCst);
+        run(ProxyOptions {
+            meta_addr: test_addr(18_385),
+            route_cache_ttl_ms: 60_000,
+            topology_check_interval_ms: 0,
+            ..ProxyOptions::default()
+        });
+        let every = topo_posts.load(Ordering::SeqCst);
+        assert!(
+            every >= 8,
+            "with the interval at zero every request should check, made only {every}"
+        );
+    }
+
+    #[test]
+    fn route_cache_serves_repeat_requests_instead_of_re_resolving() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let shard_gets = std::sync::Arc::new(AtomicUsize::new(0));
+        let topo_posts = std::sync::Arc::new(AtomicUsize::new(0));
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        start_server(test_addr(18_380), engine.clone());
+
+        let meta = crate::meta::SingleNodeMeta::default();
+        meta.register_server(crate::meta::RegisterServerRequest {
+            registered_at_ms: 0,
+            numa_nodes: Vec::new(),
+            server_addr: test_addr(18_380),
+            node_id: 1,
+            location: "zone-a".to_string(),
+            binary_version: "v-a".to_string(),
+        });
+        meta.register(RegisterShardRequest {
+            registered_at_ms: 0,
+            shard_id: 1,
+            server_addr: test_addr(18_380),
+        });
+
+        let addr = test_addr(18_381);
+        let sg = shard_gets.clone();
+        let tp = topo_posts.clone();
+        let m = meta.clone();
+        std::thread::spawn(move || {
+            serve_reserved(&addr, move |request| {
+                match (request.method.as_str(), request.path.as_str()) {
+                    ("GET", path) if path.starts_with("/shards/") => {
+                        sg.fetch_add(1, Ordering::SeqCst);
+                        let shard_id = path.trim_start_matches("/shards/").parse().unwrap_or_default();
+                        json_response(200, &m.get(shard_id))
+                    }
+                    ("POST", "/tables/topology") => {
+                        let req = parse_json::<GetTableTopologyRequest>(&request.body).unwrap();
+                        json_response(200, &m.get_table_topology(req))
+                    }
+                    ("POST", "/meta/topology_version") => {
+                        tp.fetch_add(1, Ordering::SeqCst);
+                        let req = parse_json::<TopologyVersionRequest>(&request.body).unwrap();
+                        json_response(200, &m.topology_version_report(req))
+                    }
+                    _ => json_response(404, &Status::error("not_found", "not found")),
+                }
+            })
+            .unwrap();
+        });
+        wait_for_http(&test_addr(18_380));
+        wait_for_http(&test_addr(18_381));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_381),
+            route_cache_ttl_ms: 60_000,
+            ..ProxyOptions::default()
+        });
+
+        for i in 0..10 {
+            assert!(proxy.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringSet { key: format!("k{i}"), value: b"v".to_vec() },
+            }).status.ok);
+        }
+
+        let gets = shard_gets.load(Ordering::SeqCst);
+        let posts = topo_posts.load(Ordering::SeqCst);
+        let report = proxy.preflight_report();
+
+        // Ten identical requests behind a 60s TTL. This used to be 10 shard lookups and
+        // zero cache hits: routes resolved by shard lookup were stamped topology version 0,
+        // "unknown" counted as stale, so every request invalidated the entry it had just
+        // written and resolved again. The cache existed and never once returned a hit.
+        assert!(
+            gets <= 2,
+            "10 requests should resolve at most twice, took {gets} shard lookups              (hits={} misses={} refreshes={})",
+            report.client.route_cache_hits,
+            report.client.route_cache_misses,
+            report.client.route_refreshes
+        );
+        assert!(
+            report.client.route_cache_hits >= 7,
+            "the cache should serve the repeats, saw {} hits across 10 requests",
+            report.client.route_cache_hits
+        );
+
+        // NOT asserted low on purpose: the topology check itself is still one POST per
+        // request on every command entry point. That is a separate cost and a separate
+        // change; this test pins the route cache, not the topology check.
+        assert!(posts >= 1, "topology is still checked, saw {posts}");
+    }
+
+    fn start_meta_service(addr: String, meta: crate::meta::SingleNodeMeta) {
+        std::thread::spawn(move || {
+            serve_reserved(&addr, move |request| {
+                match (request.method.as_str(), request.path.as_str()) {
+                    ("GET", path) if path.starts_with("/shards/") => {
+                        let shard_id = path
+                            .trim_start_matches("/shards/")
+                            .parse()
+                            .unwrap_or_default();
+                        json_response(200, &meta.get(shard_id))
+                    }
+                    ("POST", "/tables/topology") => {
+                        let req = parse_json::<GetTableTopologyRequest>(&request.body).unwrap();
+                        json_response(200, &meta.get_table_topology(req))
+                    }
+                    ("POST", "/meta/topology_version") => {
+                        let req = parse_json::<TopologyVersionRequest>(&request.body).unwrap();
+                        json_response(200, &meta.topology_version_report(req))
+                    }
+                    _ => json_response(404, &Status::error("not_found", "not found")),
+                }
+            })
+            .unwrap();
+        });
+    }
+
+    fn key_for_shard(shard_id: ShardId) -> String {
+        for index in 0..10_000 {
+            let key = format!("table-key-{shard_id}-{index}");
+            if crate::client::shard_id_for_key(&key, 1, 2, 1) == shard_id {
+                return key;
+            }
+        }
+        panic!("no key found for shard {shard_id}");
+    }
+
+    /// The address these tests use where a literal port number used to be.
+    ///
+    /// `port` is no longer a port: it is the name of one address, and every call
+    /// with the same name in one process answers with the same OS-assigned
+    /// address. Fixed ports collided with the other copies of this test binary
+    /// that run on the same machine -- see `crate::http::test_ports`.
+    fn test_addr(port: u16) -> String {
+        reserved_addr(u64::from(port))
+    }
+
+    fn free_local_addr() -> String {
+        unique_addr()
+    }
+
+    fn wait_for_http(addr: &str) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if std::net::TcpStream::connect(addr).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("server {addr} did not start");
+    }
+
+    /// Minimal datanode surface that serves the low-level endpoints the proxy
+    /// forwards to: the raw fast store (`/ingest/batch`, `/execute`) and the
+    /// batched context endpoints (`/context/ingest_extract`, `/context/retrieve`).
+    fn start_context_server(addr: String, engine: TemporalEngine) {
+        use crate::context_workflow::{
+            ingest_extract_context, retrieve_context, ContextIngestExtractRequest,
+            ContextRetrieveRequest,
+        };
+        use crate::ingestion::IngestionBatchRequest;
+        std::thread::spawn(move || {
+            serve_reserved(&addr, move |request| {
+                match (request.method.as_str(), request.path.as_str()) {
+                    ("POST", "/ingest/batch") => {
+                        let req = parse_json::<IngestionBatchRequest>(&request.body).unwrap();
+                        json_response(200, &engine.ingest_batch(req))
+                    }
+                    ("POST", "/execute") => {
+                        let req = parse_json::<ExecuteRequest>(&request.body).unwrap();
+                        json_response(200, &engine.execute(req))
+                    }
+                    ("POST", "/context/ingest_extract") => {
+                        let req =
+                            parse_json::<ContextIngestExtractRequest>(&request.body).unwrap();
+                        json_response(200, &ingest_extract_context(&engine, req))
+                    }
+                    ("POST", "/context/retrieve") => {
+                        let req = parse_json::<ContextRetrieveRequest>(&request.body).unwrap();
+                        json_response(200, &retrieve_context(&engine, req))
+                    }
+                    _ => json_response(404, &Status::error("not_found", "not found")),
+                }
+            })
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn context_route_lookup_uses_the_shared_route_cache() {
+        // The context routes are the whole of the gateway's traffic, and every one of them
+        // used to resolve its shard with a direct `/shards/{id}` GET -- no cache, no TTL, no
+        // backend-failure accounting. That put a metaserver round-trip in front of every
+        // ingest, extract and retrieve, and put the metaserver in the request path of all of
+        // them, while the command path had been caching the identical lookup all along.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        start_context_server(test_addr(18_372), engine.clone());
+        start_meta(test_addr(18_373), test_addr(18_372));
+        wait_for_http(&test_addr(18_373));
+        wait_for_http(&test_addr(18_372));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_373),
+            route_cache_ttl_ms: 60_000,
+            context_first_shard_id: 1,
+            context_shard_count: 1,
+            ..ProxyOptions::default()
+        });
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "scope": {"tenant_id": "team-alpha", "account_id": "acct_42"},
+            "messages": [{"role": "user", "content": "route cache check"}]
+        }))
+        .unwrap();
+        for attempt in 0..3 {
+            let (code, _) = proxy.handle(HttpRequest {
+                method: "POST".to_string(),
+                path: "/context/ingest".to_string(),
+                body: body.clone(),
+            });
+            assert_eq!(code, 200, "context ingest {attempt} should succeed");
+        }
+
+        let report = proxy.preflight_report();
+        // One resolve for the first request; the other two come from the cache. Before this
+        // the count would have been three lookups and an empty cache, because the context
+        // path never went through the client that owns the cache.
+        assert_eq!(
+            report.client.route_refreshes, 1,
+            "three context requests should resolve the shard once, saw {} refreshes",
+            report.client.route_refreshes
+        );
+        assert!(
+            report.client.route_cache_hits >= 2,
+            "the last two requests should be cache hits, saw {}",
+            report.client.route_cache_hits
+        );
+        assert_eq!(
+            report.client.route_cache_size, 1,
+            "the context lookup should populate the shared route cache"
+        );
+    }
+
+    #[test]
+    fn context_route_cache_is_invalidated_when_the_shard_moves() {
+        // Caching the context route is only safe if something notices the shard moving. A
+        // proxy fronting the context gateway serves these three routes and nothing else --
+        // it never calls execute -- so if the context path did not check topology itself,
+        // nothing on that proxy ever would, and it would keep sending the gateway to the old
+        // datanode for the whole of route_cache_ttl_ms.
+        let dir_a = tempfile::tempdir().unwrap();
+        let engine_a = TemporalEngine::with_local_dirs(
+            1024,
+            dir_a.path().join("cache"),
+            dir_a.path().join("blocks"),
+            dir_a.path().join("indexes"),
+        );
+        engine_a.load_shard(1);
+        start_context_server(test_addr(18_374), engine_a.clone());
+
+        let dir_b = tempfile::tempdir().unwrap();
+        let engine_b = TemporalEngine::with_local_dirs(
+            1024,
+            dir_b.path().join("cache"),
+            dir_b.path().join("blocks"),
+            dir_b.path().join("indexes"),
+        );
+        engine_b.load_shard(1);
+        start_context_server(test_addr(18_375), engine_b.clone());
+
+        let meta = crate::meta::SingleNodeMeta::default();
+        meta.register_server(crate::meta::RegisterServerRequest {
+            registered_at_ms: 0,
+            numa_nodes: Vec::new(),
+            server_addr: test_addr(18_374),
+            node_id: 1,
+            location: "zone-a".to_string(),
+            binary_version: "v-a".to_string(),
+        });
+        meta.register(RegisterShardRequest {
+            registered_at_ms: 0,
+            shard_id: 1,
+            server_addr: test_addr(18_374),
+        });
+        start_meta_service(test_addr(18_376), meta.clone());
+        wait_for_http(&test_addr(18_374));
+        wait_for_http(&test_addr(18_375));
+        wait_for_http(&test_addr(18_376));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_376),
+            route_cache_ttl_ms: 60_000,
+            context_first_shard_id: 1,
+            context_shard_count: 1,
+            ..ProxyOptions::default()
+        });
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "scope": {"tenant_id": "team-alpha", "account_id": "acct_42"},
+            "messages": [{"role": "user", "content": "before the move"}]
+        }))
+        .unwrap();
+        let ingest = |body: Vec<u8>| {
+            proxy.handle(HttpRequest {
+                method: "POST".to_string(),
+                path: "/context/ingest".to_string(),
+                body,
+            })
+        };
+
+        let (code, _) = ingest(body.clone());
+        assert_eq!(code, 200);
+        let before = proxy.preflight_report();
+        assert_eq!(before.client.route_refreshes, 1, "first request resolves once");
+
+        // The shard moves to the second datanode.
+        meta.register_server(crate::meta::RegisterServerRequest {
+            registered_at_ms: 0,
+            numa_nodes: Vec::new(),
+            server_addr: test_addr(18_375),
+            node_id: 2,
+            location: "zone-b".to_string(),
+            binary_version: "v-b".to_string(),
+        });
+        meta.register(RegisterShardRequest {
+            registered_at_ms: 0,
+            shard_id: 1,
+            server_addr: test_addr(18_375),
+        });
+
+        // Deliberately NOT disabling the topology check interval here: wait it out instead,
+        // so this covers what a deployment actually runs rather than an escape hatch.
+        std::thread::sleep(std::time::Duration::from_millis(
+            ProxyOptions::default().topology_check_interval_ms + 25,
+        ));
+
+        let moved_body = serde_json::to_vec(&serde_json::json!({
+            "scope": {"tenant_id": "team-alpha", "account_id": "acct_42"},
+            "messages": [{"role": "user", "content": "after the move"}]
+        }))
+        .unwrap();
+        let (code, _) = ingest(moved_body);
+        assert_eq!(code, 200);
+
+        let after = proxy.preflight_report();
+        assert!(
+            after.client.route_refreshes > before.client.route_refreshes,
+            "the context path must re-resolve after the shard moves, refreshes stayed at {}",
+            after.client.route_refreshes
+        );
+    }
+
+    #[test]
+    fn two_ingests_at_the_same_timestamp_keep_both_sets_of_messages() {
+        use crate::context_workflow::ContextIngestExtractReport;
+
+        // Raw events live in a hash whose FIELD carries their order, and the write is an
+        // upsert keyed by that field. The field used to be `{timestamp}:{index in call}`:
+        // the index restarts at zero every call, so two ingests carrying the same
+        // timestamp produced the same field names and the second silently replaced the
+        // first's messages. Extraction replays those records, so it saw two messages where
+        // four had been ingested, and nothing anywhere reported a loss.
+        //
+        // Both calls pin the SAME timestamp, which is what makes this deterministic rather
+        // than a race on whether two requests land inside one millisecond.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        start_context_server(test_addr(18_408), engine.clone());
+        start_meta(test_addr(18_409), test_addr(18_408));
+        wait_for_http(&test_addr(18_409));
+        wait_for_http(&test_addr(18_408));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_409),
+            route_cache_ttl_ms: 60_000,
+            context_first_shard_id: 1,
+            context_shard_count: 1,
+            ..ProxyOptions::default()
+        });
+
+        let pinned = 1_723_456_789_000u64;
+        let ingest = |first: &str, second: &str| {
+            let body = serde_json::to_vec(&serde_json::json!({
+                "scope": {"tenant_id": "team-beta", "account_id": "acct_7"},
+                "messages": [
+                    {"role": "user", "content": first, "timestamp_ms": pinned},
+                    {"role": "assistant", "content": second, "timestamp_ms": pinned}
+                ]
+            }))
+            .unwrap();
+            let (code, body) = proxy.handle(HttpRequest {
+                method: "POST".to_string(),
+                path: "/context/ingest".to_string(),
+                body,
+            });
+            assert_eq!(code, 200, "ingest must be accepted");
+            let response = parse_json::<crate::types::ExecuteResponse>(&body).unwrap();
+            assert!(response.status.ok, "ingest status: {:?}", response.status);
+        };
+
+        ingest("first call message one", "first call message two");
+        ingest("second call message one", "second call message two");
+
+        // Commit with no messages replays the buffer and extracts what it finds.
+        let commit = serde_json::to_vec(&serde_json::json!({
+            "scope": {"tenant_id": "team-beta", "account_id": "acct_7"}
+        }))
+        .unwrap();
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/context/extract".to_string(),
+            body: commit,
+        });
+        assert_eq!(code, 200);
+        let report = parse_json::<ContextIngestExtractReport>(&body).unwrap();
+        assert!(report.status.ok, "extract status: {:?}", report.status);
+        assert_eq!(
+            report.accepted, 4,
+            "four messages were ingested across two calls at the same timestamp; seeing \
+             two means the second call's fields collided with the first's and overwrote \
+             them: {report:?}"
+        );
+    }
+
+    #[test]
+    fn proxy_routes_high_level_context_ingest_and_retrieve_by_tenant() {
+        use crate::context_workflow::{ContextIngestExtractReport, ContextRetrieveReport};
+
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        start_context_server(test_addr(18_366), engine.clone());
+        start_meta(test_addr(18_367), test_addr(18_366));
+        wait_for_http(&test_addr(18_367));
+        wait_for_http(&test_addr(18_366));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_367),
+            route_cache_ttl_ms: 60_000,
+            context_first_shard_id: 1,
+            context_shard_count: 1,
+            ..ProxyOptions::default()
+        });
+
+        // The proxy owns hashing: the tenant hash it derives here must match the
+        // shard it routes to, and retrieve must land on the same shard.
+        let scope = context::ProxyContextScope {
+            tenant_id: "team-alpha".to_string(),
+            account_id: "acct_42".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(proxy.context_shard_id(context::context_tenant_hash(&scope)), 1);
+
+        // FAST path: /context/ingest stores raw events in one routed HashMultiSet
+        // write (no extraction) and returns an ExecuteResponse, not an extraction
+        // report. The buffer is verified by the commit-replay below.
+        let ingest_body = serde_json::to_vec(&serde_json::json!({
+            "scope": {"tenant_id": "team-alpha", "account_id": "acct_42"},
+            "messages": [
+                {"role": "user", "content": "the launch checklist owner is Dana"},
+                {"role": "assistant", "content": "noted: Dana owns the launch checklist"}
+            ]
+        }))
+        .unwrap();
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/context/ingest".to_string(),
+            body: ingest_body,
+        });
+        assert_eq!(code, 200);
+        let fast = parse_json::<crate::types::ExecuteResponse>(&body).unwrap();
+        assert!(fast.status.ok, "fast ingest status: {:?}", fast.status);
+
+        // BATCHED commit with NO messages: the proxy replays the buffered raw
+        // events (HGETALL) and extracts them via /context/ingest_extract.
+        let commit_body = serde_json::to_vec(&serde_json::json!({
+            "scope": {"tenant_id": "team-alpha", "account_id": "acct_42"}
+        }))
+        .unwrap();
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/context/extract".to_string(),
+            body: commit_body,
+        });
+        assert_eq!(code, 200);
+        let report = parse_json::<ContextIngestExtractReport>(&body).unwrap();
+        assert!(report.status.ok, "extract status: {:?}", report.status);
+        assert_eq!(report.accepted, 2, "commit replayed the buffer: {report:?}");
+        assert!(!report.node_hashes.is_empty());
+        let node_hashes = report.node_hashes.clone();
+
+        // Retrieve by the node hashes the ingest returned (the datanode's local
+        // workflow retrieves by node hash). The proxy re-derives the same
+        // shard/tenant from the scope, so the request lands on the same data.
+        let retrieve_body = serde_json::to_vec(&serde_json::json!({
+            "scope": {"tenant_id": "team-alpha", "account_id": "acct_42"},
+            "query": "who owns the launch checklist",
+            "node_hashes": node_hashes,
+        }))
+        .unwrap();
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/context/retrieve".to_string(),
+            body: retrieve_body,
+        });
+        assert_eq!(code, 200);
+        let retrieved = parse_json::<ContextRetrieveReport>(&body).unwrap();
+        assert!(retrieved.status.ok, "retrieve status: {:?}", retrieved.status);
+        assert!(
+            retrieved.node_count >= 1,
+            "expected retrieval to see the ingested tenant nodes, got {retrieved:?}"
+        );
+
+        // A different tenant asking for the SAME node hashes must not see
+        // team-alpha's nodes (keys are tenant-scoped), proving the proxy's
+        // per-tenant hashing is wired end to end.
+        let other_body = serde_json::to_vec(&serde_json::json!({
+            "scope": {"tenant_id": "team-beta", "account_id": "acct_42"},
+            "query": "who owns the launch checklist",
+            "node_hashes": report.node_hashes,
+        }))
+        .unwrap();
+        let (code, body) = proxy.handle(HttpRequest {
+            method: "POST".to_string(),
+            path: "/context/retrieve".to_string(),
+            body: other_body,
+        });
+        assert_eq!(code, 200);
+        let other = parse_json::<ContextRetrieveReport>(&body).unwrap();
+        assert!(other.status.ok);
+        assert_eq!(other.node_count, 0, "cross-tenant leak: {other:?}");
+    }
+
+    #[test]
+    fn proxy_control_state_and_feature_endpoints_round_trip_like_sdk() {
+        // Locks the HTTP/JSON wire contract the Python/Rust SDKs depend on:
+        // /ProxyService/{FeatureAdd, FeatureAggQuery, ControlStateIncrement,
+        // ControlStateCount, ControlStateSelectionSet, ControlStateSelectionQuery}.
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        start_server(test_addr(18_360), engine.clone());
+        let meta = crate::meta::SingleNodeMeta::default();
+        assert!(meta
+            .add_table(AddTableRequest {
+                namespace: "ns".to_string(),
+                table_name: "tbl".to_string(),
+                first_shard_id: 1,
+                shard_count: 1,
+                replica_count: 1,
+                partition_version: 0,
+                serving_options: crate::meta::TableServingOptions::default(),
+            })
+            .status
+            .ok);
+        assert!(meta
+            .register(RegisterShardRequest {
+                registered_at_ms: 0,
+                shard_id: 1,
+                server_addr: test_addr(18_360),
+            })
+            .status
+            .ok);
+        start_meta_service(test_addr(18_361), meta);
+        wait_for_http(&test_addr(18_360));
+        wait_for_http(&test_addr(18_361));
+
+        let proxy = ProxyService::new(ProxyOptions {
+            meta_addr: test_addr(18_361),
+            route_cache_ttl_ms: 60_000,
+            ..ProxyOptions::default()
+        });
+
+        let post = |path: &str, body: Vec<u8>| -> crate::types::ExecuteResponse {
+            let (code, out) = proxy.handle(HttpRequest {
+                method: "POST".to_string(),
+                path: path.to_string(),
+                body,
+            });
+            assert_eq!(code, 200, "{path} returned {code}");
+            parse_json::<crate::types::ExecuteResponse>(&out).unwrap()
+        };
+
+        // Feature: append raw observations, then exact serving-time aggregates.
+        let add = post(
+            "/ProxyService/FeatureAdd",
+            serde_json::to_vec(&ProxyFeatureAddCommandRequest {
+                namespace: "ns".to_string(),
+                table_name: "tbl".to_string(),
+                key: "itest:feat".to_string(),
+                policy: None,
+                points: vec![
+                    crate::types::FeaturePoint { timestamp_ms: 10, value: b"10".to_vec() },
+                    crate::types::FeaturePoint { timestamp_ms: 20, value: b"20".to_vec() },
+                    crate::types::FeaturePoint { timestamp_ms: 30, value: b"30".to_vec() },
+                ],
+            })
+            .unwrap(),
+        );
+        assert!(add.status.ok, "{add:?}");
+
+        for (agg, expected) in [("count", 3i64), ("sum", 60), ("max", 30)] {
+            let resp = post(
+                "/ProxyService/FeatureAggQuery",
+                serde_json::to_vec(&ProxyFeatureAggQueryCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "itest:feat".to_string(),
+                    start_ms: 0,
+                    end_ms: 100,
+                    aggregator: agg.to_string(),
+                    count: None,
+                })
+                .unwrap(),
+            );
+            assert_eq!(
+                resp.response,
+                CommandResponse::Aggregate { value: expected },
+                "aggregator {agg}"
+            );
+        }
+
+        // Control State: increment a counter, then read the windowed count.
+        for ts in [10u64, 20u64] {
+            let inc = post(
+                "/ProxyService/ControlStateIncrement",
+                serde_json::to_vec(&ProxyControlStateIncrementCommandRequest {
+                    namespace: "ns".to_string(),
+                    table_name: "tbl".to_string(),
+                    key: "itest:cs".to_string(),
+                    timestamp_ms: ts,
+                    amount: 1,
+                    precision_ms: None,
+                    ttl_ms: None,
+                })
+                .unwrap(),
+            );
+            assert!(inc.status.ok, "{inc:?}");
+        }
+        let count = post(
+            "/ProxyService/ControlStateCount",
+            serde_json::to_vec(&ProxyControlStateCountCommandRequest {
+                namespace: "ns".to_string(),
+                table_name: "tbl".to_string(),
+                key: "itest:cs".to_string(),
+                start_ms: 0,
+                end_ms: 100,
+            })
+            .unwrap(),
+        );
+        match count.response {
+            CommandResponse::Integer { value } | CommandResponse::Aggregate { value } => {
+                assert_eq!(value, 2, "control-state windowed count")
+            }
+            other => panic!("unexpected control-state count response: {other:?}"),
+        }
+
+        // Control State: last-value (FOL) round-trip.
+        let fol_set = post(
+            "/ProxyService/ControlStateSelectionSet",
+            serde_json::to_vec(&ProxyControlStateSelectionSetCommandRequest {
+                namespace: "ns".to_string(),
+                table_name: "tbl".to_string(),
+                key: "itest:fol".to_string(),
+                value: b"alice".to_vec(),
+                occur_time_ms: 20,
+                ttl_ms: 60_000,
+                selection_type: crate::types::ControlStateSelectionType::Last,
+            })
+            .unwrap(),
+        );
+        assert!(fol_set.status.ok, "{fol_set:?}");
+        let fol_get = post(
+            "/ProxyService/ControlStateSelectionQuery",
+            serde_json::to_vec(&ProxyKeyCommandRequest {
+                namespace: "ns".to_string(),
+                table_name: "tbl".to_string(),
+                key: "itest:fol".to_string(),
+            })
+            .unwrap(),
+        );
+        match fol_get.response {
+            CommandResponse::Bytes { value: Some(v) } => {
+                assert!(String::from_utf8_lossy(&v).contains("alice"), "fol value {v:?}")
+            }
+            other => panic!("unexpected fol query response: {other:?}"),
+        }
+    }
+}
