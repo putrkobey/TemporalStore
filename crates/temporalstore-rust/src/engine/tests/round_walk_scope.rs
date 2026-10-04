@@ -546,3 +546,1101 @@ fn a_wide_range_fixture_cannot_tell_the_two_placements_apart() {
                 != block_routing_bucket(&entry.object_key, 0, WIDE_END_BUCKET)
         })
         .count();
+    assert_eq!(
+        misfiled, 0,
+        "{misfiled} of {} live pages on the WIDE shard are summarised somewhere other than the \
+         `0..u32::MAX` placement",
+        entries.len()
+    );
+
+    // And now the half that says what that zero is worth.
+    let placements_differ = keys
+        .iter()
+        .filter(|key| {
+            block_routing_bucket(key, start, end) != block_routing_bucket(key, 0, WIDE_END_BUCKET)
+        })
+        .count();
+    assert_eq!(
+        placements_differ, 0,
+        "on this shard the two placements are the same function of the same arguments, so the \
+         zero above measures the substitution and not the engine. If this is ever non-zero the \
+         zero above has become a real reading and this comment is wrong."
+    );
+    println!(
+        "  WIDE shard: {} live pages, {misfiled} misfiled, and the two placements agree on \
+         {}/{} keys -- the zero is an identity",
+        entries.len(),
+        keys.len() - placements_differ,
+        keys.len()
+    );
+}
+
+// =============================================================================================
+// 2. The construction
+// =============================================================================================
+
+/// THE DOOR: DROPPING `rs` FROM THE WIRE CHANGES NOTHING ABOUT THE ADDRESS IT DECODES TO.
+///
+/// This used to be "the engine's own decoder produces an address with no routing bucket", and it was
+/// the construction every measurement in this file rested on. An address holds no routing bucket at
+/// all now, so the door is the IDENTITY -- and what it demonstrates is worth more than what it used
+/// to build: an index written before the field left carries a real bucket in `rs`, one written now
+/// carries nil, one written before the field existed carries nothing, and all three decode the same.
+/// That is why the field's departure needs no migration step.
+///
+/// rust-internal: reads the engine's own index wire shape, no product behaviour
+#[test]
+fn dropping_the_routing_bucket_from_the_wire_decodes_to_the_same_address() {
+    // The required fields and nothing optional. The location is ONE word now -- slab 7 in the
+    // high half, offset 128 in the low -- and the split spelling this line used to carry is
+    // refused rather than read, which `a_split_address_is_refused_and_a_merged_one_round_trips`
+    // drives directly. What is being tested here is the OPTIONAL fields defaulting, so the
+    // location is written in the shape the engine writes today.
+    let older: ElementEntry =
+        serde_json::from_slice(br#"{"a":30064771200,"l":64}"#)
+            .expect("the decoder takes an address record with no optional fields");
+    assert_eq!(older.block_slab_id(), 7, "the rest of the record still decoded");
+    assert_eq!(older.length(), 64, "the rest of the record still decoded");
+    assert_eq!(
+        older.generation(),
+        None,
+        "`BlockAddressWire`'s optional fields are `#[serde(default)]`, so a record written before \
+         they existed has to decode to None. It did not. Stated over `generation` because the \
+         object id is no longer a field to observe -- the slot is still read off the wire."
+    );
+
+    // And a REAL address, round-tripped through the same shape with the key removed.
+    let current = ElementEntry::from_parts(3, 64, 128, Some(1), Some(2));
+    let older = as_an_older_build_wrote_it(&current);
+    assert_eq!(
+        older, current,
+        "dropping `rs` from the wire shape changed the address. The key is inert -- the address \
+         holds no routing bucket -- so this round trip has to be the identity; if it is not, an \
+         index written before the field left decodes to a DIFFERENT address."
+    );
+
+    // AND A STORED BUCKET THE ADDRESS COULD NOT HAVE WRITTEN is accepted and ignored, which is the
+    // case an index already on disk actually presents.
+    let mut wire = serde_json::to_value(&current).expect("serializes");
+    wire.as_object_mut()
+        .expect("object")
+        .insert("rs".to_string(), serde_json::json!(909_u32));
+    let with_a_bucket: ElementEntry = serde_json::from_value(wire).expect("decodes");
+    assert_eq!(
+        with_a_bucket, current,
+        "an index carrying a real routing bucket in `rs` must decode to the same address as one \
+         carrying none"
+    );
+}
+
+/// THE TWO RANGES STILL PLACE A PAGE DIFFERENTLY, AND THE SUMMARY WALK NO LONGER CARES.
+///
+/// The reconstruct is the production one, with the production arguments: `lifecycle.rs`'s WAL replay
+/// tail and `persistence.rs`'s bulk-ingest flush both call
+/// `rebuild_bucket_first_index(shard_id, shard, 0, u32::MAX)` and then persist what it produced. The
+/// shard is loaded on the production narrow range. The only thing the fixture supplies is addresses in
+/// the state the engine's own decoder produces.
+///
+/// SECOND ARM, SAME FIXTURE: the same reconstruct with the shard's OWN range, which is the
+/// reconciliation. It agrees. So the difference is not a property of the pages -- it is a property of
+/// the argument those call sites pass, and that is what the `misplaced` count below measures.
+///
+/// WHAT THIS TEST USED TO ASSERT AND NO LONGER CAN. It required at least one bucket holding pages
+/// nothing summarises, and that is no longer constructible: `bucket_storage_summaries` credits a page
+/// to the bucket it is FILED in rather than re-deriving one. The bucket-set equality is therefore
+/// asserted in BOTH arms now -- it is a property of the walk, not of the argument -- and the arms are
+/// still told apart by `misplaced`, which is 600 in one and 0 in the other. A test whose two arms
+/// stopped differing would be the thing to worry about; these still do.
+///
+/// rust-internal: reads the engine's own reconstruct path, no product behaviour
+#[test]
+fn the_two_ranges_still_place_a_block_differently_and_the_summary_walk_follows_the_filing() {
+    const RECORDS: usize = 600;
+
+    for (label, rebuild_end, expect_disagreement) in [
+        ("as production calls it (0..u32::MAX)", WIDE_END_BUCKET, true),
+        ("with the shard's own range (0..1023)", NARROW_END_BUCKET, false),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on_range(&engine, NARROW_END_BUCKET);
+        seed(&engine, 0, RECORDS);
+
+        let (start, end) = routing_range(&engine);
+        assert_eq!(
+            (start, end),
+            (0, NARROW_END_BUCKET),
+            "{label}: the shard did not load on the narrow range, so this measures the identity"
+        );
+
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1");
+        let _released = assert_no_released_bucket_is_dirty(shard);
+
+        let blocks_before = collect_live_block_entries(shard).len();
+        assert!(
+            blocks_before > 0,
+            "{label}: the fixture stored no page, so there is nothing to file anywhere"
+        );
+
+        // Put the model-map addresses into the state an older index decodes into. The bucket index
+        // is rebuilt FROM these below, which is what a replay tail and a bulk flush both do.
+        let keys: Vec<String> = shard.strings().keys().map(|key| key.to_string()).collect();
+        assert!(
+            !keys.is_empty(),
+            "{label}: the string model map is empty, so the reconstruct has no source"
+        );
+        for key in &keys {
+            let older = as_an_older_build_wrote_it(&shard.string_address(key.as_str()).expect("key present"));
+            shard.set_string_address(key.as_str().into(), &older);
+        }
+
+        // THE PRODUCTION RECONSTRUCT, with the argument under test.
+        rebuild_bucket_first_index(1, shard, 0, rebuild_end);
+        refresh_bucket_runtime_flags(shard);
+
+        let entries = collect_live_block_entries(shard);
+        assert_eq!(
+            entries.len(),
+            blocks_before,
+            "{label}: the reconstruct changed the page count ({blocks_before} -> {}), so the two \
+             arms are not comparing the same store",
+            entries.len()
+        );
+        // DENOMINATOR: every page reports which bucket the reconstruct FILED it in. That is where
+        // the two ranges part company -- the reconstruct places a page by the bucket its ARGUMENTS
+        // name -- and a page whose filing the walk cannot report would be credited by a hash over
+        // the whole keyspace instead, which is a different measurement.
+        let filed_count = entries
+            .iter()
+            .filter(|entry| entry.filed_bucket().is_some())
+            .count();
+        assert_eq!(
+            filed_count,
+            entries.len(),
+            "{label}: {filed_count} of {} pages report a filing after the reconstruct, and all of \
+             them should: the bucket-index arm of the walk has the map key in hand.",
+            entries.len()
+        );
+
+        let filed = filed_buckets(shard);
+        let summarised = summarised_buckets(shard, start, end);
+        let only_filed: Vec<u32> = filed.difference(&summarised).copied().collect();
+        let only_summarised: Vec<u32> = summarised.difference(&filed).copied().collect();
+
+        // How many PAGES are credited to a bucket other than the one they are filed in.
+        let named = super::BlockObjects::of(&shard.bucket_index);
+        let mut misplaced = 0usize;
+        for (routing_bucket, bucket) in &shard.bucket_index.bucket_map {
+            for (handle, _block) in &bucket.block_index {
+                let credited =
+                    block_routing_bucket(named.at(*routing_bucket, *handle), start, end);
+                if credited != *routing_bucket {
+                    misplaced += 1;
+                }
+            }
+        }
+        println!(
+            "  {label}: {} pages, {misplaced} placed differently by the two ranges; only-filed \
+             {} buckets, only-summarised {} buckets (both must be 0 -- the summary walk reads the \
+             filing rather than deriving a placement)",
+            entries.len(),
+            only_filed.len(),
+            only_summarised.len()
+        );
+
+        // THE BUCKET SETS ARE EQUAL IN BOTH ARMS, and that is the change rather than the fixture.
+        // The summary walk credits a page to the bucket it is FILED in, so it cannot name a bucket
+        // the filing does not, whatever range the reconstruct was handed. This assertion is outside
+        // the arms on purpose: a property of the walk does not belong inside a branch on the
+        // argument, and putting it there is how the previous version came to require the opposite in
+        // one arm and this in the other.
+        assert!(
+            only_filed.is_empty() && only_summarised.is_empty(),
+            "{label}: the filed and summarised bucket sets must be equal at EVERY range, because \
+             the summary walk reads the filing rather than deriving a placement; only-filed \
+             {only_filed:?}, only-summarised {only_summarised:?}"
+        );
+
+        if expect_disagreement {
+            assert_eq!(
+                misplaced,
+                entries.len(),
+                "the reconstruct the replay tail runs places every page by \
+                 `block_routing_bucket(key, 0, u32::MAX)`, and a derivation over the shard's range \
+                 would place it by `block_routing_bucket(key, 0, {NARROW_END_BUCKET})`. Those are \
+                 different functions of the same key (asserted separately), so all {} pages have to \
+                 land differently and {misplaced} did. mx#1938 measured zero of these because its \
+                 shard made the two functions identical.",
+                entries.len()
+            );
+        } else {
+            assert_eq!(
+                misplaced, 0,
+                "with the shard's own range passed to the SAME reconstruct, the filing and the \
+                 derivation choose the same bucket for every page. This is the reconciliation, and \
+                 it is one argument."
+            );
+        }
+    }
+}
+
+// =============================================================================================
+// 3. What that does to a scoped walk
+// =============================================================================================
+
+/// THE PRECONDITION A SCOPED WALK NEEDS, ASSERTED ON THE LIVE WRITE PATH AND BROKEN ON THE OTHER.
+///
+/// > Every live page of a dirty object must be summarised under a bucket the dirty set names.
+///
+/// Arm one is the live write path on a narrow shard: it holds, with a denominator. Arm two is the
+/// same shard after the reconstruct above: it fails for every page. Both are counted rather than
+/// asserted as booleans, because "it holds" and "there was nothing to hold it for" read alike.
+///
+/// rust-internal: reads the engine's own dirty index, no product behaviour
+#[test]
+fn scoping_is_exact_only_while_every_block_carries_the_shards_own_placement() {
+    const RECORDS: usize = 600;
+
+    for (label, break_it) in [("live write path", false), ("after the replay reconstruct", true)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on_range(&engine, NARROW_END_BUCKET);
+        let written = seed(&engine, 0, RECORDS);
+        let (start, end) = routing_range(&engine);
+
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1");
+        let _released = assert_no_released_bucket_is_dirty(shard);
+
+        if break_it {
+            let keys: Vec<String> = shard.strings().keys().map(|key| key.to_string()).collect();
+            for key in &keys {
+                let older = as_an_older_build_wrote_it(&shard.string_address(key.as_str()).expect("key"));
+                shard.set_string_address(key.as_str().into(), &older);
+            }
+            rebuild_bucket_first_index(1, shard, 0, WIDE_END_BUCKET);
+            refresh_bucket_runtime_flags(shard);
+        }
+
+        // The witness: the fixture's own keys, hashed with the shard's own range. It shares no
+        // state with `shard.dirty_objects` -- comparing the dirty set against a re-derivation of
+        // itself would pass however wrong both were.
+        let witness: BTreeSet<u32> = written
+            .iter()
+            .map(|key| dirty_set_would_file(key, start, end))
+            .collect();
+        let engine_dirty: BTreeSet<u32> = shard.dirty_objects.bucket_ids().collect();
+        assert!(
+            !witness.is_empty(),
+            "{label}: the witness names no bucket, so every comparison below is vacuous"
+        );
+        assert_eq!(
+            engine_dirty, witness,
+            "{label}: the dirty set and a witness built outside the engine disagree; only-engine \
+             {:?}, only-witness {:?}",
+            engine_dirty.difference(&witness).take(5).collect::<Vec<_>>(),
+            witness.difference(&engine_dirty).take(5).collect::<Vec<_>>(),
+        );
+
+        let entries = collect_live_block_entries(shard);
+        let dirty_blocks = entries
+            .iter()
+            .filter(|entry| shard.dirty_objects.contains(&entry.object_key))
+            .count();
+        assert!(
+            dirty_blocks > 0,
+            "{label}: no live page belongs to a dirty object, so the precondition below holds \
+             over an empty set"
+        );
+
+        // HALF ONE -- CAN THE SCOPED WALK REACH THE PAGE AT ALL? It enters at
+        // `bucket_map[dirty bucket]`, so a page of a dirty object FILED anywhere else is a page
+        // the scoped walk never looks at. This is the half that loses data.
+        let named = super::BlockObjects::of(&shard.bucket_index);
+        let mut unreachable = 0usize;
+        let mut miscredited = 0usize;
+        for (routing_bucket, bucket) in &shard.bucket_index.bucket_map {
+            for (handle, _block) in &bucket.block_index {
+                let object_key = named.at(*routing_bucket, *handle);
+                if !shard.dirty_objects.contains(object_key) {
+                    continue;
+                }
+                if !witness.contains(routing_bucket) {
+                    unreachable += 1;
+                }
+                // HALF TWO -- WOULD IT CREDIT THE PAGE TO THE RIGHT BUCKET? Asserted separately,
+                // because a page that is reachable and credited elsewhere is a different defect
+                // from one that cannot be reached.
+                let credited = block_routing_bucket(object_key, start, end);
+                if !witness.contains(&credited) {
+                    miscredited += 1;
+                }
+            }
+        }
+        println!(
+            "  {label}: {dirty_blocks} pages of dirty objects, {unreachable} filed where a scoped \
+             walk never looks, {miscredited} credited to a bucket the dirty set does not name"
+        );
+
+        if break_it {
+            assert_eq!(
+                unreachable, dirty_blocks,
+                "after the reconstruct every page is FILED by `block_routing_bucket(key, 0, \
+                 u32::MAX)` while the dirty set still keys on the shard's own range, so every \
+                 page of a dirty object sits in a bucket a walk scoped to the dirty set never \
+                 opens. The dump that names the dirty bucket then carries no slab for any of \
+                 them. That is the losing direction, and it is all {dirty_blocks} pages."
+            );
+            assert_eq!(
+                miscredited, 0,
+                "the pages are still unrouted, so the summary walk's own fallback would credit \
+                 them to the shard's range and get the right bucket. It is the FILING that moved, \
+                 which is why this half is counted separately from the half above."
+            );
+        } else {
+            assert_eq!(
+                (unreachable, miscredited),
+                (0, 0),
+                "on the live write path every address carries `block_routing_bucket(key, start, \
+                 end)`, which is what the dirty set keys on, so both halves hold for all \
+                 {dirty_blocks} pages"
+            );
+        }
+    }
+}
+
+/// THE SET THE SCOPED WALK PRODUCES, ELEMENT BY ELEMENT AGAINST THE FULL WALK AND A WITNESS.
+///
+/// Five points in a write/dump sequence. The two differences are asserted SEPARATELY and with
+/// different messages, because only one of them loses data:
+///
+/// * a DIRTY bucket the full walk has and the scoped walk does not -- the page is never dumped;
+/// * a CLEAN bucket the full walk has and the scoped walk does not -- the saving.
+///
+/// rust-internal: prices the engine's own summary walk, no product behaviour
+#[test]
+fn the_scoped_walk_equals_the_full_walk_on_every_bucket_the_dirty_set_names() {
+    const STORE: usize = 2_000;
+    const BACKLOG: usize = 250;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on_range(&engine, NARROW_END_BUCKET);
+    let (start, end) = routing_range(&engine);
+
+    let mut outstanding: Vec<String> = Vec::new();
+    let mut saved_total = 0u64;
+    let mut checkpoints = 0usize;
+
+    fn check(
+        engine: &TemporalEngine,
+        label: &str,
+        outstanding: &[String],
+        expect_empty: bool,
+        start: u32,
+        end: u32,
+    ) -> u64 {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1");
+        let _released = assert_no_released_bucket_is_dirty(shard);
+
+        let witness: BTreeSet<u32> = outstanding
+            .iter()
+            .map(|key| dirty_set_would_file(key, start, end))
+            .collect();
+        let engine_dirty: BTreeSet<u32> = shard.dirty_objects.bucket_ids().collect();
+        assert_eq!(
+            engine_dirty, witness,
+            "{label}: the engine's dirty bucket set and the witness built outside it disagree"
+        );
+        if expect_empty {
+            assert!(
+                witness.is_empty(),
+                "{label}: this point is supposed to have nothing outstanding and the witness \
+                 names {} buckets",
+                witness.len()
+            );
+        }
+
+        let full = full_live_block_summaries(shard, start, end);
+        let (scoped, _visits) = scoped_live_block_summaries(shard, start, end);
+
+        // DIRECTION ONE, THE ONE THAT LOSES DATA: a bucket the dirty set names where the two
+        // walks do not agree page for page.
+        let mut disagreeing: Vec<(u32, u64, u64)> = Vec::new();
+        for routing_bucket in &witness {
+            let full_count = full.get(routing_bucket).copied().unwrap_or(0);
+            let scoped_count = scoped.get(routing_bucket).copied().unwrap_or(0);
+            if full_count != scoped_count {
+                disagreeing.push((*routing_bucket, full_count, scoped_count));
+            }
+        }
+        assert!(
+            disagreeing.is_empty(),
+            "{label}: {} of {} buckets the dirty set names are summarised differently by the \
+             scoped walk than by the full one (bucket, full, scoped): {:?}. Every one of these \
+             is a dump that carries fewer pages than the bucket holds -- silent, and discovered \
+             only when something looks for a record that is not there.",
+            disagreeing.len(),
+            witness.len(),
+            &disagreeing[..disagreeing.len().min(5)]
+        );
+
+        // DIRECTION TWO, THE ONE THAT ONLY WASTES: buckets the full walk summarises and the
+        // scoped walk never looks at. This is the saving, and it is reported, not feared.
+        let skipped: Vec<u32> = full
+            .keys()
+            .filter(|routing_bucket| !scoped.contains_key(routing_bucket))
+            .copied()
+            .collect();
+        let skipped_blocks: u64 = skipped.iter().map(|b| full[b]).sum();
+        for routing_bucket in &skipped {
+            assert!(
+                !witness.contains(routing_bucket),
+                "{label}: bucket {routing_bucket} is in the dirty witness AND was skipped by the \
+                 scoped walk; that is the losing direction and direction one should have caught it"
+            );
+        }
+
+        // And nothing invented: a bucket the scoped walk credits that the full walk does not.
+        let invented: Vec<u32> = scoped
+            .keys()
+            .filter(|routing_bucket| !full.contains_key(routing_bucket))
+            .copied()
+            .collect();
+        assert!(
+            invented.is_empty(),
+            "{label}: the scoped walk credited {} buckets the full walk does not summarise at \
+             all: {:?}",
+            invented.len(),
+            &invented[..invented.len().min(5)]
+        );
+
+        println!(
+            "  {label:<34} witness {:>5}, full {:>5} buckets, scoped {:>5}, skipped {:>5} \
+             buckets / {skipped_blocks:>6} pages",
+            witness.len(),
+            full.len(),
+            scoped.len(),
+            skipped.len()
+        );
+        skipped_blocks
+    }
+
+    saved_total += check(&engine, "1: fresh store", &outstanding, true, start, end);
+    checkpoints += 1;
+
+    outstanding.extend(seed(&engine, 0, STORE));
+    saved_total += check(&engine, "2: written, no round", &outstanding, false, start, end);
+    checkpoints += 1;
+
+    let report = one_round(&engine);
+    assert!(report.errors.is_empty(), "the settling round errored: {:?}", report.errors);
+    let _ = one_round(&engine);
+    {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let drained = shards.get(&1).expect("shard 1").dirty_objects.len();
+        assert_eq!(
+            drained, 0,
+            "the settling rounds left {drained} dirty objects behind, so point 3 is not the \
+             empty-backlog point it claims to be"
+        );
+    }
+    outstanding.clear();
+    saved_total += check(&engine, "3: after a dumping round", &outstanding, true, start, end);
+    checkpoints += 1;
+
+    outstanding.extend(seed(&engine, STORE, BACKLOG));
+    saved_total += check(&engine, "4: small backlog, large store", &outstanding, false, start, end);
+    checkpoints += 1;
+
+    outstanding.extend(seed(&engine, STORE + BACKLOG, BACKLOG));
+    saved_total += check(&engine, "5: backlog accumulated", &outstanding, false, start, end);
+    checkpoints += 1;
+
+    assert_eq!(checkpoints, 5, "the sequence was supposed to check five points");
+    assert!(
+        saved_total > 0,
+        "across five points the scoped walk skipped no page at all, so the saving this file \
+         exists to price is zero and every figure below is vacuous"
+    );
+    println!("  pages the scoped walk did not visit, summed over the five points: {saved_total}");
+}
+
+/// THE RESTART CASE, DRIVEN. WALK EVERYTHING.
+///
+/// mx#1938 established that dump selection does not survive a restart and flagged it as the
+/// binding constraint on anyone driving more of the round from the dirty set. Driven here: after a
+/// restart the dirty set is empty, so a walk scoped to it visits NOTHING while the full walk
+/// summarises every bucket in the store. Not one bucket missed -- all of them.
+///
+/// So the answer to "walk everything after a restart, or prove it need not" is WALK EVERYTHING,
+/// and this is the measurement that says so rather than the argument.
+///
+/// rust-internal: reads the engine's own load contract, no product behaviour
+#[test]
+fn a_round_immediately_after_a_restart_would_see_no_buckets_at_all() {
+    const RECORDS: usize = 1_200;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (buckets_before, blocks_before) = {
+        let engine = engine_on(dir.path());
+        load_on_range(&engine, NARROW_END_BUCKET);
+        seed(&engine, 0, RECORDS);
+        let (start, end) = routing_range(&engine);
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1");
+        let full = full_live_block_summaries(shard, start, end);
+        let (_scoped, visits) = scoped_live_block_summaries(shard, start, end);
+        assert!(
+            visits > 0,
+            "before the restart the scoped walk must visit something, or the after-figure is not \
+             a change"
+        );
+        (full.len(), full.values().sum::<u64>())
+    };
+    assert!(
+        buckets_before > 0 && blocks_before > 0,
+        "the fixture stored nothing before the restart ({buckets_before} buckets, \
+         {blocks_before} pages)"
+    );
+
+    // The restart: a new engine over the same directories, loaded on the same range.
+    let engine = engine_on(dir.path());
+    load_on_range(&engine, NARROW_END_BUCKET);
+    let (start, end) = routing_range(&engine);
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1");
+    let _released = assert_no_released_bucket_is_dirty(shard);
+
+    let dirty_after = shard.dirty_objects.len();
+    assert_eq!(
+        dirty_after, 0,
+        "the clear-dirty-on-load contract says a load clears every flag, and the shard came back \
+         holding {dirty_after} dirty objects. The rest of this test measures the consequence of \
+         that contract and means nothing without it."
+    );
+
+    let full = full_live_block_summaries(shard, start, end);
+    let (scoped, visits) = scoped_live_block_summaries(shard, start, end);
+    assert!(
+        !full.is_empty(),
+        "the shard came back from the restart holding no live page, so the comparison below is \
+         between two empty sets"
+    );
+    assert!(
+        scoped.is_empty() && visits == 0,
+        "a walk scoped to an empty dirty set has nothing to visit, and this one credited {} \
+         buckets over {visits} visits",
+        scoped.len()
+    );
+    println!(
+        "  after the restart: full walk {} buckets / {} pages, scoped walk {} buckets / {visits} \
+         visits -- the ENTIRE store is in the losing direction",
+        full.len(),
+        full.values().sum::<u64>(),
+        scoped.len()
+    );
+}
+
+// =============================================================================================
+// 4. What it would save, at two sizes
+// =============================================================================================
+
+/// WHAT SCOPING THIS ONE WALK SAVES, COUNTED IN VISITS AT TWO CORPUS SIZES.
+///
+/// VISITS, not allocations: the scoped walk borrows out of `bucket_map` and materialises nothing,
+/// and an allocation-based instrument is blind to exactly that. Counted at the two sizes mx#1934
+/// and mx#1938 used so the figures sit beside theirs, on a shard with NOTHING outstanding -- the
+/// round this file is named for.
+///
+/// THE RESIDUAL. The scoped walk is audited with an instrument it does not feed: the process-wide
+/// live-page scan counter, charged inside `collect_live_block_entries` in another module. Around
+/// a span holding only the scoped walk it reads 0 -- and a 0 cannot be told from an instrument
+/// that is not connected, so the same span is then given a real whole-store walk to see, and has
+/// to recover it exactly.
+///
+/// rust-internal: prices the engine's own maintenance walk, no product behaviour
+#[test]
+fn what_scoping_the_summary_walk_saves_at_two_corpus_sizes() {
+    let mut rows: Vec<(usize, u64, u64, usize)> = Vec::new();
+
+    for records in [SMALL, LARGE] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on_range(&engine, NARROW_END_BUCKET);
+        seed(&engine, 0, records);
+        // Settle, so the round measured has an EMPTY backlog: nothing to dump, nothing to retire.
+        let _ = one_round(&engine);
+        let _ = one_round(&engine);
+        let (start, end) = routing_range(&engine);
+
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1");
+        let _released = assert_no_released_bucket_is_dirty(shard);
+        let outstanding = shard.dirty_objects.len();
+        assert_eq!(
+            outstanding, 0,
+            "{records} records: the settling rounds left {outstanding} dirty objects, so this is \
+             not the empty round it is reported as"
+        );
+
+        // ONE FULL WALK, and -- the point of taking it here -- the NAME the engine charges it
+        // under. The per-site tally is keyed by `file:line` of the caller, so calling the walk on
+        // its own with the tally cleared makes the key SELF-LOCATING: exactly one site is charged
+        // and it is this walk's. Nothing below has to hard-code a line number that drifts.
+        crate::engine::reset_live_block_scan_entries();
+        crate::engine::reset_live_block_scan_sites();
+        let full = full_live_block_summaries(shard, start, end);
+        let one_walk = crate::engine::live_block_scan_entries();
+        let charged = crate::engine::live_block_scan_sites_snapshot();
+        assert_eq!(
+            charged.len(),
+            1,
+            "{records} records: one call of `bucket_storage_summaries` charged {} calling sites, \
+             so the key below is not this walk's: {:?}",
+            charged.len(),
+            charged.keys().collect::<Vec<_>>()
+        );
+        let summary_site = charged.keys().next().expect("exactly one site").clone();
+        assert!(
+            one_walk > 0,
+            "{records} records: the full walk charged nothing, so the instrument is not connected"
+        );
+
+        // THE SCOPED WALK, and the residual around it.
+        crate::engine::reset_live_block_scan_entries();
+        let (scoped, scoped_visits) = scoped_live_block_summaries(shard, start, end);
+        let residual = crate::engine::live_block_scan_entries();
+        assert_eq!(
+            residual, 0,
+            "{records} records: the scoped walk charged {residual} entries to the engine's own \
+             live-page counter. It reads `bucket_map` directly and should charge nothing."
+        );
+        // A 0 residual is the one reading indistinguishable from a disconnected instrument, so
+        // plant a real whole-store walk inside the same span and recover it exactly.
+        //
+        // THE PLANT IS `one_walk`, NOT `collect_live_block_entries(...).len()`, and the difference
+        // is a measurement in itself. A settled shard has RELEASED buckets, and a released bucket
+        // holds no entry in `bucket_map`, so `collect_live_block_entries` walks the index AND then
+        // re-walks the model maps to supplement them -- charging about twice the store to return
+        // one entry per page. Comparing the charge against the returned length is comparing two
+        // different quantities, and the first form of this assertion did exactly that (39,860
+        // charged against 20,000 returned). `one_walk` was charged by the SAME call under the
+        // SAME shard state a moment ago, so it is the plant this span can recover exactly.
+        let _ = full_live_block_summaries(shard, start, end);
+        let recovered = crate::engine::live_block_scan_entries();
+        assert_eq!(
+            recovered, one_walk,
+            "{records} records: a whole-store summary walk charging {one_walk} entries was \
+             planted inside the span that had just read 0, and the instrument recovered \
+             {recovered}. Without this the 0 above says nothing."
+        );
+        assert!(
+            scoped.is_empty() && scoped_visits == 0,
+            "{records} records: the backlog is empty, so the scoped walk has no bucket to visit \
+             and it visited {scoped_visits}"
+        );
+        drop(shards);
+
+        // NOW THE ROUND ITSELF, which is what the saving has to be priced against. One round with
+        // nothing to do, with the whole-call counter and the per-site tally read around it.
+        crate::engine::reset_live_block_scan_entries();
+        crate::engine::reset_live_block_scan_sites();
+        let report = one_round(&engine);
+        let round_entries = crate::engine::live_block_scan_entries();
+        let round_sites = crate::engine::live_block_scan_sites_snapshot();
+        assert!(
+            report.errors.is_empty(),
+            "{records} records: the measured round errored, so every figure it reports measures \
+             nothing: {:?}",
+            report.errors
+        );
+        assert!(
+            round_entries > 0,
+            "{records} records: the round materialised no live-page entry at all"
+        );
+        let summary_charge = round_sites.get(&summary_site).copied().unwrap_or(0);
+        assert!(
+            summary_charge > 0,
+            "{records} records: the round charged NOTHING to {summary_site}, which is the walk \
+             this whole file prices. Either the round stopped calling it or the site key moved."
+        );
+        let calls_per_round = summary_charge as f64 / one_walk as f64;
+
+        println!(
+            "  store {records:>7}: round {round_entries:>9} entries; ONE summary walk \
+             {one_walk:>8} ({:.2}x the record count -- a settled shard has {_released} released \
+             buckets and the supplement re-walks the model maps); the round charges \
+             {summary_charge:>9} to {summary_site} ({calls_per_round:.2} walks); scoped walk \
+             visits {scoped_visits}; this walk is {:.1}% of the round",
+            one_walk as f64 / records as f64,
+            100.0 * summary_charge as f64 / round_entries as f64
+        );
+        for (site, entries) in &round_sites {
+            println!("      {entries:>9}  {site}");
+        }
+        rows.push((records, round_entries, summary_charge, full.len()));
+    }
+
+    let (small_records, small_round, small_saved, _) = rows[0];
+    let (large_records, large_round, large_saved, _) = rows[1];
+    assert!(
+        small_saved > 0 && large_saved > 0,
+        "the scoped walk saved nothing at one of the two sizes ({small_saved}, {large_saved})"
+    );
+
+    let ratio = large_saved as f64 / small_saved as f64;
+    let corpus_ratio = large_records as f64 / small_records as f64;
+    let per_record_small = small_saved as f64 / small_records as f64;
+    let per_record_large = large_saved as f64 / large_records as f64;
+    println!();
+    println!(
+        "  ROUND, nothing pending:   {small_round} -> {large_round} entries \
+         ({:.3}x for a {corpus_ratio:.3}x corpus)",
+        large_round as f64 / small_round as f64
+    );
+    println!(
+        "  SCOPING THIS ONE WALK:    {small_saved} -> {large_saved} entries ({ratio:.3}x), \
+         {:.1}% -> {:.1}% of the round",
+        100.0 * small_saved as f64 / small_round as f64,
+        100.0 * large_saved as f64 / large_round as f64
+    );
+    println!(
+        "  per record of STORE       {per_record_small:.3} -> {per_record_large:.3}"
+    );
+    println!(
+        "  per record of WORK        UNDEFINED -- the backlog is empty and nothing was retired, \
+         asserted above"
+    );
+    // The integral: a store grown to N with one round every k records pays about
+    // `per_record * N^2 / 2k` in this walk alone.
+    let integral = per_record_large * 1_000_000.0 * 1_000_000.0 / (2.0 * 10_000.0);
+    let round_integral = (large_round as f64 / large_records as f64)
+        * 1_000_000.0
+        * 1_000_000.0
+        / (2.0 * 10_000.0);
+    println!(
+        "  INTEGRAL at N=1,000,000, one round every 10,000 records: the whole round \
+         {round_integral:.4e} entries, of which THIS walk {integral:.4e}"
+    );
+
+    // AND A CORRECTION TO THE PUBLISHED FIGURE, because the integral is the number a reader
+    // carries away. mx#1938 states the empty round's integral as "about 28.9 N^2 / 2k =
+    // 1.445e12 at a million records with a round every 10,000". The CONSTANT reproduces -- 28.9
+    // entries per record of store, against 24.9 measured here on a narrow shard -- but the
+    // arithmetic does not: N^2 / 2k at N = 1e6 and k = 1e4 is 5e7, so 28.9 of them is 1.445e9.
+    // The published figure is a thousand times too large. Asserted rather than remarked, with
+    // mx#1938's own constant, so a later reader quoting e12 fails here.
+    const PUBLISHED_PER_RECORD: f64 = 28.9;
+    let published_integral = PUBLISHED_PER_RECORD * 1_000_000.0 * 1_000_000.0 / (2.0 * 10_000.0);
+    println!(
+        "  mx#1938's own constant, its own formula: 28.9 * N^2 / 2k at N=1e6, k=1e4 = \
+         {published_integral:.4e}, not the 1.445e12 it prints"
+    );
+    assert!(
+        (1.0e9..1.0e10).contains(&published_integral),
+        "28.9 * N^2 / 2k at N = 1e6 and k = 1e4 came out {published_integral:.4e}; it is 1.445e9 \
+         and if this arithmetic has moved then so has the correction that goes with it"
+    );
+    assert!(
+        (0.5e9..5.0e9).contains(&round_integral),
+        "the measured round's integral is {round_integral:.4e}. It sits beside mx#1938's 1.445e9 \
+         because the per-record constants are 24.9 and 28.9; a figure outside 0.5e9..5e9 means \
+         the two are no longer measuring the same shape and the comparison has to go."
+    );
+
+    assert!(
+        ratio > 4.0,
+        "the saving is supposed to be store-proportional: {small_saved} -> {large_saved} is \
+         {ratio:.3}x for a corpus {corpus_ratio:.3}x larger. Below 4x it is not the whole-store \
+         term this file claims it is."
+    );
+    assert!(
+        (per_record_large / per_record_small - 1.0).abs() < 0.25,
+        "per record of STORE the saving moved {per_record_small:.3} -> {per_record_large:.3}, \
+         which is more than the 25% a flat per-record term is allowed to wander"
+    );
+    // AND THE HONEST HALF: this walk is a MINORITY of the round. mx#1938 wrote that scoping it
+    // "would take 2,889,724 entries off the empty round at 100,000 records", which is the whole
+    // round's figure. Asserted as a ceiling so a later reader cannot quote the saving as the
+    // round's.
+    let share = large_saved as f64 / large_round as f64;
+    assert!(
+        share < 0.5,
+        "this walk is {:.1}% of the empty round at {large_records} records. If it ever became a \
+         majority the framing above -- that scoping it is a minority of the round's floor -- is \
+         no longer true and the prose has to change with the number.",
+        100.0 * share
+    );
+}
+
+// =============================================================================================
+// 5. The enumeration, held
+// =============================================================================================
+
+/// The text between one call's own parentheses, balanced, so a multi-line call is read whole and
+/// the NEXT call's arguments are not read at all.
+pub(super) fn call_arguments(lines: &[&str], line_index: usize, needle: &str) -> Option<String> {
+    let start_column = lines[line_index].find(needle)? + needle.len();
+    let mut depth = 1i32;
+    let mut out = String::new();
+    let mut column = start_column;
+    for line in lines.iter().skip(line_index).take(40) {
+        let chars: Vec<char> = line.chars().collect();
+        while column < chars.len() {
+            match chars[column] {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(out);
+                    }
+                }
+                _ => {}
+            }
+            out.push(chars[column]);
+            column += 1;
+        }
+        out.push(' ');
+        column = 0;
+    }
+    None
+}
+
+/// THE THREE CALL SITES STILL PASSING `0..u32::MAX`, AND WHY EACH IS RIGHT TO.
+///
+/// Where a page is FILED is decided by whoever rebuilds the bucket index, and each of the three
+/// functions that do takes the routing range as an argument. Enumerated with the compiler --
+/// the three doors into `BlockAddress`'s private routing-bucket field were renamed and rustc was
+/// asked to name every caller, ITERATED to a zero pass because one rename-and-compile pass is not
+/// an enumeration: rustc poisons the type of an expression holding an unresolved method and
+/// suppresses every later use of that value. Pass one named 81 read sites and 72 assign sites,
+/// pass two named 6 more that pass one had suppressed, pass three named none.
+///
+/// Twenty production call sites rebuild the index. When mx#1942 took that enumeration, ELEVEN
+/// passed the shard's own range and NINE passed `0, u32::MAX` -- the recovery, replay,
+/// manifest-install and bulk-flush paths, exactly the paths on which an address can arrive without
+/// a routing bucket of its own. Eight of those nine now pass the shard's range. The total is still
+/// twenty; what moved is the split, 11/9 to 19/1.
+///
+/// THE THREE THAT REMAIN ARE EACH CORRECT AS WRITTEN, for two different reasons.
+///
+/// ONE IS NOT PRODUCTION CODE, which is the thing this scan structurally cannot see.
+/// `lifecycle.rs`'s `test_publish_recovering_shard` is a `#[cfg(test)]` helper, and this scan
+/// excludes test FILES, not `#[cfg(test)]` items inside production files -- so it counted a
+/// test-only helper among the nine production sites. That helper publishes its own shard info with
+/// `start_routing_bucket: 0, end_routing_bucket: u32::MAX` a few lines below the call, so the whole
+/// range IS that shard's own range.
+///
+/// TWO RUN OVER A DECODED MANIFEST INDEX, and there the whole range is load-bearing.
+/// `install_bucket_dump_manifest` and the durable-manifest recovery base in `lifecycle.rs` both
+/// call `rebuild_bucket_block_ownership` on the output of `decode_index_bytes` -- a WHOLE-SHARD
+/// image carrying explicit routing buckets from whatever range the source shard ran on. That
+/// rebuild does not merely PLACE unrouted pages by the range it is handed, it also FILTERS on it,
+/// so the installing shard's range silently deletes every page whose source bucket falls outside
+/// it. Measured rather than reasoned: with the target's range passed,
+/// `storage_merged_dump_load_policy_coordinates_dump_load_replay_and_index_gc` -- source on
+/// `load_shard` (0..u32::MAX), restore target on `0..16_383` -- read `merged-a` back as None. A
+/// whole-shard image is installed whole or it is truncated; there is no third option.
+///
+/// So the nine were never one class, and the split is not by file or by callee. It is: does this
+/// rebuild run over THIS shard's own live model maps (the shard's range is right) or over a
+/// FOREIGN whole-shard image (the whole range is right)?
+///
+/// HELD AS A LIST, not as a count, because a count agrees with itself after a site moves. If a
+/// site here is FIXED, delete it from this list. If one is ADDED, this fails and names it.
+///
+/// AND THE LIST IS WHAT MAKES THIS NON-VACUOUS. It is compared by equality, not by containment,
+/// and it is not empty -- so a matcher that broke and found nothing produces `[]`, which fails
+/// against a one-element list rather than passing as "no offending sites". That is the property an
+/// empty expected list would have destroyed, which is why the remaining entry is kept in the list
+/// rather than the assertion being turned into "must be empty". The floors below cover the other
+/// direction.
+///
+/// THE CONTROL IS A SECOND IMPLEMENTATION. The same enumeration was taken outside the crate, in
+/// Python, over the same source, and produced the same 20 / 11 / 9 split with the same seven
+/// file-and-callee rows when mx#1942 wrote it.
+///
+/// rust-internal: reads this crate's own call sites, no product behaviour
+#[test]
+fn the_three_rebuild_call_sites_still_on_the_whole_range_are_each_right_to_be() {
+    use std::path::Path;
+
+    /// Every rebuild this scan can see that passes `0, u32::MAX`, as `file :: callee x count`.
+    ///
+    /// Keyed by file and callee rather than by line, so a sibling change that moves a line does
+    /// not fail this and a change that ADDS or REMOVES one of these calls does.
+    ///
+    /// Three entries, and the note above says why each is right. Two are the manifest-decode
+    /// rebuilds, where the whole range is what keeps a whole-shard image whole; one is
+    /// `test_publish_recovering_shard`, a `#[cfg(test)]` helper this file-level scan cannot
+    /// distinguish from production code.
+    const WHOLE_RANGE_SITES: &[&str] = &[
+        "engine/bucket_dump_manifest_methods.rs :: rebuild_bucket_block_ownership x1",
+        "engine/engine_lifecycle.rs :: promote_model_maps_to_bucket_index_authority x1",
+        "engine/engine_lifecycle.rs :: rebuild_bucket_block_ownership x1",
+    ];
+    const REBUILDS: [&str; 3] = [
+        "rebuild_bucket_block_ownership(",
+        "rebuild_bucket_first_index(",
+        "promote_model_maps_to_bucket_index_authority(",
+    ];
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut pending = vec![root.clone()];
+    let mut files_scanned = 0usize;
+    let mut lines_scanned = 0usize;
+    let mut excluded = 0usize;
+    let mut whole_range: Vec<String> = Vec::new();
+    let mut shard_range: Vec<String> = Vec::new();
+
+    while let Some(path) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                pending.push(entry_path);
+                continue;
+            }
+            if entry_path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let display = entry_path.display().to_string();
+            // A test naming one of these is not production code rebuilding an index. Taken out,
+            // and the removals COUNTED, so an exclusion that started matching everything shows up
+            // as a denominator that collapsed rather than as a clean pass.
+            if display.contains("/tests/") || display.ends_with("tests.rs") {
+                excluded += 1;
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&entry_path) else {
+                continue;
+            };
+            files_scanned += 1;
+            let lines: Vec<&str> = text.lines().collect();
+            lines_scanned += lines.len();
+            let relative = display
+                .rsplit_once("/src/")
+                .map(|(_, tail)| tail.to_string())
+                .unwrap_or(display.clone());
+            for (index, line) in lines.iter().enumerate() {
+                for needle in REBUILDS {
+                    if !line.contains(needle) {
+                        continue;
+                    }
+                    // The definition is not a call of itself.
+                    if line.contains(&format!("fn {}", &needle[..needle.len() - 1])) {
+                        continue;
+                    }
+                    let Some(arguments) = call_arguments(&lines, index, needle) else {
+                        continue;
+                    };
+                    let site = format!("{relative} :: {}", &needle[..needle.len() - 1]);
+                    // BOTH OF THESE COST A RED RUN, and both are recorded because a later reader
+                    // will reach for the same two shortcuts.
+                    //
+                    // A FIXED-LINE WINDOW IS TOO WIDE. `recovery_sweep_compact.rs` rebuilds the
+                    // first index on `0, u32::MAX` and then rebuilds ownership on the shard's own
+                    // range two lines later, so any window big enough to hold a multi-line call
+                    // also holds the NEXT call's arguments and reads the first as a shard-range
+                    // site. The arguments are taken by balancing parentheses instead.
+                    //
+                    // AND `u32::MAX` FIRST IS TOO EAGER. `engine.rs` passes
+                    // `info.start_routing_bucket` with `.unwrap_or(u32::MAX)` beside it as the
+                    // default for a shard whose info is missing, so its arguments hold BOTH
+                    // spellings. A call that names `start_routing_bucket` at all is reading the
+                    // shard's range.
+                    if arguments.contains("start_routing_bucket") {
+                        shard_range.push(site);
+                    } else if arguments.contains("u32::MAX") {
+                        whole_range.push(site);
+                    }
+                }
+            }
+        }
+    }
+
+    // VACUITY FLOORS, before any verdict. A scan that stopped finding files, or an exclusion that
+    // started matching everything, reads exactly like a tree with no offending site left in it.
+    assert!(
+        files_scanned > 80,
+        "the scan read {files_scanned} production .rs files under {}; below 80 it has stopped \
+         reading the crate and every list below is empty for the wrong reason",
+        root.display()
+    );
+    assert!(
+        lines_scanned > 100_000,
+        "the scan read {lines_scanned} lines; below 100,000 it is not reading this crate"
+    );
+    assert!(
+        excluded > 10,
+        "the scan excluded {excluded} test files; this crate has more than ten, so an exclusion \
+         matching fewer means the matcher moved"
+    );
+    let total = whole_range.len() + shard_range.len();
+    assert!(
+        total >= 15,
+        "the scan found {total} rebuild call sites in all; there were 20 when this was written \
+         and below 15 the matcher is finding something other than the calls"
+    );
+    // THE FLOOR THAT MOVED WITH THE FIX. Before it, 11 sites read the shard's range; after it, 19.
+    // A floor left at the old number would have gone on passing while the argument test quietly
+    // stopped recognising a shard-range call and dropped those sites into NEITHER list -- which
+    // would also empty `whole_range` and, with an empty expected list, have read as a clean pass.
+    //
+    // Set BELOW the current 19 on purpose: retiring a rebuild call site lowers this count BY
+    // DESIGN, and a floor that forbids that would fail the next sibling who legitimately removes
+    // one. 15 is low enough to allow four removals and high enough that a matcher which stopped
+    // recognising the argument -- which would take this to roughly zero -- still fails here.
+    assert!(
+        shard_range.len() >= 13,
+        "only {} rebuild call sites read the shard's own range; there were 17 after six of the \
+         nine were reconciled and three were kept. Below 13, either several were retired at once \
+         or the `start_routing_bucket` test has stopped recognising them -- and in the second case \
+         every list above is wrong for a reason that does not show up as a failure anywhere else.",
+        shard_range.len()
+    );
+
+    whole_range.sort();
+    shard_range.sort();
+    println!(
+        "  {files_scanned} files / {lines_scanned} lines scanned, {excluded} test files excluded"
+    );
+    println!("  rebuild call sites: {total} total, {} on the shard's own range, {} on 0..u32::MAX",
+        shard_range.len(),
+        whole_range.len()
+    );
+
+    // Collapse to `file :: callee xN`, so a moved line is not a failure and an added or removed
+    // call is.
+    let mut counted: BTreeMap<String, usize> = BTreeMap::new();
+    for site in &whole_range {
+        *counted.entry(site.clone()).or_default() += 1;
+    }
+    let observed: Vec<String> = counted
+        .iter()
+        .map(|(site, count)| format!("{site} x{count}"))
+        .collect();
+    for site in &observed {
+        println!("    0..u32::MAX  {site}");
+    }
+
+    let mut expected_sorted: Vec<String> =
+        WHOLE_RANGE_SITES.iter().map(|s| s.to_string()).collect();
+    expected_sorted.sort();
+    assert_eq!(
+        observed, expected_sorted,
+        "the set of rebuild call sites filing pages under `0..u32::MAX` has moved.\n\
+         If you FIXED one -- passed the shard's own range, which is what every other caller does \
+         -- delete it from WHOLE_RANGE_SITES; that is the change this file exists to make safe, \
+         and `the_two_ranges_still_place_a_block_differently_and_the_summary_walk_follows_the_filing` \
+         is the measurement that says it works.\n\
+         If you ADDED one, it is a new path on which a page can be filed under a bucket the dirty \
+         set does not name, and a walk scoped to the dirty set would silently miss it."
+    );
+}

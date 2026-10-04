@@ -127,3 +127,391 @@ pub(super) fn command_key(command: &Command) -> Option<&str> {
         | Command::ContextQuerySummaries { .. }
         | Command::ContextQuerySummaryVectors { .. }
         | Command::ContextWriteCompressionEvent { .. }
+        | Command::ContextQueryCompressionEvents { .. }
+        | Command::ContextCompressEvents { .. }
+        | Command::ContextResourceBlobBegin { .. }
+        | Command::ContextResourceBlobAppend { .. }
+        | Command::ContextResourceBlobCommit { .. }
+        | Command::ContextResourceBlobPut { .. }
+        | Command::ContextResourceBlobFetch { .. }
+        | Command::ContextResourceBlobSweep { .. }
+        | Command::ContextQueryNodeContext { .. } => None,
+    }
+}
+
+pub(crate) fn command_routing_key(command: &Command) -> Option<String> {
+    command_key(command)
+        .map(str::to_string)
+        .or_else(|| context_command_key(command))
+}
+
+pub(super) fn context_command_key(command: &Command) -> Option<String> {
+    match command {
+        Command::ContextUpsertNode { tenant_hash, node } => {
+            Some(context_node_key(*tenant_hash, node.node_hash))
+        }
+        Command::ContextGetNode {
+            tenant_hash,
+            node_hash,
+        } => Some(context_node_key(*tenant_hash, *node_hash)),
+        Command::ContextGetNodes {
+            tenant_hash,
+            node_hashes,
+        } => node_hashes
+            .first()
+            .map(|node_hash| context_node_key(*tenant_hash, *node_hash)),
+        Command::ContextQuerySummaryVectors {
+            tenant_hash,
+            node_hashes,
+            level,
+            ..
+        } => node_hashes
+            .first()
+            .map(|node_hash| context_summary_key(*tenant_hash, *node_hash, *level)),
+        Command::ContextWriteEvent {
+            tenant_hash,
+            node_hash,
+            ..
+        }
+        | Command::ContextWriteExtractedEvent {
+            tenant_hash,
+            node_hash,
+            ..
+        }
+        | Command::ContextQueryEvents {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_event_key(*tenant_hash, *node_hash)),
+        Command::ContextWriteIndexRef {
+            tenant_hash,
+            index_name,
+            index_value_hash,
+            scope_hash,
+            ..
+        }
+        | Command::ContextQueryIndex {
+            tenant_hash,
+            index_name,
+            index_value_hash,
+            scope_hash,
+            ..
+        } => Some(context_index_key(
+            *tenant_hash,
+            index_name,
+            *index_value_hash,
+            *scope_hash,
+        )),
+        Command::ContextQueryIndexIntersection {
+            tenant_hash,
+            predicates,
+            ..
+        } => predicates.first().map(|predicate| {
+            context_index_key(
+                *tenant_hash,
+                &predicate.index_name,
+                predicate.index_value_hash,
+                predicate.scope_hash,
+            )
+        }),
+        Command::ContextWritePackAudit { tenant_hash, audit } => {
+            Some(context_audit_key(*tenant_hash, audit.session_hash))
+        }
+        Command::ContextQueryPackAudit {
+            tenant_hash,
+            session_hash,
+            ..
+        } => Some(context_audit_key(*tenant_hash, *session_hash)),
+        Command::ContextMarkSummaryDirty {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_dirty_key(*tenant_hash, *node_hash)),
+        Command::ContextQuerySummaryDirty {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_dirty_key(*tenant_hash, *node_hash)),
+        Command::ContextMarkEmbeddingDirty {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_embedding_dirty_key(*tenant_hash, *node_hash)),
+        Command::ContextQueryEmbeddingDirty {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_embedding_dirty_key(*tenant_hash, *node_hash)),
+        Command::ContextUpsertEntity {
+            tenant_hash,
+            entity,
+        } => Some(context_entity_key(
+            *tenant_hash,
+            entity.node_hash,
+            entity.entity_hash,
+        )),
+        Command::ContextGetEntity {
+            tenant_hash,
+            node_hash,
+            entity_hash,
+        } => Some(context_entity_key(*tenant_hash, *node_hash, *entity_hash)),
+        Command::ContextQueryEntities {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_entity_collection_key(*tenant_hash, *node_hash)),
+        Command::ContextUpsertChildRef {
+            tenant_hash,
+            child_ref,
+        } => Some(context_child_key(*tenant_hash, child_ref.parent_hash)),
+        Command::ContextQueryChildren {
+            tenant_hash,
+            parent_hash,
+            ..
+        } => Some(context_child_key(*tenant_hash, *parent_hash)),
+        // Keyed by the NODE: the vector lives on the node record.
+        Command::ContextSetNodeEmbedding {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_node_key(*tenant_hash, *node_hash)),
+        Command::ContextTraverseTree {
+            tenant_hash,
+            start_node_hash,
+            ..
+        } => Some(context_child_key(*tenant_hash, *start_node_hash)),
+        Command::ContextUpsertSummary {
+            tenant_hash,
+            summary,
+        } => Some(context_summary_key(
+            *tenant_hash,
+            summary.node_hash,
+            summary.level,
+        )),
+        Command::ContextQuerySummaries {
+            tenant_hash,
+            node_hash,
+            level,
+            ..
+        } => Some(context_summary_key(*tenant_hash, *node_hash, *level)),
+        Command::ContextWriteCompressionEvent { tenant_hash, event } => {
+            Some(context_compression_key(*tenant_hash, event.node_hash))
+        }
+        Command::ContextQueryCompressionEvents {
+            tenant_hash,
+            node_hashes,
+            ..
+        } => node_hashes
+            .first()
+            .map(|node_hash| context_compression_key(*tenant_hash, *node_hash)),
+        Command::ContextCompressEvents {
+            tenant_hash,
+            node_hash,
+            ..
+        }
+        | Command::ContextQueryNodeContext {
+            tenant_hash,
+            node_hash,
+            ..
+        } => Some(context_compression_key(*tenant_hash, *node_hash)),
+        _ => None,
+    }
+}
+
+pub(super) fn context_node_key(tenant_hash: u64, node_hash: u64) -> String {
+    format!("ctx:node:{tenant_hash}:{node_hash}")
+}
+
+pub(super) fn context_event_key(tenant_hash: u64, node_hash: u64) -> String {
+    format!("ctx:event:{tenant_hash}:{node_hash}")
+}
+
+pub(super) fn context_index_key(
+    tenant_hash: u64,
+    index_name: &str,
+    index_value_hash: u64,
+    scope_hash: u64,
+) -> String {
+    format!("ctxidx:{tenant_hash}:{index_name}:{index_value_hash}:{scope_hash}")
+}
+
+pub(super) fn context_audit_key(tenant_hash: u64, session_hash: u64) -> String {
+    format!("ctx:audit:{tenant_hash}:{session_hash}")
+}
+
+pub(super) fn context_dirty_key(tenant_hash: u64, node_hash: u64) -> String {
+    format!("ctx:dirty:{tenant_hash}:{node_hash}")
+}
+
+pub(super) fn context_embedding_dirty_key(tenant_hash: u64, node_hash: u64) -> String {
+    format!("ctx:embdirty:{tenant_hash}:{node_hash}")
+}
+
+pub(super) fn context_entity_key(tenant_hash: u64, node_hash: u64, entity_hash: u64) -> String {
+    format!("ctx:entity:{tenant_hash}:{node_hash}:{entity_hash}")
+}
+
+pub(super) fn context_entity_collection_key(tenant_hash: u64, node_hash: u64) -> String {
+    format!("ctx:entity:{tenant_hash}:{node_hash}")
+}
+
+pub(super) fn context_child_key(tenant_hash: u64, parent_hash: u64) -> String {
+    format!("ctx:child:{tenant_hash}:{parent_hash}")
+}
+
+pub(super) fn context_embedding_key(tenant_hash: u64, ref_hash: u64) -> String {
+    format!("ctx:embedding:{tenant_hash}:{ref_hash}")
+}
+
+pub(super) fn context_summary_key(tenant_hash: u64, node_hash: u64, level: u32) -> String {
+    format!("ctx:summary:{tenant_hash}:{node_hash}:{level}")
+}
+
+pub(super) fn context_compression_key(tenant_hash: u64, node_hash: u64) -> String {
+    format!("ctx:compress:{tenant_hash}:{node_hash}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_full_drain_drops_commands_that_carry_no_routing_key() {
+        // The drop decision hashes a routing key and answered "not dropped" for every command
+        // that has none -- the resource-blob upload path, sequence batch queries,
+        // node-embedding reads. A table an operator had drained to 100 went on sending them.
+        let keyless = Command::ContextResourceBlobPut {
+            tenant_hash: 7,
+            payload_base64: String::new(),
+        };
+        assert_eq!(
+            command_routing_key(&keyless),
+            None,
+            "premise: this command carries no routing key to hash"
+        );
+        assert!(
+            command_is_dropped(&keyless, 100),
+            "a full drain has to drop a command with no key too, or the drain is not full"
+        );
+
+        // Below a full drain the leak stands on purpose: shedding is per key, and a command
+        // with nothing to hash has no share to shed.
+        assert!(!command_is_dropped(&keyless, 99));
+
+        // A keyed command is unaffected in both directions.
+        let keyed = Command::StringGet {
+            key: "k".to_string(),
+        };
+        assert!(command_is_dropped(&keyed, 100));
+        assert!(!command_is_dropped(&keyed, 0));
+    }
+
+    #[test]
+    fn is_write_agrees_with_the_engine_for_context_writes() {
+        // Regression: client is_write drives pre-write topology refresh + write retry budget and
+        // must match the engine's is_write_command. A previously-omitted context write must now
+        // classify as a write; a context read must still be a read.
+        let context_write = Command::ContextCompressEvents {
+            tenant_hash: 1,
+            node_hash: 2,
+            source_start_ms: 0,
+            source_end_ms: 100,
+            compressed_time_ms: 50,
+            max_source_events: None,
+            min_confidence: 0.0,
+            min_importance: 0.0,
+        };
+        assert!(
+            is_write(&context_write),
+            "ContextCompressEvents mutates; the client must treat it as a write"
+        );
+        assert_eq!(
+            is_write(&context_write),
+            crate::engine::is_write_command(&context_write),
+            "client is_write must stay in lockstep with the engine's is_write_command"
+        );
+
+        let context_read = Command::ContextGetNode {
+            tenant_hash: 1,
+            node_hash: 2,
+        };
+        assert!(
+            !is_write(&context_read),
+            "ContextGetNode is read-only; the client must not treat it as a write"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shed_shape {
+    use super::*;
+
+    /// How many of `batches` batches of `batch` keys contain at least one key
+    /// the rate sheds, and what share of individual keys it sheds.
+    fn shed_rates(percent: u8, batch: usize, batches: usize) -> (f64, f64) {
+        let mut batches_touched = 0usize;
+        let mut keys_shed = 0usize;
+        let mut keys_total = 0usize;
+        for b in 0..batches {
+            let commands: Vec<Command> = (0..batch)
+                .map(|i| Command::CommonExists {
+                    key: format!("tenant/{b}/key-{i}"),
+                })
+                .collect();
+            keys_total += commands.len();
+            let here = commands
+                .iter()
+                .filter(|command| command_is_dropped(command, percent))
+                .count();
+            keys_shed += here;
+            if here > 0 {
+                batches_touched += 1;
+            }
+        }
+        (
+            100.0 * keys_shed as f64 / keys_total as f64,
+            100.0 * batches_touched as f64 / batches as f64,
+        )
+    }
+
+    #[test]
+    fn the_rate_is_per_key_and_a_batch_multiplies_it() {
+        // Not a claim about the fix -- a claim about why one was needed. The
+        // rate really is per key, and the chance a batch contains at least one
+        // shed key climbs with its size. Refusing the batch on that basis is
+        // what turned 1% into most of the traffic.
+        let (keys, touched) = shed_rates(1, 100, 2_000);
+        assert!(
+            (0.5..2.0).contains(&keys),
+            "keys shed should track the rate, got {keys:.1}%"
+        );
+        assert!(
+            touched > 40.0,
+            "a hundred-key batch should usually contain a shed key at 1%, got {touched:.1}%"
+        );
+
+        // And at a rate an operator might actually pick for load shedding,
+        // nearly every large batch contains one.
+        let (_, touched) = shed_rates(5, 100, 2_000);
+        assert!(
+            touched > 90.0,
+            "at 5% nearly every hundred-key batch contains a shed key, got {touched:.1}%"
+        );
+    }
+
+    #[test]
+    fn a_single_key_is_shed_at_the_rate_it_was_given() {
+        for &percent in &[1u8, 10, 25] {
+            let (keys, batches) = shed_rates(percent, 1, 4_000);
+            assert!(
+                (keys - batches).abs() < f64::EPSILON,
+                "a batch of one is the key itself"
+            );
+            let expected = percent as f64;
+            assert!(
+                (keys - expected).abs() < 3.0,
+                "rate {percent} shed {keys:.1}% of keys"
+            );
+        }
+    }
+}
