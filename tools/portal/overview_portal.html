@@ -340,3 +340,1372 @@
   .tile span{font-size:12.5px;color:var(--muted);line-height:1.45;display:block}
   .packitem{border:1px solid var(--line);border-left:3px solid var(--accent);border-radius:7px;
             padding:11px 13px;margin-bottom:9px;background:var(--panel-2)}
+  .packitem .meta{font-size:11.5px;color:var(--faint);margin-bottom:5px;
+                  font-family:"IBM Plex Mono",monospace}
+  .packitem p{margin:0;font-size:13.5px;line-height:1.55;overflow-wrap:anywhere}
+  .tabs{display:flex;gap:4px;border-bottom:1px solid var(--line);margin-bottom:16px;flex-wrap:wrap}
+  .tabs button{background:none;border:0;border-bottom:2px solid transparent;color:var(--muted);
+               padding:8px 12px;font-weight:550;font-size:13.5px;margin-bottom:-1px;
+               border-radius:0}
+  .tabs button[aria-selected=true]{color:var(--accent);border-bottom-color:var(--accent)}
+  .tabs button[data-badge]:not([data-badge=""])::after{content:attr(data-badge);
+      margin-left:6px;background:var(--accent);color:var(--bg);border-radius:9px;
+      padding:0 6px;font-size:11px;font-weight:650;vertical-align:1px}
+  .pane[hidden]{display:none}
+  .polrow{display:grid;grid-template-columns:1fr auto auto;gap:10px;align-items:center;
+          padding:9px 0;border-bottom:1px solid var(--line)}
+  .polrow:last-child{border-bottom:0}
+  .polrow .n{font-family:"IBM Plex Mono",monospace;font-size:12.5px;overflow-wrap:anywhere}
+  .polrow .d{grid-column:1/-1;font-size:12.5px;color:var(--faint);line-height:1.5;
+             margin-top:-4px;max-width:78ch}
+  .polrow input[type=text],.polrow select{width:120px;margin:0}
+  .polrow.locked{opacity:.72}
+  .src{font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
+       border-radius:4px;padding:2px 6px;background:var(--line);color:var(--muted)}
+  .src.user{background:var(--accent-soft);color:var(--accent)}
+  .src.tenant{background:var(--warn-soft);color:var(--warn)}
+  .opgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:7px;
+          margin-bottom:6px}
+  .opbtn{text-align:left;background:var(--panel-2);color:var(--ink);border:1px solid var(--line);
+         border-radius:7px;padding:8px 10px;cursor:pointer;font-size:13px;font-weight:550;
+         font-family:"IBM Plex Mono",monospace}
+  .opbtn:hover{border-color:var(--accent)}
+  .opbtn[aria-pressed=true]{border-color:var(--accent);background:var(--accent-soft);
+                            color:var(--accent)}
+  .opbtn.danger[aria-pressed=true]{border-color:var(--crit);background:var(--crit-soft);
+                                   color:var(--crit)}
+  .opgroup{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.05em;
+           color:var(--faint);margin:12px 0 6px}
+  .opform{border:1px solid var(--line);border-radius:9px;padding:14px 16px;margin-top:12px;
+          background:var(--panel-2)}
+  .opform h3{margin:0 0 4px;font-size:15px;font-weight:650}
+  .opform .route{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--muted);
+                 margin-bottom:8px}
+  .opform .route .scope{color:var(--faint)}
+  .mblock{border:1px solid var(--line);border-radius:9px;padding:13px 15px;margin-bottom:11px;
+          background:var(--panel-2)}
+  .mblock h3{margin:0 0 3px;font-size:14.5px;font-weight:650;display:flex;gap:9px;
+             align-items:baseline;flex-wrap:wrap}
+  .mblock h3 .cur{font-family:"IBM Plex Mono",monospace;font-size:12px;color:var(--muted);
+                  font-weight:400}
+  .mblock .mnote{font-size:13px;color:var(--muted);line-height:1.5;margin:9px 0 0;max-width:70ch}
+  .mrow{display:flex;gap:9px;align-items:center;flex-wrap:wrap;margin-top:10px}
+  .mrow select,.mrow input[type=text]{flex:1 1 240px;width:auto;margin:0}
+  .mrow button{flex:0 0 auto}
+  .mstore{font-size:12.5px;color:var(--faint);margin-top:9px;line-height:1.5}
+  .mmeas{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:11px}
+  .mmeas th{text-align:left;font-weight:600;color:var(--muted);padding:4px 10px 4px 0;
+            white-space:nowrap;font-size:11px;text-transform:uppercase;letter-spacing:.04em}
+  .mmeas td{padding:5px 10px 5px 0;border-top:1px solid var(--line);
+            font-variant-numeric:tabular-nums;white-space:nowrap}
+  .mmeas td.name{font-family:"IBM Plex Mono",monospace;font-size:11.5px;white-space:normal;
+                 overflow-wrap:anywhere;width:99%}
+  .mmeas tr.chosen td{background:var(--accent-soft)}
+  .mmeas tr.chosen td.name{font-weight:650}
+  .mmeas .best{color:var(--ok);font-weight:650}
+  .mstore b{color:var(--muted);font-weight:600}
+  .mwarn{border:1px solid var(--crit);background:var(--crit-soft);border-radius:8px;
+         padding:11px 13px;margin-top:11px;font-size:13px;line-height:1.55;max-width:78ch}
+  .mwarn b{display:block;margin-bottom:4px;font-size:13.5px}
+  .upl{border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin-top:9px;
+       background:var(--panel-2)}
+  .upl-head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+  .upl-name{font-family:"IBM Plex Mono",monospace;font-size:12.5px;overflow-wrap:anywhere;
+            flex:1 1 auto;min-width:0}
+  .upl-size{font-size:12px;color:var(--faint);font-variant-numeric:tabular-nums}
+  .upl-bar{height:5px;background:var(--line);border-radius:4px;overflow:hidden;margin-top:8px}
+  .upl-bar>i{display:block;height:100%;background:var(--accent);width:0;transition:width .2s linear}
+  .upl.done .upl-bar>i{background:var(--ok)}
+  .upl.failed .upl-bar>i{background:var(--crit)}
+  .upl-detail{font-size:12.5px;color:var(--muted);margin-top:7px;overflow-wrap:anywhere}
+  .upl-actions{margin-top:8px}
+  /* API page */
+  .route{border-bottom:1px solid var(--line);padding:14px 0}
+  .route:last-child{border-bottom:0}
+  .route-head{display:flex;gap:10px;align-items:baseline;flex-wrap:wrap}
+  .verb{font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:700;letter-spacing:.04em;
+        padding:2px 7px;border-radius:4px;background:var(--line);color:var(--muted)}
+  .verb.GET{background:var(--accent-soft);color:var(--accent)}
+  .verb.POST{background:var(--ok-soft);color:var(--ok)}
+  .verb.PUT{background:var(--warn-soft);color:var(--warn)}
+  .route-path{font-family:"IBM Plex Mono",monospace;font-size:13.5px;font-weight:600;
+              overflow-wrap:anywhere}
+  .route-live{font-size:11.5px;color:var(--muted);font-variant-numeric:tabular-nums}
+  .route-live.bad{color:var(--danger)}
+  .route-live.quiet{opacity:.6}
+  .route-scope{margin-left:auto;font-size:11.5px;font-family:"IBM Plex Mono",monospace;
+               color:var(--faint);white-space:nowrap}
+  .route p{margin:6px 0 0;font-size:13.5px;color:var(--muted);line-height:1.55;max-width:78ch}
+  .route .curl{margin-top:9px}
+  .route pre{margin-top:8px;display:none}
+  .route.open pre{display:block}
+  .visually-hidden{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;
+                   clip:rect(0 0 0 0);white-space:nowrap;border:0}
+
+</style>
+</head>
+<body>
+<main class="wrap">
+
+  <header>
+    <h1>MatrixArk</h1>
+    <span class="conn" role="status" aria-live="polite"><span id="dot" class="dot"></span><span id="conn">connecting…</span></span>
+  </header>
+  <nav class="portalnav">
+    <a href="/v1/admin" aria-current="page">Overview</a>
+    <a href="/v1/admin/onebox">One-box</a>
+    <a href="/v1/admin/setup">Setup &amp; metrics</a>
+    <a href="/v1/admin/catalog">Skills &amp; resources</a>
+    <a href="/v1/admin/explore">Explore</a>
+    <a href="/v1/admin/mem0">mem0 API</a>
+    <a href="/v1/admin/ingestion">Ingestion</a>
+    <a href="/v1/admin/portal">API keys</a>
+    <a href="/v1/admin/api">API</a>
+    <div class="livestrip" id="liveStrip" hidden>
+      <a class="live-seg" href="/v1/admin/setup#encoding" id="liveEnc" hidden></a>
+      <a class="live-seg" href="/v1/admin/ingestion" id="liveImp" hidden></a>
+      <a class="live-seg" href="/v1/admin/setup#traffic" id="liveReq" hidden></a>
+      <a class="live-seg warn" href="/v1/admin/setup#warnings" id="liveWarn" hidden></a><span class="live-seg" id="liveNode" hidden></span><a class="live-seg warn" href="/v1/admin/setup#awaitingRestart" id="liveWaiting" hidden></a>
+      <button class="live-seg" id="liveCalls" type="button" aria-expanded="false"
+              aria-controls="callLog" title="What this page has asked the gateway, and what came back"></button>
+      <span class="live-dot" id="liveDot" title="live"></span>
+    </div>
+  </nav>
+  <div class="calllog" id="callLog" hidden>
+    <table class="inv"><thead><tr><th>When</th><th>Call</th><th>Answered</th><th>Took</th></tr>
+      </thead><tbody id="callLogRows"></tbody></table>
+  </div>
+  <p class="lede">Where this deployment stands. Every item below fails quietly on its own — an
+    unconfigured model still answers 200, an unset ingestion root only surfaces when an import is
+    refused — so they are worth reading once even when nothing looks wrong.</p>
+
+  <div class="summary" id="summary"></div>
+
+  <section>
+    <div class="sechead"><h2>Access</h2><span class="aux"><label class="check"><input type="checkbox" id="remember"> remember for this browser tab</label></span></div>
+    <label for="key">Admin API key</label>
+    <input id="key" type="password" placeholder="Key carrying an admin scope" autocomplete="off" spellcheck="false">
+    <p class="hint">No key yet? <a href="/v1/admin/portal#firstkey">Where the first one comes from</a>
+      — no page can mint it; it takes one command where the gateway runs.</p>
+    <div class="hint">Reading this page needs nothing; the checklist needs an admin-scoped key.</div>
+  </section>
+
+  <section id="importsSection" hidden>
+    <h2>Import in progress <span class="aux" id="importsAux"></span></h2>
+    <div id="imports"></div>
+  </section>
+
+  <section>
+    <div class="sechead"><h2>Setup</h2><span class="aux"><label class="check"><input type="checkbox" id="autoOverview" checked> auto-refresh</label>
+      <span id="progressText" style="margin-left:12px"></span></span></div>
+    <div class="progress"><i id="progressBar" style="width:0%"></i></div>
+    <div id="checks"><div class="empty">Enter an admin key to check this deployment.</div></div>
+  </section>
+
+  <section id="encodingSection" hidden>
+    <h2>Encoding <span class="aux" id="encodingAux"></span></h2>
+    <div id="encodingBody"></div>
+  </section>
+
+  <section>
+    <div class="sechead"><h2>Diagnostics</h2><span class="aux"><button class="link" id="copyDiag" type="button">copy</button>
+      <button class="link" id="downloadDiag" type="button">download</button></span></div>
+    <p class="hint" style="margin-top:0">Everything on this page plus the effective configuration
+      and the current counters, as one JSON document — the thing to attach to a support request.
+      Secrets are never in it: the configuration half reports whether a key resolves, never its
+      value.</p>
+    <div id="diagMsg" role="status" aria-live="polite"></div>
+  </section>
+
+  <section>
+    <h2>Go to</h2>
+    <div class="tiles">
+      <a class="tile" href="/v1/admin/setup"><b>Setup &amp; metrics</b><span>Choose the models, store the provider key, probe the endpoints, watch the traffic.</span></a>
+      <a class="tile" href="/v1/admin/catalog"><b>Skills &amp; resources</b><span>What this deployment holds, and the stored text behind any entry.</span></a>
+      <a class="tile" href="/v1/admin/explore"><b>Explore</b><span>Run a real retrieve, read a memory, ingest a note.</span></a>
+      <a class="tile" href="/v1/admin/ingestion"><b>Ingestion</b><span>Import a directory of documents and watch the job.</span></a>
+      <a class="tile" href="/v1/admin/portal"><b>API keys</b><span>Create, rotate and revoke keys; per-key usage.</span></a>
+    </div>
+  </section>
+
+</main>
+<script>
+/* Helpers every page may call, placed before the page's own script.
+
+   This one lived in the nav block, which is emitted AFTER the page script. Three pages
+   called it from their own script and read as working, because a browser runs both blocks
+   before anyone clicks anything. The cost only showed when something ran a page's script on
+   its own: the call threw, the browse path caught it along with everything else, and the
+   screen said "Could not reach the gateway" about a gateway it had never asked. A helper
+   that is shared is defined where every caller can already see it. */
+  window.__matrixarkCopyText = function (text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text).then(
+          function () { return true; }, function () { return false; });
+      }
+    } catch (e) { /* falls through to the failure below */ }
+    return Promise.resolve(false);
+  };
+
+  window.__matrixarkWhy = function (body, fallback) {
+    body = body || {};
+    var text = body.detail || body.error || fallback;
+    if (body.required && body.required.length) {
+      text += " — this needs " + [].concat(body.required).join(" or ");
+    }
+    /* A backend failure now answers with a sentence that deliberately says nothing about the
+       inside of the deployment, and a token naming the log entry that does. Showing the token is
+       the whole point of it: without it the reader has a polite sentence and no way to get any
+       further, and an operator has a log they cannot tie to the report. */
+    if (body.incident) {
+      text += " — incident " + body.incident;
+    }
+    return text;
+  };
+
+  window.__matrixarkNeverArrived = function (e) {
+    /* True when the request never left. A status means it did leave and was answered, and any
+       other throw happened here, with the answer already in hand. The messages fetch itself
+       produces are a short known set; anything else is this page's own. */
+    if (typeof e === "number") { return false; }
+    var text = e && e.message ? String(e.message) : (e == null ? "" : String(e));
+    return !text
+      || /failed to fetch|networkerror|load failed|network request failed|the network connection was lost/i.test(text);
+  };
+
+  window.__matrixarkConnState = function (e) {
+    /* What the connection strip should say about this failure, as [state, words].
+
+       Three cases, not two. A first version asked only whether the request arrived and called
+       everything that did a fault in the page -- so a 404 or a 500, which is the deployment
+       answering, turned the strip amber. It showed up the moment the page was opened with
+       nothing behind it: every fetch came back 404 and the strip blamed the page. */
+    if (window.__matrixarkNeverArrived(e)) { return ["down", "gateway unreachable"]; }
+    if (typeof e === "number") { return ["live", "connected"]; }
+    return ["warn", "this page could not show the answer"];
+  };
+
+  window.__matrixarkWhyFailed = function (e, failure) {
+    /* A rejection carrying a status is the deployment answering. A rejection from fetch itself is
+       the request never leaving. A throw after the answer arrived is THIS PAGE failing to show
+       what it was given -- and that used to read "Could not reach the gateway", about a gateway
+       that had just answered.
+
+       The last two are told apart by the message fetch produces, which is one of a short known
+       set. Where it is not recognised the page repeats what it caught rather than guessing: an
+       unfamiliar message shown as it came is still more than a sentence about the network. */
+    if (typeof e === "number") {
+      return (failure || window.__matrixarkFailure)(e);
+    }
+    if (window.__matrixarkNeverArrived(e)) {
+      return "Could not reach the gateway.";
+    }
+    var text = e && e.message ? String(e.message) : String(e);
+    return "The gateway answered, but this page could not show it \u2014 " + text
+      + ". That is a fault in this page, not in the deployment.";
+  };
+
+  window.__matrixarkFailure = function (status, overrides) {
+    if (overrides && overrides[status]) { return overrides[status]; }
+    if (status === 401) { return "This key was not accepted."; }
+    if (status === 403) { return "This key lacks the scope for that call."; }
+    if (status === 413) { return "That request is larger than this deployment accepts."; }
+    if (status === 429) { return "Rate limited — the edge is throttling this key."; }
+    if (status === 502) { return "The gateway could not reach the storage behind it."; }
+    if (status === 503) { return "The gateway is not ready to serve this yet."; }
+    if (status === 504) { return "The backend did not answer in time."; }
+    return "The gateway answered " + status + ".";
+  };
+
+  window.__matrixarkTrace = (function () {
+    /* The last calls this page made, newest last. Bounded: a portal tab is left open for days and
+       an unbounded list of every request is a leak that only shows on the busiest deployment. */
+    var calls = [], LIMIT = 60;
+    var listeners = [];
+
+    function note(entry) {
+      calls.push(entry);
+      if (calls.length > LIMIT) { calls.shift(); }
+      for (var i = 0; i < listeners.length; i++) {
+        try { listeners[i](calls.length); } catch (e) { /* a listener must not break a request */ }
+      }
+    }
+
+    var original = typeof window.fetch === "function" ? window.fetch : null;
+    if (original) {
+      window.fetch = function (input, init) {
+        var at = Date.now();
+        var method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
+        var url = String((input && input.url) || input || "");
+        return original.apply(this, arguments).then(function (response) {
+          /* Untouched. Reading the body here to pull out an incident token would consume it and
+             hand the caller an empty one -- breaking the panels this exists to help diagnose. */
+          note({ at: at, ms: Date.now() - at, method: method, url: url, status: response.status });
+          return response;
+        }, function (err) {
+          /* Status 0 is "never answered", which is a different row from a 500 and has to read as
+             one. The message is the browser's own; it is what tells a blocked request from a
+             refused one. */
+          note({ at: at, ms: Date.now() - at, method: method, url: url, status: 0,
+                 detail: (err && err.message) ? String(err.message) : String(err) });
+          throw err;
+        });
+      };
+    }
+
+    return {
+      calls: function () { return calls.slice(); },
+      onChange: function (fn) { if (typeof fn === "function") { listeners.push(fn); } },
+      note: note
+    };
+  }());
+
+  window.__matrixarkWhen = function (ms) {
+    /* 0 is "no timestamp" here, not the epoch: the catalog site this replaces read
+       `ms ? ... : dash`, and a record with no time would otherwise date to 1970. */
+    if (!ms) { return "—"; }
+    var at = new Date(Number(ms));
+    if (isNaN(at.getTime())) { return "—"; }
+    try { return at.toLocaleString(undefined, { timeZoneName: "short" }); }
+    catch (e) { return at.toLocaleString(); }
+  };
+</script>
+<script>
+(function () {
+  "use strict";
+  var $ = function (id) { return document.getElementById(id); };
+
+  /* Claimed before the strip's own script runs, so it feeds from this connection instead of
+     opening a second one to the same endpoint. */
+  window.__matrixarkLive = "page";
+
+  /* ---------- the live stream ---------- */
+/* Read over fetch() rather than with EventSource, which cannot set an Authorization header --
+   the alternative is the key in a query string, and a credential in a URL ends up in every access
+   log and proxy trace between here and the gateway. Same wire format either way; only the
+   reconnect is ours to write. */
+/* ---------- the deployment's clock ----------
+ *
+ * Every frame carries the SERVER's `ts` and nothing read it, so "14s ago" was the BROWSER's clock
+ * minus a server timestamp, clamped at zero. On a machine whose clock runs behind the gateway's,
+ * every failure read "0s ago" for ever -- on the one panel whose stated job is to say whether
+ * something happened a minute ago or last Tuesday.
+ *
+ * Extrapolated from the last frame rather than sampled per call: frames arrive every few seconds,
+ * so the elapsed part is small, and a page that has seen no frame yet falls back to the browser's
+ * clock, which is what it had before. */
+var liveServerMs = 0;   /* the server's clock at the last frame */
+var liveFrameAtMs = 0;  /* Date.now() when that frame arrived */
+
+function serverNowMs() {
+  if (!liveFrameAtMs) { return Date.now(); }
+  return liveServerMs + (Date.now() - liveFrameAtMs);
+}
+
+/* How far the browser's clock is from the gateway's, positive when the browser is BEHIND. Worth
+   reporting because every other timestamp on these pages is rendered with toLocaleString() from
+   that same clock, so one wrong clock makes all of them wrong together. */
+function clockSkewMs() {
+  return liveFrameAtMs ? (liveServerMs - liveFrameAtMs) : 0;
+}
+
+/* How long since state last arrived. A connection that is open but silent leaves the page showing
+   the last frame's numbers, and the strip still says "live". */
+function sinceLastFrameMs() {
+  return liveFrameAtMs ? (Date.now() - liveFrameAtMs) : 0;
+}
+
+/* Silence is not staleness. When nothing has changed the gateway sends a keepalive instead of a
+   frame, so a quiet stream on an idle deployment is healthy and a page that treated "no frame" as
+   "stale" would say so on every deployment that was working. What is NOT normal is nothing at all
+   -- no frame and no keepalive -- for several ticks. */
+var liveBlockAtMs = 0;  /* Date.now() at the last block of ANY kind, keepalives included */
+var liveTickMs = 0;     /* the gateway's own cadence, off its frames */
+
+function sinceLastBlockMs() {
+  return liveBlockAtMs ? (Date.now() - liveBlockAtMs) : 0;
+}
+
+/* Whether a stream has ever delivered anything to this page. Read by code that runs on a button
+   press rather than on a frame, which has no other way to ask. */
+function streamConnected() {
+  return liveBlockAtMs > 0;
+}
+
+/* Three ticks: one missed tick is scheduling, two is a slow one, three is not arriving. Derived
+   from the cadence the gateway sent rather than a number written here, because a page holding its
+   own copy of the server's interval is a second place for it to be wrong. Unknown cadence means an
+   older gateway that sends no hello, and then nothing is claimed. */
+function streamStalledFor() {
+  if (!liveTickMs || !liveBlockAtMs) { return 0; }
+  var quiet = sinceLastBlockMs();
+  return quiet > (liveTickMs * 3) ? quiet : 0;
+}
+
+function liveStream(options) {
+  var onFrame = options.onFrame || function () {};
+  var onState = options.onState || function () {};
+  var headers = options.headers || function () { return {}; };
+  var controller = null, stopped = false, backoff = 1000, buffer = "";
+  /* Set when the gateway says it is closing on purpose, cleared by the reopen it
+     causes. Without it a planned recycle is indistinguishable from a gateway that
+     fell over. */
+  var planned = false;
+  /* Set when the watchdog has reported a stall, so the report is made once and withdrawn once. */
+  var stalledSince = 0;
+  var watchdog = null;
+  /* When the current connection was established, so a goodbye can be sanity-checked against how
+     long the stream actually lasted. */
+  var openedAt = 0;
+
+  function schedule() {
+    if (stopped) { return; }
+    onState("retrying", Math.round(backoff / 1000));
+    setTimeout(open, backoff);
+    backoff = Math.min(backoff * 2, 30000);  /* a gateway that is down should not be hammered */
+  }
+
+  function handle(block) {
+    /* Every block, before anything is read out of it: a keepalive carries no event and no data and
+       is exactly the evidence that the stream is alive. */
+    liveBlockAtMs = Date.now();
+    if (stalledSince) { stalledSince = 0; onState("live"); }
+    var name = "", payload = null;
+    block.split("\n").forEach(function (line) {
+      if (line.indexOf("event: ") === 0) { name = line.slice(7).trim(); }
+      else if (line.indexOf("data: ") === 0) { payload = line.slice(6); }
+    });
+    /* Read the label, not just the payload. A goodbye carries a data line of its own, so a reader
+       that looks only for `data:` hands {"reason": "stream_max_age"} to the frame handler as
+       though it were the deployment's state -- and a page rendering from an object with none of
+       the fields blanks the traffic table, the failures panel and the strip, every ten minutes. */
+    if (name === "bye") {
+      /* A rotation and a fault are both a bye. Treating every bye as planned reconnected at once
+         into a gateway that had just said it was failing -- and `planned` is exactly what makes
+         that reconnect immediate, so a fault has to clear it and take the backoff instead. */
+      var why = null;
+      try { why = JSON.parse(payload || "{}"); } catch (e) { why = null; }
+      if (why && why.reason && why.reason !== "stream_max_age") {
+        planned = false;
+        onState("failed", 0, why.incident || "");
+        return;
+      }
+      planned = true;
+      return;
+    }
+    if (name !== "status" || !payload) { return; }
+    try {
+      var frame = JSON.parse(payload);
+      /* Recorded before the handler runs, so anything the handler renders reads the clock of the
+         frame it is rendering rather than the one before it. */
+      if (typeof frame.ts === "number" && isFinite(frame.ts)) {
+        liveServerMs = frame.ts * 1000;
+        liveFrameAtMs = Date.now();
+      }
+      /* An older gateway sends no cadence; then nothing is claimed about a quiet stream. */
+      if (typeof frame.tick_s === "number" && frame.tick_s > 0) {
+        liveTickMs = frame.tick_s * 1000;
+      }
+      onFrame(frame);
+    } catch (e) { /* a partial frame; the next one is whole */ }
+  }
+
+  /* A stream is closed on purpose once it reaches its maximum age, and the gateway says so before
+     it goes. That is not a fault: reporting it through the backoff path puts "down" on every open
+     page on a timer, and delays the reconnect for a second to no purpose. */
+  function reopen() {
+    /* The label says whether to report a fault; the clock says whether to believe it. A stream
+       that said goodbye within a second of opening is not one that reached its ten-minute age,
+       and reconnecting at once because it claimed to would be a hot loop for as long as the
+       deployment kept doing it. */
+    var kept = planned && (Date.now() - openedAt) > 1000;
+    planned = false;
+    if (kept) { backoff = 1000; open(); return; }
+    schedule();
+  }
+
+  function open() {
+    if (stopped) { return; }
+    /* Same rule as the strip, which never reaches these two pages: they claim __matrixarkLive, so
+       the strip's script returns before registering it. */
+    if (document.hidden) { controller = null; return; }
+    controller = new AbortController();
+    onState("connecting");
+    fetch("/v1/admin/events", { headers: headers(), signal: controller.signal })
+      .then(function (response) {
+        if (!response.ok) { return Promise.reject(response.status); }
+        if (!response.body) { return Promise.reject("nostream"); }
+        onState("live");
+        backoff = 1000;
+        openedAt = Date.now();
+        var reader = response.body.getReader();
+        var decoder = new TextDecoder();
+        function pump() {
+          return reader.read().then(function (chunk) {
+            if (chunk.done) { reopen(); return; }
+            buffer += decoder.decode(chunk.value, { stream: true });
+            var blocks = buffer.split("\n\n");
+            buffer = blocks.pop();
+            blocks.forEach(handle);
+            return pump();
+          });
+        }
+        return pump();
+      })
+      .catch(function (err) {
+        if (stopped) { return; }
+        if (err === 401 || err === 403) { onState("denied"); return; }
+        schedule();
+      });
+  }
+
+  /* Nothing arrives to announce that nothing is arriving, so this is the one thing here that
+     needs a timer. It only reports while a connection is actually open: a dropped one is already
+     reported through `retrying`, and saying both would be two names for one fault. */
+  watchdog = setInterval(function () {
+    if (stopped || !controller) { return; }
+    var quiet = streamStalledFor();
+    if (quiet && !stalledSince) {
+      stalledSince = Date.now();
+      onState("stalled", Math.round(quiet / 1000));
+    }
+  }, 1000);
+
+  open();
+  /* A hidden tab holds a connection open for nobody. Drop it, reconnect on return -- the same
+     rule the strip follows, and until now the two pages that run their own stream followed
+     neither: the strip stands down for them, and this registered only pagehide. */
+  document.addEventListener("visibilitychange", function () {
+    if (stopped) { return; }
+    if (document.hidden) {
+      if (controller) { controller.abort(); controller = null; }
+    } else if (!controller) {
+      backoff = 1000;
+      open();
+    }
+  });
+  window.addEventListener("pagehide", function () {
+    stopped = true;
+    /* Dropped with the connection. It checks `stopped` and would do nothing, but a timer left
+       running on a page that is going away is a timer somebody has to reason about later. */
+    if (watchdog) { clearInterval(watchdog); watchdog = null; }
+    if (controller) { controller.abort(); }
+  });
+  return {
+    restart: function () {
+      if (controller) { controller.abort(); }
+      backoff = 1000;
+      stopped = false;
+      open();
+    },
+    stop: function () {
+      stopped = true;
+      if (watchdog) { clearInterval(watchdog); watchdog = null; }
+      if (controller) { controller.abort(); }
+    }
+  };
+}
+
+
+  function auth() {
+    var k = $("key").value.trim();
+    return k ? { Authorization: "Bearer " + k } : {};
+  }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function conn(state, text) {
+    $("dot").className = "dot " + state;
+    $("conn").textContent = text;
+  }
+
+  var MARK = { ok: "✓", warn: "!", todo: "·" };
+
+  function secs(s) {
+    if (!s) { return "—"; }
+    if (s < 60) { return Math.round(s) + "s"; }
+    if (s < 3600) { return Math.floor(s / 60) + "m " + Math.round(s % 60) + "s"; }
+    return Math.floor(s / 3600) + "h " + Math.round((s % 3600) / 60) + "m";
+  }
+
+  /* An import running elsewhere is a state a customer would otherwise only find by opening the
+     Ingestion page, which is not where anyone starts. */
+  /* The encoding backlog belongs next to the import strip: both are "the deployment is still
+     working on what you gave it", and both are invisible from anywhere else. */
+  function renderEncoding(d) {
+    var pending = (d && d.pending) || 0;
+    var total = (d && d.total) || 0;
+    var encoder = (d && d.encoder) || {};
+    var section = $("encodingSection");
+    if (!section) { return; }
+    if (!total || (!pending && encoder.semantic)) { section.hidden = true; return; }
+    section.hidden = false;
+    var pct = total ? Math.round((((d.encoded || 0) / total) * 100)) : 0;
+    $("encodingAux").textContent = pending
+      ? pending.toLocaleString() + " waiting"
+      : "all encoded";
+    $("encodingBody").innerHTML =
+      '<div class="importrow"><div class="importhead"><span class="mono">embedding</span>' +
+      '<span class="importmeta">' + pct + "% of " + total.toLocaleString() + "</span></div>" +
+      '<div class="bar"><i style="width:' + pct + '%"></i></div>' +
+      (encoder.semantic
+        ? '<div class="hint" style="margin-top:7px">Until a chunk is encoded it cannot be matched ' +
+          'on meaning. <a href="/v1/admin/setup">Setup</a> shows the detail.</div>'
+        : '<div class="note" style="margin-top:7px">' + esc(encoder.note || "") + "</div>") +
+      "</div>";
+  }
+
+  function loadEncoding() {
+    fetch("/v1/admin/embeddings", { headers: auth() })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(renderEncoding)
+      .catch(function () { /* the checklist already reports an unreachable backend */ });
+  }
+
+  function renderImports(imports) {
+    var active = (imports && imports.active) || [];
+    $("importsSection").hidden = active.length === 0;
+    if (!active.length) { return; }
+    $("importsAux").textContent = imports.documents_remaining + " remaining" +
+      (imports.eta_s ? " · eta " + secs(imports.eta_s) : "");
+    $("imports").innerHTML = active.map(function (job) {
+      var processed = (job.done || 0) + (job.failed || 0);
+      var pct = job.total ? Math.round((processed / job.total) * 100) : 0;
+      return '<div class="importrow"><div class="importhead"><span class="mono">' +
+        esc(job.job_id) + '</span><span class="pill ' + esc(job.state) + '">' + esc(job.state) +
+        "</span><span class='importmeta'>" + pct + "% of " + job.total +
+        (job.failed ? " · " + job.failed + " failed" : "") + "</span></div>" +
+        '<div class="bar"><i style="width:' + pct + '%"></i></div>' +
+        (job.current ? '<div class="importcur">' + esc(job.current) + "</div>" : "") + "</div>";
+    }).join("") + '<div class="hint"><a href="/v1/admin/ingestion">Open Ingestion</a> to watch it ' +
+      "in detail or stop it.</div>";
+  }
+
+  function render(d) {
+    var checks = d.checks || [];
+    $("checks").innerHTML = checks.map(function (c) {
+      var go = c.href
+        ? '<a class="go" href="' + esc(c.href) + '">' + esc(c.action || "Open") + " →</a>" : "";
+      /* The steps for the state it is in. Open for a `todo` -- something that has to be done
+         before the deployment works should not be behind a click -- and collapsed for a warning,
+         which is advice. */
+      var how = "";
+      if (c.how && c.how.length) {
+        how = "<details class='how'" + (c.status === "todo" ? " open" : "") +
+          "><summary>how</summary><ol>" +
+          c.how.map(function (step) { return "<li>" + esc(step) + "</li>"; }).join("") +
+          "</ol></details>";
+      }
+      /* Where the answer came from, next to the answer. "ok" on a configured encoder and "ok" on
+         a counted record are different claims: the first survives the encoder being unreachable,
+         and that is precisely the failure this page exists to surface. */
+      var src = c.source_label
+        ? "<span class='hint' style='margin:2px 0 0'>" + esc(c.source_label) + "</span>"
+        : "";
+      return '<div class="checkrow"><span class="mark ' + esc(c.status) + '">' +
+        (MARK[c.status] || "") + '</span><span class="body"><b>' + esc(c.title) +
+        "</b><span>" + esc(c.detail) + "</span>" + src + how + "</span>" + go + "</div>";
+    }).join("") || '<div class="empty">Nothing to check.</div>';
+
+    var pct = d.total ? Math.round((d.done / d.total) * 100) : 0;
+    $("progressBar").style.width = pct + "%";
+    $("progressText").textContent = d.done + " of " + d.total + " ready";
+
+    renderImports(d.imports);
+    /* Keep up with an import while one is running, and go back to idle pacing when it ends. */
+    pace(!!((d.imports || {}).active || []).length);
+
+    renderCounts(d);
+  }
+
+  function renderCounts(d) {
+    var counts = d.counts || {}, traffic = d.traffic || {};
+    var cards = [
+      { n: counts.skills == null ? "—" : counts.skills, l: "skills" },
+      { n: counts.resources == null ? "—" : counts.resources, l: "resources" },
+      { n: counts.users == null ? "—" : counts.users, l: "subjects with memory" },
+      { n: traffic.total_requests || 0, l: "requests served",
+        c: traffic.total_errors ? "warn" : "" }
+    ];
+    $("summary").innerHTML = cards.map(function (c) {
+      return '<div class="stat ' + (c.c || "") + '"><b>' + esc(c.n) + "</b><span>" +
+        esc(c.l) + "</span></div>";
+    }).join("");
+  }
+
+  /* ---------- diagnostics ---------- */
+  var lastReport = null;
+  var lastConfigChangedAt = null;
+  var lastFrame = null;
+
+  function compactConfig(config) {
+    if (!config) { return null; }
+    var settings = config.settings || {};
+    var groups = settings.groups || {}, out = {};
+    Object.keys(groups).forEach(function (g) {
+      groups[g].forEach(function (f) {
+        if (f.source === "default" && !f.configured) { return; }
+        out[f.key] = {
+          env: f.env, source: f.source, applies: f.applies,
+          value: f.kind === "secret" ? (f.configured ? "<configured>" : "") : f.value
+        };
+      });
+    });
+    return {
+      extraction: config.extraction,
+      embedding: config.embedding,
+      warnings: config.warnings,
+      config_file: settings.config_file,
+      updated_at: settings.updated_at,
+      inventory: settings.inventory,
+      /* Only what differs from the built-in default, which is the whole question when someone
+         asks why this deployment behaves differently from another one. */
+      non_default_settings: out
+    };
+  }
+
+  function bundle() {
+    return Promise.all([
+      fetch("/v1/admin/config", { headers: auth() })
+        .then(function (r) { return r.ok ? r.json() : null; }).catch(function () { return null; }),
+      fetch("/v1/metrics").then(function (r) { return r.ok ? r.text() : ""; })
+        .catch(function () { return ""; }),
+      /* Readiness answers 503 when the backend cannot serve, so a non-2xx here is the answer rather
+         than a failure to collect -- the status is recorded next to the body. */
+      fetch("/v1/readyz").then(function (r) {
+        return r.json().then(function (body) { return { status: r.status, body: body }; });
+      }).catch(function () { return null; })
+    ]).then(function (parts) {
+      var traffic = (lastFrame || {}).traffic || {};
+      var quiet = sinceLastBlockMs();
+      return JSON.stringify({
+        collected_at: new Date().toISOString(),
+        /* The same instant on the GATEWAY's clock, and how far apart the two are.
+           `recent_failures` below carries server timestamps, so a reader correlating them against
+           `collected_at` alone is comparing two machines -- and this file is read by somebody who
+           was not at the keyboard and cannot ask whose clock was wrong. Absent when no frame has
+           arrived to establish it, rather than repeating the browser's answer under another name. */
+        gateway_time: liveFrameAtMs ? new Date(serverNowMs()).toISOString() : null,
+        clock_skew_ms: liveFrameAtMs ? clockSkewMs() : null,
+        origin: location.origin,
+        /* How fresh the live-frame parts below are. `recent_failures` and `datanode` come off the
+           stream, so on a stalled stream they are as old as this says and the rest of the bundle
+           is current -- one document, two ages, and nothing used to say so. */
+        stream: {
+          connected: streamConnected(),
+          since_last_block_ms: liveFrameAtMs ? quiet : null,
+          stalled: streamStalledFor() > 0
+        },
+        overview: lastReport,
+        config: compactConfig(parts[0]),
+        metrics: parts[1],
+        readiness: parts[2],
+        /* The counters in `metrics` say how many requests failed. This says WHEN, which is the
+           difference between an incident and a footnote -- and it exists only on the live frame, so
+           a bundle assembled from endpoints alone cannot carry it. */
+        recent_failures: traffic.recent_failures || null,
+        datanode: (lastFrame || {}).datanode || null
+      }, null, 2);
+    });
+  }
+
+  function withBundle(fn) {
+    if (!lastReport) {
+      say($("diagMsg"), "Enter an admin key first — the bundle needs the checklist.", "info");
+      return;
+    }
+    bundle().then(fn).catch(function () {
+      say($("diagMsg"), "Could not assemble the bundle.", "err");
+    });
+  }
+
+  function say(el, text, cls) {
+    el.innerHTML = text ? '<div class="msg ' + (cls || "info") + '">' + esc(text) + "</div>" : "";
+  }
+
+  function load() {
+    fetch("/v1/admin/overview", { headers: auth() })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (d) {
+        lastReport = d;
+        render(d);
+        startLive();
+      })
+      .catch(function (e) {
+        if (e === 401 || e === 403) {
+          conn("live", "connected");
+          $("checks").innerHTML = '<div class="empty">Enter an admin-scoped key above to check ' +
+            "this deployment.</div>";
+        } else {
+          var connState = window.__matrixarkConnState(e);
+          conn(connState[0], connState[1]);
+          $("checks").innerHTML = '<div class="msg err">' + esc(window.__matrixarkWhyFailed(e))
+            + "</div>";
+        }
+      });
+  }
+
+  /* Someone fixing the checklist has this page open in one tab and the setup page in another;
+     without this they fix a thing and the list keeps telling them it is broken. Each refresh costs
+     three listings on the backend, so it does not run for a tab nobody is looking at -- an idle
+     background tab was otherwise a standing load on the store. */
+  /* The strips come from the stream, so the checklist only has to be re-read occasionally: it
+     changes when somebody changes a setting, not several times a second. */
+  var CHECKLIST_MS = 60000;
+  var overviewTimer = setInterval(function () {
+    if (document.hidden) { return; }
+    if ($("autoOverview").checked && $("key").value.trim()) { load(); }
+  }, CHECKLIST_MS);
+
+  function pace(_active) { /* the stream sets the pace now */ }
+
+  var live = null;
+
+  function startLive() {
+    /* Not gated on the key box: load() has already succeeded by the time this runs, and on the
+       developer default it succeeds without a key. */
+    if (live) { live.restart(); return; }
+    live = liveStream({
+      headers: auth,
+      onState: function (state, seconds, incident) {
+        if (state === "live") { conn("live", "live"); }
+        else if (state === "denied") { conn("live", "connected"); }
+        else if (state === "retrying") { conn("down", "reconnecting in " + seconds + "s"); }
+        /* Connected and receiving nothing. Not "down" -- the socket is open and a reconnect would
+           not help -- and not "live", which is what it said before. */
+        else if (state === "stalled") { conn("warn", "no update for " + seconds + "s"); }
+        /* The gateway said it was going, and why. Distinct from "stalled", which is a stream that
+           is still open and quiet, and from "retrying", which claims nothing about the cause. */
+        else if (state === "failed") {
+          conn("warn", "the stream failed on the gateway"
+               + (incident ? " \u2014 incident " + incident : ""));
+        }
+        if (window.__matrixarkLiveState) {
+          window.__matrixarkLiveState(state === "live" ? "live"
+            : (state === "retrying" ? "down" : "stale"));
+        }
+      },
+      onFrame: function (frame) {
+        /* A configuration write in another tab, or by another operator, used to take up to a full
+           minute to show here -- the checklist rows that exist to say what is misconfigured were the
+           ones going stale. The frame carries when the stored configuration was last written, so a
+           change is picked up on the next tick instead.
+
+           The first frame only records the value: on load the checklist has just been read, and
+           treating the first sighting as a change would re-read it immediately for nothing.
+
+           The slow timer stays. This list counts records and requests as well as reading settings,
+           and those move without anyone writing configuration. */
+        var seen = frame.config_changed_at;
+        if (seen != null) {
+          if (lastConfigChangedAt !== null && seen !== lastConfigChangedAt) {
+            lastConfigChangedAt = seen;
+            if (!document.hidden && $("key").value.trim()) { load(); }
+          } else {
+            lastConfigChangedAt = seen;
+          }
+        }
+        /* Kept for the diagnostics bundle. The failure timeline exists only on the frame, and
+           it answers "when did this start" -- which is the question a bundle is sent to
+           answer. */
+        lastFrame = frame;
+        if (window.__matrixarkLiveFrame) { window.__matrixarkLiveFrame(frame); }
+        renderImports(frame.imports);
+        if (frame.embedding) { renderEncoding(frame.embedding); }
+        if (lastReport) {
+          lastReport.imports = frame.imports;
+          lastReport.traffic = frame.traffic;
+          renderCounts(lastReport);
+        }
+      }
+    });
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (!document.hidden && $("autoOverview").checked && $("key").value.trim()) { load(); }
+  });
+  $("autoOverview").addEventListener("change", function () {
+    if ($("autoOverview").checked) { load(); }
+  });
+  window.addEventListener("pagehide", function () { clearInterval(overviewTimer); });
+
+  $("copyDiag").addEventListener("click", function () {
+    withBundle(function (text) {
+      window.__matrixarkCopyText(text).then(function (ok) {
+        say($("diagMsg"),
+            ok ? "Copied " + text.length + " characters to the clipboard."
+               : "Could not copy. Use Download instead, or select the bundle and copy it by hand.",
+            ok ? "ok" : "err");
+      });
+    });
+  });
+  $("downloadDiag").addEventListener("click", function () {
+    withBundle(function (text) {
+      var url = URL.createObjectURL(new Blob([text], { type: "application/json" }));
+      var a = document.createElement("a");
+      a.href = url;
+      a.download = "matrixark-diagnostics-" + new Date().toISOString().slice(0, 19)
+        .replace(/[:T]/g, "-") + ".json";
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+      say($("diagMsg"), "Downloaded.", "ok");
+    });
+  });
+  $("key").addEventListener("change", function () {
+    if ($("remember").checked) {
+      try { sessionStorage.setItem("matrixark_admin_key", $("key").value); } catch (e) { /* ignore */ }
+    }
+    load();
+  });
+  $("remember").addEventListener("change", function () {
+    try {
+      if ($("remember").checked) { sessionStorage.setItem("matrixark_admin_key", $("key").value); }
+      else { sessionStorage.removeItem("matrixark_admin_key"); }
+    } catch (e) { /* ignore */ }
+  });
+  try {
+    var saved = sessionStorage.getItem("matrixark_admin_key");
+    if (saved) { $("key").value = saved; $("remember").checked = true; }
+  } catch (e) { /* ignore */ }
+  load();
+}());
+</script>
+<script>
+/* One copy helper for every page. It resolves true when the text reached the clipboard and false
+   when it did not: no clipboard API at all (an http:// origin, which a self-hosted portal often
+   is), a denied permission, a document that is not focused.
+
+   Callers must report what they are handed. Announcing "copied" without looking -- which every
+   caller here used to do -- is worse than saying nothing, because the reader stops trying and
+   walks away with an empty clipboard.
+
+   Its own IIFE, ahead of the strip's: the strip returns immediately on a page that has none, and
+   a copier defined after that line would not exist on those pages. */
+(function () {
+  "use strict";
+  /* Why a request was refused, in the words the edge used. A scope refusal answers
+     {"error": "insufficient_scope", "required": ["admin:api_key"]}, and showing the code alone
+     leaves the operator guessing at the one thing the answer already contained -- and the scope
+     name is exactly the string to tick when issuing the key.
+
+     `detail` still wins where there is one: it names the setting and the reason. The scope is
+     appended to that rather than replacing it. */
+  /* One way to render an absolute time, and it names the clock.
+   *
+   * Four places showed a timestamp with toLocaleString() and none said which zone it was in, while
+   * the records they describe -- a configuration write, an audit entry, a stored memory -- carry
+   * the GATEWAY's time. Correlating a portal timestamp with a server log was guesswork, and on a
+   * browser whose clock is off (which the setup page can now measure and say) it was wrong as well
+   * as ambiguous.
+   *
+   * `timeZoneName: "short"` rather than the IANA name: "GMT+1" beside the time reads at a glance
+   * where "Europe/London" pushes the useful part off the end of a table cell. Falls back to the
+   * bare local string on a runtime without it, which is no worse than what was there before. */
+
+
+  /* One sentence per gateway status, for every page.
+   *
+   * Three pages had a map of their own and each carried a different subset. Ingestion -- the page
+   * that uploads files -- was the one with no sentence for 413, so an upload refused for size
+   * read as "The gateway answered 413." on precisely the panel where the cause was obvious to
+   * everyone but the reader. The four pages with no map at all said that about every status.
+   *
+   * `overrides` is for what a page genuinely knows better: a file rather than a request, an
+   * import conflict only ingestion can produce. Everything else is answered once, here, so the
+   * next status added does not have to be added in four places to be true in four places.
+   *
+   * This is the FALLBACK. A refusal that carries a body is explained by __matrixarkWhy from what
+   * the gateway said; this is what the reader gets when there is nothing but a number.
+   */
+
+}());
+
+/* The shared live strip. One stream per page: a page that runs its own (Setup, Overview) claims
+   window.__matrixarkLive and calls window.__matrixarkLiveFrame instead of opening a second. */
+(function () {
+  "use strict";
+  var strip = document.getElementById("liveStrip");
+  if (!strip) { return; }
+  var seg = {
+    enc: document.getElementById("liveEnc"),
+    imp: document.getElementById("liveImp"),
+    req: document.getElementById("liveReq"),
+    warn: document.getElementById("liveWarn"),
+    node: document.getElementById("liveNode"),
+    waiting: document.getElementById("liveWaiting")
+  };
+  var dot = document.getElementById("liveDot");
+  /* Any page can watch the frames this page is already receiving. The alternative -- each panel
+     opening its own stream -- costs the gateway a task per panel to show one deployment's state. */
+  var watchers = [];
+  window.__matrixarkOnFrame = function (callback) {
+    if (typeof callback === "function") { watchers.push(callback); }
+  };
+  /* This script is emitted AFTER the page's own -- deliberately, so a page running its own stream
+     can claim it before this one decides whether to open a second. The cost of that ordering was
+     that a page registering at its top level called a function that did not exist yet, and two
+     did: the catalog stopped re-listing when the store grew, and nothing looked wrong.
+
+     So pages push to a queue. Whatever is waiting is drained here, and the queue is then replaced
+     by an object whose `push` IS the registration, so a page loading later goes through the same
+     call and nothing has to know which script ran first. */
+  (window.__matrixarkFrameQueue || []).forEach(window.__matrixarkOnFrame);
+  window.__matrixarkFrameQueue = { push: window.__matrixarkOnFrame };
+
+  function n(value) {
+    return Number(value || 0).toLocaleString();
+  }
+  function show(el, html, cls) {
+    if (!el) { return; }
+    /* Reset the class on the way out too: a segment hidden while it was warning would come back
+       still coloured for a state that has passed. */
+    el.className = "live-seg" + (html != null && cls ? " " + cls : "");
+    if (html == null) { el.hidden = true; return; }
+    el.hidden = false;
+    el.innerHTML = html;
+  }
+
+  function plural(count, word) {
+    return "<b>" + n(count) + "</b> " + word + (Number(count) === 1 ? "" : "s");
+  }
+
+  /* Rendered only from a frame that arrived. Zeros drawn before the first frame would describe a
+     quiet healthy deployment for one that is not answering. */
+  function render(frame) {
+    strip.hidden = false;
+    var e = frame.embedding || null;
+    if (e && e.total) {
+      show(seg.enc, e.pending
+        ? "<b>" + n(e.pending) + "</b> waiting to embed"
+        : "<b>" + n(e.total) + "</b> embedded",
+        e.pending ? "busy" : "");
+    } else if (e) {
+      show(seg.enc, "<b>0</b> stored");
+    } else {
+      /* Absent, not zero: the backend could not be asked. "0 waiting" here would be the
+         reassuring answer to a question nobody managed to ask. */
+      show(seg.enc, "encoding <b>unknown</b>", "warn");
+    }
+
+    var imports = frame.imports || {};
+    var active = (imports.active || [])[0];
+    if (active) {
+      var done = (active.done || 0) + (active.failed || 0);
+      show(seg.imp, "importing <b>" + n(done) + "</b> of " + n(active.total || 0), "busy");
+    } else if (imports.retryable) {
+      show(seg.imp, "<b>" + n(imports.retryable) + "</b> to retry", "warn");
+    } else {
+      show(seg.imp, null);
+    }
+
+    var t = frame.traffic || {};
+    show(seg.req, plural(t.total_requests, "request") +
+      (t.total_errors ? ", <b>" + n(t.total_errors) + "</b> failed" : ""),
+      t.total_errors ? "warn" : "");
+
+    show(seg.warn, frame.warnings ? plural(frame.warnings, "warning") : null, "warn");
+
+    /* Written and not in effect: the deployment is running something other than what the Setup
+       page describes. Absent when there is none, the way the warning segment behaves -- a strip
+       that always says "0 awaiting restart" is a place people stop looking. */
+    show(seg.waiting,
+         frame.settings_waiting
+           ? plural(frame.settings_waiting, "setting") + " awaiting restart"
+           : null,
+         "warn");
+
+    /* Only when it is NOT ok, the way the warning segment already behaves. A strip that always
+       says "datanode: ok" is one people stop reading, and absent means nothing has looked yet --
+       which is not the same as reachable, so that shows nothing either.
+
+       Matched against the two states rather than escaped and interpolated: this block has no esc()
+       (it defines n, show and plural and nothing else), so calling one would have thrown inside
+       render, which the caller wraps in a catch that ignores -- failing in total silence. A closed
+       set of expected values is also stricter than escaping: a server sending something
+       unexpected renders nothing rather than rendering it safely. */
+    show(seg.node,
+      frame.datanode === "unreachable" ? "datanode <b>unreachable</b>"
+        : (frame.datanode === "erroring" ? "datanode <b>erroring</b>" : null),
+      "warn");
+
+    watchers.forEach(function (callback) {
+      /* One panel throwing must not stop the others, or the strip, from updating. */
+      try { callback(frame); } catch (err) { /* a watcher's problem, not the strip's */ }
+    });
+  }
+
+  window.__matrixarkLiveFrame = function (frame) {
+    if (frame) { render(frame); dot.className = "live-dot"; }
+  };
+  window.__matrixarkLiveState = function (state) {
+    dot.className = "live-dot" + (state === "live" ? "" : (state === "down" ? " down" : " stale"));
+  };
+
+  /* A page with its own stream feeds the strip; only pages without one connect here. */
+  if (window.__matrixarkLive) { return; }
+  window.__matrixarkLive = "strip";
+
+  /* Nothing arrives to announce that nothing is arriving, so noticing needs a timer. Three ticks
+     of the gateway's OWN cadence: one missed tick is scheduling, two is a slow one, three is not
+     arriving. The number is not written here -- it is whatever the gateway last said. */
+  function watchQuiet() {
+    if (!tickMs || !blockAt || !controller) { return; }
+    var quiet = Date.now() - blockAt;
+    if (quiet > tickMs * 3 && dot.className.indexOf("stale") < 0) {
+      dot.className = "live-dot stale";
+      dot.title = "no update for " + Math.round(quiet / 1000) + "s";
+    }
+  }
+  quietTimer = setInterval(watchQuiet, 1000);
+  window.addEventListener("pagehide", function () {
+    if (quietTimer) { clearInterval(quietTimer); quietTimer = null; }
+  });
+
+  function key() {
+    var el = document.getElementById("key");
+    if (el && el.value.trim()) { return el.value.trim(); }
+    try { return sessionStorage.getItem("matrixark_admin_key") || ""; } catch (e) { return ""; }
+  }
+
+  var controller = null, backoff = 1000, buffer = "";
+  /* When anything last arrived, and the gateway's own cadence off its frames.
+     The strip is the one element on every page, and it said "live" whenever the socket was open --
+     so a gateway that stopped producing frames left every page green. The page-side client learned
+     this in mx#1189; the strip runs its own client, because five of the seven pages never load the
+     other one, so it has to learn it too. `TheTwoClientsAgreeTest` in
+     test_matrixark_the_strip_notices_a_quiet_stream_too is what stops the two rules drifting
+     apart: both must read tick_s off the frame, both must stamp on every block rather than on
+     frames, and neither may write the interval down. */
+  var blockAt = 0, tickMs = 0, quietTimer = null;
+  /* Set when the gateway says it is closing on purpose, cleared by the reopen it
+     causes. A planned recycle and a gateway that stopped answering look identical
+     from here without it, and only one of them is      one of them is worth telling anybody about. */
+  var planned = false;
+  /* When the current connection was established; see the floor in the reopen above. */
+  var openedAt = 0;
+  /* Set the first time this deployment refuses an anonymous read. Until then there is
+     no reason to assume a key is needed; afterwards there is no reason to ask again
+     without one. */
+  var wantsKey = false;
+
+  function open() {
+    /* The drop below aborts the request; the abort rejects the fetch; the catch schedules another
+       open(). Without this the connection came back one backoff later with the tab still hidden,
+       so the rule this file states was true for about a second at a time. Left null so the
+       visibility handler's `!controller` test is what brings it back. */
+    if (document.hidden) { controller = null; return; }
+    var k = key();
+    /* No key is not the same as no access: on the developer default the gateway answers every
+       admin route anonymously, and refusing to ask left the strip dark on the deployment somebody
+       is most likely to be looking at first. So the first attempt goes out without one.
+
+       Once a deployment has refused, this is the old behaviour exactly -- watch for a key and
+       make no request until there is one. One 401 per page load, never a loop. */
+    if (!k && wantsKey) { setTimeout(open, 2000); return; }
+    controller = new AbortController();
+    fetch("/v1/admin/events", {
+      headers: k ? { Authorization: "Bearer " + k } : {},
+      signal: controller.signal
+    }).then(function (r) {
+      if (r.status === 401 || r.status === 403) { wantsKey = true; }
+      if (!r.ok || !r.body) { throw new Error("stream " + r.status); }
+      dot.className = "live-dot";
+      backoff = 1000;
+      openedAt = Date.now();
+      var reader = r.body.getReader(), decoder = new TextDecoder();
+      function pump() {
+        return reader.read().then(function (chunk) {
+          if (chunk.done) {
+            /* Closed on purpose once the stream reached its maximum age. Reconnect at once and
+               leave the dot alone: this is the gateway keeping its own rule, not one that stopped
+               answering, and marking it stale every ten minutes teaches people to ignore the
+               one signal the strip has. */
+            var kept = planned && (Date.now() - openedAt) > 1000;
+            planned = false;
+            if (kept) { controller = null; backoff = 1000; open(); return; }
+            throw new Error("stream ended");
+          }
+          buffer += decoder.decode(chunk.value, { stream: true });
+          var parts = buffer.split("\n\n");
+          buffer = parts.pop();
+          parts.forEach(function (block) {
+            /* Every block, keepalives included: when nothing has changed the gateway sends a
+               keepalive instead of a frame, so silence on an idle deployment is HEALTHY and only
+               nothing-at-all is not. */
+            blockAt = Date.now();
+            if (dot.className.indexOf("stale") >= 0) {
+              dot.className = "live-dot";
+              dot.title = "live";
+            }
+            /* Read the label. A goodbye carries a data line of its own, and rendering it as a
+               frame empties every segment of the strip -- on all five pages that read the stream
+               through here, every ten minutes. */
+            var name = "", payload = null;
+            block.split("\n").forEach(function (line) {
+              if (line.indexOf("event:") === 0) { name = line.slice(6).trim(); }
+              else if (line.indexOf("data:") === 0) { payload = line.slice(5).trim(); }
+            });
+            if (name === "bye") {
+              planned = true;
+              /* The strip has no message line, so the reason goes where a reader can still get at
+                 it: the dot's own title. A goodbye that is a fault leaves the dot down rather than
+                 letting the next keepalive clear it back to live. */
+              try {
+                var why = JSON.parse(payload || "{}");
+                if (why.reason && why.reason !== "stream_max_age") {
+                  dot.className = "live-dot down";
+                  dot.title = "the stream failed on the gateway"
+                    + (why.incident ? " \u2014 incident " + why.incident : "");
+                }
+              } catch (e) { /* an older gateway says goodbye with no body */ }
+              return;
+            }
+            if (name !== "status" || !payload) { return; }
+            try {
+              var frame = JSON.parse(payload);
+              /* The gateway states its cadence on every frame. Without one -- an older gateway --
+                 nothing is claimed about a quiet stream. */
+              if (typeof frame.tick_s === "number" && frame.tick_s > 0) {
+                tickMs = frame.tick_s * 1000;
+              }
+              render(frame);
+            } catch (err) { /* ignore */ }
+          });
+          return pump();
+        });
+      }
+      return pump();
+    }).catch(function () {
+      /* Refused for want of a key: not stale. Stale means a gateway that was answering has
+         stopped, and a deployment waiting for somebody to paste a key is not in trouble. */
+      if (wantsKey && !key()) {
+        controller = null;
+        setTimeout(open, 2000);
+        return;
+      }
+      dot.className = "live-dot stale";
+      setTimeout(open, backoff);
+      backoff = Math.min(backoff * 2, 30000);  /* a gateway that is down must not be hammered */
+    });
+  }
+
+  /* A hidden tab holds a connection open for nobody. Drop it, reconnect on return. */
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden && controller) { controller.abort(); controller = null; }
+    else if (!document.hidden && !controller) { open(); }
+  });
+  window.addEventListener("pagehide", function () { if (controller) { controller.abort(); } });
+  open();
+}());
+
+/* A fragment can name something that is folded away.
+ *
+ * The key portal answers "where does the first one come from" in a <details>, shut by default
+ * because it is a question somebody has once. The pages that ask for a key link straight at it --
+ * and a link to a closed <details> arrives with the answer still folded up, which is the dead end
+ * the block was written to remove, reached by a different road. Browsers disagree about expanding
+ * it; this does not depend on which one is reading.
+ */
+(function () {
+  "use strict";
+
+  function reveal() {
+    /* Every harness that runs this file stubs a window, and most have no location on it --
+       the same shape a page gets before navigation has settled. Nothing to reveal, not a crash. */
+    var hash = (window.location && window.location.hash) || "";
+    var name;
+    try { name = decodeURIComponent(hash.replace(/^#/, "")); }
+    catch (error) { name = hash.replace(/^#/, ""); }
+    if (!name) { return false; }
+    var target = document.getElementById(name);
+    if (!target) { return false; }
+    var opened = false;
+    /* From the target itself: the fragment usually names the <details>, not something inside it. */
+    for (var node = target; node; node = node.parentNode) {
+      if (node.tagName === "DETAILS" && !node.open) { node.open = true; opened = true; }
+    }
+    /* The browser scrolled before this ran, to a target that was folded up. */
+    if (opened && target.scrollIntoView) { target.scrollIntoView(); }
+    return opened;
+  }
+
+  reveal();
+  if (window.addEventListener) { window.addEventListener("hashchange", reveal); }
+}());
+
+/* ---------- what this page asked, and what came back ----------
+ *
+ * Every panel here is drawn from a call, and the only evidence one was made was whether the panel
+ * filled in. When something is wrong the first question is which request failed and what it
+ * answered -- and the only way to find out was the browser's own developer tools, which is a fine
+ * answer for whoever wrote the page and no answer at all for an operator looking at a deployment
+ * they did not build.
+ *
+ * Folded away until asked for: this is a debugging surface, not part of the page's job. */
+(function () {
+  var button = document.getElementById("liveCalls");
+  var panel = document.getElementById("callLog");
+  var rows = document.getElementById("callLogRows");
+  if (!button || !panel || !rows || !window.__matrixarkTrace) { return; }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+
+  /* The path, not the whole URL. Every one of these is this deployment, so the origin is the same
+     on every row and spends the width that the query -- which is what differs -- needs. */
+  function shorten(url) {
+    try {
+      var parsed = new URL(String(url), location.href);
+      return parsed.pathname + (parsed.search || "");
+    } catch (e) { return String(url); }
+  }
+
+  function label(n) {
+    button.hidden = !n;
+    button.textContent = n === 1 ? "1 call" : n + " calls";
+  }
+
+  function render() {
+    var calls = window.__matrixarkTrace.calls();
+    if (!calls.length) {
+      rows.innerHTML = '<tr><td colspan="4">Nothing asked yet.</td></tr>';
+      return;
+    }
+    /* Newest first: the call somebody is trying to explain is the one they just made. */
+    rows.innerHTML = calls.slice().reverse().map(function (c) {
+      /* A status of 0 is "never answered", which is a different row from a 500 and reads as one.
+         The browser's own message is what separates a blocked request from a refused one. */
+      var answered = c.status ? String(c.status) : (c.detail || "never answered");
+      return '<tr class="' + (!c.status || c.status >= 400 ? "bad" : "") + '"><td>'
+        + esc(window.__matrixarkWhen ? window.__matrixarkWhen(c.at) : c.at)
+        + '</td><td class="mono">' + esc(c.method + " " + shorten(c.url))
+        + "</td><td>" + esc(answered)
+        + "</td><td>" + esc(c.ms + " ms") + "</td></tr>";
+    }).join("");
+  }
+
+  button.addEventListener("click", function () {
+    var show = panel.hidden;
+    panel.hidden = !show;
+    button.setAttribute("aria-expanded", show ? "true" : "false");
+    if (show) { render(); }
+  });
+
+  window.__matrixarkTrace.onChange(function (n) {
+    label(n);
+    /* Only while it is open. Rebuilding a hidden table on every request is work nobody asked for
+       on a page that is left open for days. */
+    if (!panel.hidden) { render(); }
+  });
+  label(window.__matrixarkTrace.calls().length);
+}());
+</script>
+</body>
+</html>
