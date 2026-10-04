@@ -159,3 +159,164 @@ impl ProxyService {
             }
         }
     }
+
+    pub fn start_heartbeat_loop(&self) -> thread::JoinHandle<()> {
+        let service = self.clone();
+        thread::spawn(move || loop {
+            // Read per pass, not captured: pushing a new interval should not need a restart.
+            let interval = Duration::from_millis(
+                service
+                    .with_options(|options| options.heartbeat_interval_ms)
+                    .max(1),
+            );
+            let started = std::time::Instant::now();
+            let _ = service.heartbeat_to_meta();
+            let elapsed = started.elapsed();
+            // Fixed RATE, not a fixed gap. Sleeping a whole interval AFTER the beat makes the
+            // real period `interval + beat_duration`, so the heartbeat rate degrades exactly
+            // when the metaserver is slow -- which is precisely when the liveness margin
+            // matters. With a 5s control-plane budget one slow beat would stretch a 10s
+            // interval to 15s and eat the margin the metaserver allows before declaring this
+            // proxy dead.
+            //
+            // A beat slower than the whole interval sleeps not at all, matching the reference
+            // loop. That does not hammer a struggling metaserver: the request rate is bounded
+            // by the beat duration itself, which is what is already slow.
+            if let Some(remaining) = interval.checked_sub(elapsed) {
+                thread::sleep(remaining);
+            } else {
+                service
+                    .inner
+                    .stats
+                    .write()
+                    .expect("proxy stats lock poisoned")
+                    .heartbeat_slow_total += 1;
+            }
+        })
+    }
+
+    pub(super) fn auto_register_proxy(&self, options: &ProxyOptions) -> AckResponse {
+        self.inner
+            .stats
+            .write()
+            .expect("proxy stats lock poisoned")
+            .auto_register_total += 1;
+        let response = post_json_with_options_and_headers::<_, AckResponse>(
+            &options.meta_addr,
+            "/proxies/register",
+            &RegisterProxyRequest {
+                registered_at_ms: 0,
+                proxy_addr: options.proxy_addr.clone(),
+                namespace: options.namespace.clone(),
+                location: options.location.clone(),
+                config_version: proxy_config_version(options),
+                binary_version: options.binary_version.clone(),
+            },
+            &crate::meta::admin_auth_header(),
+            options.control_http_options(),
+        )
+        .unwrap_or_else(|err| AckResponse {
+            status: Status::error("metaserver_error", err.to_string()),
+        });
+        self.record_service_discovery_registration(&response.status);
+        response
+    }
+
+    pub(super) fn apply_heartbeat_config(&self, response: &ProxyHeartbeatResponse) {
+        let serving_mode = proxy_serving_mode_from_meta(&response.serving_mode);
+        let policy_changed = {
+            let options = self.options();
+            serving_mode.is_some_and(|mode| mode != options.serving_mode)
+                || response
+                    .drop_percent
+                    .is_some_and(|percent| percent <= 100 && percent != options.drop_percent)
+        };
+        if !response.config_changed && !policy_changed {
+            return;
+        }
+        let mut options = self.options_owned();
+        if !response.namespace.is_empty() {
+            options.namespace = response.namespace.clone();
+        }
+        if response.config_version != 0 {
+            options.config_version = response.config_version;
+        }
+        if let Some(serving_mode) = serving_mode {
+            options.serving_mode = serving_mode;
+        }
+        // Only when the metaserver actually spoke for it. The three fields above are each
+        // guarded the same way -- namespace when non-empty, config_version when non-zero,
+        // serving_mode when it parses -- and this one was not, so every heartbeat carried a
+        // hardcoded 0 into the field an operator sets to drain the proxy.
+        if let Some(percent) = response.drop_percent {
+            if percent <= 100 {
+                options.drop_percent = percent;
+            }
+        }
+        let _ = self.update_options_report(options);
+    }
+
+    /// Forget the namespace/config this proxy believes it was granted. Called when the
+    /// metaserver explicitly rejects a heartbeat. Serving policy is deliberately left alone:
+    /// the metaserver drives that through `serving_mode`, and a rejection is not by itself an
+    /// instruction to start or stop serving.
+    pub(super) fn clear_config_authority(&self) {
+        let options = self.options();
+        if options.namespace.is_empty() && options.config_version == 0 {
+            return;
+        }
+        let mut cleared = (*options).clone();
+        cleared.namespace = String::new();
+        cleared.config_version = 0;
+        let _ = self.update_options_report(cleared);
+    }
+
+    pub(super) fn record_service_discovery_heartbeat(&self, status: &Status) {
+        let mut state = self
+            .inner
+            .service_discovery
+            .write()
+            .expect("proxy service discovery lock poisoned");
+        if status.ok || status.code == "resource_frozen" {
+            state.registered = true;
+            state.last_success_ms = Some(now_ms());
+            state.last_error = None;
+            state.stats.heartbeat_success_total += 1;
+        } else {
+            state.last_error_ms = Some(now_ms());
+            state.last_error = Some(status.clone());
+            state.stats.heartbeat_failure_total += 1;
+        }
+    }
+
+    pub(super) fn record_service_discovery_registration(&self, status: &Status) {
+        let mut state = self
+            .inner
+            .service_discovery
+            .write()
+            .expect("proxy service discovery lock poisoned");
+        if status.ok {
+            state.registered = true;
+            state.last_success_ms = Some(now_ms());
+            state.last_error = None;
+            state.stats.registration_success_total += 1;
+        } else {
+            state.registered = false;
+            state.last_error_ms = Some(now_ms());
+            state.last_error = Some(status.clone());
+            state.stats.registration_failure_total += 1;
+        }
+    }
+
+    pub(super) fn record_service_discovery_error(&self, status: &Status) {
+        let mut state = self
+            .inner
+            .service_discovery
+            .write()
+            .expect("proxy service discovery lock poisoned");
+        state.last_error_ms = Some(now_ms());
+        state.last_error = Some(status.clone());
+        state.stats.heartbeat_failure_total += 1;
+    }
+
+}
