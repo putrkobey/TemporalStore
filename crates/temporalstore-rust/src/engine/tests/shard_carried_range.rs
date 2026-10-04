@@ -311,3 +311,945 @@ fn a_loaded_shard_carries_the_routing_range_it_was_loaded_on() {
 /// round trip below is kept only to show the wire key is inert.
 #[test]
 fn the_two_sites_that_file_a_block_now_file_it_under_the_shards_own_range() {
+    for (label, sync_path) in [("upsert_bucket_index_block", false), ("sync_bucket_index_object_blocks", true)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on(&engine, NARROW_END);
+        let keys = seed(&engine, 8);
+        let key = keys[0].clone();
+        assert_eq!(
+            MEASURED_KEY, key,
+            "the fixture's first key is no longer the key the measurement names"
+        );
+
+        let mut shards = engine.shards.write().expect("shards lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1 is loaded");
+        assert_eq!(
+            (0, NARROW_END),
+            shard.routing_range(),
+            "the shard under test is not carrying 0..{NARROW_END}, so what follows would measure \
+             the fallback rather than the fix"
+        );
+        let before = shard.string_address(key.as_str()).expect("key present").clone();
+        let address = as_an_older_build_wrote_it(&before);
+        assert_eq!(
+            address, before,
+            "the wire round trip changed the address. `rs` is inert -- the address holds no routing \
+             bucket -- so this has to be the identity."
+        );
+        shard.set_string_address(key.as_str().into(), &address.clone());
+
+        if sync_path {
+            crate::engine::storage_bucket_internals::sync_bucket_index_object_blocks(
+                shard,
+                1,
+                "string",
+                &key,
+                vec![address],
+                true,
+            );
+        } else {
+            crate::engine::storage_bucket_internals::upsert_bucket_index_block(
+                shard, 1, "string", &key, None, address, true,
+            );
+        }
+
+        let contents = bucket_contents(shard);
+        let in_narrow = contents
+            .get(&MEASURED_NARROW_BUCKET)
+            .is_some_and(|object_keys| object_keys.contains(&key));
+        let in_wide = contents
+            .get(&MEASURED_WIDE_BUCKET)
+            .is_some_and(|object_keys| object_keys.contains(&key));
+        println!(
+            "  {label}: {key} -- in {MEASURED_NARROW_BUCKET} {in_narrow}, in \
+             {MEASURED_WIDE_BUCKET} {in_wide}"
+        );
+        assert!(
+            in_narrow,
+            "`{label}` did not file {key} in bucket {MEASURED_NARROW_BUCKET}, the bucket the \
+             shard's own range puts it in. Buckets holding it: {:?}",
+            contents
+                .iter()
+                .filter(|(_, object_keys)| object_keys.contains(&key))
+                .map(|(bucket, _)| *bucket)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !in_wide,
+            "`{label}` filed {key} in bucket {MEASURED_WIDE_BUCKET} -- the whole-range bucket, on \
+             a shard that holds 0..{NARROW_END}. This is the defect mx#1949 measured and declined; \
+             it has come back."
+        );
+        assert_eq!(
+            0,
+            buckets_outside(&contents, 0, NARROW_END),
+            "the shard holds 0..{NARROW_END} and some page is filed outside it: {:?}",
+            contents.keys().collect::<Vec<_>>()
+        );
+    }
+}
+
+// =============================================================================================
+// 3. THE CONTROL: while every page is routed, the writers are value-identical
+// =============================================================================================
+
+/// THE WRITERS FILE BY THE STAMP, AND THE TWO STAMPS DISAGREE.
+///
+/// THIS WAS A CONTROL AND IS NOW THE SUBJECT. While an address carried its own routing bucket, that
+/// bucket won and the shard's stamp was consulted only where a fallback would otherwise have fired
+/// -- so a shard stamped `0..1023` and a shard stamped with the whole range filed the same page in
+/// the same bucket, and the control said so.
+///
+/// An address carries no bucket. The stamp decides EVERY placement, so the two stamps must file the
+/// same page DIFFERENTLY, and the assertion is inverted. The control that says the comparison can
+/// express sameness moves to the same stamp twice.
+///
+/// Run at BOTH stamps, because "the shard's range IS the whole range" is exactly the condition under
+/// which this change is invisible.
+#[test]
+fn the_two_writers_file_by_the_stamp_and_the_two_stamps_disagree() {
+    let mut filings: Vec<BTreeMap<u32, Vec<String>>> = Vec::new();
+    for stamp in [NARROW_END, WIDE_END] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on(&engine, NARROW_END);
+        let keys = seed(&engine, 32);
+
+        let mut shards = engine.shards.write().expect("shards lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1 is loaded");
+        // Re-stamp under the test's own hand. The engine loaded this shard on 0..1023 either way;
+        // what is varied here is the ONE input this change added.
+        shard.set_routing_range(0, stamp);
+
+        // DENOMINATOR: the stamp took, which is the one input this change varies.
+        assert_eq!(
+            (0, stamp),
+            shard.routing_range(),
+            "the shard is not carrying 0..{stamp}, so the arm below files by something else"
+        );
+        for key in &keys {
+            let address = shard.string_address(key.as_str()).expect("key present").clone();
+            crate::engine::storage_bucket_internals::upsert_bucket_index_block(
+                shard, 1, "string", key, None, address, true,
+            );
+        }
+        let contents = bucket_contents(shard);
+        println!(
+            "  stamped 0..{stamp}: {} pages over {} buckets",
+            block_total(&contents),
+            contents.len()
+        );
+        assert!(block_total(&contents) >= keys.len(), "the fixture filed nothing");
+        filings.push(contents);
+    }
+    // INVERTED. While an address carried its own routing bucket, that bucket won and the stamp was
+    // consulted only where a fallback would otherwise have fired -- so the two stamps had to file
+    // identically and this asserted equality. The stamp decides EVERY placement now, so they must
+    // differ, and the buckets the wide stamp names must be ones the narrow shard does not hold.
+    assert_ne!(
+        filings[0], filings[1],
+        "the two writers filed the same pages into the same buckets under a 0..{NARROW_END} stamp \
+         and a 0..{WIDE_END} one. The stamp is the only input to the placement now, so this would \
+         mean the writers are not reading it."
+    );
+    let narrow_outside = buckets_outside(&filings[0], 0, NARROW_END);
+    let wide_outside = buckets_outside(&filings[1], 0, NARROW_END);
+    assert_eq!(
+        0, narrow_outside,
+        "{narrow_outside} buckets of the NARROW stamp's filing sit above {NARROW_END}"
+    );
+    assert!(
+        wide_outside > 0,
+        "the WIDE stamp filed every page inside 0..{NARROW_END} as well, so the two stamps cannot \
+         be told apart by where they put a page and the inequality above is measuring noise"
+    );
+}
+
+// =============================================================================================
+// 4. DIRECTION: narrowing places, it does not filter
+// =============================================================================================
+
+/// NOT ONE PAGE ALREADY FILED IS REMOVED WHEN THE WRITERS NARROW.
+///
+/// mx#1945's refutation is that narrowing a FILTER drops live data -- 0 of 400 surviving. These
+/// two are not filters, and this drives it element by element rather than by count: the whole
+/// bucket-contents map before and after, with the only difference being the one page re-filed.
+///
+/// The shard here is loaded on `0..1023` with its pages made UNROUTED, so the load path's own
+/// rebuild files them on the shard's range; then one page is re-published through each writer.
+/// Every other page must be exactly where it was.
+#[test]
+fn narrowing_the_writers_removes_no_block_that_was_already_filed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, NARROW_END);
+    let keys = seed(&engine, RECORDS);
+
+    let mut shards = engine.shards.write().expect("shards lock poisoned");
+    let shard = shards.get_mut(&1).expect("shard 1 is loaded");
+    let round_tripped = round_trip_every_block_through_the_wire(shard);
+    assert_eq!(
+        RECORDS, round_tripped,
+        "the fixture round-tripped {round_tripped} of {RECORDS} addresses"
+    );
+    crate::engine::storage_bucket_internals::rebuild_bucket_block_ownership(
+        1,
+        shard,
+        0,
+        NARROW_END,
+    );
+    let before = bucket_contents(shard);
+    assert_eq!(
+        RECORDS,
+        block_total(&before),
+        "the fixture starts with {} pages, not {RECORDS}",
+        block_total(&before)
+    );
+    assert_eq!(
+        0,
+        buckets_outside(&before, 0, NARROW_END),
+        "the fixture starts with pages outside the shard's range, so this measures the rebuild \
+         rather than the writers"
+    );
+
+    let key = keys[0].clone();
+    let address = shard.string_address(key.as_str()).expect("key present").clone();
+    crate::engine::storage_bucket_internals::upsert_bucket_index_block(
+        shard, 1, "string", &key, None, address, true,
+    );
+    let after = bucket_contents(shard);
+
+    println!(
+        "  before: {} pages / {} buckets     after: {} pages / {} buckets",
+        block_total(&before),
+        before.len(),
+        block_total(&after),
+        after.len()
+    );
+    assert_eq!(
+        block_total(&before),
+        block_total(&after),
+        "a page was lost or duplicated by an upsert that only re-files one key"
+    );
+    assert_eq!(
+        0,
+        buckets_outside(&after, 0, NARROW_END),
+        "the upsert filed something outside 0..{NARROW_END}"
+    );
+    // ELEMENT BY ELEMENT: every key present before is present after, and in the same bucket
+    // unless it is the one key that was re-published.
+    let placement = |contents: &BTreeMap<u32, Vec<String>>| -> BTreeMap<String, u32> {
+        let mut out = BTreeMap::new();
+        for (bucket, object_keys) in contents {
+            for object_key in object_keys {
+                out.insert(object_key.clone(), *bucket);
+            }
+        }
+        out
+    };
+    let before_placement = placement(&before);
+    let after_placement = placement(&after);
+    assert_eq!(
+        before_placement.keys().collect::<Vec<_>>(),
+        after_placement.keys().collect::<Vec<_>>(),
+        "the set of object keys in the index moved"
+    );
+    let moved: Vec<&String> = before_placement
+        .iter()
+        .filter(|(object_key, bucket)| after_placement.get(*object_key) != Some(bucket))
+        .map(|(object_key, _)| object_key)
+        .collect();
+    assert!(
+        moved.is_empty(),
+        "these keys changed bucket when only {key} was re-published: {moved:?}"
+    );
+}
+
+// =============================================================================================
+// 5. THE STORED SHAPE DOES NOT MOVE
+// =============================================================================================
+
+/// THE FIELD IS ABSENT FROM THE SERIALIZED INDEX, DRIVEN BY BYTES.
+///
+/// `ShardState` IS the serialized index. Its own `index_format_version` doc records what a change
+/// to that shape has cost once already, so "a skipped field is not serialized" is exactly the kind
+/// of claim that has to be driven rather than read off an attribute.
+///
+/// Both directions come out of one measurement, because there is only one byte stream: a shard
+/// serialized with the field stamped and the same shard serialized unstamped produce IDENTICAL
+/// bytes, so there is no old-index/new-index distinction for a decoder to get wrong. What a decode
+/// then yields -- an UNSTAMPED state, answering the whole range -- is what an index written before
+/// this change reads as after it.
+#[test]
+fn the_routing_range_field_changes_no_serialized_byte() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, NARROW_END);
+    seed(&engine, 16);
+
+    let mut shards = engine.shards.write().expect("shards lock poisoned");
+    let shard = shards.get_mut(&1).expect("shard 1 is loaded");
+
+    let mut stamped = shard.clone();
+    // The PRODUCTION codec, not the legacy one: `serialize_index` picks its payload encoding off
+    // this field, and a byte comparison taken on the fallback path would not be a comparison of
+    // what the engine actually writes.
+    stamped.index_format_version = crate::engine::SHARD_INDEX_FORMAT_VERSION;
+    stamped.set_routing_range(0, NARROW_END);
+    let mut unstamped = shard.clone();
+    unstamped.index_format_version = crate::engine::SHARD_INDEX_FORMAT_VERSION;
+    unstamped.routing_range_start = 0;
+    unstamped.routing_range_end = 0;
+    unstamped.routing_range_known = false;
+    assert_ne!(
+        stamped.routing_range(),
+        unstamped.routing_range(),
+        "the two states under test answer the same range, so byte-equality below would prove \
+         nothing about the field"
+    );
+
+    let stamped_bytes = crate::engine::serialize_index(&stamped);
+    let unstamped_bytes = crate::engine::serialize_index(&unstamped);
+    println!(
+        "  stamped {} bytes, unstamped {} bytes",
+        stamped_bytes.len(),
+        unstamped_bytes.len()
+    );
+    assert!(
+        stamped_bytes.len() > 256,
+        "the fixture serialized {} bytes; that is not a populated index and byte-equality over \
+         two empty buffers says nothing",
+        stamped_bytes.len()
+    );
+    assert_eq!(
+        stamped_bytes, unstamped_bytes,
+        "stamping the routing range changed the serialized index. The field is supposed to be \
+         `#[serde(skip)]`; if it is now written, an index written by an older build no longer \
+         reads the same and this is a stored-format change."
+    );
+
+    let decoded = crate::engine::decode_index_bytes(&stamped_bytes)
+        .expect("the index this test just serialized decodes");
+    assert!(
+        !decoded.routing_range_known,
+        "a decoded index came back claiming to know a routing range; the field cannot have been \
+         skipped on the way out"
+    );
+    assert_eq!(
+        (0, WIDE_END),
+        decoded.routing_range(),
+        "a decoded index must answer the WHOLE range until the engine stamps it, which is what \
+         an index written before this change already did"
+    );
+    assert_eq!(
+        crate::engine::SHARD_INDEX_FORMAT_VERSION,
+        decoded.index_format_version,
+        "the on-disk format version this index decodes as is not the one this build writes, which \
+         says this change is a format change after all"
+    );
+    let decoded_unstamped = crate::engine::decode_index_bytes(&unstamped_bytes)
+        .expect("the unstamped index decodes too");
+    assert_eq!(
+        decoded.index_format_version, decoded_unstamped.index_format_version,
+        "the two arms decode as different on-disk versions"
+    );
+}
+
+// =============================================================================================
+// 6. THE CROSS-RANGE RESTORE, DRIVEN IN BOTH DIRECTIONS
+// =============================================================================================
+
+/// WRITE ON ONE RANGE, READ ON THE OTHER, BOTH WAYS.
+///
+/// mx#1945 found its refutation this way and it cost a record; mx#1949 re-drove it because a
+/// change that touches filing is silent when it loses something. This one moves where an unrouted
+/// page is filed, which is the same neighbourhood, so it is driven again: every record readable,
+/// every page present, and the buckets counted against the READING shard's range in each
+/// direction.
+///
+/// The second direction is the one with something to lose -- a store written on the whole range
+/// and read on `0..1023` has every whole-range bucket outside the reading range.
+/// AND IT IS NOW A REFUSAL -- the cross-range reopen this test drove is no longer reachable.
+///
+/// What this test established is not deleted, it is INVERTED, the same way
+/// `the_two_sites_that_file_a_block_now_file_it_under_the_shards_own_range` inverted mx#1949's
+/// measurement rather than removing it. It showed that a store written on one range reads back
+/// whole on the other -- true, and the reason the hazard was silent: every record read while every
+/// page sat in a bucket the reopened shard did not hold. `routing_range_stamp.rs` records the range
+/// a store was built under and the load REFUSES when the configured range disagrees.
+///
+/// REPLACED, NOT RETARGETED. Deleting the stamp to keep the old assertions passing would put both
+/// arms on the pre-stamp ADOPTION path, which honours the range the store was BUILT on -- so each
+/// arm would read on the range it wrote on while the name still said "on the other". A test that
+/// quietly starts measuring a different population is worse than a red one.
+///
+/// The `routing_range()` assertion this test carried -- that a reloaded shard carries the range it
+/// was LOADED with rather than the one it was written with -- is kept, over the arm where the load
+/// is now allowed.
+#[test]
+fn a_store_written_on_one_range_is_refused_on_the_other() {
+    for (write_end, read_end) in [(NARROW_END, WIDE_END), (WIDE_END, NARROW_END)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let keys = {
+            let engine = engine_on(dir.path());
+            load_on(&engine, write_end);
+            let keys = seed(&engine, RECORDS);
+            assert_eq!(RECORDS, read_back(&engine, &keys), "the write arm cannot read its own store");
+            engine.unload_shard(1);
+            keys
+        };
+        let engine = engine_on(dir.path());
+        let status = engine
+            .load_shard_with(crate::control::LoadShardRequest {
+                shard_id: 1,
+                table_name: "shard-carried-range".to_string(),
+                shard_uri: "local://shard-carried-range/1".to_string(),
+                start_routing_bucket: 0,
+                end_routing_bucket: read_end,
+                readonly: false,
+                load_version: 1,
+                local_node_id: Some(1),
+            })
+            .status;
+        println!(
+            "  wrote on 0..{write_end}, opened on 0..{read_end}: ok={} code={}",
+            status.ok, status.code
+        );
+        assert!(
+            !status.ok,
+            "wrote on 0..{write_end} and opened on 0..{read_end}: the load succeeded, so a \
+             populated store can still be opened on a range none of its pages are filed under"
+        );
+        assert_eq!(
+            "routing_range_mismatch", status.code,
+            "the load was refused with code `{}` rather than `routing_range_mismatch`",
+            status.code
+        );
+
+        // THE ARM WHERE THE LOAD IS ALLOWED, carrying every assertion that is still reachable.
+        load_on(&engine, write_end);
+        let recovered = read_back(&engine, &keys);
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 is loaded");
+        let contents = bucket_contents(shard);
+        let outside = buckets_outside(&contents, 0, write_end);
+        println!(
+            "  reopened on 0..{write_end}: {recovered}/{RECORDS} records, {} pages, {outside} \
+             buckets outside the range, stamp {:?}",
+            block_total(&contents),
+            shard.routing_range()
+        );
+        assert_eq!(
+            RECORDS, recovered,
+            "reopened on 0..{write_end}: {recovered} of {RECORDS} records came back"
+        );
+        assert!(
+            block_total(&contents) >= RECORDS,
+            "reopened on 0..{write_end}: {} pages for {RECORDS} records",
+            block_total(&contents)
+        );
+        assert_eq!(
+            0, outside,
+            "reopened on the range it was written on, {outside} buckets sit above the shard's end"
+        );
+        assert_eq!(
+            (0, write_end),
+            shard.routing_range(),
+            "the reloaded shard carries {:?} rather than the range it was loaded with",
+            shard.routing_range()
+        );
+    }
+}
+
+// =============================================================================================
+// 6b. THE MANIFEST INSTALL, WHICH SWAPS A WHOLE SHARD OUT FROM UNDER ITSELF
+// =============================================================================================
+
+/// A CROSS-RANGE MANIFEST INSTALL LEAVES THE TARGET CARRYING THE TARGET'S OWN RANGE.
+///
+/// THIS TEST EXISTS BECAUSE A MUTANT WAS KILLED BY A GUARD ALONE. Making the manifest install
+/// insert its restored state directly instead of through `install_shard_state` was caught only by
+/// `every_shard_the_engine_installs_carries_its_routing_range`, which reads the SHAPE of the call
+/// -- weaker evidence than a test that reads the answer. This reads the answer.
+///
+/// It is also the path with the most to lose. mx#1945 narrowed this install's REBUILD and dropped
+/// 0 of 400 pages; that rebuild still runs on the whole range and is untouched here. What the
+/// stamp decides is only where the NEXT write files a page. Both are asserted: every page still
+/// present, every record still readable, AND the target carrying `0..1023` rather than the range
+/// the image was written on.
+///
+/// rust-internal: drives the engine's own manifest install, no product behaviour
+#[test]
+fn a_manifest_installed_across_ranges_leaves_the_target_carrying_its_own_range() {
+    let source_dir = tempfile::tempdir().expect("tempdir");
+    let source = engine_on(source_dir.path());
+    load_on(&source, WIDE_END);
+    let keys = seed(&source, RECORDS);
+
+    let buckets: Vec<u32> = {
+        let shards = source.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1");
+        assert_eq!(
+            (0, WIDE_END),
+            shard.routing_range(),
+            "the SOURCE is not on the whole range, so this is not a cross-range install"
+        );
+        shard.bucket_index.bucket_map.keys().copied().collect()
+    };
+    assert!(!buckets.is_empty(), "the source holds no bucket to dump");
+    let manifest = source
+        .create_bucket_dump_manifest(1, buckets)
+        .expect("the source can dump its own buckets");
+
+    let target_dir = tempfile::tempdir().expect("tempdir");
+    let target = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        target_dir.path().join("cache"),
+        // The pages live where the source wrote them; only the index is restored.
+        source_dir.path().join("blocks"),
+        target_dir.path().join("indexes"),
+    );
+    load_on(&target, NARROW_END);
+    target
+        .install_bucket_dump_manifest(&manifest)
+        .expect("the manifest installs on the narrower shard");
+
+    let readable = read_back(&target, &keys);
+    let shards = target.shards.read().expect("shards lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 is loaded");
+    let contents = bucket_contents(shard);
+    println!(
+        "  installed a 0..{WIDE_END} image on a 0..{NARROW_END} shard: {readable}/{RECORDS} \
+         records, {} pages, stamp {:?}",
+        block_total(&contents),
+        shard.routing_range()
+    );
+    assert_eq!(
+        RECORDS, readable,
+        "{readable} of {RECORDS} records were readable after a cross-range manifest install -- \
+         the failure mx#1945 caught when it first narrowed this install's range"
+    );
+    assert!(
+        block_total(&contents) >= RECORDS,
+        "{} pages for {RECORDS} records after the install",
+        block_total(&contents)
+    );
+    assert_eq!(
+        (0, NARROW_END),
+        shard.routing_range(),
+        "the target came out of a manifest install carrying the IMAGE's range rather than its \
+         own, so the next unrouted page it files goes into a bucket it does not hold"
+    );
+}
+
+// =============================================================================================
+// 7. THE GUARD: there is one way in, and it stamps
+// =============================================================================================
+
+/// EVERY SHARD THE ENGINE INSTALLS CARRIES ITS ROUTING RANGE, HELD AS A LIST OF INSTALL SITES.
+///
+/// The unstamped default is the whole range, which is the OLD behaviour -- so an install site that
+/// forgot to stamp would not fail anything, it would simply keep the defect on that path. What
+/// makes that unreachable is that there is exactly ONE function which puts a `ShardState` into the
+/// served map, and it stamps. This holds that shape as an equality-compared list, with vacuity
+/// floors first and a CONTROL on the matcher itself.
+///
+/// rust-internal: reads this crate's own call sites, no product behaviour
+#[test]
+fn every_shard_the_engine_installs_carries_its_routing_range() {
+    use std::path::Path;
+
+    /// The production sites that insert a `ShardState` into the engine's served shard map.
+    const INSTALL_SITES: &[&str] = &["engine.rs :: install_shard_state"];
+
+    // THE MATCHER'S OWN CONTROL, before it is pointed at the tree. It must fire on both shapes an
+    // install can take, and stay SILENT on an insert into a field OF a shard, which is the shape
+    // that appears dozens of times on the write path.
+    let control_lines: Vec<&str> = vec![
+        "fn chain_form(&self) {",
+        "    self.shards",
+        "        .write()",
+        "        .expect(\"engine lock poisoned\")",
+        "        .insert(shard_id, state);",
+        "}",
+        "fn bound_form(&self) {",
+        "    let mut shards = self.shards.write().expect(\"engine lock poisoned\");",
+        "    shards.insert(shard_id, state);",
+        "}",
+        "fn not_an_install(&self) {",
+        "    let mut shards = self.shards.write().expect(\"engine lock poisoned\");",
+        "    let shard = shards.get_mut(&shard_id).expect(\"shard\");",
+        "    shard.strings.insert(key.clone(), durable.clone());",
+        "    shard.wal_resident_blocks.insert(object_id, placement);",
+        "}",
+    ];
+    let control_hits = shard_map_insert_sites(&control_lines);
+    assert_eq!(
+        vec!["chain_form".to_string(), "bound_form".to_string()],
+        control_hits,
+        "the matcher does not report what it is supposed to report on a planted input, so its \
+         verdict over the tree below means nothing"
+    );
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut pending = vec![root.clone()];
+    let mut files_scanned = 0usize;
+    let mut lines_scanned = 0usize;
+    let mut excluded = 0usize;
+    let mut shards_mentions = 0usize;
+    let mut sites: Vec<String> = Vec::new();
+
+    while let Some(path) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                pending.push(entry_path);
+                continue;
+            }
+            if entry_path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let display = entry_path.display().to_string();
+            if display.contains("/tests/") || display.ends_with("tests.rs") {
+                excluded += 1;
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&entry_path) else {
+                continue;
+            };
+            files_scanned += 1;
+            let lines: Vec<&str> = text.lines().collect();
+            lines_scanned += lines.len();
+            shards_mentions += lines.iter().filter(|line| line.contains("self.shards")).count();
+            let relative = display
+                .rsplit_once("/src/")
+                .map(|(_, tail)| tail.to_string())
+                .unwrap_or(display.clone());
+            for enclosing in shard_map_insert_sites(&lines) {
+                sites.push(format!("{relative} :: {enclosing}"));
+            }
+        }
+    }
+
+    // VACUITY FLOORS, BEFORE ANY VERDICT.
+    assert!(
+        files_scanned > 80,
+        "the scan read {files_scanned} production .rs files under {}; below 80 it has stopped \
+         reading the crate and the list below is empty for the wrong reason",
+        root.display()
+    );
+    assert!(
+        lines_scanned > 100_000,
+        "the scan read {lines_scanned} lines; below 100,000 it is not reading this crate"
+    );
+    assert!(
+        excluded > 10,
+        "the scan excluded {excluded} test files; this crate has more than ten"
+    );
+    assert!(
+        shards_mentions >= 20,
+        "the scan saw `self.shards` {shards_mentions} times; there were 60 when this was written, \
+         and below 20 the matcher is not looking at the engine's shard map at all"
+    );
+
+    sites.sort();
+    println!(
+        "  {files_scanned} files / {lines_scanned} lines scanned, {excluded} test files excluded, \
+         {shards_mentions} mentions of the engine's shard map"
+    );
+    for site in &sites {
+        println!("    installs a ShardState   {site}");
+    }
+    let mut expected: Vec<String> = INSTALL_SITES.iter().map(|s| s.to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        sites, expected,
+        "the set of production sites that put a ShardState into the served shard map has moved.\n\
+         If you ADDED one, it must stamp the shard's routing range -- an unstamped shard files \
+         every unrouted page under the WHOLE range, which on any shard not loaded on 0..u32::MAX \
+         is a bucket the shard does not hold. Route it through `install_shard_state` instead.\n\
+         If you REMOVED one, the engine has another way to install a shard and this guard can no \
+         longer see it."
+    );
+
+    // And the one site actually stamps: read off the source, since the list above only says WHERE.
+    let installer = std::fs::read_to_string(root.join("engine.rs")).expect("engine.rs");
+    assert!(
+        installer.contains("state.set_routing_range(start_routing_bucket, end_routing_bucket);"),
+        "`install_shard_state` no longer stamps the range it read"
+    );
+}
+
+/// The enclosing function name of every line that inserts into the engine's shard map.
+///
+/// Two shapes, because both appear in this crate: a method chain starting at `self.shards`, and a
+/// local binding taken from it. An insert into a field OF a shard (`shard.strings.insert(..)`) is
+/// neither, and the control above holds that.
+fn shard_map_insert_sites(lines: &[&str]) -> Vec<String> {
+    let enclosing = |index: usize| -> String {
+        for line in lines[..=index].iter().rev() {
+            let trimmed = line.trim_start();
+            if let Some(rest) = trimmed
+                .strip_prefix("pub(crate) fn ")
+                .or_else(|| trimmed.strip_prefix("pub(super) fn "))
+                .or_else(|| trimmed.strip_prefix("pub fn "))
+                .or_else(|| trimmed.strip_prefix("fn "))
+            {
+                return rest
+                    .split(|c: char| c == '(' || c == '<' || c == ' ')
+                    .next()
+                    .unwrap_or("?")
+                    .to_string();
+            }
+        }
+        "?".to_string()
+    };
+    let mut found: Vec<(usize, String)> = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        if !line.contains("self.shards") {
+            continue;
+        }
+        // Shape one: a method chain. Every following line that continues it starts with `.`.
+        let mut cursor = index;
+        if line.contains(".insert(") {
+            found.push((index, enclosing(index)));
+        }
+        while cursor + 1 < lines.len() && lines[cursor + 1].trim_start().starts_with('.') {
+            cursor += 1;
+            if lines[cursor].contains(".insert(") {
+                found.push((cursor, enclosing(cursor)));
+            }
+        }
+        // Shape two: a binding. `let mut shards = self.shards.write()...` and then a bare
+        // `shards.insert(`, which the chain walk above cannot see.
+        if line.contains("= self.shards") {
+            let Some(binding) = line
+                .split('=')
+                .next()
+                .and_then(|left| left.split_whitespace().last())
+            else {
+                continue;
+            };
+            let needle = format!("{binding}.insert(");
+            for (offset, later) in lines.iter().enumerate().skip(index + 1) {
+                if later.trim_start() == "}" && later.len() <= 2 {
+                    break;
+                }
+                if later.contains(&needle) {
+                    found.push((offset, enclosing(offset)));
+                }
+            }
+        }
+    }
+    found.sort_by_key(|(index, _)| *index);
+    let mut seen = BTreeSet::new();
+    found
+        .into_iter()
+        .filter(|(index, _)| seen.insert(*index))
+        .map(|(_, name)| name)
+        .collect()
+}
+
+// =============================================================================================
+// 8. THE BYTE BUDGET
+// =============================================================================================
+
+/// THREE FIELDS FOR EIGHT BYTES, NOT SIXTEEN, AND THE STRUCT IS ONE PER SHARD.
+///
+/// mx#1949 added a field to `LiveBlockEntry` -- one per LIVE PAGE -- took it from 104 to 112, and
+/// paid it back into existing padding rather than widening the bound. This field is on a structure
+/// with ONE INSTANCE PER SHARD, which is the reason `per_item_byte_budget` carries `ShardState` as
+/// a control rather than as a budgeted row: at a count of one, width is not a cost worth trading
+/// clarity for.
+///
+/// It is still paid down, the same way and for the same reason mx#1937 gives: an `Option<(u32,
+/// u32)>` is 12 bytes of its own and would have taken 16 after alignment; a `u32` pair plus a
+/// `bool` puts the flag in the byte this struct was already padding out for `promote_scan_done`,
+/// `control_coalesce_persist` and `control_distinct_sketch`. Pinned here so a later widening of
+/// this particular field is a named failure rather than a silent one.
+#[test]
+fn the_shard_carried_range_costs_eight_bytes_on_a_structure_there_is_one_of() {
+    use std::mem::size_of;
+    let state = size_of::<crate::engine::state::ShardState>();
+    println!(
+        "  ShardState {state} bytes: three routing-range fields, and the shard id it is served under"
+    );
+    // THE NUMBER WENT DOWN, WHICH THE MESSAGE BELOW DOES NOT ANTICIPATE, AND BOTH HALVES OF THE
+    // SHRINK ARE ATTRIBUTED. Measured with this test run ALONE on each tree, because the suite's
+    // 4-thread mode contaminates several part1 counters:
+    //
+    //   pin 1,904  ->  1,792 on #2252  ->  1,648 here
+    //
+    // 112 OF IT WAS ALREADY STALE ON MAIN. The owned-array conversions and the first map migration
+    // shrank this struct and nobody moved the pin, so it was red before this change touched it --
+    // the third such pin in this campaign, after the second stamp tripwire in `block_entry_names`
+    // and the fold count in `element_ordinal_reuse`. A width pin only works if something runs it.
+    //
+    // 96 IS THIS CHANGE: TWO HashMap HEADERS, because three fields became one. The arithmetic below
+    // is the previous step's and is kept because the same reasoning applies to each.
+    //
+    // 144 WAS AN EARLIER CHANGE, AND IT IS EXACTLY THE ARITHMETIC. `context_audits`,
+    // `context_summaries` and `context_compressions` each left as a
+    // `HashMap<Arc<str>, OwnedTimestampedSeries>` -- 48 bytes of `RandomState` plus table header
+    // apiece, 3 x 48 = 144. Predicted before the measurement and confirmed by it, which is worth
+    // stating because a struct-width delta that does NOT equal the removed fields' widths would
+    // mean padding had moved and the remaining fields had repacked.
+    //
+    // SO THIS IS PAID DOWN, NOT WIDENED, which is the direction the message below demands. Five
+    // of the eight per-element maps still have their own field; each will take another 48 off.
+    assert_eq!(
+        1_096, state,
+        "`ShardState` is {state} bytes. It was 1,880 before the routing range was carried on it \
+         and 1,888 after -- the two u32s, with THAT flag landing in padding this struct already \
+         had -- and 1,904 since it also carries the shard id it is served under. THAT step cost \
+         SIXTEEN, not eight: the second flag did NOT land free, which was measured rather than \
+         predicted, and an `Option<u64>` would have cost the same sixteen. It is paid rather than \
+         argued down because there is one of this struct per shard. A change here means either a \
+         field was added or a flag stopped being free; say which, and pay it down rather than \
+         widening this number. It was 1,792 after `context_children` moved into the consolidated map and 1,648 once `context_audits`, `context_summaries` and `context_compressions` followed it -- 48 bytes a map. `features` followed them for another 48, and the last three -- `context_events`, `context_entities`, `context_indexes` -- took 144 more, so this is 1,456. ALL EIGHT per-element series are in `objects`, and the two rollup ladders merged into one domain-keyed field for another 48, so this is 1,408. Every 48 from here comes from merging same-shaped maps or folding a value into `ObjectRecord`, not from the series family, which is finished. The two u64 ledgers merged for another 48 and the two counter series for another, and the two address maps for another, so this is 1,192. THE TWO ADDRESS MAPS AND THE TWO COUNTER SERIES THEN BECAME ONE FIELD -- not a same-shape merge like the four before it, because their value types differ, but a merge whose variant wraps the TABLE rather than the entry, so the tag is paid once per domain and no key pays a byte. That is one more HashMap header gone, so this is 1,144. THE THREE u64 LEDGERS THEN JOINED THE SAME FIELD -- a third table shape behind the same domain key, by the same argument -- so this is 1,096: 808 off the 1,904 this campaign started at, and every 48 of it is one HashMap header that stopped existing. THE OBJECT-KEYED FIELD COUNT IS SEVEN HERE, which is the floor this campaign was measured against."
+    );
+    assert_eq!(
+        4,
+        size_of::<u32>() + size_of::<bool>() - 1,
+        "the arithmetic this bound rests on has moved"
+    );
+    // AN `Option<(u32, u32)>` WOULD HAVE COST MORE, and that is the trade this number records.
+    assert!(
+        size_of::<Option<(u32, u32)>>() > 2 * size_of::<u32>(),
+        "an Option<(u32, u32)> is no longer wider than the pair it wraps, so the packing this \
+         test justifies is no longer a saving"
+    );
+}
+
+// =============================================================================================
+// 8. THE INSTALL RECORDS THE RANGE IT FILED UNDER
+// =============================================================================================
+
+/// A MANIFEST INSTALL STAMPS THE RANGE IT FILED UNDER, BECAUSE THE INSTALL IS WHAT PUTS THE STATE
+/// ON DISK.
+///
+/// `install_bucket_dump_manifest` writes the base index through `persist_index_bytes_durable`
+/// UNCONDITIONALLY -- before it asks whether the shard was loaded -- and `store_has_on_disk_state`
+/// counts exactly that file. So the install-then-load restore, which is the production one and is
+/// reachable over `POST /server/storage/dumps/install`, leaves a store holding state that no
+/// routing-range stamp describes. The READ side already knows a manifest is state; the WRITE side
+/// never recorded the range it filed under.
+///
+/// WHAT IT COSTS TODAY IS SILENCE, NOT A WRONG ANSWER. A later load reads no stamp, sees state and
+/// adopts the whole keyspace -- which IS the range this install files under while the shard is
+/// unloaded, so the adoption is right by coincidence rather than by record.
+/// `engine::tests::part4::restore_installs_the_manifest_then_replays_the_wal_suffix_on_load` drives
+/// the same path; its load-then-install sibling passes because the load stamped first.
+///
+/// THE RANGE IS NOT GUESSED HERE. It is `shard_routing_range`, the accessor the install's own
+/// `routing_bucket_for_key` already files pages with, and whose documented missing-info default is
+/// the whole range precisely for "a dump manifest installed before its shard is loaded". So the
+/// stamp states what the install DID rather than what a later reader hopes it did.
+///
+/// DRIVEN UNLOADED AND LOADED, because the unloaded arm is the one with no info row to read and the
+/// loaded arm is the one that must not be re-ranged to the default.
+///
+/// rust-internal: drives the engine's own manifest install, no product behaviour
+#[test]
+fn a_manifest_install_records_the_range_it_filed_under() {
+    use crate::engine::routing_range_stamp::{read_routing_range_stamp, store_has_on_disk_state};
+
+    let source_dir = tempfile::tempdir().expect("tempdir");
+    let source = engine_on(source_dir.path());
+    load_on(&source, WIDE_END);
+    let keys = seed(&source, RECORDS);
+    let buckets: Vec<u32> = {
+        let shards = source.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1");
+        shard.bucket_index.bucket_map.keys().copied().collect()
+    };
+    assert!(!buckets.is_empty(), "the source holds no bucket to dump");
+    let manifest = source
+        .create_bucket_dump_manifest(1, buckets)
+        .expect("the source can dump its own buckets");
+
+    // ARM 1 -- UNLOADED, which is the production restore order. No load has run, so nothing other
+    // than the install could have written a stamp.
+    let unloaded_dir = tempfile::tempdir().expect("tempdir");
+    let unloaded = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        unloaded_dir.path().join("cache"),
+        source_dir.path().join("blocks"),
+        unloaded_dir.path().join("indexes"),
+    );
+    let unloaded_index_dir = unloaded_dir.path().join("indexes");
+    assert!(
+        read_routing_range_stamp(&unloaded_index_dir, 1).is_none(),
+        "the fixture is not clean: something stamped this store before the install, so a passing \
+         assertion below would say nothing about the install"
+    );
+    unloaded
+        .install_bucket_dump_manifest(&manifest)
+        .expect("the manifest installs on an unloaded shard");
+    assert!(
+        store_has_on_disk_state(&unloaded_index_dir, 1),
+        "the install left NO on-disk state, so this arm is vacuous -- the stamp assertion below \
+         would pass on a store that a load would call new"
+    );
+    let filed = unloaded.shard_routing_range(1);
+    let read_back_stamp = read_routing_range_stamp(&unloaded_index_dir, 1);
+    println!("  unloaded install filed under {filed:?}, stamp {read_back_stamp:?}");
+    let unloaded_stamp = read_back_stamp.expect(
+        "a manifest install left on-disk state with NO routing-range stamp. The next load reads no \
+         stamp, sees state, and has to infer the range from its absence -- which is the silent \
+         re-ranging this stamp exists to prevent",
+    );
+    assert_eq!(
+        filed,
+        (
+            unloaded_stamp.start_routing_bucket,
+            unloaded_stamp.end_routing_bucket
+        ),
+        "the install filed pages under {filed:?} and stamped \
+         {}..{}; a stamp naming a range other than the one the pages were filed under is worse \
+         than no stamp at all",
+        unloaded_stamp.start_routing_bucket,
+        unloaded_stamp.end_routing_bucket
+    );
+
+    // ARM 2 -- LOADED: the range on the info row, never the missing-info default.
+    let loaded_dir = tempfile::tempdir().expect("tempdir");
+    let loaded = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        loaded_dir.path().join("cache"),
+        source_dir.path().join("blocks"),
+        loaded_dir.path().join("indexes"),
+    );
+    load_on(&loaded, NARROW_END);
+    loaded
+        .install_bucket_dump_manifest(&manifest)
+        .expect("the manifest installs on the narrower loaded shard");
+    let loaded_index_dir = loaded_dir.path().join("indexes");
+    let loaded_stamp = read_routing_range_stamp(&loaded_index_dir, 1)
+        .expect("a loaded shard's manifest install left no routing-range stamp");
+    println!(
+        "  loaded install stamp {}..{}",
+        loaded_stamp.start_routing_bucket, loaded_stamp.end_routing_bucket
+    );
+    assert_eq!(
+        (0, NARROW_END),
+        (
+            loaded_stamp.start_routing_bucket,
+            loaded_stamp.end_routing_bucket
+        ),
+        "the install stamped {}..{} on a shard loaded on 0..{NARROW_END}; stamping the \
+         missing-info default over a range the engine KNOWS is how a narrow store gets re-ranged",
+        loaded_stamp.start_routing_bucket,
+        loaded_stamp.end_routing_bucket
+    );
+    assert_eq!(
+        RECORDS,
+        read_back(&loaded, &keys),
+        "the install stopped the records reading back, so the stamp is not the only thing that \
+         moved here"
+    );
+}
