@@ -95,3 +95,100 @@ pub(super) fn apply_storage_manager_cycle_to_runtime_report(
         wal_floor_sequence = wal_floor_sequence.max(stage.wal_floor_sequence);
         index_log_floor_sequence = index_log_floor_sequence.max(stage.index_log_floor_sequence);
         retention_blockers = retention_blockers.max(stage.retention_blockers);
+    }
+    report.last_pressure_snapshot = Some(StorageManagerPressureSnapshot {
+        shard_id: cycle.shard_id,
+        dirty_bucket_count: cycle.pressure_snapshot.dirty_bucket_count,
+        selected_dirty_bucket_count: cycle.plan.selected_dump_buckets.len(),
+        undumped_wal_records: cycle.pressure_snapshot.undumped_wal_records,
+        wal_bytes: cycle.pressure_snapshot.wal_bytes,
+        index_log_bytes: cycle.pressure_snapshot.index_log_bytes,
+        stale_block_slab_count: cycle.plan.stale_block_slab_ids.len(),
+        reclaim_candidate_count: cycle.plan.reclaim_candidates.len(),
+        reclaimable_physical_bytes: cycle.plan.reclaimable_physical_bytes,
+        block_slab_stale_density_basis_points: cycle
+            .pressure_snapshot
+            .block_slab_stale_density_basis_points,
+        cache_memory_bytes: cycle.pressure_snapshot.memory_cache_bytes,
+        cache_disk_bytes: cycle.pressure_snapshot.disk_cache_bytes,
+        bucket_index_resident_bytes: cycle.pressure_snapshot.bucket_index_resident_bytes,
+        // The cycle publishes `memory_cache_pressure_score` as cache memory + pinned + the
+        // writeback queue; the evict gate adds disk cache and the resident index on top. Assembled
+        // here rather than carried, so the two pipelines report the same quantity under the same
+        // name instead of one of them reporting a cache-only number under an eviction name.
+        eviction_memory_pressure_bytes: cycle
+            .pressure_snapshot
+            .memory_cache_pressure_score
+            .saturating_add(cycle.pressure_snapshot.disk_cache_bytes)
+            .saturating_add(cycle.pressure_snapshot.bucket_index_resident_bytes),
+        memory_cache_pressure_score: cycle.pressure_snapshot.memory_cache_pressure_score,
+        live_block_summaries_measured: cycle.pressure_snapshot.live_block_summaries_measured,
+        expired_bucket_object_scan_debt: cycle.pressure_snapshot.expired_bucket_object_scan_debt,
+        delayed_destroy_slab_count: cycle.pressure_snapshot.delayed_destroy_slab_count,
+        delayed_destroy_bytes: cycle.pressure_snapshot.delayed_destroy_bytes,
+        follower_cursor_retention_blockers: cycle
+            .pressure_snapshot
+            .follower_cursor_retention_blockers,
+        raft_snapshot_retention_blockers: cycle.pressure_snapshot.raft_snapshot_retention_blockers,
+        compaction_debt_model_count: cycle.pressure_snapshot.compaction_debt_model_count,
+        compaction_debt_score: cycle.pressure_snapshot.compaction_debt_score,
+        total_pressure_score: cycle.pressure_snapshot.total_pressure_score,
+        background_queue_depth: 0,
+        foreground_queue_depth: 0,
+    });
+    report.last_phase_reports = cycle.stages.clone();
+    report.last_selected_buckets = selected_buckets.into_iter().collect();
+    report.last_skipped_reasons = skipped_reasons.into_iter().collect();
+    report.last_bytes_reclaimed = bytes_reclaimed;
+    report.last_pressure_before = pressure_before.max(cycle.pressure_snapshot.total_pressure_score);
+    report.last_pressure_after = pressure_after;
+    report.last_wal_floor_sequence = wal_floor_sequence;
+    report.last_index_log_floor_sequence = index_log_floor_sequence;
+    report.last_retention_blockers = retention_blockers;
+    report.last_phase_blockers = phase_blockers.into_iter().collect();
+    report.last_completed_cycle = Some(cycle);
+}
+
+pub(super) fn storage_manager_runtime_delay_ms(
+    options: &StorageManagerRuntimeOptions,
+    round: u64,
+    current_backoff_ms: u64,
+) -> u64 {
+    let base = options.interval_ms.max(1).max(current_backoff_ms);
+    let jitter_bound = base.saturating_mul(options.jitter_percent.min(100) as u64) / 100;
+    if jitter_bound == 0 {
+        return base;
+    }
+    let seed = options
+        .request
+        .shard_id
+        .wrapping_mul(1_099_511_628_211)
+        .wrapping_add(round.wrapping_mul(1_469_598_103_934_665_603));
+    base.saturating_add(seed % jitter_bound.saturating_add(1))
+}
+
+pub(super) fn storage_manager_runtime_next_backoff_ms(
+    current_backoff_ms: u64,
+    initial_backoff_ms: u64,
+    max_backoff_ms: u64,
+) -> u64 {
+    let floor = initial_backoff_ms.max(1);
+    let ceiling = max_backoff_ms.max(floor);
+    if current_backoff_ms < floor {
+        floor
+    } else {
+        current_backoff_ms.saturating_mul(2).min(ceiling)
+    }
+}
+
+pub(super) fn sleep_until_storage_manager_runtime_round(stop: &AtomicBool, delay_ms: u64) -> bool {
+    let deadline = Instant::now() + Duration::from_millis(delay_ms.max(1));
+    while Instant::now() < deadline {
+        if stop.load(Ordering::Relaxed) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
+    stop.load(Ordering::Relaxed)
+}
