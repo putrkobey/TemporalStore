@@ -191,3 +191,584 @@ fn alloc_class_slots_are_dense_and_in_order() {
 fn every_alloc_class_has_a_production_scope() {
     use crate::alloc_probe::AllocClass;
     use std::path::Path;
+
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut pending = vec![root];
+    let mut files_scanned = 0usize;
+    let mut lines_scanned = 0usize;
+    let mut excluded = 0usize;
+    let mut sites: Vec<(String, String)> = Vec::new();
+
+    while let Some(path) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            if entry_path.is_dir() {
+                pending.push(entry_path);
+                continue;
+            }
+            if entry_path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let display = entry_path.display().to_string();
+            // The declaring module names every class in its own `slot` and `label` matches, and a
+            // test file naming one is not production code entering it. Both are taken out, and the
+            // removals are counted so an exclusion that started matching everything shows up as a
+            // denominator that collapsed rather than as a clean pass.
+            let is_declaration =
+                entry_path.file_name().and_then(|n| n.to_str()) == Some("alloc_probe.rs");
+            let is_test = display.contains("/tests/")
+                || display.ends_with("tests.rs")
+                || display.contains("/tests.rs");
+            if is_declaration || is_test {
+                excluded += 1;
+                continue;
+            }
+            let Ok(text) = std::fs::read_to_string(&entry_path) else {
+                continue;
+            };
+            files_scanned += 1;
+            lines_scanned += text.lines().count();
+            for class in AllocClass::ALL.iter() {
+                let needle = format!("AllocClass::{}", variant_name(*class));
+                if text.contains(&needle) {
+                    sites.push((class.label().to_string(), display.clone()));
+                }
+            }
+        }
+    }
+
+    // Denominators before verdicts. Every assertion below is about a set, and an empty set
+    // satisfies none of them honestly.
+    assert!(
+        files_scanned > 100,
+        "the source walk read {files_scanned} production files; this guard would pass over nothing"
+    );
+    assert!(
+        lines_scanned > 50_000,
+        "the source walk read {lines_scanned} lines, which is not this crate"
+    );
+    assert!(
+        excluded >= 20,
+        "only {excluded} files were excluded as tests or as the declaring module; the exclusion \
+         has stopped matching and this scan is now reading its own declarations"
+    );
+
+    let mut missing: Vec<&'static str> = Vec::new();
+    for class in AllocClass::ALL.iter() {
+        if !sites.iter().any(|(label, _)| label == class.label()) {
+            missing.push(class.label());
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "{:?} are declared as allocation classes and no production file enters them, so their rows \
+         read zero in every report and the sum reconciles without them. Scanned {files_scanned} \
+         files, {lines_scanned} lines, found {} scope sites",
+        missing,
+        sites.len()
+    );
+    assert!(
+        sites.len() >= AllocClass::ALL.len(),
+        "found {} scope sites for {} classes",
+        sites.len(),
+        AllocClass::ALL.len()
+    );
+}
+
+/// The enum variant's spelling, which is what a scope in the source says.
+///
+/// Exhaustive on purpose: a class added to the enum stops this file compiling until it is named
+/// here, which is the same compile error the ledger's `slot` match raises.
+fn variant_name(class: crate::alloc_probe::AllocClass) -> &'static str {
+    use crate::alloc_probe::AllocClass;
+    match class {
+        AllocClass::BlockBytes => "BlockBytes",
+        AllocClass::CarriedBlock => "CarriedBlock",
+        AllocClass::SlabAppend => "SlabAppend",
+        AllocClass::BucketIndex => "BucketIndex",
+        AllocClass::DirtyObjects => "DirtyObjects",
+        AllocClass::StagedOutcome => "StagedOutcome",
+        AllocClass::LogRecord => "LogRecord",
+        AllocClass::IndexLogDelta => "IndexLogDelta",
+        AllocClass::CacheInvalidation => "CacheInvalidation",
+        AllocClass::CacheRead => "CacheRead",
+        AllocClass::RecencyStamp => "RecencyStamp",
+    }
+}
+
+/// Without the counting allocator, the ledger says NOTHING rather than zero.
+///
+/// This is the trap the feature gate creates: every counter reads zero in a build that is not
+/// counting, and a table of zeros looks exactly like a store that allocates nothing. The `Option`
+/// is what makes the two distinguishable, and this holds that it really is `None` in the build
+/// where it matters -- which is this one, the ordinary gate build.
+#[cfg(not(feature = "alloc-probe"))]
+#[test]
+fn an_uninstrumented_build_reports_no_classes_rather_than_a_table_of_zeros() {
+    assert!(
+        crate::alloc_probe::classified_now().is_none(),
+        "the counting allocator is not installed in this build, so the per-class ledger must \
+         answer None; a Some full of zeros would be read as a measurement"
+    );
+    assert!(
+        crate::alloc_probe::counted_now().is_none(),
+        "the whole-span counter must answer None in the same build, or a span could report a \
+         total with no classes under it and look like a total residual"
+    );
+    // And the scope still runs the work it is given, so a production path wrapped in one behaves
+    // identically in the build that does not count.
+    let mut sink = 0usize;
+    let out = crate::alloc_probe::in_class(crate::alloc_probe::AllocClass::BlockBytes, || {
+        sink += 1;
+        7usize
+    });
+    assert_eq!(7, out);
+    assert_eq!(1, sink);
+}
+
+// ---------------------------------------------------------------------------------------------
+// The instrument's own controls, then the measurement.
+// ---------------------------------------------------------------------------------------------
+
+/// PLANT A KNOWN NUMBER AND RECOVER EXACTLY THAT NUMBER.
+///
+/// A probe that reports a plausible number for something whose answer is not in question is the
+/// only evidence its numbers mean anything. `Vec::with_capacity` on a non-zero size is exactly one
+/// allocation and its drop is exactly one free, so the count here is not approximate and the
+/// assertion is an equality rather than a bound.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn the_class_probe_recovers_exactly_the_allocations_planted_in_a_class() {
+    use crate::alloc_probe::{AllocClass, ClassSpan};
+    const PLANTED: usize = 64;
+    const EACH: usize = 4096;
+
+    let span = ClassSpan::open();
+    crate::alloc_probe::in_class(AllocClass::BlockBytes, || {
+        for _ in 0..PLANTED {
+            let sink: Vec<u8> = Vec::with_capacity(EACH);
+            assert_eq!(EACH, sink.capacity());
+            drop(sink);
+        }
+    });
+    let counts = span
+        .close()
+        .expect("built with `alloc-probe`, so the ledger is a measurement");
+
+    let row = counts.classes.row(AllocClass::BlockBytes);
+    assert_eq!(
+        PLANTED as u64, row.allocs,
+        "planted {PLANTED} allocations in one class and the row recovered {}",
+        row.allocs
+    );
+    assert_eq!(
+        PLANTED as u64, row.frees,
+        "planted {PLANTED} frees in one class and the row recovered {}",
+        row.frees
+    );
+    assert_eq!(
+        (PLANTED * EACH) as u64,
+        row.alloc_bytes,
+        "planted {} bytes and the row recovered {}",
+        PLANTED * EACH,
+        row.alloc_bytes
+    );
+    // The other rows must not have moved. A scope that leaked into its neighbours would still
+    // reconcile against the total, so the total cannot catch this.
+    for class in AllocClass::ALL.iter() {
+        if *class == AllocClass::BlockBytes {
+            continue;
+        }
+        assert_eq!(
+            0,
+            counts.classes.row(*class).allocs,
+            "{} moved during a span that only entered block_bytes",
+            class.label()
+        );
+    }
+}
+
+/// NEGATIVE CONTROL: the same allocations OUTSIDE a scope move no row at all.
+///
+/// Without this, a probe that charged everything to the last class it saw would pass the positive
+/// control exactly as a correct one does.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn allocations_outside_every_class_move_no_row() {
+    use crate::alloc_probe::{AllocClass, ClassSpan};
+    const PLANTED: usize = 64;
+
+    // Enter and leave a class first, so this also proves the scope is RESTORED rather than merely
+    // set -- a scope that never put the previous class back would charge everything after it,
+    // which is the failure this ordering is chosen to expose.
+    crate::alloc_probe::in_class(AllocClass::BucketIndex, || {
+        let sink: Vec<u8> = Vec::with_capacity(256);
+        drop(sink);
+    });
+
+    let span = ClassSpan::open();
+    for _ in 0..PLANTED {
+        let sink: Vec<u8> = Vec::with_capacity(4096);
+        drop(sink);
+    }
+    let counts = span.close().expect("built with `alloc-probe`");
+
+    assert!(
+        counts.total.allocs >= PLANTED as u64,
+        "the whole-span counter saw {} allocations for {PLANTED} planted, so the span total is not \
+         measuring either",
+        counts.total.allocs
+    );
+    assert_eq!(
+        0,
+        counts.classes.summed().allocs,
+        "{PLANTED} allocations made outside every scope were charged to a class: {}",
+        counts.classes.report_line()
+    );
+    assert_eq!(
+        counts.total.allocs as i64,
+        counts.residual_allocs(),
+        "everything in this span is residual by construction of the test"
+    );
+}
+
+/// Nesting: the innermost scope owns the allocation, and the outer one resumes afterwards.
+///
+/// This is what lets the carried-page copy and the payload encode be told apart from the slab
+/// append they both happen inside, which is the one place classes are genuinely nested in
+/// production.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn a_nested_class_takes_the_allocation_and_gives_the_scope_back() {
+    use crate::alloc_probe::{AllocClass, ClassSpan};
+    let span = ClassSpan::open();
+    crate::alloc_probe::in_class(AllocClass::SlabAppend, || {
+        let outer_first: Vec<u8> = Vec::with_capacity(1024);
+        crate::alloc_probe::in_class(AllocClass::CarriedBlock, || {
+            let inner: Vec<u8> = Vec::with_capacity(2048);
+            drop(inner);
+        });
+        let outer_second: Vec<u8> = Vec::with_capacity(1024);
+        drop(outer_first);
+        drop(outer_second);
+    });
+    let counts = span.close().expect("built with `alloc-probe`");
+    assert_eq!(
+        2,
+        counts.classes.row(AllocClass::SlabAppend).allocs,
+        "the outer class should hold its own two allocations and not the nested one"
+    );
+    assert_eq!(
+        1,
+        counts.classes.row(AllocClass::CarriedBlock).allocs,
+        "the nested class should hold exactly the allocation made inside it"
+    );
+    assert_eq!(
+        2048,
+        counts.classes.row(AllocClass::CarriedBlock).alloc_bytes,
+        "the nested class should hold exactly the bytes asked for inside it"
+    );
+}
+
+/// Entering the same class twice, nested, charges it once.
+///
+/// The bucket-index primitive re-enters `staged_outcome` around the item it builds while
+/// `stage_outcome` enters the same class again inside, so this is a production arrangement and not
+/// a hypothetical.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn re_entering_the_same_class_does_not_double_charge_it() {
+    use crate::alloc_probe::{AllocClass, ClassSpan};
+    let span = ClassSpan::open();
+    crate::alloc_probe::in_class(AllocClass::StagedOutcome, || {
+        crate::alloc_probe::in_class(AllocClass::StagedOutcome, || {
+            let sink: Vec<u8> = Vec::with_capacity(1024);
+            drop(sink);
+        });
+    });
+    let counts = span.close().expect("built with `alloc-probe`");
+    assert_eq!(
+        1,
+        counts.classes.row(AllocClass::StagedOutcome).allocs,
+        "one allocation inside two nested scopes of the same class should be charged once"
+    );
+    assert_eq!(
+        1024,
+        counts.classes.row(AllocClass::StagedOutcome).alloc_bytes
+    );
+}
+
+/// A panic inside a scoped primitive must not leave the class set for the rest of the thread.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn a_panic_inside_a_class_gives_the_scope_back() {
+    use crate::alloc_probe::{AllocClass, ClassSpan};
+    let unwound = std::panic::catch_unwind(|| {
+        crate::alloc_probe::in_class(AllocClass::DirtyObjects, || {
+            let sink: Vec<u8> = Vec::with_capacity(512);
+            drop(sink);
+            panic!("deliberate");
+        })
+    });
+    assert!(unwound.is_err(), "the panic should have propagated");
+    let span = ClassSpan::open();
+    let sink: Vec<u8> = Vec::with_capacity(4096);
+    drop(sink);
+    let counts = span.close().expect("built with `alloc-probe`");
+    assert_eq!(
+        0,
+        counts.classes.summed().allocs,
+        "a panic left a class in scope, so everything after it is charged to {}",
+        counts.classes.report_line()
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The measurement.
+// ---------------------------------------------------------------------------------------------
+
+#[cfg(feature = "alloc-probe")]
+struct Ingest {
+    records: usize,
+    value_bytes: usize,
+    counts: crate::alloc_probe::ClassifiedCounts,
+}
+
+/// Ingest `records` values of `value_bytes` into a fresh shard, measured as one span.
+///
+/// The engine is built and the shard loaded BEFORE the span opens, so the fixed cost of standing a
+/// store up is not divided by the record count and reported as a per-record figure.
+#[cfg(feature = "alloc-probe")]
+fn ingest(
+    records: usize,
+    value_bytes: usize,
+    batch: usize,
+) -> (Ingest, tempfile::TempDir) {
+    use crate::alloc_probe::ClassSpan;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    engine.load_shard(1);
+    // One write before the span, so a lazily built table created on first use is not charged to
+    // whichever class happens to run first.
+    engine.execute(crate::types::ExecuteRequest {
+        shard_id: 1,
+        command: Command::StringSet {
+            key: "warm".to_string(),
+            value: incompressible(value_bytes, u64::MAX),
+        },
+    });
+
+    // THE CORPUS IS BUILT BEFORE THE SPAN OPENS. A probe that builds its commands inside the
+    // measured window charges the store for its own fixture: this crate's write-ahead budget read
+    // three allocations a write too high for four rounds because the command was assembled inside
+    // the window, and a measurement wrong by a constant still moves the right way after every
+    // change, which feels like confirmation and is no evidence at all.
+    let mut batches: Vec<Vec<Command>> = Vec::new();
+    let mut index = 0usize;
+    while index < records {
+        let end = (index + batch).min(records);
+        let mut commands = Vec::with_capacity(end - index);
+        let mut cursor = index;
+        while cursor < end {
+            commands.push(Command::StringSet {
+                key: format!("k-{cursor:08}"),
+                value: incompressible(value_bytes, cursor as u64),
+            });
+            cursor += 1;
+        }
+        batches.push(commands);
+        index = end;
+    }
+
+    let span = ClassSpan::open();
+    for commands in batches.drain(..) {
+        let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+            shard_id: 1,
+            commands,
+        });
+        assert!(response.status.ok, "ingest failed: {:?}", response.status);
+    }
+    let counts = span
+        .close()
+        .expect("built with `alloc-probe`, so these are measurements");
+    drop(engine);
+    (
+        Ingest {
+            records,
+            value_bytes,
+            counts,
+        },
+        dir,
+    )
+}
+
+#[cfg(feature = "alloc-probe")]
+fn print_table(measurement: &Ingest) {
+    use crate::alloc_probe::AllocClass;
+    let records = measurement.records as f64;
+    println!(
+        "\n{} records of {} bytes",
+        measurement.records, measurement.value_bytes
+    );
+    println!(
+        "  {:<20} {:>12} {:>9} {:>14} {:>11} {:>13}",
+        "class", "allocs", "per rec", "alloc bytes", "B per rec", "outstanding"
+    );
+    for class in AllocClass::ALL.iter() {
+        let row = measurement.counts.classes.row(*class);
+        println!(
+            "  {:<20} {:>12} {:>9.3} {:>14} {:>11.1} {:>13}",
+            class.label(),
+            row.allocs,
+            row.allocs as f64 / records,
+            row.alloc_bytes,
+            row.alloc_bytes as f64 / records,
+            row.outstanding()
+        );
+    }
+    let summed = measurement.counts.classes.summed();
+    println!(
+        "  {:<20} {:>12} {:>9.3} {:>14} {:>11.1} {:>13}",
+        "classes summed",
+        summed.allocs,
+        summed.allocs as f64 / records,
+        summed.alloc_bytes,
+        summed.alloc_bytes as f64 / records,
+        summed.outstanding()
+    );
+    println!(
+        "  {:<20} {:>12} {:>9.3} {:>14} {:>11.1} {:>13}   <- independent counter",
+        "SPAN TOTAL",
+        measurement.counts.total.allocs,
+        measurement.counts.total.allocs as f64 / records,
+        measurement.counts.total.alloc_bytes,
+        measurement.counts.total.alloc_bytes as f64 / records,
+        measurement.counts.total.outstanding()
+    );
+    println!(
+        "  {:<20} {:>12} {:>9.3} {:>14} {:>11.1}                 ({:.1}% of bytes and {:.1}% of \
+         calls classified)",
+        "residual",
+        measurement.counts.residual_allocs(),
+        measurement.counts.residual_allocs() as f64 / records,
+        measurement.counts.residual_bytes(),
+        measurement.counts.residual_bytes() as f64 / records,
+        measurement.counts.classified_byte_share() * 100.0,
+        measurement.counts.classified_call_share() * 100.0
+    );
+}
+
+/// What a whole ingest allocated, class by class, checked against a counter the classes do not
+/// feed, at two corpus sizes.
+///
+/// Two sizes and not one, because a fixed cost divides away and genuine drift climbs: a residual
+/// that is the same number per record at both sizes is the probe's own edges, and one that grows
+/// with the corpus is a sink nobody wrote down.
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "builds two corpora; run with --features alloc-probe --ignored --nocapture"]
+fn what_a_stored_record_allocates_by_class_at_two_corpus_sizes() {
+    use crate::alloc_probe::AllocClass;
+
+    let (small, _small_dir) = ingest(SMALL, VALUE_BYTES, BATCH);
+    let (large, _large_dir) = ingest(LARGE, VALUE_BYTES, BATCH);
+    print_table(&small);
+    print_table(&large);
+
+    println!("\n  per-record allocations, and the ratio across a 10x corpus");
+    println!(
+        "  {:<20} {:>12} {:>12} {:>8}",
+        "class", "2,000", "20,000", "ratio"
+    );
+    let mut ratios: Vec<(&'static str, f64)> = Vec::new();
+    for class in AllocClass::ALL.iter() {
+        let small_per = small.counts.classes.row(*class).allocs as f64 / small.records as f64;
+        let large_per = large.counts.classes.row(*class).allocs as f64 / large.records as f64;
+        let ratio = if small_per == 0.0 {
+            0.0
+        } else {
+            large_per / small_per
+        };
+        ratios.push((class.label(), ratio));
+        println!(
+            "  {:<20} {:>12.3} {:>12.3} {:>8.3}",
+            class.label(),
+            small_per,
+            large_per,
+            ratio
+        );
+    }
+
+    // THE RECONCILIATION. The rows are checked against a counter they do not feed.
+    for measurement in [&small, &large] {
+        assert!(
+            measurement.counts.total.allocs > 0,
+            "the span total is zero at {} records, so nothing was counting",
+            measurement.records
+        );
+        assert!(
+            measurement.counts.residual_allocs() >= 0,
+            "the classes claim {} allocations out of a span total of {} at {} records; a negative \
+             residual is double counting, not an omission",
+            measurement.counts.classes.summed().allocs,
+            measurement.counts.total.allocs,
+            measurement.records
+        );
+        assert!(
+            measurement.counts.classified_byte_share() > 0.6,
+            "only {:.1}% of the allocated bytes landed in a named class at {} records: {}",
+            measurement.counts.classified_byte_share() * 100.0,
+            measurement.records,
+            measurement.counts.classes.report_line()
+        );
+        assert!(
+            measurement.counts.classified_call_share() > 0.6,
+            "only {:.1}% of the allocation CALLS landed in a named class at {} records: {}",
+            measurement.counts.classified_call_share() * 100.0,
+            measurement.records,
+            measurement.counts.classes.report_line()
+        );
+        // Non-vacuity: every class this table prints must have moved on this workload, or the
+        // report carries a row that is not a measurement.
+        for class in AllocClass::ALL.iter() {
+            assert!(
+                measurement.counts.classes.row(*class).allocs > 0,
+                "{} recorded no allocation at {} records, so it is a row of zeros in a report that \
+                 otherwise reconciles",
+                class.label(),
+                measurement.records
+            );
+        }
+    }
+
+    // FLATNESS, which is the finding. Every class was flat per record across a ten-times corpus
+    // when this was written; a class that stops being flat is the next thread's subject and this
+    // is where it announces itself.
+    for (label, ratio) in &ratios {
+        assert!(
+            *ratio > 0.5 && *ratio < 2.0,
+            "{label} allocated {ratio:.3}x as much per record at 20,000 records as at 2,000; it \
+             was flat at 1.00x when this was measured, so either the store now scales with itself \
+             on this path or the class has stopped covering what it used to"
+        );
+    }
+
+    // The residual PER RECORD must not climb with the corpus either. A fixed cost at the edges of
+    // the span divides away; a sink that grows with the store does not, and that is the thing this
+    // is watching for.
+    let small_residual = small.counts.residual_allocs() as f64 / small.records as f64;
+    let large_residual = large.counts.residual_allocs() as f64 / large.records as f64;
+    assert!(
+        large_residual <= small_residual * 1.5 + 1.0,
+        "unattributed allocations per record went {small_residual:.3} -> {large_residual:.3} across \
+         a 10x corpus, so there is a sink outside every class that grows with the store"
+    );
+}
