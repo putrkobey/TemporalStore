@@ -739,3 +739,1487 @@ impl DataNodeRuntime {
         if eviction.is_some() {
             executed_stages.push("evict".to_string());
             self.inner
+                .stats
+                .lock()
+                .expect("data node stats lock poisoned")
+                .storage_manager_evict_runs += 1;
+        } else {
+            skipped_stages.push("evict_disabled".to_string());
+        }
+        pressure_decisions.push(storage_manager_pressure_decision(
+            "evict",
+            // `enable_evict` is no longer the only thing that can enable this stage, so the
+            // decision reports whether the stage RAN rather than re-reading one of the two flags
+            // that could have started it.
+            eviction.is_some(),
+            true,
+            eviction.is_some(),
+            // The observed value, against the threshold it is actually compared with.
+            //
+            // This used to pass `eviction_memory_pressure_threshold` as the OBSERVED number and 1
+            // as the threshold, so the signal said `observed = threshold, over_threshold = true`
+            // on every round regardless of the shard -- a reading that cannot distinguish a shard
+            // under pressure from an empty one, under a name ("cache_memory_bytes") that was not
+            // what it held either.
+            vec![
+                storage_manager_pressure_signal(
+                    "eviction_memory_pressure_bytes",
+                    pressure.eviction_memory_pressure_bytes,
+                    options.eviction_memory_pressure_threshold,
+                ),
+                // Broken out because it is the term the evict stage can give back, and the one
+                // every other memory signal here omits.
+                storage_manager_pressure_signal(
+                    "bucket_index_resident_bytes",
+                    pressure.bucket_index_resident_bytes,
+                    options.eviction_memory_pressure_threshold,
+                ),
+                // THE BAR THE STAGE ACTUALLY USED, against the same observed quantity. With two
+                // settings on one number, a decision that published only one of them cannot be
+                // read: an operator seeing `observed=1,200 threshold=1` would conclude the stage
+                // fired when the bound had in fact refused it.
+                storage_manager_pressure_signal(
+                    "index_resident_limit_bytes",
+                    pressure.bucket_index_resident_bytes,
+                    if index_bound_is_the_gate {
+                        options.index_resident_limit_bytes
+                    } else {
+                        options.eviction_memory_pressure_threshold
+                    },
+                ),
+            ],
+            vec![if index_bound_is_the_gate {
+                "index_resident_bound_set".to_string()
+            } else {
+                "operator_enabled_eviction".to_string()
+            }],
+            eviction
+                .is_none()
+                .then(|| "evict_disabled".to_string()),
+        ));
+
+        // Expire and evict run BEFORE the cache invalidation below, not after it.
+        //
+        // `reclaim_memory` is a blanket whole-shard cache invalidation. Eviction's gate
+        // compares its threshold against exactly that cache, so running it afterwards handed
+        // it a zero: measured over ten rounds, the gate never opened once and every round
+        // skipped with `memory_pressure_below_threshold`, whatever the threshold was set to.
+        // Eviction had therefore never evicted anything on a default server, and
+        // `executed_stages` said "evict" either way, which is why it went unnoticed.
+        //
+        // The name collision is what makes this confusing. The `ReclaimMemory` this stage is
+        // named after CONTAINS expire and evict and invalidates nothing -- there, those two
+        // ARE the memory relief. Our blanket invalidation is a separate mechanism with no
+        // counterpart, so there is no ordering to match, only an input not to destroy.
+        //
+        // `enable_evict` now ships TRUE, so this ordering is load-bearing on a default server
+        // rather than only for an operator who turned the stage on. The shipped round opens the
+        // bound rather than the wide gate, and the bound reads `bucket_index_resident_bytes`,
+        // which a cache invalidation does not touch -- but the ordering stays as it is, because
+        // lowering the bound below the threshold lands on the wide arm, whose input this
+        // invalidation would zero.
+        if options.enable_memory_reclaim && cache_pressure {
+            let response = self.apply_storage_lifecycle(StorageLifecycleRequest {
+                shard_id,
+                selected_dump_buckets: Vec::new(),
+                // The cap, not 0. This stage dumps before it invalidates, and an unbounded dump
+                // here made the cap `reclaim_wal` respects meaningless: measured, one round with
+                // every stage on dumped 1,280 of 1,280 dirty buckets, while `reclaim_wal` alone
+                // dumped exactly 64. Bounding is safe -- invalidation drops CACHED pages, and the
+                // data is in the write-ahead log whether or not its bucket was dumped this round.
+                max_dump_buckets_per_round: options.max_dump_buckets_per_round,
+                min_undumped_wal_records: 0,
+                min_undumped_wal_bytes: 0,
+                purge_delayed_destroy: false,
+                purge_delayed_destroy_slab_ids: None,
+                prune_bucket_dump_manifests: false,
+                roll_forward_bucket_dump_installs: false,
+                follower_replay_cursors: options.follower_replay_cursors.clone(),
+                block_gc_shared_store_cursors: Vec::new(),
+                block_gc_raft_snapshot_refs: options.raft_snapshot_refs.clone(),
+                block_gc_checkpoint_floor_slab_id: None,
+                block_gc_raft_install_floor_slab_id: None,
+                block_gc_delayed_destroy_grace_ms: 0,
+                invalidate_cache: true,
+                warm_cache: false,
+            });
+            let mut stats = self
+                .inner
+                .stats
+                .lock()
+                .expect("runtime stats lock poisoned");
+            stats.storage_manager_reclaim_memory_runs += 1;
+            lifecycle_report = Some(response.report);
+            executed_stages.push("reclaim_memory".to_string());
+        } else if !options.enable_memory_reclaim {
+            skipped_stages.push("reclaim_memory_disabled".to_string());
+        } else {
+            skipped_stages.push("reclaim_memory_no_pressure".to_string());
+        }
+        pressure_decisions.push(storage_manager_pressure_decision(
+            "reclaim_memory",
+            options.enable_memory_reclaim,
+            cache_pressure,
+            options.enable_memory_reclaim && cache_pressure,
+            vec![
+                storage_manager_pressure_signal(
+                    "cache_memory_bytes",
+                    pressure.cache_memory_bytes,
+                    options.cache_memory_bytes_pressure.max(1),
+                ),
+                storage_manager_pressure_signal(
+                    "cache_disk_bytes",
+                    pressure.cache_disk_bytes,
+                    options.cache_disk_bytes_pressure.max(1),
+                ),
+            ],
+            storage_manager_trigger_reasons(&[
+                (
+                    pressure.cache_memory_bytes >= options.cache_memory_bytes_pressure.max(1),
+                    "cache_memory_pressure",
+                ),
+                (
+                    pressure.cache_disk_bytes >= options.cache_disk_bytes_pressure.max(1),
+                    "cache_disk_pressure",
+                ),
+            ]),
+            storage_manager_skip_reason(
+                options.enable_memory_reclaim,
+                cache_pressure,
+                "reclaim_memory",
+            ),
+        ));
+
+
+        if options.enable_block_gc && stale_block_pressure {
+            // The floor is a MIN over the stale slabs, so a stale slab that can never be deleted
+            // freezes it -- and one always can be. `run_gc_inner` treats every slab named by a
+            // bucket dump manifest as live, so the moment a dump exists, the slab it names is
+            // stale (its pages have moved) and retained (the manifest needs it). `min` then sits
+            // on that slab for ever, the floor never advances, and every slab compaction rolls
+            // afterwards is above it and permanently out of reach.
+            //
+            // Measured before this: the floor froze at 2 while stale slabs climbed to nine and the
+            // collector removed nothing, on a store nobody was writing to. That is the same shape
+            // as #1516, where a reclaim frontier taken as a min over every bucket was pinned for
+            // ever by one clean bucket -- a min over a set with an immovable member.
+            //
+            // So take the min over the slabs that are actually candidates: stale AND not pinned by
+            // a manifest. Excluding them does not make them deletable -- `gc_slabs_before_..`
+            // checks `is_live` itself and still refuses them -- it only stops them dictating how
+            // far back the round is allowed to look.
+            let manifest_pinned_block_slab_ids = self
+                .inner
+                .engine
+                .list_bucket_dump_manifests(shard_id)
+                .into_iter()
+                .flat_map(|manifest| manifest.block_slab_ids.into_iter())
+                .collect::<std::collections::BTreeSet<_>>();
+            let retain_block_slabs_from_id = lifecycle_plan
+                .stale_block_slab_ids
+                .iter()
+                .filter(|slab_id| !manifest_pinned_block_slab_ids.contains(slab_id))
+                .min()
+                .map(|slab_id| slab_id.saturating_add(1))
+                // Every stale slab is manifest-pinned: nothing to collect this round, and the
+                // floor must not fall back to 0 -- that would read as "retain nothing".
+                .or_else(|| {
+                    lifecycle_plan
+                        .stale_block_slab_ids
+                        .iter()
+                        .min()
+                        .map(|slab_id| slab_id.saturating_add(1))
+                });
+            let response = run_gc_inner(
+                &self.inner,
+                GcRequest {
+                    shard_id,
+                    retain_wal_from_sequence: lifecycle_report
+                        .as_ref()
+                        .and_then(|report| report.dump_manifest.as_ref())
+                        .map(|manifest| manifest.wal_sequence),
+                    retain_index_log_from_sequence: lifecycle_report
+                        .as_ref()
+                        .and_then(|report| report.dump_manifest.as_ref())
+                        .map(|manifest| manifest.index_log_sequence),
+                    retain_block_slabs_from_id,
+                    // Quarantine rather than unlink, as the cycle has always done. This stage
+                    // deleted a slab outright, so if the retain floor above was ever computed too
+                    // generously there was nothing left to recover from. The prepare stage passes
+                    // `purge_delayed_destroy` whenever page GC is on, so quarantined slabs are
+                    // still collected -- an hour later, not never.
+                    block_gc_delayed_destroy: true,
+                    // This stage ran every round page pressure held, and each run emptied the
+                    // shard's cache outright -- memory, pmem and disk tiers alike -- however few
+                    // slabs it went on to reclaim. Invalidate what was reclaimed instead.
+                    block_gc_invalidate_removed_slabs_only: true,
+                },
+            );
+            if !response.status.ok {
+                status = response.status.clone();
+            }
+            gc_report = Some(response);
+            self.inner
+                .stats
+                .lock()
+                .expect("runtime stats lock poisoned")
+                .storage_manager_reclaim_block_runs += 1;
+            executed_stages.push("reclaim_page".to_string());
+        } else if !options.enable_block_gc {
+            skipped_stages.push("reclaim_page_disabled".to_string());
+        } else {
+            skipped_stages.push("reclaim_page_no_pressure".to_string());
+        }
+        pressure_decisions.push(storage_manager_pressure_decision(
+            "reclaim_page",
+            options.enable_block_gc,
+            stale_block_pressure,
+            options.enable_block_gc && stale_block_pressure,
+            vec![
+                storage_manager_pressure_signal(
+                    "stale_page_segment_count",
+                    pressure.stale_block_slab_count as u64,
+                    options.stale_block_slab_pressure.max(1) as u64,
+                ),
+                storage_manager_pressure_signal(
+                    "reclaim_candidate_count",
+                    pressure.reclaim_candidate_count as u64,
+                    options.stale_block_slab_pressure.max(1) as u64,
+                ),
+                storage_manager_pressure_signal(
+                    "reclaimable_physical_bytes",
+                    pressure.reclaimable_physical_bytes,
+                    options.reclaimable_physical_bytes_pressure.max(1),
+                ),
+            ],
+            storage_manager_trigger_reasons(&[
+                (
+                    pressure.stale_block_slab_count >= options.stale_block_slab_pressure.max(1),
+                    "stale_page_segment_pressure",
+                ),
+                (
+                    pressure.reclaim_candidate_count >= options.stale_block_slab_pressure.max(1),
+                    "reclaim_candidate_pressure",
+                ),
+                (
+                    pressure.reclaimable_physical_bytes
+                        >= options.reclaimable_physical_bytes_pressure.max(1),
+                    "reclaimable_physical_bytes_pressure",
+                ),
+            ]),
+            storage_manager_skip_reason(
+                options.enable_block_gc,
+                stale_block_pressure,
+                "reclaim_page",
+            ),
+        ));
+
+        let index_gc_pressure = lifecycle_plan.reasons.iter().any(|reason| {
+            reason == "slot_dump_manifest_prune" || reason == "slot_dump_install_roll_forward_check"
+        });
+        if options.enable_index_gc {
+            let index_gc_request = StorageLifecycleRequest {
+                shard_id,
+                selected_dump_buckets: Vec::new(),
+                // UNBOUNDED, and load-bearing -- do not cap this.
+                //
+                // Capping it was tried and it stopped index-log reclaim dead: 16,000 records
+                // before a round, 16,000 after. The reason is COVERAGE, not the commit check:
+                // `wal_plan.safe_to_reclaim` needs a durable manifest for every live generation,
+                // and this whole-dirty-set dump is what produces one. Bound it and the frontier
+                // never advances -- the #1439 finding seen from the other side.
+                //
+                // The consequence is that `max_dump_buckets_per_round` bounds the reclaim_wal
+                // and reclaim_memory stages, not a ROUND: this stage still dumps the whole dirty
+                // set by default.
+                //
+                // #1516 fixed the frozen frontier that made a bounded dump fail to advance the
+                // floor, so the cap is now reachable and its effect is measurable rather than
+                // assumed. Defaults to 0, which is exactly the behaviour above.
+                max_dump_buckets_per_round: options.index_gc_max_dump_buckets_per_round,
+                min_undumped_wal_records: 0,
+                min_undumped_wal_bytes: 0,
+                purge_delayed_destroy: true,
+                purge_delayed_destroy_slab_ids: None,
+                prune_bucket_dump_manifests: true,
+                roll_forward_bucket_dump_installs: true,
+                // THE SITE THAT MATTERS MOST OF THE FOUR, because this is the one that PRUNES.
+                // Two of the others only ever cost a clamp on the reclaim floor: the pressure
+                // snapshot builds a PLAN and applies nothing, and the `reclaim_wal` stage applies
+                // with `prune_bucket_dump_manifests: false`. Here it costs a dump: with no cursor
+                // to anchor, `bucket_dump_manifest_prune_plan_at` retains only what local coverage
+                // needs and the older manifests go. A reader that was relying on one to restore
+                // from -- `POST /server/storage/dumps/install` is how a node is rebuilt from a
+                // dump -- loses the thing it would have restored from, and unlike a reclaimed log
+                // record nothing regenerates it.
+                follower_replay_cursors: options.follower_replay_cursors.clone(),
+                block_gc_shared_store_cursors: Vec::new(),
+                block_gc_raft_snapshot_refs: options.raft_snapshot_refs.clone(),
+                block_gc_checkpoint_floor_slab_id: None,
+                block_gc_raft_install_floor_slab_id: None,
+                block_gc_delayed_destroy_grace_ms: 0,
+                invalidate_cache: false,
+                warm_cache: false,
+            };
+            let response = self.apply_storage_lifecycle(index_gc_request.clone());
+            // Pruning manifests and rolling forward installs make the index log RECLAIMABLE.
+            // Neither frees a byte of it: `storage_index_gc_report` is what truncates, and until
+            // now nothing on this loop reached it -- so a server started as shipped grew its index
+            // log for ever, exactly as it grew its write-ahead log before #1470.
+            //
+            // The same request this stage just applied, so the plan the safety check reads is the
+            // one this stage's dump produced; and this stage's OWN report, so a dump that
+            // committed dirty buckets is visible to
+            // `index_gc_commit_dirty_buckets_before_truncation`.
+            let index_gc = self
+                .inner
+                .engine
+                .apply_periodic_index_gc(
+                    index_gc_request,
+                    Some(&response.report),
+                    options.index_gc_max_entries_per_round,
+                );
+            if index_gc.applied {
+                tracing::debug!(
+                    shard_id,
+                    index_log_records_removed = index_gc.records_removed,
+                    "storage manager reclaimed index-log records"
+                );
+            }
+            lifecycle_report = Some(response.report);
+            self.inner
+                .stats
+                .lock()
+                .expect("runtime stats lock poisoned")
+                .storage_manager_index_gc_runs += 1;
+            executed_stages.push("reclaim_index".to_string());
+        } else {
+            skipped_stages.push("reclaim_index_disabled".to_string());
+        }
+        pressure_decisions.push(storage_manager_pressure_decision(
+            "reclaim_index",
+            options.enable_index_gc,
+            index_gc_pressure,
+            options.enable_index_gc,
+            vec![
+                storage_manager_pressure_signal(
+                    "manifest_prune_reasons",
+                    lifecycle_plan
+                        .reasons
+                        .iter()
+                        .filter(|reason| reason.as_str() == "slot_dump_manifest_prune")
+                        .count() as u64,
+                    1,
+                ),
+                storage_manager_pressure_signal(
+                    "install_roll_forward_reasons",
+                    lifecycle_plan
+                        .reasons
+                        .iter()
+                        .filter(|reason| reason.as_str() == "slot_dump_install_roll_forward_check")
+                        .count() as u64,
+                    1,
+                ),
+            ],
+            if index_gc_pressure {
+                lifecycle_plan
+                    .reasons
+                    .iter()
+                    .filter(|reason| {
+                        reason.as_str() == "slot_dump_manifest_prune"
+                            || reason.as_str() == "slot_dump_install_roll_forward_check"
+                    })
+                    .cloned()
+                    .collect()
+            } else {
+                vec!["continuous_index_gc_safety_check".to_string()]
+            },
+            (!options.enable_index_gc).then(|| "reclaim_index_disabled".to_string()),
+        ));
+
+        // Reclaim the index log BEFORE rewriting blocks, not after, so the stages run in the
+        // order the design intends: reclaim memory, reclaim pages, reclaim the index, compact.
+        //
+        // This is an ALIGNMENT, not a throughput fix, and the probe beside it is what settles
+        // that. `what_the_stage_order_buys` runs the same eight-round overwrite fixture under
+        // both arrangements, with compaction firing in all eight rounds either way, and the two
+        // are identical to the record: 1,873 left in the log, 1,765 removed per round.
+        //
+        // The reason they are identical is worth keeping, because the opposite is intuitive:
+        // compaction rewrites live records into fresh blocks and appends an index record for
+        // each, so running it first looks like it should hand the reclaim a log it just grew.
+        // It does -- but those records are above the floor the reclaim computed, and a record
+        // above the floor is protected whichever order the two stages run in. Moving the reclaim
+        // earlier cannot collect them any sooner; it only stops them from being written until
+        // after it has finished. Neither order is unsafe and neither collects more.
+        // WHAT WOULD THIS ROUND RELOCATE? Asked before issuing a compaction, and not the same
+        // question as `stale_block_pressure`.
+        //
+        // `stale_block_pressure` counts reclaim candidates, and a candidate is any slab carrying
+        // dead space. That lumps together the slab compaction must empty and the slab compaction
+        // has ALREADY emptied -- and the second is its own residue: a round relocates a slab's
+        // live pages onto a fresh one, and the vacated slab stays a candidate until the collector
+        // destroys it, which is the pressure that runs the next round. Measured on an idle
+        // 8,000-record shard: `compact_pages` executed in all twelve rounds with nobody writing,
+        // the whole live set rewritten every four rounds, and the index log growing 63 bytes a
+        // round for ever -- about 181 KB a day per idle shard at this cadence -- because each of
+        // those rounds persists a fresh index record. With compaction off over the identical
+        // fixture the index log grew by zero, which is what attributes it.
+        //
+        // The question below is answered PER OBJECT: does any object still hold a page on a slab
+        // someone wants emptied? A slab holding nothing but dead space answers no -- no object has
+        // a page there, nothing can be relocated off it, and destroying it is `reclaim_page`'s
+        // job, not this stage's. That is the distinction three shard-wide predicates could not
+        // make, which is why they were each refused by the suite (#1550, #1553): they asked about
+        // the shard's staleness, and the shard is stale either way.
+        //
+        // Costs no walk: `live_page_refs` per candidate is already in the plan this round built.
+        let compaction_relocatable_block_refs =
+            crate::engine::compaction_relocatable_block_refs(&lifecycle_plan.reclaim_candidates);
+        let compaction_has_work = compaction_relocatable_block_refs > 0;
+        // AND THE ROUND MOVES THAT, AND NOT THE REST OF THE SHARD.
+        //
+        // The count above and the set below are the same answer read two ways off the same plan:
+        // the count is what makes this round worth starting, the set is what the round is then
+        // allowed to touch. They were not always the same answer. The gate has asked the
+        // per-object question since the self-retrigger fix, but the round it issued relocated
+        // every live page in the shard -- so one overwritten record anywhere cost a rewrite of
+        // the WHOLE live set, over as many rounds of shard write lock as the ref budget needed,
+        // to recover that one page.
+        //
+        // Relocating a page off a slab that carries no dead space recovers nothing.
+        // `compact_block_addresses` copies its bytes verbatim, so it lands byte for byte what
+        // it was, on a slab that is now the one carrying the dead space -- same live bytes, one
+        // more emptied slab for the collector, one more share of an index record.
+        //
+        // Taking both off ONE plan snapshot also removes a smaller divergence: the gate and the
+        // selection used to be computed from different views of the shard, so a round could be
+        // started for a slab it then had no particular interest in draining.
+        let compaction_drain_block_slab_ids =
+            crate::engine::compaction_drain_block_slab_ids(&lifecycle_plan.reclaim_candidates);
+        // AND WHO IS ASKING? A node that does not lead this shard rewrites its full live set
+        // onto a fresh slab, copying every byte verbatim, for a layout its clients cannot see.
+        //
+        // The rewrite is node-local and it is NOT divergent -- compaction emits no replicated
+        // record and does not advance `applied_wal_sequence` (#1620), so the relocated addresses
+        // exist only in this node's durable index; replication ships commands, and a snapshot
+        // install builds a FRESH engine and replaces this one wholesale, so a follower's slab
+        // ids can neither collide with nor leak into the leader's. It is pure waste, and it
+        // scales with the shard rather than with the traffic.
+        //
+        // THREE states, and the third is the one that could break this. The server constructs
+        // this scheduler about eighty lines before it constructs raft, so for the first rounds
+        // -- and for ever on a standalone node, which is the shipped default -- there is nothing
+        // to ask. `is_known_not_leading` is therefore a POSITIVE test on the one state that is
+        // evidence: `Unknown` compacts, exactly as every deployment did before this existed. The
+        // negation (`!= Leading`) would have read "unknown" as "follower" and switched
+        // compaction off on every single-node store in the world, silently.
+        let leadership = self.shard_leadership(shard_id);
+        let leadership_permits_compaction = !leadership.is_known_not_leading();
+        if options.enable_block_compaction
+            && leadership_permits_compaction
+            && stale_block_pressure
+            && compaction_has_work
+        {
+            let response = run_compaction_inner_draining(
+                &self.inner,
+                CompactionRequest { shard_id },
+                Some(compaction_drain_block_slab_ids),
+            );
+            if !response.status.ok {
+                status = response.status.clone();
+            }
+            compaction_report = Some(response);
+            self.inner
+                .stats
+                .lock()
+                .expect("runtime stats lock poisoned")
+                .storage_manager_compact_runs += 1;
+            executed_stages.push("compact_pages".to_string());
+        } else if !options.enable_block_compaction {
+            skipped_stages.push("compact_pages_disabled".to_string());
+        } else if !leadership_permits_compaction {
+            skipped_stages.push("compact_pages_not_leading".to_string());
+        } else if !stale_block_pressure {
+            skipped_stages.push("compact_pages_no_pressure".to_string());
+        } else {
+            skipped_stages.push("compact_pages_nothing_to_relocate".to_string());
+        }
+        pressure_decisions.push(storage_manager_pressure_decision(
+            "compact_pages",
+            options.enable_block_compaction && leadership_permits_compaction,
+            stale_block_pressure,
+            options.enable_block_compaction
+                && leadership_permits_compaction
+                && stale_block_pressure
+                && compaction_has_work,
+            vec![
+                storage_manager_pressure_signal(
+                    "relocatable_block_refs",
+                    compaction_relocatable_block_refs,
+                    1,
+                ),
+                // 1 for the two states that compact, 0 for the one that does not. Carried so an
+                // operator can tell "skipped because this node follows" from the three other
+                // reasons a round skips, without correlating against raft's own report.
+                storage_manager_pressure_signal(
+                    "leadership_permits_compaction",
+                    u64::from(leadership_permits_compaction),
+                    1,
+                ),
+                storage_manager_pressure_signal(
+                    "stale_page_segment_count",
+                    pressure.stale_block_slab_count as u64,
+                    options.stale_block_slab_pressure.max(1) as u64,
+                ),
+                storage_manager_pressure_signal(
+                    "reclaim_candidate_count",
+                    pressure.reclaim_candidate_count as u64,
+                    options.stale_block_slab_pressure.max(1) as u64,
+                ),
+                storage_manager_pressure_signal(
+                    "reclaimable_physical_bytes",
+                    pressure.reclaimable_physical_bytes,
+                    options.reclaimable_physical_bytes_pressure.max(1),
+                ),
+            ],
+            storage_manager_trigger_reasons(&[
+                (
+                    pressure.stale_block_slab_count >= options.stale_block_slab_pressure.max(1),
+                    "stale_page_segment_pressure",
+                ),
+                (
+                    pressure.reclaim_candidate_count >= options.stale_block_slab_pressure.max(1),
+                    "reclaim_candidate_pressure",
+                ),
+                (
+                    pressure.reclaimable_physical_bytes
+                        >= options.reclaimable_physical_bytes_pressure.max(1),
+                    "reclaimable_physical_bytes_pressure",
+                ),
+            ]),
+            storage_manager_skip_reason(
+                options.enable_block_compaction,
+                stale_block_pressure,
+                "compact_pages",
+            )
+            .or_else(|| {
+                (!leadership_permits_compaction).then(|| {
+                    format!("compact_pages_not_leading (role={})", leadership.as_str())
+                })
+            })
+            .or_else(|| {
+                (!compaction_has_work)
+                    .then(|| "compact_pages_nothing_to_relocate".to_string())
+            }),
+        ));
+
+
+        // Gather what the stage has always claimed to gather. Deliberately a snapshot and not
+        // a reset: `durability_metrics` documents its counters as process-wide and monotonic,
+        // and tests reset them to isolate a measurement window -- a background cycle clearing
+        // them would pull the floor out from under anyone diffing two points in time.
+        let metrics_reap = options.enable_metrics_reap.then(|| {
+            let durability_barriers: std::collections::BTreeMap<String, u64> =
+                crate::durability_metrics::snapshot()
+                    .into_iter()
+                    .map(|(site, count)| (site.to_string(), count))
+                    .collect();
+            StorageMetricsReapReport {
+                durability_barriers_total: durability_barriers.values().copied().sum(),
+                durability_barriers,
+                wal: self.inner.engine.write_ahead_log_store().stats(shard_id),
+            }
+        });
+        if metrics_reap.is_some() {
+            executed_stages.push("reap_metrics".to_string());
+        } else {
+            skipped_stages.push("reap_metrics_disabled".to_string());
+        }
+        pressure_decisions.push(storage_manager_pressure_decision(
+            "reap_metrics",
+            options.enable_metrics_reap,
+            true,
+            options.enable_metrics_reap,
+            vec![
+                storage_manager_pressure_signal(
+                    "foreground_queue_depth",
+                    pressure.foreground_queue_depth as u64,
+                    1,
+                ),
+                storage_manager_pressure_signal(
+                    "background_queue_depth",
+                    pressure.background_queue_depth as u64,
+                    1,
+                ),
+            ],
+            vec!["continuous_metrics_reap".to_string()],
+            (!options.enable_metrics_reap).then(|| "reap_metrics_disabled".to_string()),
+        ));
+
+
+        {
+            // Recorded beside the round counter, so every caller gets it: the per-shard
+            // scheduler, the all-shards scheduler, and the cycle endpoint.
+            let mut stats = self.inner.stats.lock().expect("runtime stats lock poisoned");
+            // A round here is a run of the storage manager, and has to be counted as one.
+            //
+            // The queued path counts both (`worker.rs`, storage_manager_runs then
+            // storage_manager_loops). This one counted only the round, and
+            // `storage_manager_runs` is the field the scrape exports as
+            // temporalstore_data_node_runtime_jobs_total{kind="storage_manager"} -- while
+            // `storage_manager_loops` is exported nowhere. A server started as shipped drives
+            // maintenance from THIS path and never the queued one, so the only exported sign
+            // that maintenance runs at all sat at zero while it ran every thirty seconds, and
+            // an operator reading it could not tell a working loop from a stopped one.
+            stats.storage_manager_runs += 1;
+            stats.storage_manager_loops += 1;
+            stats.storage_manager_last_shard_id = Some(shard_id);
+        }
+
+        StorageManagerLoopReport {
+            shard_id,
+            pressure,
+            executed_stages,
+            skipped_stages,
+            pressure_decisions,
+            lifecycle_plan,
+            lifecycle_report,
+            expired_records_removed,
+            metrics_reap,
+            compaction_report,
+            gc_report,
+            eviction,
+            status,
+        }
+    }
+
+    /// Run a maintenance cycle for EVERY loaded shard, forever, on an interval.
+    ///
+    /// The per-shard scheduler below needs to be told which shard it serves, so a server that
+    /// does not know its shards up front could not start one -- which is why nothing started
+    /// one. This asks the engine each tick instead, so a shard loaded later is picked up without
+    /// restarting anything and a shard unloaded in between is simply not visited.
+    ///
+    /// A cycle that fails is not fatal to the loop. The failure is already recorded in the
+    /// report the cycle returns and in the runtime's stats; stopping the loop over one bad round
+    /// would turn a transient error into a store that never reclaims again, which is the state
+    /// this exists to end.
+    pub fn start_storage_manager_scheduler_for_all_shards(
+        &self,
+        interval: Duration,
+        options: StorageManagerOptions,
+    ) -> StorageLifecycleScheduler {
+        let runtime = self.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let scheduler_stop = Arc::clone(&stop);
+        let sleep_interval = interval.max(Duration::from_millis(1));
+        let handle = thread::spawn(move || {
+            while !scheduler_stop.load(Ordering::Relaxed) {
+                thread::sleep(sleep_interval);
+                if scheduler_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                for shard_id in runtime.inner.engine.loaded_shard_ids() {
+                    if scheduler_stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    runtime.run_storage_manager_once(shard_id, options.clone());
+                }
+            }
+        });
+        StorageLifecycleScheduler {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn start_storage_manager_scheduler(
+        &self,
+        interval: Duration,
+        shard_id: ShardId,
+        options: StorageManagerOptions,
+    ) -> StorageLifecycleScheduler {
+        let runtime = self.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let scheduler_stop = Arc::clone(&stop);
+        let sleep_interval = interval.max(Duration::from_millis(1));
+        let handle = thread::spawn(move || {
+            while !scheduler_stop.load(Ordering::Relaxed) {
+                thread::sleep(sleep_interval);
+                if scheduler_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                runtime.run_storage_manager_once(shard_id, options.clone());
+            }
+        });
+        StorageLifecycleScheduler {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn storage_production_readiness_report(
+        &self,
+        shard_id: ShardId,
+    ) -> StorageProductionReadinessReport {
+        self.inner
+            .engine
+            .storage_production_readiness_report(shard_id)
+    }
+
+    pub fn storage_production_readiness_report_with_policy(
+        &self,
+        shard_id: ShardId,
+        policy: StorageProductionReadinessPolicy,
+    ) -> StorageProductionReadinessReport {
+        self.inner
+            .engine
+            .storage_production_readiness_report_with_policy(shard_id, policy)
+    }
+
+    pub fn apply_storage_lifecycle(
+        &self,
+        request: StorageLifecycleRequest,
+    ) -> StorageLifecycleResponse {
+        let report = self.inner.engine.apply_storage_lifecycle(request);
+        self.inner
+            .stats
+            .lock()
+            .expect("runtime stats lock poisoned")
+            .storage_lifecycle_runs += 1;
+        StorageLifecycleResponse {
+            status: Status::ok(),
+            report,
+        }
+    }
+
+    pub fn start_dirty_dump_scheduler(
+        &self,
+        interval: Duration,
+        controller: RequestController,
+    ) -> DirtyDumpScheduler {
+        let runtime = self.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let scheduler_stop = Arc::clone(&stop);
+        let sleep_interval = interval.max(Duration::from_millis(1));
+        let handle = thread::spawn(move || {
+            while !scheduler_stop.load(Ordering::Relaxed) {
+                thread::sleep(sleep_interval);
+                if scheduler_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                runtime.schedule_dirty_shard_dumps(controller);
+            }
+        });
+        DirtyDumpScheduler {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn start_storage_lifecycle_scheduler(
+        &self,
+        interval: Duration,
+        request: StorageLifecycleRequest,
+    ) -> StorageLifecycleScheduler {
+        let runtime = self.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let scheduler_stop = Arc::clone(&stop);
+        let sleep_interval = interval.max(Duration::from_millis(1));
+        let handle = thread::spawn(move || {
+            while !scheduler_stop.load(Ordering::Relaxed) {
+                thread::sleep(sleep_interval);
+                if scheduler_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                runtime.apply_storage_lifecycle(request.clone());
+            }
+        });
+        StorageLifecycleScheduler {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn start_storage_manager_cycle_scheduler(
+        &self,
+        interval: Duration,
+        request: StorageManagerCycleRequest,
+        controller: RequestController,
+    ) -> StorageManagerScheduler {
+        let runtime = self.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let scheduler_stop = Arc::clone(&stop);
+        let sleep_interval = interval.max(Duration::from_millis(1));
+        let handle = thread::spawn(move || {
+            while !scheduler_stop.load(Ordering::Relaxed) {
+                thread::sleep(sleep_interval);
+                if scheduler_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let should_submit = !runtime
+                    .inner
+                    .queue
+                    .lock()
+                    .expect("runtime queue lock poisoned")
+                    .has_pending_storage_manager(request.shard_id);
+                if should_submit {
+                    runtime.submit_storage_manager_cycle(request.clone(), controller);
+                }
+            }
+        });
+        StorageManagerScheduler {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn start_storage_manager_runtime(
+        &self,
+        options: StorageManagerRuntimeOptions,
+    ) -> StorageManagerRuntime {
+        let runtime = self.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        let report = Arc::new(Mutex::new(storage_manager_runtime_initial_report(&options)));
+        let thread_stop = Arc::clone(&stop);
+        let thread_paused = Arc::clone(&paused);
+        let thread_report = Arc::clone(&report);
+        let handle = thread::spawn(move || {
+            let mut round = 0u64;
+            let mut current_backoff_ms = options.initial_backoff_ms;
+            // Cycles whose completion outlived the short wait below. Their reports are collected
+            // on a later tick instead of being thrown away -- see the comment at the wait.
+            //
+            // A LIST, not a single slot. With one slot the report was lost every time: the
+            // top-of-tick poll saw the cycle still running, the cycle finished later in that same
+            // tick, `has_pending` then went false so a new cycle was submitted, and submitting
+            // overwrote the slot before anything polled the finished job again. Every cycle was
+            // abandoned exactly one tick before it completed, so `last_completed_cycle` stayed
+            // None forever and every derived figure -- bytes reclaimed, pressure after, WAL and
+            // index-log floors -- stayed at zero while the manager was doing real work.
+            //
+            // Bounded by `has_pending_storage_manager`, which allows only one cycle in flight per
+            // shard, so this holds a couple of entries at most; the cap is a backstop, not a
+            // budget.
+            let mut uncollected_cycle_jobs: Vec<u64> = Vec::new();
+            const MAX_UNCOLLECTED_CYCLE_JOBS: usize = 64;
+            loop {
+                let delay_ms =
+                    storage_manager_runtime_delay_ms(&options, round, current_backoff_ms);
+                {
+                    let mut report = thread_report
+                        .lock()
+                        .expect("storage manager runtime report lock poisoned");
+                    report.last_delay_ms = delay_ms;
+                    report.current_backoff_ms = current_backoff_ms;
+                }
+                if sleep_until_storage_manager_runtime_round(&thread_stop, delay_ms) {
+                    break;
+                }
+                if thread_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                round = round.saturating_add(1);
+                if thread_paused.load(Ordering::Relaxed) {
+                    let mut report = thread_report
+                        .lock()
+                        .expect("storage manager runtime report lock poisoned");
+                    report.rounds_skipped_paused = report.rounds_skipped_paused.saturating_add(1);
+                    report.paused = true;
+                    continue;
+                }
+                {
+                    let mut report = thread_report
+                        .lock()
+                        .expect("storage manager runtime report lock poisoned");
+                    report.paused = false;
+                    report.rounds_attempted = report.rounds_attempted.saturating_add(1);
+                }
+                // Collect a cycle that finished after we stopped waiting for it. Without this
+                // the runtime report only ever reflected cycles that completed inside the very
+                // short budget below -- which are precisely the cycles that found nothing to
+                // do. Any cycle that actually dumped buckets or reclaimed WAL outlived the
+                // budget and had its report dropped, so the reported dirty-bucket count,
+                // selected buckets and reclaim floors sat at zero while the manager was busy.
+                if !uncollected_cycle_jobs.is_empty() {
+                    let mut still_running = Vec::with_capacity(uncollected_cycle_jobs.len());
+                    for job_id in std::mem::take(&mut uncollected_cycle_jobs) {
+                        match runtime.job_status(job_id) {
+                            Some(status) if status.finished_at_ms.is_some() => {
+                                // Finished: collect the report if it carried one, and stop
+                                // tracking either way so a job that finished without a usable
+                                // output cannot pin a slot forever.
+                                if let Some(DataNodeTaskOutput::StorageManager(response)) =
+                                    status.output
+                                {
+                                    let mut report = thread_report
+                                        .lock()
+                                        .expect("storage manager runtime report lock poisoned");
+                                    apply_storage_manager_cycle_to_runtime_report(
+                                        &mut report,
+                                        response.report,
+                                    );
+                                }
+                            }
+                            Some(_) => still_running.push(job_id),
+                            // Gone from the jobs map (pruned): nothing left to collect.
+                            None => {}
+                        }
+                    }
+                    uncollected_cycle_jobs = still_running;
+                }
+                let should_submit = !runtime
+                    .inner
+                    .queue
+                    .lock()
+                    .expect("runtime queue lock poisoned")
+                    .has_pending_storage_manager(options.request.shard_id);
+                if !should_submit {
+                    let mut report = thread_report
+                        .lock()
+                        .expect("storage manager runtime report lock poisoned");
+                    report.rounds_skipped_pending = report.rounds_skipped_pending.saturating_add(1);
+                    continue;
+                }
+                // Same question, the other periodic driver. This one does not call
+                // `run_storage_manager_once`; it posts a cycle to the worker, and the engine
+                // that runs it has no way to ask about leadership. Masking the request here is
+                // the only place in this path that can see both. An on-demand cycle posted by
+                // an operator is untouched -- that is an instruction, not a background round.
+                let mut cycle_request = options.request.clone();
+                if runtime
+                    .shard_leadership(cycle_request.shard_id)
+                    .is_known_not_leading()
+                {
+                    cycle_request.enable_block_compaction = false;
+                }
+                let submitted =
+                    runtime.submit_storage_manager_cycle(cycle_request, options.controller);
+                let mut report = thread_report
+                    .lock()
+                    .expect("storage manager runtime report lock poisoned");
+                report.last_job_id = Some(submitted.job_id);
+                report.last_status = Some(submitted.status.clone());
+                if submitted.status.ok {
+                    report.rounds_submitted = report.rounds_submitted.saturating_add(1);
+                    current_backoff_ms = options.initial_backoff_ms;
+                } else {
+                    report.submit_failures = report.submit_failures.saturating_add(1);
+                    current_backoff_ms = storage_manager_runtime_next_backoff_ms(
+                        current_backoff_ms,
+                        options.initial_backoff_ms,
+                        options.max_backoff_ms,
+                    );
+                }
+                drop(report);
+                if submitted.status.ok {
+                    let wait_budget_ms = options
+                        .controller
+                        .timeout_ms
+                        .max(50)
+                        .min(delay_ms.saturating_mul(10).max(50));
+                    // The budget is deliberately tied to the loop interval, not to
+                    // `controller.timeout_ms`, so pause/stop stay responsive. That means a
+                    // working cycle routinely finishes AFTER we stop waiting -- remember it and
+                    // collect it at the top of a later tick rather than losing its report.
+                    if let Some(cycle) = wait_for_storage_manager_cycle_completion(
+                        &runtime,
+                        submitted.job_id,
+                        wait_budget_ms,
+                    ) {
+                        let mut report = thread_report
+                            .lock()
+                            .expect("storage manager runtime report lock poisoned");
+                        apply_storage_manager_cycle_to_runtime_report(&mut report, cycle);
+                    } else {
+                        if uncollected_cycle_jobs.len() >= MAX_UNCOLLECTED_CYCLE_JOBS {
+                            uncollected_cycle_jobs.remove(0);
+                        }
+                        uncollected_cycle_jobs.push(submitted.job_id);
+                    }
+                }
+            }
+            let mut report = thread_report
+                .lock()
+                .expect("storage manager runtime report lock poisoned");
+            report.running = false;
+            report.stopped = true;
+        });
+        StorageManagerRuntime {
+            stop,
+            paused,
+            report,
+            handle: Some(handle),
+        }
+    }
+
+    /// Sweep every loaded shard with a per-round bound, resuming each from where it stopped.
+    ///
+    /// `hot_limit` / `cold_limit` of 0 mean no limit, and then this is exactly
+    /// `sweep_expired_records`: the window reaches the end, returns no cursor, and the stored
+    /// cursor stays `None`. With a bound it takes a window per round and advances, which is what
+    /// keeps one tick from walking the whole deadline map.
+    pub fn sweep_expired_records_bounded(&self, hot_limit: usize, cold_limit: usize) -> usize {
+        let shard_ids = self.inner.engine.loaded_shard_ids();
+        let mut removed = 0usize;
+        for shard_id in shard_ids {
+            let (hot_cursor, cold_cursor) = self
+                .inner
+                .expiry_cursors
+                .lock()
+                .expect("expiry cursor lock poisoned")
+                .get(&shard_id)
+                .cloned()
+                .unwrap_or((None, None));
+            let Ok(report) = self.inner.engine.sweep_expired_records_with_request(
+                crate::engine::reports::ShardExpirySweepRequest {
+                    shard_id,
+                    hot_cursor,
+                    cold_cursor,
+                    max_hot_buckets_per_round: hot_limit,
+                    max_cold_buckets_per_round: cold_limit,
+                    load_cold_buckets: true,
+                },
+            ) else {
+                continue;
+            };
+            removed = removed.saturating_add(report.expired_records_removed);
+            self.inner
+                .expiry_cursors
+                .lock()
+                .expect("expiry cursor lock poisoned")
+                .insert(
+                    shard_id,
+                    (report.next_hot_cursor.clone(), report.next_cold_cursor.clone()),
+                );
+        }
+        let mut stats = self
+            .inner
+            .stats
+            .lock()
+            .expect("runtime stats lock poisoned");
+        stats.expiry_sweeps += 1;
+        stats.expired_records_removed += removed as u64;
+        removed
+    }
+
+    pub fn sweep_expired_records(&self) -> usize {
+        let reports = self.inner.engine.sweep_all_expired_records();
+        let removed = reports
+            .iter()
+            .map(|report| report.expired_records_removed)
+            .sum::<usize>();
+        let mut stats = self
+            .inner
+            .stats
+            .lock()
+            .expect("runtime stats lock poisoned");
+        stats.expiry_sweeps += 1;
+        stats.expired_records_removed += removed as u64;
+        removed
+    }
+
+    pub fn start_expiry_sweep_scheduler(&self, interval: Duration) -> ExpirySweepScheduler {
+        let runtime = self.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let scheduler_stop = Arc::clone(&stop);
+        let sleep_interval = interval.max(Duration::from_millis(1));
+        let handle = thread::spawn(move || {
+            while !scheduler_stop.load(Ordering::Relaxed) {
+                thread::sleep(sleep_interval);
+                if scheduler_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                runtime.sweep_expired_records();
+            }
+        });
+        ExpirySweepScheduler {
+            stop,
+            handle: Some(handle),
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod eviction_loop_terms_tests {
+    use super::{eviction_loop_live_stopping_conditions, EvictionLoopTerms};
+    use crate::data_node::StorageManagerOptions;
+
+    fn all_true() -> EvictionLoopTerms {
+        EvictionLoopTerms {
+            pressure_gate_open: true,
+            more_budget: true,
+            still_over: true,
+            made_progress: true,
+        }
+    }
+
+    /// THE THRESHOLD IS STILL THE VACUOUS ONE, AND THE SHIPPED ROUND NO LONGER USES IT.
+    ///
+    /// RESTATED, not re-goldened. This asserted `!options.enable_evict` and read "the threshold of
+    /// 0 is only safe because the stage does not run by default". The stage now runs by default,
+    /// and the thing that makes a threshold of 0 safe is no longer the stage being off -- it is
+    /// that `index_resident_limit_bytes` is the higher bar, so `stage_threshold` in the loop above
+    /// is 64 MiB and not 0. All four claims above are read against whichever bar the gate used.
+    ///
+    /// Three facts, each of which the vacuity reasoning needs, and each pinned separately so a
+    /// later edit to the `Default` impl has to come past the one it breaks.
+    #[test]
+    fn the_shipped_bar_is_the_bound_and_the_vacuous_threshold_is_not_the_one_in_force() {
+        let options = StorageManagerOptions::default();
+        assert_eq!(
+            options.eviction_memory_pressure_threshold, 0,
+            "the vacuity documented at the eviction loop is derived from a threshold of 0",
+        );
+        assert!(
+            options.enable_evict,
+            "enable_evict ships off again; the loop above describes a stage that runs",
+        );
+        // THE BAR IN FORCE. `index_bound_is_the_gate` in the loop above is exactly this
+        // comparison, so asserting it here is asserting that the shipped round takes the bound.
+        assert!(
+            options.index_resident_limit_bytes > options.eviction_memory_pressure_threshold,
+            "the bound ({}) is no longer above the threshold ({}), so the shipped round falls back \
+             on the wide arm, where both terms above ARE vacuous and nothing closes the gate",
+            options.index_resident_limit_bytes,
+            options.eviction_memory_pressure_threshold,
+        );
+        assert_eq!(
+            options.index_resident_limit_bytes,
+            crate::engine::reports::DEFAULT_INDEX_RESIDENT_LIMIT_BYTES,
+            "the periodic loop's bound has drifted off the named constant the cycle request uses, \
+             so the two pipelines no longer agree on it",
+        );
+    }
+
+    /// The denominator: 2 of the 4 terms can stop the loop at the shipped default, 4 of 4 above
+    /// it. Printing the count is the point -- a guard that says "the conditions are checked"
+    /// without saying how many are live is the shape this replaces.
+    #[test]
+    fn live_stopping_condition_count_is_two_of_four_at_the_shipped_default() {
+        let at_zero = eviction_loop_live_stopping_conditions(0);
+        let above_zero = eviction_loop_live_stopping_conditions(1);
+        assert_eq!(
+            at_zero.len(),
+            2,
+            "expected 2 of 4 live stopping conditions at threshold 0, got {at_zero:?}",
+        );
+        assert_eq!(
+            above_zero.len(),
+            4,
+            "expected 4 of 4 live stopping conditions above 0, got {above_zero:?}",
+        );
+        assert!(!at_zero.contains(&"still_over"));
+        assert!(!at_zero.contains(&"pressure_gate_open"));
+        assert!(above_zero.contains(&"still_over"));
+        assert!(above_zero.contains(&"pressure_gate_open"));
+    }
+
+    /// `still_over` is `pressure_after >= threshold` on two `u64`s. At a threshold of 0 there is
+    /// no value of `pressure_after` -- including `u64::MAX` and 0 itself -- that makes it false.
+    #[test]
+    fn still_over_cannot_be_false_at_threshold_zero() {
+        let threshold_zero: u64 = 0;
+        let mut false_cases = 0usize;
+        let probes = [0u64, 1, 4_800, 1_775_000, u64::MAX];
+        for pressure_after in probes {
+            if !(pressure_after >= threshold_zero) {
+                false_cases += 1;
+            }
+        }
+        assert_eq!(
+            false_cases, 0,
+            "still_over fired at threshold 0 -- the documented vacuity is wrong",
+        );
+        // POSITIVE CONTROL over the same probe set: above 0 the comparison is a real test, so
+        // the probes are proving something rather than passing because the loop body never ran.
+        let threshold_raised: u64 = 1_775_000;
+        let mut raised_false_cases = 0usize;
+        for pressure_after in probes {
+            if !(pressure_after >= threshold_raised) {
+                raised_false_cases += 1;
+            }
+        }
+        assert_eq!(
+            raised_false_cases, 3,
+            "expected 3 of {} probes below a raised threshold",
+            probes.len(),
+        );
+    }
+
+    /// The loop must not be able to terminate on a vacuous term at the shipped default. With the
+    /// two live terms satisfied, the decision is `continue` no matter what the two vacuous terms
+    /// would have said had they been reachable.
+    #[test]
+    fn at_threshold_zero_the_loop_stops_only_on_budget_or_progress() {
+        let terms = all_true();
+        assert!(terms.should_continue());
+        assert!(terms.stops_only_on_live_conditions(0));
+
+        let out_of_budget = EvictionLoopTerms {
+            more_budget: false,
+            ..all_true()
+        };
+        assert!(!out_of_budget.should_continue());
+        assert!(
+            out_of_budget.stops_only_on_live_conditions(0),
+            "the budget is a live stopping condition at every threshold",
+        );
+
+        let no_progress = EvictionLoopTerms {
+            made_progress: false,
+            ..all_true()
+        };
+        assert!(!no_progress.should_continue());
+        assert!(
+            no_progress.stops_only_on_live_conditions(0),
+            "progress is a live stopping condition at every threshold",
+        );
+
+        // The guard itself: a stop attributable ONLY to a term that cannot fire at 0.
+        let leaned_on_still_over = EvictionLoopTerms {
+            still_over: false,
+            ..all_true()
+        };
+        assert!(!leaned_on_still_over.should_continue());
+        assert!(
+            !leaned_on_still_over.stops_only_on_live_conditions(0),
+            "a loop that stops only because still_over went false at threshold 0 is relying on a \
+             condition that cannot fire there",
+        );
+
+        let leaned_on_gate = EvictionLoopTerms {
+            pressure_gate_open: false,
+            ..all_true()
+        };
+        assert!(
+            !leaned_on_gate.stops_only_on_live_conditions(0),
+            "pressure_gate_open cannot be false at threshold 0",
+        );
+
+        // ... and above 0 both become legitimate stops. Same inputs, different threshold: this is
+        // what makes the assertion above about the threshold and not about the struct.
+        assert!(leaned_on_still_over.stops_only_on_live_conditions(1));
+        assert!(leaned_on_gate.stops_only_on_live_conditions(1));
+    }
+
+    /// Every term is load-bearing in `should_continue`: dropping any one of the four flips the
+    /// decision for at least one input. Keeps a future edit from quietly deleting a term.
+    #[test]
+    fn each_of_the_four_terms_can_stop_the_loop() {
+        let mut stopped_by = 0usize;
+        assert!(!EvictionLoopTerms {
+            pressure_gate_open: false,
+            ..all_true()
+        }
+        .should_continue());
+        stopped_by += 1;
+        assert!(!EvictionLoopTerms {
+            more_budget: false,
+            ..all_true()
+        }
+        .should_continue());
+        stopped_by += 1;
+        assert!(!EvictionLoopTerms {
+            still_over: false,
+            ..all_true()
+        }
+        .should_continue());
+        stopped_by += 1;
+        assert!(!EvictionLoopTerms {
+            made_progress: false,
+            ..all_true()
+        }
+        .should_continue());
+        stopped_by += 1;
+        assert_eq!(
+            stopped_by, 4,
+            "all four terms must be able to stop the loop once the threshold is raised",
+        );
+    }
+}
+
+
+/// Guards that the evict stage's batch loop TERMINATES, and in how many rounds.
+///
+/// WHY THESE EXIST. Forcing `made_progress` true at the point the terms are computed from a
+/// batch report made this loop run for ever. 27 of 29 tests in the area still passed; two ran
+/// unbounded. libtest has no per-test timeout, so nothing FAILED -- the run was cancelled, which
+/// reads as infrastructure trouble rather than a defect, and names no test. The test written to
+/// cover the loop's stopping conditions passed too: it catches "stopped too early" and never
+/// "never stops".
+///
+/// The predicate `EvictionLoopTerms` had unit tests already. They construct the struct directly,
+/// so the step that turns a report INTO terms -- where the spin lives -- was not reached by any
+/// of them. These guards drive the real loop through the real wiring and assert the round count.
+#[cfg(test)]
+mod eviction_loop_termination_guards {
+    use super::{eviction_loop_round_limit, eviction_loop_terms_for_batch, run_eviction_stage};
+    use crate::engine::reports::{StorageEvictionReport, StorageEvictionVictim};
+
+    /// The shipped victim budget, which is also the round limit derived from it.
+    const BUDGET: usize = crate::data_node::DEFAULT_EVICTION_COUNT_LIMIT;
+
+    /// A batch that took `victims` victims, was not in cooldown, and did not take the pressure
+    /// gate's early return -- i.e. every term except `made_progress` says continue.
+    fn batch(victims: usize) -> StorageEvictionReport {
+        StorageEvictionReport {
+            pressure_gate_open: true,
+            cooldown: false,
+            selected_victims: vec![StorageEvictionVictim::default(); victims],
+            ..StorageEvictionReport::default()
+        }
+    }
+
+    /// THE TERMINATION GUARD. A batch that finds nobody must stop the stage, in a stated number
+    /// of rounds. Forcing `made_progress` true is what this exists to catch: before the round
+    /// bound that mutation spun here instead of failing, and an unbounded test is a cancelled CI
+    /// run with no named failure. Now the same mutation stops at the round limit and this fails
+    /// on the number.
+    #[test]
+    fn a_batch_that_takes_no_victims_stops_the_stage_without_another_round() {
+        let mut calls = 0usize;
+        let tally = run_eviction_stage(0, BUDGET, batch(0), |_remaining| {
+            calls += 1;
+            batch(0)
+        });
+        assert_eq!(
+            tally.rounds, 0,
+            "expected 0 further rounds after a batch that found nobody, ran {}",
+            tally.rounds,
+        );
+        assert_eq!(calls, 0, "the stage took {calls} more batches after finding nobody");
+        assert!(tally.victims.is_empty(), "{} victims from empty batches", tally.victims.len());
+    }
+
+    /// A batch that freed nothing stops it too, by the other half of the same term.
+    #[test]
+    fn a_batch_in_cooldown_stops_the_stage_without_another_round() {
+        let mut calls = 0usize;
+        let seed = StorageEvictionReport { cooldown: true, ..batch(1) };
+        let tally = run_eviction_stage(0, BUDGET, seed, |_remaining| {
+            calls += 1;
+            batch(1)
+        });
+        assert_eq!(tally.rounds, 0, "expected 0 further rounds after a cooldown batch");
+        assert_eq!(calls, 0, "the stage took {calls} more batches after a cooldown batch");
+    }
+
+    /// The productive case, on a number: a stage whose every batch takes one victim spends the
+    /// budget exactly and stops. This is the denominator for the two guards above -- without it
+    /// they would pass on a loop that never ran a round at all.
+    #[test]
+    fn the_stage_spends_its_victim_budget_and_then_stops() {
+        let mut calls = 0usize;
+        let tally = run_eviction_stage(0, BUDGET, batch(1), |_remaining| {
+            calls += 1;
+            batch(1)
+        });
+        assert_eq!(
+            tally.victims.len(),
+            BUDGET,
+            "expected the stage to take exactly its budget of {BUDGET} victims",
+        );
+        assert_eq!(
+            tally.rounds,
+            BUDGET - 1,
+            "expected {} rounds after the seed batch, ran {}",
+            BUDGET - 1,
+            tally.rounds,
+        );
+        assert_eq!(calls, BUDGET - 1, "batches taken and rounds counted disagree");
+    }
+
+    /// The ROUND half of `more_budget`, asserted where the victim half cannot reach it: `taken`
+    /// has not moved, so `count_limit > taken` is still true and only the round count can stop
+    /// the loop. This is the term that turns a spin into a bounded run.
+    #[test]
+    fn the_round_bound_stops_a_loop_whose_victim_budget_never_advances() {
+        let productive = batch(1);
+
+        let below = eviction_loop_terms_for_batch(&productive, 0, BUDGET, 0, BUDGET - 1);
+        assert!(
+            below.more_budget,
+            "round {} of {BUDGET} must still have budget",
+            BUDGET - 1,
+        );
+        assert!(below.should_continue());
+
+        let at_limit = eviction_loop_terms_for_batch(&productive, 0, BUDGET, 0, BUDGET);
+        assert!(
+            !at_limit.more_budget,
+            "round {BUDGET} of {BUDGET} still had budget with 0 victims taken -- the budget \
+             bounds victims only, which is what let the stage spin",
+        );
+        assert!(!at_limit.should_continue());
+        assert_eq!(
+            eviction_loop_round_limit(BUDGET),
+            BUDGET,
+            "the round limit is derived from the victim budget",
+        );
+    }
+
+    /// THE WIRING. Exactly one of three batch shapes reads as progress. The predicate's own unit
+    /// tests construct `EvictionLoopTerms` directly and so cannot see this step at all.
+    #[test]
+    fn exactly_one_of_three_batch_shapes_reads_as_progress() {
+        let probes: [(&str, StorageEvictionReport, bool); 3] = [
+            ("took a victim", batch(1), true),
+            ("found nobody", batch(0), false),
+            (
+                "in cooldown",
+                StorageEvictionReport { cooldown: true, ..batch(1) },
+                false,
+            ),
+        ];
+        let progressed = probes
+            .iter()
+            .filter(|(_, report, _)| {
+                eviction_loop_terms_for_batch(report, 0, BUDGET, 0, 0).made_progress
+            })
+            .count();
+        assert_eq!(
+            progressed,
+            1,
+            "expected exactly 1 of {} batch shapes to read as progress, got {progressed}",
+            probes.len(),
+        );
+        for (name, report, expected) in &probes {
+            assert_eq!(
+                eviction_loop_terms_for_batch(report, 0, BUDGET, 0, 0).made_progress,
+                *expected,
+                "batch shape {name} read the wrong way",
+            );
+        }
+    }
+
+    /// The accumulation the stage report is built from, so a bounded loop cannot buy termination
+    /// by losing what the earlier batches did.
+    #[test]
+    fn the_stage_report_accumulates_every_batch_not_only_the_last() {
+        let mut calls = 0usize;
+        let seed = StorageEvictionReport {
+            pressure_before: 1_775_000,
+            cache_entries_removed: 3,
+            ..batch(1)
+        };
+        let tally = run_eviction_stage(0, 4, seed, |_remaining| {
+            calls += 1;
+            StorageEvictionReport { cache_entries_removed: 2, ..batch(1) }
+        });
+        assert_eq!(tally.rounds, 3, "expected 3 rounds against a budget of 4");
+        let report = tally.into_stage_report();
+        assert_eq!(report.selected_victims.len(), 4, "the stage lost victims");
+        assert_eq!(
+            report.cache_entries_removed, 9,
+            "expected 3 + 3 * 2 cache entries across the stage",
+        );
+        assert_eq!(
+            report.pressure_before, 1_775_000,
+            "pressure_before must come from the FIRST batch",
+        );
+    }
+}

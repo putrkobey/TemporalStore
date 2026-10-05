@@ -71,3 +71,150 @@ struct Carrier {
 #[test]
 fn every_side_table_domain_round_trips_as_its_own_shape() {
     let carrier = Carrier { side_tables: every_domain() };
+    let json = serde_json::to_string(&carrier).expect("the side tables must serialize");
+    let back: Carrier = serde_json::from_str(&json).expect("and deserialize");
+
+    assert_eq!(
+        back.side_tables.len(),
+        SideTable::ALL.len(),
+        "a domain was lost in the round trip. Written: {}, read back: {}. The decode resolves a \
+         table's shape from its spelling, so a lost domain means a spelling did not resolve.",
+        SideTable::ALL.len(),
+        back.side_tables.len()
+    );
+
+    for domain in SideTable::ALL {
+        match (domain.shape(), back.side_tables.get(domain)) {
+            (SideTableShape::Addresses, Some(SideTableData::Addresses(table))) => {
+                let entry = table
+                    .get(&*format!("k-{}", domain.as_str()))
+                    .unwrap_or_else(|| panic!("{} lost its key", domain.as_str()));
+                assert_eq!(
+                    entry.block_id(),
+                    Some(7),
+                    "{} round-tripped its table but not its entry's block id",
+                    domain.as_str()
+                );
+            }
+            (SideTableShape::Counters, Some(SideTableData::Counters(table))) => {
+                let series = table
+                    .get(&*format!("k-{}", domain.as_str()))
+                    .unwrap_or_else(|| panic!("{} lost its key", domain.as_str()));
+                assert_eq!(
+                    series.get(&1_700_000_000_000),
+                    Some(&42),
+                    "{} round-tripped its table but not its series point",
+                    domain.as_str()
+                );
+            }
+            (SideTableShape::U64s, Some(SideTableData::U64s(table))) => {
+                let held = table
+                    .get(&*format!("k-{}", domain.as_str()))
+                    .unwrap_or_else(|| panic!("{} lost its key", domain.as_str()));
+                assert_eq!(
+                    *held, 1_700_000_000_123,
+                    "{} round-tripped its table but not its value",
+                    domain.as_str()
+                );
+            }
+            (wanted, other) => panic!(
+                "{} came back as the WRONG SHAPE. It should hold {wanted:?}; read back: {}. This \
+                 is the invariant the whole codec rests on -- the spelling decides the shape -- \
+                 and nothing in the type system enforces it.",
+                domain.as_str(),
+                match other {
+                    Some(SideTableData::Addresses(_)) => "an address table",
+                    Some(SideTableData::Counters(_)) => "a counter table",
+                    Some(SideTableData::U64s(_)) => "a u64 ledger",
+                    None => "absent",
+                }
+            ),
+        }
+    }
+}
+
+#[test]
+fn the_six_spellings_are_distinct_and_are_the_ones_the_old_fields_used() {
+    // DISTINCT, because the wire key is the only thing separating two domains. A collision would
+    // not fail -- it would merge them, and the second written would win.
+    let mut seen = std::collections::HashSet::new();
+    for domain in SideTable::ALL {
+        assert!(
+            seen.insert(domain.as_str()),
+            "the spelling {:?} is used by more than one domain. Two domains sharing a wire key \
+             are indistinguishable on decode and silently become one.",
+            domain.as_str()
+        );
+    }
+
+    // AND THEY ARE THE OLD NAMES. A serialized map key is a durable name: changing one is a format
+    // change, and this merge deliberately did not make one -- the stamp it spent covers the two
+    // top-level keys becoming one, nothing more.
+    let expected = [
+        (SideTable::ContextNodes, "context_nodes"),
+        (SideTable::ControlStateCounters, "control_state"),
+        (SideTable::FeatureCounters, "feature_values"),
+        (SideTable::ControlStateUuid, "control_state_uuid"),
+        (SideTable::ContextCompressionWatermark, "context_compression_watermark"),
+        (SideTable::Expiry, "expires_at_ms"),
+    ];
+    assert_eq!(
+        expected.len(),
+        SideTable::ALL.len(),
+        "a domain was added or removed without this list following it, so the spellings are no \
+         longer exhaustively pinned"
+    );
+    for (domain, spelling) in expected {
+        assert_eq!(domain.as_str(), spelling, "a durable spelling moved");
+        assert_eq!(
+            SideTable::from_stored_name(spelling),
+            Some(domain),
+            "{spelling} does not resolve back to its domain, so an image written with it would \
+             be skipped as unknown"
+        );
+    }
+}
+
+#[test]
+fn an_undeclared_spelling_is_skipped_rather_than_refused() {
+    // A newer binary's domain, arriving at this one. The division of labour is: this codec stays
+    // forward-compatible, and the STAMP refuses an image this binary should not serve. A refusal
+    // here would turn a readable image into a load failure.
+    let json =
+        r#"{"side_tables":{"context_nodes":{},"a_domain_from_the_future":{"anything":[1,2,3]}}}"#;
+    let back: Carrier =
+        serde_json::from_str(json).expect("an unknown domain must not fail the decode");
+    assert!(
+        back.side_tables.contains_key(&SideTable::ContextNodes),
+        "the declared domain beside the unknown one was lost, so the skip consumed too much"
+    );
+    assert_eq!(
+        back.side_tables.len(),
+        1,
+        "the unknown domain was kept as something, which it cannot be -- this binary has no shape \
+         for it"
+    );
+}
+
+#[test]
+fn the_stored_image_carries_the_spellings_without_a_variant_tag() {
+    // THE POINT OF RESOLVING THE SHAPE FROM THE KEY: no wrapper per table. If this ever starts
+    // writing a variant name, every stored index grows by one object per domain and the claim that
+    // the merge cost no bytes stops being true.
+    let carrier = Carrier { side_tables: every_domain() };
+    let json = serde_json::to_string(&carrier).expect("must serialize");
+    for spelling in SideTable::ALL.iter().map(|d| d.as_str()) {
+        assert!(
+            json.contains(&format!("\"{spelling}\"")),
+            "the stored image does not carry the spelling {spelling:?}"
+        );
+    }
+    for tag in ["Addresses", "Counters", "U64s", "addresses", "counters", "u64s"] {
+        assert!(
+            !json.contains(tag),
+            "the stored image carries the variant tag {tag:?}. The shape is supposed to be \
+             resolved from the spelling, so a tag means every table grew a wrapper and the \
+             merge is no longer free on the wire. Image: {json}"
+        );
+    }
+}
