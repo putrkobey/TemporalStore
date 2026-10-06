@@ -266,3 +266,272 @@ impl RaftCluster {
     /// Block until the quorum commit reaches `index`, or the deadline passes.
     pub(crate) fn wait_for_quorum_commit(&self, index: u64, deadline: Duration) -> bool {
         let started = Instant::now();
+        let (epoch_lock, condvar) = &*self.commit_signal;
+        let mut epoch = epoch_lock.lock().expect("commit signal poisoned");
+        loop {
+            {
+                let inner = self.inner.read().expect("raft cluster lock poisoned");
+                let leader_id = inner.leader_id;
+                if inner
+                    .nodes
+                    .get(&leader_id)
+                    .map(|leader| leader.commit_index >= index)
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+            let elapsed = started.elapsed();
+            if elapsed >= deadline {
+                return false;
+            }
+            let (next, _timeout) = condvar
+                .wait_timeout(epoch, deadline - elapsed)
+                .expect("commit signal poisoned");
+            epoch = next;
+        }
+    }
+
+    /// Fold successful replication into the quorum commit, waking every waiting proposer.
+    pub(crate) fn advance_quorum_commit(&self) {
+        // Cheap pre-check under the read lock: every sender calls this after every response, and
+        // most calls have nothing to advance. Taking the write lock for those serializes the
+        // senders against the proposers appending under the same lock.
+        {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            let leader_id = inner.leader_id;
+            let Some(leader) = inner.nodes.get(&leader_id) else {
+                return;
+            };
+            if leader.role != RaftRole::Leader {
+                return;
+            }
+            let required = inner.required_majority();
+            let leader_last = node_next_log_index(leader).saturating_sub(1);
+            let mut matched: Vec<u64> = Vec::new();
+            for (id, node) in &inner.nodes {
+                if !node.replica_role.participates_in_quorum() {
+                    continue;
+                }
+                matched.push(if *id == leader_id {
+                    leader_last
+                } else {
+                    node.pipeline_state.match_index
+                });
+            }
+            if matched.len() < required {
+                return;
+            }
+            matched.sort_unstable_by(|left, right| right.cmp(left));
+            if matched[required - 1] <= leader.commit_index {
+                return;
+            }
+        }
+        let advanced = {
+            let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+            let advanced = inner.maybe_advance_quorum_commit();
+            if advanced {
+                // Commit-index durability keeps the old path's cadence: persisted with the
+                // record that carries it. It is recoverable state either way.
+                let _ = inner.persist_configured_wal();
+            }
+            advanced
+        };
+        if advanced {
+            let (epoch_lock, condvar) = &*self.commit_signal;
+            let mut epoch = epoch_lock.lock().expect("commit signal poisoned");
+            *epoch = epoch.wrapping_add(1);
+            condvar.notify_all();
+        }
+    }
+}
+
+/// One follower's sender: the only thread that ever sends this follower anything.
+#[allow(clippy::too_many_arguments)]
+fn sender_loop<T>(
+    cluster: RaftCluster,
+    transport: T,
+    peer: RaftNodeId,
+    signal: Arc<PeerSignal>,
+    health: Arc<PeerHealth>,
+    stopping: Arc<AtomicBool>,
+    started: Instant,
+) where
+    T: RaftTransport + Clone + Send + 'static,
+{
+    let mut consecutive_rejections: u32 = 0;
+    loop {
+        let (heartbeat, stop) = signal.wait();
+        if stop || stopping.load(Ordering::SeqCst) {
+            return;
+        }
+        // Drain: keep sending while this peer is behind. One request at a time, response awaited
+        // before the next, so order per follower holds by construction.
+        let mut send_heartbeat = heartbeat;
+        loop {
+            if stopping.load(Ordering::SeqCst) {
+                return;
+            }
+            match pipeline_step(
+                &cluster,
+                &transport,
+                peer,
+                send_heartbeat,
+                &health,
+                started,
+                &mut consecutive_rejections,
+            ) {
+                PipelineStep::Sent => {
+                    send_heartbeat = false;
+                    continue;
+                }
+                PipelineStep::Idle => break,
+                PipelineStep::Backoff => {
+                    std::thread::sleep(Duration::from_millis(SEND_FAILURE_BACKOFF_MS));
+                    break;
+                }
+            }
+        }
+    }
+}
+
+enum PipelineStep {
+    /// A request went out and its outcome was folded in; there may be more to send.
+    Sent,
+    /// Nothing to send: the peer is caught up and no heartbeat is due.
+    Idle,
+    /// The send failed outright; wait before hammering an unreachable peer.
+    Backoff,
+}
+
+/// Send at most one request to `peer` and fold its outcome into the cluster state.
+fn pipeline_step<T>(
+    cluster: &RaftCluster,
+    transport: &T,
+    peer: RaftNodeId,
+    heartbeat: bool,
+    health: &PeerHealth,
+    started: Instant,
+    consecutive_rejections: &mut u32,
+) -> PipelineStep
+where
+    T: RaftTransport + Clone + Send + 'static,
+{
+    // Only a live leader sends; anything else idles until the next ring.
+    let (behind, local_node_id) = {
+        let inner = cluster.inner.read().expect("raft cluster lock poisoned");
+        let leader_id = inner.leader_id;
+        if peer == leader_id {
+            return PipelineStep::Idle;
+        }
+        if let Some(local) = inner.local_node_id {
+            if local != leader_id {
+                return PipelineStep::Idle;
+            }
+        }
+        let Some(leader) = inner.nodes.get(&leader_id) else {
+            return PipelineStep::Idle;
+        };
+        if !leader.alive || leader.role != RaftRole::Leader {
+            return PipelineStep::Idle;
+        }
+        let last = node_next_log_index(leader).saturating_sub(1);
+        let leader_commit = leader.commit_index;
+        let (next, peer_commit) = inner
+            .nodes
+            .get(&peer)
+            .map(|node| (node.pipeline_state.next_index, node.commit_index))
+            .unwrap_or((1, 0));
+        // Commit lag counts as behind: an entry-less append carries the commit index, and a
+        // follower that has not heard it keeps its in-flight window charged -- which blocks the
+        // next real entry at the window and, with no heartbeat timer running (tests), forever.
+        let commit_lagging = peer_commit < leader_commit;
+        (last >= next || commit_lagging, inner.local_node_id)
+    };
+    if !behind && !heartbeat {
+        return PipelineStep::Idle;
+    }
+
+    if *consecutive_rejections >= REJECTIONS_BEFORE_SNAPSHOT {
+        *consecutive_rejections = 0;
+        return pipeline_send_snapshot(cluster, transport, peer);
+    }
+
+    let request = match cluster.build_append_entries_request(peer) {
+        Ok(request) => request,
+        Err(_) => return PipelineStep::Backoff,
+    };
+    match transport.append_entries(request) {
+        Ok(response) => {
+            health
+                .last_ok_at_ms
+                .store(started.elapsed().as_millis().max(1) as u64, Ordering::Relaxed);
+            health.consecutive_failures.store(0, Ordering::Relaxed);
+            let success = response.success;
+            let peer_term = response.term;
+            let _ = cluster.record_append_entries_response(peer, &response);
+            let _ = cluster.set_alive(peer, true);
+            if success {
+                *consecutive_rejections = 0;
+                cluster.advance_quorum_commit();
+            } else {
+                *consecutive_rejections = consecutive_rejections.saturating_add(1);
+                if peer_term > 0 {
+                    // A peer on a newer term has seen a different leader: stand down rather
+                    // than keep appending as a superseded one.
+                    if let Some(local) = local_node_id {
+                        let current = {
+                            let inner =
+                                cluster.inner.read().expect("raft cluster lock poisoned");
+                            inner
+                                .nodes
+                                .get(&inner.leader_id)
+                                .map(|leader| leader.current_term)
+                                .unwrap_or_default()
+                        };
+                        if peer_term > current {
+                            let _ = cluster.observe_higher_term(local, peer_term);
+                        }
+                    }
+                }
+            }
+            // A rejection retreated `next_index` inside record_response; sending again
+            // immediately is the probe walking backwards to where the follower really is.
+            PipelineStep::Sent
+        }
+        Err(_) => {
+            let failures = health
+                .consecutive_failures
+                .fetch_add(1, Ordering::Relaxed)
+                .saturating_add(1);
+            let _ = cluster.record_append_entries_send_failure(peer);
+            if failures >= RAFT_PEER_FAILURE_THRESHOLD as u64 {
+                let _ = cluster.set_alive(peer, false);
+            }
+            PipelineStep::Backoff
+        }
+    }
+}
+
+/// The log cannot reach this peer: install a snapshot, on this sender's thread so it serializes
+/// with the peer's appends instead of racing them.
+fn pipeline_send_snapshot<T>(
+    cluster: &RaftCluster,
+    transport: &T,
+    peer: RaftNodeId,
+) -> PipelineStep
+where
+    T: RaftTransport + Clone + Send + 'static,
+{
+    let request = match cluster.build_install_snapshot_request(peer) {
+        Ok(request) => request,
+        Err(_) => return PipelineStep::Backoff,
+    };
+    match transport.install_snapshot(request) {
+        Ok(response) if response.success => {
+            let _ = cluster.catch_up(peer);
+            PipelineStep::Sent
+        }
+        _ => PipelineStep::Backoff,
+    }
+}
