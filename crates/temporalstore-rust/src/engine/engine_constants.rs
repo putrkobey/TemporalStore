@@ -23,3 +23,28 @@ pub(super) const CONTEXT_MAX_INDEX_NAME_BYTES: usize = 64;
 pub(super) const CONTEXT_MAX_CANONICAL_NAME_BYTES: usize = 512;
 pub(super) const CONTEXT_MAX_ENTITY_NAME_BYTES: usize = 512;
 pub(super) const CONTEXT_MAX_ENTITY_VALUE_BYTES: usize = 4096;
+pub(super) const CONTEXT_MAX_EMBEDDING_DIM: usize = 4096;
+pub(super) const CONTEXT_MAX_SUMMARY_BYTES: usize = 16 * 1024;
+pub(super) const CONTEXT_MAX_COMPRESSION_SNIPPET_BYTES: usize = 256;
+pub(super) const CONTEXT_MAX_TRAVERSAL_DEPTH: u32 = 16;
+pub(super) const CONTEXT_DEFAULT_TRAVERSAL_TOP_K: usize = 8;
+pub(super) const CONTEXT_DEFAULT_TRAVERSAL_CANDIDATES: usize = 64;
+pub(super) const CONTEXT_MAX_L0_BYTES: usize = 2048;
+pub(super) const CONTEXT_MAX_REF_BYTES: usize = 4096;
+pub(super) const CONTEXT_MAX_EVENT_TEXT_BYTES: usize = 64 * 1024;
+pub(super) const CONTEXT_MAX_COMPACT_ATTRS_BYTES: usize = 8 * 1024;
+pub(super) const CONTEXT_NODE_FIELD: &str = "meta";
+/// Sentinel slab id for a block that lives in the log rather than a slab file, as the live
+/// write path mints it: the address's `offset` is a counter, not a position.
+///
+/// `pub(crate)` so [`crate::wal_record::is_wal_resident`] can answer for both sentinels in one
+/// place rather than each site comparing by hand.
+/// AT THE TOP OF THE THIRTY-TWO BIT RANGE, NOT THE SIXTY-FOUR BIT ONE.
+///
+/// A block address packs its slab id into the high half of one 64-bit word, so a sentinel that
+/// only exists above `u32::MAX` cannot be carried at all. It is a reserved VALUE, not a large
+/// number: all it has to be is something no real slab id reaches, and
+/// `block_store::MAX_ADDRESSABLE_BLOCK_SLAB_ID` reserves this and the log-resident sentinel
+/// below it.
+pub(crate) const HOT_BLOCK_SLAB_ID: u64 = u32::MAX as u64;
+pub(super) static HOT_BLOCK_OFFSET: AtomicU64 = AtomicU64::new(1);

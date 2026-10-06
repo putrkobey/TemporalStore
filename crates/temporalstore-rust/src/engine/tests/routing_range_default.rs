@@ -787,3 +787,1581 @@ fn both_byte_columns_recover_a_planted_size_and_the_chunk_column_is_not_the_requ
 /// What the bucket map charges the allocator, in both columns and in calls.
 #[cfg(feature = "alloc-probe")]
 struct Arm {
+    request_bytes: u64,
+    chunk_bytes: u64,
+    allocs: u64,
+    buckets: usize,
+    blocks: usize,
+    records: usize,
+    arms: (usize, usize, usize),
+    fill_p50: usize,
+    fill_max: usize,
+}
+
+#[cfg(feature = "alloc-probe")]
+impl Arm {
+    fn request_per_record(&self) -> f64 {
+        self.request_bytes as f64 / self.records as f64
+    }
+    fn chunk_per_record(&self) -> f64 {
+        self.chunk_bytes as f64 / self.records as f64
+    }
+    fn allocs_per_record(&self) -> f64 {
+        self.allocs as f64 / self.records as f64
+    }
+}
+
+/// BOTH BYTE COLUMNS AND THE ALLOCATION COUNT, PER RECORD, AT EVERY CANDIDATE, AT TWO SIZES.
+///
+/// PER RECORD and not per block, so the column is the one an operator sizing a box reads. The block
+/// count is asserted equal to the record count in the fixture, so the two differ only by a name.
+///
+/// BOTH COLUMNS, BECAUSE THEY CAN DISAGREE IN SIGN. `alloc_bytes` charges `layout.size()`;
+/// `chunk_bytes` charges `malloc_usable_size`. A container change moves the rounding, so a saving
+/// the request column reports can be entirely rounding the chunk column never gave back. Every
+/// comparison in this campaign before #1967 read the request column only.
+///
+/// ONE INSTRUMENT FOR BOTH SIDES: the counting allocator over a clone of the real `bucket_map` as
+/// production built it. No `size_of` arithmetic appears in the comparison.
+///
+/// NEITHER DIRECTION IS ASSERTED. The arm counts are printed beside the bytes because they are
+/// what explains the sign, and the sign is the thing being measured.
+///
+/// rust-internal: measures the engine's own bucket map, no product behaviour
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "seeds ten stores up to 40,000 records each; run by name"]
+fn both_byte_columns_and_the_allocations_a_record_at_every_candidate_range() {
+    let mut observed: BTreeMap<(usize, u32), Arm> = BTreeMap::new();
+    let mut path_lengths: BTreeSet<usize> = BTreeSet::new();
+
+    for records in [SMALL, LARGE] {
+        for end_routing_bucket in swept_ranges() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            path_lengths.insert(store_path_length(dir.path()));
+            let engine = engine_on(dir.path());
+            load_on(&engine, end_routing_bucket);
+            let keys = seed_routed(&engine, records);
+            assert_eq!(records, read_back(&engine, &keys), "the arm cannot read itself back");
+            let hist = blocks_per_bucket(&engine);
+            let arms = block_index_arms(&engine);
+
+            let (request_bytes, chunk_bytes, allocs) = {
+                let shards = engine.shards.read().expect("engine lock poisoned");
+                let shard = shards.get(&1).expect("shard 1");
+                let probe = Probe::start();
+                let copy = shard.bucket_index.bucket_map.clone();
+                let counts = probe.stop();
+                std::hint::black_box(&copy);
+                drop(copy);
+                (counts.alloc_bytes, counts.chunk_bytes, counts.allocs)
+            };
+            assert!(
+                request_bytes > 0 && allocs > 0,
+                "on 0..{end_routing_bucket} at {records} records the clone charged \
+                 {request_bytes} B in {allocs} calls. A zero here is the instrument not running, \
+                 which reads as the shape being free"
+            );
+
+            observed.insert(
+                (records, end_routing_bucket),
+                Arm {
+                    request_bytes,
+                    chunk_bytes,
+                    allocs,
+                    buckets: hist.buckets(),
+                    blocks: hist.blocks(),
+                    records,
+                    arms,
+                    fill_p50: hist.percentile(0.50),
+                    fill_max: hist.max(),
+                },
+            );
+        }
+    }
+
+    assert_eq!(
+        1,
+        path_lengths.len(),
+        "the arms ran at {} different store path lengths ({:?}); bytes move at about six bytes a \
+         character",
+        path_lengths.len(),
+        path_lengths
+    );
+    println!(
+        "  store path length held at {} characters across all {} arms",
+        path_lengths.iter().next().copied().unwrap_or_default(),
+        observed.len()
+    );
+
+    for records in [SMALL, LARGE] {
+        println!("=== {records} routed records: the bucket map, per record ===");
+        let wide = observed.get(&(records, WIDE_END)).expect("wide arm");
+        for end_routing_bucket in swept_ranges() {
+            let arm = observed.get(&(records, end_routing_bucket)).expect("arm ran");
+            assert_eq!(
+                arm.blocks, arm.records,
+                "on 0..{end_routing_bucket} at {records} records the index holds {} pages for \
+                 {records} records; a per-record figure over a different page count is two \
+                 questions",
+                arm.blocks
+            );
+            let label = if end_routing_bucket == WIDE_END {
+                "0..u32::MAX (shipped)".to_string()
+            } else {
+                format!("0..{end_routing_bucket}")
+            };
+            println!(
+                "  {label:<24} fill p50 {:>4} MAX {:>4} | REQUEST {:>8.1} B/rec ({:+7.1}%) \
+                 CHUNK {:>8.1} B/rec ({:+7.1}%) | allocs {:>7.4}/rec ({:+8.1}%) | \
+                 buckets {:>6} arms E{} O{} M{}",
+                arm.fill_p50,
+                arm.fill_max,
+                arm.request_per_record(),
+                100.0 * (arm.request_per_record() - wide.request_per_record())
+                    / wide.request_per_record(),
+                arm.chunk_per_record(),
+                100.0 * (arm.chunk_per_record() - wide.chunk_per_record())
+                    / wide.chunk_per_record(),
+                arm.allocs_per_record(),
+                100.0 * (arm.allocs_per_record() - wide.allocs_per_record())
+                    / wide.allocs_per_record(),
+                arm.buckets,
+                arm.arms.0,
+                arm.arms.1,
+                arm.arms.2,
+            );
+        }
+    }
+
+    // THE ARMS MOVED, or every figure above is two readings of one shape.
+    for records in [SMALL, LARGE] {
+        let wide = observed.get(&(records, WIDE_END)).expect("wide arm");
+        assert_eq!(
+            0, wide.arms.2,
+            "on the shipped default at {records} records {} buckets are already on the `Many` \
+             arm; at one page a bucket none should be",
+            wide.arms.2
+        );
+        let narrowest = observed.get(&(records, CANDIDATES[0])).expect("narrowest arm");
+        assert!(
+            narrowest.arms.2 > 0,
+            "0..{} at {records} records put no bucket on the `Many` arm, so no candidate filled \
+             and the table above compares single-page stores",
+            CANDIDATES[0]
+        );
+    }
+
+    // THE TWO COLUMNS ARE NOT THE SAME COLUMN, on the real measurement rather than on a plant.
+    // If they were, the chunk column would be decorative and this module's claim to have settled
+    // the sign would be empty.
+    let mut columns_differ = 0usize;
+    for ((records, end_routing_bucket), arm) in &observed {
+        if arm.chunk_bytes != arm.request_bytes {
+            columns_differ += 1;
+        } else {
+            println!(
+                "  NOTE 0..{end_routing_bucket} at {records} records: the two columns agree \
+                 exactly at {} B",
+                arm.chunk_bytes
+            );
+        }
+    }
+    assert!(
+        columns_differ > 0,
+        "the request and chunk columns agreed exactly on all {} arms. On a real bucket map they \
+         differ by the allocator's rounding, so agreement everywhere means the chunk column is \
+         not reading `malloc_usable_size` and this table carries the pre-#1967 bias",
+        observed.len()
+    );
+    println!(
+        "  the two byte columns differ on {columns_differ} of {} arms",
+        observed.len()
+    );
+}
+
+// =============================================================================================
+// 4. WHAT MORE BLOCKS A BUCKET COSTS THE WRITE PATH AND THE RELEASE UNIT
+// =============================================================================================
+
+/// THE DUMP UNIT, THE DIRTY DRAIN AND THE RELEASE UNIT ALL COARSEN BY THE BUCKET'S FILL.
+///
+/// A routing bucket is the unit of three separate things, and every one of them gets coarser as
+/// the bucket fills:
+///
+///   * `DirtyObjectIndex::drain_buckets` is what a dump runs once its manifest is durable, and it
+///     drops every dirty key of the named bucket -- so a dump of one bucket writes the bucket's
+///     whole key group;
+///   * `refresh_one_bucket_runtime_flags` ORs `bucket.dirty` over every block, so one dirty key
+///     marks the group; and
+///   * `release_bucket_blocks` frees a whole bucket's blocks at once, so the bucket is also the
+///     granularity at which memory can be given back.
+///
+/// Measured at every candidate: the keys a one-bucket drain drops, and the blocks a one-bucket
+/// release frees. Both are counts of what the engine's own functions did, not derivations from the
+/// fill.
+///
+/// rust-internal: reads the engine's own dirty index and release pass, no product behaviour
+#[test]
+#[ignore = "seeds ten stores of 40,000 records each; run by name"]
+fn the_dump_drain_and_the_release_unit_coarsen_by_the_blocks_a_bucket_holds() {
+    let mut observed: BTreeMap<u32, (usize, usize, usize, usize)> = BTreeMap::new();
+
+    for end_routing_bucket in swept_ranges() {
+        // TWO STORES PER RANGE, because the two units want opposite states: the dirty drain is
+        // only measurable while the store IS dirty, and `release_bucket_blocks` REFUSES a dirty
+        // bucket on `bucket_dirty`. Measuring both on one store would flatten one of them to zero
+        // at every range, which reads as the unit being range-independent.
+        let (dirty_buckets_len, dirty_keys, drained, fill_p50, fill_max) = {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let engine = engine_on(dir.path());
+            load_on(&engine, end_routing_bucket);
+            let keys = seed_routed(&engine, LARGE);
+            let hist = blocks_per_bucket(&engine);
+            let mut shards = engine.shards.write().expect("engine lock poisoned");
+            let shard = shards.get_mut(&1).expect("shard 1");
+
+            // DENOMINATOR: a freshly written store has every key dirty. Without this the drain
+            // could drop nothing and report a clean zero for the wrong reason.
+            let dirty_buckets: Vec<(u32, u64)> = shard.dirty_objects.bucket_counts().collect();
+            let dirty_keys: usize = dirty_buckets.iter().map(|(_, count)| *count as usize).sum();
+            assert_eq!(
+                dirty_keys,
+                keys.len(),
+                "on 0..{end_routing_bucket} the dirty index holds {dirty_keys} keys after writing \
+                 {}",
+                keys.len()
+            );
+
+            // THE DUMP DRAIN, on the WIDEST dirty bucket -- the amplification an operator meets.
+            let widest_dirty = dirty_buckets
+                .iter()
+                .max_by_key(|(_, count)| *count)
+                .map(|(routing_bucket, _)| *routing_bucket)
+                .expect("a freshly written store has a dirty bucket");
+            let drained = shard.dirty_objects.drain_buckets(&[widest_dirty]);
+            assert!(
+                drained > 0,
+                "on 0..{end_routing_bucket} draining bucket {widest_dirty} dropped nothing, so \
+                 this arm measures the drain not running"
+            );
+            (
+                dirty_buckets.len(),
+                dirty_keys,
+                drained,
+                hist.percentile(0.50),
+                hist.max(),
+            )
+        };
+
+        // THE RELEASE UNIT, on a store RELOADED so the pass is not refused.
+        //
+        // `release_bucket_blocks` refuses a dirty bucket, and it is right to: the model maps carry
+        // no per-block dirty bit, so a reload could not restore what a release of a dirty bucket
+        // dropped. A freshly written store is entirely dirty, so without clearing it every release
+        // here is refused and frees zero blocks -- identically at every range, which would read as
+        // the release unit being range-independent.
+        //
+        // NEITHER `flush_shard_index` NOR `dump_index_catalog` CLEARS IT. Both were tried and both
+        // left one `bucket_dirty` refusal: `refresh_one_bucket_runtime_flags` sets the flag as
+        // `bucket.dirty() | any_block_dirty`, an OR that never clears. What does clear it is the
+        // clear-dirty-on-load contract in `persistence.rs` -- a reloaded block comes back
+        // `dirty = false` -- so the store is written, flushed, dropped and reopened.
+        let blocks_released = {
+            let dir = tempfile::tempdir().expect("tempdir");
+            {
+                let engine = engine_on(dir.path());
+                load_on(&engine, end_routing_bucket);
+                let _ = seed_routed(&engine, LARGE);
+                engine.flush_shard_index(1);
+                engine.unload_shard(1);
+            }
+            let engine = engine_on(dir.path());
+            load_on(&engine, end_routing_bucket);
+            let mut shards = engine.shards.write().expect("engine lock poisoned");
+            let shard = shards.get_mut(&1).expect("shard 1");
+            let widest_bucket = shard
+                .bucket_index
+                .bucket_map
+                .iter()
+                .max_by_key(|(_, bucket)| bucket.block_index.len())
+                .map(|(routing_bucket, _)| *routing_bucket)
+                .expect("a written store has a bucket");
+            let held = shard
+                .bucket_index
+                .bucket_map
+                .get(&widest_bucket)
+                .map(|bucket| bucket.block_index.len())
+                .unwrap_or_default();
+            let released = crate::engine::storage_bucket_internals::release_bucket_blocks(
+                shard,
+                &[widest_bucket],
+            );
+            assert_eq!(
+                0, released.refused_buckets,
+                "on 0..{end_routing_bucket} the release of bucket {widest_bucket} (holding \
+                 {held} pages) was refused {} time(s): {:?}. A refused release frees zero pages \
+                 at every range, which would read as the release unit not moving with the fill",
+                released.refused_buckets, released.refusals
+            );
+            released.released_blocks
+        };
+
+        let label = if end_routing_bucket == WIDE_END {
+            "0..u32::MAX (shipped)".to_string()
+        } else {
+            format!("0..{end_routing_bucket}")
+        };
+        println!(
+            "  {label:<24} fill p50 {fill_p50:>4} MAX {fill_max:>4} | {dirty_buckets_len} dirty \
+             buckets over {dirty_keys} dirty keys | a one-bucket dump drains {drained} keys | a \
+             one-bucket release frees {blocks_released} pages",
+        );
+        observed.insert(
+            end_routing_bucket,
+            (drained, blocks_released, dirty_buckets_len, fill_max),
+        );
+    }
+
+    // THE SHIPPED DEFAULT IS THE FINEST UNIT THERE IS: one key, one block.
+    let (wide_drained, wide_released, _, wide_max) =
+        *observed.get(&WIDE_END).expect("the wide arm ran");
+    assert_eq!(
+        1, wide_max,
+        "the shipped default's widest bucket holds {wide_max} pages, so it is not the one-page \
+         shape the rest of this test compares against"
+    );
+    assert_eq!(
+        1, wide_drained,
+        "on the shipped default a dump of one bucket drained {wide_drained} keys, not one"
+    );
+    assert_eq!(
+        1, wide_released,
+        "on the shipped default a release of one bucket freed {wide_released} pages, not one"
+    );
+
+    // AND EVERY CANDIDATE COARSENS BOTH, monotonically: the narrower the range the deeper the
+    // fill and the coarser the unit.
+    let mut previous: Option<(u32, usize, usize)> = None;
+    for candidate in CANDIDATES {
+        let (drained, released, _, _) = *observed.get(&candidate).expect("candidate ran");
+        assert!(
+            drained > wide_drained && released > wide_released,
+            "0..{candidate} drains {drained} keys and releases {released} pages a bucket against \
+             the shipped default's {wide_drained} and {wide_released}. If a candidate did not \
+             coarsen either unit then it did not fill a bucket and this whole section is vacuous"
+        );
+        if let Some((wider, wider_drained, wider_released)) = previous {
+            assert!(
+                drained <= wider_drained && released <= wider_released,
+                "0..{candidate} drains {drained} keys and releases {released} pages against \
+                 0..{wider}'s {wider_drained} and {wider_released}, yet 0..{candidate} is the \
+                 WIDER range and therefore the shallower fill"
+            );
+        }
+        previous = Some((candidate, drained, released));
+    }
+
+    let (narrow_drained, narrow_released, _, _) =
+        *observed.get(&CANDIDATES[0]).expect("narrowest ran");
+    println!(
+        "  the write-path and release price of the fill at {LARGE} records: a one-bucket dump \
+         drains {wide_drained} key and a release frees {wide_released} page on the shipped \
+         default, against {narrow_drained} keys and {narrow_released} pages at 0..{} -- both \
+         units coarsen by exactly the fill",
+        CANDIDATES[0]
+    );
+}
+
+// =============================================================================================
+// 5. THE CONTROL ON THE EXPLANATION
+// =============================================================================================
+
+/// THE WORKLOAD WHERE THE MECHANISM PREDICTS NO EFFECT, AND THERE IS NONE.
+///
+/// Everything above is attributed to one mechanism: the range width is the MODULUS, so narrowing
+/// it maps more object keys onto one bucket. That explanation makes a falsifiable prediction in
+/// the other direction -- a store whose blocks all share ONE OBJECT KEY cannot be regrouped by any
+/// range, because `block_routing_bucket` takes the object key and never the component while the
+/// block handle `stable_block_object_id(shard, kind, key)` takes both. One key is one
+/// bucket at every range.
+///
+/// So this seeds a single container key with many component blocks and sweeps the same five ranges
+/// over it. If the byte and fill figures moved here too, the mechanism named above would not be
+/// the mechanism and the sweep would be measuring something else.
+///
+/// rust-internal: reads the engine's own placement functions, no product behaviour
+#[test]
+#[ignore = "seeds five container stores; run by name"]
+fn narrowing_the_range_changes_nothing_for_a_store_whose_blocks_share_one_object_key() {
+    const MEMBERS: usize = 2_000;
+    let mut observed: BTreeMap<u32, (usize, usize, usize)> = BTreeMap::new();
+
+    for end_routing_bucket in swept_ranges() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on(&engine, end_routing_bucket);
+        run_batch(
+            &engine,
+            (0..MEMBERS)
+                .map(|f| Command::HashSet {
+                    key: "one-container".to_string(),
+                    field: format!("f{f}"),
+                    value: vec![b'v'; 32],
+                })
+                .collect(),
+        );
+        let hist = blocks_per_bucket(&engine);
+        let arms = block_index_arms(&engine);
+        let label = if end_routing_bucket == WIDE_END {
+            "0..u32::MAX (shipped)".to_string()
+        } else {
+            format!("0..{end_routing_bucket}")
+        };
+        println!(
+            "  {label:<24} {} occupied buckets, {} pages, p50 {} MAX {} | arms E{} O{} M{}",
+            hist.buckets(),
+            hist.blocks(),
+            hist.percentile(0.50),
+            hist.max(),
+            arms.0,
+            arms.1,
+            arms.2
+        );
+        observed.insert(end_routing_bucket, (hist.buckets(), hist.blocks(), hist.max()));
+    }
+
+    // NON-VACUITY FIRST: the fixture has to have written blocks, or "no effect" is the effect of
+    // an empty store.
+    let (_, wide_blocks, wide_max) = *observed.get(&WIDE_END).expect("the wide arm ran");
+    assert!(
+        wide_blocks >= MEMBERS,
+        "the container arm wrote {wide_blocks} pages for {MEMBERS} components; an absent effect \
+         over an empty store is not a control"
+    );
+    assert!(
+        wide_max > 1,
+        "the container arm's widest bucket holds {wide_max} page, so the components did not share \
+         a bucket even on the shipped default and this control is not the shape it names"
+    );
+
+    // AND THE PREDICTION: identical at every range, element for element.
+    for end_routing_bucket in swept_ranges() {
+        let (buckets, blocks, max) = *observed.get(&end_routing_bucket).expect("arm ran");
+        assert_eq!(
+            (1, wide_blocks, wide_max),
+            (buckets, blocks, max),
+            "on 0..{end_routing_bucket} a store of one object key occupied {buckets} buckets \
+             holding {blocks} pages with a widest of {max}, against the shipped default's 1 \
+             bucket, {wide_blocks} pages, widest {wide_max}. Routing takes the object key and \
+             never the component, so the range cannot split one key -- if it did here, the \
+             mechanism every figure in this module is attributed to is not the mechanism"
+        );
+    }
+    println!(
+        "  the control holds: one object key is one bucket holding {wide_blocks} pages at all {} \
+         ranges, so the sweep's effect is the modulus over OBJECT KEYS and nothing else",
+        swept_ranges().len()
+    );
+}
+
+// =============================================================================================
+// 6. THE MIGRATION -- DRIVEN, NOT ARGUED
+// =============================================================================================
+
+use crate::engine::routing_range_stamp::{
+    read_routing_range_stamp, routing_range_stamp_path, ROUTING_RANGE_UNSTAMPED,
+};
+
+/// The index directory `engine_on` hands the engine, and therefore where the stamp lives.
+fn index_dir_of(dir: &std::path::Path) -> std::path::PathBuf {
+    dir.join("indexes")
+}
+
+/// Load, returning the status rather than asserting it -- the refusal arms need to read it.
+fn try_load_on(engine: &TemporalEngine, end_routing_bucket: u32) -> crate::types::Status {
+    engine
+        .load_shard_with(crate::control::LoadShardRequest {
+            shard_id: 1,
+            table_name: "routing-range-default".to_string(),
+            shard_uri: "local://routing-range-default/1".to_string(),
+            start_routing_bucket: 0,
+            end_routing_bucket,
+            readonly: false,
+            load_version: 1,
+            local_node_id: Some(1),
+        })
+        .status
+}
+
+/// Every bucket that holds a block, with the block HANDLES it holds. A key set cannot see a lost
+/// component; this can.
+fn bucket_handle_sets(engine: &TemporalEngine) -> BTreeMap<u32, BTreeSet<u64>> {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    let mut contents: BTreeMap<u32, BTreeSet<u64>> = BTreeMap::new();
+    for (routing_bucket, bucket) in &shard.bucket_index.bucket_map {
+        let handles: BTreeSet<u64> = bucket.block_index.iter().map(|(handle, _)| *handle).collect();
+        if handles.is_empty() {
+            continue;
+        }
+        contents.insert(*routing_bucket, handles);
+    }
+    contents
+}
+
+/// A STORE BUILT ON THE OLD DEFAULT IS REFUSED UNDER THE NEW ONE, LOUDLY AND BEFORE THE DECODE.
+///
+/// THIS IS THE ASSERTION THE DEFAULT MOVE RESTS ON. Measured on the build before the stamp existed:
+/// a store of 2,000 routed keys written on the whole keyspace and reopened on `0..1023` came back
+/// with 2,000 of 2,000 blocks filed in buckets ABOVE the shard's own end -- every record readable,
+/// and every block outside the dump's bucket selection, eviction's victim sampling, the reclaim floor
+/// and the release pass. Nothing failed, nothing logged, and a per-bucket sweep simply never saw the
+/// data again.
+///
+/// So the refusal is asserted at four levels, because "it returned an error" would hold for the
+/// wrong error:
+///
+///   1. the load is NOT ok;
+///   2. the code is exactly `routing_range_mismatch` -- a different code is a different finding;
+///   3. the message names BOTH ranges and the stamp file, because an operator who cannot see which
+///      two ranges disagree cannot act on it; and
+///   4. the shard is NOT in the served map afterwards -- a refusal that still installed the shard
+///      would be a warning wearing an error's clothes.
+///
+/// rust-internal: drives the engine's own load path, no product behaviour
+#[test]
+fn a_store_built_on_the_old_default_is_refused_under_the_new_default() {
+    const RECORDS: usize = 200;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // PHASE ONE: build it on the old default, the range every store on disk today was built on.
+    let keys = {
+        let engine = engine_on(dir.path());
+        load_on(&engine, OLD_DEFAULT_END_ROUTING_BUCKET);
+        let keys = seed_routed(&engine, RECORDS);
+        assert_eq!(
+            RECORDS,
+            read_back(&engine, &keys),
+            "the write arm cannot read its own store, so the refusal below would be over a store \
+             that never worked"
+        );
+        engine.flush_shard_index(1);
+        engine.unload_shard(1);
+        keys
+    };
+
+    // THE FIXTURE'S OWN PRECONDITION: the store really was stamped with the old range. Without
+    // this the refusal below could be firing for a missing stamp instead of a disagreeing one.
+    let stamped = read_routing_range_stamp(&index_dir_of(dir.path()), 1)
+        .expect("phase one stamped the store it created");
+    assert_eq!(
+        (OLD_DEFAULT_START_ROUTING_BUCKET, OLD_DEFAULT_END_ROUTING_BUCKET),
+        (stamped.start_routing_bucket, stamped.end_routing_bucket),
+        "phase one recorded {stamped:?}, not the old default it was loaded on"
+    );
+
+    // PHASE TWO: open it on the new default.
+    let engine = engine_on(dir.path());
+    let status = try_load_on(&engine, crate::DEFAULT_END_ROUTING_BUCKET);
+    println!(
+        "  built on 0..{OLD_DEFAULT_END_ROUTING_BUCKET}, opened on \
+         0..{}: ok={} code={} message={}",
+        crate::DEFAULT_END_ROUTING_BUCKET,
+        status.ok,
+        status.code,
+        status.message
+    );
+
+    assert!(
+        !status.ok,
+        "a store built on 0..{OLD_DEFAULT_END_ROUTING_BUCKET} loaded successfully on \
+         0..{}. Its pages are filed under nine-figure buckets the shard does not hold; the load \
+         has to refuse, because nothing re-files them and every record still reads",
+        crate::DEFAULT_END_ROUTING_BUCKET
+    );
+    assert_eq!(
+        "routing_range_mismatch", status.code,
+        "the load was refused with code `{}`, not `routing_range_mismatch`. A refusal for another \
+         reason is a different finding and this test would be passing on it",
+        status.code
+    );
+    for expected in [
+        OLD_DEFAULT_END_ROUTING_BUCKET.to_string(),
+        crate::DEFAULT_END_ROUTING_BUCKET.to_string(),
+        "routing-range.json".to_string(),
+    ] {
+        assert!(
+            status.message.contains(&expected),
+            "the refusal message does not contain `{expected}`: {}. An operator who cannot see \
+             which two ranges disagree, and where the built one is recorded, cannot act on it",
+            status.message
+        );
+    }
+    assert!(
+        !engine
+            .shards
+            .read()
+            .expect("engine lock poisoned")
+            .contains_key(&1),
+        "the load was refused and the shard is in the served map anyway, so the refusal is a \
+         warning rather than a refusal"
+    );
+
+    // AND THE STORE IS STILL LOADABLE ON ITS OWN RANGE -- the refusal is not a brick.
+    let status = try_load_on(&engine, OLD_DEFAULT_END_ROUTING_BUCKET);
+    assert!(
+        status.ok,
+        "the same store could not be reopened on the range it was built on: {status:?}. A refusal \
+         that leaves no way back is worse than the silence it replaced"
+    );
+    assert_eq!(
+        RECORDS,
+        read_back(&engine, &keys),
+        "reopened on its own range, the store served fewer than {RECORDS} records"
+    );
+}
+
+/// A STORE BUILT ON THE NEW DEFAULT ROUND-TRIPS, WHOLE.
+///
+/// The partner of the refusal above, and the arm that says the new default is a working
+/// configuration rather than one the refusal merely protects. Asserted at three levels: every
+/// record readable, every block present HANDLE FOR HANDLE, and every occupied bucket INSIDE the
+/// range -- the third because "the records are readable" held even in the silent-stranding state
+/// this change exists to remove.
+///
+/// rust-internal: drives the engine's own restart, no product behaviour
+#[test]
+fn a_store_built_on_the_new_default_round_trips_whole() {
+    const RECORDS: usize = 200;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let end = crate::DEFAULT_END_ROUTING_BUCKET;
+
+    let (keys, handles_before, buckets_before) = {
+        let engine = engine_on(dir.path());
+        load_on(&engine, end);
+        let keys = seed_routed(&engine, RECORDS);
+        assert_eq!(RECORDS, read_back(&engine, &keys), "the write arm cannot read itself back");
+        let before = bucket_handle_sets(&engine);
+        let handles: BTreeSet<u64> = before.values().flatten().copied().collect();
+        assert_eq!(
+            RECORDS,
+            handles.len(),
+            "the store went in holding {} pages for {RECORDS} keys",
+            handles.len()
+        );
+        engine.flush_shard_index(1);
+        engine.unload_shard(1);
+        (keys, handles, before.len())
+    };
+
+    let engine = engine_on(dir.path());
+    let status = try_load_on(&engine, end);
+    assert!(status.ok, "a store built on 0..{end} could not be reopened on 0..{end}: {status:?}");
+
+    let readable = read_back(&engine, &keys);
+    let after = bucket_handle_sets(&engine);
+    let handles_after: BTreeSet<u64> = after.values().flatten().copied().collect();
+    let outside: Vec<u32> = after.keys().copied().filter(|bucket| *bucket > end).collect();
+    println!(
+        "  built and reopened on 0..{end}: {readable}/{RECORDS} readable, {} page handles, \
+         {buckets_before} buckets -> {} buckets, {} occupied above the shard's end",
+        handles_after.len(),
+        after.len(),
+        outside.len()
+    );
+
+    assert_eq!(RECORDS, readable, "{readable} of {RECORDS} records came back");
+    assert_eq!(
+        handles_before, handles_after,
+        "{} page handles went in and {} came back; {} are in one and not the other",
+        handles_before.len(),
+        handles_after.len(),
+        handles_before.symmetric_difference(&handles_after).count()
+    );
+    assert!(
+        outside.is_empty(),
+        "{} buckets are occupied above the shard's end on a store built and read on the same \
+         range: {outside:?}. Those pages are outside every per-bucket sweep the shard runs",
+        outside.len()
+    );
+    assert!(
+        after.len() <= (end as usize) + 1,
+        "the store occupies {} buckets, more than the {} the range has",
+        after.len(),
+        (end as usize) + 1
+    );
+}
+
+/// A STORE WITH STATE AND NO ROUTING-RANGE STAMP IS REFUSED, AND THE REMEDY IN THE MESSAGE WORKS.
+///
+/// This arm used to ADOPT the whole keyspace instead of refusing, on the reasoning that the whole
+/// keyspace "was the ONLY default a store could have been built on". True of the DEFAULT, false of
+/// the CONFIGURATION: `TS_SHARD_END_ROUTING_BUCKET` is documented and `docs/runtime_tuning.md` told
+/// operators to set it before the first ingest. So a store built narrow before the stamp existed was
+/// adopted onto the whole keyspace and silently mis-ranged -- 600 of 600 blocks, measured.
+///
+/// AN INFERENCE WAS CONSIDERED AND DECLINED. A store built on `0..1023` has every bucket at or below
+/// 1023 and a whole-keyspace store spreads over 4.29e9, so `max(bucket_map.keys())` separates them
+/// almost always -- and ALMOST is the problem. A whole-keyspace store whose keys all fall below 1024
+/// is indistinguishable from a narrow one, at about 2.4e-7 for a single key. A wrong inference is
+/// silent, and silence is the defect this whole file exists to remove, so the arm refuses instead.
+///
+/// FOUR LEVELS, because "it returned an error" would hold for the wrong error:
+///
+///   1. the load is NOT ok;
+///   2. the code is exactly `routing_range_unstamped` -- NOT `routing_range_mismatch`, because the
+///      remedies differ: a mismatch means the range is known and the configuration is wrong;
+///   3. the message names the file that would record the range, since that is the whole remedy; and
+///   4. the shard is NOT in the served map -- a refusal that still installed it would be a warning.
+///
+/// AND TWO CONTROLS, because a gate that fires everywhere is not a gate: the same store loads and
+/// serves every record with its stamp present, and a genuinely new store is still stamped and
+/// served rather than refused.
+///
+/// rust-internal: drives the engine's own load path, no product behaviour
+#[test]
+fn a_store_that_predates_the_stamp_is_refused_rather_than_adopted_onto_a_guessed_range() {
+    const RECORDS: usize = 200;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // PHASE ONE: an ordinary store on the shipped default, which stamps itself.
+    let keys = {
+        let engine = engine_on(dir.path());
+        load_on(&engine, crate::DEFAULT_END_ROUTING_BUCKET);
+        let keys = seed_routed(&engine, RECORDS);
+        assert_eq!(
+            RECORDS,
+            read_back(&engine, &keys),
+            "the write arm cannot read its own store, so every verdict below is over a store that \
+             never worked"
+        );
+        engine.flush_shard_index(1);
+        engine.unload_shard(1);
+        keys
+    };
+    let index_dir = index_dir_of(dir.path());
+
+    // CONTROL ONE: WITH the stamp, this store loads and serves. Establishing this FIRST means a
+    // refusal below cannot be the store simply being broken.
+    {
+        let engine = engine_on(dir.path());
+        let status = try_load_on(&engine, crate::DEFAULT_END_ROUTING_BUCKET);
+        assert!(
+            status.ok,
+            "the stamped store did not load on the range it was built on: {status:?}"
+        );
+        assert_eq!(
+            RECORDS,
+            read_back(&engine, &keys),
+            "the stamped store served fewer than {RECORDS} records"
+        );
+        engine.unload_shard(1);
+    }
+
+    // Now make it a pre-stamp store: remove the file, which is byte-for-byte what a build older
+    // than the stamp left behind.
+    let stamp_path = routing_range_stamp_path(&index_dir, 1);
+    let saved = std::fs::read(&stamp_path).expect("the stamp exists to be saved");
+    std::fs::remove_file(&stamp_path).expect("the stamp is removable");
+    assert!(
+        read_routing_range_stamp(&index_dir, 1).is_none(),
+        "the stamp still reads back after removal, so the refusal below would be over a stamped \
+         store and would be testing nothing"
+    );
+
+    // THE REFUSAL.
+    let engine = engine_on(dir.path());
+    let status = try_load_on(&engine, crate::DEFAULT_END_ROUTING_BUCKET);
+    println!(
+        "  unstamped store with state on disk, opened on 0..{}: ok={} code={} message={}",
+        crate::DEFAULT_END_ROUTING_BUCKET,
+        status.ok,
+        status.code,
+        status.message
+    );
+    assert!(
+        !status.ok,
+        "an unstamped store with {RECORDS} records on disk loaded successfully. The load has \
+         nothing on hand that establishes the range its blocks are filed under, so it must not \
+         adopt one"
+    );
+    assert_eq!(
+        ROUTING_RANGE_UNSTAMPED, status.code,
+        "refused with code `{}` rather than `{ROUTING_RANGE_UNSTAMPED}`. A mismatch code would \
+         tell an operator to correct a range, and there is no range here to correct to",
+        status.code
+    );
+    assert!(
+        status.message.contains("routing-range.json"),
+        "the refusal does not name the file that records the range: {}. That file IS the remedy, \
+         so a message without it leaves an operator nothing to do",
+        status.message
+    );
+    assert!(
+        !engine
+            .shards
+            .read()
+            .expect("engine lock poisoned")
+            .contains_key(&1),
+        "the load was refused and the shard is in the served map anyway, so the refusal is a \
+         warning wearing an error's clothes"
+    );
+
+    // THE REMEDY THE MESSAGE PROMISES, DRIVEN. The message tells an operator to write the stamp if
+    // the range is known. If that did not actually recover the store the instruction would be a
+    // lie, and this is the only place that can catch it.
+    std::fs::write(&stamp_path, &saved).expect("the stamp is writable by hand");
+    let status = try_load_on(&engine, crate::DEFAULT_END_ROUTING_BUCKET);
+    assert!(
+        status.ok,
+        "after writing the stamp the message asks for, the store still did not load: {status:?}. \
+         The refusal would then be a brick rather than a remedy"
+    );
+    assert_eq!(
+        RECORDS,
+        read_back(&engine, &keys),
+        "the recovered store served fewer than {RECORDS} records, so the remedy restores the load \
+         without restoring the data"
+    );
+
+    // CONTROL TWO: a genuinely new store -- no stamp AND no state -- is still stamped and served.
+    // This is the arm that says the refusal keys on STATE, not merely on the stamp's absence.
+    let fresh = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(fresh.path());
+    let status = try_load_on(&engine, crate::DEFAULT_END_ROUTING_BUCKET);
+    assert!(
+        status.ok,
+        "a brand-new store with no stamp and nothing on disk was refused: {status:?}. The refusal \
+         must key on having STATE whose range is unknown, or no store could ever be created"
+    );
+    let stamped = read_routing_range_stamp(&index_dir_of(fresh.path()), 1)
+        .expect("a new store records the range it was created on");
+    assert_eq!(
+        (0, crate::DEFAULT_END_ROUTING_BUCKET),
+        (stamped.start_routing_bucket, stamped.end_routing_bucket),
+        "a new store recorded {stamped:?} rather than the range it was asked for"
+    );
+}
+
+/// A FRESH STORE IS STAMPED WITH THE RANGE IT IS CREATED ON, WHATEVER THAT RANGE IS.
+///
+/// The fourth case, and the one that makes the other three decidable. Driven at three ranges, one
+/// of which is the new default and one of which is the old, so the stamp cannot be a constant.
+///
+/// rust-internal: drives the engine's own load path, no product behaviour
+#[test]
+fn a_fresh_store_is_stamped_with_the_range_it_is_created_on() {
+    for end_routing_bucket in [
+        crate::DEFAULT_END_ROUTING_BUCKET,
+        255,
+        OLD_DEFAULT_END_ROUTING_BUCKET,
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        assert!(
+            read_routing_range_stamp(&index_dir_of(dir.path()), 1).is_none(),
+            "a fresh temporary directory already carries a stamp, so this arm is not over a new \
+             store"
+        );
+        let engine = engine_on(dir.path());
+        let status = try_load_on(&engine, end_routing_bucket);
+        assert!(status.ok, "a new store could not be created on 0..{end_routing_bucket}: {status:?}");
+        let stamped = read_routing_range_stamp(&index_dir_of(dir.path()), 1)
+            .unwrap_or_else(|| panic!("a new store on 0..{end_routing_bucket} was not stamped"));
+        println!("  new store on 0..{end_routing_bucket} stamped {stamped:?}");
+        assert_eq!(
+            (0, end_routing_bucket),
+            (stamped.start_routing_bucket, stamped.end_routing_bucket),
+            "a new store created on 0..{end_routing_bucket} was stamped {stamped:?}"
+        );
+    }
+}
+
+/// THE CONVENIENCE LOAD IS DELIBERATELY NOT THE PRODUCTION DEFAULT, AND THAT IS HELD HERE.
+///
+/// `Engine::load_shard` keeps the whole keyspace while `startup_load_shard_request` now defaults to
+/// [`crate::DEFAULT_END_ROUTING_BUCKET`]. The divergence is intended -- several hundred fixtures
+/// call the convenience and the range decides which arm of `BlockIndexMap` every one of them
+/// exercises -- but an intended divergence and a forgotten one look identical in the source, so it
+/// is asserted with the reason attached.
+///
+/// #1959 measured "almost every bucket holds exactly one block" off a fixture on the convenience
+/// load and read it as a property of the workload. At the whole keyspace the modulus is 4.29
+/// billion and no workload can do otherwise, which is why this is worth a guard rather than a
+/// comment.
+///
+/// rust-internal: reads the engine's own defaults, no product behaviour
+#[test]
+fn the_convenience_load_is_deliberately_not_the_production_default() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    engine.load_shard(1);
+    let convenience = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        shards.get(&1).expect("shard 1 is loaded").routing_range()
+    };
+    println!(
+        "  Engine::load_shard gives {convenience:?}; the production default end is {}",
+        crate::DEFAULT_END_ROUTING_BUCKET
+    );
+    assert_eq!(
+        (OLD_DEFAULT_START_ROUTING_BUCKET, OLD_DEFAULT_END_ROUTING_BUCKET),
+        convenience,
+        "`Engine::load_shard` now gives {convenience:?}. If it has been moved onto the production \
+         default, every fixture that calls it has changed which `BlockIndexMap` arm it exercises \
+         and each one needs examining rather than retargeting -- and this guard's own doc comment, \
+         and `load_shard`'s, are now wrong"
+    );
+    assert_ne!(
+        OLD_DEFAULT_END_ROUTING_BUCKET,
+        crate::DEFAULT_END_ROUTING_BUCKET,
+        "the production default is still the whole keyspace, so the divergence this guard records \
+         does not exist and the sweep in this module changed nothing"
+    );
+}
+
+/// THE STAMP DECIDES ON THE RANGE AND NOTHING ELSE -- the unit table for the four cases.
+///
+/// The three tests above drive the engine end to end, which is the right level for a behaviour
+/// change but a coarse one for a four-case decision: each of them exercises one case, and a case
+/// that stopped being reachable would simply stop being tested. This drives
+/// `decide_routing_range` directly over all four, including the one the engine tests cannot
+/// easily produce -- a stamp present, disagreeing, over a store with NO on-disk state -- and
+/// asserts the ORDER of the cases: a disagreeing stamp refuses whether or not there are blocks.
+///
+/// rust-internal: drives the engine's own decision function, no product behaviour
+#[test]
+fn the_routing_range_decision_covers_its_four_cases_in_the_right_order() {
+    use crate::engine::routing_range_stamp::{
+        decide_routing_range, store_has_on_disk_state, write_routing_range_stamp,
+        RoutingRangeDecision, RoutingRangeStamp,
+    };
+
+    // CASE 4: nothing on disk at all -- a new store takes the range it is asked for.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let index_dir = dir.path().join("indexes");
+    std::fs::create_dir_all(&index_dir).expect("index dir");
+    assert!(
+        !store_has_on_disk_state(&index_dir, 1),
+        "an empty index directory reports on-disk state, so every case below is misclassified"
+    );
+    assert_eq!(
+        RoutingRangeDecision::Load {
+            start_routing_bucket: 0,
+            end_routing_bucket: 1023,
+            write_stamp: true,
+        },
+        decide_routing_range(&index_dir, 1, 0, 1023),
+        "a new store was not given the range it asked for"
+    );
+
+    // CASE 3: on-disk state, no stamp -- REFUSED. The range is not recoverable, so the load
+    // cannot be right about it and does not guess.
+    std::fs::write(index_dir.join("shard-1.index.json"), b"{}").expect("write a base index");
+    assert!(
+        store_has_on_disk_state(&index_dir, 1),
+        "a base index file on disk is not reported as on-disk state"
+    );
+    match decide_routing_range(&index_dir, 1, 0, 1023) {
+        RoutingRangeDecision::Refuse { code, message } => {
+            assert_eq!(
+                ROUTING_RANGE_UNSTAMPED, code,
+                "an unstamped store was refused with code `{code}`, not \
+                 `{ROUTING_RANGE_UNSTAMPED}`. The mismatch code means the range is KNOWN and the \
+                 configuration is wrong, which is a different remedy"
+            );
+            assert!(
+                message.contains("routing-range.json"),
+                "the refusal does not name the file that would record the range: {message}"
+            );
+        }
+        other => panic!(
+            "an unstamped store with state on disk was not refused: {other:?}. This arm used to \
+             ADOPT the whole keyspace, which silently mis-ranged every store built narrow before \
+             the stamp existed"
+        ),
+    }
+    // AND ASKING FOR THE OLD DEFAULT IS REFUSED TOO, which is the half most likely to be lost in a
+    // rewrite. The old behaviour treated a request for the whole keyspace as agreeing with what it
+    // assumed the store was built on, so that request loaded where every other one was overridden.
+    // There is nothing to agree WITH now: an absent stamp is absent whatever is asked for.
+    match decide_routing_range(
+        &index_dir,
+        1,
+        OLD_DEFAULT_START_ROUTING_BUCKET,
+        OLD_DEFAULT_END_ROUTING_BUCKET,
+    ) {
+        RoutingRangeDecision::Refuse { code, .. } => assert_eq!(
+            ROUTING_RANGE_UNSTAMPED, code,
+            "refused with `{code}` rather than `{ROUTING_RANGE_UNSTAMPED}`"
+        ),
+        other => panic!(
+            "an unstamped store asked for the OLD DEFAULT was not refused: {other:?}. A store \
+             built narrow before the stamp existed would load on the whole keyspace exactly as it \
+             did before this change"
+        ),
+    }
+
+    // CASE 3 AGAIN, THROUGH THE OTHER DOOR: a store with NO base index but durable bucket dump
+    // manifests. A load recovers from those, so such a store is not new -- and this arm exists
+    // because a mutation survived without it. Replacing the manifest check with `false` passed
+    // every other test in this module: the base-index half was asserted and the manifest half was
+    // not, so a store recoverable only from its manifests would have been called new and stamped
+    // with whatever range it was asked for.
+    std::fs::remove_file(index_dir.join("shard-1.index.json")).expect("removable");
+    assert!(
+        !store_has_on_disk_state(&index_dir, 1),
+        "with the base index removed and no manifests yet, the store still reports on-disk state, \
+         so the arm below would pass for the wrong reason"
+    );
+    let manifest_dir = index_dir.join("slot-dumps").join("shard-1");
+    std::fs::create_dir_all(&manifest_dir).expect("manifest dir");
+    std::fs::write(manifest_dir.join("dump-0001.json"), b"{}").expect("write a manifest");
+    assert!(
+        store_has_on_disk_state(&index_dir, 1),
+        "a shard with a durable bucket dump manifest and no base index is not reported as having \
+         on-disk state. A load recovers from those manifests, so such a store is NOT new, and \
+         calling it new stamps it with the range it was asked for instead of the range it was \
+         built on"
+    );
+    match decide_routing_range(&index_dir, 1, 0, 1023) {
+        RoutingRangeDecision::Refuse { code, .. } => assert_eq!(
+            ROUTING_RANGE_UNSTAMPED, code,
+            "a store recoverable only from its dump manifests was refused with `{code}` rather \
+             than `{ROUTING_RANGE_UNSTAMPED}`"
+        ),
+        other => panic!(
+            "a store recoverable only from its dump manifests was not refused: {other:?}. It has \
+             state and no stamp, so its range is no more recoverable than one with a base index"
+        ),
+    }
+    // Put the base index back so the cases below are over the shape they describe.
+    std::fs::write(index_dir.join("shard-1.index.json"), b"{}").expect("write a base index");
+    std::fs::remove_file(manifest_dir.join("dump-0001.json")).expect("removable");
+
+    // CASE 1: a stamp that agrees -- load, write nothing.
+    write_routing_range_stamp(
+        &index_dir,
+        1,
+        RoutingRangeStamp {
+            start_routing_bucket: 0,
+            end_routing_bucket: 1023,
+        },
+    )
+    .expect("stamp is writable");
+    assert_eq!(
+        RoutingRangeDecision::Load {
+            start_routing_bucket: 0,
+            end_routing_bucket: 1023,
+            write_stamp: false,
+        },
+        decide_routing_range(&index_dir, 1, 0, 1023),
+        "an agreeing stamp did not load cleanly"
+    );
+
+    // CASE 2: a stamp that disagrees -- REFUSE. Both directions, because narrowing and widening
+    // are not the same hazard and neither is safe: widening leaves blocks inside the new range but
+    // routes every new write to a different bucket than a re-read would compute from the key.
+    for (requested_start, requested_end) in [(0, 255), (0, OLD_DEFAULT_END_ROUTING_BUCKET), (1, 1023)] {
+        match decide_routing_range(&index_dir, 1, requested_start, requested_end) {
+            RoutingRangeDecision::Refuse { code, message } => {
+                assert_eq!(
+                    "routing_range_mismatch", code,
+                    "a DISAGREEING stamp was refused with `{code}`; the two refusals have \
+                     different remedies and must keep different codes"
+                );
+                assert!(
+                    message.contains("1023") && message.contains(&requested_end.to_string()),
+                    "the refusal for {requested_start}..{requested_end} names neither the stamped \
+                     range nor the requested one: {message}"
+                );
+            }
+            other => panic!(
+                "a stamp of 0..1023 did not refuse a request for \
+                 {requested_start}..{requested_end}: {other:?}"
+            ),
+        }
+    }
+
+    // AND A DISAGREEING STAMP REFUSES EVEN WITH NO BLOCKS ON DISK -- the order of the cases, which
+    // the engine tests above cannot show. If the on-disk-state check ran first, an empty store
+    // would silently adopt whatever it was asked for and lose its claim on the range.
+    std::fs::remove_file(index_dir.join("shard-1.index.json")).expect("removable");
+    assert!(
+        !store_has_on_disk_state(&index_dir, 1),
+        "the base index is still reported after being removed"
+    );
+    assert!(
+        matches!(
+            decide_routing_range(&index_dir, 1, 0, 255),
+            RoutingRangeDecision::Refuse { .. }
+        ),
+        "with no pages on disk a disagreeing stamp stopped refusing, so the stamp check does not \
+         run before the on-disk-state check"
+    );
+}
+
+// =============================================================================================
+// 5. WHAT THE ROUTING BUCKET COST A RECORD, AT BOTH RANGES AND IN BOTH COLUMNS
+// =============================================================================================
+
+/// THE ADDRESSES A RECORD IS RESIDENT IN, COUNTED, AT BOTH RANGES -- AND WHAT EIGHT BYTES OFF EACH
+/// IS WORTH.
+///
+/// `BlockAddress` went 32 bytes to 24: `routing_bucket` stopped being a field (a block's bucket is
+/// `block_routing_bucket(object_key, ..)` over the range the store is stamped with) and `block_id`
+/// narrowed from 32 bits to 16. NEITHER is worth anything alone -- 29 - 4 = 25 and 29 - 2 = 27, both
+/// of which round back to 32 -- and together they shed six and cross to 24.
+/// `block_store::address_size_tests::every_byte_of_a_block_address_is_accounted_for` asserts both
+/// counterfactuals; this measures what the step is worth on a store.
+///
+/// # WHY A COUNT TIMES A WIDTH, AND NOT A BEFORE-AND-AFTER
+///
+/// One binary holds one width. So the per-record saving is reported as the COUNTED number of live
+/// addresses a record is resident in, times the width the struct measurably lost -- and both factors
+/// are measurements. The count comes from walking the shard, the width from `size_of`. The byte
+/// columns below are what anchors it: they are what the allocator actually handed over for the map
+/// those addresses live in, so an arm where the addresses were not resident could not report them.
+///
+/// # ONE INSTRUMENT, BOTH COLUMNS
+///
+/// `alloc_bytes` is what the caller asked for; `chunk_bytes` reads `malloc_usable_size` and charges
+/// what the allocator handed over. A width change moves the request column by construction and the
+/// chunk column only if it crosses a rounding step, so reporting one without the other would let a
+/// saving that the allocator rounds straight back be published as a saving.
+///
+/// # THE CONTROL ON THE MECHANISM
+///
+/// The allocation CALL count per record must NOT move with a width change: narrowing a struct held
+/// inline changes how many bytes a container asks for, never how many times it asks. That is asserted
+/// against the arms of this sweep rather than against a remembered figure -- every arm at one corpus
+/// size must agree on calls per record to within the bucket-count effect the sweep itself is about,
+/// and the two ranges are reported side by side so a reader can see which term moved.
+///
+/// rust-internal: reads the engine's own index, no product behaviour
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "seeds four stores up to 40,000 records each; run by name"]
+fn what_the_narrower_address_is_worth_a_record_at_both_ranges_and_in_both_columns() {
+    /// Every live address a record is resident in, counted rather than assumed to be two.
+    fn resident_addresses(engine: &TemporalEngine) -> (usize, usize, usize) {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1");
+        let in_model_maps = shard.strings().len()
+            + shard.hashes.values().map(|fields| fields.len()).sum::<usize>()
+            + shard.features().values().map(|series| series.len()).sum::<usize>()
+            + shard.context_nodes().len()
+            + shard.control_state_blocks().len();
+        let in_bucket_index = shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .map(|bucket| bucket.block_index.len())
+            .sum::<usize>();
+        (in_model_maps, in_bucket_index, in_model_maps + in_bucket_index)
+    }
+
+    const OLD_WIDTH: usize = 32;
+    let width = std::mem::size_of::<ElementEntry>();
+    assert_eq!(
+        24, width,
+        "this measurement prices the step from {OLD_WIDTH} to 24; the address is {width} bytes"
+    );
+
+    let mut path_lengths: BTreeSet<usize> = BTreeSet::new();
+    let mut rows: Vec<(usize, u32, usize, usize, u64, u64, u64)> = Vec::new();
+
+    for records in [SMALL, LARGE] {
+        for end_routing_bucket in [1023u32, WIDE_END] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            path_lengths.insert(store_path_length(dir.path()));
+            let engine = engine_on(dir.path());
+            load_on(&engine, end_routing_bucket);
+            let keys = seed_routed(&engine, records);
+            assert_eq!(records, read_back(&engine, &keys), "the arm cannot read itself back");
+
+            let (in_model_maps, in_bucket_index, addresses) = resident_addresses(&engine);
+            assert!(
+                in_model_maps > 0 && in_bucket_index > 0,
+                "0..{end_routing_bucket} at {records} records: {in_model_maps} model-map and \
+                 {in_bucket_index} index addresses. BOTH have to be non-zero -- there are two \
+                 addresses per stored record and a census that saw one of them would halve every \
+                 figure below"
+            );
+
+            let (request_bytes, chunk_bytes, allocs) = {
+                let shards = engine.shards.read().expect("engine lock poisoned");
+                let shard = shards.get(&1).expect("shard 1");
+                let probe = Probe::start();
+                let copy = shard.bucket_index.bucket_map.clone();
+                let counts = probe.stop();
+                std::hint::black_box(&copy);
+                drop(copy);
+                (counts.alloc_bytes, counts.chunk_bytes, counts.allocs)
+            };
+            assert!(
+                request_bytes > 0 && chunk_bytes > 0 && allocs > 0,
+                "0..{end_routing_bucket} at {records} records: the instrument charged \
+                 {request_bytes}/{chunk_bytes} B in {allocs} calls; a zero reads as the shape being \
+                 free"
+            );
+            rows.push((
+                records,
+                end_routing_bucket,
+                addresses,
+                in_bucket_index,
+                request_bytes,
+                chunk_bytes,
+                allocs,
+            ));
+        }
+    }
+
+    // THE STORE PATH LENGTH, HELD AND STATED. Allocations move with it at about six bytes a
+    // character, which has masqueraded as a result in this tree before.
+    assert_eq!(
+        1,
+        path_lengths.len(),
+        "the arms ran at {} different store path lengths ({path_lengths:?})",
+        path_lengths.len()
+    );
+    println!(
+        "  store path length held at {} characters across all {} arms",
+        path_lengths.iter().next().copied().unwrap_or_default(),
+        rows.len()
+    );
+
+    println!("=== what the narrower address is worth a record ===");
+    for (records, end_routing_bucket, addresses, in_index, request_bytes, chunk_bytes, allocs) in
+        &rows
+    {
+        let per_record = *addresses as f64 / *records as f64;
+        let saved = per_record * (OLD_WIDTH - width) as f64;
+        let label = if *end_routing_bucket == WIDE_END {
+            "0..u32::MAX".to_string()
+        } else {
+            format!("0..{end_routing_bucket}")
+        };
+        println!(
+            "  {records:>6} rec {label:<12} addresses {addresses:>7} ({per_record:>4.2}/rec, \
+             {in_index} in the index) | was {:>7.2} B/rec of address, now {:>7.2} | SAVED \
+             {saved:>5.2} B/rec | bucket map REQUEST {:>8.1} B/rec CHUNK {:>8.1} B/rec allocs \
+             {:>7.4}/rec",
+            per_record * OLD_WIDTH as f64,
+            per_record * width as f64,
+            *request_bytes as f64 / *records as f64,
+            *chunk_bytes as f64 / *records as f64,
+            *allocs as f64 / *records as f64,
+        );
+    }
+
+    // TWO ADDRESSES A RECORD, asserted rather than restated: the figure above is a count times a
+    // width, and the count is the half that can silently become one.
+    for (records, end_routing_bucket, addresses, _, _, _, _) in &rows {
+        let per_record = *addresses as f64 / *records as f64;
+        assert!(
+            per_record >= 2.0,
+            "0..{end_routing_bucket} at {records} records: {per_record:.2} addresses a record. \
+             There are two per stored record -- one in the model map a read resolves through, one \
+             in the page-index entry -- so anything under two means a map was not walked"
+        );
+    }
+
+    // THE BYTE COLUMNS HAVE TO BE BIG ENOUGH TO HOLD THE ADDRESSES THEY ARE BEING CREDITED FOR.
+    // Without this the saving is arithmetic over a count that need not be resident anywhere.
+    for (records, end_routing_bucket, _, in_index, request_bytes, chunk_bytes, _) in &rows {
+        let address_bytes = (*in_index * width) as u64;
+        assert!(
+            *chunk_bytes >= address_bytes && *request_bytes >= address_bytes,
+            "0..{end_routing_bucket} at {records} records: the bucket map charged \
+             {request_bytes}/{chunk_bytes} B but holds {in_index} addresses at {width} B each \
+             ({address_bytes} B). The saving is credited to bytes that are not in the measured \
+             total."
+        );
+    }
+
+    // THE CONTROL ON THE MECHANISM: a width change moves BYTES, not CALLS. The allocation count per
+    // record is a function of the container arms -- how many buckets take a `Vec` -- and not of how
+    // wide the inline entry is, so the two byte columns and the call column must not move together.
+    for records in [SMALL, LARGE] {
+        let narrow = rows
+            .iter()
+            .find(|row| row.0 == records && row.1 == 1023)
+            .expect("narrow arm");
+        let wide = rows
+            .iter()
+            .find(|row| row.0 == records && row.1 == WIDE_END)
+            .expect("wide arm");
+        println!(
+            "  {records:>6} rec: allocs/rec narrow {:.4} wide {:.4}; the address width is the same \
+             {width} B in both arms, so any difference here is the container arms and not the \
+             struct",
+            narrow.6 as f64 / records as f64,
+            wide.6 as f64 / records as f64,
+        );
+        assert_eq!(
+            narrow.2, wide.2,
+            "{records} records: the two ranges hold {} and {} resident addresses. The RANGE cannot \
+             change how many addresses a store holds -- it decides only which bucket each page is \
+             filed in -- so a difference means the two arms did not store the same thing and the \
+             per-record figures above are not comparable",
+            narrow.2, wide.2
+        );
+    }
+}
+
+/// THE CONTROL ON THE EXPLANATION: A COMMAND THAT NAMES NO BLOCK DERIVES NO BUCKET.
+///
+/// The mechanism this change introduces on the serving path is one FNV-1a pass per block read, to
+/// derive the bucket the read used to find stamped on the address. The claim is that it is paid PER
+/// BLOCK NAMED -- so a command that names no block must pay exactly none, and that zero is the control.
+/// `Command::LeaderEstablish` on a store holding NO blocks is such a workload: it carries no key,
+/// there is no block for `execute`'s housekeeping to reach either, and the counter over a run of them
+/// has to read 0 -- 0.00% of what the read arm pays. It can fail, and it did: run against the SEEDED
+/// engine the same arm measured 1.00 an op over 11 key bytes, which is this module's own key length,
+/// because `execute` does per-op work over keys the store already holds. The arm now has its own
+/// empty engine, and that number is the reason it does.
+///
+/// AND THE OTHER TWO ARMS STATE WHERE THE COST ACTUALLY LANDS, which is the half a flattering control
+/// would leave out. THIS DOCSTRING USED TO CLAIM THE WRITE ARM WAS THE ZERO, while three lines of the
+/// body below asserted the write arm is NON-zero. The body was right: `append_value` has taken the
+/// routing bucket as an ARGUMENT since it existed, so the write path always derived its own and this
+/// change did not touch it. A guard whose prose contradicts its own assertion is the defect class
+/// this campaign keeps finding -- `a_guard_can_encode_the_same_mistaken_belief_it_guards` -- and the
+/// fix is a zero that can fail, not a sentence saying there is one.
+///
+/// rust-internal: reads the engine's own counters, no product behaviour
+#[test]
+#[ignore = "reads process-wide counters; run by name"]
+fn a_command_that_names_no_block_derives_no_bucket_and_a_read_derives_two() {
+    const RECORDS: usize = 500;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, 1023);
+    let keys = seed_routed(&engine, RECORDS);
+
+    // THE ZERO ARM FIRST, because it is the control and a control read after the thing it controls
+    // is easy to fit to.
+    //
+    // ITS OWN ENGINE, WITH NOTHING SEEDED. A keyless command on the SEEDED engine measured 1.00
+    // derivations an op over 11 key bytes -- and 11 characters is the length of this module's seeded
+    // keys, so what it was measuring was `execute`'s per-op housekeeping reaching a key the store
+    // already held, not the command. An empty store has no such key, which is what makes the zero
+    // below a statement about the mechanism.
+    let control_dir = tempfile::tempdir().expect("control tempdir");
+    let control = engine_on(control_dir.path());
+    load_on(&control, 1023);
+    crate::engine::hashing::reset_routing_bucket_derivations();
+    for index in 0..RECORDS {
+        let response = control.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::LeaderEstablish,
+        });
+        assert!(response.status.ok, "keyless command {index}: {:?}", response.status);
+    }
+    let (keyless_derivations, keyless_key_bytes) =
+        crate::engine::hashing::routing_bucket_derivations();
+
+    // THE WRITE-ONLY ARM. Counters reset AFTER the seed, so what is counted is what the arm below
+    // does and not what setting it up did.
+    crate::engine::hashing::reset_routing_bucket_derivations();
+    for index in 0..RECORDS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: keys[index].clone(),
+                value: vec![b'w'; 64],
+            },
+        });
+        assert!(response.status.ok, "write {index}: {:?}", response.status);
+    }
+    let (write_derivations, _) = crate::engine::hashing::routing_bucket_derivations();
+
+    // THE READ ARM, on the same store, so the two differ in nothing but the command.
+    crate::engine::hashing::reset_routing_bucket_derivations();
+    assert_eq!(RECORDS, read_back(&engine, &keys), "the reads must answer");
+    let (read_derivations, read_key_bytes) = crate::engine::hashing::routing_bucket_derivations();
+
+    println!("--- where the bucket derivation is paid ---");
+    println!(
+        "  {RECORDS} keyless commands: {keyless_derivations} derivations ({:.2}/op), \
+         {keyless_key_bytes} key bytes hashed   <- THE CONTROL",
+        keyless_derivations as f64 / RECORDS as f64
+    );
+    println!(
+        "  {RECORDS} writes: {write_derivations} derivations ({:.2}/op)",
+        write_derivations as f64 / RECORDS as f64
+    );
+    println!(
+        "  {RECORDS} reads:  {read_derivations} derivations ({:.2}/op), {read_key_bytes} key bytes \
+         hashed ({:.2}/op)",
+        read_derivations as f64 / RECORDS as f64,
+        read_key_bytes as f64 / RECORDS as f64,
+    );
+
+    // THE READ ARM IS THE DENOMINATOR: a zero here would make the ratio below 0/0.
+    assert!(
+        read_derivations >= RECORDS as u64,
+        "{read_derivations} derivations over {RECORDS} reads. A read derives its page's bucket to \
+         build the cache key, so this cannot be under one a read -- and if it is, the control below \
+         is measuring nothing"
+    );
+
+    // AND THE WRITE PATH STILL DERIVES ITS OWN, which is the half that stops this being a claim that
+    // the write path is free. It always did: `block_routing_bucket(key, start, end)` is what the
+    // command arm hands `append_value`. What this control says is that the READ path's derivations
+    // are the ones this change added, and the report states both rather than only the flattering one.
+    println!(
+        "  the write path's own derivations are {:.2}/op and predate this change -- `append_value` \
+         has taken the bucket as an argument since it existed",
+        write_derivations as f64 / RECORDS as f64
+    );
+    assert!(
+        write_derivations > 0,
+        "the write path derived no bucket at all, which would mean `append_value` is being handed \
+         one from somewhere this test does not know about"
+    );
+
+    // THE CONTROL, ASSERTED. Exactly zero, and stated as a percentage of the read arm so the number
+    // that matters is the one printed rather than one a reader has to compute.
+    println!(
+        "  the keyless arm is {:.2}% of the read arm ({keyless_derivations} against \
+         {read_derivations}) -- the mechanism predicts nothing for a command that names no page",
+        100.0 * keyless_derivations as f64 / read_derivations as f64
+    );
+    assert_eq!(
+        0, keyless_derivations,
+        "{keyless_derivations} bucket derivations over {RECORDS} commands that name no page, on a \
+         store holding none. The mechanism this change introduces is one derivation per page named, \
+         so this arm has to pay none -- a non-zero count means something derives a bucket on a path \
+         with no page to derive one for, and the first version of this arm caught exactly that in \
+         the fixture rather than in the engine"
+    );
+    assert_eq!(
+        0, keyless_key_bytes,
+        "the keyless arm hashed {keyless_key_bytes} key bytes, which cannot happen if it derived no \
+         bucket; the two counters disagree and one of them is not counting what it says"
+    );
+}
+
+/// A CANDIDATE RANGE CAN BE CHECKED AFTER STAMPING IT, WHICH IS WHAT MAKES THE UNKNOWN CASE
+/// RECOVERABLE.
+///
+/// The refusal above leaves an operator two situations. If the range the store was built on is
+/// KNOWN, they stamp it and load -- driven in that test. If it is NOT known, the honest answer is
+/// that the store cannot be recovered safely by guessing, and re-ingesting is the reliable option.
+/// But a guess is not unfalsifiable: a stamped range can be CHECKED, and this is the check.
+///
+/// `validate_bucket_ownership_index` recomputes every live block's bucket from the loaded range and
+/// counts the blocks whose address claims a different one. An operator reaches that count as
+/// `owner_mismatch_block_refs` on the recovery boundary report and as
+/// `owner_mismatch_block_ref_count` on the production readiness report. So the loop is: stamp a
+/// candidate, load on it, read the count. **Zero means the candidate is consistent with every block
+/// in the store; nonzero names the blocks that disagree.**
+///
+/// THIS IS THE SAME ARITHMETIC THAT WAS REJECTED AS AN INFERENCE, AND THE DISTINCTION IS THE POINT.
+/// Asking "which range was this built on?" unprompted is not answerable -- a whole-keyspace store
+/// whose keys all fall below 1024 looks exactly like a narrow one. Asking "is THIS range consistent
+/// with every block?" is answerable, because it has a candidate to test and every block votes. A
+/// wrong candidate is caught by the blocks that do not fit; it is only the absence of a candidate
+/// that cannot be resolved.
+///
+/// DRIVEN IN BOTH DIRECTIONS, because a check that answered zero for everything would read as a
+/// confirmation of whatever was tried first.
+///
+/// rust-internal: drives the engine's own ownership validation, no product behaviour
+#[test]
+fn a_stamped_candidate_range_is_checkable_even_when_the_built_range_was_not_known() {
+    const RECORDS: usize = 200;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    // A store genuinely built on the narrow range -- the population the old adoption mis-ranged.
+    let keys = {
+        let engine = engine_on(dir.path());
+        load_on(&engine, crate::DEFAULT_END_ROUTING_BUCKET);
+        let keys = seed_routed(&engine, RECORDS);
+        assert_eq!(RECORDS, read_back(&engine, &keys), "the write arm cannot read itself back");
+        engine.flush_shard_index(1);
+        engine.unload_shard(1);
+        keys
+    };
+    let index_dir = index_dir_of(dir.path());
+    let stamp_path = routing_range_stamp_path(&index_dir, 1);
+    std::fs::remove_file(&stamp_path).expect("the stamp is removable");
+
+    /// Stamp a candidate range, load on it, and report what the check says.
+    fn try_candidate(
+        dir: &std::path::Path,
+        index_dir: &std::path::Path,
+        end_routing_bucket: u32,
+        keys: &[String],
+    ) -> (usize, usize) {
+        std::fs::write(
+            routing_range_stamp_path(index_dir, 1),
+            format!(
+                "{{\"start_routing_bucket\":0,\"end_routing_bucket\":{end_routing_bucket}}}"
+            ),
+        )
+        .expect("the stamp is writable by hand");
+        let engine = engine_on(dir);
+        let status = try_load_on(&engine, end_routing_bucket);
+        assert!(
+            status.ok,
+            "a store stamped with 0..{end_routing_bucket} and loaded on the same range was \
+             refused: {status:?}. The candidate loop needs the load to SUCCEED so the check below \
+             is what rejects a wrong range, not the stamp comparison"
+        );
+        let boundary = engine.storage_recovery_boundary_report(1);
+        let mismatches = boundary.owner_mismatch_block_refs.len();
+        let readable = read_back(&engine, keys);
+        engine.unload_shard(1);
+        (mismatches, readable)
+    }
+
+    // THE WRONG CANDIDATE: the whole keyspace, which is exactly what the old arm adopted.
+    let (wrong_mismatches, wrong_readable) =
+        try_candidate(dir.path(), &index_dir, u32::MAX, &keys);
+    println!(
+        "  candidate 0..{}: {wrong_mismatches} blocks claim a bucket this range does not compute, \
+         {wrong_readable}/{RECORDS} records still readable",
+        u32::MAX
+    );
+
+    // THE RIGHT CANDIDATE: the range it was actually built on.
+    let (right_mismatches, right_readable) =
+        try_candidate(dir.path(), &index_dir, crate::DEFAULT_END_ROUTING_BUCKET, &keys);
+    println!(
+        "  candidate 0..{}: {right_mismatches} blocks disagree, {right_readable}/{RECORDS} records \
+         readable",
+        crate::DEFAULT_END_ROUTING_BUCKET
+    );
+
+    // THE CHECK DISCRIMINATES, which is the whole claim.
+    assert_eq!(
+        0, right_mismatches,
+        "the range the store was BUILT on reports {right_mismatches} owner mismatches. If the \
+         correct candidate does not come back clean the check cannot confirm anything"
+    );
+    assert!(
+        wrong_mismatches > 0,
+        "the WRONG candidate reported {wrong_mismatches} owner mismatches. A check that answers \
+         zero for a range the store was not built on would confirm whatever an operator tried \
+         first, which is worse than having no check at all"
+    );
+    // AND THE READS DO NOT DISTINGUISH THEM -- which is why the count is the instrument and
+    // "the records come back" is not.
+    assert_eq!(
+        (RECORDS, RECORDS),
+        (wrong_readable, right_readable),
+        "the two candidates served {wrong_readable} and {right_readable} of {RECORDS} records. \
+         Both are expected to serve everything: a mis-ranged store reads perfectly, and if reading \
+         could tell them apart the silent state this whole file addresses would never have existed"
+    );
+    println!(
+        "  the check discriminates ({wrong_mismatches} against {right_mismatches}) while reading \
+         does not ({wrong_readable} against {right_readable} of {RECORDS}); `max(bucket ids)` is \
+         rejected as an INFERENCE and sound as a VERIFICATION because a candidate gives every \
+         block a vote"
+    );
+}
