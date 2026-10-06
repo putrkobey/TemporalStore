@@ -295,3 +295,300 @@ fn what_the_payload_cache_holds_per_user_byte() {
     println!("  THE PAYLOAD CACHE'S ACCOUNTING AGAINST THE USER BYTES THAT PRODUCED IT");
     println!();
     println!(
+        "    {:>6} {:>6} {:>7} {:>10} {:>10} {:>9} {:>9} {:>9}",
+        "keys", "value", "values", "user B", "cache B", "cache/user", "B/entry", "over/entry"
+    );
+    for reading in &readings {
+        let per_entry = reading.cache_bytes as f64 / reading.keys as f64;
+        println!(
+            "    {:>6} {:>6} {:>7} {:>10} {:>10} {:>9.3} {:>9.1} {:>9.1}",
+            reading.keys,
+            reading.value,
+            if reading.compressible { "run" } else { "noise" },
+            reading.user_bytes,
+            reading.cache_bytes,
+            reading.cache_bytes as f64 / reading.user_bytes as f64,
+            per_entry,
+            per_entry - reading.value as f64,
+        );
+    }
+
+    println!();
+    println!("  AND THE DENOMINATOR THE PUBLISHED FIGURE USES, beside the one in the same unit");
+    println!();
+    println!(
+        "    {:>6} {:>6} {:>7} {:>11} {:>11} {:>11} {:>11} {:>11}",
+        "keys", "value", "values", "live stored", "logical wr", "stored wr", "mem/stored",
+        "mem/user"
+    );
+    for reading in &readings {
+        println!(
+            "    {:>6} {:>6} {:>7} {:>11} {:>11} {:>11} {:>11.3} {:>11.3}",
+            reading.keys,
+            reading.value,
+            if reading.compressible { "run" } else { "noise" },
+            reading.live_stored,
+            reading.logical_written,
+            reading.stored_written,
+            if reading.live_stored == 0 {
+                0.0
+            } else {
+                reading.cache_bytes as f64 / reading.live_stored as f64
+            },
+            reading.cache_bytes as f64 / reading.user_bytes as f64,
+        );
+    }
+    println!();
+    println!("  WHY: THE CACHE'S OWN HIT AND FILL COUNTERS, per reading");
+    println!();
+    println!(
+        "    {:>6} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8}",
+        "keys", "value", "puts", "fills", "hits", "misses", "evicts", "fills/key"
+    );
+    for reading in &readings {
+        println!(
+            "    {:>6} {:>6} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8.2}",
+            reading.keys,
+            reading.value,
+            reading.puts,
+            reading.memory_fills,
+            reading.memory_hits,
+            reading.misses,
+            reading.memory_evictions,
+            reading.memory_fills as f64 / reading.keys as f64,
+        );
+    }
+    println!();
+    println!(
+        "    ONE fill per key, no evictions: the payload is resident ONCE, as the block frame"
+    );
+    println!(
+        "    under CacheKey::page_with_slot(address). It used to be resident twice -- the command"
+    );
+    println!(
+        "    response under CacheKey::string(shard, key) held it as well, at 2.00 fills per key."
+    );
+    println!();
+    println!(
+        "    THE LOGICAL COPY WAS THE ONE THAT WENT, on three counts: it was memory-only"
+    );
+    println!(
+        "    (put_memory_only), it had one reader where the frame key has 25 call paths, and the"
+    );
+    println!(
+        "    frame is the key of the PERSISTENT block cache that part2 asserts refills a tiny"
+    );
+    println!(
+        "    memory cache without a block-store read. It was also the larger, by the envelope."
+    );
+    println!("    So: 2.5*value+21, then 2.0*value+c, now exactly value. See the module doc.");
+    println!();
+
+    // NON-VACUITY BEFORE ANY READING IS QUOTED. A cache that filled with nothing would satisfy a
+    // ratio assertion at 0 and report an overhead of minus the value size.
+    for reading in &readings {
+        assert!(
+            reading.cache_bytes > 0,
+            "{} keys x {} B left the cache empty, so every figure on this row is vacuous -- the \
+             read-back loop is not filling it",
+            reading.keys,
+            reading.value
+        );
+        assert!(
+            reading.user_bytes > 0,
+            "the denominator is zero, so the ratio on this row cannot be read"
+        );
+    }
+
+    // THE LAWS, STATED AS THE ARM'S OWN FINDING. Both are printed above; this pins which one the
+    // numbers actually support, so a change to the cache's accounting makes it speak rather than
+    // silently moving a figure somebody is quoting.
+    let by_value: Vec<&Reading> =
+        readings.iter().filter(|r| r.keys == 2_000 && r.compressible).collect();
+    let smallest = by_value.first().expect("the value sweep ran");
+    let largest = by_value.last().expect("the value sweep ran");
+    let small_ratio = smallest.cache_bytes as f64 / smallest.user_bytes as f64;
+    let large_ratio = largest.cache_bytes as f64 / largest.user_bytes as f64;
+    let small_over = smallest.cache_bytes as f64 / smallest.keys as f64 - smallest.value as f64;
+    let large_over = largest.cache_bytes as f64 / largest.keys as f64 - largest.value as f64;
+    println!(
+        "    value {} -> {}:  ratio {small_ratio:.3} -> {large_ratio:.3},  over/entry \
+         {small_over:.1} -> {large_over:.1}",
+        smallest.value, largest.value
+    );
+    println!(
+        "    a CONSTANT per entry holds the right column flat; a FACTOR holds the left one flat"
+    );
+    println!();
+
+    // THIS GUARD USED TO ASSERT THERE WAS OVERHEAD TO ATTRIBUTE, so that a vacuous reading could
+    // not pass as a finding. The overhead is now ZERO by design -- the second copy of the payload
+    // is gone -- so the guard is inverted into the stronger claim: the cache holds EXACTLY the user
+    // bytes, at both ends of the value sweep. Any new layer, envelope or re-encoding breaks this in
+    // bytes rather than quietly widening a tolerance.
+    assert!(
+        (small_ratio - 1.0).abs() < 1e-9 && (large_ratio - 1.0).abs() < 1e-9,
+        "the cache holds {small_ratio:.6}x the user bytes at value {} and {large_ratio:.6}x at \
+         value {}. It must hold exactly 1.000x at both: one copy of the payload, charged by length, \
+         with no envelope. A figure above 1.0 means a second copy or an envelope is back; below \
+         1.0 means entries are missing",
+        smallest.value,
+        largest.value
+    );
+    assert!(
+        small_over.abs() < 1e-9 && large_over.abs() < 1e-9,
+        "the per-entry overhead is {small_over:.3} B at value {} and {large_over:.3} B at value \
+         {}, not zero. The response envelope went with the logical copy, so any non-zero constant \
+         here is a new one",
+        smallest.value,
+        largest.value
+    );
+
+    // WHICHEVER WORLD WE ARE IN, THE ARM SAYS SO. The read-back loop touches every key exactly
+    // once, so hits and misses on the read side sum to the key count; which side they land on is
+    // the finding. Asserted as a disjunction with both messages spelled out, so a future change
+    // that fixes the keying makes this speak rather than quietly passing with half the cache gone.
+    let published = readings
+        .iter()
+        .find(|r| r.keys == 2_000 && r.value == 256 && r.compressible)
+        .expect("the published corpus is in the sweep");
+    let served_from_cache = published.memory_hits >= published.keys as u64;
+    println!(
+        "    published corpus (2,000 x 256): {} hits, {} misses, {} fills over {} keys -- reads \
+         were served {}",
+        published.memory_hits,
+        published.misses,
+        published.memory_fills,
+        published.keys,
+        if served_from_cache { "FROM THE CACHE" } else { "FROM STORAGE" }
+    );
+    assert!(
+        published.memory_fills > 0,
+        "the cache recorded no memory fill at all, so nothing populated it and every byte figure \
+         above is measuring an empty cache"
+    );
+
+    // THE FIXTURE CAVEAT, ASSERTED. A run of one byte compresses to nothing, so the compressible
+    // rows' stored-byte denominator is framing rather than content -- which is why the same 2.0x
+    // cache overhead reported 1.961x and 234.657x in the mem/stored column. The noise rows exist
+    // so that cannot be read as a property of the store, and this pins that they really do differ:
+    // if the two fixtures ever store the same number of bytes, the noise rows have stopped being
+    // incompressible and the caveat they document is no longer being demonstrated.
+    let run_row = readings
+        .iter()
+        .find(|r| r.keys == 2_000 && r.value == 1_024 && r.compressible)
+        .expect("the compressible 1 KiB row ran");
+    let noise_row = readings
+        .iter()
+        .find(|r| r.keys == 2_000 && r.value == 1_024 && !r.compressible)
+        .expect("the incompressible 1 KiB row ran");
+    println!(
+        "    1 KiB x 2,000:  run stores {} B, noise stores {} B  ({:.1}x more)",
+        run_row.live_stored,
+        noise_row.live_stored,
+        noise_row.live_stored as f64 / run_row.live_stored.max(1) as f64
+    );
+    assert!(
+        noise_row.live_stored > run_row.live_stored,
+        "incompressible values stored {} B and a run of one byte stored {} B, so the fixture is \
+         not demonstrating the compression caveat it exists to demonstrate",
+        noise_row.live_stored,
+        run_row.live_stored
+    );
+    // THE CACHE'S LAW IS **NOT** INDIFFERENT TO THE CONTENTS, and asserting that it was is what
+    // found this. `memory_bytes` does sum value lengths -- but one of the two entries holds the
+    // msgpack ENCODING of the value, and `rmp_serde` writes a `Vec<u8>` as an array of integers
+    // rather than a byte string. A byte below 0x80 is a positive fixint and costs one byte; a byte
+    // at or above 0x80 takes a uint8 marker and costs two. Uniform random data sits half above the
+    // line and averages 1.5 bytes per byte; 'v' is 0x76 and costs 1.0.
+    //
+    // Read in the source, not inferred from the fit: `encode_cached_response` builds an
+    // `rmp_serde::Serializer`, `CommandResponse::value` is a plain `Vec<u8>`, and `serde_bytes`
+    // appears nowhere in this crate. A `#[serde(with = "serde_bytes")]` on that field would make
+    // it a msgpack `bin` blob and charge 1.0 for any payload -- which is a wire-format decision
+    // about a cached encoding, not a change this measuring arm should make.
+    // THIS USED TO REQUIRE NOISE TO COST MORE, and it was right when written: the response
+    // payload was a msgpack ARRAY OF INTEGERS, one byte below 0x80 and two at or above, so a
+    // uniform payload cost ~1.5x a run of 'v'. #2279 made that field a byte string, which charges
+    // by LENGTH ALONE -- so the two fixtures now cost the SAME, and that equality is the fix
+    // landing rather than a regression.
+    //
+    // The old assertion fired the moment this arm was next run. It survived on main because this
+    // arm is `#[ignore]`d and #2279's verification used the filter `the_cached_payload`, which does
+    // not match this module; the three check arms COMPILE ignored tests without running them. A fix
+    // that changes a measured law owes a run of every arm that measured it -- a filter is not that.
+    assert_eq!(
+        noise_row.cache_bytes, run_row.cache_bytes,
+        "noise charged {} B and a run charged {} B at the same value size. Since #2279 the payload          is a msgpack byte string, which charges by length alone, so the byte distribution must not          matter -- if these differ again the field has reverted to an element-wise encoding",
+        noise_row.cache_bytes,
+        run_row.cache_bytes
+    );
+
+    // THE TWO LAWS, one per fixture, each stated as arithmetic the reader can check.
+    //
+    //     frame entry    = value                 (the block's own bytes, uncompressed)
+    //     response entry = encoded(value) + 21   (msgpack, plus the response envelope)
+    //
+    // The run figures are exact integers, so they are asserted as equalities. The noise figures are
+    // an expectation over a byte distribution, so they get a tolerance -- asserting a sampled mean
+    // exactly would make this fail on a different seed, which is a fixture detail masquerading as
+    // a property.
+    // `c` IS NOT ONE CONSTANT: msgpack's length prefix widens at 256 bytes. A payload below 256
+    // fits `bin8`, a 2-byte header; from 256 up it takes `bin16`, 3 bytes. So the envelope is 20
+    // below the step and 21 above it -- measured 148.0 B/entry at value 64 against 533.0 at 256.
+    //
+    // The flat +21 that stood here was fitted on four value sizes, three of which shared a prefix
+    // width. That is the same error as reading a per-key law off two counts inside one phase of a
+    // sawtooth: the sizes agreed because they were all on one side of a step.
+    // ONE COPY, CHARGED BY LENGTH, NO ENVELOPE -- asserted for EVERY reading rather than only the
+    // compressible ones. The envelope went with the logical copy, and the frame charges the block's
+    // own bytes, so the law no longer has a term that depends on the byte distribution and the
+    // tolerance the noise rows used to need is gone. Asserting both fixtures exactly is what
+    // distinguishes "one copy charged by length" from "one copy charged by content".
+    for reading in &readings {
+        let expected = (reading.keys as u64).saturating_mul(reading.value as u64);
+        assert_eq!(
+            reading.cache_bytes, expected,
+            "{} keys x {} B ({}): the cache holds {} B where one copy charged by length is {} B. \
+             This is exact -- a mismatch means a second copy is back, an envelope appeared, or an \
+             entry was added or dropped",
+            reading.keys,
+            reading.value,
+            if reading.compressible { "run" } else { "noise" },
+            reading.cache_bytes,
+            expected
+        );
+    }
+    // THE NOISE ROWS NEEDED A TOLERANCE AND NO LONGER DO, which is itself the finding worth
+    // printing. The slack existed because the response copy's size depended on the BYTE
+    // DISTRIBUTION -- 1.5 bytes per byte for uniform data under the old array-of-integers
+    // encoding, 1.0 for a run. With that copy gone the only term left is the block's own length,
+    // so the exact equality above covers these rows too and a sampled mean is no longer being
+    // asserted as a property.
+    for reading in readings.iter().filter(|r| !r.compressible) {
+        let per_entry = reading.cache_bytes as f64 / reading.keys as f64;
+        println!(
+            "    noise {} B: {per_entry:.1} B/entry, exactly value -- no tolerance needed",
+            reading.value
+        );
+    }
+
+    // THE ENTRY COUNT IS THE SAME IN BOTH WORLDS, which is what makes the byte difference an
+    // ENCODING difference rather than an extra copy. Asserted across every reading, because it is
+    // the one figure that distinguishes "a third layer appeared" from "the same two layers charged
+    // more", and those have nothing in common as problems.
+    for reading in &readings {
+        assert_eq!(
+            reading.memory_fills,
+            reading.keys as u64,
+            "{} keys x {} B ({}) filled the cache {} times, not ONCE per key. This was exactly \
+             twice per read while the payload was cached under both the logical and the physical \
+             key; the logical copy is gone, so one fill per key is the law. Two again means a \
+             second copy is back, and anything else means a layer stopped filling",
+            reading.keys,
+            reading.value,
+            if reading.compressible { "run" } else { "noise" },
+            reading.memory_fills
+        );
+    }
+}
