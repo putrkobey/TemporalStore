@@ -34,3 +34,77 @@ SKIP_DIRS = {
     "output-ubuntu22",
     "target",
     ".local",
+}
+SKIP_SUFFIXES = {
+    ".a",
+    ".bin",
+    ".gz",
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".so",
+    ".zip",
+}
+
+
+def should_skip(path: Path) -> bool:
+    relative = path.relative_to(ROOT)
+    if relative.as_posix() in SKIP_FILES:
+        return True
+    parts = set(relative.parts)
+    if parts & SKIP_DIRS:
+        return True
+    return path.suffix.lower() in SKIP_SUFFIXES
+
+
+def stale_skips() -> list[str]:
+    """Skipped files that no longer earn their exemption.
+
+    An exemption is defensible only while the thing it excuses is still true. If
+    `validate_open_source_readiness.py` is rewritten to stop enumerating the retired name, this
+    skip stops being a dictionary exception and becomes a file nobody checks. So the skip checks
+    itself and the run fails until someone deletes it.
+    """
+    stale: list[str] = []
+    for relative in sorted(SKIP_FILES):
+        candidate = ROOT / relative
+        if not candidate.is_file():
+            stale.append(f"{relative}: skipped, but the file is gone")
+            continue
+        try:
+            text = candidate.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        if not PATTERN.search(text):
+            stale.append(f"{relative}: skipped, but it no longer spells the retired name")
+    return stale
+
+
+def main() -> int:
+    matches: list[str] = []
+    for path in ROOT.rglob("*"):
+        if not path.is_file() or should_skip(path):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            continue
+        for lineno, line in enumerate(text.splitlines(), start=1):
+            if PATTERN.search(line):
+                matches.append(f"{path.relative_to(ROOT)}:{lineno}: {line.strip()}")
+    if matches:
+        raise SystemExit(
+            "retired legacy object-store naming found:\n" + "\n".join(matches[:200])
+        )
+    stale = stale_skips()
+    if stale:
+        raise SystemExit(
+            "the skip list has entries that no longer apply -- remove them:\n"
+            + "\n".join(stale)
+        )
+    print("legacy_object_store_names: ok")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
