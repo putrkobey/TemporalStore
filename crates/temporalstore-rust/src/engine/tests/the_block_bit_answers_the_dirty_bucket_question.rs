@@ -70,3 +70,147 @@ fn by_block_bit(engine: &crate::TemporalEngine) -> BTreeSet<u32> {
         .bucket_map
         .iter()
         .filter_map(|(id, bucket)| {
+            let dirty = bucket.dirty() || bucket.block_index.values().any(|block| block.dirty);
+            dirty.then_some(*id)
+        })
+        .collect()
+}
+
+#[test]
+fn the_block_bit_answers_the_dirty_bucket_question() {
+    // ---- A NARROW ROUTING RANGE, so keys SHARE buckets. On the default range a key lands alone
+    // ---- by construction, every object's blocks sit in its own routing bucket, and the two
+    // ---- methods would agree without the case that distinguishes them ever arising.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = crate::TemporalEngine::with_local_dirs(
+        4 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    let loaded = engine.load_shard_with(crate::control::LoadShardRequest {
+        shard_id: 1,
+        table_name: "dirty-bucket-equivalence".to_string(),
+        shard_uri: "local://dirty-bucket-equivalence/1".to_string(),
+        start_routing_bucket: 0,
+        end_routing_bucket: 15,
+        readonly: false,
+        load_version: 1,
+        local_node_id: Some(1),
+    });
+    assert!(
+        loaded.status.ok,
+        "the fixture could not load shard 1 on 0..15: {:?}",
+        loaded.status
+    );
+
+    for index in 0..KEYS {
+        let key = format!("dirty-probe-{index:04}");
+        for command in [
+            Command::StringSet { key: key.clone(), value: vec![b'v'; 96] },
+            Command::HashSet {
+                key: key.clone(),
+                field: "f".to_string(),
+                value: vec![b'h'; 96],
+            },
+            Command::SetAdd { key: key.clone(), member: vec![b's'; 96] },
+        ] {
+            let out = engine.execute(ExecuteRequest { shard_id: 1, command });
+            assert!(out.status.ok, "fixture write {index}: {:?}", out.status);
+        }
+    }
+
+    // ---- CLEAR DIRTINESS FIRST, then dirty a FEW. Comparing the two methods while every
+    // ---- bucket is dirty would agree trivially: both return the whole map, and a method that
+    // ---- always answered "all buckets" would pass. The case this arm exists for is a bucket
+    // ---- that is dirty ONLY because a page of some other bucket's object lives in it, and that
+    // ---- case is invisible until most buckets are clean.
+    let _dumped = engine.apply_storage_lifecycle(crate::StorageLifecycleRequest {
+        shard_id: 1,
+        ..Default::default()
+    });
+
+    let (after_dump_objects, after_dump_dirty) = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1");
+        (
+            shard.dirty_objects.len(),
+            shard.bucket_index.bucket_map.values().filter(|b| b.dirty()).count(),
+        )
+    };
+    println!("    after the dump: {after_dump_objects} dirty object(s), {after_dump_dirty} dirty bucket(s)");
+
+    // ---- NOW DIRTY A FEW, chosen to land in different buckets.
+    for index in [1usize, 5, 9] {
+        let out = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("dirty-probe-{index:04}"),
+                value: vec![b'w'; 96],
+            },
+        });
+        assert!(out.status.ok, "re-dirtying {index}: {:?}", out.status);
+    }
+
+    let via_objects = by_object_set(&engine);
+    let via_blocks = by_block_bit(&engine);
+
+    let (object_count, bucket_count, blocks) = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1");
+        (
+            shard.dirty_objects.len(),
+            shard.bucket_index.bucket_map.len(),
+            shard
+                .bucket_index
+                .bucket_map
+                .values()
+                .map(|b| b.block_index.len())
+                .sum::<usize>(),
+        )
+    };
+
+    println!();
+    println!("  {KEYS} keys on a 16-bucket routing range");
+    println!();
+    println!("    dirty objects in the set      {object_count:>5}");
+    println!("    buckets in the map            {bucket_count:>5}");
+    println!("    pages across those buckets    {blocks:>5}");
+    println!("    dirty buckets via the SET     {:>5}", via_objects.len());
+    println!("    dirty buckets via the PAGE    {:>5}", via_blocks.len());
+    println!();
+
+    // ---- THE FIXTURE HAS TO REACH THE CASE. With one bucket per object the two agree trivially.
+    assert!(
+        bucket_count < KEYS,
+        "{KEYS} keys landed in {bucket_count} buckets, so each key may still have a bucket to \
+         itself and the blocks-outside-the-routing-bucket case this arm exists for never arose"
+    );
+    assert!(
+        object_count > 0,
+        "nothing is dirty, so both methods return the empty set and agreeing means nothing"
+    );
+    assert!(
+        !via_objects.is_empty(),
+        "the object-keyed method found no dirty bucket, so there is nothing to agree about"
+    );
+    // ---- AND NOT EVERY BUCKET, or both methods are answering "all of them" and a method that
+    // ---- always said so would pass. This is the assertion that makes the agreement mean
+    // ---- something.
+    assert!(
+        via_objects.len() < bucket_count,
+        "every one of the {bucket_count} buckets reads dirty, so both methods return the whole          map and agreeing proves nothing. The dump above was supposed to leave most of them          clean -- check what it actually cleared before trusting the equality below"
+    );
+
+    // ---- AND THEY MUST AGREE. This is the whole claim: the page bit is sufficient, so the
+    // ---- object-keyed set is not load-bearing for this question and can be removed.
+    assert_eq!(
+        via_objects, via_blocks,
+        "the two methods disagree.\n  via the object set: {via_objects:?}\n  via the page bit:   \
+         {via_blocks:?}\n\nThe page bit is only sufficient while \
+         `push_object_dirty_onto_its_existing_blocks` runs at EVERY site that marks an object dirty. \
+         A disagreement means a marking site stopped pushing, and the object-keyed set is covering \
+         for it -- fix the push rather than keeping the set, because a bucket missing from the page \
+         view is a bucket that stops being dumped"
+    );
+}
