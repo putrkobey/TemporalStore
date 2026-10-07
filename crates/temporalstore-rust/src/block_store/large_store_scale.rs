@@ -455,3 +455,460 @@ fn what_a_large_store_costs_at_two_slab_counts() {
         let large_per = per(large_value, large.records);
         println!(
             "    {:<36} {:>14.3} {:>16.3} {:>8.2}x    raw {small_value} / {large_value}",
+            label,
+            small_per,
+            large_per,
+            ratio(small_per.max(f64::MIN_POSITIVE), large_per)
+        );
+    }
+    println!("  PER SLAB");
+    let slab_rows: [(&str, u64, u64); 6] = [
+        ("allocations", small.roll_allocs, large.roll_allocs),
+        ("root-directory entries walked", small.root_dir_entries, large.root_dir_entries),
+        ("whole-manifest writes", small.manifest_writes, large.manifest_writes),
+        ("manifest write(2) calls", small.manifest_file_writes, large.manifest_file_writes),
+        ("manifest bytes on disk", small.manifest_bytes_on_disk, large.manifest_bytes_on_disk),
+        ("resident index bytes", small.resident_index_bytes, large.resident_index_bytes),
+    ];
+    for (label, small_value, large_value) in slab_rows {
+        let small_per = per(small_value, small.slabs_asked);
+        let large_per = per(large_value, large.slabs_asked);
+        println!(
+            "    {:<36} {:>14.3} {:>16.3} {:>8.2}x    raw {small_value} / {large_value}",
+            label,
+            small_per,
+            large_per,
+            ratio(small_per.max(f64::MIN_POSITIVE), large_per)
+        );
+    }
+    println!("  WHOLE STORE");
+    println!(
+        "    {:<36} {:>14} {:>16} {:>8.2}x",
+        "resident index bytes",
+        small.resident_index_bytes,
+        large.resident_index_bytes,
+        ratio(small.resident_index_bytes as f64, large.resident_index_bytes as f64)
+    );
+    println!(
+        "    {:<36} {:>14} {:>16} {:>8.2}x",
+        "payload bytes appended",
+        small.payload_bytes,
+        large.payload_bytes,
+        ratio(small.payload_bytes as f64, large.payload_bytes as f64)
+    );
+    println!(
+        "    {:<36} {:>14.6} {:>16.6} {:>8.2}x",
+        "index bytes per payload byte",
+        per(small.resident_index_bytes, small.payload_bytes),
+        per(large.resident_index_bytes, large.payload_bytes),
+        ratio(
+            per(small.resident_index_bytes, small.payload_bytes),
+            per(large.resident_index_bytes, large.payload_bytes)
+        )
+    );
+    println!(
+        "    {:<36} {:>14} {:>16}",
+        "directory fsyncs", small.directory_fsyncs, large.directory_fsyncs
+    );
+    println!(
+        "    {:<36} {:>14} {:>16} {:>8.2}x",
+        "root-directory WALKS (not entries)",
+        small.root_dir_walks,
+        large.root_dir_walks,
+        ratio(small.root_dir_walks as f64, large.root_dir_walks as f64)
+    );
+    println!(
+        "    {:<36} {:>14} {:>16}",
+        "  of which the open costs",
+        small.root_dir_walks - (small.slabs_asked - 1),
+        large.root_dir_walks - (large.slabs_asked - 1)
+    );
+    println!(
+        "    {:<36} {:>14} {:>16}",
+        "stored bytes (payload + envelopes)", small.stored_bytes, large.stored_bytes
+    );
+    println!(
+        "    {:<36} {:>14} {:>16}",
+        "RESIDUAL allocations (outer - rows)",
+        small.residual_allocs(),
+        large.residual_allocs()
+    );
+    println!(
+        "    {:<36} {:>14.4} {:>16.4}",
+        "  per record",
+        small.residual_allocs() as f64 / small.records as f64,
+        large.residual_allocs() as f64 / large.records as f64
+    );
+    println!();
+
+    // ---- WHAT IS FLAT. ---------------------------------------------------------------------
+    let append_per_record_small = per(small.append_allocs, small.records);
+    let append_per_record_large = per(large.append_allocs, large.records);
+    assert!(
+        (append_per_record_large - append_per_record_small).abs() < 1.0,
+        "an append must cost the same however many slabs the store already holds: \
+         {append_per_record_small:.3} at {} slabs against {append_per_record_large:.3} at {}",
+        small.slabs_asked,
+        large.slabs_asked
+    );
+    assert_eq!(
+        small.manifest_writes, small.slabs_asked,
+        "one whole-manifest write per roll and not one per record -- the manifest persist is \
+         deferred on the append path"
+    );
+    assert_eq!(
+        large.manifest_writes, large.slabs_asked,
+        "and the same at ten times the slabs"
+    );
+    assert_eq!(
+        0, small.descriptors_summarised,
+        "NOT SUMMARISED: neither an append nor a roll walks the descriptor set, whatever \
+         `rolled_store_fixture` says about the append path"
+    );
+    assert_eq!(0, large.descriptors_summarised, "and the same at ten times the slabs");
+    // Per ROLL and not per slab, and asserted as an exact integer rather than a ratio: a store of
+    // S slabs rolls S-1 times, each roll fsyncs the store root twice -- once for the new slab file
+    // and once for the manifest rename -- and the OPEN fsyncs it once more for the manifest
+    // persist its reconcile does. So 2(S-1)+1 exactly, at both sizes.
+    // `a_roll_costs_the_same_directory_fsyncs_at_any_slab_count` already pins that a roll's
+    // barrier count does not move with the store; this reads the same property at a thousand and
+    // ten thousand slabs, where an accidental per-slab fsync inside the roll would be unmissable.
+    let expected_fsyncs = |slabs: u64| 2 * (slabs - 1) + 1;
+    assert_eq!(
+        expected_fsyncs(small.slabs_asked),
+        small.directory_fsyncs,
+        "two directory fsyncs per roll plus the open's one, not {} over {} rolls",
+        small.directory_fsyncs,
+        small.slabs_asked - 1
+    );
+    assert_eq!(
+        expected_fsyncs(large.slabs_asked),
+        large.directory_fsyncs,
+        "and exactly the same shape at ten times the slabs: {} over {} rolls",
+        large.directory_fsyncs,
+        large.slabs_asked - 1
+    );
+
+    // Resident index is per SLAB and flat in it -- this is the memory answer.
+    let index_per_slab_small = per(small.resident_index_bytes, small.slabs_asked);
+    let index_per_slab_large = per(large.resident_index_bytes, large.slabs_asked);
+    assert!(
+        (index_per_slab_large - index_per_slab_small).abs() < 32.0,
+        "a slab descriptor costs the same resident bytes at any store size: \
+         {index_per_slab_small:.1} against {index_per_slab_large:.1}"
+    );
+    let manifest_per_slab_small = per(small.manifest_bytes_on_disk, small.slabs_asked);
+    let manifest_per_slab_large = per(large.manifest_bytes_on_disk, large.slabs_asked);
+    assert!(
+        (manifest_per_slab_large - manifest_per_slab_small).abs() < 16.0,
+        "THE MANIFEST STAYS LINEAR IN THE SLAB COUNT: {manifest_per_slab_small:.1} bytes per \
+         descriptor at {} slabs against {manifest_per_slab_large:.1} at {}",
+        small.slabs_asked,
+        large.slabs_asked
+    );
+
+    // ---- WHAT GROWS. -----------------------------------------------------------------------
+    let entries_ratio = large.root_dir_entries as f64 / small.root_dir_entries as f64;
+    assert!(
+        entries_ratio > 50.0,
+        "THE INTEGRAL OF THE ROLL'S DIRECTORY SCAN IS QUADRATIC IN THE SLAB COUNT: ten times \
+         the store should walk about a hundred times the directory entries, saw {entries_ratio:.2}x \
+         ({} against {})",
+        small.root_dir_entries,
+        large.root_dir_entries
+    );
+    // The SECOND quantity that does not hold an order of magnitude up, and it is on the other
+    // half of the roll: the manifest buffer is 256 KiB, so while the manifest fits in it one
+    // persist is one `write(2)` -- and once the manifest outgrows it, a persist costs a syscall
+    // per buffer. The count per roll therefore goes from 1 to the manifest's size over 256 KiB,
+    // and summed over the store's life it grows with the square of the slab count exactly as the
+    // directory walk does.
+    let manifest_syscall_ratio =
+        large.manifest_file_writes as f64 / small.manifest_file_writes as f64;
+    assert!(
+        manifest_syscall_ratio > 10.0,
+        "THE MANIFEST'S WRITE SYSCALLS OUTGROW THE BUFFER: ten times the store took \
+         {manifest_syscall_ratio:.1}x the write(2) calls ({} against {}), so the 256 KiB buffer \
+         stops being one syscall per persist somewhere between these two sizes",
+        small.manifest_file_writes,
+        large.manifest_file_writes
+    );
+
+    let walks_ratio = large.root_dir_walks as f64 / small.root_dir_walks as f64;
+    assert!(
+        (walks_ratio - 10.0).abs() < 0.2,
+        "while the number of WALKS is LINEAR -- one per roll, plus the fixed few an open costs \
+         -- so the growth is in the directory each walk faces and not in how often it is asked: \
+         {} walks against {} is {walks_ratio:.3}x",
+        small.root_dir_walks,
+        large.root_dir_walks
+    );
+
+    // ---- THE INDEPENDENT RESIDUAL. ---------------------------------------------------------
+    let small_residual_per_record = small.residual_allocs() as f64 / small.records as f64;
+    let large_residual_per_record = large.residual_allocs() as f64 / large.records as f64;
+    assert!(
+        small.residual_allocs() > 0,
+        "FLOOR: the store open is inside the outer span and in no row, so the residual must \
+         carry something -- a residual of {} is an identity rather than a reading",
+        small.residual_allocs()
+    );
+    assert!(
+        large.residual_allocs() > 0,
+        "and the same at ten times the slabs: {}",
+        large.residual_allocs()
+    );
+    assert!(
+        (large_residual_per_record - small_residual_per_record).abs() < 0.5,
+        "THE RESIDUAL IS FLAT PER RECORD, so no phase boundary has drifted past real work: \
+         {small_residual_per_record:.4} per record at {} slabs against \
+         {large_residual_per_record:.4} at {}",
+        small.slabs_asked,
+        large.slabs_asked
+    );
+    // And the stronger reading the two arms allow: the residual is a FIXED cost, not a small
+    // per-record one. Ten times the store leaves it where it was, which is what "the store open
+    // and nothing else escaped the rows" means. A boundary that had drifted past real work would
+    // put a number here that grew with the store; pinning it exactly would instead fail on an
+    // unrelated allocation moving one statement, which is not what this watches for.
+    assert!(
+        (large.residual_allocs() - small.residual_allocs()).abs() <= 8,
+        "THE RESIDUAL IS FIXED, not per record: {} allocations at {} slabs against {} at {}",
+        small.residual_allocs(),
+        small.slabs_asked,
+        large.residual_allocs(),
+        large.slabs_asked
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// The same properties at a size CI can afford. These run in the ordinary gate.
+// -------------------------------------------------------------------------------------------
+
+/// Build a small store the same way the scale arms do, with no probe and no counting.
+fn small_appended_store(root: &std::path::Path, slabs: u64, records_per_slab: u64) -> BlockStore {
+    let store = BlockStore::new(root);
+    let mut slab = 0u64;
+    while slab < slabs {
+        let mut record = 0u64;
+        while record < records_per_slab {
+            store.append(PAYLOAD).expect("append");
+            record += 1;
+        }
+        if slab + 1 < slabs {
+            store.roll_slab().expect("roll");
+        }
+        slab += 1;
+    }
+    store
+}
+
+/// A roll walks the WHOLE store root, so the entries a store walks getting to N slabs grow with N.
+///
+/// THE COUNTER IS THE SUBJECT. `the_roll_at_scale` already prices one roll's scan with a
+/// stopwatch, which cannot be asserted -- wall times on this box move by more than the effect.
+/// `block_store_root_dir_entries` counts inside `slab_ids_at`, so the shape is assertable at four
+/// slabs and the ignored arm above only has to confirm it holds at ten thousand.
+///
+/// TWO SIZES, because a single size cannot tell a per-roll constant from a walk of the directory.
+#[test]
+fn a_slab_roll_walks_every_slab_already_in_the_store_root() {
+    let small_dir = tempfile::tempdir().unwrap();
+    let large_dir = tempfile::tempdir().unwrap();
+
+    let before = root_dir_entries_now();
+    let small = small_appended_store(small_dir.path(), 4, 3);
+    let small_entries = root_dir_entries_now() - before;
+
+    let before = root_dir_entries_now();
+    let large = small_appended_store(large_dir.path(), 40, 3);
+    let large_entries = root_dir_entries_now() - before;
+
+    // DENOMINATORS. The two fixtures really differ by ten, and both really hold more than one
+    // slab -- a fixture that collapsed into a single slab would compare {0} against {0}.
+    let small_slabs = small.slab_ids().unwrap().len();
+    let large_slabs = large.slab_ids().unwrap().len();
+    assert_eq!(small_slabs, 4, "the small fixture really holds four slabs");
+    assert_eq!(large_slabs, 40, "the large fixture really holds forty");
+    assert!(small_slabs > 1, "and more than one, or there is nothing to walk");
+
+    // VACUITY FLOOR. A counter that never moved reports zero entries at both sizes, which would
+    // satisfy any ratio assertion written as an inequality on their difference.
+    assert!(
+        small_entries > 0,
+        "the four-slab build must have walked the store root at all"
+    );
+
+    // THE SHAPE, derived rather than quoted. A store of S slabs rolls S-1 times, and the k'th
+    // roll faces k slab files PLUS the slab manifest -- the walk is over every entry in the store
+    // root, not over the ones whose names parse as a slab. So the entries a build walks are
+    //
+    //     sum over k in 1..=R of (k + 1)  =  R(R+1)/2 + R,   R = S - 1 rolls
+    //
+    // which is 9 at four slabs and 819 at forty. The manifest term is what made a first pass at
+    // this test read 6 and 780 and fail: the +1 is a real entry the roll really stats, and
+    // leaving it out would have understated the walk by one per roll at every size.
+    let walked = |slabs: u64| {
+        let rolls = slabs - 1;
+        rolls * (rolls + 1) / 2 + rolls
+    };
+    assert_eq!(
+        small_entries,
+        walked(4),
+        "three rolls over a store growing 1, 2, 3 -- each plus the manifest -- must walk {} \
+         entries, not {small_entries}",
+        walked(4)
+    );
+    assert_eq!(
+        large_entries,
+        walked(40),
+        "thirty-nine rolls over a store growing 1..39 must walk {} entries, not {large_entries}",
+        walked(40)
+    );
+    assert!(
+        large_entries > small_entries * 50,
+        "ten times the slabs must cost far more than ten times the walk: {small_entries} \
+         against {large_entries}"
+    );
+}
+
+/// An APPEND does not walk the store root and does not summarise the descriptor set.
+///
+/// The per-record half of the same question, and the one that says a large store's writes are not
+/// slowed by its size. Asserted as an exact zero for both, each with a control beside it proving
+/// the counter it reads does move -- a zero from a counter nobody increments is the failure this
+/// pair exists to rule out.
+#[test]
+fn an_append_walks_no_directory_and_summarises_no_descriptor() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = small_appended_store(dir.path(), 8, 3);
+    assert!(
+        store.slab_ids().unwrap().len() > 1,
+        "DENOMINATOR: a store of one slab has no directory worth walking"
+    );
+
+    let entries_before = root_dir_entries_now();
+    let summarised_before = slab_descriptors_summarised();
+    let mut record = 0u64;
+    while record < 64 {
+        store.append(PAYLOAD).expect("append");
+        record += 1;
+    }
+    let entries = root_dir_entries_now() - entries_before;
+    let summarised = slab_descriptors_summarised() - summarised_before;
+
+    assert_eq!(0, entries, "sixty-four appends must walk no directory entry");
+    assert_eq!(
+        0, summarised,
+        "and must summarise no slab descriptor -- the append path does not touch the slab set \
+         beyond its own entry"
+    );
+
+    // CONTROLS. Both counters move for an operation that really does the thing, so neither zero
+    // above is the counter failing to count.
+    let entries_before = root_dir_entries_now();
+    store.roll_slab().expect("roll");
+    assert!(
+        root_dir_entries_now() > entries_before,
+        "CONTROL: a roll DOES walk the store root, so the zero above is the append and not the \
+         counter"
+    );
+    let summarised_before = slab_descriptors_summarised();
+    let summary = store.slab_summary();
+    assert!(
+        slab_descriptors_summarised() > summarised_before,
+        "CONTROL: a summary DOES walk the descriptors, so the zero above is the append and not \
+         the counter"
+    );
+    assert!(
+        summary.active_slabs + summary.sealed_slabs > 1,
+        "and the summary it walked really covers more than one slab"
+    );
+}
+
+/// The store's resident index is PER SLAB, not per record.
+///
+/// Ten times the records in the SAME number of slabs must not move the descriptor map at all;
+/// ten times the slabs must move it by ten. Both halves, because either one alone is satisfied by
+/// a map that does not grow with anything.
+#[test]
+#[cfg(feature = "alloc-probe")]
+fn the_resident_index_tracks_slabs_and_not_records() {
+    let few_dir = tempfile::tempdir().unwrap();
+    let many_dir = tempfile::tempdir().unwrap();
+    let wide_dir = tempfile::tempdir().unwrap();
+
+    let few = small_appended_store(few_dir.path(), 8, 4);
+    let many = small_appended_store(many_dir.path(), 80, 4);
+    // Same slab count as `few`, ten times the records in each slab.
+    let wide = small_appended_store(wide_dir.path(), 8, 40);
+
+    let heap = |store: &BlockStore| {
+        let inner = store.inner.lock().expect("block store lock poisoned");
+        deep_heap_bytes(&inner.slabs)
+    };
+    let few_bytes = heap(&few);
+    let many_bytes = heap(&many);
+    let wide_bytes = heap(&wide);
+
+    // DENOMINATORS and the probe FLOOR, before anything is divided.
+    assert_eq!(few.slab_ids().unwrap().len(), 8);
+    assert_eq!(many.slab_ids().unwrap().len(), 80);
+    assert_eq!(wide.slab_ids().unwrap().len(), 8);
+    assert!(
+        few_bytes > 0,
+        "FLOOR: eight descriptors cannot clone into zero bytes -- the counting allocator is not \
+         installed and every figure here is a zero that means the opposite"
+    );
+    assert_eq!(
+        few.stats().writes * 10,
+        wide.stats().writes,
+        "DENOMINATOR: the wide store really took ten times the records of the narrow one"
+    );
+
+    assert_eq!(
+        few_bytes, wide_bytes,
+        "ten times the RECORDS in the same eight slabs must not cost one resident byte more: \
+         {few_bytes} against {wide_bytes}"
+    );
+    assert!(
+        many_bytes > few_bytes * 5,
+        "while ten times the SLABS must cost about ten times the bytes: {few_bytes} against \
+         {many_bytes}"
+    );
+}
+
+/// The root-directory walk counter sees the store's own `slab_ids()`, not only the private walk.
+///
+/// `BlockStore::slab_ids` used to be a SECOND copy of `slab_ids_at`'s loop, written out inline, so
+/// a counter placed in one of them saw none of the other's callers -- the exact shape of a guard
+/// that covers one of two live copies. The copy is gone; this is what keeps it gone.
+#[test]
+fn the_public_slab_id_listing_is_counted_like_the_private_one() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = small_appended_store(dir.path(), 5, 2);
+
+    let walks_before = root_dir_walks_now();
+    let entries_before = root_dir_entries_now();
+    let listed = store.slab_ids().unwrap().len() as u64;
+    let walks = root_dir_walks_now() - walks_before;
+    let entries = root_dir_entries_now() - entries_before;
+
+    assert_eq!(5, listed, "DENOMINATOR: the listing really found five slabs");
+    assert!(listed > 1, "and more than one, or the walk is trivial");
+    assert_eq!(1, walks, "one listing is one walk, not {walks}");
+    // THE WALK IS OVER THE DIRECTORY, NOT OVER THE SLABS. Five slab files and the slab manifest
+    // are six entries; only five of them parse as a slab id. That difference is why the counter
+    // is on ENTRIES rather than on the returned length -- the cost is what `read_dir` hands back,
+    // and anything else the store root accumulates is charged to every walk of it.
+    assert_eq!(
+        listed + 1,
+        entries,
+        "the listing returned {listed} slabs and the walk stat'd {entries} entries; the extra \
+         one is the slab manifest, which shares the directory"
+    );
+    assert!(
+        fs::metadata(slab_manifest_path(dir.path())).is_ok(),
+        "and that extra entry really is the manifest, which really is in the store root"
+    );
+}

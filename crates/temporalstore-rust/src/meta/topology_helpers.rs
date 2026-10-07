@@ -99,3 +99,309 @@ pub(super) fn table_for_shard<'a>(state: &'a MetaState, shard_id: ShardId) -> Op
         return state
             .table_starts
             .range(..=shard_id)
+            .next_back()
+            .and_then(|(_, key)| state.tables.get(key))
+            .filter(|table| table_owns_shard(&table.info, shard_id));
+    }
+    // Two tables have claimed overlapping shards at some point, and this
+    // answered those with the first in map order, which the index cannot
+    // reproduce. So it answers them.
+    state
+        .tables
+        .values()
+        .find(|table| table_owns_shard(&table.info, shard_id))
+}
+
+pub(super) fn push_replica(
+    state: &MetaState,
+    replicas: &mut Vec<String>,
+    seen_replicas: &mut BTreeSet<String>,
+    used_hosts: &mut BTreeSet<String>,
+    server_addr: &str,
+) {
+    if !seen_replicas.insert(server_addr.to_string()) {
+        return;
+    }
+    let host = server_host(server_addr);
+    if !host.is_empty() {
+        used_hosts.insert(host);
+    }
+    replicas.push(server_addr.to_string());
+}
+
+pub(super) fn placement_shard_state_penalty(serving_state: &str) -> u8 {
+    match serving_state {
+        "serving" | "readonly" => 0,
+        "queued" | "running" | "loading" => 1,
+        "freezing" | "unloading" => 2,
+        "failed" => 3,
+        _ => 1,
+    }
+}
+
+pub(super) fn server_host(server_addr: &str) -> String {
+    if let Some(stripped) = server_addr.strip_prefix('[') {
+        return stripped
+            .split_once(']')
+            .map(|(host, _)| host.to_string())
+            .unwrap_or_else(|| server_addr.to_string());
+    }
+    server_addr
+        .rsplit_once(':')
+        .map(|(host, port)| {
+            if port.chars().all(|ch| ch.is_ascii_digit()) {
+                host.to_string()
+            } else {
+                server_addr.to_string()
+            }
+        })
+        .unwrap_or_else(|| server_addr.to_string())
+}
+
+pub(super) fn server_endpoint(state: &MetaState, server_addr: &str) -> ServerEndpoint {
+    ServerEndpoint {
+        server_addr: server_addr.to_string(),
+        location: state
+            .servers
+            .get(server_addr)
+            .map(|server| server.location.clone())
+            .unwrap_or_default(),
+    }
+}
+
+pub(super) fn ensure_server(state: &mut MetaState, server_addr: &str) {
+    state
+        .servers
+        .entry(server_addr.to_string())
+        .or_insert_with(|| ServerMetaInfo {
+            registered_at_ms: 0,
+            reported_record_count: 0,
+            reported_storage_bytes: 0,
+            numa_nodes: Vec::new(),
+            load_key_count: 0,
+            load_memory_bytes: 0,
+            worst_shard_state_penalty: 0,
+            freeze_reason: FreezeReason::Unspecified,
+            server_addr: server_addr.to_string(),
+            node_id: 0,
+            location: String::new(),
+            state: MetaEntityState::Normal,
+            last_heartbeat_ms: now_ms(),
+            frozen_since_ms: 0,
+            freeze_cooldown_until_ms: 0,
+            boot_time_ms: 0,
+            reported_boot_time_ms: 0,
+            reboot_detected: false,
+            reports_shard_states: false,
+            binary_version: String::new(),
+            shard_loads: Vec::new(),
+            shard_stat_loads: Vec::new(),
+            runtime_load: ServerRuntimeLoad::default(),
+            shard_states: Vec::new(),
+        });
+}
+
+pub(super) fn stats_from_state(state: &MetaState, counters: &MetaCounters) -> MetaStats {
+    MetaStats {
+        register_shard_total: counters.register_shard_total.load(Ordering::Relaxed),
+        get_shard_total: counters.get_shard_total.load(Ordering::Relaxed),
+        server_register_total: counters.server_register_total.load(Ordering::Relaxed),
+        server_heartbeat_total: counters.server_heartbeat_total.load(Ordering::Relaxed),
+        proxy_register_total: counters.proxy_register_total.load(Ordering::Relaxed),
+        proxy_heartbeat_total: counters.proxy_heartbeat_total.load(Ordering::Relaxed),
+        namespace_create_total: counters.namespace_create_total.load(Ordering::Relaxed),
+        table_create_total: counters.table_create_total.load(Ordering::Relaxed),
+        topology_query_total: counters.topology_query_total.load(Ordering::Relaxed),
+        load_finish_total: counters.load_finish_total.load(Ordering::Relaxed),
+        topology_version: state.topology_version,
+        server_count: state.servers.len(),
+        proxy_count: state.proxies.len(),
+        namespace_count: state.namespaces.len(),
+        table_count: state.tables.len(),
+        shard_count: state.shards.len(),
+        frozen_shard_count: state
+            .shards
+            .values()
+            .filter(|location| location.state != MetaEntityState::Normal)
+            .count(),
+    }
+}
+
+pub(super) const TOPOLOGY_EVENT_HISTORY_LIMIT: usize = 256;
+
+/// How many of a collection are normal, frozen and dropped, in one walk.
+///
+/// The report wants all three, and asking for them separately walked the
+/// collection three times. They are disjoint, so one walk answers all of them.
+fn tally_states(states: impl Iterator<Item = MetaEntityState>) -> (usize, usize, usize) {
+    let mut normal = 0;
+    let mut frozen = 0;
+    let mut dropped = 0;
+    for state in states {
+        match state {
+            MetaEntityState::Normal => normal += 1,
+            MetaEntityState::Frozen => frozen += 1,
+            MetaEntityState::Dropped => dropped += 1,
+            // Any other state is counted by none of the three, exactly as the
+            // separate filters counted it by none of them.
+            _ => {}
+        }
+    }
+    (normal, frozen, dropped)
+}
+
+pub(super) fn topology_version_report_from_state(
+    state: &MetaState,
+    old_topology_version: u64,
+) -> TopologyVersionReport {
+    // Nothing can be newer than a caller who is already current, so there is
+    // nothing to look for. Every table and every event carries a version that
+    // `record_topology_event` returned, which is the global version as it stood
+    // when it was bumped -- so none of them can be above it.
+    //
+    // This is the answer almost every check gets: callers ask whether the
+    // topology moved far more often than it moves, and producing this answer
+    // used to walk every table and every recorded event to conclude that none
+    // of them qualified.
+    let unchanged = old_topology_version >= state.topology_version;
+    let changed_tables = if unchanged {
+        Vec::new()
+    } else {
+        state
+            .tables
+            .values()
+            .filter(|table| table.info.topology_version > old_topology_version)
+            .map(|table| table.info.clone())
+            .collect::<Vec<_>>()
+    };
+    let events = if unchanged {
+        Vec::new()
+    } else {
+        state
+            .topology_events
+            .iter()
+            .filter(|event| event.topology_version > old_topology_version)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let event_history_truncated = old_topology_version < state.topology_version
+        && state
+            .topology_events
+            .front()
+            .is_some_and(|event| old_topology_version < event.topology_version.saturating_sub(1));
+    let (normal_servers, frozen_servers, dropped_servers) =
+        tally_states(state.servers.values().map(|server| server.state));
+    let (normal_proxies, frozen_proxies, dropped_proxies) =
+        tally_states(state.proxies.values().map(|proxy| proxy.state));
+    let (normal_tables, frozen_tables, dropped_tables) =
+        tally_states(state.tables.values().map(|table| table.info.state));
+    TopologyVersionReport {
+        status: Status::ok(),
+        current_topology_version: state.topology_version,
+        old_topology_version,
+        unchanged,
+        server_count: state.servers.len(),
+        proxy_count: state.proxies.len(),
+        table_count: state.tables.len(),
+        shard_route_count: state.shards.len(),
+        normal_servers,
+        frozen_servers,
+        dropped_servers,
+        normal_proxies,
+        frozen_proxies,
+        dropped_proxies,
+        normal_tables,
+        frozen_tables,
+        dropped_tables,
+        changed_tables,
+        events,
+        event_history_truncated,
+    }
+}
+
+pub(super) fn record_topology_event(
+    state: &mut MetaState,
+    kind: impl Into<String>,
+    resource: impl Into<String>,
+    detail: impl Into<String>,
+) -> u64 {
+    state.topology_version += 1;
+    state.topology_events.push_back(TopologyChangeEvent {
+        topology_version: state.topology_version,
+        timestamp_ms: now_ms(),
+        kind: kind.into(),
+        resource: resource.into(),
+        detail: detail.into(),
+    });
+    while state.topology_events.len() > TOPOLOGY_EVENT_HISTORY_LIMIT {
+        state.topology_events.pop_front();
+    }
+    state.topology_version
+}
+
+
+/// Key under which a resource's drop timestamp is recorded in
+/// [`MetaState::dropped_since_ms`].
+pub(super) fn dropped_key(kind: &str, id: &str) -> String {
+    format!("{kind}:{id}")
+}
+
+/// Record when a table was frozen, or clear the record when it leaves the
+/// frozen state. Freeze aging has nothing to measure without this.
+pub(super) fn stamp_frozen_since(
+    state: &mut MetaState,
+    key: &str,
+    next: MetaEntityState,
+    now_ms: u64,
+) {
+    match next {
+        MetaEntityState::Frozen => {
+            // Keep the first freeze time: re-freezing an already frozen table
+            // must not restart its cooldown.
+            state.frozen_since_ms.entry(key.to_string()).or_insert(now_ms);
+        }
+        MetaEntityState::Normal | MetaEntityState::Dropped => {
+            state.frozen_since_ms.remove(key);
+        }
+    }
+}
+
+/// Record when a resource was dropped, or clear the record when it comes back.
+/// Retention has nothing to age against without this.
+pub(super) fn stamp_dropped_since(
+    state: &mut MetaState,
+    key: &str,
+    next: MetaEntityState,
+    now_ms: u64,
+) {
+    match next {
+        MetaEntityState::Dropped => {
+            // Keep the first drop time: re-dropping an already dropped resource
+            // must not restart its retention clock.
+            state.dropped_since_ms.entry(key.to_string()).or_insert(now_ms);
+        }
+        MetaEntityState::Normal | MetaEntityState::Frozen => {
+            state.dropped_since_ms.remove(key);
+        }
+    }
+}
+
+/// The shard -> owner map, restricted to shards that are actually being served.
+///
+/// Every planner reads placement through this. A frozen shard is deliberately
+/// out of service, so rebalancing must not move it, the divergence check must
+/// not "repair" it, and it must not appear in a client's topology.
+/// Who owns each serving shard, borrowed from the metadata.
+///
+/// The names are read to be compared and to be named as a target; none is kept
+/// past the round, and the state is read-locked throughout it. Copying them cost
+/// an allocation per serving shard -- 1,647us of a 3,109us round at 16,384
+/// shards, which is more than half of what a round that moves nothing spends.
+pub(super) fn serving_shard_owners(state: &MetaState) -> BTreeMap<ShardId, &str> {
+    state
+        .shards
+        .values()
+        .filter(|location| location.state == MetaEntityState::Normal)
+        .map(|location| (location.shard_id, location.server_addr.as_str()))
+        .collect()
+}
