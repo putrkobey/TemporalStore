@@ -26,3 +26,32 @@ pub struct Options {
 }
 
 impl Options {
+    pub fn new(
+        metaserver_addr: impl Into<String>,
+        namespace_name: impl Into<String>,
+        table_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            metaserver_addr: metaserver_addr.into(),
+            namespace_name: namespace_name.into(),
+            table_name: table_name.into(),
+            metaserver_consul: String::new(),
+            idc: "vdc1".to_string(),
+            host: "127.0.0.1".to_string(),
+            psm: "temporalstore.rust.client".to_string(),
+            log_dir: "./".to_string(),
+            log_level: 3,
+            io_timeout_ms: 1000,
+            connect_timeout_ms: 1000,
+            request_timeout_ms: 5000,
+            max_read_retries: 1,
+            max_write_retries: 0,
+            retry_backoff_ms: 2,
+            max_feature_points_per_request: 1000,
+            max_feature_query_count: 5000,
+            max_key_bytes: 4096,
+            max_value_bytes: 16 * 1024 * 1024,
+            pin_primary: true,
+        }
+    }
+}
