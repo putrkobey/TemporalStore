@@ -321,3 +321,326 @@ fn the_second_open_skips_sealed_slabs_and_only_the_byte_count_shows_it() {
     let cold = BlockStore::new(dir.path());
     let (cold_bytes, cold_reads) = cold.open_file_read_counts();
     let cold_slabs = cold.slab_ids().expect("slab ids").len();
+    drop(cold);
+
+    let warm = BlockStore::new(dir.path());
+    let (warm_bytes, warm_reads) = warm.open_file_read_counts();
+    let skipped = warm.slabs_skipped_reinspection_on_open();
+
+    // DENOMINATOR: the route has to have run before anything is asserted about it.
+    assert!(
+        skipped > 0,
+        "the skip route did not run, so this asserts nothing about it"
+    );
+    assert_eq!(
+        skipped,
+        cold_slabs - 1,
+        "every sealed slab is skipped; the active one is always inspected"
+    );
+    assert!(
+        warm_bytes < cold_bytes,
+        "a skipping open must read strictly less than the cold one: {warm_bytes} against \
+         {cold_bytes}"
+    );
+    assert!(
+        warm_reads < cold_reads,
+        "and it must issue strictly fewer reads: {warm_reads} against {cold_reads}"
+    );
+    // The answers are the same either way, which is why the count is what has to be asserted.
+    assert_eq!(
+        warm.slab_ids().expect("slab ids").len(),
+        cold_slabs,
+        "the skipping open must still know about every slab -- the skip is not a behaviour change"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// THE KERNEL AGREES, TO THE BYTE
+// ---------------------------------------------------------------------------------------------
+
+/// The two-size table in the module doc, with the kernel as the third instrument.
+///
+/// `#[ignore]`d and run by name because it reads `/proc/self/io`, which is charged whatever any
+/// other thread in the process reads. Run it as:
+///
+/// ```text
+/// cargo test -p temporalstore-rust --lib \
+///     what_a_cold_open_reads_at_two_corpus_sizes -- --ignored --nocapture --test-threads=1
+/// ```
+// rust-internal: a two-size cost table read from an internal counter and the kernel
+#[test]
+#[ignore = "takes its third instrument from a process-wide kernel counter; run by name"]
+fn what_a_cold_open_reads_at_two_corpus_sizes() {
+    let parallelism = available_parallelism_rchar();
+    println!("  available_parallelism costs {parallelism} rchar per call on this box");
+    for slabs in [50_u64, 200] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path();
+        let records = build_appended_store(root, slabs);
+        let (slab_bytes, manifest_bytes, slab_files) = bytes_on_disk(root);
+
+        // NOTHING BUT THE OPEN IS INSIDE THE SPAN. An instrument read placed between these two
+        // lines is charged to the span and shows up as residual that is not the store's.
+        let kernel_before = read_proc_io();
+        let store = BlockStore::new(root);
+        let kernel_after = read_proc_io();
+
+        let (open_bytes, open_reads) = store.open_file_read_counts();
+        let on_disk = slab_bytes + manifest_bytes;
+        println!("  slabs {slabs}, records {records}, slab files {slab_files}");
+        println!("    slab bytes on disk (stat)   {slab_bytes}");
+        println!("    manifest on disk (stat)     {manifest_bytes}");
+        println!("    on disk, both               {on_disk}");
+        println!("    THE COUNTER INSIDE THE READ {open_bytes} in {open_reads} reads");
+        println!("    the old row, stats          {}", store.stats().bytes_read);
+
+        assert_eq!(open_bytes, on_disk, "the counter must be what is on disk");
+
+        // THE KERNEL, WHERE /proc SPOKE. `None` is "the kernel was not counting", never
+        // "the kernel counted zero".
+        match kernel_rchar_span(kernel_before, kernel_after) {
+            Some(kernel) => {
+                let residual = kernel as i64 - open_bytes as i64;
+                println!("    the kernel, this process    {kernel}");
+                println!("    RESIDUAL                    {residual}");
+                println!("      of it, available_parallelism {parallelism}");
+                println!(
+                    "    RESIDUAL, that named and removed {}",
+                    residual - parallelism as i64
+                );
+                assert_eq!(
+                    residual,
+                    parallelism as i64,
+                    "every byte the kernel charged this process across the open must be claimed: \
+                     kernel {kernel}, counter {open_bytes}, and the only other reader in the span \
+                     is available_parallelism at {parallelism}"
+                );
+            }
+            None => println!("    the kernel said nothing; residual not taken"),
+        }
+    }
+}
+
+/// THE RESIDUAL IS A READING, and a read the counter cannot see proves it.
+///
+/// A residual of zero means "every byte the kernel charged is claimed" only if a byte the counter
+/// CANNOT claim would have shown up. This plants a 1,000,003-byte read of a file that is not a
+/// block-store file inside the span and requires the residual to come back as exactly that --
+/// and the store's own counter not to move by a byte.
+// rust-internal: residual control over an internal counter against the kernel
+#[test]
+#[ignore = "reads a process-wide kernel counter; run by name"]
+fn the_residual_a_cold_open_leaves_is_zero_and_a_planted_read_proves_it_is_a_reading() {
+    let parallelism = available_parallelism_rchar();
+    let dir = tempfile::tempdir().expect("tempdir");
+    build_appended_store(dir.path(), 8);
+
+    let marker_dir = tempfile::tempdir().expect("tempdir");
+    let marker = marker_dir.path().join("not-a-slab.bin");
+    let planted = vec![3_u8; 1_000_003];
+    std::fs::write(&marker, &planted).expect("plant");
+
+    let kernel_before = read_proc_io();
+    let store = BlockStore::new(dir.path());
+    // DELIBERATELY NOT CHARGED TO THE COUNTER: it is not a block-store file, and it is read with
+    // the plain primitive rather than through the counted door.
+    let read_back = std::fs::read(&marker).expect("read the marker");
+    let kernel_after = read_proc_io();
+
+    assert_eq!(read_back.len(), planted.len());
+    let (open_bytes, _) = store.open_file_read_counts();
+
+    let Some(kernel) = kernel_rchar_span(kernel_before, kernel_after) else {
+        println!("the kernel said nothing; residual not taken");
+        return;
+    };
+    let residual = kernel as i64 - open_bytes as i64 - parallelism as i64;
+    println!(
+        "  planted {} bytes; residual {residual} (available_parallelism {parallelism} named and \
+         removed)",
+        planted.len()
+    );
+    assert_eq!(
+        residual,
+        planted.len() as i64,
+        "the residual must be exactly the planted read -- if it is not, the residual is not \
+         measuring what it claims to"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// EVERY DOOR, AND THE GUARD THAT SAYS SO
+// ---------------------------------------------------------------------------------------------
+
+/// Every module of the block store that can reach one of its files.
+///
+/// DERIVED FROM THE TREE RATHER THAN LISTED BY HAND: a file added to `block_store/` and left out
+/// of a hand-written list is exactly the second door this campaign keeps finding.
+const MODULES: &[(&str, &str)] = &[
+    ("block_store.rs", include_str!("../block_store.rs")),
+    ("block_store_append.rs", include_str!("block_store_append.rs")),
+    ("block_store_gc.rs", include_str!("block_store_gc.rs")),
+    ("block_store_paths.rs", include_str!("block_store_paths.rs")),
+    ("block_store_read.rs", include_str!("block_store_read.rs")),
+    ("block_store_record.rs", include_str!("block_store_record.rs")),
+    ("slab_backend.rs", include_str!("slab_backend.rs")),
+    ("slab_ids.rs", include_str!("slab_ids.rs")),
+    ("slab_manifest.rs", include_str!("slab_manifest.rs")),
+    ("slab_reports.rs", include_str!("slab_reports.rs")),
+];
+
+/// The production half of a module: everything before its first `#[cfg(test)] mod`.
+///
+/// CLASSIFIED BY ITEM, NOT BY FILE. `block_store.rs` carries three test modules and 56 of the
+/// module's file primitives live in them; a guard that read the whole file would be reading test
+/// fixtures as production reads.
+fn production_half(source: &str) -> &str {
+    match source.find("#[cfg(test)]\nmod ") {
+        Some(at) => &source[..at],
+        None => source,
+    }
+}
+
+/// Lines that read the CONTENT of a file without going through the counted door.
+///
+/// A directory walk, a metadata probe and a write are not reads of content. A directory handle
+/// opened only to `sync_all` it is not either, and there are three of those.
+fn uncounted_reads_in(source: &str) -> Vec<String> {
+    let mut offenders = Vec::new();
+    for (number, line) in source.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") {
+            continue;
+        }
+        let reads = line.contains("fs::read(")
+            || line.contains("fs::read_to_string(")
+            || line.contains("File::open(")
+            || line.contains(".read(true)");
+        if !reads {
+            continue;
+        }
+        // The counted door itself, and the two ranged reads that take a tally beside it.
+        if line.contains("let bytes = std::fs::read(path)?;")
+            || line.contains("std::fs::File::open(self.path(slab_id))?")
+        {
+            continue;
+        }
+        // A DIRECTORY handle, opened only to fsync it. No byte is read from any of these.
+        if line.contains("File::open(parent)")
+            || line.contains("File::open(path)")
+            || line.contains("File::open(&root)")
+        {
+            continue;
+        }
+        offenders.push(format!("  line {}: {}", number + 1, trimmed));
+    }
+    offenders
+}
+
+/// No production read of a block-store file bypasses the counted door.
+// rust-internal: a source-level guard over this crate's own read sites
+#[test]
+fn every_production_read_of_a_block_store_file_goes_through_the_counted_door() {
+    // THE DENOMINATOR IS DERIVED FROM THE TREE, NOT FROM THIS LIST. `include_str!` needs literal
+    // paths, so `MODULES` has to be written out by hand -- and a hand-written subject list goes
+    // stale the moment someone adds a file, with nothing failing. So the authority is the
+    // DIRECTORY: every non-test module in `block_store/` must be named above, and a new file
+    // added without a row here fails right here rather than being silently unscanned.
+    let module_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/block_store");
+    let mut on_disk: Vec<String> = std::fs::read_dir(&module_dir)
+        .expect("the block_store module directory must be readable")
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.ends_with(".rs"))
+        // The wholly-`#[cfg(test)]` modules are not production and carry their own imports.
+        .filter(|name| !matches!(name.as_str(),
+            "gc_scale.rs" | "large_store_scale.rs" | "open_read_scale.rs"))
+        .collect();
+    on_disk.sort();
+    let mut named: Vec<String> = MODULES
+        .iter()
+        .map(|(name, _)| (*name).to_owned())
+        .filter(|name| name != "block_store.rs")
+        .collect();
+    named.sort();
+    assert_eq!(
+        named, on_disk,
+        "the modules this guard scans must be exactly the non-test modules on disk; a file added \
+         to block_store/ without a row in MODULES would otherwise go unscanned"
+    );
+    // VACUITY FLOOR: and the list must not have collapsed to nothing.
+    assert!(
+        MODULES.len() >= 10,
+        "only {} modules named; the guard has lost its subject",
+        MODULES.len()
+    );
+    let mut scanned_bytes = 0_usize;
+    let mut offenders: Vec<String> = Vec::new();
+    for (name, source) in MODULES {
+        let production = production_half(source);
+        assert!(
+            !production.is_empty(),
+            "{name}: the production half is empty -- the split is wrong, and an empty input \
+             passes every assertion below"
+        );
+        scanned_bytes += production.len();
+        for offender in uncounted_reads_in(production) {
+            offenders.push(format!("{name}{offender}"));
+        }
+    }
+    assert!(
+        scanned_bytes > 100_000,
+        "only {scanned_bytes} bytes of production source were scanned; the guard is reading the \
+         wrong thing"
+    );
+    assert!(
+        offenders.is_empty(),
+        "these read a block-store file without going through the counted door:\n{}",
+        offenders.join("\n")
+    );
+
+    // THE OTHER DENOMINATOR: the door has to be getting used.
+    let counted: usize = MODULES
+        .iter()
+        .map(|(_, source)| {
+            production_half(source).matches("read_block_store_file(").count()
+                + production_half(source).matches("read_all(").count()
+        })
+        .sum();
+    assert!(
+        counted >= 6,
+        "only {counted} reads go through the counted door -- either the guard is reading the \
+         wrong files or the door has been bypassed wholesale"
+    );
+}
+
+/// THE NEGATIVE CONTROL: the guard above must go red on an input that deserves it.
+///
+/// Nine checks in this campaign could not fail. A guard whose ability to fail is untested says
+/// nothing at all.
+// rust-internal: the negative control for a source-level guard over this crate
+#[test]
+fn a_new_uncounted_read_would_fail_this_guard() {
+    let clean = "        let bytes = read_block_store_file(&path, tally)?;\n";
+    assert!(
+        uncounted_reads_in(clean).is_empty(),
+        "APPARATUS: the guard flagged a counted read"
+    );
+    let dir_handle = "    if let Ok(dir) = File::open(parent) {\n";
+    assert!(
+        uncounted_reads_in(dir_handle).is_empty(),
+        "APPARATUS: the guard flagged a directory handle opened only to fsync it"
+    );
+
+    for planted in [
+        "        let bytes = fs::read(slab_path(&root, id))?;\n",
+        "        let mut file = std::fs::File::open(&slab)?;\n",
+        "        let raw = std::fs::read_to_string(&manifest)?;\n",
+        "        let file = OpenOptions::new().read(true).open(&path)?;\n",
+    ] {
+        assert!(
+            !uncounted_reads_in(planted).is_empty(),
+            "the guard did not flag {planted:?} -- it cannot go red, so it says nothing"
+        );
+    }
+}
