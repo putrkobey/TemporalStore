@@ -181,3 +181,186 @@ fn all_three_maps_survive_a_reload() {
         },
     });
     assert!(
+        selection.status.ok,
+        "the selection write failed: {}",
+        selection.status.message
+    );
+
+    // A second bucket that stays EXACT, so the reload has something to carry in both maps.
+    let other = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::ControlStateChangeAdd {
+            key: KEY.to_string(),
+            timestamp_ms: BUCKET_MS + 60_000,
+            value: b"single".to_vec(),
+            precision_ms: None,
+            ttl_ms: None,
+        },
+    });
+    assert!(other.status.ok, "the second bucket write failed: {}", other.status.message);
+
+    let (exact_before, sketch_before, selection_before) = held(&engine);
+    println!("  before reload -> exact buckets {exact_before}, sketched buckets {sketch_before}, selection {selection_before}");
+    assert!(
+        exact_before > 0 && sketch_before > 0 && selection_before,
+        "denominator: all three maps must hold something for `{KEY}` before the reload, or the \
+         assertions after it are about empty maps. Got exact {exact_before}, sketch \
+         {sketch_before}, selection {selection_before}"
+    );
+
+    engine.flush_shard_index(1);
+    drop(engine);
+
+    let reloaded = engine_at(dir.path());
+    reloaded.load_shard(1);
+    let (exact_after, sketch_after, selection_after) = held(&reloaded);
+    println!("  after reload  -> exact buckets {exact_after}, sketched buckets {sketch_after}, selection {selection_after}");
+
+    assert_eq!(
+        (exact_before, sketch_before, selection_before),
+        (exact_after, sketch_after, selection_after),
+        "one of the three control-state value maps did not survive a reload. If a map comes back \
+         EMPTY it is derived rather than durable -- like `expiry_by_deadline`, which is \
+         `#[serde(skip)]` and rebuilt from `expires_at_ms` -- and a derived map is not a \
+         consolidation candidate at all. Re-derive the floor before changing this."
+    );
+}
+
+/// 2. THE SKETCH MAP'S KEY-CREATING WRITER IS GATED, AND THE EXACT MAP'S IS NOT.
+#[test]
+fn the_sketch_map_has_no_writer_until_its_flag_is_on() {
+    // ---- gate OFF: the default ----------------------------------------------------------
+    let off_dir = tempfile::tempdir().expect("tempdir");
+    let off = engine_at(off_dir.path());
+    off.load_shard(1);
+    {
+        let shards = off.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 is loaded");
+        assert!(
+            !shard.control_distinct_sketch,
+            "denominator: the distinct-sketch gate must be OFF by default, or this arm is not \
+             measuring the default. `Config::flag` is `flag_or(name, false)`."
+        );
+    }
+    fill_past_the_threshold(&off);
+    let (exact_off, sketch_off, _) = held(&off);
+    println!("  gate off -> exact buckets {exact_off}, sketched buckets {sketch_off}");
+    assert_eq!(
+        1, exact_off,
+        "with the gate off every value must stay in the one exact bucket"
+    );
+    assert_eq!(
+        0, sketch_off,
+        "the sketch map gained a key with the gate OFF, so its writer is not gated after all and \
+         the default deployment does populate it"
+    );
+
+    // ---- gate ON ------------------------------------------------------------------------
+    let on_dir = tempfile::tempdir().expect("tempdir");
+    let on = engine_at(on_dir.path());
+    on.load_shard(1);
+    enable_distinct_sketch(&on);
+    fill_past_the_threshold(&on);
+    let (exact_on, sketch_on, _) = held(&on);
+    println!("  gate on  -> exact buckets {exact_on}, sketched buckets {sketch_on}");
+    assert_eq!(
+        1, sketch_on,
+        "with the gate on, a bucket past the threshold must be converted into exactly one sketch"
+    );
+}
+
+/// 3. A BUCKET HOLDS EXACTLY ONE REPRESENTATION, AND NOW CANNOT HOLD TWO.
+///
+/// # WHAT THIS ARM ASSERTED, AND WHY IT CHANGED
+///
+/// It asserted that the two change maps were mutually exclusive per `(key, bucket)` -- the
+/// property that made merging them a consolidation rather than a reshuffle. The exclusivity was
+/// maintained by `record_change` doing a `remove` from one map and an `insert` into the other,
+/// which meant a bucket in both was REPRESENTABLE and the assertion had something it could catch.
+///
+/// The merge happened, and `hll::DistinctBucket` makes the overlap state unrepresentable: one
+/// bucket, one variant. So this arm can no longer fail the way it was written to fail, and
+/// pretending otherwise would leave a guard over a state the type system has already excluded --
+/// which is the kind of assertion that looks like coverage and is not.
+///
+/// WHAT IT ASSERTS INSTEAD is that the conversion REPLACES rather than ADDS: after a bucket is
+/// sketched, the key holds that one bucket and it is the sketch. That is still a real claim about
+/// `record_change` -- a conversion that inserted a new bucket id, or left the exact one behind
+/// under a different key, would fail it.
+///
+/// AND IT WAS NEVER A CORRECTNESS RISK, which stays written down so the merge is not later
+/// justified as fixing a bug it did not fix. `count_changes` folds the exact values into an HLL
+/// and merges the sketches into the same HLL, and both an `Hll` and a `BTreeSet` absorb a
+/// duplicate, so a bucket present in both maps would still have produced the right distinct
+/// count. The merge bought the invariant being unbreakable, not a defect repaired.
+#[test]
+fn a_bucket_holds_exactly_one_representation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_at(dir.path());
+    engine.load_shard(1);
+    enable_distinct_sketch(&engine);
+    fill_past_the_threshold(&engine);
+
+    use crate::engine::hll::DistinctBucket;
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 is loaded");
+    let buckets = shard
+        .control_state_changes
+        .get(KEY)
+        .expect("the key holds a change series");
+    let shapes: Vec<(u64, &str)> = buckets
+        .iter()
+        .map(|(at, bucket)| {
+            (
+                *at,
+                match bucket {
+                    DistinctBucket::Exact(_) => "exact",
+                    DistinctBucket::Sketch(_) => "sketch",
+                },
+            )
+        })
+        .collect();
+    println!("  buckets held: {shapes:?}");
+    assert_eq!(
+        1,
+        shapes.len(),
+        "the conversion left {} buckets under one key where the fixture wrote to one. A \
+         conversion that ADDS a bucket rather than replacing one in place would look like this, \
+         and it would double the memory the sketch exists to bound.",
+        shapes.len()
+    );
+    assert_eq!(
+        "sketch", shapes[0].1,
+        "the bucket past the threshold with the gate on is still exact, so the conversion did \
+         not happen and this arm is measuring nothing"
+    );
+}
+
+/// 4. NONE OF THE THREE HAS AN OUTER KIND KEY, WHICH IS WHY A SLOT CANNOT ADDRESS THEM.
+///
+/// Asked of `StoredModelKind::from_stored_name` rather than of a list in a comment. A kind exists
+/// for data whose elements are PAGES; the positive control is `control_state`, whose blocks are
+/// pages and which does have one.
+#[test]
+fn none_of_these_maps_has_a_stored_model_kind() {
+    assert!(
+        StoredModelKind::from_stored_name("control_state").is_some(),
+        "positive control: `control_state` must have a stored kind, or `from_stored_name` is \
+         answering None for everything and the assertions below mean nothing"
+    );
+    for absent in [
+        "control_state_changes",
+        "control_state_change_sketch",
+        "control_state_selection",
+        "control_state_fol",
+        "expires_at_ms",
+    ] {
+        assert!(
+            StoredModelKind::from_stored_name(absent).is_none(),
+            "`{absent}` now has a `StoredModelKind`. That is the outer key a consolidated map \
+             would address it by, so if this is deliberate the floor of nine-of-thirteen has \
+             moved and the slot's value type has to be able to hold whatever this map holds -- \
+             which for these is a domain value, not a page address."
+        );
+    }
+}
