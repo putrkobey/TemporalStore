@@ -278,3 +278,283 @@ impl TemporalEngine {
                 push_metric(
                     &mut out,
                     "temporalstore_block_store_operations_total",
+                    &[
+                        ("shard_id", stats.shard_id.to_string()),
+                        ("kind", kind.into()),
+                    ],
+                    value,
+                );
+            }
+            for (kind, value) in [
+                ("written", stats.block_store_compat.bytes_written),
+                ("read", stats.block_store_compat.bytes_read),
+                ("logical_written", stats.block_store_compat.logical_bytes_written),
+                ("logical_read", stats.block_store_compat.logical_bytes_read),
+                (
+                    "compression_saved",
+                    stats.block_store_compat.compression_bytes_saved,
+                ),
+            ] {
+                push_metric(
+                    &mut out,
+                    "temporalstore_block_store_bytes_total",
+                    &[
+                        ("shard_id", stats.shard_id.to_string()),
+                        ("kind", kind.into()),
+                    ],
+                    value,
+                );
+            }
+            for (state, value) in [
+                ("active", stats.block_store_slabs_compat.active_slabs),
+                ("sealed", stats.block_store_slabs_compat.sealed_slabs),
+                (
+                    "delayed_destroy",
+                    stats.block_store_slabs_compat.delayed_destroy_slabs,
+                ),
+                ("purged", stats.block_store_slabs_compat.purged_slabs),
+            ] {
+                push_metric(
+                    &mut out,
+                    "temporalstore_block_store_slab_count",
+                    &[
+                        ("shard_id", stats.shard_id.to_string()),
+                        ("state", state.into()),
+                    ],
+                    value,
+                );
+            }
+            for (kind, value) in [
+                ("active", stats.block_store_slabs_compat.active_physical_bytes),
+                ("sealed", stats.block_store_slabs_compat.sealed_physical_bytes),
+                (
+                    "delayed_destroy",
+                    stats.block_store_slabs_compat.delayed_destroy_physical_bytes,
+                ),
+                ("purged", stats.block_store_slabs_compat.purged_physical_bytes),
+                ("live", stats.block_store_slabs_compat.live_physical_bytes),
+                (
+                    "reclaimable",
+                    stats.block_store_slabs_compat.reclaimable_physical_bytes,
+                ),
+                (
+                    "total_known",
+                    stats.block_store_slabs_compat.total_known_physical_bytes,
+                ),
+            ] {
+                push_metric(
+                    &mut out,
+                    "temporalstore_block_store_slab_bytes",
+                    &[
+                        ("shard_id", stats.shard_id.to_string()),
+                        ("kind", kind.into()),
+                    ],
+                    value,
+                );
+            }
+            for (scope, value) in [
+                ("known", stats.block_store_slabs_compat.oldest_known_slab_unix_ms),
+                ("live", stats.block_store_slabs_compat.oldest_live_slab_unix_ms),
+                (
+                    "reclaimable",
+                    stats.block_store_slabs_compat.oldest_reclaimable_slab_unix_ms,
+                ),
+            ] {
+                if let Some(value) = value {
+                    push_metric(
+                        &mut out,
+                        "temporalstore_block_store_slab_oldest_unix_ms",
+                        &[
+                            ("shard_id", stats.shard_id.to_string()),
+                            ("scope", scope.into()),
+                        ],
+                        value,
+                    );
+                }
+            }
+            for (scope, value) in [
+                ("known", stats.block_store_slabs_compat.oldest_known_slab_age_ms),
+                ("live", stats.block_store_slabs_compat.oldest_live_slab_age_ms),
+                (
+                    "reclaimable",
+                    stats.block_store_slabs_compat.oldest_reclaimable_slab_age_ms,
+                ),
+            ] {
+                if let Some(value) = value {
+                    push_metric(
+                        &mut out,
+                        "temporalstore_block_store_slab_oldest_age_ms",
+                        &[
+                            ("shard_id", stats.shard_id.to_string()),
+                            ("scope", scope.into()),
+                        ],
+                        value,
+                    );
+                }
+            }
+            push_metric(
+                &mut out,
+                "temporalstore_wal_records_total",
+                &[("shard_id", stats.shard_id.to_string())],
+                stats.write_ahead_log.writes,
+            );
+            push_metric(
+                &mut out,
+                "temporalstore_wal_bytes_total",
+                &[("shard_id", stats.shard_id.to_string())],
+                stats.write_ahead_log.bytes_written,
+            );
+            push_metric(
+                &mut out,
+                "temporalstore_object_manager_objects",
+                &[("shard_id", stats.shard_id.to_string())],
+                stats.object_manager.object_count as u64,
+            );
+            push_metric(
+                &mut out,
+                "temporalstore_object_manager_block_refs",
+                &[("shard_id", stats.shard_id.to_string())],
+                stats.object_manager.block_ref_count as u64,
+            );
+            push_metric(
+                &mut out,
+                "temporalstore_object_manager_dirty_objects",
+                &[("shard_id", stats.shard_id.to_string())],
+                stats.object_manager.dirty_object_count as u64,
+            );
+            push_metric(
+                &mut out,
+                "temporalstore_object_manager_dirty_buckets",
+                &[("shard_id", stats.shard_id.to_string())],
+                stats.object_manager.dirty_bucket_count as u64,
+            );
+            // One routing slot is derived per key, so these are four series per RECORD: measured
+            // 20,140 sample lines and 1.6 MB at 5k records, 240,140 lines and 18.9 MB at 60k, with
+            // the scrape already at 460 ms. A few million records would build a multi-gigabyte
+            // response on every poll. Past the cap the per-slot detail is dropped and the slot
+            // count is reported instead; the shard totals emitted above already carry the aggregate.
+            // A routing slot is derived per key, so these are four series per RECORD, not per
+            // topology: measured 20,140 sample lines and 1.6 MB at 5k records, 240,140 lines and
+            // 18.9 MB at 60k. A few million records would build a multi-gigabyte response on every
+            // scrape. Past the cap the per-slot detail is dropped and the slot count is reported
+            // instead; the shard totals emitted above already carry the aggregate. Note
+            // object_manager.routing_bucket_count is the shard's routing RANGE (u32::MAX), not the
+            // number of occupied slots, so the occupied count has to come from the summaries.
+            let bucket_summaries = self.bucket_storage_summaries(stats.shard_id);
+            let max_bucket_series = max_bucket_series_per_shard();
+            if bucket_summaries.len() > max_bucket_series {
+                push_metric(
+                    &mut out,
+                    "temporalstore_storage_bucket_series_omitted",
+                    &[("shard_id", stats.shard_id.to_string())],
+                    bucket_summaries.len() as u64,
+                );
+            }
+            for summary in bucket_summaries.iter().take(max_bucket_series) {
+                push_metric(
+                    &mut out,
+                    "temporalstore_storage_bucket_block_refs",
+                    &[
+                        ("shard_id", stats.shard_id.to_string()),
+                        ("bucket", summary.routing_bucket.to_string()),
+                    ],
+                    summary.block_ref_count,
+                );
+                for (kind, value) in [
+                    ("logical", summary.logical_bytes),
+                    ("physical", summary.physical_bytes),
+                ] {
+                    push_metric(
+                        &mut out,
+                        "temporalstore_storage_bucket_bytes",
+                        &[
+                            ("shard_id", stats.shard_id.to_string()),
+                            ("bucket", summary.routing_bucket.to_string()),
+                            ("kind", kind.to_string()),
+                        ],
+                        value,
+                    );
+                }
+                push_metric(
+                    &mut out,
+                    "temporalstore_storage_bucket_dirty_objects",
+                    &[
+                        ("shard_id", stats.shard_id.to_string()),
+                        ("bucket", summary.routing_bucket.to_string()),
+                    ],
+                    summary.dirty_object_count,
+                );
+            }
+            push_metric(
+                &mut out,
+                "temporalstore_partition_routing_buckets",
+                &[("shard_id", stats.shard_id.to_string())],
+                stats.object_manager.routing_bucket_count as u64,
+            );
+        }
+        let ingestion = self.ingestion_state_report();
+        for (outcome, value) in [
+            ("accepted", ingestion.stats.accepted_total),
+            ("failed", ingestion.stats.failed_total),
+            ("duplicate", ingestion.stats.duplicate_total),
+            ("dead_letter", ingestion.stats.dead_letter_total),
+            (
+                "stream_backpressure",
+                ingestion.stats.stream_backpressure_total,
+            ),
+            ("stream_duplicate", ingestion.stats.stream_duplicate_total),
+            ("kafka_committed", ingestion.stats.kafka_committed_total),
+            ("flink_precommit", ingestion.stats.flink_precommit_total),
+            ("flink_commit", ingestion.stats.flink_commit_total),
+            ("flink_abort", ingestion.stats.flink_abort_total),
+        ] {
+            push_metric(
+                &mut out,
+                "temporalstore_ingestion_records_total",
+                &[("outcome", outcome.to_string())],
+                value,
+            );
+        }
+        push_metric(
+            &mut out,
+            "temporalstore_ingestion_kafka_lag",
+            &[("scope", "max".to_string())],
+            ingestion.stats.max_kafka_lag.max(0) as u64,
+        );
+        for offset in ingestion.kafka_offsets {
+            push_metric(
+                &mut out,
+                "temporalstore_ingestion_kafka_committed_offset",
+                &[
+                    ("topic", offset.topic),
+                    ("partition", offset.partition.to_string()),
+                ],
+                offset.committed_offset.max(0) as u64,
+            );
+        }
+        for stream in ingestion.stream_commits {
+            push_metric(
+                &mut out,
+                "temporalstore_ingestion_stream_committed_sequence",
+                &[("stream_id", stream.stream_id)],
+                stream.committed_sequence,
+            );
+        }
+        for checkpoint in ingestion.flink_checkpoints {
+            let status = format!("{:?}", checkpoint.status).to_ascii_lowercase();
+            push_metric(
+                &mut out,
+                "temporalstore_ingestion_flink_checkpoint_state",
+                &[
+                    ("job_id", checkpoint.job_id),
+                    ("operator_uid", checkpoint.operator_uid),
+                    ("subtask_index", checkpoint.subtask_index.to_string()),
+                    ("checkpoint_id", checkpoint.checkpoint_id.to_string()),
+                    ("status", status),
+                ],
+                1,
+            );
+        }
+        out
+    }
+}
