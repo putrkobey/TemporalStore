@@ -93,3 +93,98 @@ function inspect(path) {
     });
   };
   win.TextDecoder = function () { this.decode = (v) => Buffer.from(v || []).toString("utf8"); };
+
+  /* Seeded the way a page seeds it: pushed BEFORE any script runs. A watcher already waiting is
+     the case the drain exists for, and without seeding it the harness only ever proves that
+     registering AFTER the nav script works -- which is a different claim, and one that passes even
+     with the drain deleted. */
+  const early = { got: 0 };
+  win.__matrixarkFrameQueue = [];
+  win.__matrixarkFrameQueue.push(function () { early.got += 1; });
+
+  const names = Object.keys(win);
+  const values = names.map((k) => win[k]);
+
+  const attempts = [];
+  scripts.forEach((body, index) => {
+    const wantsToRegister = REGISTERS.test(body);
+    const queues = QUEUES.test(body);
+    const availableBefore = typeof win.__matrixarkOnFrame === "function";
+    try {
+      new Function(...names, body)(...values);
+    } catch (e) { /* a page that throws at load is another harness's business */ }
+    if (wantsToRegister || queues) {
+      attempts.push({ index, availableBefore, queues });
+    }
+  });
+  return { path, attempts, win, early,
+           defines: typeof win.__matrixarkOnFrame === "function" };
+}
+
+/* Register one more watcher the way a page does, then let the stream deliver. If it arrives, the
+   queue drained, the nav kept accepting after the drain, and frames reach watchers. */
+function deliversFrames(win) {
+  return new Promise((resolve) => {
+    let got = false;
+    const queue = win.__matrixarkFrameQueue;
+    if (!queue || typeof queue.push !== "function") { resolve(null); return; }
+    queue.push(function () { got = true; });
+    setTimeout(() => {
+      if (got) { resolve("stream"); return; }
+      /* A page that runs its own stream claims it, and the nav block then never opens one -- it is
+         fed by the page calling __matrixarkLiveFrame. Driving that page's whole load path is a
+         different harness's job, so the hand-off itself is exercised here: if a frame put through
+         it reaches the watcher, the registration and dispatch are sound. */
+      if (typeof win.__matrixarkLiveFrame === "function") {
+        try {
+          win.__matrixarkLiveFrame({ ts: 1, traffic: {}, imports: {}, warnings: 0,
+                                     embedding: { total: 7 } });
+        } catch (e) { /* reported below as a non-delivery */ }
+        setTimeout(() => resolve(got ? "own-stream" : false), 5);
+        return;
+      }
+      resolve(false);
+    }, 25);
+  });
+}
+
+let failures = 0;
+(async function () {
+for (const path of process.argv.slice(2)) {
+  const r = inspect(path);
+  const name = path.split(/[\\/]/).pop();
+  const direct = r.attempts.filter((a) => !a.queues);
+  if (!r.attempts.length) {
+    console.log("--   " + name + ": does not ask for frames");
+    continue;
+  }
+  const dead = direct.filter((a) => !a.availableBefore);
+  if (dead.length) {
+    console.log("FAIL " + name + ": script " + dead.map((a) => a.index).join(",") +
+                " registers a frame watcher before anything defines one, so it never registers");
+    failures += 1;
+  } else {
+    const delivered = await deliversFrames(r.win);
+    if (r.early.got === 0) {
+      console.log("FAIL " + name + ": a watcher queued before the nav script never received a " +
+                  "frame -- what pages queue is not being drained");
+      failures += 1;
+      continue;
+    }
+    if (delivered === "stream") {
+      console.log("ok   " + name + ": a watcher registers AND receives a frame");
+    } else if (delivered === "own-stream") {
+      console.log("ok   " + name + ": a watcher receives a frame through the page's own stream");
+    } else if (delivered === null) {
+      console.log("FAIL " + name + ": no frame queue exists after load, so nothing can register");
+      failures += 1;
+    } else {
+      console.log("FAIL " + name + ": a watcher registers and never receives a frame");
+      failures += 1;
+    }
+  }
+}
+
+console.log(failures === 0 ? "PASS" : "FAILED " + failures);
+process.exit(failures === 0 ? 0 : 1);
+}());
