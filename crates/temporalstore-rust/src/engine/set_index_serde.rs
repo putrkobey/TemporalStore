@@ -13,3 +13,33 @@ pub fn serialize<S>(
 ) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
+{
+    let encoded = value
+        .iter()
+        .map(|(key, members)| {
+            (
+                key,
+                members
+                    .iter()
+                    .map(|(member, address)| (member, address))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    encoded.serialize(serializer)
+}
+
+pub fn deserialize<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<super::state::ModelKey, BTreeMap<Vec<u8>, ElementEntry>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let encoded = HashMap::<super::state::ModelKey, Vec<(Vec<u8>, ElementEntry)>>::deserialize(
+        deserializer,
+    )?;
+    Ok(encoded
+        .into_iter()
+        .map(|(key, members)| (key, members.into_iter().collect()))
+        .collect())
+}
