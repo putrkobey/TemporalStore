@@ -86,3 +86,92 @@ fn routes_called() -> BTreeSet<String> {
             if path.is_dir() {
                 dirs.push(path);
                 continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let text = fs::read_to_string(&path).expect("read source");
+            for line in text.lines() {
+                if line.trim_start().starts_with("//") {
+                    continue;
+                }
+                let mut rest = line;
+                while let Some(open) = rest.find("\"/") {
+                    rest = &rest[open + 1..];
+                    let Some(close) = rest.find('"') else { break };
+                    let literal = &rest[..close];
+                    rest = &rest[close + 1..];
+                    if literal.starts_with("/ProxyService/") || literal.starts_with("/v1/") {
+                        found.insert(literal.to_string());
+                    }
+                }
+            }
+        }
+    }
+    found
+}
+
+#[test]
+fn proxy_route_contract() {
+    let called = routes_called();
+
+    // Premise: the scan reads the sources. An empty result would otherwise satisfy every
+    // assertion below while checking nothing -- which is exactly how 88 files went unnoticed.
+    assert!(
+        called.len() > 30,
+        "premise: the SDK calls the proxy; the scan found {} route(s)",
+        called.len()
+    );
+
+    let served: BTreeSet<String> = SERVED_ROUTES.iter().map(|r| r.to_string()).collect();
+    assert_eq!(
+        served.len(),
+        SERVED_ROUTES.len(),
+        "the served list has a duplicate"
+    );
+
+    // Each unserved route, by name, so the failure says why.
+    for route in UNSERVED_ROUTES {
+        assert!(
+            !called.contains(*route),
+            "the SDK calls {route}, which the dispatcher answers 404 for. Either add the arm in \
+             crates/temporalstore-rust/src/proxy/proxy_handle.rs and move the route into SERVED_ROUTES, \
+             or leave the method off as #1040 did."
+        );
+    }
+
+    // #1040's other half: the `/v1/*` shapes the proxy never served.
+    let v1: Vec<&String> = called.iter().filter(|r| r.starts_with("/v1/")).collect();
+    assert!(
+        v1.is_empty(),
+        "the SDK posts to {v1:?}; the proxy serves /ProxyService/* only"
+    );
+
+    let unexpected: Vec<&String> = called.difference(&served).collect();
+    assert!(
+        unexpected.is_empty(),
+        "the SDK calls {} route(s) that are not declared served:\n{}\nAdd each to SERVED_ROUTES \
+         only after checking the dispatcher has a POST arm for it.",
+        unexpected.len(),
+        unexpected
+            .iter()
+            .map(|r| format!("  {r}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    // A route that leaves the SDK should leave the list with it, so the list cannot drift into a
+    // record of routes nobody calls.
+    let stale: Vec<&String> = served.difference(&called).collect();
+    assert!(
+        stale.is_empty(),
+        "SERVED_ROUTES names {} route(s) the SDK no longer calls:\n{}\nRemove them, so this list \
+         stays a statement about this SDK.",
+        stale.len(),
+        stale
+            .iter()
+            .map(|r| format!("  {r}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
