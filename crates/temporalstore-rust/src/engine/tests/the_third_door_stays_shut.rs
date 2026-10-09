@@ -115,3 +115,237 @@ fn index_log_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
                 walk(&path, out);
             } else {
                 out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&dir.join("indexes").join("indexlogs"), &mut out);
+    out.sort();
+    out
+}
+
+/// `StringSet` for a live page, a `context_nodes` entry planted under the same key as a clone of
+/// that live entry, then `CommonExpire` to arm a deadline -- which is one of the two halves
+/// `delta_key_state_change` fires on, so the capture runs with the entry in place and writes a
+/// blob carrying `context_nodes`.
+///
+/// `CommonExpire` and not `StringSetEx`: a value-replacing write relocates the string's page and
+/// leaves the plant naming a superseded address, which is a second variable.
+fn build_fixture(dir: &std::path::Path, flush_base: bool) {
+    let engine = engine_at(dir);
+    engine.load_shard(SHARD);
+
+    let wrote = engine.execute(ExecuteRequest {
+        shard_id: SHARD,
+        command: Command::StringSet {
+            key: KEY.to_string(),
+            value: b"v".to_vec(),
+        },
+    });
+    assert!(wrote.status.ok, "the setup write failed: {}", wrote.status.message);
+
+    {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&SHARD).expect("the shard is loaded");
+        let live = shard
+            .strings()
+            .get(KEY)
+            .expect("the written string is resident")
+            .clone();
+        shard.context_nodes_mut().insert(KEY.into(), live.address());
+    }
+
+    let expired = engine.execute(ExecuteRequest {
+        shard_id: SHARD,
+        command: Command::CommonExpire {
+            key: KEY.to_string(),
+            ttl_ms: HOUR_MS,
+        },
+    });
+    assert!(
+        expired.status.ok,
+        "arming the deadline failed: {}",
+        expired.status.message
+    );
+
+    if flush_base {
+        engine.flush_shard_index(SHARD);
+    }
+    drop(engine);
+}
+
+fn planted_arrived(engine: &TemporalEngine) -> bool {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    shards
+        .get(&SHARD)
+        .map_or(false, |shard| shard.context_nodes().contains_key(KEY))
+}
+
+fn decisions_for_this_shard() -> Vec<(ShardId, u64, bool)> {
+    crate::index_log::probe::decisions()
+        .into_iter()
+        .filter(|(shard_id, _, _)| *shard_id == SHARD)
+        .collect()
+}
+
+fn applied_for_this_shard() -> Vec<(ShardId, u64)> {
+    crate::index_log::probe::applied()
+        .into_iter()
+        .filter(|(shard_id, _)| *shard_id == SHARD)
+        .collect()
+}
+
+/// Build the fixture with no base index, and return the directory holding it.
+///
+/// The two fixture controls live here so neither arm can run without them: the index log must
+/// contain the literal `context_nodes`, and no base index file may exist.
+fn fixture_with_no_base_index() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().expect("tempdir");
+    build_fixture(dir.path(), false);
+
+    let logs = index_log_files(dir.path());
+    assert!(
+        !logs.is_empty(),
+        "no file at all under the index-log root, so there is no fold to drive"
+    );
+    let carried = logs.iter().any(|path| {
+        std::fs::read(path).map_or(false, |bytes| {
+            bytes
+                .windows(b"context_nodes".len())
+                .any(|window| window == b"context_nodes")
+        })
+    });
+    assert!(
+        carried,
+        "no index-log file contains the literal `context_nodes`, so the capture never wrote the \
+         blob and nothing below says anything about the fold. Files checked: {logs:?}"
+    );
+
+    let base = base_index_path(dir.path());
+    let _ = std::fs::remove_file(&base);
+    assert!(
+        !base.exists(),
+        "a base index file is still present at {base:?}, so this is not the base-absent path"
+    );
+    dir
+}
+
+/// THE PLANT IS DELIVERABLE AND READABLE, through a path that is open.
+///
+/// Shared by both arms. Without it, a no-arrival in either is equally well explained by a fixture
+/// that never planted anything, and the two read identically from the far end.
+fn assert_the_plant_is_deliverable() {
+    let twin = tempfile::tempdir().expect("tempdir");
+    build_fixture(twin.path(), true);
+    assert!(
+        base_index_path(twin.path()).exists(),
+        "denominator: the twin was asked to flush a base index and has none"
+    );
+    let twin_engine = engine_at(twin.path());
+    twin_engine.load_shard(SHARD);
+    assert!(
+        planted_arrived(&twin_engine),
+        "the plant is not deliverable even through an accepted base index, so the verdicts below \
+         would be facts about the fixture and not about the fold"
+    );
+}
+
+/// ARM A: THE SHIPPED RECOVERY PATH DOES NOT CONSULT THE FOLD AT ALL.
+///
+/// This is the structural half of why the third door is shut, and it is the half #2151 did not
+/// have. On the single-barrier default `load_shard` reaches `load_index_base_only`, which passes
+/// `fold_deltas: false`. The fold-aware `load_index_checked` is the `TS_WAL_LEGACY_RECOVERY` arm,
+/// and `install_on_load_anchor` says of it, in as many words, that nothing in a shipped
+/// configuration selects it.
+///
+/// So this asserts the fold was asked about ZERO records, with the fixture controls proving there
+/// was a record there to be asked about. That is a stronger statement than "the entry did not
+/// arrive": the entry cannot arrive because the door carries no traffic. It fails if the default
+/// recovery path ever starts folding the log.
+///
+/// It also explains the observation that muddied #2151. The deadline and the string came back on
+/// this path from WAL REPLAY, not from the fold, which is why removing the index log entirely
+/// changed nothing there.
+#[test]
+fn the_shipped_recovery_path_asks_the_fold_about_nothing() {
+    assert_the_plant_is_deliverable();
+    let dir = fixture_with_no_base_index();
+
+    let _probe = FoldProbeArmed::arm();
+    let reloaded = engine_at(dir.path());
+    reloaded.load_shard(SHARD);
+
+    let decisions = decisions_for_this_shard();
+    let applied = applied_for_this_shard();
+    println!("  shipped path -> fold decisions {decisions:?}, fold applied {applied:?}");
+    assert!(
+        decisions.is_empty() && applied.is_empty(),
+        "the shipped recovery path consulted the index-log fold: decisions {decisions:?}, \
+         applied {applied:?}. That is a change of recovery arm -- `load_shard` reaching \
+         `load_index_checked` rather than `load_index_base_only` -- and it puts the \
+         `context_nodes` key-state fold back on a path a deployment actually takes. Re-read the \
+         second arm below before trusting any closure of this door."
+    );
+    assert!(
+        !planted_arrived(&reloaded),
+        "the entry arrived on the shipped path even though the fold was asked about nothing, so \
+         something other than the fold is writing this map"
+    );
+}
+
+/// ARM B: THE FOLD ITSELF, DRIVEN DIRECTLY, IS WHAT DECIDES THIS MAP.
+///
+/// `load_index_checked` is the exact entry point the fold-aware arm uses, and driving it is the
+/// precedent `expiry_scale` set for this situation. It is the right instrument for two reasons:
+///
+///   * it REPLAYS NO WAL, so anything in the returned state came from the base (absent here) or
+///     from the fold, and the replay confound that muddied the deadline observation is gone;
+///   * it needs no environment mutation. Setting `TS_WAL_LEGACY_RECOVERY` reaches the same code
+///     through `load_shard`, but that flag is process-global and would change the recovery arm of
+///     every other test running beside this one.
+///
+/// The fold being REACHED is asserted rather than assumed: the decision list non-empty, every
+/// decision not-reflected (with no base the anchor is 0 and `delta_record_is_reflected_by` opens
+/// with `base_anchor > 0`, so nothing may be skipped), and the applied list non-empty, which
+/// `note_fold_applied` records only after the page items are re-attached and the key states are
+/// applied.
+#[test]
+fn the_fold_driven_directly_decides_whether_this_map_arrives() {
+    assert_the_plant_is_deliverable();
+    let dir = fixture_with_no_base_index();
+
+    let _probe = FoldProbeArmed::arm();
+    let engine = engine_at(dir.path());
+    let folded = engine
+        .load_index_checked(SHARD, false)
+        .expect("the fold-aware load must not refuse this index log")
+        .expect("a fold over a non-empty index log must produce a state");
+
+    let decisions = decisions_for_this_shard();
+    let applied = applied_for_this_shard();
+    println!("  direct fold -> decisions {decisions:?}, applied {applied:?}");
+    assert!(
+        !decisions.is_empty(),
+        "the fold was asked about no record for shard {SHARD}, so it never saw the blob"
+    );
+    assert!(
+        decisions.iter().all(|(_, _, reflected)| !*reflected),
+        "the fold declared a record already reflected and skipped it: {decisions:?} -- with no \
+         base index the anchor is 0, so every record must be folded"
+    );
+    assert!(
+        !applied.is_empty(),
+        "the fold applied no record for shard {SHARD}; `note_fold_applied` fires after the key \
+         states are applied, so an empty list means `apply_key_states` never ran"
+    );
+
+    let arrived = folded.context_nodes().contains_key(KEY);
+    println!("  the planted `context_nodes` entry survived the fold: {arrived}");
+    assert!(
+        arrived,
+        "THE FOLD NO LONGER DELIVERS THIS MAP. That is a change in `apply_key_states` or in what \
+         runs after it. It would mean the population is foreclosed by the fold as well as by the \
+         recovery arm, which is good news -- but it must be measured and recorded rather than \
+         inherited, because this file and #2151 both rest on WHICH of the two reasons holds."
+    );
+}
