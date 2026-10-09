@@ -51,3 +51,110 @@ function world(answer, keyValue) {
 
   function element(id) {
     return {
+      id, value: keyValue, textContent: "", className: "", hidden: false, style: {}, dataset: {},
+      classList: { add() {}, remove() {}, toggle() {}, contains: () => false },
+      addEventListener() {}, setAttribute() {}, getAttribute: () => null,
+      appendChild() {}, querySelector: () => null, querySelectorAll: () => [],
+    };
+  }
+  const nodes = {};
+  const doc = {
+    hidden: false,
+    addEventListener(t, fn) { (listeners.document[t] = listeners.document[t] || []).push(fn); },
+    getElementById(id) { return (nodes[id] = nodes[id] || element(id)); },
+    createElement(tag) { return element(tag); },
+    querySelectorAll: () => [], querySelector: () => null, body: element("body"),
+  };
+  const win = {
+    addEventListener(t, fn) { (listeners.window[t] = listeners.window[t] || []).push(fn); },
+    location: { hash: "" },
+    setTimeout(fn, ms) { timers.push({ at: now + (ms || 0), fn, delay: ms || 0 }); },
+    clearTimeout() {}, setInterval() { return 0; }, clearInterval() {},
+  };
+
+  class Controller {
+    constructor() { this.signal = { aborted: false }; }
+    abort() { this.signal.aborted = true; }
+  }
+
+  const globals = {
+    document: doc, window: win, fetch(url, opts) {
+      calls.push({ url, headers: (opts && opts.headers) || {} });
+      return answer(calls.length);
+    },
+    AbortController: Controller,
+    setTimeout: win.setTimeout, clearTimeout: win.clearTimeout,
+    setInterval: win.setInterval, clearInterval: win.clearInterval,
+    TextDecoder: function () { this.decode = () => ""; },
+    sessionStorage: { getItem: () => keyValue || null, setItem() {}, removeItem() {} },
+    localStorage: { getItem: () => keyValue || null, setItem() {}, removeItem() {} },
+  };
+  new Function(...Object.keys(globals), src)(...Object.values(globals));
+
+  return {
+    calls, timers,
+    async advance(ms) {
+      const until = now + ms;
+      await flush();
+      for (let guard = 0; guard < 100; guard += 1) {
+        const next = timers.filter((t) => t.at <= until).sort((a, b) => a.at - b.at)[0];
+        if (!next) { break; }
+        timers.splice(timers.indexOf(next), 1);
+        now = Math.max(now, next.at);
+        next.fn();
+        await flush();
+      }
+      now = until;
+    },
+    delays: () => timers.map((t) => t.delay),
+  };
+}
+
+/* A stream that never settles: what a live connection looks like. */
+const live = () => new Promise(() => {});
+const refused = () => Promise.resolve({ ok: false, status: 401, body: null });
+
+(async () => {
+  /* ---------- a deployment that answers anonymously ---------- */
+  const openDeployment = world(live, "");
+  await openDeployment.advance(100);
+  ok("with no key it still asks", openDeployment.calls.length === 1,
+     "made " + openDeployment.calls.length + " request(s); the strip stayed dark");
+  ok("and sends no credential it does not have",
+     !("Authorization" in ((openDeployment.calls[0] || {}).headers || {})),
+     JSON.stringify(((openDeployment.calls[0] || {}).headers || {})));
+
+  /* ---------- a deployment that wants a key ---------- */
+  const closed = world(refused, "");
+  await closed.advance(100);
+  ok("a deployment that refuses is asked once", closed.calls.length === 1,
+     String(closed.calls.length));
+  const waits = closed.delays();
+  ok("and is then watched for a key, not backed off from",
+     waits.length > 0 && Math.min(...waits) <= 2000,
+     "next retry in " + JSON.stringify(waits) + " ms");
+
+  /* The promise this page already made: "the strip must not be the thing that 401s in a loop."
+     Asking once is the change; asking every two seconds forever would be a different bug wearing
+     the same patch, and only running the clock forward can tell them apart. */
+  await closed.advance(60000);
+  ok("and does not go on asking a deployment that said no", closed.calls.length === 1,
+     closed.calls.length + " requests in a minute with no key -- that is a 401 loop");
+
+  /* ---------- with a key ---------- */
+  const withKey = world(live, "k-test");
+  await withKey.advance(100);
+  ok("a key is still sent when there is one",
+     /Bearer k-test/.test(JSON.stringify(((withKey.calls[0] || {}).headers || {}))),
+     JSON.stringify(((withKey.calls[0] || {}).headers || {})));
+
+  /* ---------- the hidden-tab rule still holds ---------- */
+  const hidden = world(live, "k-test");
+  await hidden.advance(100);
+  const before = hidden.calls.length;
+  hidden.timers.length = 0;
+  ok("a connection is open before hiding", before === 1, String(before));
+
+  console.log(failures === 0 ? "PASS" : "FAILED " + failures);
+  process.exit(failures === 0 ? 0 : 1);
+})();
