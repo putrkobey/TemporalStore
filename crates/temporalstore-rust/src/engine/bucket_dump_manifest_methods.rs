@@ -847,3 +847,852 @@ impl TemporalEngine {
         // let the narrow field through; the page-by-page readability probe below deliberately
         // stays scoped, because a slab that is gone or corrupt is already caught by the two checks
         // over this set and reading every live page of the shard is the whole-store pass the
+        // preflight was bounded to avoid.
+        let manifest_block_slab_ids = manifest
+            .block_slab_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        if index_block_slab_ids != manifest_block_slab_ids {
+            return Err(Status::error(
+                "slot_dump_block_segment_mismatch",
+                format!(
+                    "slot dump page segment ids {manifest_block_slab_ids:?} do not match the live refs of the index it installs {index_block_slab_ids:?}"
+                ),
+            ));
+        }
+        if !manifest.dump_generation_id.is_empty()
+            && manifest.dump_generation_id != bucket_dump_generation_id(manifest)
+        {
+            return Err(Status::error(
+                "slot_dump_generation_mismatch",
+                "slot dump manifest generation id does not match its sequence, slots, pages, and index checksum",
+            ));
+        }
+        let mut unreadable_block_refs = 0usize;
+        let mut unreadable_block_bytes = 0u64;
+        for entry in live_block_entries {
+            if self.block_store.read(&entry.address).is_err() {
+                unreadable_block_refs = unreadable_block_refs.saturating_add(1);
+                unreadable_block_bytes = unreadable_block_bytes.saturating_add(entry.address.length());
+            }
+        }
+        if unreadable_block_refs > 0 {
+            return Err(Status::error(
+                "slot_dump_unreadable_block_refs",
+                format!(
+                    "slot dump has {unreadable_block_refs} unreadable page refs covering {unreadable_block_bytes} bytes"
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The install preflight, checking EVERY page the manifest names.
+    ///
+    /// This is what an actual install must use: a dump whose pages cannot be read must not be
+    /// installed, and a sample cannot establish that.
+    pub fn bucket_dump_install_preflight_report(
+        &self,
+        manifest: &BucketDumpManifest,
+    ) -> BucketDumpInstallPreflightReport {
+        self.bucket_dump_install_preflight_report_sampled(manifest, 0)
+    }
+
+    /// The same preflight, reading at most `readable_probe_limit` of the manifest's pages.
+    ///
+    /// 0 means no bound. The maintenance cycle computes a preflight every round for an install it
+    /// is not performing (`install_dump_manifest: false`) -- the result feeds a reported readiness
+    /// flag and nothing destructive -- and the unbounded version read every live page to do it:
+    /// measured 8,000 reads for 8,000 live pages, the last whole-store pass left in a round.
+    pub fn bucket_dump_install_preflight_report_sampled(
+        &self,
+        manifest: &BucketDumpManifest,
+        readable_probe_limit: usize,
+    ) -> BucketDumpInstallPreflightReport {
+        let current_wal_sequence = self.wal_store.stats(manifest.shard_id).last_sequence;
+        let current_index_log_sequence =
+            self.index_log_store.stats(manifest.shard_id).last_sequence;
+        let existing_slabs = self
+            .block_store
+            .slab_ids()
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let missing_block_slab_ids = manifest
+            .block_slab_ids
+            .iter()
+            .copied()
+            .filter(|id| !existing_slabs.contains(id))
+            .collect::<Vec<_>>();
+        let corrupt_block_slab_ids = self
+            .block_store
+            .slab_reports()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|report| {
+                report.has_corruption && manifest.block_slab_ids.contains(&report.block_slab_id)
+            })
+            .map(|report| report.block_slab_id)
+            .collect::<Vec<_>>();
+        let stale_manifest = current_index_log_sequence > manifest.index_log_sequence;
+        let mut blockers = Vec::new();
+        if stale_manifest {
+            blockers.push("stale_manifest_sequence".to_string());
+        }
+        if !missing_block_slab_ids.is_empty() {
+            blockers.push("missing_block_segments".to_string());
+        }
+        if !corrupt_block_slab_ids.is_empty() {
+            blockers.push("corrupt_block_segments".to_string());
+        }
+
+        let mut unreadable_block_ref_count = 0usize;
+        let mut unreadable_block_bytes = 0u64;
+        let mut restored_index = None;
+        if !manifest.index_bytes.is_empty() && missing_block_slab_ids.is_empty() {
+            if let Ok(restored) = crate::engine::decode_index_bytes(&manifest.index_bytes) {
+                let manifest_buckets = manifest.bucket_ids.iter().copied().collect::<BTreeSet<_>>();
+                let mut probed_block_refs = 0usize;
+                for entry in collect_live_block_entries(&restored) {
+                    // The restored image's own filing -- see the note in the install path.
+                    let routing_bucket = entry.filed_bucket().unwrap_or_else(|| {
+                        self.routing_bucket_for_key(manifest.shard_id, &entry.object_key)
+                    });
+                    if manifest_buckets.is_empty() || manifest_buckets.contains(&routing_bucket) {
+                        if readable_probe_limit > 0 && probed_block_refs >= readable_probe_limit {
+                            continue;
+                        }
+                        probed_block_refs += 1;
+                        if self.block_store.read(&entry.address).is_err() {
+                            unreadable_block_ref_count = unreadable_block_ref_count.saturating_add(1);
+                            unreadable_block_bytes =
+                                unreadable_block_bytes.saturating_add(entry.address.length());
+                        }
+                    }
+                }
+                // REPORTED, NOT COUNTED. `validate_bucket_dump_manifest` is what refuses this
+                // manifest and what moves the refusal counter; this is the read-only report, and
+                // a report that installs nothing must not look like an install that was refused.
+                // Without the blocker the report would say `install_safe` of a manifest the
+                // install then rejects, which is the shape of a preflight nobody can act on.
+                if crate::engine::persistence::index_stamp_is_stale(&restored) {
+                    blockers.push("stale_index_stamp".to_string());
+                }
+                restored_index = Some(restored);
+            } else {
+                blockers.push("invalid_manifest_index".to_string());
+            }
+        }
+        let (stale_object_conflicts, mut stale_block_conflicts) = restored_index
+            .as_ref()
+            .map(|restored| self.bucket_dump_stale_conflict_report(manifest, restored))
+            .unwrap_or_default();
+        let (
+            source_manifest_count,
+            missing_source_manifest_ids,
+            source_manifest_bucket_ids,
+            source_bucket_coverage_missing_bucket_ids,
+        ) = self.bucket_dump_merged_source_preflight(manifest);
+        if !missing_source_manifest_ids.is_empty() {
+            blockers.push("missing_source_manifests".to_string());
+        }
+        if !source_bucket_coverage_missing_bucket_ids.is_empty() {
+            blockers.push("source_manifest_slot_coverage".to_string());
+        }
+        if stale_manifest && stale_block_conflicts.is_empty() {
+            stale_block_conflicts.push(format!(
+                "index_log_sequence:{}->{}",
+                manifest.index_log_sequence, current_index_log_sequence
+            ));
+        }
+        if unreadable_block_ref_count > 0 {
+            blockers.push("unreadable_page_refs".to_string());
+        }
+        if let Some(handoff) = &manifest.load_version_handoff {
+            let current_load_version = self
+                .infos
+                .read()
+                .expect("info lock poisoned")
+                .get(&manifest.shard_id)
+                .map(|info| info.load_version)
+                .unwrap_or_default();
+            if current_load_version != handoff.previous_load_version {
+                blockers.push("load_version_handoff_mismatch".to_string());
+            }
+        }
+        if !stale_object_conflicts.is_empty() {
+            blockers.push("stale_object_conflicts".to_string());
+        }
+        if !stale_block_conflicts.is_empty() {
+            blockers.push("stale_block_conflicts".to_string());
+        }
+        blockers.sort();
+        blockers.dedup();
+
+        BucketDumpInstallPreflightReport {
+            shard_id: manifest.shard_id,
+            manifest_id: manifest.manifest_id.clone(),
+            install_safe: blockers.is_empty(),
+            blockers,
+            current_wal_sequence,
+            current_index_log_sequence,
+            manifest_wal_sequence: manifest.wal_sequence,
+            manifest_index_log_sequence: manifest.index_log_sequence,
+            missing_block_slab_ids,
+            corrupt_block_slab_ids,
+            unreadable_block_ref_count,
+            unreadable_block_bytes,
+            stale_manifest,
+            stale_object_conflict_count: stale_object_conflicts.len(),
+            stale_block_conflict_count: stale_block_conflicts.len(),
+            stale_object_conflicts,
+            stale_block_conflicts,
+            source_manifest_count,
+            missing_source_manifest_ids,
+            source_manifest_bucket_ids,
+            source_bucket_coverage_missing_bucket_ids,
+        }
+    }
+
+    pub(super) fn bucket_dump_merged_source_preflight(
+        &self,
+        manifest: &BucketDumpManifest,
+    ) -> (usize, Vec<String>, Vec<u32>, Vec<u32>) {
+        if manifest.manifest_kind != "merged_slot_dump" && manifest.source_manifest_ids.is_empty() {
+            return (0, Vec::new(), Vec::new(), Vec::new());
+        }
+        let (source_manifest_count, missing_source_manifest_ids, source_manifest_bucket_ids) =
+            if !manifest.source_manifest_coverage.is_empty() {
+                // Self-describing manifest: use the embedded per-source coverage so a
+                // target engine without the source files on disk can still validate.
+                let present = manifest
+                    .source_manifest_coverage
+                    .iter()
+                    .map(|coverage| coverage.manifest_id.clone())
+                    .collect::<BTreeSet<_>>();
+                let missing = manifest
+                    .source_manifest_ids
+                    .iter()
+                    .filter(|manifest_id| !present.contains(*manifest_id))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let bucket_ids = manifest
+                    .source_manifest_coverage
+                    .iter()
+                    .flat_map(|coverage| coverage.bucket_ids.iter().copied())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                (manifest.source_manifest_coverage.len(), missing, bucket_ids)
+            } else {
+                self.bucket_dump_source_manifest_coverage(
+                    manifest.shard_id,
+                    &manifest.source_manifest_ids,
+                )
+            };
+        let source_buckets = source_manifest_bucket_ids
+            .iter()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let missing_bucket_ids = manifest
+            .bucket_ids
+            .iter()
+            .copied()
+            .filter(|bucket| !source_buckets.contains(bucket))
+            .collect::<Vec<_>>();
+        (
+            source_manifest_count,
+            missing_source_manifest_ids,
+            source_manifest_bucket_ids,
+            missing_bucket_ids,
+        )
+    }
+
+    pub(super) fn bucket_dump_source_manifest_coverage(
+        &self,
+        shard_id: ShardId,
+        source_manifest_ids: &[String],
+    ) -> (usize, Vec<String>, Vec<u32>) {
+        let mut source_manifest_count = 0usize;
+        let mut missing_source_manifest_ids = Vec::new();
+        let mut source_manifest_bucket_ids = BTreeSet::new();
+        for manifest_id in source_manifest_ids {
+            match bucket_dump_manifest_at(&self.index_dir, shard_id, manifest_id) {
+                Ok(Some(source))
+                    if source.shard_id == shard_id
+                        && bucket_dump_manifest_checksum(&source)
+                            .map(|checksum| checksum == source.checksum)
+                            .unwrap_or(false) =>
+                {
+                    source_manifest_count = source_manifest_count.saturating_add(1);
+                    source_manifest_bucket_ids.extend(source.bucket_ids);
+                }
+                _ => missing_source_manifest_ids.push(manifest_id.clone()),
+            }
+        }
+        (
+            source_manifest_count,
+            missing_source_manifest_ids,
+            source_manifest_bucket_ids.into_iter().collect(),
+        )
+    }
+
+    pub(super) fn bucket_dump_stale_conflict_report(
+        &self,
+        manifest: &BucketDumpManifest,
+        restored: &ShardState,
+    ) -> (Vec<String>, Vec<String>) {
+        let manifest_buckets = manifest.bucket_ids.iter().copied().collect::<BTreeSet<_>>();
+        let manifest_entries =
+            bucket_dump_entries_by_key(manifest.shard_id, restored, &manifest_buckets, |key| {
+                self.routing_bucket_for_key(manifest.shard_id, key)
+            });
+        let current_entries = {
+            let shards = self.shards.read().expect("engine lock poisoned");
+            let Some(current) = shards.get(&manifest.shard_id) else {
+                return (Vec::new(), Vec::new());
+            };
+            bucket_dump_entries_by_key(manifest.shard_id, current, &manifest_buckets, |key| {
+                self.routing_bucket_for_key(manifest.shard_id, key)
+            })
+        };
+        // bucket_dump_entries_by_key keys pages by "kind:object_key:component:page_id",
+        // so a value update (which allocates a new page_id) shows up as a removed page
+        // plus a new page for the same object. Classify at the object level (strip the
+        // trailing :page_id): a page whose object still exists on the other side is a
+        // page conflict; only an object present on exactly one side is an object
+        // conflict.
+        let object_level = |key: &str| -> String {
+            key.rsplit_once(':')
+                .map(|(prefix, _)| prefix.to_string())
+                .unwrap_or_else(|| key.to_string())
+        };
+        let manifest_object_keys = manifest_entries
+            .keys()
+            .map(|key| object_level(key))
+            .collect::<BTreeSet<_>>();
+        let current_object_keys = current_entries
+            .keys()
+            .map(|key| object_level(key))
+            .collect::<BTreeSet<_>>();
+        let mut stale_object_conflicts = Vec::new();
+        let mut stale_block_conflicts = Vec::new();
+        for key in manifest_entries.keys().chain(current_entries.keys()) {
+            let object_key = object_level(key);
+            match (manifest_entries.get(key), current_entries.get(key)) {
+                (Some(manifest_address), Some(current_address)) => {
+                    if manifest_address != current_address {
+                        stale_block_conflicts.push(object_key);
+                    }
+                }
+                (Some(_), None) => {
+                    if current_object_keys.contains(&object_key) {
+                        stale_block_conflicts.push(object_key);
+                    }
+                }
+                (None, Some(_)) => {
+                    if manifest_object_keys.contains(&object_key) {
+                        stale_block_conflicts.push(object_key);
+                    } else {
+                        stale_object_conflicts.push(object_key);
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        stale_object_conflicts.sort();
+        stale_object_conflicts.dedup();
+        stale_block_conflicts.sort();
+        stale_block_conflicts.dedup();
+        (stale_object_conflicts, stale_block_conflicts)
+    }
+
+    pub fn bucket_dump_fault_matrix_report(&self, shard_id: ShardId) -> BucketDumpFaultMatrixReport {
+        let manifest = match self.create_bucket_dump_manifest(shard_id, Vec::new()) {
+            Ok(manifest) => manifest,
+            Err(status) => {
+                let scenario = BucketDumpFaultScenarioReport {
+                    scenario: "create_manifest".to_string(),
+                    passed: false,
+                    expected_code: "ok".to_string(),
+                    actual_code: status.code,
+                    blockers: Vec::new(),
+                    install_safe: false,
+                };
+                return BucketDumpFaultMatrixReport {
+                    shard_id,
+                    manifest_id: String::new(),
+                    production_ready_slice: false,
+                    scenario_count: 1,
+                    passed_count: 0,
+                    failed_scenarios: vec![scenario.clone()],
+                    scenarios: vec![scenario],
+                };
+            }
+        };
+
+        let mut scenarios = Vec::new();
+
+        let mut checksum_mismatch = manifest.clone();
+        checksum_mismatch.logical_bytes = checksum_mismatch.logical_bytes.saturating_add(1);
+        let checksum_code = self
+            .validate_bucket_dump_manifest(&checksum_mismatch)
+            .err()
+            .map(|status| status.code)
+            .unwrap_or_else(|| "ok".to_string());
+        scenarios.push(bucket_dump_fault_scenario(
+            "checksum_mismatch",
+            "slot_dump_checksum_mismatch",
+            checksum_code,
+            Vec::new(),
+            false,
+        ));
+
+        let mut partial = manifest.clone();
+        partial.index_bytes.clear();
+        partial.checksum =
+            bucket_dump_manifest_checksum(&partial).unwrap_or_else(|err| err.code.clone());
+        let partial_code = self
+            .install_bucket_dump_manifest(&partial)
+            .err()
+            .map(|status| status.code)
+            .unwrap_or_else(|| "ok".to_string());
+        scenarios.push(bucket_dump_fault_scenario(
+            "partial_manifest",
+            "slot_dump_partial_manifest",
+            partial_code,
+            Vec::new(),
+            false,
+        ));
+
+        let mut missing = manifest.clone();
+        let missing_slab_id = missing
+            .block_slab_ids
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or_default()
+            .saturating_add(1_000_000);
+        missing.block_slab_ids.push(missing_slab_id);
+        missing.block_slab_ids.sort_unstable();
+        missing.checksum =
+            bucket_dump_manifest_checksum(&missing).unwrap_or_else(|err| err.code.clone());
+        let missing_preflight = self.bucket_dump_install_preflight_report(&missing);
+        let missing_code = self
+            .validate_bucket_dump_manifest(&missing)
+            .err()
+            .map(|status| status.code)
+            .unwrap_or_else(|| "ok".to_string());
+        scenarios.push(bucket_dump_fault_scenario(
+            "missing_block_segment",
+            "slot_dump_missing_block_segments",
+            missing_code,
+            missing_preflight.blockers,
+            missing_preflight.install_safe,
+        ));
+
+        let mut stale_code = "not_run".to_string();
+        let mut stale_blockers = Vec::new();
+        let mut stale_install_safe = false;
+        let stale_write = self.execute(ExecuteRequest {
+            shard_id,
+            command: Command::StringSet {
+                key: "__slot_dump_fault_matrix_stale__".to_string(),
+                value: b"newer".to_vec(),
+            },
+        });
+        if stale_write.status.ok {
+            let stale_preflight = self.bucket_dump_install_preflight_report(&manifest);
+            stale_install_safe = stale_preflight.install_safe;
+            stale_blockers = stale_preflight.blockers;
+            stale_code = self
+                .install_bucket_dump_manifest(&manifest)
+                .err()
+                .map(|status| status.code)
+                .unwrap_or_else(|| "ok".to_string());
+        }
+        scenarios.push(bucket_dump_fault_scenario(
+            "stale_manifest",
+            "slot_dump_stale_manifest",
+            stale_code,
+            stale_blockers,
+            stale_install_safe,
+        ));
+
+        let restart_code;
+        let mut restart_blockers = Vec::new();
+        let mut restart_install_safe = false;
+        match self.create_bucket_dump_manifest(shard_id, Vec::new()) {
+            Ok(restart_manifest) => {
+                match self.persist_bucket_dump_install_marker_by_fields(
+                    restart_manifest.shard_id,
+                    &restart_manifest.manifest_id,
+                    "prepare",
+                    restart_manifest.wal_sequence,
+                    restart_manifest.index_log_sequence,
+                ) {
+                    Ok(()) => {
+                        let before = self.bucket_dump_install_roll_forward_reports(shard_id);
+                        let applied = self.roll_forward_bucket_dump_installs(shard_id);
+                        let interrupted_after = self.interrupted_bucket_dump_installs(shard_id);
+                        restart_install_safe = before.iter().any(|report| report.can_retry_install);
+                        if !restart_install_safe {
+                            restart_blockers.push("roll_forward_not_retryable".to_string());
+                        }
+                        if !applied
+                            .iter()
+                            .any(|report| report.completed_install && report.completed_commit)
+                        {
+                            restart_blockers.push("roll_forward_not_completed".to_string());
+                        }
+                        if !interrupted_after.is_empty() {
+                            restart_blockers.push("interrupted_markers_remaining".to_string());
+                        }
+                        restart_code = if restart_blockers.is_empty() {
+                            "slot_dump_restart_roll_forward".to_string()
+                        } else {
+                            "slot_dump_restart_roll_forward_failed".to_string()
+                        };
+                    }
+                    Err(err) => restart_code = format!("slot_dump_marker_write_failed:{err}"),
+                }
+            }
+            Err(status) => restart_code = status.code,
+        }
+        scenarios.push(bucket_dump_fault_scenario(
+            "restart_during_install_roll_forward",
+            "slot_dump_restart_roll_forward",
+            restart_code,
+            restart_blockers,
+            restart_install_safe,
+        ));
+
+        let mut corrupt_code = "not_run".to_string();
+        let mut corrupt_blockers = Vec::new();
+        let mut corrupt_install_safe = false;
+        if let Some(slab_id) = manifest.block_slab_ids.first().copied() {
+            match self.block_store.read_slab(slab_id) {
+                Ok(mut slab) if !slab.is_empty() => {
+                    if let Some(last) = slab.last_mut() {
+                        *last ^= 0xff;
+                    }
+                    match self.block_store.install_slab(slab_id, &slab) {
+                        Ok(()) => {
+                            let corrupt_preflight =
+                                self.bucket_dump_install_preflight_report(&manifest);
+                            corrupt_install_safe = corrupt_preflight.install_safe;
+                            corrupt_blockers = corrupt_preflight.blockers;
+                            corrupt_code = if corrupt_blockers
+                                .iter()
+                                .any(|blocker| blocker == "corrupt_block_segments")
+                            {
+                                "corrupt_block_segments".to_string()
+                            } else {
+                                self.validate_bucket_dump_manifest(&manifest)
+                                    .err()
+                                    .map(|status| status.code)
+                                    .unwrap_or_else(|| "ok".to_string())
+                            };
+                        }
+                        Err(err) => corrupt_code = format!("install_segment_failed:{err}"),
+                    }
+                }
+                Ok(_) => corrupt_code = "empty_segment".to_string(),
+                Err(err) => corrupt_code = format!("read_segment_failed:{err}"),
+            }
+        }
+        scenarios.push(bucket_dump_fault_scenario(
+            "corrupt_block_segment",
+            "corrupt_block_segments",
+            corrupt_code,
+            corrupt_blockers,
+            corrupt_install_safe,
+        ));
+
+        let passed_count = scenarios.iter().filter(|scenario| scenario.passed).count();
+        let failed_scenarios = scenarios
+            .iter()
+            .filter(|scenario| !scenario.passed)
+            .cloned()
+            .collect::<Vec<_>>();
+        BucketDumpFaultMatrixReport {
+            shard_id,
+            manifest_id: manifest.manifest_id,
+            production_ready_slice: failed_scenarios.is_empty(),
+            scenario_count: scenarios.len(),
+            passed_count,
+            failed_scenarios,
+            scenarios,
+        }
+    }
+
+    pub fn install_bucket_dump_manifest(&self, manifest: &BucketDumpManifest) -> Result<(), Status> {
+        self.validate_bucket_dump_manifest(manifest)?;
+        let preflight = self.bucket_dump_install_preflight_report(manifest);
+        if !preflight.install_safe {
+            if preflight.stale_manifest {
+                return Err(Status::error(
+                    "slot_dump_stale_manifest",
+                    format!(
+                        "manifest index sequence {} is older than current {}",
+                        manifest.index_log_sequence, preflight.current_index_log_sequence
+                    ),
+                ));
+            }
+            if preflight.unreadable_block_ref_count > 0 {
+                return Err(Status::error(
+                    "slot_dump_unreadable_block_refs",
+                    format!(
+                        "slot dump has {} unreadable page refs covering {} bytes",
+                        preflight.unreadable_block_ref_count, preflight.unreadable_block_bytes
+                    ),
+                ));
+            }
+            return Err(Status::error(
+                "slot_dump_install_preflight_failed",
+                format!(
+                    "slot dump install preflight blockers: {:?}",
+                    preflight.blockers
+                ),
+            ));
+        }
+        self.validate_bucket_dump_generation_for_install(manifest)?;
+        let current_index_sequence = self.index_log_store.stats(manifest.shard_id).last_sequence;
+        if current_index_sequence > manifest.index_log_sequence {
+            return Err(Status::error(
+                "slot_dump_stale_manifest",
+                format!(
+                    "manifest index sequence {} is older than current {}",
+                    manifest.index_log_sequence, current_index_sequence
+                ),
+            ));
+        }
+        let mut restored = crate::engine::decode_index_bytes(&manifest.index_bytes)
+            .map_err(|err| Status::error("slot_dump_invalid_index", err.to_string()))?;
+        // Rebuild the unserialized model maps from the durable bucket index BEFORE rebuilding
+        // ownership. `rebuild_bucket_block_ownership` clears the bucket map and repopulates it
+        // from the model maps, so running it against a state whose `hashes` map never survived
+        // serialization would drop every hash page from the restored index -- and that index is
+        // what gets persisted durably below.
+        rebuild_unserialized_model_maps_from_bucket_index(&mut restored);
+        // THE WHOLE RANGE HERE IS LOAD-BEARING, and it is the one place in this change where
+        // that is true. `restored` is a DECODED MANIFEST INDEX -- a whole-shard image, written by
+        // whatever routing range the SOURCE shard ran on, whose pages already carry explicit
+        // routing buckets from that range. `rebuild_bucket_block_ownership` does not merely place
+        // unrouted pages by the range it is given, it also FILTERS on it
+        // (`routing_bucket < start || routing_bucket > end` -> `continue`), so handing it the
+        // INSTALLING shard's range silently deletes every page whose source bucket falls outside
+        // it.
+        //
+        // Not hypothetical: a cross-range restore is what
+        // `storage_merged_dump_load_policy_coordinates_dump_load_replay_and_index_gc` drives --
+        // source on `load_shard` (0..u32::MAX), restore target on `0..16_383` -- and passing the
+        // target's range here made it read `merged-a` back as None. A whole-shard image must be
+        // installed whole; narrowing it is data loss, not reconciliation.
+        //
+        // The unrouted pages this leaves filed outside the target's range are the known residual,
+        // and they are recoverable: the addresses stay unrouted, so a later rebuild over the live
+        // model maps re-derives their placement from the shard's own range.
+        rebuild_bucket_block_ownership(manifest.shard_id, &mut restored, 0, u32::MAX);
+        let restored_index_bytes = serialize_index(&restored);
+        self.persist_bucket_dump_install_marker(manifest, "prepare")
+            .map_err(|err| Status::error("slot_dump_install_failed", err.to_string()))?;
+        // THE INSTALL IS WHAT PUTS THE STATE ON DISK, SO THE INSTALL IS WHAT RECORDS ITS
+        // RANGE. The write below materializes the base index UNCONDITIONALLY -- before the
+        // `shard_was_loaded` check -- and `store_has_on_disk_state` counts exactly that file.
+        // Without this, the install-then-load restore (the production order, reached over
+        // `POST /server/storage/dumps/install`) leaves state that no stamp describes, and the
+        // load then has to infer the range from the stamp's absence.
+        //
+        // THE RANGE IS THE ONE THIS INSTALL FILES UNDER, not the one anybody requested:
+        // `shard_routing_range` is the same accessor `routing_bucket_for_key` uses above, and
+        // its missing-info default is the whole range precisely for "a dump manifest installed
+        // before its shard is loaded" -- so an unloaded install records the range it actually
+        // filed under and a loaded one records the range it was loaded with. Behaviour is
+        // unchanged either way; what changes is that it is now WRITTEN DOWN instead of being
+        // recoverable only by a later load guessing the same default.
+        //
+        // BEFORE THE INDEX BYTES, the order `install_index_bytes` already takes: a crash
+        // between the two leaves a stamp with no index, which a load treats as a new store,
+        // rather than an index with no stamp, which is the state this closes.
+        let (start_routing_bucket, end_routing_bucket) =
+            self.shard_routing_range(manifest.shard_id);
+        crate::engine::routing_range_stamp::write_routing_range_stamp(
+            &self.index_dir,
+            manifest.shard_id,
+            crate::engine::routing_range_stamp::RoutingRangeStamp {
+                start_routing_bucket,
+                end_routing_bucket,
+            },
+        )
+        .map_err(|err| Status::error("slot_dump_install_failed", err.to_string()))?;
+        // Durable (bulk-gate-bypassing) write: under bulk-ingest mode the ordinary
+        // persist_index_bytes is a no-op, which would leave the stale pre-manifest index on
+        // disk while the advanced replay watermark suppresses replay of the records this
+        // manifest embeds -- silently losing them. Recovery install must always materialize.
+        self.persist_index_bytes_durable(manifest.shard_id, &restored_index_bytes)
+            .map_err(|err| Status::error("slot_dump_install_failed", err.to_string()))?;
+        self.persist_bucket_dump_install_marker(manifest, "install")
+            .map_err(|err| Status::error("slot_dump_install_failed", err.to_string()))?;
+        let shard_was_loaded = self
+            .shards
+            .read()
+            .expect("engine lock poisoned")
+            .contains_key(&manifest.shard_id);
+        if shard_was_loaded {
+            // Gate serving off BEFORE the swap, the way load_shard_with does. Between the swap
+            // and the replay below the shard describes itself as it was AT THE DUMP, which is
+            // not what it holds; a read served from that window answers with the post-dump
+            // records missing, and a write interleaved with the replay regresses the anchor.
+            // Set on the info row first so a concurrent execute() that observes the swapped
+            // shard is guaranteed (happens-before via the shards lock) to observe this too.
+            if let Some(info) = self
+                .infos
+                .write()
+                .expect("info lock poisoned")
+                .get_mut(&manifest.shard_id)
+            {
+                info.recovering = true;
+            }
+            // Stamped with the TARGET's own range, not the image's. The whole-range rebuild above
+            // is what keeps this image whole and must stay; what the stamp decides is where the
+            // NEXT write files a page, and the comment above already records that the unrouted
+            // residual is meant to come back into range under the shard's own range. Nothing that
+            // is already filed moves: this places, it does not filter.
+            self.install_shard_state(manifest.shard_id, restored);
+        }
+        // Persist the manifest BEFORE the replay. If the replay below fails, the durable state
+        // is the embedded index anchored at the dump plus this manifest -- behind the log, never
+        // ahead of it -- so a later load finds the manifest, installs it, and re-derives the
+        // suffix from the WAL. Persisting it after the replay would leave a failed install with
+        // no lineage to recover from.
+        self.persist_bucket_dump_manifest(manifest)
+            .map_err(|err| Status::error("slot_dump_install_failed", err.to_string()))?;
+        if shard_was_loaded {
+            // A RESTORE IS THE INSTALL PLUS THE REPLAY. The manifest's watermark is the anchor
+            // carried INSIDE its embedded index, so every record written after the dump lives
+            // only in the WAL. Installing the index and stopping reconstructs the shard as it
+            // was at the dump and reports success -- which is indistinguishable from a correct
+            // restore unless you count the post-dump records separately.
+            //
+            // Only reached when the shard is already loaded. When it is not, the durable index
+            // written above carries the dump's anchor and the next load_shard_with replays the
+            // same suffix from it; replaying here as well would be the same work done twice.
+            //
+            // A log holding nothing past the anchor replays nothing and costs a scan.
+            self.rehydrate_wal_resident_blocks(manifest.shard_id);
+            if let Err(status) =
+                self.replay_wal_into_shard(manifest.shard_id, manifest.wal_sequence)
+            {
+                // Leave the shard gated. Replay refuses on a WAL hole / an outcome it cannot
+                // install, and serving a shard that is missing its tail is the failure this
+                // whole path exists to prevent. The durable anchor is still the dump's, so a
+                // reload re-derives what the snapshot describes.
+                return Err(status);
+            }
+            if let Some(info) = self
+                .infos
+                .write()
+                .expect("info lock poisoned")
+                .get_mut(&manifest.shard_id)
+            {
+                info.recovering = false;
+            }
+        }
+        self.persist_bucket_dump_install_marker(manifest, "commit")
+            .map_err(|err| Status::error("slot_dump_install_failed", err.to_string()))?;
+        Ok(())
+    }
+
+    pub fn install_merged_bucket_dump_manifest(
+        &self,
+        manifest: &BucketDumpManifest,
+    ) -> BucketDumpMergedInstallReport {
+        let preflight = self.bucket_dump_install_preflight_report(manifest);
+        let rollback_marker_written = self
+            .persist_bucket_dump_install_marker(manifest, "rollback")
+            .is_ok();
+        if !preflight.install_safe {
+            return BucketDumpMergedInstallReport {
+                shard_id: manifest.shard_id,
+                manifest_id: manifest.manifest_id.clone(),
+                source_manifest_ids: manifest.source_manifest_ids.clone(),
+                bucket_ids: manifest.bucket_ids.clone(),
+                source_manifest_count: preflight.source_manifest_count,
+                missing_source_manifest_ids: preflight.missing_source_manifest_ids.clone(),
+                source_bucket_coverage_missing_bucket_ids: preflight
+                    .source_bucket_coverage_missing_bucket_ids
+                    .clone(),
+                stale_object_conflict_count: preflight.stale_object_conflict_count,
+                stale_block_conflict_count: preflight.stale_block_conflict_count,
+                preflight,
+                rollback_marker_written,
+                prepare_marker_written: false,
+                install_marker_written: false,
+                commit_marker_written: false,
+                load_version_handoff: manifest.load_version_handoff.clone(),
+                installed: false,
+                status_code: "slot_dump_install_preflight_failed".to_string(),
+            };
+        }
+        match self.install_bucket_dump_manifest(manifest) {
+            Ok(()) => {
+                let mut load_version_handoff = manifest.load_version_handoff.clone();
+                if let Some(handoff) = load_version_handoff.as_mut() {
+                    if let Some(info) = self
+                        .infos
+                        .write()
+                        .expect("info lock poisoned")
+                        .get_mut(&manifest.shard_id)
+                    {
+                        info.load_version = handoff.next_load_version;
+                        handoff.applied = true;
+                    }
+                }
+                BucketDumpMergedInstallReport {
+                    shard_id: manifest.shard_id,
+                    manifest_id: manifest.manifest_id.clone(),
+                    source_manifest_ids: manifest.source_manifest_ids.clone(),
+                    bucket_ids: manifest.bucket_ids.clone(),
+                    source_manifest_count: preflight.source_manifest_count,
+                    missing_source_manifest_ids: preflight.missing_source_manifest_ids.clone(),
+                    source_bucket_coverage_missing_bucket_ids: preflight
+                        .source_bucket_coverage_missing_bucket_ids
+                        .clone(),
+                    stale_object_conflict_count: preflight.stale_object_conflict_count,
+                    stale_block_conflict_count: preflight.stale_block_conflict_count,
+                    preflight,
+                    rollback_marker_written,
+                    prepare_marker_written: true,
+                    install_marker_written: true,
+                    commit_marker_written: true,
+                    load_version_handoff,
+                    installed: true,
+                    status_code: "ok".to_string(),
+                }
+            }
+            Err(status) => BucketDumpMergedInstallReport {
+                shard_id: manifest.shard_id,
+                manifest_id: manifest.manifest_id.clone(),
+                source_manifest_ids: manifest.source_manifest_ids.clone(),
+                bucket_ids: manifest.bucket_ids.clone(),
+                source_manifest_count: preflight.source_manifest_count,
+                missing_source_manifest_ids: preflight.missing_source_manifest_ids.clone(),
+                source_bucket_coverage_missing_bucket_ids: preflight
+                    .source_bucket_coverage_missing_bucket_ids
+                    .clone(),
+                stale_object_conflict_count: preflight.stale_object_conflict_count,
+                stale_block_conflict_count: preflight.stale_block_conflict_count,
+                preflight,
+                rollback_marker_written,
+                prepare_marker_written: false,
+                install_marker_written: false,
+                commit_marker_written: false,
+                load_version_handoff: manifest.load_version_handoff.clone(),
+                installed: false,
+                status_code: status.code,
+            },
+        }
+    }
+}
