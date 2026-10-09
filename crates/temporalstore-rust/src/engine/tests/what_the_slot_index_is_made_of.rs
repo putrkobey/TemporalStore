@@ -514,3 +514,2071 @@ impl Tally {
                         "[CLAUSE group-is-whole] `{label}` is named in a group total and was never \
                          charged, so the group is summing over a term that is not in the index"
                     )
+                });
+                row.bytes
+            })
+            .sum()
+    }
+}
+
+/// EVERY TERM THE PAGE ENTRY'S COMPOSITE MAP KEY IS MADE OF, and nothing else.
+///
+/// Named as a list rather than matched by a prefix so that a term added under `page/` later has to
+/// be put in or left out ON PURPOSE. [`Tally::sum_of`] refuses a member that was not charged.
+const BLOCK_KEY_TERMS: &[&str] = &[
+    "page/map_key_quotes",
+    "page/map_key/kind",
+    "page/map_key/object_key",
+    "page/map_key/component_slot",
+    "page/map_key/block_slab_id",
+    "page/map_key/offset",
+    "page/map_key/length",
+    "page/map_key/block_id",
+    "page/map_key/generation",
+    "page/map_key/separators",
+    "page/map_key/empty_slot_separator",
+];
+
+/// THE ENTRY FIELDS WHOSE VALUES THE COMPOSITE KEY RESTATES, envelope included -- because removing
+/// a field removes its JSON name and its separator too, and a report counting only the value would
+/// understate what the field costs.
+///
+/// TWO MEMBERS LEFT WHEN THE PROPOSAL LANDED. `entry/object_key` and `entry/model_id` were the
+/// first two rows; the entry does not write them any more. What remains restated is the ADDRESS,
+/// and it is restated for good: its five values are in the key, and the two PRESENCE bits beside
+/// them are not, so it cannot be reconstructed. See
+/// `the_key_a_block_is_filed_under_inverts_exactly::the_presence_bits_of_an_address_are_not_in_the_key_it_renders`.
+const ENTRY_RESTATED_TERMS: &[&str] = &[
+    "entry/address/field_name",
+    "entry/address/open_brace",
+    "entry/address/field_tails",
+    "entry/address/a",
+    "entry/address/l",
+    "entry/address/pi",
+    "entry/address/oi",
+    "entry/address/g",
+];
+
+/// The five address values as the composite key renders them: decimals and nothing else.
+const KEY_ADDRESS_TERMS: &[&str] = &[
+    "page/map_key/block_slab_id",
+    "page/map_key/offset",
+    "page/map_key/length",
+    "page/map_key/block_id",
+    "page/map_key/generation",
+];
+
+/// The same five values as the named `address` object beside the key writes them.
+const ENTRY_ADDRESS_TERMS: &[&str] = &[
+    "entry/address/field_name",
+    "entry/address/open_brace",
+    "entry/address/field_tails",
+    "entry/address/a",
+    "entry/address/l",
+    "entry/address/pi",
+    "entry/address/oi",
+    "entry/address/g",
+];
+
+const FNV1A64_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
+
+fn fnv1a_update(hash: &mut u64, bytes: &[u8]) {
+    for byte in bytes {
+        *hash ^= u64::from(*byte);
+        *hash = hash.wrapping_mul(FNV1A64_PRIME);
+    }
+}
+
+/// THE STABLE OBJECT ID FOR A SHARD, A KIND AND A KEY -- WRITTEN OUT HERE, AND NOT FOR STYLE.
+///
+/// `engine::hashing::stable_block_object_id` bumps two PROCESS-WIDE atomics on every call in a test
+/// build, and other arms in this suite reset and read them. A probe that called it once per page
+/// over an 8,000-object corpus would move a counter it is not measuring, in a binary that runs its
+/// tests in one process -- a measurement perturbing the suite it is meant to be measured in.
+///
+/// AND IT IS ALSO THE HONEST FORM OF THE CLAIM. What is being shown is that the WRITTEN page
+/// entries carry enough to rebuild the written `object_index`; an independent implementation over
+/// their bytes is what shows that, where calling the engine's own would be the engine agreeing with
+/// itself. The cost is that this is a GOLDEN: a change to the derivation breaks it, which is the
+/// right direction -- the ids are a stored shape.
+fn stable_object_id_from_the_written_terms(shard: u64, kind: &str, key: &str) -> u64 {
+    let mut hash = FNV1A64_OFFSET_BASIS;
+    fnv1a_update(&mut hash, shard.to_string().as_bytes());
+    fnv1a_update(&mut hash, b":");
+    fnv1a_update(&mut hash, kind.as_bytes());
+    fnv1a_update(&mut hash, b":");
+    fnv1a_update(&mut hash, key.as_bytes());
+    hash
+}
+
+/// The bytes a JSON value occupies on its own.
+fn jlen(value: &serde_json::Value) -> usize {
+    serde_json::to_vec(value).expect("a value serializes").len()
+}
+
+/// The bytes a JSON object key occupies, quotes included.
+fn klen(name: &str) -> usize {
+    serde_json::to_vec(name).expect("a name serializes").len()
+}
+
+// =================================================================================================
+// THE FIXTURE
+// =================================================================================================
+
+/// One store's reading: the shard's three surfaces, and the structures the decomposition walks.
+struct Reading {
+    objects: usize,
+    blocks: usize,
+    buckets: usize,
+    width: usize,
+    shape: KeyShape,
+    /// The whole shard as a JSON value, which is what the partition is taken on.
+    value: serde_json::Value,
+    json_len: usize,
+    msgpack_len: usize,
+    container_len: usize,
+    /// Every page's written map key paired with the handle the live map files it under, joined on
+    /// the renderer the encoder itself uses. Used to price a handle-keyed page index; NOT used for
+    /// the reconstruction claim, which goes the other way, from the entry's written bytes.
+    handles_by_written_key: BTreeMap<String, u64>,
+}
+
+fn reading_on(keys: usize, width: usize, shape: KeyShape, end_routing_bucket: u32) -> Reading {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = TemporalEngine::with_local_dirs(
+        64,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    let response = engine.load_shard_with(crate::control::LoadShardRequest {
+        shard_id: SHARD,
+        table_name: "what-the-slot-index-is-made-of".to_string(),
+        shard_uri: "local://what-the-slot-index-is-made-of/41".to_string(),
+        start_routing_bucket: 0,
+        end_routing_bucket: end_routing_bucket,
+        readonly: false,
+        load_version: 1,
+        local_node_id: Some(1),
+    });
+    assert!(
+        response.status.ok,
+        "[CLAUSE seed-landed] the fixture could not load shard {SHARD} on 0..{end_routing_bucket}: \
+         {:?}",
+        response.status
+    );
+
+    for ordinal in 0..keys {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringSet {
+                key: key_text(ordinal, width, shape),
+                value: vec![b'v'; 128],
+            },
+        });
+        assert!(response.status.ok, "the seed must ack at {ordinal}: {response:?}");
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&SHARD).expect("shard is loaded");
+    assert_eq!(
+        keys,
+        shard.strings().len(),
+        "[CLAUSE seed-landed] the fixture acked {keys} string object(s) and the index holds {}, so \
+         the denominator every figure below is taken against is not the corpus",
+        shard.strings().len()
+    );
+
+    let buckets = shard.bucket_index.bucket_map.len();
+    let blocks: usize = shard
+        .bucket_index
+        .bucket_map
+        .values()
+        .map(|node| node.block_index.len())
+        .sum();
+
+    // THE JOIN FROM A WRITTEN KEY TO THE HANDLE THE LIVE MAP FILES THE PAGE UNDER.
+    //
+    // Built through the encoder's own renderer, which is legitimate HERE and nowhere else in this
+    // module: this is bookkeeping for a counterfactual, not the redundancy claim. The claim is
+    // taken in the other direction -- the key rebuilt from the entry's WRITTEN BYTES -- because a
+    // comparison against `block_index_written_key` would be a renderer compared with itself.
+    let identity_keys = crate::engine::state::BlockKeysByPosition::from_lookup(
+        &shard.bucket_index.object_block_lookup,
+    );
+    let mut handles_by_written_key = BTreeMap::new();
+    for node in shard.bucket_index.bucket_map.values() {
+        let identities = crate::engine::state::block_identities_in(node, &identity_keys);
+        for (handle, block) in node.block_index.iter() {
+            let object_key = identities.get(handle).unwrap_or_else(|| {
+                panic!(
+                    "[CLAUSE join-total] the page at handle {handle} in bucket {} has no identity \
+                     beside it, so no counterfactual over page keys can be priced",
+                    node.routing_bucket
+                )
+            });
+            let written = crate::engine::state::block_index_written_key(object_key, block);
+            assert!(
+                handles_by_written_key.insert(written.clone(), *handle).is_none(),
+                "[CLAUSE join-total] two pages render the written key `{written}`, so a key is not \
+                 a page's name and the join below is not one-to-one"
+            );
+        }
+    }
+    assert_eq!(
+        handles_by_written_key.len(),
+        blocks,
+        "[CLAUSE join-total] the join names {} page(s) against {blocks} resident",
+        handles_by_written_key.len()
+    );
+
+    let container = crate::engine::encode_index_bytes(shard);
+    let msgpack = msgpack_payload_of(&container);
+    let json = serde_json::to_vec(shard).expect("the index must serialize as JSON");
+    let value = serde_json::to_value(shard).expect("the index must serialize as a value");
+
+    Reading {
+        objects: keys,
+        blocks,
+        buckets,
+        width,
+        shape,
+        value,
+        json_len: json.len(),
+        msgpack_len: msgpack.len(),
+        container_len: container.len(),
+        handles_by_written_key,
+    }
+}
+
+/// The pre-compression payload the default codec writes, pulled back out of the container.
+fn msgpack_payload_of(container: &[u8]) -> Vec<u8> {
+    const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+    let start = container
+        .windows(4)
+        .position(|window| window == ZSTD_MAGIC)
+        .expect("the container must hold a zstd frame, or this is not the shipped artefact");
+    assert!(
+        start < 32,
+        "the zstd magic is {start} bytes into the container, too far to be its header"
+    );
+    zstd::stream::decode_all(&container[start..]).expect("the container's frame must decompress")
+}
+
+impl Reading {
+    fn object(&self) -> &serde_json::Map<String, serde_json::Value> {
+        self.value.as_object().expect("the served index is a JSON object")
+    }
+
+    /// The bytes the `slot_index` entry occupies in the shard's own stream: its quoted name, its
+    /// colon and its value. The same quantity the published 226.35 B/object is a division of.
+    fn slot_index_entry_bytes(&self) -> usize {
+        let value = self
+            .object()
+            .get("slot_index")
+            .expect("the core index is written under `slot_index`");
+        klen("slot_index") + 1 + jlen(value)
+    }
+}
+
+// =================================================================================================
+// THE WALK
+// =================================================================================================
+
+/// The eight slots a page's written key composes, in the order the composite writes them.
+struct KeySlots {
+    kind: String,
+    object_key: String,
+    component: String,
+    block_slab_id: String,
+    offset: String,
+    length: String,
+    block_id: String,
+    generation: String,
+}
+
+/// Split a written page key into its eight slots, and REFUSE a key the split does not recompose.
+///
+/// The five numbers are taken from the right, because an object key may contain a colon while a
+/// rendered `u64` may not. The recomposition is asserted rather than assumed: a split that does
+/// not rebuild its input is a guess, and every per-slot byte figure below would inherit it.
+fn split_written_key(key: &str) -> KeySlots {
+    let mut from_right = key.rsplitn(6, ':');
+    let generation = from_right.next().expect("a key has a last slot").to_string();
+    let block_id = from_right.next().unwrap_or_default().to_string();
+    let length = from_right.next().unwrap_or_default().to_string();
+    let offset = from_right.next().unwrap_or_default().to_string();
+    let block_slab_id = from_right.next().unwrap_or_default().to_string();
+    let head = from_right.next().unwrap_or_default();
+    let mut from_left = head.splitn(2, ':');
+    let kind = from_left.next().unwrap_or_default().to_string();
+    let rest = from_left.next().unwrap_or_default();
+    // The component slot is the LAST colon-separated run of the head's tail, and the object key is
+    // everything before it -- so an object key holding a colon stays in one slot.
+    let (object_key, component) = match rest.rfind(':') {
+        Some(at) => (rest[..at].to_string(), rest[at + 1..].to_string()),
+        None => (rest.to_string(), String::new()),
+    };
+    let slots = KeySlots {
+        kind,
+        object_key,
+        component,
+        block_slab_id,
+        offset,
+        length,
+        block_id,
+        generation,
+    };
+    let recomposed = format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}",
+        slots.kind,
+        slots.object_key,
+        slots.component,
+        slots.block_slab_id,
+        slots.offset,
+        slots.length,
+        slots.block_id,
+        slots.generation
+    );
+    assert_eq!(
+        recomposed, key,
+        "[CLAUSE key-split-recomposes] the eight-slot split of a written page key does not rebuild \
+         it, so every per-slot figure taken from it is a guess"
+    );
+    slots
+}
+
+/// A node field that is not one of the twelve the encoder writes is a PANIC naming it.
+fn node_field_label(name: &str) -> &'static str {
+    match name {
+        "routing_slot" => "node/routing_slot",
+        "layout" => "node/layout",
+        "dirty" => "node/dirty",
+        "deleted" => "node/deleted",
+        "meta_loaded" => "node/meta_loaded",
+        "loading" => "node/loading",
+        "in_memory" => "node/in_memory",
+        "ttl_ms" => "node/ttl_ms",
+        "dirty_generation" => "node/dirty_generation",
+        "object_index" => "node/object_index",
+        "deleted_object_index" => "node/deleted_object_index",
+        "tombstone_elements" => "node/tombstone_elements",
+        other => panic!(
+            "[CLAUSE no-unclassified] a bucket node writes the key `{other}`, which this \
+             decomposition does not name -- its bytes would be absorbed by whatever term was \
+             charged last, and the sum would still balance"
+        ),
+    }
+}
+
+/// An address slot that is not one of the five the wire declares is a PANIC naming it.
+fn address_field_label(name: &str) -> &'static str {
+    match name {
+        "a" => "entry/address/a",
+        "l" => "entry/address/l",
+        "pi" => "entry/address/pi",
+        "oi" => "entry/address/oi",
+        "g" => "entry/address/g",
+        other => panic!(
+            "[CLAUSE no-unclassified] a stored address writes the slot `{other}`, which this \
+             decomposition does not name"
+        ),
+    }
+}
+
+/// THE WHOLE OF `slot_index`, CHARGED TERM BY TERM, WITH THREE SUM IDENTITIES ASSERTED.
+///
+/// Returns the tally, the page-level subtotal measured independently, and the reconstruction count.
+struct Walked {
+    tally: Tally,
+    /// The bytes of every `block_index` VALUE, summed over buckets and measured directly off the
+    /// JSON rather than from the tally. The second, independent identity: a term charged at the
+    /// bucket level that belongs at the page level balances the whole and breaks this.
+    block_subtree_bytes: usize,
+    /// Pages whose written key was rebuilt from the entry's own written bytes, character for
+    /// character.
+    keys_reconstructed: usize,
+    /// Buckets whose `routing_slot` field was rebuilt from the map key it is filed under.
+    slots_reconstructed: usize,
+    /// Buckets whose written `object_index` is exactly the set of ids derivable from the kinds and
+    /// object keys of the page entries written in that same bucket.
+    buckets_whose_object_index_is_derivable: usize,
+    /// Pages whose stored address writes its `oi` slot as JSON null.
+    ///
+    /// `impl From<ElementEntry> for BlockAddressWire` fills `object_id` with a LITERAL `None` --
+    /// the type it converts from has no such field to read -- so this is a property of the writer
+    /// and not of a workload. Counted rather than asserted from the source, because a count is
+    /// what fails when the literal stops being one.
+    nil_object_id_slots: usize,
+}
+
+fn walk(reading: &Reading) -> Walked {
+    let mut tally = Tally::default();
+
+    let slot_index = reading
+        .object()
+        .get("slot_index")
+        .expect("the core index is written under `slot_index`");
+    tally.add("slot_index/field_name", klen("slot_index") + 1, klen("slot_index") + 1);
+    tally.add("slot_index/open_brace", 1, 0);
+
+    let core = slot_index.as_object().expect("the core index writes an object");
+    for name in core.keys() {
+        assert_eq!(
+            name, "bucket_map",
+            "[CLAUSE no-unclassified] the core index writes the key `{name}`, which this \
+             decomposition does not name"
+        );
+    }
+    assert_eq!(
+        core.len(),
+        1,
+        "[CLAUSE no-unclassified] the core index writes {} key(s); this walk charges the \
+         punctuation of exactly one",
+        core.len()
+    );
+    tally.add("bucket_map/field_name", klen("bucket_map") + 1, klen("bucket_map") + 1);
+    tally.add("bucket_map/field_tail", 1, 0);
+
+    let bucket_map = core
+        .get("bucket_map")
+        .expect("the core index writes `bucket_map`")
+        .as_object()
+        .expect("the bucket map writes an object");
+    assert_eq!(
+        bucket_map.len(),
+        reading.buckets,
+        "[CLAUSE part-sum] the written bucket map holds {} node(s) against {} resident",
+        bucket_map.len(),
+        reading.buckets
+    );
+    assert!(
+        !bucket_map.is_empty(),
+        "[CLAUSE part-sum] the bucket map is empty, so there is nothing here to decompose"
+    );
+    tally.add("bucket_map/open_brace", 1, 0);
+
+    let mut block_subtree_bytes = 0usize;
+    let mut keys_reconstructed = 0usize;
+    let mut slots_reconstructed = 0usize;
+    let mut nil_object_id_slots = 0usize;
+    let mut buckets_whose_object_index_is_derivable = 0usize;
+    let mut blocks_seen = 0usize;
+
+    for (bucket_key, node_value) in bucket_map.iter() {
+        tally.add("bucket/map_key", klen(bucket_key), 0);
+        tally.add("bucket/map_key_colon", 1, 0);
+        tally.add("bucket/map_entry_tail", 1, 0);
+
+        let node = node_value.as_object().expect("a bucket node writes an object");
+        tally.add("node/open_brace", 1, 0);
+        tally.add("node/field_tails", node.len(), 0);
+
+        for (field, value) in node.iter() {
+            if field == "page_index" {
+                tally.add("node/page_index/field_name", klen(field) + 1, klen(field) + 1);
+                continue;
+            }
+            let label = node_field_label(field);
+            tally.add(label, klen(field) + 1 + jlen(value), klen(field) + 1);
+            if field == "routing_slot" {
+                // RECONSTRUCTED FROM THE MAP KEY, measured per bucket. The map key is a JSON
+                // object key and so a quoted decimal; the field is a number. Both are parsed and
+                // compared as numbers, which is the comparison that says one restates the other.
+                let from_key: u64 = bucket_key
+                    .parse()
+                    .expect("a bucket map key is a rendered routing bucket");
+                let from_field = value
+                    .as_u64()
+                    .expect("`routing_slot` is written as a number");
+                assert_eq!(
+                    from_key, from_field,
+                    "[CLAUSE routing-slot-restates-the-map-key] bucket `{bucket_key}` holds \
+                     `routing_slot` {from_field}, so the field is not a restatement of the key and \
+                     its bytes are not redundancy"
+                );
+                slots_reconstructed += 1;
+            }
+        }
+
+        // THE IDS THE NODE WRITES, held while the pages beside them are walked.
+        let written_object_ids: std::collections::BTreeSet<u64> = node
+            .get("object_index")
+            .expect("a bucket node writes `object_index`")
+            .as_array()
+            .expect("`object_index` writes an array")
+            .iter()
+            .map(|id| id.as_u64().expect("an object id is written as a number"))
+            .collect();
+        let mut derived_object_ids: std::collections::BTreeSet<u64> =
+            std::collections::BTreeSet::new();
+
+        let block_index = node
+            .get("page_index")
+            .expect("a bucket node writes `block_index`");
+        block_subtree_bytes += jlen(block_index);
+        let blocks = block_index.as_object().expect("the page index writes an object");
+        assert!(
+            !blocks.is_empty(),
+            "[CLAUSE no-empty-page-index] bucket `{bucket_key}` writes an EMPTY page index, and \
+             this walk charges one separator byte per entry -- an empty object's second brace has \
+             no entry to be charged to, so the partition identity would be off by one per such \
+             bucket"
+        );
+        tally.add("page_index/open_brace", 1, 0);
+
+        for (block_key, entry_value) in blocks.iter() {
+            blocks_seen += 1;
+            // QUOTES AND NOTHING ELSE. `klen` is the JSON rendering, so this difference is the two
+            // quotes plus any escaping; the fixture's keys hold none, and the assertion is what
+            // keeps the label honest rather than letting an escape hide inside an envelope term.
+            assert_eq!(
+                klen(block_key) - block_key.len(),
+                2,
+                "[CLAUSE map-key-quotes-are-two] the written page key `{block_key}` renders {} B \
+                 wider than its characters, so it carries escaping and this term is not quotes",
+                klen(block_key) - block_key.len()
+            );
+            tally.add("page/map_key_quotes", klen(block_key) - block_key.len(), 0);
+            tally.add("page/map_key_colon", 1, 0);
+            tally.add("page/map_entry_tail", 1, 0);
+
+            let slots = split_written_key(block_key);
+            tally.add("page/map_key/kind", slots.kind.len(), 0);
+            tally.add("page/map_key/object_key", slots.object_key.len(), 0);
+            tally.add("page/map_key/component_slot", slots.component.len(), 0);
+            tally.add("page/map_key/block_slab_id", slots.block_slab_id.len(), 0);
+            tally.add("page/map_key/offset", slots.offset.len(), 0);
+            tally.add("page/map_key/length", slots.length.len(), 0);
+            tally.add("page/map_key/block_id", slots.block_id.len(), 0);
+            tally.add("page/map_key/generation", slots.generation.len(), 0);
+            // SEVEN SEPARATORS, AND ONE OF THEM DELIMITS A SLOT THAT IS ALWAYS EMPTY. Charged
+            // apart from the other six because what it is worth to remove is a different number.
+            tally.add("page/map_key/separators", 6, 0);
+            tally.add("page/map_key/empty_slot_separator", 1, 0);
+
+            let entry = entry_value.as_object().expect("a page entry writes an object");
+            tally.add("entry/open_brace", 1, 0);
+            tally.add("entry/field_tails", entry.len(), 0);
+            for (field, value) in entry.iter() {
+                match field.as_str() {
+                    // NO `object_key` AND NO `model_id` ARMS. They are the key's own second and
+                    // first slots, the decoder reads them back out of it, and the entry writes
+                    // neither -- so an entry carrying one lands in the `no-unclassified` panic
+                    // below, which is the tripwire that says the field came back.
+                    "dirty" => {
+                        tally.add("entry/dirty", klen(field) + 1 + jlen(value), klen(field) + 1)
+                    }
+                    "deleted" => {
+                        tally.add("entry/deleted", klen(field) + 1 + jlen(value), klen(field) + 1)
+                    }
+                    "address" => {
+                        tally.add(
+                            "entry/address/field_name",
+                            klen(field) + 1,
+                            klen(field) + 1,
+                        );
+                        let address =
+                            value.as_object().expect("a stored address writes an object");
+                        tally.add("entry/address/open_brace", 1, 0);
+                        tally.add("entry/address/field_tails", address.len(), 0);
+                        for (slot, slot_value) in address.iter() {
+                            let label = address_field_label(slot);
+                            tally.add(
+                                label,
+                                klen(slot) + 1 + jlen(slot_value),
+                                klen(slot) + 1,
+                            );
+                            if slot == "oi" && slot_value.is_null() {
+                                nil_object_id_slots += 1;
+                            }
+                        }
+                    }
+                    other => panic!(
+                        "[CLAUSE no-unclassified] a page entry writes the key `{other}`, which \
+                         this decomposition does not name"
+                    ),
+                }
+            }
+
+            // ---- THE RECONSTRUCTION, AND HALF OF IT IS CLOSED BECAUSE THE PROPOSAL LANDED ----
+            //
+            // THIS CLAUSE WAS `key-restates-the-entry` AND IT HAS INVERTED. It rebuilt the whole
+            // page key from the entry's own written `object_key`, `model_id` and `address`, and
+            // asserted the result was the key the entry is filed under -- which was the evidence
+            // that the key held nothing the entry did not, so calling it redundancy was fair. The
+            // entry writes neither name now, so that comparison has ONE SOURCE on two of its
+            // terms and would be a renderer compared with itself. It is RETIRED rather than
+            // weakened: a comparison that cannot disagree is worse than no comparison, because its
+            // name goes on claiming the stronger thing.
+            //
+            // WHAT SURVIVES IS THE OTHER DIRECTION, WHICH IS WHERE THE REMAINING DUPLICATION IS.
+            // The entry's `address` still restates five of the key's slots, so the address is
+            // decoded back out of the written value through its production `Deserialize` -- which
+            // is what a load has in hand -- and compared against the five decimals in the key,
+            // read by THIS MODULE'S splitter and not by the production parse.
+            let decoded: crate::ElementEntry = serde_json::from_value(
+                entry
+                    .get("address")
+                    .expect("a page entry writes `address`")
+                    .clone(),
+            )
+            .expect("a written address decodes through its own production impl");
+            assert_eq!(
+                (
+                    slots.block_slab_id.as_str(),
+                    slots.offset.as_str(),
+                    slots.length.as_str(),
+                    slots.block_id.as_str(),
+                    slots.generation.as_str(),
+                ),
+                (
+                    decoded.block_slab_id().to_string().as_str(),
+                    decoded.offset().to_string().as_str(),
+                    decoded.length().to_string().as_str(),
+                    decoded.block_id().unwrap_or_default().to_string().as_str(),
+                    decoded.generation().unwrap_or_default().to_string().as_str(),
+                ),
+                "[CLAUSE address-restates-the-key] the five decimals in the page key {block_key:?} \
+                 are not what the entry's own written address spells, so the address is not a \
+                 restatement of them and classing it redundancy would be wrong"
+            );
+            keys_reconstructed += 1;
+
+            // AND THE OBJECT ID THE NODE FILES THIS PAGE'S OBJECT UNDER, FROM THE KEY'S OWN TWO
+            // NAME SLOTS -- which is where those two terms live now, and the reason this arm still
+            // has content: the ids in `node/object_index` are derived from a kind and an object key
+            // that the entry no longer carries, so the derivation reads the key.
+            //
+            // A LIVE page only: a removal's id goes to `deleted_object_index`, and this fixture
+            // performs none -- which `optional-stays-absent` pins.
+            if !entry
+                .get("deleted")
+                .expect("a page entry writes `deleted`")
+                .as_bool()
+                .expect("`deleted` is written as a boolean")
+            {
+                derived_object_ids.insert(stable_object_id_from_the_written_terms(
+                    SHARD,
+                    &slots.kind,
+                    &slots.object_key,
+                ));
+            }
+        }
+
+        if derived_object_ids == written_object_ids {
+            buckets_whose_object_index_is_derivable += 1;
+        }
+    }
+
+    assert_eq!(
+        blocks_seen, reading.blocks,
+        "[CLAUSE part-sum] the walk saw {blocks_seen} written page(s) against {} resident",
+        reading.blocks
+    );
+
+    Walked {
+        tally,
+        block_subtree_bytes,
+        keys_reconstructed,
+        slots_reconstructed,
+        buckets_whose_object_index_is_derivable,
+        nil_object_id_slots,
+    }
+}
+
+/// Print one tally as a table, and assert every declared term is non-zero (or exactly zero where
+/// it is structurally empty).
+fn report(reading: &Reading, walked: &Walked) {
+    let tally = &walked.tally;
+    let whole = reading.slot_index_entry_bytes();
+    let per = |bytes: usize| bytes as f64 / reading.objects as f64;
+
+    println!();
+    println!(
+        "================ `slot_index` TERM BY TERM, {} OBJECTS IN {} BUCKETS ON 0..{} \
+         ({} KEYS, WIDTH {}) ================",
+        reading.objects,
+        reading.buckets,
+        SHIPPED_END_BUCKET,
+        reading.shape.label(),
+        reading.width
+    );
+    println!(
+        "  {:<38} {:>12} {:>10} {:>11} {:>12} {:>12} {:>8}",
+        "term", "bytes", "instances", "B/object", "% slot_index", "scale", "nature"
+    );
+    let mut ordered: Vec<(&'static str, Row)> =
+        tally.rows.iter().map(|entry| (*entry.0, *entry.1)).collect();
+    ordered.sort_by(|left, right| right.1.bytes.cmp(&left.1.bytes).then(left.0.cmp(right.0)));
+    for (label, row) in ordered.iter() {
+        let (scale, nature, _) = declared(label);
+        println!(
+            "  {:<38} {:>12} {:>10} {:>11.3} {:>11.2}% {:>12} {:>8}",
+            label,
+            row.bytes,
+            row.instances,
+            per(row.bytes),
+            100.0 * row.bytes as f64 / whole as f64,
+            scale.label(),
+            nature.label()
+        );
+    }
+    println!(
+        "  {:<38} {:>12} {:>10} {:>11.3} {:>11.2}%",
+        "TOTAL",
+        tally.total(),
+        "",
+        per(tally.total()),
+        100.0 * tally.total() as f64 / whole as f64
+    );
+
+    println!();
+    println!("  BY SCALE");
+    for scale in [Scale::PerBlock, Scale::PerBucket, Scale::PerShard] {
+        let bytes = tally.at_scale(scale);
+        println!(
+            "    {:<12} {:>12} B  {:>9.3} B/object  {:>6.2}%",
+            scale.label(),
+            bytes,
+            per(bytes),
+            100.0 * bytes as f64 / whole as f64
+        );
+    }
+    println!("  BY NATURE");
+    for nature in [Nature::Payload, Nature::Identity, Nature::Envelope, Nature::Redundancy] {
+        let bytes = tally.of_nature(nature);
+        println!(
+            "    {:<12} {:>12} B  {:>9.3} B/object  {:>6.2}%",
+            nature.label(),
+            bytes,
+            per(bytes),
+            100.0 * bytes as f64 / whole as f64
+        );
+    }
+    let name_tax: usize = tally.rows.values().map(|row| row.name_bytes).sum();
+    println!(
+        "  JSON FIELD NAMES, a cross-cut and not a term: {name_tax} B = {:.3} B/object = {:.2}% \
+         -- what a NAMED encoding spends on keys. The served index is msgpack `with_struct_map` \
+         for a stated reason: the positional form mis-reads a struct that skipped an absent \
+         optional, so this is a priced DECLINE and not a finding.",
+        per(name_tax),
+        100.0 * name_tax as f64 / whole as f64
+    );
+}
+
+// =================================================================================================
+// THE COUNTERFACTUAL SURFACES
+// =================================================================================================
+
+/// The container `TSIDX\x01` codec 1 writes: the magic, the codec id, and a zstd-3 frame over the
+/// struct's JSON.
+///
+/// THIS IS A PRODUCTION CONTAINER ARM OF THIS STORE AND NOT A SURFACE INVENTED HERE.
+/// `engine::wrap_index_json` writes exactly this whenever the codec is not the binary one, and
+/// `decode_index_bytes` sniffs and reads it. It is used for every counterfactual below for one
+/// reason: a doctored stream has to be RE-ENCODED, and the only re-encoding this module can take
+/// that is byte-for-byte what production writes is the JSON one. A msgpack payload rebuilt from a
+/// `serde_json::Value` is NOT that -- measured: it differs from the production payload at byte 4,
+/// because a `Value` writes its keys sorted while the struct writes them in declaration order, and
+/// the reordering alone moves the compressed size by 5%. So the counterfactual is taken on the
+/// container arm it can be taken on exactly, and
+/// [`what_removing_a_redundant_slot_index_term_would_cost_the_shipped_container`] asserts how far
+/// the two container arms are apart before quoting a price from either.
+fn json_container_bytes(value: &serde_json::Value) -> usize {
+    const MAGIC: &[u8] = b"TSIDX\x01";
+    const CODEC_BYTE: usize = 1;
+    const ZSTD_LEVEL: i32 = 3;
+    let json = serde_json::to_vec(value).expect("the doctored index serializes");
+    let payload =
+        zstd::stream::encode_all(json.as_slice(), ZSTD_LEVEL).expect("the payload compresses");
+    MAGIC.len() + CODEC_BYTE + payload.len()
+}
+
+/// The removals this module prices, each one a term the decomposition classified as redundancy.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Candidate {
+    /// Nothing is changed. The CONTROL: it must reproduce the undoctored stream byte for byte, or
+    /// every price below is a price of the doctoring machinery rather than of a removal.
+    Control,
+    /// The page index is keyed by the handle the LIVE map already keys it by, rendered as a
+    /// decimal, in place of the composite.
+    BlockKeyBecomesTheHandle,
+    /// The composite loses the slot that is always empty, and the separator that delimits it.
+    BlockKeyDropsTheEmptySlot,
+    /// The entry loses `address`, whose five values its own map key spells.
+    ///
+    /// Priced and BLOCKED, and the reason is not a scope decision. The five VALUES are in the key;
+    /// the two PRESENCE bits beside them are not. `block_index_written_key` renders
+    /// `block_id().unwrap_or_default()`, and `ElementEntry::block_id()` is `None` EXACTLY while a
+    /// block is log-resident -- so a staged page and the first page of an object in a slab render
+    /// ONE key and differ in `log_backed()`, which has production readers.
+    /// `the_key_a_block_is_filed_under_inverts_exactly::the_presence_bits_of_an_address_are_not_in_the_key_it_renders`
+    /// builds both and asserts the keys identical. Trimming the address slot-wise instead is
+    /// blocked independently: `BlockAddressWire` is shared with the index log, which packs it
+    /// POSITIONALLY.
+    EntryDropsAddress,
+    /// The stored address loses its `oi` slot, which the writer fills from a literal `None`.
+    ///
+    /// Priced and DECLINED, with the reason in the source rather than in this comment: the index
+    /// log packs the same struct POSITIONALLY, so a slot skipped here shortens that array and
+    /// shifts every slot after it. Pricing a decline is what makes it a decision.
+    AddressDropsTheAlwaysNilSlot,
+}
+
+impl Candidate {
+    fn label(self) -> &'static str {
+        match self {
+            Candidate::Control => "control: nothing removed",
+            Candidate::BlockKeyBecomesTheHandle => "page key -> the live map's handle",
+            Candidate::BlockKeyDropsTheEmptySlot => "page key -> drop the always-empty slot",
+            Candidate::EntryDropsAddress => "entry -> drop `address` (BLOCKED)",
+            Candidate::AddressDropsTheAlwaysNilSlot => "address -> drop the always-nil `oi` slot",
+        }
+    }
+}
+
+/// `slot_index` as it would be written with one term removed.
+///
+/// A BYTE-WEIGHT COUNTERFACTUAL, AND THAT IS ALL IT CLAIMS TO BE. It says what the artefact would
+/// weigh, not that the result loads -- except for the one candidate whose loadability is MEASURED,
+/// by [`the_page_keys_characters_are_not_read_back_by_the_decoder`], which feeds the doctored bytes
+/// to the production decoder.
+fn doctor(reading: &Reading, candidate: Candidate) -> serde_json::Value {
+    let mut value = reading.value.clone();
+    {
+        let bucket_map = value
+            .get_mut("slot_index")
+            .expect("slot_index")
+            .get_mut("bucket_map")
+            .expect("bucket_map")
+            .as_object_mut()
+            .expect("an object");
+        for node in bucket_map.values_mut() {
+            let block_index = node
+                .get("page_index")
+                .expect("page_index")
+                .as_object()
+                .expect("an object")
+                .clone();
+            let mut replacement = serde_json::Map::with_capacity(block_index.len());
+            for (block_key, entry_value) in block_index.iter() {
+                let mut entry = entry_value.clone();
+                let fields = entry.as_object_mut().expect("a page entry is an object");
+                let new_key = match candidate {
+                    Candidate::Control
+                    | Candidate::EntryDropsAddress
+                    | Candidate::AddressDropsTheAlwaysNilSlot => block_key.clone(),
+                    Candidate::BlockKeyBecomesTheHandle => reading
+                        .handles_by_written_key
+                        .get(block_key)
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "[CLAUSE join-total] the written key `{block_key}` has no handle \
+                                 beside it, so this counterfactual cannot be priced"
+                            )
+                        })
+                        .to_string(),
+                    Candidate::BlockKeyDropsTheEmptySlot => {
+                        let slots = split_written_key(block_key);
+                        assert!(
+                            slots.component.is_empty(),
+                            "[CLAUSE empty-slot-is-empty] the component slot of `{block_key}` holds \
+                             `{}`, so dropping it would drop a term rather than a hole",
+                            slots.component
+                        );
+                        format!(
+                            "{}:{}:{}:{}:{}:{}:{}",
+                            slots.kind,
+                            slots.object_key,
+                            slots.block_slab_id,
+                            slots.offset,
+                            slots.length,
+                            slots.block_id,
+                            slots.generation
+                        )
+                    }
+                };
+                match candidate {
+                    Candidate::EntryDropsAddress => {
+                        fields.remove("address").expect("address was written");
+                    }
+                    Candidate::AddressDropsTheAlwaysNilSlot => {
+                        let address = fields
+                            .get_mut("address")
+                            .expect("address was written")
+                            .as_object_mut()
+                            .expect("an object");
+                        let was = address.remove("oi").expect("the `oi` slot was written");
+                        assert!(
+                            was.is_null(),
+                            "[CLAUSE empty-slot-is-empty] the `oi` slot of a page in this fixture \
+                             holds `{was}`, so dropping it would drop a value rather than a hole"
+                        );
+                    }
+                    Candidate::Control
+                    | Candidate::BlockKeyBecomesTheHandle
+                    | Candidate::BlockKeyDropsTheEmptySlot => {}
+                }
+                assert!(
+                    replacement.insert(new_key.clone(), entry).is_none(),
+                    "[CLAUSE doctoring-is-one-to-one] the doctored page index files two entries \
+                     under `{new_key}`, so this candidate loses a page rather than bytes"
+                );
+            }
+            *node.get_mut("page_index").expect("page_index") =
+                serde_json::Value::Object(replacement);
+        }
+    }
+    value
+}
+
+/// The bytes the `slot_index` entry of a (possibly doctored) shard value occupies.
+fn slot_index_entry_bytes_of(value: &serde_json::Value) -> usize {
+    let entry = value
+        .as_object()
+        .expect("a shard value is an object")
+        .get("slot_index")
+        .expect("slot_index");
+    klen("slot_index") + 1 + jlen(entry)
+}
+
+// =================================================================================================
+
+/// THE TERM TABLE IS WELL FORMED BEFORE ANY FIXTURE RUNS.
+///
+/// One conclusion: the vocabulary every byte below is charged against has no duplicate label, and
+/// `Redundancy` is assigned exactly where a reconstructor is named. A class whose membership is a
+/// matter of prose is a class that drifts, and the cost of finding that out is one run.
+#[test]
+fn the_slot_index_term_table_is_well_formed() {
+    let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+    for (label, ..) in TERMS.iter() {
+        *seen.entry(label).or_default() += 1;
+    }
+    let duplicates: Vec<&&str> = seen
+        .iter()
+        .filter(|(_, count)| **count > 1)
+        .map(|(label, _)| label)
+        .collect();
+    assert!(
+        duplicates.is_empty(),
+        "[CLAUSE table-unique] these labels are declared more than once: {duplicates:?} -- a \
+         repeated label silently merges two terms and the sum still balances"
+    );
+    for (label, _, nature, reconstructor) in TERMS.iter() {
+        match nature {
+            Nature::Redundancy => assert!(
+                !reconstructor.is_empty(),
+                "[CLAUSE redundancy-names-its-source] `{label}` is classed as redundancy and names \
+                 nothing that reconstructs it, so the class is an opinion"
+            ),
+            _ => assert!(
+                reconstructor.is_empty(),
+                "[CLAUSE redundancy-names-its-source] `{label}` is classed `{}` and names \
+                 `{reconstructor}` as reconstructing it -- a term with a reconstructor belongs in \
+                 the redundancy class or the class is wrong",
+                nature.label()
+            ),
+        }
+    }
+    assert_eq!(
+        declared(STRUCTURALLY_EMPTY).0,
+        Scale::PerBlock,
+        "[CLAUSE table-unique] the structurally empty term must be a per-page one, or the \
+         exemption below exempts the wrong thing"
+    );
+    println!();
+    println!(
+        "  {} term(s) declared, {} of them redundancy with a named reconstructor",
+        TERMS.len(),
+        TERMS
+            .iter()
+            .filter(|(_, _, nature, _)| *nature == Nature::Redundancy)
+            .count()
+    );
+}
+
+// =================================================================================================
+
+/// WHAT `slot_index` IS MADE OF ON THE SHIPPED ROUTING RANGE, TERM BY TERM.
+///
+/// One conclusion: the full partition of the `slot_index` entry at the amortised regime, every term
+/// named, non-zero, classed by a measured scale, and summing to the whole by two independent
+/// identities.
+///
+/// THE ASSERTION ORDER IS LOAD-BEARING. A plant stops at the first failing assertion, so the
+/// fixture-regime clauses come first: a corpus that did not land and a fixture that never reached
+/// the amortised regime are refused BEFORE any byte is read as a finding. Each message carries a
+/// `[CLAUSE <name>]` tag so a plant's verdict comes from the panic text.
+#[test]
+fn what_the_slot_index_is_made_of_on_the_shipped_routing_range() {
+    let reading = reading_on(
+        HEADLINE_KEYS,
+        PUBLISHED_WIDTH,
+        KeyShape::Padded,
+        SHIPPED_END_BUCKET,
+    );
+
+    // ---- FIXTURE REGIME FIRST ----
+    assert!(
+        reading.buckets < reading.objects,
+        "[CLAUSE amortised-regime] the fixture put {} object(s) in {} bucket(s), so no bucket \
+         holds more than one and the per-bucket terms amortise over nothing -- this is the \
+         unbounded regime wearing the shipped range's name",
+        reading.objects,
+        reading.buckets
+    );
+    let occupancy = reading.objects as f64 / reading.buckets as f64;
+    assert!(
+        occupancy > 4.0,
+        "[CLAUSE amortised-regime] {occupancy:.2} object(s) per bucket is not the regime the \
+         published 226.35 B/object was taken in (7.81), so the per-bucket terms below amortise \
+         over the wrong denominator"
+    );
+    assert_eq!(
+        reading.blocks, reading.objects,
+        "[CLAUSE one-page-an-object] the fixture holds {} page(s) for {} object(s), so a per-PAGE \
+         term and a per-OBJECT term are different quantities here and every B/object figure below \
+         would silently be a B/page figure",
+        reading.blocks, reading.objects
+    );
+
+    let walked = walk(&reading);
+    let tally = &walked.tally;
+    let whole = reading.slot_index_entry_bytes();
+
+    // ---- IDENTITY ONE: THE WHOLE ----
+    assert_eq!(
+        tally.total(),
+        whole,
+        "[CLAUSE part-sum-whole] the {} declared term(s) charge {} B against a {whole}-byte \
+         `slot_index` entry, so some bytes are unattributed -- and an \"everything else\" column is \
+         exactly what this identity exists instead of",
+        tally.rows.len(),
+        tally.total()
+    );
+
+    // ---- IDENTITY TWO: THE PAGE SUBTREE, MEASURED SEPARATELY ----
+    //
+    // THIS IS THE ONE THAT CATCHES A TERM CHARGED AT THE WRONG LEVEL. `bucket_map` is bucket-keyed
+    // and the `block_index` inside it is page-keyed at 7.81 entries a bucket, so a term moved
+    // between those two levels is wrong by that factor and the whole still balances.
+    let block_level: usize = tally
+        .rows
+        .iter()
+        .filter(|entry| {
+            let label: &str = entry.0;
+            label.starts_with("page/")
+                || label.starts_with("entry/")
+                || label == "page_index/open_brace"
+        })
+        .map(|entry| entry.1.bytes)
+        .sum();
+    assert_eq!(
+        block_level, walked.block_subtree_bytes,
+        "[CLAUSE part-sum-page-subtree] the page-level terms charge {block_level} B against {} B of \
+         written page index, so a term is charged at the bucket level that belongs at the page \
+         level or the reverse -- the error the bucket-keyed NAME of this structure invites",
+        walked.block_subtree_bytes
+    );
+
+    // ---- EVERY DECLARED TERM WAS CHARGED, AND EVERY CHARGED TERM IS NON-ZERO ----
+    //
+    // `node/tombstone_elements` is the one optional key: the encoder writes it only for a bucket
+    // that has had a removal, and this fixture performs none. It is named rather than tolerated,
+    // and its ABSENCE is asserted -- a term that quietly appeared would otherwise be absorbed.
+    const OPTIONAL: &[&str] = &["node/tombstone_elements"];
+    for (label, scale, ..) in TERMS.iter() {
+        let row = tally.rows.get(label).copied().unwrap_or_default();
+        if OPTIONAL.contains(label) {
+            assert_eq!(
+                row.instances, 0,
+                "[CLAUSE optional-stays-absent] `{label}` was charged {} time(s) and this fixture \
+                 performs no removal, so the fixture is not the one these figures describe",
+                row.instances
+            );
+            continue;
+        }
+        assert!(
+            row.instances > 0,
+            "[CLAUSE every-term-charged] `{label}` is declared and was never charged, so either \
+             the encoder stopped writing it or this walk stopped finding it, and the partition \
+             above is of a different index than the table describes"
+        );
+        if *label == STRUCTURALLY_EMPTY {
+            assert_eq!(
+                row.bytes, 0,
+                "[CLAUSE structurally-empty] `{label}` holds {} B; it is the always-absent \
+                 component the key composer passes as a literal `None`, and content there means \
+                 the composite now names something",
+                row.bytes
+            );
+            continue;
+        }
+        assert!(
+            row.bytes > 0,
+            "[CLAUSE every-term-nonzero] `{label}` is charged {} instance(s) and 0 B, so it is a \
+             zero wearing a name and its bytes went into whichever term was charged next",
+            row.instances
+        );
+        let _ = scale;
+    }
+
+    // ---- THE TWO RECONSTRUCTIONS, COUNTED ----
+    assert_eq!(
+        walked.keys_reconstructed, reading.blocks,
+        "[CLAUSE address-restates-the-key] {} of {} page(s) write an address whose five values are \
+         exactly the five decimals in the key they are filed under",
+        walked.keys_reconstructed, reading.blocks
+    );
+    assert_eq!(
+        walked.slots_reconstructed, reading.buckets,
+        "[CLAUSE routing-slot-restates-the-map-key] {} of {} bucket(s) restate their map key in \
+         `routing_slot`",
+        walked.slots_reconstructed, reading.buckets
+    );
+    // THE SECOND-LARGEST TERM, AND IT IS NOT CLASSED BY ITS NAME EITHER. `node/object_index` holds
+    // the ids of the objects a bucket carries, and those ids are a pure function of the shard, the
+    // kind and the object key -- all three of which the page entries in the SAME BUCKET write. So
+    // the question is answerable by derivation, and it is answered on every bucket rather than
+    // argued from the shape.
+    assert_eq!(
+        walked.buckets_whose_object_index_is_derivable, reading.buckets,
+        "[CLAUSE object-index-restates-the-pages] {} of {} bucket(s) write an `object_index` that \
+         is exactly the set of ids derivable from the kinds and object keys of their own page \
+         entries -- a bucket that writes an id no page beside it accounts for carries something \
+         the pages do not, and calling this term redundancy would be wrong",
+        walked.buckets_whose_object_index_is_derivable, reading.buckets
+    );
+
+    report(&reading, &walked);
+
+    // ---- THE TWO COPIES OF EACH PER-PAGE FACT, AND EXACTLY ONE OF THEM IS NEEDED ----
+    //
+    // The key side and the entry side state the same three facts -- the object, the kind and the
+    // address -- and the reconstruction above was asserted in the direction that matters: the key
+    // is rebuildable from the entry. So a page can be written with the key or with the fields, and
+    // the two sides are NOT the same price, which is the whole point of pricing them apart.
+    let key_side = tally.sum_of(BLOCK_KEY_TERMS);
+    let entry_side = tally.sum_of(ENTRY_RESTATED_TERMS);
+    let key_address = tally.sum_of(KEY_ADDRESS_TERMS);
+    let entry_address = tally.sum_of(ENTRY_ADDRESS_TERMS);
+    println!();
+    println!("================ THE SAME THREE FACTS, WRITTEN TWICE ================");
+    println!(
+        "  the composite MAP KEY        {key_side:>10} B = {:>8.3} B/object = {:>5.2}% of \
+         `slot_index`",
+        key_side as f64 / reading.objects as f64,
+        100.0 * key_side as f64 / whole as f64
+    );
+    println!(
+        "  the ENTRY's three fields     {entry_side:>10} B = {:>8.3} B/object = {:>5.2}% of \
+         `slot_index`",
+        entry_side as f64 / reading.objects as f64,
+        100.0 * entry_side as f64 / whole as f64
+    );
+    println!(
+        "  together                     {:>10} B = {:>8.3} B/object = {:>5.2}% of `slot_index`",
+        key_side + entry_side,
+        (key_side + entry_side) as f64 / reading.objects as f64,
+        100.0 * (key_side + entry_side) as f64 / whole as f64
+    );
+    assert!(
+        key_side > 0 && entry_side > 0,
+        "[CLAUSE two-copies] one of the two sides is 0 B, so there is only one copy and nothing \
+         here is redundancy"
+    );
+    println!(
+        "  AND THE FIVE ADDRESS VALUES ARE NOT THE SAME PRICE ON THE TWO SIDES. As decimals inside \
+         the key they are {key_address} B = {:.3} B/object; as the named `address` object beside it \
+         they are {entry_address} B = {:.3} B/object -- {:.2}x, and the difference is field names, \
+         braces, separators and a nil slot rather than any value.",
+        key_address as f64 / reading.objects as f64,
+        entry_address as f64 / reading.objects as f64,
+        entry_address as f64 / key_address as f64
+    );
+    assert!(
+        entry_address > key_address,
+        "[CLAUSE the-named-address-costs-more] the named `address` object is {entry_address} B \
+         against {key_address} B of decimals in the key, so the direction this arm reports is wrong"
+    );
+
+    // ---- A SLOT THE WRITER FILLS WITH A LITERAL `None`, ON EVERY PAGE ----
+    assert_eq!(
+        walked.nil_object_id_slots, reading.blocks,
+        "[CLAUSE the-nil-slot-is-always-nil] {} of {} stored address(es) write `oi` as null; \
+         `impl From<ElementEntry> for BlockAddressWire` fills it from a LITERAL `None`, so a page \
+         carrying a value there means that literal has stopped being one and this term is no \
+         longer a hole",
+        walked.nil_object_id_slots, reading.blocks
+    );
+    println!(
+        "  THE `oi` SLOT IS NULL ON ALL {} PAGES and costs {:.3} B/object. The writer fills it \
+         from a literal `None` -- the type it converts from has no such field -- and the reader \
+         consumes it only as the right-hand side of `block_id.or(object_id)`. It is not skipped \
+         for a reason the source states: the index log packs this struct POSITIONALLY, so a \
+         `skip_serializing_if` here shortens the array and shifts every slot after it.",
+        walked.nil_object_id_slots,
+        tally.bytes_of("entry/address/oi") as f64 / reading.objects as f64
+    );
+
+    println!();
+    println!("================ THE ANSWER AT {} OBJECTS ================", reading.objects);
+    println!(
+        "  `slot_index` is {whole} B = {:.2} B/object, against json_stream {:.2} B/object in all \
+         ({:.2}%).",
+        whole as f64 / reading.objects as f64,
+        reading.json_len as f64 / reading.objects as f64,
+        100.0 * whole as f64 / reading.json_len as f64
+    );
+    println!(
+        "  {} object(s) in {} bucket(s) = {occupancy:.2} per bucket; {} page(s), one an object.",
+        reading.objects, reading.buckets, reading.blocks
+    );
+    println!(
+        "  THE PAGE ENTRY'S MAP KEY is {:.3} B/object of it, and every character of it was rebuilt \
+         from the entry it is filed against, on all {} pages.",
+        (tally.bytes_of("page/map_key_quotes")
+            + tally.bytes_of("page/map_key/kind")
+            + tally.bytes_of("page/map_key/object_key")
+            + tally.bytes_of("page/map_key/component_slot")
+            + tally.bytes_of("page/map_key/block_slab_id")
+            + tally.bytes_of("page/map_key/offset")
+            + tally.bytes_of("page/map_key/length")
+            + tally.bytes_of("page/map_key/block_id")
+            + tally.bytes_of("page/map_key/generation")
+            + tally.bytes_of("page/map_key/separators")
+            + tally.bytes_of("page/map_key/empty_slot_separator")) as f64
+            / reading.objects as f64,
+        reading.blocks
+    );
+    println!(
+        "  msgpack_payload {:.2} B/object and shipped container {:.2} B/object, NEITHER of which \
+         names a field: the first is not the stream this partition is taken on and the second is a \
+         zstd frame.",
+        reading.msgpack_len as f64 / reading.objects as f64,
+        reading.container_len as f64 / reading.objects as f64
+    );
+    println!();
+}
+
+// =================================================================================================
+
+/// HOW EACH TERM OF `slot_index` SCALES WITH THE STORE, AND WHETHER ITS DECLARED CLASS IS TRUE.
+///
+/// One conclusion: the slope of every term over a swept store, with each term's DECLARED scale
+/// checked against its MEASURED instance count at every size.
+///
+/// THIS IS WHERE THE CLASSIFICATION IS EARNED. A name-based reading of `slot_index/bucket_map` says
+/// bucket-keyed and is wrong by the bucket occupancy for everything inside its `block_index`. So no
+/// term is classed by its name: a term declared per-page whose instance count is not EXACTLY the
+/// page count fails here, and so does a per-bucket term that is not exactly the bucket count and a
+/// per-shard term that is not exactly one. An earlier probe on this structure reported 3 -> 1 -> 0
+/// copies per object as the store grew, from a ceiling that did not move with the corpus; an
+/// identity asserted at three sizes is what refuses that shape of result.
+#[test]
+fn how_each_term_of_the_slot_index_scales_with_the_store() {
+    let readings: Vec<Reading> = SIZES
+        .into_iter()
+        .map(|keys| reading_on(keys, PUBLISHED_WIDTH, KeyShape::Padded, SHIPPED_END_BUCKET))
+        .collect();
+    let walks: Vec<Walked> = readings.iter().map(walk).collect();
+
+    println!();
+    println!(
+        "================ THE STORE SWEEP ON 0..{SHIPPED_END_BUCKET}, {PUBLISHED_WIDTH}-BYTE KEYS \
+         ================"
+    );
+    println!(
+        "  {:>8} {:>9} {:>8} {:>12} {:>14} {:>16} {:>12}",
+        "objects", "buckets", "obj/bkt", "blocks", "slot_index B", "B/object", "json B/object"
+    );
+    for reading in readings.iter() {
+        println!(
+            "  {:>8} {:>9} {:>8.2} {:>12} {:>14} {:>16.2} {:>13.2}",
+            reading.objects,
+            reading.buckets,
+            reading.objects as f64 / reading.buckets as f64,
+            reading.blocks,
+            reading.slot_index_entry_bytes(),
+            reading.slot_index_entry_bytes() as f64 / reading.objects as f64,
+            reading.json_len as f64 / reading.objects as f64
+        );
+    }
+
+    // ---- FIXTURE REGIME, AT EVERY POINT ----
+    for reading in readings.iter() {
+        assert_eq!(
+            reading.blocks, reading.objects,
+            "[CLAUSE one-page-an-object] {} object(s) hold {} page(s)",
+            reading.objects, reading.blocks
+        );
+    }
+    let large = readings.last().expect("a largest reading");
+    assert!(
+        large.objects as f64 / large.buckets as f64 > 4.0,
+        "[CLAUSE amortised-regime] the largest point is {:.2} object(s) per bucket",
+        large.objects as f64 / large.buckets as f64
+    );
+
+    // ---- THE DECLARED SCALE AGAINST THE MEASURED INSTANCE COUNT, AT EVERY SIZE ----
+    for (reading, walked) in readings.iter().zip(walks.iter()) {
+        for (label, row) in walked.tally.rows.iter() {
+            let (scale, ..) = declared(label);
+            let expected = match scale {
+                Scale::PerBlock => reading.blocks,
+                Scale::PerBucket => reading.buckets,
+                Scale::PerShard => 1,
+            };
+            assert_eq!(
+                row.instances, expected,
+                "[CLAUSE scale-is-measured] `{label}` is declared {} and was charged {} \
+                 instance(s) at {} object(s) in {} bucket(s), where that class means {expected} -- \
+                 so the class was read off the term's NAME and not off the bytes",
+                scale.label(),
+                row.instances,
+                reading.objects,
+                reading.buckets
+            );
+        }
+    }
+
+    // ---- THE PER-TERM SLOPE ----
+    let small = &readings[0];
+    let small_walk = &walks[0];
+    let large_walk = walks.last().expect("a largest walk");
+    let span = (large.objects - small.objects) as f64;
+    println!();
+    println!(
+        "================ THE SLOPE OF EACH TERM OVER {} -> {} OBJECTS (json_stream) ================",
+        small.objects, large.objects
+    );
+    println!(
+        "  {:<38} {:>13} {:>13} {:>12} {:>12} {:>12}",
+        "term", "B at small", "B at large", "slope B/obj", "constant B", "scale"
+    );
+    let mut labels: Vec<&'static str> = large_walk.tally.rows.keys().copied().collect();
+    let slope_of = |label: &str| -> f64 {
+        let at_small = small_walk.tally.bytes_of(label) as f64;
+        let at_large = large_walk.tally.bytes_of(label) as f64;
+        (at_large - at_small) / span
+    };
+    labels.sort_by(|left, right| {
+        slope_of(right)
+            .partial_cmp(&slope_of(left))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(left.cmp(right))
+    });
+    let mut slope_total = 0.0f64;
+    let mut constant_total = 0.0f64;
+    for label in labels.iter() {
+        let at_small = small_walk.tally.bytes_of(label) as f64;
+        let at_large = large_walk.tally.bytes_of(label) as f64;
+        let slope = (at_large - at_small) / span;
+        let constant = at_small - slope * small.objects as f64;
+        slope_total += slope;
+        constant_total += constant;
+        let (scale, ..) = declared(label);
+        println!(
+            "  {:<38} {:>13.0} {:>13.0} {:>12.3} {:>12.0} {:>12}",
+            label,
+            at_small,
+            at_large,
+            slope,
+            constant,
+            scale.label()
+        );
+    }
+    println!(
+        "  {:<38} {:>13} {:>13} {:>12.3} {:>12.0}",
+        "TOTAL", "", "", slope_total, constant_total
+    );
+
+    // ---- THE SLOPE BY SCALE, WHICH IS WHAT THE THREE CLASSES BUY ----
+    println!();
+    println!("================ THE SLOPE BY SCALE ================");
+    for scale in [Scale::PerBlock, Scale::PerBucket, Scale::PerShard] {
+        let at_small = small_walk.tally.at_scale(scale) as f64;
+        let at_large = large_walk.tally.at_scale(scale) as f64;
+        let slope = (at_large - at_small) / span;
+        println!(
+            "  {:<12} {:>10.0} B -> {:>10.0} B   slope {:>8.3} B/object   {:>8.3} -> {:>8.3} \
+             B/object as written",
+            scale.label(),
+            at_small,
+            at_large,
+            slope,
+            at_small / small.objects as f64,
+            at_large / large.objects as f64
+        );
+    }
+    println!(
+        "  THE MIDDLE CLASS IS WHY THERE ARE THREE. The bucket count saturates on this range -- {} \
+         bucket(s) at {} objects and {} at {} -- so the per-bucket terms grow and then stop, and \
+         per object they fall without ever being constant. A \"grows / bounded\" taxonomy has \
+         nowhere to put that, and it is where the amortisation this range exists for happens.",
+        small.buckets, small.objects, large.buckets, large.objects
+    );
+
+    // ---- `slot_index` IS NOT A LINE ON THIS RANGE, AND EXACTLY ONE CLASS IS WHY ----
+    //
+    // THE PUBLISHED 226.35 B/object IS A DIVISION AT THE TOP OF THIS SWEEP, NOT A SLOPE, and on
+    // this range those are different quantities: the bucket count SATURATES, so the per-bucket
+    // class contributes 212 B/object at 500 objects and 49 at 8,000. Quoting a slope and a
+    // division under one name is how a figure becomes fiction, so both are measured here, each is
+    // named, and the clauses below say which one the decomposition decomposes.
+    let middle = &readings[1];
+    let middle_walk = &walks[1];
+    let half = |low: &Reading, high: &Reading| -> f64 {
+        (high.slot_index_entry_bytes() as f64 - low.slot_index_entry_bytes() as f64)
+            / (high.objects - low.objects) as f64
+    };
+    let half_at_scale = |low: (&Reading, &Walked), high: (&Reading, &Walked), scale: Scale| -> f64 {
+        (high.1.tally.at_scale(scale) as f64 - low.1.tally.at_scale(scale) as f64)
+            / (high.0.objects - low.0.objects) as f64
+    };
+    let lower = half(small, middle);
+    let upper = half(middle, large);
+    let division = large.slot_index_entry_bytes() as f64 / large.objects as f64;
+
+    println!();
+    println!("================ A SLOPE AND A DIVISION ARE NOT THE SAME NUMBER HERE ================");
+    println!(
+        "  whole-sweep slope {slope_total:.2} B/object; lower half ({} -> {}) {lower:.2}; upper \
+         half ({} -> {}) {upper:.2}; DIVISION at {} objects {division:.2} B/object.",
+        small.objects, middle.objects, middle.objects, large.objects, large.objects
+    );
+    println!(
+        "  {:<12} {:>14} {:>14} {:>14}",
+        "scale", "lower half", "upper half", "division@top"
+    );
+    for scale in [Scale::PerBlock, Scale::PerBucket, Scale::PerShard] {
+        println!(
+            "  {:<12} {:>14.3} {:>14.3} {:>14.3}",
+            scale.label(),
+            half_at_scale((small, small_walk), (middle, middle_walk), scale),
+            half_at_scale((middle, middle_walk), (large, large_walk), scale),
+            large_walk.tally.at_scale(scale) as f64 / large.objects as f64
+        );
+    }
+
+    // THE PUBLISHED FIGURE IS THE DIVISION, so that is what is pinned.
+    //
+    // 226.35 -> 176.35 WHEN THE ENTRY STOPPED RESTATING ITS KEY, and the step is EXACTLY the 50.0
+    // B/object this module predicted for those two fields: `entry/object_key` at 30.0 and
+    // `entry/model_id` at 20.0, on the same corpus and the same range. That is the prediction
+    // closing on its own measurement rather than a figure being re-goldened, which is why the
+    // arithmetic is written here beside the new value.
+    //
+    // THE PER-PAGE CLASS CARRIES THE WHOLE OF IT: 177.015 -> 127.015 B/object, while per-bucket
+    // stays at 49.331 and per-shard at 0.004. A step that had moved the per-bucket class would be
+    // a step in something other than the page entry.
+    let published = 176.35f64;
+    assert!(
+        (division - published).abs() / published < 0.005,
+        "[CLAUSE matches-the-published-division] `slot_index` divides to {division:.2} B/object at \
+         {} object(s) against the published {published:.2} for this range, so the decomposition is \
+         of a different quantity than the figure it claims to decompose",
+        large.objects
+    );
+
+    // THE PER-PAGE CLASS IS THE LINE. Its two half-slopes must agree: a per-page term whose cost
+    // moved with the store would mean the per-object figure has no single value at all.
+    let block_lower = half_at_scale((small, small_walk), (middle, middle_walk), Scale::PerBlock);
+    let block_upper = half_at_scale((middle, middle_walk), (large, large_walk), Scale::PerBlock);
+    assert!(
+        (block_lower - block_upper).abs() / block_upper < 0.05,
+        "[CLAUSE the-per-page-class-is-a-line] the per-page class grows {block_lower:.3} B/object \
+         over the lower half and {block_upper:.3} over the upper, so the class that is supposed to \
+         be one cost per stored page is not"
+    );
+
+    // AND THE PER-BUCKET CLASS IS THE NON-LINEARITY, because the range bounds it.
+    assert_eq!(
+        large.buckets,
+        SHIPPED_END_BUCKET as usize + 1,
+        "[CLAUSE the-per-bucket-class-saturates] the largest point holds {} bucket(s) on a range \
+         of {} -- the per-bucket class has not saturated, so the fall in its per-object cost below \
+         is not the saturation this arm attributes it to",
+        large.buckets,
+        SHIPPED_END_BUCKET as usize + 1
+    );
+    let bucket_small = small_walk.tally.at_scale(Scale::PerBucket) as f64 / small.objects as f64;
+    let bucket_large = large_walk.tally.at_scale(Scale::PerBucket) as f64 / large.objects as f64;
+    assert!(
+        bucket_small / bucket_large > 3.0,
+        "[CLAUSE the-per-bucket-class-saturates] the per-bucket class is {bucket_small:.2} \
+         B/object at {} objects and {bucket_large:.2} at {}, a fall of only {:.2}x -- too little to \
+         be the amortisation that makes this range's figure different from the unbounded one",
+        small.objects,
+        large.objects,
+        bucket_small / bucket_large
+    );
+
+    // THE THREE CLASSES ACCOUNT FOR THE WHOLE OF EACH HALF, exactly. An accounting identity rather
+    // than a threshold on one class: a term misfiled between two classes changes two of the three
+    // and leaves the total alone, and only this equation sees that it still adds up by accident.
+    for (name, low, high) in [
+        ("lower", (small, small_walk), (middle, middle_walk)),
+        ("upper", (middle, middle_walk), (large, large_walk)),
+    ]
+    .map(|(name, low, high)| (name, low, high))
+    {
+        let whole = (high.0.slot_index_entry_bytes() as f64 - low.0.slot_index_entry_bytes() as f64)
+            / (high.0.objects - low.0.objects) as f64;
+        let summed: f64 = [Scale::PerBlock, Scale::PerBucket, Scale::PerShard]
+            .into_iter()
+            .map(|scale| half_at_scale(low, high, scale))
+            .sum();
+        assert!(
+            (whole - summed).abs() < 1e-6,
+            "[CLAUSE classes-account-for-the-whole] on the {name} half the whole grows \
+             {whole:.6} B/object and the three classes grow {summed:.6} between them"
+        );
+    }
+    println!();
+}
+
+// =================================================================================================
+
+/// WHAT REMOVING A REDUNDANT TERM WOULD COST, ON THE PAYLOAD AND ON A CONTAINER THAT LANDS.
+///
+/// One conclusion: per candidate removal, the saving on `json_stream` and the saving on the
+/// `TSIDX\x01` codec-1 container, taken on BOTH key shapes -- because duplication is not byte cost
+/// and a padded fixture reports almost none of it.
+///
+/// THE TWO CONTAINER ARMS ARE COMPARED BEFORE EITHER IS QUOTED. The counterfactual has to be
+/// RE-ENCODED, and the only re-encoding this module can take byte-for-byte as production writes it
+/// is the JSON one, so the prices are on the codec-1 container. How good a proxy that is for the
+/// msgpack one is not assumed: the clause below asserts the two baselines are within a few percent
+/// of each other, measured, and the figure is printed beside every price.
+#[test]
+fn what_removing_a_redundant_slot_index_term_would_cost_the_shipped_container() {
+    // THREE CANDIDATES LEFT, AND THE THREE THAT LEFT ARE THE ONES THAT LANDED.
+    //
+    // `EntryDropsObjectKey`, `EntryDropsModelId` and `EntryDropsWhatTheKeyRestates` priced the
+    // removal of the entry's `object_key` and `model_id` at +2.34 to +2.96 and +0.26 to +0.37
+    // B/object of container, and the pair of them plus the address at +6.72 to +7.17. The first
+    // two are IN the index now, so a counterfactual that removes them cannot be built -- the
+    // fields are not there to remove, and `doctor`'s own
+    // `fields.remove("object_key").expect("object_key was written")` is what said so when it
+    // panicked on the first run after the change.
+    //
+    // RETIRED RATHER THAN REPAIRED, which is this tree's rule for a measurement whose proposal has
+    // landed: a counterfactual kept against a shape that no longer exists is a measurement nothing
+    // can read. What the landed figure is instead is measured on the production encoder, before
+    // and after, by
+    // `the_key_a_block_is_filed_under_inverts_exactly::what_the_entry_restating_its_key_costs_the_shipped_container`.
+    //
+    // `EntryDropsAddress` STAYS, because it has NOT landed and is blocked rather than deferred --
+    // see the variant's own note. Pricing a block is what makes it a decision.
+    const CANDIDATES: [Candidate; 5] = [
+        Candidate::Control,
+        Candidate::BlockKeyBecomesTheHandle,
+        Candidate::BlockKeyDropsTheEmptySlot,
+        Candidate::AddressDropsTheAlwaysNilSlot,
+        Candidate::EntryDropsAddress,
+    ];
+
+    // TWO KEY SHAPES AND TWO STORE SIZES, BECAUSE A SIGN TAKEN ONCE IS AN ATTRIBUTION. The two
+    // headline candidates below are asserted by the DIRECTION of their container delta, and a
+    // direction read off one measurement is a claim about that measurement. Four points, and the
+    // clause names which four it held on.
+    for shape in [KeyShape::Padded, KeyShape::Scattered] {
+        for objects in [2_000usize, HEADLINE_KEYS] {
+        let reading = reading_on(objects, PUBLISHED_WIDTH, shape, SHIPPED_END_BUCKET);
+        assert!(
+            reading.buckets < reading.objects,
+            "[CLAUSE amortised-regime] {} object(s) in {} bucket(s)",
+            reading.objects,
+            reading.buckets
+        );
+
+        let baseline_stream = slot_index_entry_bytes_of(&reading.value);
+        let baseline_container = json_container_bytes(&reading.value);
+        let shipped_container = reading.container_len;
+        let apart = (baseline_container as f64 - shipped_container as f64).abs()
+            / shipped_container as f64;
+
+        println!();
+        println!(
+            "================ WHAT A REMOVAL IS WORTH, {} KEYS, {} OBJECTS ================",
+            shape.label(),
+            reading.objects
+        );
+        println!(
+            "  baseline: json_stream `slot_index` {baseline_stream} B = {:.2} B/object; whole \
+             json_stream {} B; codec-1 container {baseline_container} B = {:.2} B/object; SHIPPED \
+             msgpack container {shipped_container} B = {:.2} B/object -- the two container arms are \
+             {:.2}% apart.",
+            baseline_stream as f64 / reading.objects as f64,
+            reading.json_len,
+            baseline_container as f64 / reading.objects as f64,
+            shipped_container as f64 / reading.objects as f64,
+            100.0 * apart
+        );
+        assert!(
+            apart < 0.15,
+            "[CLAUSE container-arms-agree] the codec-1 container is {:.2}% away from the shipped \
+             msgpack one, which is too far for a price taken on the first to be quoted about the \
+             second",
+            100.0 * apart
+        );
+
+        println!(
+            "  {:<42} {:>14} {:>13} {:>14} {:>13} {:>10}",
+            "candidate", "stream saved", "B/object", "container saved", "B/object", "coll'pse"
+        );
+        for candidate in CANDIDATES {
+            let doctored = doctor(&reading, candidate);
+            let stream = slot_index_entry_bytes_of(&doctored);
+            let container = json_container_bytes(&doctored);
+            let stream_saved = baseline_stream as i64 - stream as i64;
+            let container_saved = baseline_container as i64 - container as i64;
+            if candidate == Candidate::Control {
+                // ---- THE CONTROL, AND IT IS THE FIRST THING CHECKED ----
+                let rebuilt = serde_json::to_vec(&doctored).expect("the control serializes");
+                let original = serde_json::to_vec(&reading.value).expect("the baseline serializes");
+                assert_eq!(
+                    rebuilt, original,
+                    "[CLAUSE doctoring-control] rebuilding the page index without changing \
+                     anything did not reproduce the stream, so every saving below is partly the \
+                     cost of the doctoring itself"
+                );
+                assert_eq!(
+                    stream_saved, 0,
+                    "[CLAUSE doctoring-control] the control saves {stream_saved} B of stream"
+                );
+                assert_eq!(
+                    container_saved, 0,
+                    "[CLAUSE doctoring-control] the control saves {container_saved} B of container"
+                );
+            }
+            let collapse = if container_saved == 0 {
+                f64::INFINITY
+            } else {
+                stream_saved as f64 / container_saved as f64
+            };
+            println!(
+                "  {:<42} {:>14} {:>13.3} {:>14} {:>13.3} {:>10.2}x",
+                candidate.label(),
+                stream_saved,
+                stream_saved as f64 / reading.objects as f64,
+                container_saved,
+                container_saved as f64 / reading.objects as f64,
+                collapse
+            );
+            if candidate != Candidate::Control {
+                assert!(
+                    stream_saved > 0,
+                    "[CLAUSE a-removal-removes-bytes] `{}` saves {stream_saved} B of stream, so \
+                     either the term was not written or the doctoring did not reach it",
+                    candidate.label()
+                );
+            }
+
+            // ---- THE TWO SIGNS THIS ARM EXISTS TO PIN ----
+            //
+            // THE BIGGEST-LOOKING REDUNDANCY IS NOT WORTH REMOVING, and that is a measured
+            // negative rather than a caution. The composite key is the most duplicated structure
+            // in the index and it is also the most COMPRESSIBLE one: sorted, sharing long
+            // prefixes, and mostly decimal runs that repeat. The handle the live map already keys
+            // the page by is a hash, so a stream that looks 19 B/object shorter lands LARGER.
+            if candidate == Candidate::BlockKeyBecomesTheHandle {
+                assert!(
+                    container_saved <= 0,
+                    "[CLAUSE the-key-is-free-on-the-artefact] re-keying the page index by its \
+                     handle saved {container_saved} B of container at {} {} object(s) -- the \
+                     recorded direction is that it COSTS, and a flip here is the finding changing \
+                     rather than the fixture",
+                    reading.objects,
+                    shape.label()
+                );
+            }
+            // AND THE OTHER DIRECTION IS WORTH TAKING, on the artefact and not only on the stream.
+            //
+            // THE CLAUSE MOVED ONTO WHAT IS LEFT OF THAT DIRECTION, because the two cheap thirds of
+            // it have LANDED and the counterfactual for them cannot be built any more. It read
+            // `EntryDropsWhatTheKeyRestates` -- all three fields at once -- and asserted the
+            // container saving positive and over 10%. What remains removable on the entry side is
+            // the ADDRESS, which is the largest of the three at +4.27 to +4.52 B/object; its sign
+            // is what this clause pins now, so the direction the whole module turns on is still
+            // asserted at every one of the four points rather than taken on trust from a figure
+            // that is now in the commit log.
+            if candidate == Candidate::EntryDropsAddress {
+                assert!(
+                    container_saved > 0,
+                    "[CLAUSE the-entry-side-pays-on-the-artefact] dropping the `address` the key \
+                     restates saved {container_saved} B of container at {} {} object(s) -- the \
+                     recorded direction is that the entry side PAYS, and a flip here is the \
+                     finding changing rather than the fixture",
+                    reading.objects,
+                    shape.label()
+                );
+            }
+        }
+        println!(
+            "  `collapse` is stream bytes per container byte: how much of the saving the zstd frame \
+             was already taking, and a NEGATIVE one is a removal that makes the artefact bigger. On \
+             {} keys this is the {} end of the range, and neither end may be quoted on its own.",
+            shape.label(),
+            match shape {
+                KeyShape::Padded => "optimistic (a constant run plus an ordinal compresses)",
+                KeyShape::Scattered => "pessimistic (the keys share no structure)",
+            }
+        );
+        }
+    }
+    println!();
+    println!("================ WHICH DIRECTION IS THE ONE WORTH TAKING ================");
+    println!(
+        "  The three per-page facts -- the object, the kind and the address -- are each written \
+         TWICE: once inside the composite map key, once as fields of the entry filed under it. \
+         EXACTLY ONE of the two sides may go, never both, and the two sides are nothing like the \
+         same price on the artefact."
+    );
+    println!(
+        "  DROPPING THE KEY COSTS. It is 41 B/object of stream and the most compressible structure \
+         in the index -- sorted, sharing prefixes, mostly repeating decimal runs -- so replacing it \
+         with the hash the live map already keys the page by lands a LARGER container on every \
+         point measured above."
+    );
+    println!(
+        "  DROPPING THE ENTRY'S THREE FIELDS PAID, and it was the larger term as well: 104 B/object \
+         of stream and 6.7 to 7.2 B/object of container out of 29 to 42, because a named encoding \
+         spends its bytes on field names, braces, a nil slot and separators that the key spends on \
+         digits."
+    );
+    println!(
+        "  TWO THIRDS OF THAT HAS SINCE LANDED, which is why only three candidates are priced \
+         above. `object_key` and `model_id` are off the entry at `SHARD_INDEX_FORMAT_VERSION` 27 \
+         and the decoder PARSES the key -- the load-path change this module named as the whole \
+         cost. `the_block_keys_characters_are_read_back_by_the_decoder_now` is the same arm as the \
+         one that measured they were not, with its subject inverted."
+    );
+    println!(
+        "  AND THE THIRD IS BLOCKED, not deferred. The address's five VALUES are in the key and the \
+         two PRESENCE bits beside them are not: a log-resident page and the first page of an \
+         object in a slab render ONE key and differ in `log_backed()`. Its container price stays \
+         priced here, and `the_presence_bits_of_an_address_are_not_in_the_key_it_renders` is why \
+         it is not taken."
+    );
+    println!();
+}
+
+// =================================================================================================
+
+/// THE PAGE KEY'S CHARACTERS ARE READ BACK NOW, AND THIS TEST'S SUBJECT INVERTED RATHER THAN MOVED.
+///
+/// # WHAT IT USED TO SAY, AND WHY THE NAME CHANGED WITH THE FACT
+///
+/// It was `the_page_keys_characters_are_not_read_back_by_the_decoder`, and it measured exactly
+/// that: an index whose every page key was replaced by the decimal of the handle the live map files
+/// that page under decoded to the same `slot_index`, BYTE FOR BYTE, as the undoctored one. The
+/// composite key was a name the writer composed and the reader discarded -- `block_index` decoded as
+/// a `BTreeMap<String, StoredBlockEntry>` consumed by `into_values()`.
+///
+/// That was the measurement the proposal rested on and it is the measurement the proposal ENDED.
+/// The decoder parses the key now (`index_log::block_ref_key_parts`), and
+/// `block_index_and_identities` iterates the map rather than its values. So the old claim is FALSE,
+/// and this test is renamed rather than re-goldened: a test whose NAME asserts the opposite of what
+/// it checks is worse than a stale golden, because the name is what a future reader greps for.
+///
+/// # WHAT IT SAYS NOW, AND IT IS A STRONGER STATEMENT THAN THE EQUALITY IT REPLACES
+///
+/// Re-keying every page by its handle does not produce an equal index. It does not produce an index
+/// at all: the decode REFUSES, because a decimal handle is not an eight-slot composite and the one
+/// place a page's object can be read from is the name it is filed under. A silent misread is the
+/// failure this change could have had, and a refusal naming the key is what it has instead.
+///
+/// AND THE CHARACTERS ARE PROVED TO REACH THE DECODED INDEX. One character of ONE page key's
+/// object-key slot is changed -- the key left a well-formed composite -- and the decoded
+/// `slot_index` must MOVE. Under the old behaviour that doctoring changed nothing at all, which is
+/// the whole difference this change makes, measured in one assertion.
+#[test]
+fn the_block_keys_characters_are_read_back_by_the_decoder_now() {
+    let reading = reading_on(2_000, PUBLISHED_WIDTH, KeyShape::Padded, SHIPPED_END_BUCKET);
+    assert!(
+        reading.buckets < reading.objects,
+        "[CLAUSE amortised-regime] {} object(s) in {} bucket(s)",
+        reading.objects,
+        reading.buckets
+    );
+
+    // SPLIT INTO A FALLIBLE DOOR AND AN INFALLIBLE ONE, because the refusal is now part of the
+    // subject: one arm below needs the `Err` and the others need the bytes.
+    let try_the_decoder = |value: &serde_json::Value| -> Result<Vec<u8>, String> {
+        let bytes = serde_json::to_vec(value).expect("the index serializes");
+        let decoded = crate::engine::decode_index_bytes(&bytes)?;
+        let again = serde_json::to_value(&decoded).expect("the decoded index re-serializes");
+        Ok(serde_json::to_vec(
+            again
+                .as_object()
+                .expect("an object")
+                .get("slot_index")
+                .expect("slot_index"),
+        )
+        .expect("slot_index serializes"))
+    };
+    let through_the_decoder = |value: &serde_json::Value| -> Vec<u8> {
+        try_the_decoder(value)
+            .expect("a served index in plain JSON is a shape the decoder sniffs and accepts")
+    };
+
+    let baseline = through_the_decoder(&reading.value);
+    assert!(
+        !baseline.is_empty(),
+        "[CLAUSE the-round-trip-carries-pages] the decoded `slot_index` is empty, so the \
+         comparison below would hold for an index that lost everything"
+    );
+    assert!(
+        baseline.len() > 64 * reading.objects,
+        "[CLAUSE the-round-trip-carries-pages] the decoded `slot_index` is {} B for {} object(s), \
+         which is too little to be carrying one page each",
+        baseline.len(),
+        reading.objects
+    );
+
+    // ---- THE INVERSION: A HANDLE-KEYED PAGE INDEX IS REFUSED, NOT SILENTLY EQUAL ----
+    let rekeyed = try_the_decoder(&doctor(&reading, Candidate::BlockKeyBecomesTheHandle));
+    let refusal = match rekeyed {
+        Ok(bytes) => panic!(
+            "[CLAUSE page-key-is-read] re-keying every page index by its handle still DECODES, to \
+             a {} B `slot_index` against the baseline's {} -- the key is the only source of a \
+             page's object now, so a decimal handle in its place has to be refused and not read",
+            bytes.len(),
+            baseline.len()
+        ),
+        Err(message) => message,
+    };
+    assert!(
+        refusal.contains("is not a block-ref key"),
+        "[CLAUSE page-key-is-read] the handle-keyed index was refused with {refusal:?}, which is \
+         not the key parse refusing -- a refusal for some other reason would pass this arm while \
+         saying nothing about whether the key is read"
+    );
+
+    // ---- AND THE CHARACTERS REACH THE DECODED INDEX, WHICH IS WHAT THE OLD CLAIM DENIED ----
+    //
+    // ONE CHARACTER OF ONE PAGE KEY'S OBJECT-KEY SLOT, and the key stays a well-formed composite --
+    // so what is measured is the decoder READING the slot, not the decoder refusing a malformed
+    // name. Under the old behaviour this doctoring moved nothing at all.
+    let mut tampered = reading.value.clone();
+    let mut touched = 0usize;
+    {
+        let bucket_map = tampered
+            .get_mut("slot_index")
+            .expect("slot_index")
+            .get_mut("bucket_map")
+            .expect("bucket_map")
+            .as_object_mut()
+            .expect("an object");
+        for node in bucket_map.values_mut() {
+            if touched > 0 {
+                break;
+            }
+            let blocks = node
+                .get_mut("page_index")
+                .expect("page_index")
+                .as_object_mut()
+                .expect("an object");
+            let Some(was) = blocks.keys().next().cloned() else { continue };
+            let slots = split_written_key(&was);
+            let mut object_key = slots.object_key.clone();
+            assert!(
+                !object_key.is_empty(),
+                "[CLAUSE instrument-fires] the key {was:?} names an empty object, so changing a \
+                 character of it is not possible and the tamper below would be a no-op"
+            );
+            object_key.replace_range(0..1, "Z");
+            let now = format!(
+                "{}:{}:{}:{}:{}:{}:{}:{}",
+                slots.kind,
+                object_key,
+                slots.component,
+                slots.block_slab_id,
+                slots.offset,
+                slots.length,
+                slots.block_id,
+                slots.generation
+            );
+            assert_ne!(now, was, "the tamper must change the key");
+            let entry = blocks.remove(&was).expect("the key was just read from this map");
+            blocks.insert(now, entry);
+            touched += 1;
+        }
+    }
+    assert_eq!(
+        touched, 1,
+        "[CLAUSE instrument-fires] the tamper reached {touched} page(s) and must reach exactly \
+         one, or a comparison that fails says nothing about which change caused it"
+    );
+    let tampered_out = through_the_decoder(&tampered);
+    assert_ne!(
+        tampered_out, baseline,
+        "[CLAUSE page-key-is-read] changing one character of ONE page key's object-key slot left \
+         the decoded `slot_index` byte-identical, so the decoder is not reading the slot and the \
+         identity it files that page under came from somewhere else"
+    );
+
+    println!();
+    println!("================ THE PAGE KEY IS WRITTEN AND READ ================");
+    println!(
+        "  {} object(s), {} page(s), {} bucket(s), baseline `slot_index` {} B.",
+        reading.objects,
+        reading.blocks,
+        reading.buckets,
+        baseline.len()
+    );
+    println!("  every page key replaced by its handle -> REFUSED: {refusal}");
+    println!(
+        "  one character changed in ONE page key's object-key slot moves the decoded index ({} B \
+         against {} B) -- under the shape this change replaced it moved NOTHING.",
+        tampered_out.len(),
+        baseline.len()
+    );
+    println!();
+}
+
+// =================================================================================================
+
+/// THE SAME DECOMPOSITION ON THE RANGE `load_shard` LEAVES BEHIND -- THE SECONDARY COLUMN.
+///
+/// One conclusion: the per-scale split of `slot_index` on `0..u32::MAX`, where a key's routing
+/// bucket is effectively unique so every per-bucket cost divides by ONE object. It is reported
+/// beside the shipped range and never instead of it: the tree's own prose says this is not the
+/// regime a meta-server-managed shard runs on, and the two differ by nearly 2x.
+///
+/// THE REGIME IS ASSERTED IN THE OPPOSITE DIRECTION from the shipped arm: here a fixture in which
+/// buckets amortised at all would be measuring something else under this range's name.
+#[test]
+fn what_the_slot_index_is_made_of_on_the_unbounded_routing_range() {
+    let reading = reading_on(2_000, PUBLISHED_WIDTH, KeyShape::Padded, u32::MAX);
+    assert_eq!(
+        reading.buckets, reading.objects,
+        "[CLAUSE unbounded-regime] {} object(s) landed in {} bucket(s) on the unbounded range, so \
+         the per-bucket terms amortise here and this is not the regime this arm is named for",
+        reading.objects, reading.buckets
+    );
+    let walked = walk(&reading);
+    let whole = reading.slot_index_entry_bytes();
+    assert_eq!(
+        walked.tally.total(),
+        whole,
+        "[CLAUSE part-sum-whole] the terms charge {} B against a {whole}-byte entry on the \
+         unbounded range",
+        walked.tally.total()
+    );
+
+    println!();
+    println!(
+        "================ `slot_index` BY SCALE ON 0..u32::MAX, {} OBJECTS IN {} BUCKETS \
+         ================",
+        reading.objects, reading.buckets
+    );
+    for scale in [Scale::PerBlock, Scale::PerBucket, Scale::PerShard] {
+        let bytes = walked.tally.at_scale(scale);
+        println!(
+            "  {:<12} {:>12} B  {:>9.3} B/object  {:>6.2}%",
+            scale.label(),
+            bytes,
+            bytes as f64 / reading.objects as f64,
+            100.0 * bytes as f64 / whole as f64
+        );
+    }
+    // ---- AND THE DIFFERENCE BETWEEN THE TWO COLUMNS IS ONE CLASS, MEASURED SIDE BY SIDE ----
+    //
+    // THE SAME CORPUS ON THE SHIPPED RANGE, so the comparison is between two ROUTING RANGES and not
+    // between two store sizes. Without this the claim "the fall is the per-bucket class" would be a
+    // reading of two figures taken at different sizes, which is the shape of comparison this tree
+    // keeps a record of getting wrong.
+    let shipped = reading_on(
+        reading.objects,
+        PUBLISHED_WIDTH,
+        KeyShape::Padded,
+        SHIPPED_END_BUCKET,
+    );
+    assert_eq!(
+        shipped.objects, reading.objects,
+        "[CLAUSE one-corpus-two-ranges] the two columns must be the same corpus"
+    );
+    assert!(
+        shipped.buckets < shipped.objects,
+        "[CLAUSE amortised-regime] the shipped-range column put {} object(s) in {} bucket(s)",
+        shipped.objects,
+        shipped.buckets
+    );
+    let shipped_walk = walk(&shipped);
+    let per_object = |bytes: usize| bytes as f64 / reading.objects as f64;
+    println!();
+    println!("================ THE SAME CORPUS ON BOTH RANGES, BY SCALE ================");
+    println!(
+        "  {:<12} {:>16} {:>16} {:>14}",
+        "scale", "0..u32::MAX", "0..1023", "difference"
+    );
+    for scale in [Scale::PerBlock, Scale::PerBucket, Scale::PerShard] {
+        println!(
+            "  {:<12} {:>16.3} {:>16.3} {:>14.3}",
+            scale.label(),
+            per_object(walked.tally.at_scale(scale)),
+            per_object(shipped_walk.tally.at_scale(scale)),
+            per_object(walked.tally.at_scale(scale)) - per_object(shipped_walk.tally.at_scale(scale))
+        );
+    }
+    println!(
+        "  {:<12} {:>16.3} {:>16.3} {:>14.3}",
+        "WHOLE",
+        per_object(whole),
+        per_object(shipped.slot_index_entry_bytes()),
+        per_object(whole) - per_object(shipped.slot_index_entry_bytes())
+    );
+
+    // THE PER-PAGE CLASS DOES NOT KNOW WHICH RANGE IT IS ON. That is the statement that makes the
+    // whole difference between the two published columns attributable to ONE class rather than
+    // spread over the index -- and it is asserted rather than inferred from the two totals.
+    //
+    // THE EXACT CLAUSE AND THE TOLERANT ONE, AND THE EXACT ONE IS NOT DERIVED FROM IT. The two
+    // columns write the same objects in the same order, and a per-page term depends only on the
+    // page's own key and address -- so the two totals are not merely close, they are the SAME
+    // BYTES, and a tolerance wide enough to survive rounding is wider than drifts worth catching.
+    let block_unbounded_bytes = walked.tally.at_scale(Scale::PerBlock);
+    let block_shipped_bytes = shipped_walk.tally.at_scale(Scale::PerBlock);
+    assert_eq!(
+        block_unbounded_bytes, block_shipped_bytes,
+        "[CLAUSE the-per-page-class-is-range-blind] the per-page class is {block_unbounded_bytes} B \
+         unbounded and {block_shipped_bytes} B on the shipped range for the SAME corpus -- a \
+         per-page term depends only on the page's own key and address, so a difference here means \
+         one of them does not"
+    );
+    let block_unbounded = per_object(block_unbounded_bytes);
+    let block_shipped = per_object(block_shipped_bytes);
+    assert!(
+        (block_unbounded - block_shipped).abs() / block_shipped < 0.02,
+        "[CLAUSE the-per-page-class-is-range-blind] the per-page class is {block_unbounded:.3} \
+         B/object unbounded and {block_shipped:.3} on the shipped range -- if it moves with the \
+         routing range then the fall between the two published columns is not the one class this \
+         arm attributes it to"
+    );
+    let whole_difference = per_object(whole) - per_object(shipped.slot_index_entry_bytes());
+    let bucket_difference = per_object(walked.tally.at_scale(Scale::PerBucket))
+        - per_object(shipped_walk.tally.at_scale(Scale::PerBucket));
+    assert!(
+        (whole_difference - bucket_difference).abs() / whole_difference < 0.02,
+        "[CLAUSE the-difference-is-one-class] the whole differs by {whole_difference:.3} B/object \
+         between the two ranges and the per-bucket class by {bucket_difference:.3}, so the other \
+         two classes carry some of it and the attribution is wrong"
+    );
+    println!(
+        "  `slot_index` is {:.2} B/object here against {:.2} on the shipped range, and {:.3} of the \
+         {:.3} B/object difference is the per-bucket class alone: EVERY per-bucket term divides by \
+         ONE object on this range. The per-page class does not move. Read the two columns together \
+         or neither.",
+        per_object(whole),
+        per_object(shipped.slot_index_entry_bytes()),
+        bucket_difference,
+        whole_difference
+    );
+    println!();
+}
