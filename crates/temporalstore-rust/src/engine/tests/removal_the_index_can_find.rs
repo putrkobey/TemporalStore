@@ -134,3 +134,140 @@ fn components_the_named_blocks_state(engine: &TemporalEngine) -> BTreeSet<String
     let mut stated = BTreeSet::new();
     for address in &addresses {
         let Ok(bytes) = engine.block_store.read(address) else {
+            continue;
+        };
+        if let crate::engine::container_blocks::ContainerBlockDecode::Framed {
+            spelling, items, ..
+        } = crate::engine::container_blocks::decode_container_block(&bytes)
+        {
+            for item in items {
+                if item.deleted {
+                    continue;
+                }
+                if let Some(component) =
+                    crate::engine::container_blocks::component_from_element_key(spelling, &item.key)
+                {
+                    stated.insert(component);
+                }
+            }
+        }
+    }
+    stated
+}
+
+/// rust-internal: a gated removal must leave a tombstone page the index actually names
+#[test]
+fn a_gated_removal_leaves_a_tombstone_block_the_index_can_reach() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    for index in 0..MEMBERS {
+        write(
+            &engine,
+            Command::SetAdd {
+                key: KEY.to_string(),
+                member: member_bytes(index),
+            },
+        );
+    }
+
+    // FOLD FIRST, so the survivors share a page. Before a fold each member owns its own page, so
+    // removing one takes its page with it and there is nothing left to disagree -- the fixture
+    // would pass for the wrong reason.
+    engine
+        .compact_shard_blocks(1)
+        .expect("the fold round must succeed");
+
+    let (_, live_before, tombstoned_before) = addresses_the_index_names(&engine);
+    let victim = member_bytes(7);
+    let victim_component = hex::encode(&victim);
+
+    // 1. REMOVE THROUGH THE REAL SURFACE, not by reaching into the index.
+    write(
+        &engine,
+        Command::SetRemove {
+            key: KEY.to_string(),
+            member: victim.clone(),
+        },
+    );
+
+    let (addresses, live_after, tombstoned_after) = addresses_the_index_names(&engine);
+
+    // 2. THE PAGES THE INDEX NAMES STILL STATE THE MEMBER -- the disagreement, observed.
+    let stated = components_the_named_blocks_state(&engine);
+
+    // 3. WHAT A FOLD OF THOSE PAGES CONCLUDES. `derive_membership` owns the ordering and the
+    //    precedence; it is handed exactly the pages the index names, which is the whole question.
+    let store = &engine.block_store;
+    let derived = crate::engine::container_membership::derive_membership(
+        "set",
+        addresses.clone(),
+        |address| store.read(address).ok(),
+    );
+
+    println!("\n=== a gated removal, and what the index can reach ===");
+    println!("  entries before: {live_before} live, {tombstoned_before} tombstoned");
+    println!("  entries after:  {live_after} live, {tombstoned_after} tombstoned");
+    println!("  addresses the index names: {}", addresses.len());
+    println!(
+        "  pages those addresses state {} live component(s); victim still stated: {}",
+        stated.len(),
+        stated.contains(&victim_component)
+    );
+    println!(
+        "  derived from them: {} live, {} removed, blocks_read={}, complete={}",
+        derived.live.len(),
+        derived.removed.len(),
+        derived.blocks_read,
+        derived.is_complete()
+    );
+
+    // ---- FLOORS, on the reaching of the path rather than on the answer ----
+    assert!(
+        live_before > 0,
+        "the fixture filed no live entry before the removal, so nothing below is about a removal"
+    );
+    assert!(
+        !addresses.is_empty(),
+        "the index names no page at all for this object, so the fold below is handed nothing and \
+         its answer would be empty for a reason that has nothing to do with the removal"
+    );
+    assert!(
+        derived.blocks_read > 0,
+        "the fold read no page, so its conclusion is about nothing"
+    );
+
+    // ---- THE HOLE IN THE COMPLETENESS SIGNAL, asserted rather than mentioned ----
+    // `is_complete` is false for a page that was READ and failed. An unreachable page is never
+    // read, so nothing is counted and this stays true even when the answer below is wrong. The
+    // assertion is here so the hole is a recorded property and not a remark.
+    assert!(
+        derived.is_complete(),
+        "this derivation reports itself INCOMPLETE ({} read failures, {} undecodable, {} unframed, \
+         {} unrenderable). That is a different defect from the one under test: the point here is \
+         that an unreachable page leaves completeness UNDISTURBED",
+        derived.read_failures,
+        derived.undecodable,
+        derived.unframed,
+        derived.unrenderable_items
+    );
+
+    // ---- THE PROPERTY UNDER TEST ----
+    assert!(
+        !derived.live.contains_key(&victim_component),
+        "A MEMBERSHIP FOLDED FROM THE PAGES THE INDEX NAMES STILL HOLDS THE REMOVED MEMBER.\n\
+         The removal appended a tombstone page that names the element, but \
+         `mark_bucket_index_block_deleted_recording` selects the entry to tombstone BY COMPONENT \
+         and a page-named entry has none -- so nothing was filed and the tombstone page is \
+         UNREACHABLE from the index ({live_after} live / {tombstoned_after} tombstoned entries, \
+         {} address(es) named). The fold calls itself COMPLETE because an unreachable page is \
+         never read and therefore never counted as a failure.",
+        addresses.len()
+    );
+    assert!(
+        derived.removed.contains(&victim_component),
+        "the fold does not name the victim as removed either, so the pages the index reaches say \
+         nothing about it at all -- which is the silence a reader cannot tell from 'no removal'"
+    );
+}

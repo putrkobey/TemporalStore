@@ -127,3 +127,133 @@
         {
           "expr": "temporalstore_block_store_slab_bytes"
         }
+      ]
+    },
+    {
+      "title": "Data Node Lifecycle And Runtime",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "temporalstore_data_node_runtime_queue_depth"
+        },
+        {
+          "expr": "temporalstore_data_node_runtime_background_queue_depth"
+        },
+        {
+          "expr": "temporalstore_data_node_dirty_objects"
+        },
+        {
+          "expr": "sum by (kind) (temporalstore_data_node_lifecycle_snapshot_events_total)"
+        }
+      ]
+    },
+    {
+      "title": "Ingestion Lag Dead Letters And Checkpoints",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "temporalstore_ingestion_kafka_lag"
+        },
+        {
+          "expr": "temporalstore_ingestion_kafka_max_lag"
+        },
+        {
+          "expr": "sum by (outcome) (temporalstore_ingestion_records_total)"
+        },
+        {
+          "expr": "temporalstore_ingestion_dead_letters"
+        },
+        {
+          "expr": "temporalstore_ingestion_flink_checkpoint_state"
+        },
+        {
+          "expr": "temporalstore_ingestion_flink_checkpoints"
+        }
+      ]
+    },
+    {
+      "title": "MatrixArk Backend SLO",
+      "type": "timeseries",
+      "targets": [
+        {
+          "expr": "matrixark_backend_qps"
+        },
+        {
+          "expr": "sum by (backend) (matrixark_backend_commands_total)"
+        },
+        {
+          "expr": "matrixark_backend_command_latency_ms"
+        },
+        {
+          "expr": "sum by (backend) (matrixark_backend_records_written_total)"
+        },
+        {
+          "expr": "sum by (backend) (matrixark_backend_records_read_total)"
+        },
+        {
+          "expr": "matrixark_backend_ready"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Storage Maintenance: Work Done Per Phase",
+      "targets": [
+        {
+          "expr": "temporalstore_storage_manager_phase_work"
+        },
+        {
+          "expr": "temporalstore_storage_manager_phase_applied"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Storage Maintenance: Phase Enabled And Skipped",
+      "targets": [
+        {
+          "expr": "temporalstore_storage_manager_phase_enabled"
+        },
+        {
+          "expr": "temporalstore_storage_manager_phase_skipped"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Storage Maintenance: Errors And Duration",
+      "targets": [
+        {
+          "expr": "temporalstore_storage_manager_phase_errors"
+        },
+        {
+          "expr": "temporalstore_storage_manager_phase_duration_ms"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Storage Maintenance: Pressure And Floors",
+      "targets": [
+        {
+          "expr": "temporalstore_storage_manager_pressure"
+        },
+        {
+          "expr": "temporalstore_storage_manager_phase_pressure"
+        },
+        {
+          "expr": "temporalstore_storage_manager_phase_floors"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Shard Rate Limit: Allowed And Refused",
+      "targets": [
+        {
+          "expr": "temporalstore_shard_rate_limit_total"
+        }
+      ]
+    }
+  ]
+}
