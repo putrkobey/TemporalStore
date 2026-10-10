@@ -112,3 +112,118 @@ PYTHONPATH=. python3 -m unittest tools.test_matrixark_mcp_server
 }
 ```
 
+Key checks:
+
+- Compression is non-destructive: raw `context_event` records remain in replay.
+- The compression record stores `source_event_ids` for audit and replay.
+- Retrieval treats the compressed summary as `ref_type = compression`.
+- Packing boosts source-linked compression summaries when they cover multiple source events, so old/cold windows can save tokens.
+
+## Selected ContextPack
+
+```json
+{
+  &quot;recall_policy&quot;: {
+    &quot;auxiliary_path&quot;: &quot;keyword graph inside selected tree after secondary-index prefilter&quot;,
+    &quot;auxiliary_quota&quot;: 2,
+    &quot;primary_path&quot;: &quot;tree-first hybrid dense semantic + sparse lexical after secondary-index prefilter&quot;,
+    &quot;secondary_index_filter&quot;: {
+      &quot;applied_before_embedding_scoring&quot;: true,
+      &quot;dropped_candidate_count&quot;: 1,
+      &quot;enabled&quot;: true,
+      &quot;matched_candidate_count&quot;: 2,
+      &quot;mode&quot;: &quot;AND across groups, OR within each group&quot;,
+      &quot;required_groups&quot;: [
+        [
+          &quot;classification:confirmation&quot;,
+          &quot;entity_type:approval_state&quot;,
+          &quot;entity_type:confirmation&quot;,
+          &quot;event_type:confirmation&quot;,
+          &quot;segment_topic:approval_budget&quot;
+        ]
+      ]
+    },
+    &quot;time_decay&quot;: {
+      &quot;freshness_tolerance_ms&quot;: 86400000,
+      &quot;half_life_ms&quot;: 604800000
+    },
+    &quot;tree_traversal&quot;: {
+      &quot;enabled&quot;: true,
+      &quot;fallback_to_flat&quot;: false,
+      &quot;max_children_scored_per_parent&quot;: 10000,
+      &quot;selected_leaf_count&quot;: 1,
+      &quot;selected_node_count&quot;: 5,
+      &quot;selected_path_count&quot;: 5,
+      &quot;summary_embeddings&quot;: [
+        &quot;node_l0&quot;,
+        &quot;node_l1&quot;
+      ],
+      &quot;top_k_per_layer&quot;: 8
+    },
+    &quot;weights&quot;: {
+      &quot;business&quot;: 0.25,
+      &quot;time&quot;: 0.05
+    }
+  },
+  &quot;selected_refs&quot;: [
+    {
+      &quot;business_score&quot;: 0.5,
+      &quot;embedding_score&quot;: 0.499999,
+      &quot;event_type&quot;: &quot;time_compress&quot;,
+      &quot;final_score&quot;: 0.827226,
+      &quot;keyword_score&quot;: 5,
+      &quot;node_hash&quot;: 9049490510714952373,
+      &quot;node_path&quot;: [
+        &quot;account:acct_dev&quot;,
+        &quot;tenant:tenant_dev&quot;,
+        &quot;principal:user:alice&quot;,
+        &quot;collection:sessions&quot;,
+        &quot;session:operator-window&quot;
+      ],
+      &quot;node_score&quot;: 0.785048,
+      &quot;operator&quot;: &quot;TIME_COMPRESS&quot;,
+      &quot;origin_score&quot;: 0.9317519999999999,
+      &quot;packing_policy&quot;: &quot;fact&quot;,
+      &quot;packing_score&quot;: 1.0,
+      &quot;ranking_formula&quot;: &quot;Sfinal=(1-wtime-wbusi)*Sorigin+wtime*Stime+wbusi*Sbusi&quot;,
+      &quot;recall_path&quot;: &quot;primary_time_compression&quot;,
+      &quot;ref_hash&quot;: 8849697440636724129,
+      &quot;ref_type&quot;: &quot;compression&quot;,
+      &quot;scope&quot;: {
+        &quot;account_id&quot;: &quot;acct_dev&quot;,
+        &quot;session_hash&quot;: 7101050098322077057,
+        &quot;session_id&quot;: &quot;operator-window&quot;,
+        &quot;team&quot;: &quot;infra&quot;,
+        &quot;tenant_hash&quot;: 5019518775864453950,
+        &quot;tenant_id&quot;: &quot;tenant_dev&quot;,
+        &quot;user_hash&quot;: 4964277056467908383,
+        &quot;user_id&quot;: &quot;alice&quot;
+      },
+      &quot;score&quot;: 0.827226,
+      &quot;source_end_ms&quot;: 1782119740794,
+      &quot;source_event_ids&quot;: [
+        1264545819372063038,
+        6457433297074149587
+      ],
+      &quot;source_start_ms&quot;: 1782119740784,
+      &quot;sparse_score&quot;: 1.0,
+      &quot;text&quot;: &quot;TIME_COMPRESS: Temporal compression window [1782119740784, 1782119740794] contains 2 selected events plus additional source events. user: Alice approved the old GPU purchase after finance reviewed it. | user: The GPU approval budget was 42000 dollars.&quot;,
+      &quot;time_score&quot;: 1.0,
+      &quot;token_estimate&quot;: 33,
+      &quot;updated_at_ms&quot;: 1782119750794
+    }
+  ],
+  &quot;used_context_tokens&quot;: 33
+}
+```
+
+## TemporalStore Coverage
+
+Native coverage lives in the context extension tests:
+
+- `TreeEmbeddingSummaryAndCompressionRoundTrip`
+- `TemporalCompressionBuildsReplayableSummaryWithoutDeletingSources`
+- decayed event query tests using `decay_half_life_ms`, `min_decayed_score`, and `rank_by_decayed_score`
+
+Those tests prove the storage-side records and time-window query semantics. This MatrixArk validation proves the application-side retrieval and token-packing path can consume the compressed records.
+</pre></body></html>
