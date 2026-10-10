@@ -246,3 +246,251 @@ struct MirrorAddressEightBitObject {
     object_ordinal: u8,
 }
 
+/// The same with a SIXTEEN-bit ordinal, which #1994 measured as worth nothing. Mirrored so the claim
+/// is reproduced from declarations here rather than quoted.
+#[allow(dead_code)]
+struct MirrorAddressSixteenBitObject {
+    address_word: u64,
+    length: u32,
+    block_id: u16,
+    present: u8,
+    object_ordinal: u16,
+}
+
+/// Step 3: the component as an element ordinal too. Another tree's step, not this one's -- mirrored
+/// only so the combined width can be stated.
+#[allow(dead_code)]
+struct MirrorEntryBothOrdinals {
+    model_id: StoredModelKind,
+    component: u16,
+    address: MirrorAddressEightBitObject,
+    dirty: bool,
+    deleted: bool,
+    log_backed: bool,
+}
+
+/// Step 5: the same shape with the alignment given up.
+#[allow(dead_code)]
+#[repr(packed)]
+struct MirrorEntryBothOrdinalsPacked {
+    model_id: StoredModelKind,
+    component: u16,
+    address: MirrorAddressEightBitObject,
+    dirty: bool,
+    deleted: bool,
+    log_backed: bool,
+}
+
+
+// =================================================================================================
+// 2. THE HEAP. What a one-word name slot is worth on the chunk column, at both populations.
+// =================================================================================================
+
+
+/// WHAT AN `Arc<str>` ACTUALLY ASKS THE ALLOCATOR FOR, read back from the allocator rather than
+/// modelled.
+///
+/// The whole of step 1a's free ride is the claim that `Arc<str>`'s allocation is TWO header words
+/// and the characters, so a thin string that replaces the weak count with the length asks for the
+/// same number of bytes. `name_heap` above takes the header width as a parameter precisely so this
+/// test can be the thing that fixes it, and the comparison against the three-word row in
+/// `what_a_one_word_name_slot_is_worth_on_the_chunk_column` is what stops the two-word equality
+/// being vacuous.
+///
+/// SINGLE-THREADED. The counters are process-wide, so this must be run with `--test-threads=1`; a
+/// concurrent allocation from another test would land in this span. That is why it asserts the
+/// allocation COUNT as well as the byte total -- a perturbed span shows up as a count above one.
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "counting allocator; run by name under --features alloc-probe with --test-threads=1"]
+fn an_arc_str_allocation_is_two_header_words_and_the_characters() {
+    let text = "tenant/1/object/00000006";
+    assert_eq!(
+        24,
+        text.len(),
+        "the fixture key is {} characters, and the expected byte total below is written in terms of \
+         24",
+        text.len()
+    );
+    // Warm anything the first call allocates on the side, so the measured span holds one `Arc`.
+    let warm: Arc<str> = Arc::from(text);
+    std::hint::black_box(&warm);
+
+    let probe = Probe::start();
+    let held: Arc<str> = Arc::from(text);
+    let counts = probe.stop();
+    std::hint::black_box(&held);
+
+    let expected_request = 2 * size_of::<usize>() + text.len();
+    println!(
+        "\n=== Arc<str>::from({} chars) ===\n  {} alloc call(s), {} B requested, {} B of chunk\n  \
+         modelled: {expected_request} B requested, {} B of chunk",
+        text.len(),
+        counts.allocs,
+        counts.alloc_bytes,
+        counts.chunk_bytes,
+        chunk(expected_request)
+    );
+    assert_eq!(
+        1, counts.allocs,
+        "the span held {} allocations, not one. Either `Arc<str>` no longer allocates once or \
+         another thread allocated inside this span -- run with --test-threads=1",
+        counts.allocs
+    );
+    assert_eq!(
+        expected_request as u64,
+        counts.alloc_bytes,
+        "`Arc<str>` asked for {} B to hold {} characters. Two header words and the characters is \
+         {expected_request} B, and if that is wrong then a thin string replacing the weak count \
+         with a length is NOT the same size and step 1a is not free on the allocation",
+        counts.alloc_bytes,
+        text.len()
+    );
+    assert_eq!(
+        chunk(expected_request) as u64,
+        counts.chunk_bytes,
+        "the allocator set aside {} B for a {expected_request} B request; the documented rule says \
+         {}. The reading and the rule are supposed to agree on this platform",
+        counts.chunk_bytes,
+        chunk(expected_request)
+    );
+}
+
+// =================================================================================================
+// 3. STEP 1b, REFUTED ON IDENTITY. The entry cannot find its object without the key.
+// =================================================================================================
+
+/// THIS REFUTATION IS RESOLVED, NOT RETIRED, AND THE RESOLUTION IS THE POINT.
+///
+/// It recorded that step 1b was blocked: an entry whose address carried no object id answered `0`
+/// from `BlockIndex::object_id()`, so the entry could not name its object and the object list could
+/// not be rebuilt from the entries. That was true of the shape it was written against, where the
+/// entry's only handle on its object was a COPY held in the address.
+///
+/// The entry now DERIVES its id from the terms it holds -- the stored model spelling and the object
+/// key -- so an entry with no id in its address, which is every entry, names its object exactly.
+/// The premise the refutation rested on is gone, and with it the conclusion.
+#[test]
+fn an_entry_names_its_object_from_its_own_terms() {
+    use crate::block_store::ElementEntry;
+    use crate::engine::state::BlockIndex;
+    use crate::engine::storage_bucket_internals::stored_model_kind;
+    use std::sync::Arc;
+
+    let entry_key: Arc<str> = Arc::from("named-key");
+    let entry = BlockIndex {
+        model_id: stored_model_kind("string"),
+        address: ElementEntry::from_parts(1, 2, 3, Some(4), None),
+        dirty: false,
+        deleted: false,
+    };
+    // THE DERIVATION IS THE AUTHORITY, and this compares against it rather than against a second
+    // copy -- there is no second copy, which is the change being recorded.
+    let expected = crate::engine::hashing::stable_block_object_id(1, "string", "named-key");
+    assert_eq!(
+        entry.object_id(1, &entry_key),
+        expected,
+        "an entry names its object from the identity beside it"
+    );
+    assert_ne!(
+        entry.object_id(1, &entry_key),
+        0,
+        "and the answer is not the silent zero this used to report"
+    );
+    // A DIFFERENT SHARD IS A DIFFERENT OBJECT, which is why the shard is a parameter and not a
+    // guess: if this held, a zero default would have been harmless and it is not.
+    assert_ne!(
+        entry.object_id(1, &entry_key),
+        entry.object_id(2, &entry_key),
+        "the shard is a term of the identity, so two shards must not agree"
+    );
+    // AND IT SURVIVES THE STORED FORM: the id was never written, so nothing about it can be lost.
+    let written = serde_json::to_string(&crate::engine::state::BlockEntryAt { block: &entry })
+        .expect("a page entry serializes");
+    // AND THE TERMS COME BACK FROM THE KEY, which is where the object key and the kind live now.
+    // Rendered by the production renderer rather than hand-written, so the two halves of the round
+    // trip are the two halves production uses.
+    let stored_key = crate::engine::state::block_index_written_key(&entry_key, &entry);
+    let (read_back_key, read_back) =
+        serde_json::from_str::<crate::engine::state::StoredBlockEntry>(&written)
+            .expect("a page entry deserializes")
+            .into_parts_from_key(&stored_key)
+            .expect("the key the production renderer wrote must invert");
+    assert_eq!(read_back.object_id(1, &read_back_key), expected, "the terms survive the stored form");
+    assert!(
+        !written.contains(&expected.to_string()),
+        "the id is DERIVED, so it must not appear in the stored spelling: {written}"
+    );
+}
+
+
+
+/// A PACKED ENTRY READS ITS ADDRESS BY VALUE, BECAUSE A BORROW OF IT IS UNDEFINED BEHAVIOUR.
+///
+/// This is the cost of step 5 that is not bytes, and it is the class no zero-error pass reaches:
+/// `&entry.address` on a `repr(packed)` structure is a misaligned borrow, which is undefined
+/// behaviour, and it COMPILES: rustc's misaligned-borrow lint fires on a borrow written out in
+/// full, and there is no diagnostic for the same borrow reached through a method, a macro or a
+/// generic. The same shape as the width assertions #1994 had to sweep separately -- a claim that
+/// compiles is a claim no error count sees.
+///
+/// So the discipline a packed entry would require is that every field is read BY VALUE through an
+/// accessor that copies, exactly as the compared design does -- its address is a plain 64-bit word
+/// copied out, never borrowed. This test drives that: the address is read out of a packed mirror as a
+/// copy, and the copy is asserted equal to what was written, so the accessor shape is exercised
+/// rather than described.
+///
+/// rust-internal: measures declarations, no product behaviour
+#[test]
+fn a_packed_entry_reads_its_address_by_value_because_a_borrow_of_it_is_undefined() {
+    let written = MirrorAddressEightBitObject {
+        address_word: 0x0123_4567_89ab_cdef,
+        length: 4_096,
+        block_id: 7,
+        present: 1,
+        object_ordinal: 42,
+    };
+    let entry = MirrorEntryBothOrdinalsPacked {
+        model_id: StoredModelKind::String,
+        component: 9,
+        address: written,
+        dirty: true,
+        deleted: false,
+        log_backed: true,
+    };
+    // BY VALUE. `let read = entry.address;` copies out of the packed layout; `&entry.address` would
+    // be a misaligned borrow and is deliberately not written anywhere in this module.
+    let read = entry.address;
+    assert_eq!(
+        written, read,
+        "the address copied out of a packed entry is {read:?} against the {written:?} that went in; \
+         if a by-value read does not round-trip then the accessor discipline step 5 needs is not \
+         this one"
+    );
+    // And the flags are read the same way, so the test covers the one-byte members too.
+    let dirty = entry.dirty;
+    let log_backed = entry.log_backed;
+    assert!(dirty && log_backed, "the flag members did not survive a by-value read");
+
+    println!(
+        "\n=== step 5's non-byte cost ===\n  a packed entry is {} B and {}-aligned; every field read \
+         must copy, and `&entry.address` compiles while being undefined",
+        size_of::<MirrorEntryBothOrdinalsPacked>(),
+        align_of::<MirrorEntryBothOrdinalsPacked>()
+    );
+    assert_eq!(
+        1,
+        align_of::<MirrorEntryBothOrdinalsPacked>(),
+        "the packed mirror is {}-aligned, so it is not packed and this test is about a structure \
+         whose field reads are perfectly safe",
+        align_of::<MirrorEntryBothOrdinalsPacked>()
+    );
+    assert!(
+        align_of::<MirrorEntryBothOrdinals>() > align_of::<MirrorEntryBothOrdinalsPacked>(),
+        "the unpacked mirror is {}-aligned and the packed one {}. If they agree, packing changed \
+         nothing and there is no unaligned read to pay for",
+        align_of::<MirrorEntryBothOrdinals>(),
+        align_of::<MirrorEntryBothOrdinalsPacked>()
+    );
+}
+
