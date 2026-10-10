@@ -131,3 +131,137 @@ impl<M: Message + Default> Iterator for FramedRecords<'_, M> {
     /// `(log_id, framed_size, record)` — the log id and size are what a block address is built
     /// from, so a replay can address a block it just read without recomputing anything.
     type Item = Result<(u64, u64, M), RecordFramingError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.finished || self.offset >= self.bytes.len() {
+            return None;
+        }
+        let log_id = self.offset as u64;
+        match decode_framed_at::<M>(self.bytes, self.offset) {
+            Ok((record, next_offset)) => {
+                debug_assert!(next_offset > self.offset, "framed scan must advance");
+                let framed_size = (next_offset - self.offset) as u64;
+                self.offset = next_offset;
+                Some(Ok((log_id, framed_size, record)))
+            }
+            Err(error) => {
+                self.finished = true;
+                Some(Err(error))
+            }
+        }
+    }
+}
+
+fn encode_varint32(mut value: u32, out: &mut Vec<u8>) {
+    loop {
+        if value < 0x80 {
+            out.push(value as u8);
+            return;
+        }
+        out.push((value as u8 & 0x7f) | 0x80);
+        value >>= 7;
+    }
+}
+
+fn decode_varint32(bytes: &[u8]) -> Result<(u32, usize), RecordFramingError> {
+    let mut value = 0_u32;
+    for (index, &byte) in bytes.iter().take(5).enumerate() {
+        let part = u32::from(byte & 0x7f);
+        value |= part
+            .checked_shl(7 * index as u32)
+            .ok_or_else(|| RecordFramingError("varint overflows 32 bits".to_string()))?;
+        if byte & 0x80 == 0 {
+            return Ok((value, index + 1));
+        }
+    }
+    Err(RecordFramingError(
+        "varint is truncated or overlong".to_string(),
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wal_record::{WalItem, WalRecord, WAL_RECORD_VERSION};
+
+    fn record(sequence: u64, block: &[u8]) -> WalRecord {
+        WalRecord {
+            version: WAL_RECORD_VERSION,
+            sequence,
+            items: vec![WalItem {
+                block_log: true,
+                block: block.to_vec(),
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn iterator_yields_log_id_and_size_for_every_record() {
+        let records: Vec<WalRecord> = (1..=4)
+            .map(|sequence| record(sequence, format!("block-{sequence}").as_bytes()))
+            .collect();
+        let mut stream = Vec::new();
+        let mut expected_log_ids = Vec::new();
+        for value in &records {
+            expected_log_ids.push(stream.len() as u64);
+            stream.extend_from_slice(&encode_framed(value));
+        }
+
+        let seen: Vec<(u64, u64, WalRecord)> = FramedRecords::new(&stream, 0)
+            .map(|item| item.unwrap())
+            .collect();
+        assert_eq!(seen.len(), records.len());
+        for (index, (log_id, framed_size, value)) in seen.iter().enumerate() {
+            assert_eq!(*log_id, expected_log_ids[index], "log id is the byte offset");
+            assert_eq!(value, &records[index]);
+            assert!(*framed_size > 0);
+        }
+    }
+
+    #[test]
+    fn iterator_can_start_from_a_watermark() {
+        // Replay resumes from the dumped-log-id watermark rather than from zero.
+        let first = encode_framed(&record(1, b"first"));
+        let second_log_id = first.len();
+        let mut stream = first;
+        stream.extend_from_slice(&encode_framed(&record(2, b"second")));
+
+        let seen: Vec<WalRecord> = FramedRecords::new(&stream, second_log_id)
+            .map(|item| item.unwrap().2)
+            .collect();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(seen[0].sequence, 2);
+    }
+
+    #[test]
+    fn iterator_stops_at_corruption_rather_than_skipping_it() {
+        let mut stream = encode_framed(&record(1, b"good"));
+        let corrupt_at = stream.len();
+        stream.extend_from_slice(&encode_framed(&record(2, b"bad")));
+        let last = stream.len() - 1;
+        stream[last] ^= 0xff;
+
+        let results: Vec<_> = FramedRecords::<WalRecord>::new(&stream, 0).collect();
+        assert_eq!(results.len(), 2, "one good record, then the error");
+        assert!(results[0].is_ok());
+        let error = results[1].as_ref().unwrap_err();
+        assert!(
+            error.0.contains(&corrupt_at.to_string()),
+            "error names the offending offset: {error}"
+        );
+    }
+
+    #[test]
+    fn a_truncated_tail_surfaces_as_an_error_not_a_silent_stop() {
+        // A crash mid-append leaves a partial record. Replay must see an error, not treat the
+        // stream as having ended cleanly.
+        let mut stream = encode_framed(&record(1, b"complete"));
+        stream.extend_from_slice(&encode_framed(&record(2, b"incomplete")));
+        stream.truncate(stream.len() - 4);
+
+        let results: Vec<_> = FramedRecords::<WalRecord>::new(&stream, 0).collect();
+        assert!(results[0].is_ok());
+        assert!(results.last().unwrap().is_err());
+    }
+}
