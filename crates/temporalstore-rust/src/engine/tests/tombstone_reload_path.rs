@@ -184,3 +184,189 @@ fn seed_and_unload(dir: &std::path::Path) -> (BTreeSet<Vec<u8>>, Vec<u8>) {
     (expected, victim)
 }
 
+/// rust-internal: drives a real unload/reload and reads the load-path counters
+#[test]
+fn a_reload_of_a_store_this_binary_wrote_reads_the_index_rather_than_replaying() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (expected, victim) = seed_and_unload(dir.path());
+
+    crate::engine::persistence::reset_index_load_path_counts();
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+    let (accepted, refused, absent, undecodable) =
+        crate::engine::persistence::index_load_path_counts();
+
+    println!("=== reload of a store written by THIS binary ===");
+    println!("  load paths: accepted={accepted} refused_stale={refused} absent={absent} undecodable={undecodable}");
+    let (live, tombstoned) = entry_counts(&engine);
+    let seen = members_of(&engine);
+    println!("  entries after the reload: {live} live, {tombstoned} tombstone");
+    println!("  SMEMBERS returns {} member(s)", seen.len());
+
+    // DENOMINATOR: exactly one load must have been classified, or the tuple below says nothing.
+    assert_eq!(
+        1,
+        accepted + refused + absent + undecodable,
+        "the reload classified {} index loads, not one -- so the arm below is not about a single \
+         load and the counters cannot be attributed",
+        accepted + refused + absent + undecodable
+    );
+    assert_eq!(
+        1, accepted,
+        "THE RELOAD DID NOT READ THE INDEX. accepted={accepted} refused_stale={refused} \
+         absent={absent} undecodable={undecodable}. A store this binary just wrote must load through \
+         its own index: if it replayed instead, the membership below would be right for the WRONG \
+         REASON and the persisted index's handling of tombstone entries would be untested."
+    );
+
+    assert_eq!(
+        expected, seen,
+        "the reload does not serve the membership the removal left"
+    );
+    assert!(
+        !seen.contains(&victim),
+        "THE REMOVED MEMBER IS BACK AFTER A RELOAD THAT READ THE INDEX"
+    );
+    // THE SAME DENOMINATOR AS THE FIXTURE'S, ON THE OTHER SIDE OF THE ROUND TRIP. What this
+    // assertion is FOR is the tombstone surviving -- one of them, either way -- and that half does
+    // not move. The live half does: per-element one entry names each survivor, one entry a page
+    // names the folded page they share.
+    //
+    // And the assertions above this one are what make that a count rather than a defect. The
+    // accept-or-replay check passes, so the binary reads the index it wrote rather than replaying;
+    // the membership is what the removal left; and the removed member is still absent. A short live
+    // count here with those three holding is a statement about FILING.
+    // ONE LIVE ENTRY, UNCONDITIONALLY: the per-element projection this chose against is retired.
+    let expected_live = 1;
+    assert_eq!(
+        (expected_live, 1),
+        (live, tombstoned),
+        "the reload restored {live} live and {tombstoned} tombstone entries, where this projection \
+         files {expected_live} live and 1. The tombstone entry must SURVIVE the round trip through \
+         the persisted index -- if it does not, the pages stop recording the removal the moment a \
+         store is reloaded, and a later derivation resurrects it."
+    );
+}
+
+/// rust-internal: rewrites the stored stamp, then drives a real reload
+#[test]
+fn a_reload_after_the_stamp_bump_replays_rather_than_reading_the_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (expected, victim) = seed_and_unload(dir.path());
+
+    // STAMP THE STORED INDEX WITH THE PREVIOUS VERSION, which is what every existing store looks
+    // like to this binary.
+    //
+    // THERE ARE TWO STAMPS AND THIS IS THE INNER ONE. The base index is written as a BINARY container
+    // whose first bytes carry an outer version, and changing that one makes `decode_index_bytes`
+    // REFUSE -- a corrupt-index path, not the stale-stamp path. What `load_index_inner` refuses on is
+    // the `index_format_version` FIELD inside the decoded state, which means the bytes must decode
+    // cleanly and then be judged. So the index is decoded, its field lowered, and re-serialized: and
+    // it is re-serialized as JSON deliberately, because `serialize_index_stamped` writes the binary
+    // container only when the field EQUALS the current constant and JSON otherwise, so a
+    // down-stamped state cannot be written in the binary form at all.
+    let index_path = dir.path().join("indexes").join("shard-1.index.json");
+    let raw = std::fs::read(&index_path).expect("the unload wrote a base index");
+    let mut stored =
+        crate::engine::decode_index_bytes(&raw).expect("the stored base index decodes");
+    let current = crate::engine::SHARD_INDEX_FORMAT_VERSION;
+    assert_eq!(
+        current, stored.index_format_version,
+        "the stored index is stamped {} and this binary writes {current}; this fixture lowers a stamp \
+         it must first be able to read",
+        stored.index_format_version
+    );
+    stored.index_format_version = current - 1;
+    std::fs::write(
+        &index_path,
+        serde_json::to_vec(&stored).expect("re-serialize the down-stamped state as JSON"),
+    )
+    .expect("write the down-stamped index");
+    // AND THE DOWN-STAMPED FILE STILL DECODES, which is the precondition for the arm below testing
+    // the stale-stamp path rather than the undecodable one.
+    let reread = std::fs::read(&index_path).expect("re-read");
+    let decoded =
+        crate::engine::decode_index_bytes(&reread).expect("the down-stamped index still decodes");
+    assert_eq!(
+        current - 1,
+        decoded.index_format_version,
+        "the down-stamp did not survive the round trip, so the arm below is not testing a stale stamp"
+    );
+
+    crate::engine::persistence::reset_index_load_path_counts();
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+    let (accepted, refused, absent, undecodable) =
+        crate::engine::persistence::index_load_path_counts();
+
+    println!("=== reload of a store stamped {} (this binary writes {current}) ===", current - 1);
+    println!("  load paths: accepted={accepted} refused_stale={refused} absent={absent} undecodable={undecodable}");
+    let seen = members_of(&engine);
+    let (live, tombstoned) = entry_counts(&engine);
+    println!("  entries after the replay: {live} live, {tombstoned} tombstone");
+    println!("  SMEMBERS returns {} member(s)", seen.len());
+
+    assert_eq!(
+        1,
+        accepted + refused + absent + undecodable,
+        "the reload classified {} index loads, not one",
+        accepted + refused + absent + undecodable
+    );
+    assert_eq!(
+        1, refused,
+        "THE STALE STAMP WAS NOT REFUSED. accepted={accepted} refused_stale={refused} \
+         absent={absent} undecodable={undecodable}. If the index was ACCEPTED then the bump from 3 \
+         to 5 does not gate anything and an index written before the page format changed would be \
+         served as if it had not."
+    );
+    assert_eq!(
+        0, accepted,
+        "the index was both refused and accepted, which cannot be one load"
+    );
+
+    // AND THE REPLAY REBUILDS THE MEMBERSHIP THE REMOVAL LEFT.
+    assert_eq!(
+        expected, seen,
+        "the replay does not rebuild the membership the removal left: it serves {} member(s) where \
+         {} were expected",
+        seen.len(),
+        expected.len()
+    );
+    assert!(
+        !seen.contains(&victim),
+        "THE REMOVED MEMBER IS BACK AFTER A REPLAY. The removal's outcome carries the tombstone \
+         page's address so the replay can re-file the entry that keeps it reachable; if that address \
+         is not carried, replay re-drops the entry and the page is named by nothing."
+    );
+    assert_eq!(
+        MEMBERS - 1,
+        live,
+        "the replay rebuilt {live} live entries for {} live members",
+        MEMBERS - 1
+    );
+
+    // AND THE REPLAY RE-FILES THE TOMBSTONE ENTRY, FROM THE OUTCOME'S ADDRESS.
+    //
+    // THIS WAS A REFUTATION BEFORE IT WAS A FIX, and the distinction it turns on is why the outcome
+    // carries an address at all. The membership a replay serves was always correct: the WAL outcome
+    // states the removal and the replay applies it to the resident map and the index. What did NOT
+    // survive was the ENTRY that keeps the tombstone PAGE reachable -- a replay runs precisely when the
+    // index was not usable, so there is no index to preserve it from, and the model maps cannot
+    // re-derive it because a removed element is not in them.
+    //
+    // So the tombstone page's address travels in the removal's outcome and the replay's install hands
+    // it back. Drop it and the replay re-drops the entry, the page is named by nothing, and a
+    // derivation after the recovery puts the element back: the original defect, on the one path where
+    // it is hardest to see.
+    assert_eq!(
+        1, tombstoned,
+        "THE REPLAY REBUILT {tombstoned} TOMBSTONE ENTRIES, NOT ONE. Zero means the removal is no \
+         longer recorded in the pages after a recovery, so a membership derived from the pages would \
+         resurrect the member. The outcome carries the tombstone page's address for exactly this; if \
+         the install stops passing it, or the outcome stops carrying it, this is what fails."
+    );
+    println!(
+        "  the replay refused the stale index, rebuilt the membership from the log, and re-filed the \
+         tombstone entry from the outcome's address"
+    );
+}
