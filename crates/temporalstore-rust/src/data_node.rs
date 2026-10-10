@@ -1493,3 +1493,1498 @@ pub struct StorageManagerPressureSnapshot {
     pub compaction_debt_score: u64,
     #[serde(default)]
     pub total_pressure_score: u64,
+    pub background_queue_depth: usize,
+    pub foreground_queue_depth: usize,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageManagerPressureSignal {
+    pub name: String,
+    pub observed: u64,
+    pub threshold: u64,
+    pub over_threshold: bool,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageManagerPressureDecision {
+    pub stage: String,
+    pub enabled: bool,
+    pub pressure_active: bool,
+    pub executed: bool,
+    pub signals: Vec<StorageManagerPressureSignal>,
+    pub trigger_reasons: Vec<String>,
+    pub skip_reason: Option<String>,
+}
+
+/// What a metrics reap actually collected.
+///
+/// The stage used to push the string "reap_metrics" onto the executed list and stop there, so a
+/// cycle reported the stage as having run while nothing was gathered and nothing published. The
+/// WAL's own counters are the clearest example of the cost: they are incremented on every append
+/// and barrier and were never read by anything outside the module that owns them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageMetricsReapReport {
+    /// Durability barriers taken, by the call site that took them.
+    #[serde(default)]
+    pub durability_barriers: std::collections::BTreeMap<String, u64>,
+    #[serde(default)]
+    pub durability_barriers_total: u64,
+    /// This shard's write-ahead log counters at the moment of the reap.
+    #[serde(default)]
+    pub wal: crate::wal::WriteAheadLogStats,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct StorageManagerLoopReport {
+    pub shard_id: ShardId,
+    pub pressure: StorageManagerPressureSnapshot,
+    pub executed_stages: Vec<String>,
+    pub skipped_stages: Vec<String>,
+    #[serde(default)]
+    pub pressure_decisions: Vec<StorageManagerPressureDecision>,
+    pub lifecycle_plan: StorageLifecyclePlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_report: Option<StorageLifecycleReport>,
+    #[serde(default)]
+    pub expired_records_removed: usize,
+    /// Present when the reap stage ran. `None` means it was disabled, not that it found
+    /// nothing -- a reap that gathers nothing still reports zeros.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_reap: Option<StorageMetricsReapReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_report: Option<CompactionResponse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gc_report: Option<GcResponse>,
+    /// What the evict stage did, when it ran.
+    ///
+    /// Every other stage reports itself here. This one computed a full report -- the victims it
+    /// picked, the pressure before and after, whether the round relieved anything at all -- and
+    /// the loop dropped it on the floor, keeping only "did it run" for `executed_stages`. So the
+    /// one stage whose whole purpose is relieving memory was also the one stage an operator could
+    /// not see the result of, and `cooldown` (pressure_after >= pressure_before, i.e. the round
+    /// freed nothing) reached nobody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eviction: Option<crate::engine::reports::StorageEvictionReport>,
+    pub status: Status,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageLifecycleResponse {
+    pub status: Status,
+    pub report: StorageLifecycleReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageManagerResponse {
+    pub status: Status,
+    pub report: StorageManagerCycleReport,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageManagerRuntimeOptions {
+    pub interval_ms: u64,
+    pub jitter_percent: u8,
+    pub initial_backoff_ms: u64,
+    pub max_backoff_ms: u64,
+    pub request: StorageManagerCycleRequest,
+    pub controller: RequestController,
+}
+
+impl Default for StorageManagerRuntimeOptions {
+    fn default() -> Self {
+        Self {
+            interval_ms: 1_000,
+            jitter_percent: 20,
+            initial_backoff_ms: 250,
+            max_backoff_ms: 5_000,
+            request: StorageManagerCycleRequest {
+                max_dump_buckets_per_round: 16,
+                warm_cache: true,
+                ..StorageManagerCycleRequest::default()
+            },
+            controller: RequestController { timeout_ms: 30_000 },
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StorageManagerRuntimeReport {
+    pub running: bool,
+    pub paused: bool,
+    pub stopped: bool,
+    pub interval_ms: u64,
+    pub jitter_percent: u8,
+    pub current_backoff_ms: u64,
+    pub last_delay_ms: u64,
+    pub rounds_attempted: u64,
+    pub rounds_submitted: u64,
+    pub rounds_skipped_paused: u64,
+    pub rounds_skipped_pending: u64,
+    pub submit_failures: u64,
+    pub last_job_id: Option<u64>,
+    pub last_status: Option<Status>,
+    pub phase_prepare_enabled: bool,
+    pub phase_wal_reclaim_enabled: bool,
+    pub phase_expire_enabled: bool,
+    pub phase_evict_enabled: bool,
+    pub phase_block_gc_enabled: bool,
+    pub phase_compaction_enabled: bool,
+    pub phase_index_gc_enabled: bool,
+    pub bounded_max_dump_buckets_per_round: usize,
+    #[serde(default)]
+    pub configured_follower_cursor_count: usize,
+    #[serde(default)]
+    pub configured_raft_snapshot_ref_count: usize,
+    #[serde(default)]
+    pub configured_block_gc_raft_install_floor_slab_id: Option<u64>,
+    #[serde(default)]
+    pub last_completed_cycle: Option<StorageManagerCycleReport>,
+    #[serde(default)]
+    pub last_pressure_snapshot: Option<StorageManagerPressureSnapshot>,
+    #[serde(default)]
+    pub last_phase_reports: Vec<StorageManagerStageReport>,
+    #[serde(default)]
+    pub last_selected_buckets: Vec<u32>,
+    #[serde(default)]
+    pub last_skipped_reasons: Vec<String>,
+    #[serde(default)]
+    pub last_bytes_reclaimed: u64,
+    #[serde(default)]
+    pub last_pressure_before: u64,
+    #[serde(default)]
+    pub last_pressure_after: u64,
+    #[serde(default)]
+    pub last_wal_floor_sequence: u64,
+    #[serde(default)]
+    pub last_index_log_floor_sequence: u64,
+    #[serde(default)]
+    pub last_retention_blockers: usize,
+    #[serde(default)]
+    pub last_phase_blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DataNodeRuntime {
+    inner: Arc<DataNodeRuntimeInner>,
+}
+
+#[derive(Debug)]
+pub struct DirtyDumpScheduler {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+pub struct ExpirySweepScheduler {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+pub struct StorageLifecycleScheduler {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+pub struct StorageManagerScheduler {
+    stop: Arc<AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+pub struct StorageManagerRuntime {
+    stop: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
+    report: Arc<Mutex<StorageManagerRuntimeReport>>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl DirtyDumpScheduler {
+    pub fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for DirtyDumpScheduler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl ExpirySweepScheduler {
+    pub fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ExpirySweepScheduler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl StorageLifecycleScheduler {
+    pub fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for StorageLifecycleScheduler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl StorageManagerScheduler {
+    pub fn stop(mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for StorageManagerScheduler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl StorageManagerRuntime {
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+        self.report
+            .lock()
+            .expect("runtime report lock poisoned")
+            .paused = true;
+    }
+
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Relaxed);
+        self.report
+            .lock()
+            .expect("runtime report lock poisoned")
+            .paused = false;
+    }
+
+    pub fn report(&self) -> StorageManagerRuntimeReport {
+        self.report
+            .lock()
+            .expect("runtime report lock poisoned")
+            .clone()
+    }
+
+    pub fn stop(mut self) -> StorageManagerRuntimeReport {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        self.report()
+    }
+}
+
+impl Drop for StorageManagerRuntime {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Durable shared-storage sink for successfully-applied write commands.
+///
+/// When a datanode is configured with a shared-storage backend (e.g.
+/// matrixobject), an implementor is attached to the runtime via
+/// [`DataNodeRuntime::set_shared_wal_sink`]. Every write command that the local
+/// engine accepts is then mirrored to shared storage, so the data survives the
+/// loss of this node's local dirs and can be replayed on restart. The call is
+/// made synchronously after the local write succeeds; implementors decide their
+/// own durability mode (sync publish vs. queued) and error handling.
+pub trait SharedWalSink: std::fmt::Debug + Send + Sync {
+    /// Record a single successfully-applied write `command` for `shard_id`.
+    fn record_write(&self, shard_id: ShardId, command: &Command);
+}
+
+/// What this node knows about its own role for one shard. THREE states, not two.
+///
+/// The third one is the point. A maintenance stage that asks "am I the leader" and gets a
+/// `bool` has already lost the distinction that matters: a node with no consensus attached --
+/// standalone, shared-storage, or simply a node whose raft runtime has not been constructed yet
+/// -- is not a follower, it is a node with nobody to follow. Collapsing that onto `false` would
+/// disable the stage on EVERY such deployment, which is the shipped default here, and that is a
+/// far worse outcome than the waste the check exists to remove.
+///
+/// So `Unknown` is a real answer with its own deliberate behaviour, and every caller has to say
+/// what it does with it rather than letting an `Option`'s default decide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ShardLeadership {
+    /// Consensus is attached and reports this node as the leader for the shard.
+    Leading,
+    /// Consensus is attached and reports some OTHER node as the leader for the shard.
+    NotLeading,
+    /// Nobody can answer: no source attached, no leader elected yet, or the shard is not one
+    /// this node's consensus covers.
+    Unknown,
+}
+
+impl ShardLeadership {
+    /// The name a stage report carries, so an operator reading a skipped stage can see which of
+    /// the three states produced it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ShardLeadership::Leading => "leading",
+            ShardLeadership::NotLeading => "not_leading",
+            ShardLeadership::Unknown => "unknown",
+        }
+    }
+
+    /// True only for the one state that is EVIDENCE this node does not lead.
+    ///
+    /// Written as a positive test on `NotLeading` rather than `!= Leading` on purpose: the
+    /// negation would fold `Unknown` in with the followers, which is exactly the mistake this
+    /// enum exists to prevent, and it would do it silently.
+    pub fn is_known_not_leading(self) -> bool {
+        matches!(self, ShardLeadership::NotLeading)
+    }
+}
+
+/// Answers [`ShardLeadership`] for a shard. Attached to a runtime by whoever owns consensus.
+///
+/// The runtime cannot ask raft directly, and deliberately so: the server constructs the storage
+/// maintenance scheduler roughly eighty lines BEFORE it constructs the raft runtime, so at the
+/// moment the scheduler starts there is nothing to ask. A source installed later is picked up by
+/// the next round, and every round before that sees `Unknown`.
+pub trait ShardLeadershipSource: std::fmt::Debug + Send + Sync {
+    fn shard_leadership(&self, shard_id: ShardId) -> ShardLeadership;
+}
+
+#[derive(Debug)]
+struct DataNodeRuntimeInner {
+    engine: TemporalEngine,
+    options: DataNodeRuntimeOptions,
+    queue: Mutex<RuntimeQueues>,
+    queue_signal: Condvar,
+    jobs: Mutex<HashMap<u64, DataNodeTaskStatus>>,
+    canceled: Mutex<BTreeSet<u64>>,
+    dirty: Mutex<DirtyTracker>,
+    stats: Mutex<MutableRuntimeStats>,
+    meta_heartbeat: Mutex<DataNodeMetaHeartbeatReport>,
+    lifecycle: Mutex<HashMap<ShardId, DataNodeShardLifecycleState>>,
+    /// Where each shard's expiry sweep left off, as (hot, cold).
+    ///
+    /// Only meaningful when a bound is set: an unbounded window always reaches the end and
+    /// returns `None`, so at the shipped default these stay `None` and cost nothing. Live-path
+    /// state, never persisted -- a reload re-derives deadlines and a fresh pass is correct.
+    expiry_cursors: Mutex<HashMap<ShardId, (Option<String>, Option<String>)>>,
+    lifecycle_tokens: Mutex<HashMap<(ShardId, String), SchedulerLifecycleToken>>,
+    lifecycle_snapshot_path: Option<PathBuf>,
+    lifecycle_persistence: Mutex<DataNodeLifecyclePersistenceReport>,
+    last_storage_manager_cycle: Mutex<Option<StorageManagerCycleReport>>,
+    next_job_id: AtomicU64,
+    /// Optional durable shared-storage sink; when set, accepted writes are
+    /// mirrored to shared storage for cross-restart / local-loss recovery.
+    shared_wal_sink: Mutex<Option<Arc<dyn SharedWalSink>>>,
+    /// Who answers "do I lead this shard". `None` means nobody has been told to answer, which
+    /// reads as [`ShardLeadership::Unknown`] and NOT as "not the leader".
+    shard_leadership: Mutex<Option<Arc<dyn ShardLeadershipSource>>>,
+}
+
+#[derive(Debug, Default)]
+struct MutableRuntimeStats {
+    submitted_total: u64,
+    completed_total: u64,
+    rejected_total: u64,
+    rejected_background_total: u64,
+    timed_out_total: u64,
+    canceled_total: u64,
+    expiry_sweeps: u64,
+    expired_records_removed: u64,
+    dump_runs: u64,
+    compaction_runs: u64,
+    gc_runs: u64,
+    storage_lifecycle_runs: u64,
+    storage_manager_runs: u64,
+    storage_manager_loops: u64,
+    storage_manager_last_shard_id: Option<ShardId>,
+    storage_manager_prepare_runs: u64,
+    storage_manager_reclaim_wal_runs: u64,
+    storage_manager_reclaim_memory_runs: u64,
+    storage_manager_expire_runs: u64,
+    storage_manager_reclaim_block_runs: u64,
+    storage_manager_compact_runs: u64,
+    storage_manager_index_gc_runs: u64,
+    storage_manager_evict_runs: u64,
+}
+
+#[derive(Debug)]
+struct QueuedTask {
+    job_id: u64,
+    kind: DataNodeTaskKind,
+    deadline: Instant,
+    submitted_at_ms: u64,
+    request: TaskRequest,
+}
+
+#[derive(Debug, Default)]
+struct RuntimeQueues {
+    by_shard: HashMap<ShardId, ShardTaskQueues>,
+    ready_shards: VecDeque<ShardId>,
+    ready_background_shards: VecDeque<ShardId>,
+    running_shards: BTreeSet<ShardId>,
+    queued_total: usize,
+    background_queued_total: usize,
+}
+
+#[derive(Debug, Default)]
+struct ShardTaskQueues {
+    foreground: VecDeque<QueuedTask>,
+    background: VecDeque<QueuedTask>,
+}
+
+#[derive(Debug)]
+enum TaskRequest {
+    Load(LoadShardRequest),
+    Reload(LoadShardRequest),
+    Unload(UnloadShardRequest),
+    Execute(ExecuteRequest),
+    CheckedExecute(CheckedExecuteRequest),
+    Dump(DumpShardRequest),
+    Compact(CompactionRequest),
+    Gc(GcRequest),
+    StorageManager(StorageManagerCycleRequest),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskPriority {
+    Foreground,
+    Background,
+}
+
+impl TaskRequest {
+    fn shard_id(&self) -> ShardId {
+        match self {
+            TaskRequest::Load(request) => request.shard_id,
+            TaskRequest::Reload(request) => request.shard_id,
+            TaskRequest::Unload(request) => request.shard_id,
+            TaskRequest::Execute(request) => request.shard_id,
+            TaskRequest::CheckedExecute(request) => request.shard_id,
+            TaskRequest::Dump(request) => request.shard_id,
+            TaskRequest::Compact(request) => request.shard_id,
+            TaskRequest::Gc(request) => request.shard_id,
+            TaskRequest::StorageManager(request) => request.shard_id,
+        }
+    }
+
+    fn priority(&self) -> TaskPriority {
+        match self {
+            TaskRequest::Load(_)
+            | TaskRequest::Reload(_)
+            | TaskRequest::Unload(_)
+            | TaskRequest::Execute(_)
+            | TaskRequest::CheckedExecute(_) => TaskPriority::Foreground,
+            TaskRequest::Dump(_)
+            | TaskRequest::Compact(_)
+            | TaskRequest::Gc(_)
+            | TaskRequest::StorageManager(_) => TaskPriority::Background,
+        }
+    }
+}
+
+impl RuntimeQueues {
+    fn push(&mut self, task: QueuedTask) {
+        let shard_id = task.request.shard_id();
+        let priority = task.request.priority();
+        let queue = self.by_shard.entry(shard_id).or_default();
+        match priority {
+            TaskPriority::Foreground => queue.foreground.push_back(task),
+            TaskPriority::Background => {
+                queue.background.push_back(task);
+                self.background_queued_total += 1;
+            }
+        }
+        self.queued_total += 1;
+        if self.running_shards.contains(&shard_id) {
+            return;
+        }
+        match priority {
+            TaskPriority::Foreground => {
+                self.ready_background_shards
+                    .retain(|ready_shard_id| *ready_shard_id != shard_id);
+                if !self.ready_shards.contains(&shard_id) {
+                    self.ready_shards.push_back(shard_id);
+                }
+            }
+            TaskPriority::Background => {
+                if queue.foreground.is_empty()
+                    && !self.ready_shards.contains(&shard_id)
+                    && !self.ready_background_shards.contains(&shard_id)
+                {
+                    self.ready_background_shards.push_back(shard_id);
+                }
+            }
+        }
+    }
+
+    fn pop_ready(&mut self) -> Option<QueuedTask> {
+        if let Some(task) = self.pop_from_ready_queue(TaskPriority::Foreground) {
+            return Some(task);
+        }
+        self.pop_from_ready_queue(TaskPriority::Background)
+    }
+
+    fn pop_from_ready_queue(&mut self, priority: TaskPriority) -> Option<QueuedTask> {
+        while let Some(shard_id) = match priority {
+            TaskPriority::Foreground => self.ready_shards.pop_front(),
+            TaskPriority::Background => self.ready_background_shards.pop_front(),
+        } {
+            if self.running_shards.contains(&shard_id) {
+                continue;
+            }
+            let Some(queue) = self.by_shard.get_mut(&shard_id) else {
+                continue;
+            };
+            let task = match priority {
+                TaskPriority::Foreground => queue.foreground.pop_front(),
+                TaskPriority::Background => queue.background.pop_front(),
+            };
+            let Some(task) = task else {
+                continue;
+            };
+            self.queued_total = self.queued_total.saturating_sub(1);
+            if priority == TaskPriority::Background {
+                self.background_queued_total = self.background_queued_total.saturating_sub(1);
+            }
+            self.running_shards.insert(shard_id);
+            return Some(task);
+        }
+        None
+    }
+
+    fn finish_shard(&mut self, shard_id: ShardId) {
+        self.running_shards.remove(&shard_id);
+        let Some(queue) = self.by_shard.get(&shard_id) else {
+            return;
+        };
+        if !queue.foreground.is_empty() {
+            self.ready_shards.push_back(shard_id);
+        } else if !queue.background.is_empty() {
+            self.ready_background_shards.push_back(shard_id);
+        } else {
+            self.by_shard.remove(&shard_id);
+        }
+    }
+
+    fn remove_job(&mut self, job_id: u64) -> bool {
+        for (shard_id, queue) in self.by_shard.iter_mut() {
+            let foreground_before = queue.foreground.len();
+            queue.foreground.retain(|task| task.job_id != job_id);
+            if queue.foreground.len() != foreground_before {
+                self.queued_total = self
+                    .queued_total
+                    .saturating_sub(foreground_before - queue.foreground.len());
+                if queue.is_empty() && !self.running_shards.contains(shard_id) {
+                    self.ready_shards
+                        .retain(|ready_shard_id| ready_shard_id != shard_id);
+                    self.ready_background_shards
+                        .retain(|ready_shard_id| ready_shard_id != shard_id);
+                }
+                return true;
+            }
+            let background_before = queue.background.len();
+            queue.background.retain(|task| task.job_id != job_id);
+            if queue.background.len() != background_before {
+                let removed = background_before - queue.background.len();
+                self.queued_total = self.queued_total.saturating_sub(removed);
+                self.background_queued_total = self.background_queued_total.saturating_sub(removed);
+                if queue.is_empty() && !self.running_shards.contains(shard_id) {
+                    self.ready_shards
+                        .retain(|ready_shard_id| ready_shard_id != shard_id);
+                    self.ready_background_shards
+                        .retain(|ready_shard_id| ready_shard_id != shard_id);
+                }
+                return true;
+            }
+        }
+        false
+    }
+
+    fn has_pending_dump(&self, shard_id: ShardId) -> bool {
+        self.by_shard
+            .get(&shard_id)
+            .map(|queue| {
+                queue
+                    .background
+                    .iter()
+                    .any(|task| matches!(task.request, TaskRequest::Dump(_)))
+            })
+            .unwrap_or(false)
+    }
+
+    fn has_pending_storage_manager(&self, shard_id: ShardId) -> bool {
+        self.by_shard
+            .get(&shard_id)
+            .map(|queue| {
+                queue
+                    .background
+                    .iter()
+                    .any(|task| matches!(task.request, TaskRequest::StorageManager(_)))
+            })
+            .unwrap_or(false)
+    }
+}
+
+impl ShardTaskQueues {
+    fn is_empty(&self) -> bool {
+        self.foreground.is_empty() && self.background.is_empty()
+    }
+}
+
+#[derive(Debug, Default)]
+struct DirtyTracker {
+    next_object_id: u64,
+    by_key: HashMap<(ShardId, String), DirtyObjectInfo>,
+}
+
+impl DataNodeRuntime {
+    pub fn new(engine: TemporalEngine, options: DataNodeRuntimeOptions) -> Self {
+        Self::new_with_optional_lifecycle_snapshot_path(
+            engine,
+            options,
+            lifecycle_snapshot_path_from_env(),
+        )
+    }
+
+    pub fn new_with_lifecycle_snapshot_path(
+        engine: TemporalEngine,
+        options: DataNodeRuntimeOptions,
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::new_with_optional_lifecycle_snapshot_path(engine, options, Some(path.into()))
+    }
+
+    fn new_with_optional_lifecycle_snapshot_path(
+        engine: TemporalEngine,
+        options: DataNodeRuntimeOptions,
+        lifecycle_snapshot_path: Option<PathBuf>,
+    ) -> Self {
+        let inner = Arc::new(DataNodeRuntimeInner {
+            engine,
+            options: DataNodeRuntimeOptions {
+                worker_threads: options.worker_threads.max(1),
+                max_queue_depth: options.max_queue_depth.max(1),
+                max_background_queue_depth: options.max_background_queue_depth.max(1),
+            },
+            queue: Mutex::default(),
+            queue_signal: Condvar::new(),
+            jobs: Mutex::default(),
+            canceled: Mutex::default(),
+            dirty: Mutex::default(),
+            stats: Mutex::default(),
+            meta_heartbeat: Mutex::default(),
+            lifecycle: Mutex::default(),
+            expiry_cursors: Mutex::default(),
+            lifecycle_tokens: Mutex::default(),
+            lifecycle_persistence: Mutex::new(lifecycle_persistence_report_for_path(
+                lifecycle_snapshot_path.as_ref(),
+            )),
+            lifecycle_snapshot_path,
+            last_storage_manager_cycle: Mutex::default(),
+            next_job_id: AtomicU64::new(1),
+            shared_wal_sink: Mutex::new(None),
+            shard_leadership: Mutex::new(None),
+        });
+        restore_lifecycle_snapshot_from_path_inner(&inner);
+        for _ in 0..inner.options.worker_threads {
+            let worker = Arc::clone(&inner);
+            thread::spawn(move || worker_loop(worker));
+        }
+        Self { inner }
+    }
+
+    pub fn engine(&self) -> TemporalEngine {
+        self.inner.engine.clone()
+    }
+
+    /// Attach a durable shared-storage sink. Once set, every write command the
+    /// local engine accepts is also mirrored to shared storage (see
+    /// [`SharedWalSink`]). Opt-in: with no sink attached the runtime behaves
+    /// exactly as before.
+    /// Attach the thing that answers "do I lead this shard".
+    ///
+    /// Opt-in and idempotent. Until it is called -- and on every deployment that never calls it
+    /// -- `shard_leadership` answers `Unknown` and every stage that consults it runs exactly as
+    /// it did before.
+    pub fn set_shard_leadership_source(&self, source: Arc<dyn ShardLeadershipSource>) {
+        *self
+            .inner
+            .shard_leadership
+            .lock()
+            .expect("shard leadership lock poisoned") = Some(source);
+    }
+
+    /// What this node knows about its role for `shard_id`, as one of three states.
+    ///
+    /// No source attached -> `Unknown`. That is the answer during the window between the
+    /// maintenance scheduler starting and consensus being constructed, and it is the permanent
+    /// answer for a standalone node, which is the shipped default.
+    pub fn shard_leadership(&self, shard_id: ShardId) -> ShardLeadership {
+        let source = self
+            .inner
+            .shard_leadership
+            .lock()
+            .expect("shard leadership lock poisoned")
+            .clone();
+        match source {
+            Some(source) => source.shard_leadership(shard_id),
+            None => ShardLeadership::Unknown,
+        }
+    }
+
+    pub fn set_shared_wal_sink(&self, sink: Arc<dyn SharedWalSink>) {
+        // The engine emits deletions of its own -- eviction drops, expiry sweeps -- that never
+        // pass through this layer. Give it the same sink, or those deletions reach the local
+        // log alone and a successor replaying the shared log resurrects the keys.
+        self.inner.engine.set_maintenance_wal_mirror(Arc::clone(&sink));
+        *self
+            .inner
+            .shared_wal_sink
+            .lock()
+            .expect("shared wal sink lock poisoned") = Some(sink);
+    }
+
+    fn mirror_write(&self, shard_id: ShardId, command: &Command) {
+        if !is_write_command(command) {
+            return;
+        }
+        let sink = self
+            .inner
+            .shared_wal_sink
+            .lock()
+            .expect("shared wal sink lock poisoned")
+            .clone();
+        if let Some(sink) = sink {
+            sink.record_write(shard_id, command);
+        }
+    }
+
+    fn mirror_writes(
+        &self,
+        shard_id: ShardId,
+        commands: &[Command],
+        responses: &[ExecuteResponse],
+    ) {
+        let sink = self
+            .inner
+            .shared_wal_sink
+            .lock()
+            .expect("shared wal sink lock poisoned")
+            .clone();
+        let Some(sink) = sink else {
+            return;
+        };
+        for (command, response) in commands.iter().zip(responses.iter()) {
+            if response.status.ok && is_write_command(command) {
+                sink.record_write(shard_id, command);
+            }
+        }
+    }
+
+    pub fn last_storage_manager_cycle_report(&self) -> Option<StorageManagerCycleReport> {
+        self.inner
+            .last_storage_manager_cycle
+            .lock()
+            .expect("last storage manager cycle lock poisoned")
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn new_without_workers_for_test(engine: TemporalEngine, max_queue_depth: usize) -> Self {
+        Self::new_without_workers_with_options(
+            engine,
+            DataNodeRuntimeOptions {
+                worker_threads: 0,
+                max_queue_depth: max_queue_depth.max(1),
+                max_background_queue_depth: max_queue_depth.max(1),
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn new_without_workers_with_options(
+        engine: TemporalEngine,
+        options: DataNodeRuntimeOptions,
+    ) -> Self {
+        Self::new_without_workers_with_options_and_lifecycle_snapshot_path(engine, options, None)
+    }
+
+    #[cfg(test)]
+    fn new_without_workers_with_options_and_lifecycle_snapshot_path(
+        engine: TemporalEngine,
+        options: DataNodeRuntimeOptions,
+        lifecycle_snapshot_path: Option<PathBuf>,
+    ) -> Self {
+        let inner = Arc::new(DataNodeRuntimeInner {
+            engine,
+            options: DataNodeRuntimeOptions {
+                worker_threads: 0,
+                max_queue_depth: options.max_queue_depth.max(1),
+                max_background_queue_depth: options.max_background_queue_depth.max(1),
+            },
+            queue: Mutex::default(),
+            queue_signal: Condvar::new(),
+            jobs: Mutex::default(),
+            canceled: Mutex::default(),
+            dirty: Mutex::default(),
+            stats: Mutex::default(),
+            meta_heartbeat: Mutex::default(),
+            lifecycle: Mutex::default(),
+            expiry_cursors: Mutex::default(),
+            lifecycle_tokens: Mutex::default(),
+            lifecycle_persistence: Mutex::new(lifecycle_persistence_report_for_path(
+                lifecycle_snapshot_path.as_ref(),
+            )),
+            lifecycle_snapshot_path,
+            last_storage_manager_cycle: Mutex::default(),
+            next_job_id: AtomicU64::new(1),
+            shared_wal_sink: Mutex::new(None),
+            shard_leadership: Mutex::new(None),
+        });
+        restore_lifecycle_snapshot_from_path_inner(&inner);
+        Self { inner }
+    }
+
+    pub fn load_shard_with(&self, request: LoadShardRequest) -> LoadShardResponse {
+        load_shard_with_inner(&self.inner, request)
+    }
+
+    pub fn reload_shard_with(&self, request: LoadShardRequest) -> LoadShardResponse {
+        reload_shard_with_inner(&self.inner, request)
+    }
+
+    pub fn unload_shard_with(&self, request: UnloadShardRequest) -> UnloadShardResponse {
+        unload_shard_with_inner(&self.inner, request, true)
+    }
+
+    pub fn require_lifecycle_token(&self, token: SchedulerLifecycleToken) {
+        self.inner
+            .lifecycle_tokens
+            .lock()
+            .expect("runtime lifecycle token lock poisoned")
+            .insert((token.shard_id, token.operation.clone()), token);
+        persist_lifecycle_snapshot_inner(&self.inner);
+    }
+
+    pub fn lifecycle_tokens(&self) -> Vec<SchedulerLifecycleToken> {
+        let mut tokens = self
+            .inner
+            .lifecycle_tokens
+            .lock()
+            .expect("runtime lifecycle token lock poisoned")
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        tokens.sort_by_key(|token| (token.shard_id, token.operation.clone()));
+        tokens
+    }
+
+    pub fn lifecycle_snapshot(&self) -> DataNodeLifecycleSnapshot {
+        lifecycle_snapshot_inner(&self.inner)
+    }
+
+    pub fn lifecycle_persistence_report(&self) -> DataNodeLifecyclePersistenceReport {
+        self.inner
+            .lifecycle_persistence
+            .lock()
+            .expect("runtime lifecycle persistence lock poisoned")
+            .clone()
+    }
+
+    pub fn restore_lifecycle_snapshot(&self, snapshot: DataNodeLifecycleSnapshot) -> Status {
+        let status = restore_lifecycle_snapshot_inner(&self.inner, snapshot);
+        if status.ok {
+            persist_lifecycle_snapshot_inner(&self.inner);
+        }
+        status
+    }
+
+    pub fn submit_load(
+        &self,
+        request: LoadShardRequest,
+        controller: RequestController,
+    ) -> DataNodeTaskStatus {
+        self.submit(
+            TaskRequest::Load(request),
+            DataNodeTaskKind::Load,
+            controller,
+        )
+    }
+
+    pub fn submit_reload(
+        &self,
+        request: LoadShardRequest,
+        controller: RequestController,
+    ) -> DataNodeTaskStatus {
+        self.submit(
+            TaskRequest::Reload(request),
+            DataNodeTaskKind::Reload,
+            controller,
+        )
+    }
+
+    pub fn submit_unload(
+        &self,
+        request: UnloadShardRequest,
+        controller: RequestController,
+    ) -> DataNodeTaskStatus {
+        self.submit(
+            TaskRequest::Unload(request),
+            DataNodeTaskKind::Unload,
+            controller,
+        )
+    }
+
+    pub fn validate_foreground_write_allowed(
+        &self,
+        shard_id: ShardId,
+        commands: &[Command],
+    ) -> Result<(), Status> {
+        validate_foreground_write_allowed_inner(&self.inner, shard_id, commands)
+    }
+
+    pub fn execute(&self, request: ExecuteRequest) -> ExecuteResponse {
+        if let Err(status) = validate_foreground_write_allowed_inner(
+            &self.inner,
+            request.shard_id,
+            std::slice::from_ref(&request.command),
+        ) {
+            return ExecuteResponse {
+                status,
+                response: CommandResponse::Empty,
+            };
+        }
+        let response = self.inner.engine.execute(request.clone());
+        if response.status.ok && is_write_command(&request.command) {
+            mark_dirty(
+                &self.inner.dirty,
+                request.shard_id,
+                command_key(&request.command).as_deref(),
+            );
+            self.mirror_write(request.shard_id, &request.command);
+        }
+        response
+    }
+
+    pub fn execute_checked(&self, request: CheckedExecuteRequest) -> CheckedExecuteResponse {
+        if let Err(status) = validate_foreground_write_allowed_inner(
+            &self.inner,
+            request.shard_id,
+            std::slice::from_ref(&request.command),
+        ) {
+            return CheckedExecuteResponse {
+                status: status.clone(),
+                response: ExecuteResponse {
+                    status,
+                    response: CommandResponse::Empty,
+                },
+            };
+        }
+        let response = self.inner.engine.execute_checked(request.clone());
+        if response.status.ok && is_write_command(&request.command) {
+            mark_dirty(
+                &self.inner.dirty,
+                request.shard_id,
+                command_key(&request.command).as_deref(),
+            );
+            self.mirror_write(request.shard_id, &request.command);
+        }
+        response
+    }
+
+    pub fn batch_execute(&self, request: BatchExecuteRequest) -> BatchExecuteResponse {
+        if let Err(status) = validate_foreground_write_allowed_inner(
+            &self.inner,
+            request.shard_id,
+            &request.commands,
+        ) {
+            return BatchExecuteResponse {
+                status,
+                responses: Vec::new(),
+            };
+        }
+        let response = self.inner.engine.batch_execute(request.clone());
+        mark_dirty_for_successful_commands(
+            &self.inner.dirty,
+            request.shard_id,
+            &request.commands,
+            &response.responses,
+        );
+        self.mirror_writes(request.shard_id, &request.commands, &response.responses);
+        response
+    }
+
+    pub fn batch_execute_checked(
+        &self,
+        request: CheckedBatchExecuteRequest,
+    ) -> CheckedBatchExecuteResponse {
+        if let Err(status) = validate_foreground_write_allowed_inner(
+            &self.inner,
+            request.shard_id,
+            &request.commands,
+        ) {
+            return CheckedBatchExecuteResponse {
+                status: status.clone(),
+                response: BatchExecuteResponse {
+                    status,
+                    responses: Vec::new(),
+                },
+            };
+        }
+        let response = self.inner.engine.batch_execute_checked(request.clone());
+        if response.status.ok {
+            mark_dirty_for_successful_commands(
+                &self.inner.dirty,
+                request.shard_id,
+                &request.commands,
+                &response.response.responses,
+            );
+            self.mirror_writes(
+                request.shard_id,
+                &request.commands,
+                &response.response.responses,
+            );
+        }
+        response
+    }
+
+    pub fn submit_execute(
+        &self,
+        request: ExecuteRequest,
+        controller: RequestController,
+    ) -> DataNodeTaskStatus {
+        self.submit(
+            TaskRequest::Execute(request),
+            DataNodeTaskKind::Execute,
+            controller,
+        )
+    }
+
+    pub fn submit_checked_execute(
+        &self,
+        request: CheckedExecuteRequest,
+        controller: RequestController,
+    ) -> DataNodeTaskStatus {
+        self.submit(
+            TaskRequest::CheckedExecute(request),
+            DataNodeTaskKind::CheckedExecute,
+            controller,
+        )
+    }
+
+    pub fn submit_dump(
+        &self,
+        request: DumpShardRequest,
+        controller: RequestController,
+    ) -> DataNodeTaskStatus {
+        self.submit(
+            TaskRequest::Dump(request),
+            DataNodeTaskKind::Dump,
+            controller,
+        )
+    }
+
+    pub fn submit_compaction(
+        &self,
+        request: CompactionRequest,
+        controller: RequestController,
+    ) -> DataNodeTaskStatus {
+        self.submit(
+            TaskRequest::Compact(request),
+            DataNodeTaskKind::Compact,
+            controller,
+        )
+    }
+
+    pub fn submit_gc(
+        &self,
+        request: GcRequest,
+        controller: RequestController,
+    ) -> DataNodeTaskStatus {
+        self.submit(TaskRequest::Gc(request), DataNodeTaskKind::Gc, controller)
+    }
+
+    pub fn submit_storage_manager_cycle(
+        &self,
+        request: StorageManagerCycleRequest,
+        controller: RequestController,
+    ) -> DataNodeTaskStatus {
+        self.submit(
+            TaskRequest::StorageManager(request),
+            DataNodeTaskKind::StorageManager,
+            controller,
+        )
+    }
+
+    pub fn job_status(&self, job_id: u64) -> Option<DataNodeTaskStatus> {
+        self.inner
+            .jobs
+            .lock()
+            .expect("data node jobs lock poisoned")
+            .get(&job_id)
+            .cloned()
+    }
+
+    pub fn cancel_job(&self, job_id: u64) -> DataNodeTaskStatus {
+        let mut jobs = self
+            .inner
+            .jobs
+            .lock()
+            .expect("data node jobs lock poisoned");
+        let Some(existing) = jobs.get(&job_id).cloned() else {
+            return DataNodeTaskStatus {
+                job_id,
+                kind: DataNodeTaskKind::Execute,
+                status: Status::error("job_not_found", "data node job not found"),
+                output: None,
+                submitted_at_ms: now_ms(),
+                finished_at_ms: Some(now_ms()),
+            };
+        };
+        if existing.finished_at_ms.is_some() {
+            return DataNodeTaskStatus {
+                status: Status::error("job_already_finished", "data node job already finished"),
+                ..existing
+            };
+        }
+        let mut queue = self
+            .inner
+            .queue
+            .lock()
+            .expect("runtime queue lock poisoned");
+        if !queue.remove_job(job_id) {
+            self.inner
+                .canceled
+                .lock()
+                .expect("runtime cancellation lock poisoned")
+                .insert(job_id);
+            let cancel_requested = DataNodeTaskStatus {
+                status: Status::error(
+                    "job_cancel_requested",
+                    "data node job cancellation requested",
+                ),
+                ..existing
+            };
+            jobs.insert(job_id, cancel_requested.clone());
+            return cancel_requested;
+        }
+        let canceled = DataNodeTaskStatus {
+            status: Status::error("job_canceled", "data node job canceled before execution"),
+            finished_at_ms: Some(now_ms()),
+            ..existing
+        };
+        jobs.insert(job_id, canceled.clone());
+        self.inner
+            .stats
+            .lock()
+            .expect("runtime stats lock poisoned")
+            .canceled_total += 1;
+        canceled
+    }
+
+    pub fn dirty_objects(&self) -> Vec<DirtyObjectInfo> {
+        self.inner
+            .dirty
+            .lock()
+            .expect("dirty tracker lock poisoned")
+            .by_key
+            .values()
+            .cloned()
+            .collect()
+    }
+
+    pub fn dirty_shards(&self) -> Vec<ShardId> {
+        dirty_shards(&self.inner.dirty)
+    }
+
+    pub fn shard_worker_info(&self, shard_id: ShardId) -> ShardWorkerInfo {
+        let worker_threads = self.inner.options.worker_threads.max(1);
+        ShardWorkerInfo {
+            shard_id,
+            worker_index: shard_id as usize % worker_threads,
+            worker_threads,
+        }
+    }
+
+    pub fn queued_shard_worker_infos(&self) -> Vec<ShardWorkerInfo> {
+        let queue = self
+            .inner
+            .queue
+            .lock()
+            .expect("runtime queue lock poisoned");
+        let worker_threads = self.inner.options.worker_threads.max(1);
+        queue
+            .by_shard
+            .keys()
+            .map(|shard_id| ShardWorkerInfo {
+                shard_id: *shard_id,
+                worker_index: *shard_id as usize % worker_threads,
+                worker_threads,
+            })
+            .collect()
+    }
+
+    pub fn schedule_dirty_shard_dumps(
+        &self,
+        controller: RequestController,
+    ) -> Vec<DataNodeTaskStatus> {
+        self.dirty_shards()
+            .into_iter()
+            .filter(|shard_id| {
+                !self
+                    .inner
+                    .queue
+                    .lock()
+                    .expect("runtime queue lock poisoned")
+                    .has_pending_dump(*shard_id)
+            })
+            .map(|shard_id| {
+                self.submit_dump(
+                    DumpShardRequest {
+                        shard_id,
+                        selected_routing_buckets: Vec::new(),
+                    },
+                    controller,
+                )
+            })
+            .collect()
+    }
+
+
+
+    fn submit(
+        &self,
+        request: TaskRequest,
+        kind: DataNodeTaskKind,
+        controller: RequestController,
+    ) -> DataNodeTaskStatus {
+        let job_id = self.inner.next_job_id.fetch_add(1, Ordering::Relaxed);
+        let submitted_at_ms = now_ms();
+        let status = DataNodeTaskStatus {
+            job_id,
+            kind,
+            status: Status::ok(),
+            output: None,
+            submitted_at_ms,
+            finished_at_ms: None,
+        };
+        {
+            let priority = request.priority();
+            let mut queue = self
+                .inner
+                .queue
+                .lock()
+                .expect("runtime queue lock poisoned");
+            if queue.queued_total >= self.inner.options.max_queue_depth {
+                self.inner
+                    .stats
+                    .lock()
+                    .expect("runtime stats lock poisoned")
+                    .rejected_total += 1;
+                return DataNodeTaskStatus {
+                    status: Status::error("queue_full", "data node worker queue is full"),
+                    finished_at_ms: Some(now_ms()),
+                    ..status
+                };
+            }
+            if priority == TaskPriority::Background
+                && queue.background_queued_total >= self.inner.options.max_background_queue_depth
+            {
+                let mut stats = self
+                    .inner
+                    .stats
+                    .lock()
+                    .expect("runtime stats lock poisoned");
+                stats.rejected_total += 1;
+                stats.rejected_background_total += 1;
+                return DataNodeTaskStatus {
+                    status: Status::error(
+                        "background_queue_full",
+                        "data node background worker queue is full",
+                    ),
+                    finished_at_ms: Some(now_ms()),
+                    ..status
+                };
+            }
+            queue.push(QueuedTask {
+                job_id,
+                kind,
+                deadline: Instant::now() + Duration::from_millis(controller.timeout_ms),
+                submitted_at_ms,
+                request,
+            });
+            self.inner.queue_signal.notify_one();
+        }
+        self.inner
+            .jobs
+            .lock()
+            .expect("data node jobs lock poisoned")
+            .insert(job_id, status.clone());
+        self.inner
+            .stats
+            .lock()
+            .expect("runtime stats lock poisoned")
+            .submitted_total += 1;
+        status
+    }
+}
+
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default()
+}
+
+
+pub fn distributed_admission_decision(
+    shard_id: ShardId,
+    peer_snapshots: &[DistributedAdmissionPeerSnapshot],
+    read_budget: u64,
+    write_budget: u64,
+    min_topology_version: u64,
+) -> DistributedAdmissionDecision {
+    let relevant = peer_snapshots
+        .iter()
+        .filter(|snapshot| snapshot.shard_id == shard_id)
+        .collect::<Vec<_>>();
+    let aggregate_read_count = relevant
+        .iter()
+        .map(|snapshot| snapshot.read_count)
+        .sum::<u64>();
+    let aggregate_write_count = relevant
+        .iter()
+        .map(|snapshot| snapshot.write_count)
+        .sum::<u64>();
+    let topology_version = relevant
+        .iter()
+        .map(|snapshot| snapshot.topology_version)
+        .min()
+        .unwrap_or_default();
+    let mut reasons = Vec::new();
+    if relevant.is_empty() {
+        reasons.push("missing_peer_snapshots".to_string());
+    }
+    if topology_version < min_topology_version {
+        reasons.push("stale_distributed_admission_topology".to_string());
+    }
+    let read_allowed = read_budget == 0 || aggregate_read_count < read_budget;
+    let write_allowed = write_budget == 0 || aggregate_write_count < write_budget;
+    if !read_allowed {
+        reasons.push("distributed_read_budget_exceeded".to_string());
+    }
+    if !write_allowed {
+        reasons.push("distributed_write_budget_exceeded".to_string());
+    }
+    let status = if reasons.is_empty() {
+        Status::ok()
+    } else {
+        Status::error("distributed_admission_rejected", reasons.join(","))
+    };
+    DistributedAdmissionDecision {
+        shard_id,
+        status,
+        topology_version,
+        participating_nodes: relevant.len(),
+        aggregate_read_count,
+        aggregate_write_count,
+        read_budget,
+        write_budget,
+        read_allowed,
+        write_allowed,
+        reasons,
+    }
+}
+
+pub fn validate_multi_process_lifecycle_reports(
+    reports: &[DataNodeLifecycleReport],
+    persistence_reports: &[DataNodeLifecyclePersistenceReport],
+) -> MultiProcessLifecycleValidationReport {
+    let mut operations = BTreeSet::new();
+    let mut restart_restore_validated = false;
+    for report in reports {
+        for transition in &report.transitions {
+            operations.insert((transition.operation.clone(), transition.state.clone()));
+        }
+    }
+    for persistence in persistence_reports {
+        if persistence.enabled
+            && persistence.restore_success_total > 0
+            && persistence
+                .last_restore_status
+                .as_ref()
+                .is_some_and(|status| status.ok)
+        {
+            restart_restore_validated = true;
+        }
+    }
+    let load_validated = operations.contains(&("load".to_string(), "serving".to_string()));
+    let reload_validated = operations.contains(&("reload".to_string(), "readonly".to_string()))
+        || operations.contains(&("reload".to_string(), "serving".to_string()));
+    let unload_validated = operations.contains(&("unload".to_string(), "unloaded".to_string()));
+    let all_nodes_have_persistence = !reports.is_empty()
+        && reports.len() == persistence_reports.len()
+        && persistence_reports.iter().all(|report| report.enabled);
+    let mut blockers = Vec::new();
+    if !load_validated {
+        blockers.push("load_not_validated".to_string());
+    }
+    if !reload_validated {
+        blockers.push("reload_not_validated".to_string());
+    }
+    if !unload_validated {
+        blockers.push("unload_not_validated".to_string());
+    }
+    if !restart_restore_validated {
+        blockers.push("restart_restore_not_validated".to_string());
+    }
+    if !all_nodes_have_persistence {
+        blockers.push("lifecycle_persistence_not_enabled_on_all_nodes".to_string());
+    }
+    MultiProcessLifecycleValidationReport {
+        node_count: reports.len(),
+        load_validated,
+        reload_validated,
+        unload_validated,
+        restart_restore_validated,
+        all_nodes_have_persistence,
+        passed: blockers.is_empty(),
+        blockers,
+    }
+}
+
+#[cfg(test)]
+#[path = "data_node/data_node_regression_tests.rs"]
+mod tests;
