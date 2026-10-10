@@ -69,3 +69,75 @@ function run(routeBody, picked, fieldKeys) {
         case "pendingPick": return pendingPick;
         case "pickedModel": return () => picked;
         case "$": return (id) => (id === "groups" ? groups : { id });
+        case "say": return (_el, text) => messages.push(String(text));
+        case "window": return { showTab: () => {} };
+        case "ev": return { target: { closest: () => ({ dataset: { use: "extraction" } }) },
+                            preventDefault: () => {} };
+        default: return () => {};
+      }
+    }
+  });
+
+  /* The handler's own `var`s have to be declared INSIDE a function, or `with` resolves them
+     against the proxy -- which answers every name with an inert function, so the body runs to
+     completion having written nothing and every assertion below reads as a silent no-op.
+     Locals of an inner function shadow the with-object; free names still fall through to it. */
+  const NL = String.fromCharCode(10);
+  const body = "return function handle() {" + NL + resolverSource + NL + handlerSource + NL + "};";
+  let threw = null;
+  try {
+    new Function("scope", "with (scope) { " + body + " }")(scope)();
+  } catch (err) {
+    threw = err;
+  }
+  return { edits, queried, messages, threw };
+}
+
+/* 1. Anthropic: the route names its own field, and that is the one the page fills in. */
+let r = run({ key: "extraction.anthropic_model", current: "claude-sonnet-5", catalogue: [] },
+            "claude-opus-5", ["extraction.model", "extraction.anthropic_model"]);
+ok("no exception on the path that sets a field", r.threw === null,
+   r.threw && String(r.threw));
+ok("the field looked up is the one the route named",
+   r.queried.length === 1 && r.queried[0] === "extraction.anthropic_model",
+   "queried " + JSON.stringify(r.queried));
+ok("the pick is recorded against that key",
+   r.edits["extraction.anthropic_model"] === "claude-opus-5" &&
+   !Object.prototype.hasOwnProperty.call(r.edits, "extraction.model"),
+   JSON.stringify(r.edits));
+ok("the confirmation still names the control", r.messages.some((m) => /Extraction model set to/.test(m)),
+   JSON.stringify(r.messages));
+
+/* 2. OpenAI-compatible: unchanged from what shipped. */
+r = run({ key: "extraction.model", current: "gpt-4o-mini", catalogue: [] },
+        "gpt-4o", ["extraction.model", "extraction.anthropic_model"]);
+ok("an openai-compatible pick still lands in extraction.model",
+   r.edits["extraction.model"] === "gpt-4o" &&
+   !Object.prototype.hasOwnProperty.call(r.edits, "extraction.anthropic_model"),
+   JSON.stringify(r.edits));
+
+/* 3. A gateway that does not say: the page keeps working on its own static key rather than
+      querying `[data-key="undefined"]` and reporting the field as missing. */
+r = run({ current: "gpt-4o-mini", catalogue: [] }, "gpt-4o",
+        ["extraction.model", "extraction.anthropic_model"]);
+ok("a route that names no field falls back to the static one",
+   r.edits["extraction.model"] === "gpt-4o", JSON.stringify(r.edits));
+
+/* 4. The floor. If the handler stopped writing anything, every assertion above about WHICH key is
+      written would still pass. */
+r = run({ key: "extraction.anthropic_model", current: "", catalogue: [] }, "",
+        ["extraction.anthropic_model"]);
+ok("nothing picked writes nothing and says so",
+   Object.keys(r.edits).length === 0 && r.messages.some((m) => /Type a model name first/.test(m)),
+   JSON.stringify(r.edits) + " " + JSON.stringify(r.messages));
+
+/* 5. The field named by the route is not on the form: say so rather than silently doing nothing. */
+r = run({ key: "extraction.anthropic_model", current: "", catalogue: [] }, "claude-opus-5",
+        ["extraction.model"]);
+ok("a field the form does not carry is reported, not skipped",
+   Object.keys(r.edits).length === 0 &&
+   r.messages.some((m) => /not loaded/.test(m)),
+   JSON.stringify(r.edits) + " " + JSON.stringify(r.messages));
+
+console.log(failures ? "\n" + failures + " failure(s)" : "\nall ok");
+process.exit(failures ? 1 : 0);
