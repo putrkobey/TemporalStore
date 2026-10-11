@@ -122,3 +122,252 @@ global/resources/public_docs</code></pre>
   Worker->>TS: batch extraction / summaries / embeddings / compression</pre>
 
 <h3>ContextEvent</h3>
+<p>ContextEvent is the raw or extracted observation. The primary ordering key is timestamp-like:</p>
+<pre><code>context_event_key = 00000001782681920521:1121810234980183195</code></pre>
+<p>The first part is ingestion timestamp in milliseconds. The second part is the event hash tie-breaker so multiple events in the same millisecond do not overwrite each other.</p>
+<pre><code>{
+  "record_type": "context_event",
+  "event_id_hash": 1121810234980183195,
+  "node_hash": 2100209595829882121,
+  "timestamp_key_ms": 1782681920521,
+  "source_type": "message",
+  "text": "user: Alice approved the GPU purchase.",
+  "event_type": "confirmation"
+}</code></pre>
+
+<h2>Batch Extraction</h2>
+<p>Batch extraction converts pending same-session ContextEvents into derived memory: entities, segments, summaries, embeddings, and compact secondary-index postings.</p>
+<pre class="mermaid">flowchart TD
+  A["Pending session ContextEvents"]
+  B["one_pass_memory_extraction"]
+  C["ContextEntity records"]
+  D["ContextSegment records"]
+  E["ContextSummary batch_l0/session_l0"]
+  F["ContextEmbedding event/entity/segment/summary"]
+  G["ContextIndex compact postings"]
+
+  A --> B
+  B --> C
+  B --> D
+  B --> E
+  C --> F
+  D --> F
+  E --> F
+  C --> G
+  D --> G
+  A --> G</pre>
+
+<p>Today deterministic extraction is still used as a CI/dev fallback. Production should prefer OSS/OpenAI-compatible extraction where configured, while emitting the same internal schema.</p>
+
+<h3>ContextEntity</h3>
+<pre><code>{
+  "record_type": "context_entity",
+  "entity_hash": 7343877841316191174,
+  "node_hash": 2100209595829882121,
+  "entity_type": "approval_state",
+  "name": "Project Aurora GPU purchase",
+  "state": "Approved by Alice after finance review.",
+  "operator": "LATEST",
+  "source_ref": "event:1121810234980183195"
+}</code></pre>
+
+<h2>Resource Ingestion</h2>
+<p>Resources are parsed into cited chunks. Raw bytes stay in local storage, S3, or object storage and are referenced by <code>raw_uri</code>.</p>
+<pre class="mermaid">flowchart TD
+  A["matrixark_ingest(kind=resource, raw_uri)"]
+  B["ResourceImportTask"]
+  C["Parser dispatch"]
+  D["Chunking"]
+  E["Dedupe by content_hash"]
+  F["Embeddings"]
+  G["ResourceManifest / ResourceRegistry"]
+  H["ResourceChunk records"]
+  I["Resource facts as ContextEvent / ContextEntity"]
+  J["ContextIndex postings"]
+  K["Dirty summaries"]
+
+  A --> B --> C --> D --> E --> F
+  F --> G
+  F --> H
+  H --> I
+  H --> J
+  H --> K</pre>
+
+<pre><code>{
+  "record_type": "resource_chunk",
+  "chunk_hash": 5143435679319321803,
+  "resource_hash": 826404229911,
+  "node_hash": 91423188001,
+  "raw_uri_ref": 42,
+  "source_ref": "doc:42#page=1",
+  "unit_kind": "pdf_page",
+  "content_hash": "720c7be01019a773",
+  "token_estimate": 191,
+  "text": "Project Aurora GPU Approval Packet..."
+}</code></pre>
+
+<p>Resource facts are optional extracted events/entities with <code>source_chunk_hash</code>. They should be limited to answer-dense facts such as decisions, owners, costs, deadlines, policies, API contracts, and troubleshooting steps.</p>
+
+<h2>Skill Ingestion</h2>
+<p>Skills are not just generic Markdown. <code>SKILL.md</code> and bundles produce skill records and a separate skill-section retrieval lane.</p>
+<pre class="mermaid">flowchart TD
+  A["SKILL.md or bundle"]
+  B["SkillParser"]
+  C["SkillManifest"]
+  D["SkillSection records"]
+  E["ResourceChunk records with resource_type=skill"]
+  F["ContextSummary skill_l0 / skill_summary"]
+  G["ContextEmbedding skill summary and sections"]
+  H["ContextIndex skill_name / skill_trigger / skill_tool"]
+  I["ContextPack includes only relevant sections"]
+
+  A --> B --> C
+  B --> D
+  D --> E
+  D --> F
+  D --> G
+  D --> H
+  H --> I</pre>
+
+<h2>Summaries: L0 And L1</h2>
+<p>Summaries live as separate <code>ContextSummary</code> records. Events do not duplicate summaries, and embeddings are separate <code>ContextEmbedding</code> records.</p>
+<pre class="mermaid">flowchart TD
+  A["Leaf events/entities/chunks/sections"]
+  B["Leaf node_l0"]
+  C["Leaf node_l1"]
+  D["Parent selected child summaries"]
+  E["Parent selected entity state"]
+  F["Parent node_l0"]
+  G["Parent node_l1"]
+  H["ContextEmbedding for every summary"]
+
+  A --> B
+  A --> C
+  B --> D
+  C --> D
+  E --> F
+  D --> F
+  D --> G
+  B --> H
+  C --> H
+  F --> H
+  G --> H</pre>
+
+<p>L0 is the short routing/preview summary. L1 is richer and carries more content for broader traversal. Production should use OSS/LLM summarization when configured; deterministic summarization remains a fallback.</p>
+
+<h2>Secondary Indexes</h2>
+<p>Secondary indexes should be compact postings, not one tiny row per event forever.</p>
+<pre><code>{
+  "record_type": "context_index",
+  "data_model": "context_event",
+  "index_name": "event_type:confirmation",
+  "timestamp_key_ms": 1782681900000,
+  "node_hash": 2100209595829882121,
+  "ref_hashes": [1121810234980183195, 1384573524671901516]
+}</code></pre>
+
+<p>Query understanding creates filters, retrieval applies scope first, scans compact postings, intersects/boosts candidate refs, then scores fewer leaf records.</p>
+
+<h2>Retrieval</h2>
+<pre class="mermaid">flowchart TD
+  A["matrixark_retrieve(query, scope, budget)"]
+  B["Query understanding"]
+  C["Scope filter"]
+  D["Node L0/L1 traversal"]
+  E["Secondary-index prefilter"]
+  F["Fetch leaf candidates"]
+  G["Score: dense + sparse + temporal decay + business boost"]
+  H["Rerank cross-session/shared candidates"]
+  I["Pack compact ContextPack"]
+  J["Optional audit/telemetry"]
+
+  A --> B --> C --> D --> E --> F --> G --> H --> I --> J</pre>
+
+<p>Retrieval uses same-session continuity first, cross-session same-user memory when useful, shared tenant/global resources with a quota, skills in a separate quota, compressed events for old history, and raw old events only when high-confidence evidence is required.</p>
+
+<h2>ContextPack</h2>
+<p>The serving ContextPack should be compact. Full access objects, cache-hit booleans, dropped refs, full recall policy, raw model payloads, and repeated type strings belong in telemetry or audit/debug records.</p>
+<pre><code>{
+  "context_pack_id": "native-native-1782632828-348",
+  "groups": {
+    "same_session": [
+      {"type": "event", "text": "Alice approved the GPU purchase.", "source": "event:1121810"}
+    ],
+    "entities": [
+      {"name": "Project Aurora GPU purchase", "state": "Approved by Alice."}
+    ],
+    "resources": [
+      {"source": "doc:42#page=1", "text": "Approval packet..."}
+    ],
+    "skills": [
+      {"name": "matrixark-debug", "section": "Retrieval diagnostics", "text": "..."}
+    ]
+  },
+  "used_context_tokens": 1420,
+  "quality_warnings": []
+}</code></pre>
+
+<h2>Temporal Compression</h2>
+<p>Time-weighted recall is query-time ranking. Temporal compression is background lifecycle work that creates summary records for old raw events and can later make raw events eligible for deletion.</p>
+<pre class="mermaid">flowchart TD
+  A["Timestamp-keyed raw ContextEvents"]
+  B["Node has more than max_raw_events_per_node"]
+  C["Select old window before cutoff"]
+  D["Generate ContextCompressionEvent"]
+  E["Create compression_summary embedding"]
+  F["Write raw-event retention markers"]
+  G["Normal retrieval scores compression + newest raw events"]
+  H["Future GC deletes raw events only after safety checks"]
+
+  A --> B --> C --> D --> E --> F --> G --> H</pre>
+
+<pre><code>{
+  "record_type": "context_compression_event",
+  "compression_id_hash": 773920331,
+  "node_hash": 2100209595829882121,
+  "source_event_ids": [101, 102, 103],
+  "source_start_ms": 1782000000000,
+  "source_end_ms": 1782200000000,
+  "summary_text": "Older Project Aurora discussions established Alice approval and Bob ownership.",
+  "retention_policy": {
+    "raw_events_remain_replayable": true,
+    "ttl_marker_only": true,
+    "evict_after_ms": 1784792000000
+  }
+}</code></pre>
+
+<p>Current production gap: compression summaries and TTL markers exist, but physical raw-event GC is not fully automatic yet. A native conformance <code>matrixark_gc_expired_context_events</code> worker should use timestamp indexes, no-cache cold scans, bounded batches, tombstones, and retention/audit safety gates.</p>
+
+<h2>Durable Storage Growth</h2>
+<p>If no GC/compaction runs, local/shared durable storage grows forever. Cache eviction removes hot memory residency; temporal compression reduces retrieval cost; WAL/checkpoint GC reclaims replication artifacts; Rust block store has segment GC/delayed-destroy/purge paths; MatrixArk raw ContextEvent physical deletion is not fully automatic yet.</p>
+<pre class="mermaid">flowchart TD
+  A["Hot serving records in TemporalStore"]
+  B["Old raw events compressed"]
+  C["Retention markers written"]
+  D["Cold no-cache GC scan"]
+  E["Verify replay/audit/reinforcement safety"]
+  F["Write tombstones"]
+  G["Remove expired raw ContextEvents"]
+  H["Storage compaction reclaims pages/blocks"]
+  I["Cold immutable raw ingest log remains in MatrixKV/SQL/S3 for backfill"]
+
+  A --> B --> C --> D --> E --> F --> G --> H
+  A --> I</pre>
+
+<h2>Backfill</h2>
+<p>Backfill should replay raw ingestion messages from MatrixKV/SQL into TemporalStore in batches: read raw messages, normalize envelopes, batch append timestamp-keyed ContextEvents, run extraction windows, refresh summaries, generate embeddings, rebuild compact secondary postings, validate retrieval, and mark a checkpoint.</p>
+
+<h2>And Rust Parity Expectations</h2>
+<p>Both backends should pass shared contracts for ingest, extraction, async summary refresh, L0/L1 traversal, secondary-index prefilter, resource/skill/event/entity retrieval, compact ContextPack packing, optional audit/replay, temporal compression, and storage-mode routing.</p>
+
+<h2>Production Direction</h2>
+<p>MatrixArk should optimize for same-session continuity first, cross-session entity state as the bridge, shared resources and skills as governed context, temporal compression for old history, compact ContextPack serving output, telemetry by default, sampled audit/replay, TemporalStore for hot serving, and MatrixKV/SQL/S3 for cold immutable history and backfill.</p>
+
+</article>
+</main>
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+  mermaid.initialize({ startOnLoad: true, theme: 'default' });
+</script>
+</body>
+</html>
