@@ -229,3 +229,234 @@ fn tombstones_by_bucket(engine: &TemporalEngine) -> std::collections::BTreeMap<u
 /// Percentile off a sorted slice, nearest-rank. Returns 0 for an empty sample.
 fn pct(sorted: &[usize], p: f64) -> usize {
     if sorted.is_empty() {
+        return 0;
+    }
+    let rank = ((p / 100.0) * (sorted.len() as f64 - 1.0)).round() as usize;
+    sorted[rank.min(sorted.len() - 1)]
+}
+
+struct Arm {
+    label: &'static str,
+    records: usize,
+    /// Delete every Nth key. `None` deletes nothing -- the control.
+    delete_every: Option<usize>,
+}
+
+/// WHAT A MARK-IN-PLACE DELETE WOULD RETAIN, AND WHAT IT WOULD COST, AT FOUR POINTS AND A CONTROL.
+///
+/// The state is produced, not constructed. Strings are written and a share of them deleted through
+/// the single-command delete path -- the one that retires the pages and writes the tombstone.
+///
+/// EVERY DENOMINATOR IS PRINTED AND ASSERTED, because an arm that wrote nothing, an arm that
+/// deleted nothing and an arm whose deletes found no page all produce "0 entries would be
+/// retained", which reads exactly like a cheap design:
+///
+///   * records acked (the seed reached the store);
+///   * keys deleted (the delete path ran);
+///   * buckets occupied (the denominator every per-bucket figure divides by);
+///   * pages LOST across the delete, per bucket, measured before and after -- the entries a
+///     mark-in-place design would have kept; and
+///   * tombstoned ids actually written, which must be non-zero wherever pages were lost, or the
+///     two halves are not describing the same delete.
+///
+/// A HISTOGRAM, NEVER A MEAN: p50, p90, p99 and MAX of the per-bucket retained-entry count, with
+/// the sample count beside them. A mean of one retained entry per bucket can hold a bucket with
+/// none and a bucket with forty, and the cap sweep is decided by the tail.
+///
+/// THE CONTROL ARM deletes nothing and must report 0 retained entries and 0.00% -- the change
+/// predicts exactly nothing there.
+///
+/// rust-internal: seeds up to 40,000 records per arm, no external surface
+#[test]
+#[ignore = "seeds 4,000 and 40,000 records across five arms; run by name"]
+fn what_a_mark_in_place_delete_would_retain_at_two_corpus_sizes_and_two_delete_rates() {
+    let saving = saving_per_bucket();
+    let stride = cost_per_retained_entry();
+    println!(
+        "  saving/bucket = {saving} B   cost/retained entry = {stride} B   break-even = {:.4} entries/bucket\n",
+        saving as f64 / stride as f64
+    );
+
+    let arms = [
+        Arm { label: "4,000  / 1-in-20", records: 4_000, delete_every: Some(20) },
+        Arm { label: "4,000  / 1-in-4 ", records: 4_000, delete_every: Some(4) },
+        Arm { label: "40,000 / 1-in-20", records: 40_000, delete_every: Some(20) },
+        Arm { label: "40,000 / 1-in-4 ", records: 40_000, delete_every: Some(4) },
+        Arm { label: "CONTROL: no delete", records: 4_000, delete_every: None },
+    ];
+
+    let mut rows = Vec::new();
+
+    for arm in &arms {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = mip_engine(dir.path());
+        mip_load(&engine, MIP_END_BUCKET);
+
+        let keys: Vec<String> =
+            (0..arm.records).map(|index| format!("mip-{index:06}")).collect();
+        let mut acked = 0usize;
+        for chunk in keys.chunks(512) {
+            let commands = chunk
+                .iter()
+                .map(|key| Command::StringSet { key: key.clone(), value: vec![b'm'; 64] })
+                .collect::<Vec<_>>();
+            let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+                shard_id: MIP_SHARD,
+                commands,
+            });
+            assert!(response.status.ok, "seed must ack: {:?}", response.status);
+            acked += chunk.len();
+        }
+        assert_eq!(acked, arm.records, "DENOMINATOR: the seed did not ack every record");
+
+        let before = blocks_by_bucket(&engine);
+        let blocks_before: usize = before.values().sum();
+        assert!(
+            blocks_before > 0,
+            "DENOMINATOR [{}]: the seed filed no page at all, so nothing could be retained",
+            arm.label
+        );
+
+        let mut deleted = 0usize;
+        if let Some(step) = arm.delete_every {
+            for key in keys.iter().step_by(step) {
+                let response = engine.execute(ExecuteRequest {
+                    shard_id: MIP_SHARD,
+                    command: Command::StringDelete { key: key.clone() },
+                });
+                assert!(response.status.ok, "delete {key} failed: {:?}", response.status);
+                deleted += 1;
+            }
+            assert!(
+                deleted > 0,
+                "DENOMINATOR [{}]: the arm claims a delete rate and deleted nothing",
+                arm.label
+            );
+        }
+
+        let after = blocks_by_bucket(&engine);
+        let tombs = tombstones_by_bucket(&engine);
+        let blocks_after: usize = after.values().sum();
+        let tombs_total: usize = tombs.values().sum();
+
+        // The entries a mark-in-place delete would have KEPT: the pages each bucket lost.
+        let buckets: std::collections::BTreeSet<u32> =
+            before.keys().chain(after.keys()).copied().collect();
+        let mut retained_per_bucket: Vec<usize> = Vec::new();
+        for routing_bucket in &buckets {
+            let b = before.get(routing_bucket).copied().unwrap_or(0);
+            let a = after.get(routing_bucket).copied().unwrap_or(0);
+            retained_per_bucket.push(b.saturating_sub(a));
+        }
+        let retained_total: usize = retained_per_bucket.iter().sum();
+        let mut sorted = retained_per_bucket.clone();
+        sorted.sort_unstable();
+        let carrying = sorted.iter().filter(|n| **n > 0).count();
+
+        // The two halves must describe the same delete.
+        if deleted > 0 {
+            assert!(
+                retained_total > 0,
+                "[{}]: {deleted} keys were deleted and no bucket lost a page, so the fixture did \
+                 not reach the delete path this module prices",
+                arm.label
+            );
+            assert!(
+                tombs_total > 0,
+                "[{}]: {retained_total} pages were removed and no tombstone was written; the page \
+                 removal and the tombstone are supposed to be the same delete",
+                arm.label
+            );
+        } else {
+            // THE CONTROL. The change predicts nothing here.
+            assert_eq!(
+                retained_total, 0,
+                "CONTROL: {retained_total} entries would be retained on an arm that deleted \
+                 nothing, so the measurement is counting something other than deletes"
+            );
+            assert_eq!(
+                tombs_total, 0,
+                "CONTROL: {tombs_total} tombstones on an arm that deleted nothing"
+            );
+        }
+
+        let n_buckets = buckets.len();
+        let today = saving * n_buckets; // what removing the field would recover
+        println!("=== {}", arm.label);
+        println!(
+            "    records acked {acked}   keys deleted {deleted}   buckets {n_buckets}   \
+             pages {blocks_before} -> {blocks_after}   tombstoned ids {tombs_total}"
+        );
+        println!(
+            "    retained entries would be {retained_total} over {n_buckets} buckets; \
+             {carrying} buckets carry >=1 ({:.2}%)",
+            if n_buckets == 0 { 0.0 } else { 100.0 * carrying as f64 / n_buckets as f64 }
+        );
+        println!(
+            "    per-bucket retained entries: p50 {}  p90 {}  p99 {}  MAX {}   (n={})",
+            pct(&sorted, 50.0),
+            pct(&sorted, 90.0),
+            pct(&sorted, 99.0),
+            sorted.last().copied().unwrap_or(0),
+            sorted.len()
+        );
+        println!("    field saving at {saving} B x {n_buckets} buckets = {today} B");
+        println!("    cap   retained  cost B      net B        verdict");
+        let mut nets = Vec::new();
+        for cap in [usize::MAX, 128usize, 8, 1] {
+            let kept: usize = retained_per_bucket.iter().map(|n| (*n).min(cap)).sum();
+            let cost = kept * stride;
+            let net = cost as i64 - today as i64;
+            let cap_label = if cap == usize::MAX { "none".to_string() } else { cap.to_string() };
+            println!(
+                "    {cap_label:<5} {kept:>9}  {cost:>9}   {net:>+10}   {}",
+                if net < 0 { "WINS" } else { "LOSES" }
+            );
+            nets.push((cap_label, net));
+        }
+        let pct_of_node = if n_buckets == 0 {
+            0.0
+        } else {
+            100.0 * (retained_total * stride) as f64 / (size_of::<BucketNode>() * n_buckets) as f64
+        };
+        println!(
+            "    unbounded retained-entry cost as a share of the node budget: {pct_of_node:.2}%\n"
+        );
+        rows.push((arm.label, deleted, n_buckets, retained_total, nets, pct_of_node));
+    }
+
+    // ------------------------------------------------------------------ the verdict, per arm
+    println!("SUMMARY: net bytes of a mark-in-place delete, by compaction cap");
+    println!("  {:<19} {:>8} {:>8} {:>9}  {:>12} {:>12} {:>12} {:>12}", "arm", "deleted", "buckets", "retained", "cap none", "cap 128", "cap 8", "cap 1");
+    for (label, deleted, n_buckets, retained, nets, _) in &rows {
+        println!(
+            "  {label:<19} {deleted:>8} {n_buckets:>8} {retained:>9}  {:>+12} {:>+12} {:>+12} {:>+12}",
+            nets[0].1, nets[1].1, nets[2].1, nets[3].1
+        );
+    }
+
+    // Every arm that actually deleted must LOSE at every cap, including a cap of one.
+    let mut deleting_arms = 0usize;
+    for (label, deleted, _, _, nets, pct_of_node) in &rows {
+        if *deleted == 0 {
+            assert_eq!(
+                *pct_of_node, 0.0,
+                "CONTROL [{label}]: the retained-entry cost is {pct_of_node:.2}% of the node \
+                 budget on an arm that deleted nothing, and must be 0.00%"
+            );
+            continue;
+        }
+        deleting_arms += 1;
+        for (cap_label, net) in nets {
+            assert!(
+                *net > 0,
+                "[{label}] at cap {cap_label}: a mark-in-place delete nets {net} B, so it PAYS \
+                 here and the refutation this module reports is wrong for this arm"
+            );
+        }
+    }
+    assert_eq!(
+        deleting_arms, 4,
+        "DENOMINATOR: {deleting_arms} arms exercised a delete, not the four this module claims"
+    );
+}
