@@ -253,3 +253,259 @@ fn restore(corpus: &Corpus, plant: Option<&std::path::Path>) -> Restore {
     let (wal_before, wal_reads_before) = wal_piece_read_counts_on_this_thread();
     let (index_before, index_reads_before) = index_log_piece_read_counts_on_this_thread();
     crate::wal::WAL_SEGMENT_HEADER_READS.with(|reads| reads.set(0));
+    let mut replayed = 0usize;
+    let mut folded = 0usize;
+    let mut windows = 0u64;
+
+    let (_, kernel_rchar) = kernel_read_span(|| {
+        let mut from = corpus
+            .wal
+            .replay_start_after_sequence(SHARD, 0)
+            .expect("a replay must be able to find where to start");
+        let mut verify_tail = true;
+        loop {
+            let (scanned, more_to_come, resume_at) = corpus
+                .wal
+                .scan_decoded_window(SHARD, from, WINDOW_BYTES, verify_tail)
+                .expect("the replay under measurement must succeed");
+            verify_tail = false;
+            windows += 1;
+            replayed += scanned.len();
+            if !more_to_come {
+                break;
+            }
+            assert!(
+                resume_at.log_id() > from.log_id(),
+                "a window that did not advance would spin"
+            );
+            from = resume_at;
+        }
+        corpus
+            .index
+            .for_each_delta_record_above_anchor(SHARD, 0, 0, |_| folded += 1)
+            .expect("the fold under measurement must succeed");
+        if let Some(path) = plant {
+            let read = std::fs::read(path).expect("the planted read must succeed");
+            assert!(!read.is_empty(), "the planted file is empty");
+        }
+    });
+
+    let (wal_after, wal_reads_after) = wal_piece_read_counts_on_this_thread();
+    let (index_after, index_reads_after) = index_log_piece_read_counts_on_this_thread();
+
+    Restore {
+        replayed,
+        folded,
+        windows,
+        wal_bytes: wal_after - wal_before,
+        wal_reads: wal_reads_after - wal_reads_before,
+        index_bytes: index_after - index_before,
+        index_reads: index_reads_after - index_reads_before,
+        header_reads: crate::wal::WAL_SEGMENT_HEADER_READS.with(|reads| reads.get()),
+        kernel_rchar,
+    }
+}
+
+/// WHAT A RESTORE READS AT TWO CORPUS SIZES, AND WHAT IS LEFT UNATTRIBUTED.
+///
+/// Both of this restore's readers are counted now. The residual is what says whether that is the
+/// whole of them, and it is taken from outside every row it audits.
+#[test]
+fn a_restore_leaves_nothing_unattributed_at_two_corpus_sizes() {
+    let _thresholds = Thresholds;
+
+    let small_corpus = build(SMALL);
+    let big_corpus = build(BIG);
+    let small = restore(&small_corpus, None);
+    let big = restore(&big_corpus, None);
+
+    println!(
+        "what a restore reads, and what no reader claims\n\
+         {:>38}{:>16}{:>16}{:>10}\n\
+         {:>38}{:>16}{:>16}{:>10.3}\n\
+         {:>38}{:>16}{:>16}{:>10.3}\n\
+         {:>38}{:>16}{:>16}{:>10.3}\n\
+         {:>38}{:>16}{:>16}{:>10.3}\n\
+         {:>38}{:>16}{:>16}{:>10.3}\n\
+         {:>38}{:>16}{:>16}{:>10.3}\n\
+         {:>38}{:>16}{:>16}{:>10.3}\n\
+         {:>38}{:>16}{:>16}{:>10.3}\n\
+         {:>38}{:>16}{:>16}{:>10.3}\n\
+         {:>38}{:>16}{:>16}\n\
+         {:>38}{:>16}{:>16}\n",
+        "", format!("{SMALL} records"), format!("{BIG} records"), "ratio",
+        "the write-ahead log on disk", small_corpus.wal_bytes, big_corpus.wal_bytes,
+        big_corpus.wal_bytes as f64 / small_corpus.wal_bytes as f64,
+        "  in pieces", small_corpus.wal_pieces, big_corpus.wal_pieces,
+        big_corpus.wal_pieces as f64 / small_corpus.wal_pieces as f64,
+        "the index log on disk", small_corpus.index_bytes, big_corpus.index_bytes,
+        big_corpus.index_bytes as f64 / small_corpus.index_bytes as f64,
+        "  in pieces", small_corpus.index_pieces, big_corpus.index_pieces,
+        big_corpus.index_pieces as f64 / small_corpus.index_pieces as f64,
+        "replay windows", small.windows, big.windows,
+        big.windows as f64 / small.windows as f64,
+        "the write-ahead reader (#1936)", small.wal_bytes, big.wal_bytes,
+        big.wal_bytes as f64 / small.wal_bytes as f64,
+        "  in reads", small.wal_reads, big.wal_reads,
+        big.wal_reads as f64 / small.wal_reads as f64,
+        "THE INDEX-LOG READER (this change)", small.index_bytes, big.index_bytes,
+        big.index_bytes as f64 / small.index_bytes as f64,
+        "  in reads", small.index_reads, big.index_reads,
+        big.index_reads as f64 / small.index_reads as f64,
+        "kernel rchar for this thread",
+        small.kernel_rchar.unwrap_or(0), big.kernel_rchar.unwrap_or(0),
+        "RESIDUAL (kernel less both readers)",
+        small.residual().unwrap_or(i64::MIN), big.residual().unwrap_or(i64::MIN),
+    );
+
+    // DENOMINATORS FIRST.
+    assert_eq!(
+        (small.replayed, big.replayed),
+        (SMALL, BIG),
+        "APPARATUS: the replays handed back {} and {} records",
+        small.replayed,
+        big.replayed
+    );
+    assert_eq!(
+        (small.folded, big.folded),
+        (SMALL, BIG),
+        "APPARATUS: the folds handed back {} and {} records",
+        small.folded,
+        big.folded
+    );
+    assert!(
+        small.windows > 1 && big.windows > small.windows,
+        "APPARATUS: {} and {} windows -- a single window measures no walk",
+        small.windows,
+        big.windows
+    );
+    assert!(
+        small_corpus.wal_pieces > 1 && small_corpus.index_pieces > 1,
+        "APPARATUS: the small corpus is in {} and {} pieces",
+        small_corpus.wal_pieces,
+        small_corpus.index_pieces
+    );
+    assert!(
+        small.kernel_rchar.is_some() && big.kernel_rchar.is_some(),
+        "APPARATUS: /proc/thread-self/io carried no rchar line"
+    );
+    assert!(
+        small.index_bytes > 0 && big.index_bytes > 0,
+        "the index-log reader claimed nothing -- before this change it claimed nothing because \
+         nothing counted it, which is the defect, not the fix"
+    );
+
+    // WHAT THE TWO FIXES MOVED, at restore level.
+    //
+    // The index-log counter moved NO byte: every byte it now reports was already being read, and
+    // reported by nothing. The whole of it is visibility. The header bound moved bytes, and this
+    // is exactly how many -- a count of reads times a difference in read size, both known.
+    println!(
+        "what the two fixes moved, at restore level\n\
+         {:>38}{:>16}{:>16}\n\
+         {:>38}{:>16}{:>16}\n\
+         {:>38}{:>16}{:>16}\n\
+         {:>38}{:>15.2}%{:>15.2}%\n\
+         {:>38}{:>16}{:>16}\n\
+         {:>38}{:>15.2}%{:>15.2}%\n",
+        "", format!("{SMALL} records"), format!("{BIG} records"),
+        "base-header reads", small.header_reads, big.header_reads,
+        "bytes the bound took off",
+        small.bytes_before_the_bound() - small.named(),
+        big.bytes_before_the_bound() - big.named(),
+        "  as a share of what it read before",
+        (small.bytes_before_the_bound() - small.named()) as f64 * 100.0
+            / small.bytes_before_the_bound() as f64,
+        (big.bytes_before_the_bound() - big.named()) as f64 * 100.0
+            / big.bytes_before_the_bound() as f64,
+        "bytes the index-log counter made VISIBLE", small.index_bytes, big.index_bytes,
+        "  as a share of what this restore reads",
+        small.index_bytes as f64 * 100.0 / small.named() as f64,
+        big.index_bytes as f64 * 100.0 / big.named() as f64,
+    );
+
+    // The arithmetic above is exact only if every piece read was longer than the buffer that used
+    // to be filled. Asserted rather than assumed.
+    assert!(
+        WAL_SEGMENT_BYTES >= 8 * 1024 && INDEX_SEGMENT_BYTES >= 8 * 1024,
+        "APPARATUS: pieces roll at {WAL_SEGMENT_BYTES} and {INDEX_SEGMENT_BYTES} bytes, under \
+         the 8 KiB fill the saving is computed against"
+    );
+    assert!(
+        small.header_reads > 0 && big.header_reads > small.header_reads,
+        "APPARATUS: {} and {} base-header reads",
+        small.header_reads,
+        big.header_reads
+    );
+
+    // THE CLAIM. Nothing this restore reads is unclaimed, at either size.
+    for (label, cost) in [("small", &small), ("big", &big)] {
+        assert_eq!(
+            cost.residual(),
+            Some(0),
+            "{label}: {:?} bytes of this restore belong to no reader the engine names -- kernel \
+             {:?}, write-ahead {} , index log {}",
+            cost.residual(),
+            cost.kernel_rchar,
+            cost.wal_bytes,
+            cost.index_bytes
+        );
+    }
+}
+
+/// THE RESIDUAL IS A READING, NOT AN IDENTITY.
+///
+/// Zero is exactly what an instrument that always answered zero would say. This runs the same
+/// span with a read of a file NEITHER counter can see planted inside it, and requires the
+/// residual to come back as exactly its size.
+#[test]
+fn the_restore_residual_recovers_a_planted_read_exactly() {
+    const PLANTED: usize = 1_000_003;
+
+    let _thresholds = Thresholds;
+    let corpus = build(SMALL);
+
+    let unseen_dir = tempfile::tempdir().unwrap();
+    let unseen = unseen_dir.path().join("unseen.bin");
+    std::fs::write(&unseen, vec![5u8; PLANTED]).unwrap();
+
+    let plain = restore(&corpus, None);
+    let planted = restore(&corpus, Some(&unseen));
+
+    println!(
+        "the restore residual, without and with a {PLANTED}-byte read planted inside it\n\
+         {:>34}{:>14}{:>14}\n\
+         {:>34}{:>14}{:>14}\n\
+         {:>34}{:>14?}{:>14?}\n",
+        "", "plain", "planted",
+        "bytes the two readers claimed", plain.named(), planted.named(),
+        "residual", plain.residual(), planted.residual(),
+    );
+
+    assert_eq!(
+        (plain.replayed, planted.replayed),
+        (SMALL, SMALL),
+        "APPARATUS: the two restores replayed {} and {}",
+        plain.replayed,
+        planted.replayed
+    );
+    assert!(
+        plain.named() > 0,
+        "APPARATUS: the restore under measurement claimed no byte at all"
+    );
+    assert_eq!(plain.residual(), Some(0), "the plain restore left {:?}", plain.residual());
+    assert_eq!(
+        planted.residual(),
+        Some(PLANTED as i64),
+        "a {PLANTED}-byte read planted in the span came back as {:?} -- the residual is not a \
+         reading",
+        planted.residual()
+    );
+    assert_eq!(
+        plain.named(),
+        planted.named(),
+        "the planted read must not be charged to either counter: {} against {}",
+        plain.named(),
+        planted.named()
+    );
+}
