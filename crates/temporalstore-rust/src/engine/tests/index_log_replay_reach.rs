@@ -330,3 +330,335 @@ fn base_with_deadlines_and_anchor_less_deltas(
     keys: usize,
     with_content: usize,
 ) -> AnchorLessFixture {
+    let blocks = dir.join("blocks");
+    let indexes = dir.join("indexes");
+    let engine = TemporalEngine::with_local_dirs(1 << 20, dir.join("cache"), &blocks, &indexes);
+    engine.load_shard(SHARD);
+
+    for index in 0..keys {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringSetEx {
+                key: deadline_key(index),
+                value: vec![b'v'; 16],
+                ttl_ms: 600_000,
+            },
+        });
+        assert!(response.status.ok, "seed write failed: {:?}", response.status);
+    }
+    engine.flush_shard_index(SHARD);
+
+    let base_state = decode_index_bytes(&std::fs::read(engine.index_path(SHARD)).unwrap())
+        .expect("the base index decodes");
+    let base_anchor = base_state
+        .applied_wal_sequence
+        .expect("the base index must anchor somewhere");
+
+    // DENOMINATOR ONE: a base anchor of 0 turns the whole comparison off, and every row below
+    // would be a pass that means nothing.
+    assert!(base_anchor > 0, "the base index anchors at 0");
+    // DENOMINATOR TWO: the base must HOLD every deadline. A base that holds none is one where a
+    // fold that applies nothing and a fold that applies everything look the same.
+    let held = (0..keys)
+        .filter(|index| base_state.expires_at_ms().contains_key(deadline_key(*index).as_str()))
+        .count();
+    assert_eq!(
+        held, keys,
+        "the base index holds {held} of {keys} deadlines, so removing them is not observable"
+    );
+
+    // THE ANCHOR-LESS RECORDS WITH CONTENT, appended after the base was taken so no base can
+    // reflect them. A key-state blob carrying only `key` is what an expiry round captures AFTER
+    // the delete: the ABSENT `expires_at_ms` is the removal, and a present one would RESTORE the
+    // deadline of a key the round expired. So applying these must leave the deadline map empty,
+    // and skipping them must leave it exactly as the base had it.
+    let per_delta = keys.div_ceil(with_content.max(1)).max(1);
+    let mut planted = Vec::new();
+    for chunk in (0..keys).collect::<Vec<_>>().chunks(per_delta) {
+        let key_states: Vec<serde_json::Value> = chunk
+            .iter()
+            .map(|index| serde_json::json!({ "key": deadline_key(*index) }))
+            .collect();
+        planted.push(
+            engine
+                .index_log_store
+                .append_delta(SHARD, Vec::new(), key_states, None, None, false, true)
+                .expect("the anchor-less delta appends"),
+        );
+    }
+    // An anchored record the base covers EXACTLY. Its key-state would put a deadline BACK, so a
+    // fold that stops skipping what the base already holds is visible rather than merely slower.
+    let at_base = engine
+        .index_log_store
+        .append_delta(
+            SHARD,
+            Vec::new(),
+            vec![serde_json::json!({ "key": deadline_key(0), "expires_at_ms": u64::MAX })],
+            Some(base_anchor),
+            None,
+            false,
+            true,
+        )
+        .expect("the at-the-base delta appends");
+    // Two anchored records ABOVE the base, HIGHER ANCHOR FIRST. A fold that takes the LAST
+    // anchor rather than the HIGHEST lands on the second one, and the two differ.
+    let mut above = Vec::new();
+    for (offset, index) in [(5_u64, 1_usize), (2_u64, 2_usize)] {
+        let sequence = engine
+            .index_log_store
+            .append_delta(
+                SHARD,
+                Vec::new(),
+                vec![serde_json::json!({ "key": format!("tenant/1/above/{index:04}") })],
+                Some(base_anchor + offset),
+                None,
+                false,
+                true,
+            )
+            .expect("the above-the-base delta appends");
+        above.push((sequence, base_anchor + offset));
+    }
+
+    AnchorLessFixture {
+        engine,
+        base_anchor,
+        with_content: planted,
+        above,
+        at_base,
+    }
+}
+
+/// THE DEFECT, AS THE DEPLOYMENT WOULD SEE IT: a deadline the delta removed comes BACK.
+///
+/// THE ASSERTION IS PER KEY, NOT A COUNT. A count is equally happy when the right NUMBER of the
+/// wrong keys survives, and the failure here is exactly a wrong per-key outcome -- the key an
+/// expiry round removed is restored, with its deadline, and the load reports success. So the
+/// deadline map is compared key by key, in key order, against a control that names every key.
+///
+/// This test uses nothing that did not exist before the fix, so it runs against the unmodified
+/// tree: there it fails with all six deadlines still standing.
+#[test]
+fn the_fold_applies_an_anchor_less_delta_no_base_anchor_can_reflect() {
+    const KEYS: usize = 6;
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = base_with_deadlines_and_anchor_less_deltas(dir.path(), KEYS, 1);
+    assert_eq!(fixture.with_content.len(), 1, "fixture: one content record");
+
+    // DENOMINATOR THREE: the record really is anchor-less and really carries content. Either
+    // half alone describes a record the sweep is SUPPOSED to drop.
+    let records = fixture
+        .engine
+        .index_log_store
+        .read_delta_records(SHARD, 0)
+        .expect("the index log reads back");
+    let planted = records
+        .iter()
+        .find(|record| record.sequence == fixture.with_content[0])
+        .expect("the anchor-less record is in the log");
+    assert!(
+        planted.applied_wal_sequence.is_none(),
+        "fixture: the planted record anchors at {:?}",
+        planted.applied_wal_sequence
+    );
+    assert_eq!(
+        planted.key_states.len(),
+        KEYS,
+        "fixture: the planted record carries {} key-states",
+        planted.key_states.len()
+    );
+
+    let reader = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache-reader"),
+        &dir.path().join("blocks"),
+        &dir.path().join("indexes"),
+    );
+    let loaded = reader
+        .load_index_checked(SHARD, false)
+        .expect("the delta log is intact, so the checked load must not refuse it")
+        .expect("the base index is present, so the load must return a state");
+
+    let after: Vec<(String, bool)> = (0..KEYS)
+        .map(|index| {
+            let key = deadline_key(index);
+            let still_held = loaded.expires_at_ms().contains_key(key.as_str());
+            (key, still_held)
+        })
+        .collect();
+    let control: Vec<(String, bool)> =
+        (0..KEYS).map(|index| (deadline_key(index), false)).collect();
+    assert_eq!(
+        after, control,
+        "the fold skipped the anchor-less delta at sequence {} behind a base anchored at {}: \
+         every `true` above is a key whose deadline the delta removed and the load put back",
+        fixture.with_content[0], fixture.base_anchor
+    );
+}
+
+/// WHAT THE FOLD DECIDED, WHAT IT DID, AND WHERE IT LEFT THE ANCHOR -- EACH AGAINST ITS OWN
+/// CONTROL, ELEMENT BY ELEMENT.
+///
+/// The test above asserts an OUTCOME, which is what a deployment sees. This asserts the three
+/// things that produce it, separately, because a change can break any one of them while leaving
+/// the other two intact:
+///
+///   * the DECISION sequence -- for each record, in the order the fold met it, the (shard,
+///     sequence) pair and whether the base reflects it;
+///   * the APPLICATION sequence -- which records the fold actually folded, recorded where the
+///     work lands rather than where the decision is taken, so a fold that asks the predicate and
+///     then ignores the answer is visible;
+///   * the reconstructed ANCHOR -- the HIGHEST anchor among the applied records, which is where
+///     WAL replay resumes above. The fixture plants the higher anchor FIRST so that "the last
+///     one" and "the highest one" are different numbers.
+///
+/// A test asserting only "three records applied" passes while the right number of the wrong
+/// records is applied, which is why all three are compared pairwise against controls built from
+/// how the fixture was WRITTEN.
+///
+/// THE INSTRUMENT IS FLOORED BY PLANTING A KNOWN NUMBER. Three anchor-less content-carrying
+/// records go in and the counter inside the predicate must come back reading exactly three --
+/// not two, not four, and not the whole log. A counter reading zero because nothing increments
+/// it is indistinguishable from a path that never runs.
+#[test]
+fn every_record_the_fold_met_was_decided_by_its_own_anchor() {
+    const KEYS: usize = 6;
+    const PLANTED: usize = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let fixture = base_with_deadlines_and_anchor_less_deltas(dir.path(), KEYS, PLANTED);
+    assert_eq!(fixture.with_content.len(), PLANTED, "fixture: {PLANTED} planted");
+
+    let records = fixture
+        .engine
+        .index_log_store
+        .read_delta_records(SHARD, 0)
+        .expect("the index log reads back");
+    // DENOMINATOR: every shape the fixture claims to plant has to actually be in the log, or the
+    // controls below are about records that are not there. Checked one shape at a time.
+    let mut seen_with_content = 0;
+    let mut seen_above = 0;
+    let mut seen_at_base = 0;
+    let mut seen_engine_written = 0;
+    for record in &records {
+        if fixture.with_content.contains(&record.sequence) {
+            assert!(
+                record.applied_wal_sequence.is_none() && !record.key_states.is_empty(),
+                "fixture: planted record {} is {:?} / {} key-states",
+                record.sequence,
+                record.applied_wal_sequence,
+                record.key_states.len()
+            );
+            seen_with_content += 1;
+        } else if let Some((_, anchor)) = fixture
+            .above
+            .iter()
+            .find(|(sequence, _)| *sequence == record.sequence)
+        {
+            assert_eq!(
+                record.applied_wal_sequence,
+                Some(*anchor),
+                "fixture: the above-the-base record {} anchors elsewhere",
+                record.sequence
+            );
+            assert!(*anchor > fixture.base_anchor, "fixture: {anchor} is not above the base");
+            seen_above += 1;
+        } else if record.sequence == fixture.at_base {
+            assert_eq!(
+                record.applied_wal_sequence,
+                Some(fixture.base_anchor),
+                "fixture: the at-the-base record {} anchors elsewhere",
+                record.sequence
+            );
+            seen_at_base += 1;
+        } else {
+            let anchor = record.applied_wal_sequence.unwrap_or(0);
+            assert!(
+                anchor > 0 && anchor <= fixture.base_anchor,
+                "fixture: record {} anchors at {anchor}, which the base's {} does not cover",
+                record.sequence,
+                fixture.base_anchor
+            );
+            seen_engine_written += 1;
+        }
+    }
+    assert_eq!(seen_with_content, PLANTED, "the log is missing a planted content record");
+    assert_eq!(seen_above, fixture.above.len(), "the log is missing an above-the-base record");
+    assert_eq!(seen_at_base, 1, "the log is missing the at-the-base record");
+    assert!(
+        seen_engine_written > 0,
+        "the log holds no record the engine wrote, so every row is a planted one"
+    );
+
+    let control: Vec<(ShardId, u64, bool)> = records
+        .iter()
+        .map(|record| {
+            (
+                record.shard_id,
+                record.sequence,
+                fixture.expected_reflected(record.sequence),
+            )
+        })
+        .collect();
+    let control_applied = fixture.expected_applied(&records);
+
+    let reader = TemporalEngine::with_local_dirs(
+        1 << 20,
+        dir.path().join("cache-reader"),
+        &dir.path().join("blocks"),
+        &dir.path().join("indexes"),
+    );
+    crate::index_log::probe::reset();
+    crate::index_log::probe::arm_decisions();
+    let loaded = reader
+        .load_index_checked(SHARD, false)
+        .expect("the checked load must not refuse an intact log");
+    let decisions = crate::index_log::probe::decisions();
+    let applied = crate::index_log::probe::applied();
+    let tested = crate::index_log::probe::fold_records_tested();
+    let anchorless_seen = crate::index_log::probe::fold_anchorless_with_content();
+    crate::index_log::probe::disarm_decisions();
+
+    let loaded = loaded.expect("APPARATUS: the load returned no state");
+    // THE PLANTED-MARKER CONTROL, before any claim that rests on the counter.
+    assert_eq!(
+        anchorless_seen as usize, PLANTED,
+        "{PLANTED} anchor-less content-carrying records were planted (and one anchor-less record \
+         carrying nothing, which must not be counted); the counter inside the predicate read \
+         {anchorless_seen}"
+    );
+    assert_eq!(
+        tested as usize,
+        records.len(),
+        "the fold was asked about {tested} records; the log holds {}",
+        records.len()
+    );
+    assert_eq!(
+        decisions, control,
+        "the fold's per-record DECISIONS do not match the control. Each triple is (shard, \
+         sequence, reflected-by-the-base); the planted content-carrying records are {:?}, the \
+         at-the-base one is {}, those above are {:?}, and the base anchors at {}",
+        fixture.with_content, fixture.at_base, fixture.above, fixture.base_anchor
+    );
+    assert_eq!(
+        applied, control_applied,
+        "the fold APPLIED a different set of records than it decided to apply"
+    );
+    assert_eq!(
+        loaded.applied_wal_sequence,
+        Some(fixture.expected_anchor()),
+        "the reconstructed anchor must be the HIGHEST anchor the fold applied ({}), not the \
+         last one it saw ({:?}) and not the base's {}",
+        fixture.expected_anchor(),
+        fixture.above.last().map(|(_, anchor)| *anchor),
+        fixture.base_anchor
+    );
+    // AND THE OUTCOME, so a change that keeps every sequence above and still loses the removals
+    // is not scored a pass.
+    let still_held = (0..KEYS)
+        .filter(|index| loaded.expires_at_ms().contains_key(deadline_key(*index).as_str()))
+        .count();
+    assert_eq!(
+        still_held, 0,
+        "{still_held} of {KEYS} deadlines survived a fold that decided to apply the records \
+         removing them"
+    );
+}
