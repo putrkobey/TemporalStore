@@ -1057,3 +1057,1063 @@ fn filling_a_bucket_trades_a_node_a_block_for_a_map_node_a_bucket_and_the_fill_d
                 bytes > 0 && allocs > 0,
                 "{records}/{end_routing_bucket}: the instrument charged {bytes} B in {allocs} \
                  calls for a map of {buckets} buckets; a zero reading is the instrument failing, \
+                 not the map being free"
+            );
+            observed.insert(
+                (records, end_routing_bucket),
+                Arm {
+                    bytes,
+                    allocs,
+                    buckets,
+                    blocks,
+                    arms,
+                },
+            );
+        }
+    }
+
+    let first = path_lengths[0];
+    assert!(
+        path_lengths.iter().all(|length| *length == first),
+        "the store path length moved across arms ({path_lengths:?}); allocation bytes move at \
+         about six bytes a character and the byte column would carry it"
+    );
+    println!("  store path length held at {first} characters across all arms");
+    println!(
+        "  {:>8} {:>12} {:>9} {:>8} {:>9} {:>12} {:>20}",
+        "records", "range end", "buckets", "blocks", "B/page", "allocs/page", "index arms E/One/Many"
+    );
+    for ((records, end_routing_bucket), row) in &observed {
+        println!(
+            "  {records:>8} {:>12} {:>9} {:>8} {:>9.1} {:>12.4} {:>7}/{:>5}/{:>6}",
+            if *end_routing_bucket == WIDE_END {
+                "whole".to_string()
+            } else {
+                end_routing_bucket.to_string()
+            },
+            row.buckets,
+            row.blocks,
+            row.bytes_per_block(),
+            row.allocs_per_block(),
+            row.arms.0,
+            row.arms.1,
+            row.arms.2
+        );
+    }
+
+    for records in [SMALL, LARGE] {
+        let wide = observed.get(&(records, WIDE_END)).expect("wide arm");
+        let narrow = observed.get(&(records, NARROW_END)).expect("narrow arm");
+
+        assert_eq!(
+            wide.blocks, narrow.blocks,
+            "the two arms at {records} records hold {} and {} pages; a per-page figure over \
+             different page counts is two questions",
+            wide.blocks, narrow.blocks
+        );
+        assert!(
+            narrow.buckets < wide.buckets,
+            "at {records} records the narrow arm occupied {} buckets against the wide arm's {}; \
+             without fewer buckets there is no amortising to measure",
+            narrow.buckets,
+            wide.buckets
+        );
+
+        // THE ARMS MOVED, or the per-block figures are two readings of the same shape.
+        assert_eq!(
+            wide.arms.2, 0,
+            "on the whole keyspace {} buckets are already on the `Many` arm at {records} records; \
+             at one page a bucket none should be, and if any are then the wide arm is not the \
+             single-page shape every figure here is compared against",
+            wide.arms.2
+        );
+        assert!(
+            narrow.arms.2 > 0,
+            "on 0..{NARROW_END} no bucket reached the `Many` arm at {records} records, so the \
+             fill did not happen and the per-page figures below compare two single-page stores"
+        );
+
+        // NEITHER DIRECTION IS ASSERTED. The fill trades one node per BLOCK for one node per
+        // BUCKET plus a `BTreeMap` node per filled bucket, and which of those is larger depends
+        // on the fill -- so the sign is reported, with the arm counts that explain it.
+        println!(
+            "  {records} records: allocations a page {:.4} -> {:.4} ({:+.1}%); bytes a page \
+             {:.1} -> {:.1} ({:+.1}%); page index arms One {} -> {}, Many {} -> {}",
+            wide.allocs_per_block(),
+            narrow.allocs_per_block(),
+            100.0 * (narrow.allocs_per_block() - wide.allocs_per_block()) / wide.allocs_per_block(),
+            wide.bytes_per_block(),
+            narrow.bytes_per_block(),
+            100.0 * (narrow.bytes_per_block() - wide.bytes_per_block()) / wide.bytes_per_block(),
+            wide.arms.1,
+            narrow.arms.1,
+            wide.arms.2,
+            narrow.arms.2
+        );
+    }
+
+    // WHAT IS ASSERTED IS THE MECHANISM, NOT THE SIGN: a deeper fill amortises the map node
+    // better than a shallow one, so whatever the sign at the small corpus, the large corpus must
+    // be the better of the two. This is the claim a tuning decision actually rests on, and it is
+    // the one direction that cannot be true by accident.
+    let small_wide = observed.get(&(SMALL, WIDE_END)).expect("small wide");
+    let small_narrow = observed.get(&(SMALL, NARROW_END)).expect("small narrow");
+    let large_wide = observed.get(&(LARGE, WIDE_END)).expect("large wide");
+    let large_narrow = observed.get(&(LARGE, NARROW_END)).expect("large narrow");
+    let small_ratio = small_narrow.allocs_per_block() / small_wide.allocs_per_block();
+    let large_ratio = large_narrow.allocs_per_block() / large_wide.allocs_per_block();
+    println!(
+        "  the fill deepens from {:.2} to {:.2} pages a bucket between the two corpus sizes, and \
+         the allocation ratio moves from {small_ratio:.3} to {large_ratio:.3}",
+        small_narrow.blocks as f64 / small_narrow.buckets as f64,
+        large_narrow.blocks as f64 / large_narrow.buckets as f64
+    );
+    assert!(
+        large_ratio < small_ratio,
+        "the narrow range costs {large_ratio:.3}x the allocations a page at {LARGE} records and \
+         {small_ratio:.3}x at {SMALL}. A deeper fill spreads the map node over more pages, so the \
+         larger corpus must be the better of the two; if it is not, the node is not what the \
+         per-page figure is tracking"
+    );
+}
+
+/// One arm of the allocator table: what the map charged, over what it was holding.
+#[cfg(feature = "alloc-probe")]
+struct Arm {
+    bytes: u64,
+    allocs: u64,
+    buckets: usize,
+    blocks: usize,
+    /// `BlockIndexMap` arms as (Empty, One, Many) -- the footprint the byte column cannot explain.
+    arms: (usize, usize, usize),
+}
+
+#[cfg(feature = "alloc-probe")]
+impl Arm {
+    fn bytes_per_block(&self) -> f64 {
+        self.bytes as f64 / self.blocks as f64
+    }
+
+    fn allocs_per_block(&self) -> f64 {
+        self.allocs as f64 / self.blocks as f64
+    }
+}
+
+// =============================================================================================
+// 6. WHAT THE FILL COSTS: THE DIRTY SET AND THE DUMP UNIT COARSEN BY THE BUCKET'S KEY COUNT
+// =============================================================================================
+
+/// THE OTHER SIDE OF THE TRADE, MEASURED.
+///
+/// `docs/runtime_tuning.md` sells the narrow range as "about 45% less resident memory at no cost
+/// on disk" and names no cost at all. There is one, and it is not on disk: a routing bucket is the
+/// unit of the dirty set and of the dump, and both coarsen by exactly the bucket's key count.
+///
+///   * `DirtyObjectIndex::drain_buckets` is the drain a dump runs once its manifest is durable. It
+///     drops every dirty key of the named buckets. On the whole keyspace that is one key; on
+///     0..1023 it is the whole group.
+///   * `DirtyKeySet` holds one key inline and promotes to a boxed `BTreeSet` beyond that, so the
+///     narrow range moves almost every dirty bucket into the `Many` arm -- the arm whose node is
+///     sized for eleven.
+///   * `refresh_one_bucket_runtime_flags` sets `bucket.dirty` as an OR over every block, so one
+///     dirty key marks the whole group and a dump of that bucket writes every key in it.
+///
+/// Measured rather than argued: the drain is run and what it drops is counted, at both widths.
+///
+/// rust-internal: reads the engine's own dirty index, no product behaviour
+#[test]
+#[ignore = "seeds two stores of 4,000 records; run by name"]
+fn filling_a_bucket_coarsens_the_dirty_set_by_exactly_the_keys_it_holds() {
+    let mut observed: BTreeMap<u32, (usize, usize, usize, usize, usize)> = BTreeMap::new();
+
+    for end_routing_bucket in [WIDE_END, NARROW_END] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on(&engine, end_routing_bucket);
+        let keys = seed_routed(&engine, SMALL);
+
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1");
+
+        // DENOMINATOR: a freshly written store has every key dirty. If it did not, the drain
+        // below would drop nothing and report a clean zero for the wrong reason.
+        let dirty_buckets: Vec<(u32, u64)> = shard.dirty_objects.bucket_counts().collect();
+        let dirty_keys: usize = dirty_buckets.iter().map(|(_, count)| *count as usize).sum();
+        assert_eq!(
+            dirty_keys,
+            keys.len(),
+            "on 0..{end_routing_bucket} the dirty index holds {dirty_keys} keys after writing {}; \
+             the drain below is not over the fixture",
+            keys.len()
+        );
+
+        let (empty_arm, one_arm, many_arm) = shard.dirty_objects.bucket_arms();
+        assert_eq!(
+            empty_arm, 0,
+            "on 0..{end_routing_bucket} {empty_arm} dirty buckets hold an Empty key set; a set \
+             that empties is meant to be dropped from the map by its caller"
+        );
+
+        // THE MEASUREMENT: drain ONE bucket -- what a dump of one bucket drops -- and count it.
+        // The widest bucket, because that is the amplification an operator actually meets.
+        let widest = dirty_buckets
+            .iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(routing_bucket, _)| *routing_bucket)
+            .expect("a freshly written store has a dirty bucket");
+        let dropped = shard.dirty_objects.drain_buckets(&[widest]);
+        assert!(
+            dropped > 0,
+            "on 0..{end_routing_bucket} draining bucket {widest} dropped nothing, so this arm \
+             measures the drain not running rather than what it drains"
+        );
+
+        println!(
+            "  0..{end_routing_bucket}: {} dirty buckets over {dirty_keys} dirty keys; \
+             DirtyKeySet arms (Empty {empty_arm}, One {one_arm}, Many {many_arm}); draining the \
+             widest bucket dropped {dropped} keys"
+        , dirty_buckets.len());
+        observed.insert(
+            end_routing_bucket,
+            (dirty_buckets.len(), dirty_keys, one_arm, many_arm, dropped),
+        );
+    }
+
+    let (wide_buckets, _, wide_one, wide_many, wide_dropped) =
+        *observed.get(&WIDE_END).expect("wide arm");
+    let (narrow_buckets, _, narrow_one, narrow_many, narrow_dropped) =
+        *observed.get(&NARROW_END).expect("narrow arm");
+
+    // ON THE WHOLE KEYSPACE the dirty set is what #1958 measured: one key a bucket, the inline
+    // arm, and a dump of one bucket drops one key.
+    assert_eq!(
+        wide_dropped, 1,
+        "on the whole keyspace a dump of one bucket drained {wide_dropped} keys; #1958 measured \
+         40,040 of 40,040 buckets holding exactly one"
+    );
+    assert_eq!(
+        wide_many, 0,
+        "on the whole keyspace {wide_many} dirty buckets are in the boxed `Many` arm; at one key \
+         a bucket none should be"
+    );
+
+    // ON THE PRODUCTION RANGE both move, and the amplification is the bucket's key count.
+    assert!(
+        narrow_dropped > wide_dropped,
+        "on 0..{NARROW_END} a dump of one bucket drained {narrow_dropped} keys against the whole \
+         keyspace's {wide_dropped}; if they were equal the fill would be free and this whole \
+         section would be unnecessary"
+    );
+    assert!(
+        narrow_many > 0,
+        "on 0..{NARROW_END} no dirty bucket reached the boxed `Many` arm of `DirtyKeySet`, so the \
+         narrow range did not fill a dirty bucket and the amplification above is not what it says"
+    );
+    println!(
+        "  the cost of the fill: a dump of one bucket drains {wide_dropped} key on the whole \
+         keyspace and {narrow_dropped} on 0..{NARROW_END}; `DirtyKeySet` goes from \
+         (One {wide_one}, Many {wide_many}) over {wide_buckets} dirty buckets to \
+         (One {narrow_one}, Many {narrow_many}) over {narrow_buckets}"
+    );
+}
+
+/// WHY THE OBJECT-TO-BLOCKS LOOKUP CANNOT BE ANSWERED BY SCANNING ONE BUCKET.
+///
+/// `ObjectBlockLookup` holds four levels -- two `BTreeMap`s, an `Option` slot and
+/// `BlockRefs` over `BlockLookupRef` -- and every block entry in a bucket already carries the
+/// object key that would let a scan answer the same question. The lookup is also already
+/// `skip_serializing` and rebuilt by `rebuild_object_block_lookup` on load, so it is provably a
+/// cache of the bucket map and nothing about it is authoritative.
+///
+/// So the question is not whether the ANSWER is derivable -- a load derives it -- but whether a
+/// READ can derive it, one object at a time, and the cache be dropped. That needs the bucket to
+/// scan. There is exactly one function that could supply it, `block_routing_bucket(key, start,
+/// end)`, and THE RANGE IT TAKES IS NOT A PROPERTY OF THE STORE. It is a deployment setting
+/// (`TS_SHARD_END_ROUTING_BUCKET`, documented at 1023, defaulted to `u32::MAX`), and this
+/// module's own header records that narrowing a populated store re-files nothing.
+///
+/// This turns that prose into an assertion. A block filed on one range sits where THAT range put
+/// it for the rest of its life, so a bucket recomputed from the key and the range in force names
+/// a bucket that does not hold the object -- and on a narrowed shard cannot even be a bucket the
+/// shard holds. `BlockLookupRef::routing_bucket` records where a block ACTUALLY is, which is the
+/// one thing the key cannot be asked for.
+///
+/// THE POSITIVE CONTROL IS THE SAME CALL AT THE RANGE THE STORE WAS WRITTEN ON, where it agrees
+/// for every key. Without it a computation that was simply broken would read as this finding.
+///
+/// rust-internal: reads the engine's own placement function, no product behaviour
+#[test]
+#[ignore = "seeds a routed store; run by name"]
+fn an_objects_bucket_cannot_be_recomputed_from_its_key_once_the_range_has_moved() {
+    const KEYS: usize = 4_000;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, WIDE_END);
+    let keys = seed_routed(&engine, KEYS);
+
+    // Where every object's blocks ACTUALLY sit, read off the bucket map.
+    let contents = bucket_key_sets(&engine);
+    let mut actual: BTreeMap<String, u32> = BTreeMap::new();
+    for (routing_bucket, held) in &contents {
+        for key in held {
+            actual.insert(key.clone(), *routing_bucket);
+        }
+    }
+    assert_eq!(
+        actual.len(),
+        KEYS,
+        "the fixture placed {} of {KEYS} keys; every figure below divides by this denominator",
+        actual.len()
+    );
+
+    // --- POSITIVE CONTROL: recomputing at the range the store was WRITTEN on agrees. ---
+    let mut agreed_same_range = 0usize;
+    for (key, sits_in) in &actual {
+        if block_routing_bucket(key, 0, WIDE_END) == *sits_in {
+            agreed_same_range += 1;
+        }
+    }
+    assert_eq!(
+        agreed_same_range, KEYS,
+        "recomputing the bucket at the range the store was written on agreed for only \
+         {agreed_same_range} of {KEYS} keys; the placement call is not answering what the bucket \
+         map holds, and the disagreement measured below would be that defect rather than the \
+         range moving"
+    );
+
+    // --- THE FINDING: the operator narrows to the documented production range. ---
+    // Nothing is re-filed, so every block stays where the wide range put it while a recomputation
+    // answers inside 0..NARROW_END.
+    let mut disagreed = 0usize;
+    let mut unnameable = 0usize;
+    for (key, sits_in) in &actual {
+        if block_routing_bucket(key, 0, NARROW_END) != *sits_in {
+            disagreed += 1;
+        }
+        if *sits_in > NARROW_END {
+            unnameable += 1;
+        }
+    }
+    println!(
+        "  a store written on 0..{WIDE_END} and reopened on 0..{NARROW_END}: a bucket recomputed \
+         from the object key disagrees with the bucket the blocks are in for {disagreed} of \
+         {KEYS} objects ({:.2}%), and {unnameable} of {KEYS} ({:.2}%) sit above {NARROW_END}, \
+         which the narrowed shard cannot name at all",
+        disagreed as f64 * 100.0 / KEYS as f64,
+        unnameable as f64 * 100.0 / KEYS as f64,
+    );
+    assert!(
+        disagreed * 100 > KEYS * 99,
+        "only {disagreed} of {KEYS} objects moved; if a recomputed bucket were right for nearly \
+         all of them a read could derive its own bucket and this refutation would not hold"
+    );
+    assert!(
+        unnameable > 0,
+        "no object sits above {NARROW_END} on a store written over the whole keyspace, so the \
+         narrowed shard could reach every block it holds and the second half of this claim is \
+         unfounded"
+    );
+
+    // And the stored lookup is right exactly where the recomputation is wrong: its refs carry the
+    // bucket as filed rather than as computed.
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    let mut checked = 0usize;
+    for (_model, object, refs) in shard.bucket_index.object_block_lookup.iter() {
+        let sits_in = actual.get(object.as_ref()).copied();
+        for block_ref in refs.iter() {
+            assert_eq!(
+                Some(block_ref.routing_bucket),
+                sits_in,
+                "the lookup files {object} in bucket {} while the bucket map holds it in {sits_in:?}",
+                block_ref.routing_bucket
+            );
+            checked += 1;
+        }
+    }
+    assert_eq!(
+        checked, KEYS,
+        "checked {checked} stored block refs against {KEYS} objects; a lookup that held none \
+         would agree with the bucket map trivially"
+    );
+}
+
+/// WHAT A DERIVED READ WOULD COST, COUNTED, AT BOTH POPULATIONS.
+///
+/// Suppose the bucket were somehow known. A bucket's blocks are held as a flat list sorted by
+/// HANDLE, and `block_index_handle` hashes the object key, the component and the whole address
+/// together -- so the list's order carries no trace of the object key. Finding one object's
+/// blocks in it is a walk of the WHOLE list: there is no bisection, because the list is not
+/// ordered on what is being looked for, and no early stop, because nothing says how many blocks
+/// the object has.
+///
+/// A ONE-BLOCK OBJECT IS THE CASE THAT REGRESSES, and it must not be averaged with the other.
+/// Today its answer is the object's one slot, held inline: nothing is probed. Derived, it is the
+/// bucket's whole list. This reports the two populations separately, with the histogram of what
+/// a derived walk would examine.
+///
+/// rust-internal: reads the engine's own bucket map, no product behaviour
+#[test]
+#[ignore = "seeds two stores; run by name"]
+fn deriving_an_objects_blocks_from_the_flat_list_walks_the_whole_bucket() {
+    #[derive(Default)]
+    struct Walk {
+        lengths: Vec<usize>,
+        components: Vec<usize>,
+        scattered: usize,
+        objects: usize,
+    }
+
+    fn measure(engine: &TemporalEngine) -> Walk {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let mut walk = Walk::default();
+        let mut by_bucket: BTreeMap<u32, Vec<(u64, String)>> = BTreeMap::new();
+        for (routing_bucket, handle, object_key, _block) in
+            super::blocks_with_identity(&shard.bucket_index)
+        {
+            by_bucket
+                .entry(routing_bucket)
+                .or_default()
+                .push((handle, object_key.to_string()));
+        }
+        for entries in by_bucket.values() {
+            let mut per_object: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+            for (at, (_handle, key)) in entries.iter().enumerate() {
+                per_object.entry(key.clone()).or_default().push(at);
+            }
+            for positions in per_object.values() {
+                walk.objects += 1;
+                // A walk cannot stop before the end: it has no count to stop on.
+                walk.lengths.push(entries.len());
+                walk.components.push(positions.len());
+                let first = *positions.first().expect("non-empty");
+                let last = *positions.last().expect("non-empty");
+                if last - first + 1 != positions.len() {
+                    walk.scattered += 1;
+                }
+            }
+        }
+        walk
+    }
+
+    fn pct(sorted: &[usize], p: f64) -> usize {
+        if sorted.is_empty() {
+            return 0;
+        }
+        let at = ((sorted.len() as f64 - 1.0) * p).round() as usize;
+        sorted[at]
+    }
+
+    fn report(label: &str, walk: &Walk) {
+        let mut sorted = walk.lengths.clone();
+        sorted.sort_unstable();
+        let mean = sorted.iter().sum::<usize>() as f64 / sorted.len() as f64;
+        let blocks: usize = walk.components.iter().sum();
+        let mean_blocks = blocks as f64 / walk.objects as f64;
+        // What the shipped shape probes: the `One` arm is inline and probes nothing, the `Many`
+        // arm bisects.
+        let probes: f64 = walk
+            .components
+            .iter()
+            .map(|n| if *n <= 1 { 0.0 } else { (*n as f64).log2().ceil() })
+            .sum::<f64>()
+            / walk.objects as f64;
+        println!(
+            "  {label}: {} objects, blocks/object mean {mean_blocks:.3} (MAX {}) | a derived walk \
+             examines p50 {} p90 {} p99 {} MAX {} mean {mean:.4} entries | the shipped lookup \
+             probes {probes:.4} | {} of {} objects have their blocks SCATTERED through the list",
+            walk.objects,
+            walk.components.iter().copied().max().unwrap_or(0),
+            pct(&sorted, 0.50),
+            pct(&sorted, 0.90),
+            pct(&sorted, 0.99),
+            sorted.last().copied().unwrap_or(0),
+            walk.scattered,
+            walk.objects,
+        );
+    }
+
+    // POPULATION ONE: routed keys on the documented production range -- one block an object.
+    let routed = {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on(&engine, NARROW_END);
+        let keys = seed_routed(&engine, LARGE);
+        assert_eq!(keys.len(), LARGE, "the routed fixture seeded {} keys", keys.len());
+        let walk = measure(&engine);
+        report("ROUTED, one block an object", &walk);
+        walk
+    };
+    assert!(
+        routed.objects > 0,
+        "the routed arm measured no objects, so every figure it reports is vacuous"
+    );
+    assert_eq!(
+        routed.components.iter().copied().max(),
+        Some(1),
+        "the routed arm's widest object holds {:?} blocks; this population is defined by holding \
+         one, and if it does not the two populations below are the same population",
+        routed.components.iter().copied().max()
+    );
+
+    // POPULATION TWO: containers on the same range -- a hundred blocks an object.
+    let container = {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on(&engine, NARROW_END);
+        let keys = seed_container(&engine, 40, 100);
+        assert_eq!(keys.len(), 40, "the container fixture seeded {} keys", keys.len());
+        let walk = measure(&engine);
+        report("CONTAINER, a hundred blocks an object", &walk);
+        walk
+    };
+    assert_eq!(
+        container.components.iter().copied().max(),
+        Some(100),
+        "the container arm's widest object holds {:?} blocks rather than 100, so it is not the \
+         population it claims to be",
+        container.components.iter().copied().max()
+    );
+
+    // NEITHER ARM ABOVE CAN ANSWER WHETHER AN OBJECT'S BLOCKS ARE CONTIGUOUS IN THE LIST, and
+    // both reported zero scattered. That zero is vacuous, and saying so is the point: 40 containers
+    // on 1024 buckets is ONE multi-block object a bucket, and a routed object holds ONE block, so
+    // in both arms every object is trivially a contiguous run of the whole or of one. A third arm
+    // on a range narrow enough to put SEVERAL containers in one bucket is what exercises it.
+    let crowded = {
+        const CROWDED_END: u32 = 7;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on(&engine, CROWDED_END);
+        let keys = seed_container(&engine, 40, 100);
+        assert_eq!(keys.len(), 40, "the crowded fixture seeded {} keys", keys.len());
+        let walk = measure(&engine);
+        report("CROWDED, several containers to a bucket", &walk);
+        walk
+    };
+    assert!(
+        crowded.lengths.iter().copied().max().unwrap_or(0) > 100,
+        "the crowded arm's widest bucket holds {:?} entries, which is no more than one container's \
+         hundred; the range was not narrow enough to put two containers in one bucket and the \
+         scattering figure below is as vacuous as the two above",
+        crowded.lengths.iter().copied().max()
+    );
+    println!(
+        "  CONTIGUITY, on the one arm that can answer it: {} of {} objects have their blocks \
+         SCATTERED through their bucket's list rather than sitting in one run. The list is sorted \
+         by HANDLE and the handle hashes the object key, the component and the address together, \
+         so the order carries no trace of the object -- a derived walk cannot bisect to a run and \
+         cannot stop at the end of one.",
+        crowded.scattered, crowded.objects
+    );
+    assert_eq!(
+        crowded.scattered, crowded.objects,
+        "{} of {} objects sharing a bucket kept their blocks in one contiguous run; if handle \
+         order grouped an object's blocks a derived walk could bound itself and the claim above \
+         is wrong",
+        crowded.scattered, crowded.objects
+    );
+
+    // THE REGRESSION, STATED AS ONE. A one-block object is answered today without a probe.
+    let mut routed_sorted = routed.lengths.clone();
+    routed_sorted.sort_unstable();
+    let p50 = pct(&routed_sorted, 0.50);
+    assert!(
+        p50 > 1,
+        "the routed arm's median bucket holds {p50} entries, so a walk would be free and there is \
+         no regression to report; the fixture is not on a range that fills a bucket"
+    );
+    println!(
+        "  THE SERVING REGRESSION, NOT AVERAGED: an object holding ONE block is answered today by \
+         an inline arm with ZERO probes. Derived, the same answer is a walk of its bucket's whole \
+         list -- p50 {p50}, p99 {}, MAX {} entries, each a string comparison against the object \
+         key. There is no length at which the walk is the cheaper of the two.",
+        pct(&routed_sorted, 0.99),
+        routed_sorted.last().copied().unwrap_or(0),
+    );
+}
+
+// `a_walk_of_the_flat_list_answers_in_handle_order_not_component_order` WAS HERE, AND IT IS GONE
+// FOR TWO REASONS -- ONE OF WHICH WAS TRUE BEFORE THIS COMMIT TOUCHED ANYTHING.
+//
+// ITS SUBJECT NO LONGER EXISTS. It asserted that a walk of a bucket's flat block list answers in
+// handle order while `ObjectBlockRefs::position` bisects `by_component` in COMPONENT order, so a
+// derived read would have to sort. `by_component` and `position` are both gone: an object has one
+// slot, so there is no component order for a derived answer to come back in the wrong one of.
+//
+// AND IT COULD ONLY EVER HAVE FAILED. Both sides of its comparison were vectors of EMPTY STRINGS.
+// `walked` pushed `String::new()` per page by construction, and `held` pushed
+// `component.component.as_deref().unwrap_or("")` -- and every entry's component was already `None`
+// once the element name came off the page entry, so every `held` element was `""` too. So
+// `walked == held` for every object, `differed` stayed 0, and the closing
+// `assert_eq!(differed, compared)` was unsatisfiable for any non-empty fixture. It never reported
+// that because the arm carries `#[ignore]` and is run only by name: an assertion inside a test
+// nothing runs has a third state, and this one was in it.
+//
+// Nothing replaces it. The surviving ordering question -- whether the refs INSIDE a slot are
+// sorted -- is `BlockRefs::insert`'s, and `index_bytes_per_key` already drives it.
+
+/// IS THE BUCKET A BLOCK IS FILED IN ALWAYS THE BUCKET ITS KEY COMPUTES, WITHIN ONE RANGE?
+///
+/// `an_objects_bucket_cannot_be_recomputed_from_its_key_once_the_range_has_moved` measures a store
+/// reopened on a range it was not written on. Since #1973 that is a state the engine REFUSES
+/// (`routing_range_mismatch`, read before the decode), so for any store that loads the range is
+/// known and is the one the store was written on. That makes the recomputation question a live one
+/// again, and this is it: given the loaded range, does
+/// `block_routing_bucket(object_key, range)` name the bucket the block is actually filed in --
+/// for every block, after every path that can move one?
+///
+/// IF IT DOES, a read can compute its own bucket and the six levels are derivable on correctness
+/// grounds, leaving only cost. IF IT DOES NOT, recomputation is unsound WITHIN a range, which the
+/// stamp does not prevent and no reader can defend against.
+///
+/// THE ENGINE ITSELF TREATS THIS AS AN INVARIANT IT REPORTS ON RATHER THAN ONE IT GUARANTEES:
+/// `validate_bucket_ownership_index_from_entries` computes `expected_routing_bucket` exactly this
+/// way and counts `missing_owner_block_refs` when the bucket map does not hold the block there. So
+/// the question is not rhetorical, and the paths that could break it are driven below rather than
+/// argued about.
+///
+/// THE VERDICT HAS TWO INDEPENDENT SIDES, AND THAT IS ASSERTED RATHER THAN CAVEATED. This walk is over
+/// `bucket_map`, so one side is the key the walk just read -- where the INDEX filed the block -- and the
+/// other is what `block_routing_bucket` computes from the object key. Neither side is the address.
+///
+/// It used to also count blocks "carrying no bucket of their own", as a caveat that a block claiming
+/// nothing cannot disagree. That caveat was about comparing the ADDRESS's claim against the key, which is
+/// a comparison this test does not make, and no address carries a bucket any more -- so the count would be
+/// the whole population and would read as a refutation of a verdict it does not bear on. The two sides are
+/// asserted instead: every block in this walk has a filing, because the filing is the map key.
+///
+/// rust-internal: reads the engine's own placement function, no product behaviour
+#[test]
+#[ignore = "seeds and compacts two stores; run by name"]
+fn the_bucket_a_block_is_filed_in_is_the_bucket_its_key_computes_within_one_range() {
+    /// Every block, checked against the recomputation, at a known range.
+    struct Verdict {
+        blocks: usize,
+        filed_elsewhere: Vec<(String, u32, u32)>,
+    }
+
+    fn check(engine: &TemporalEngine, end_routing_bucket: u32) -> Verdict {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        // THE COMPARISON IS DERIVED-AGAINST-FILED AND THAT IS WHY THE POSITION DOOR IS RIGHT
+        // HERE. What is recomputed is where a key WOULD route on this range; the lookup records
+        // the bucket each page was FILED under, which is the bucket it sits in. So the inversion
+        // answers for every page, and a disagreement between the two is the finding rather than
+        // a missing name.
+        let mut verdict = Verdict { blocks: 0, filed_elsewhere: Vec::new() };
+        for (routing_bucket, _handle, object_key, block) in
+            super::blocks_with_identity(&shard.bucket_index)
+        {
+            if block.deleted {
+                continue;
+            }
+            verdict.blocks += 1;
+            let computed = block_routing_bucket(&object_key, 0, end_routing_bucket);
+            if computed != routing_bucket {
+                verdict
+                    .filed_elsewhere
+                    .push((object_key.to_string(), routing_bucket, computed));
+            }
+        }
+        verdict
+    }
+
+    fn report(stage: &str, v: &Verdict) {
+        println!(
+            "  {stage}: {} live blocks | filed somewhere other than where the key computes: {}",
+            v.blocks,
+            v.filed_elsewhere.len()
+        );
+        for (key, filed, computed) in v.filed_elsewhere.iter().take(4) {
+            println!("      {key} is filed in {filed}, its key computes {computed}");
+        }
+    }
+
+    for end_routing_bucket in [WIDE_END, NARROW_END] {
+        println!("RANGE 0..{end_routing_bucket}");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on(&engine, end_routing_bucket);
+
+        // Both populations in one store, so one sweep covers a one-block object and a container.
+        let routed = seed_routed(&engine, 400);
+        let containers = seed_container(&engine, 8, 100);
+        let expected = routed.len() + containers.len() * 100;
+
+        let fresh = check(&engine, end_routing_bucket);
+        assert_eq!(
+            fresh.blocks, expected,
+            "the fixture placed {} live blocks against {expected} written; every count below \
+             divides by this denominator",
+            fresh.blocks
+        );
+        report("after the writes", &fresh);
+
+        // PATH ONE: a flush and the load-time rebuild that follows it.
+        engine.flush_shard_index(1);
+        let flushed = check(&engine, end_routing_bucket);
+        assert_eq!(
+            flushed.blocks, expected,
+            "the flush changed the live block count from {expected} to {}, so the stages below are \
+             not comparing the same store",
+            flushed.blocks
+        );
+        report("after flush_shard_index", &flushed);
+
+        // PATH TWO: COMPACTION, which rewrites a block's address -- the path most likely to move
+        // one. A report that relocated nothing would make this stage vacuous, so the count is
+        // printed either way.
+        let compacted = engine.compact_shard_blocks(1);
+        println!(
+            "      compaction: rewritten block refs {:?}",
+            compacted.as_ref().map(|r| r.rewritten_block_refs)
+        );
+        let after_compact = check(&engine, end_routing_bucket);
+        report("after compact_shard_blocks", &after_compact);
+
+        // PATH THREE: RELEASE AND RELOAD. A released bucket's blocks come back from the model maps,
+        // where `rebuild_bucket_first_index` stamps only the object id -- the documented way a
+        // block comes out of a reconstruct still unrouted.
+        let buckets: Vec<u32> = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            shard.bucket_index.bucket_map.keys().copied().take(16).collect()
+        };
+        let released = engine.release_bucket_index_blocks(1, buckets.clone());
+        println!(
+            "      release of {} buckets: (released, refused, blocks) = {released:?}",
+            buckets.len()
+        );
+        let after_release = check(&engine, end_routing_bucket);
+        report("after release_bucket_index_blocks", &after_release);
+
+        // PATH FOUR: THE RECONSTRUCT, DRIVEN EXPLICITLY. The stage above checks the blocks STILL IN
+        // the bucket map -- every block EXCEPT the released ones -- so on its own it says nothing
+        // about a block that comes BACK. `reload_released_bucket` re-derives a released bucket's
+        // entries from the model maps, and `rebuild_bucket_first_index` stamps only the object id
+        // onto an address, so a block can come out of a reconstruct carrying no bucket of its own.
+        //
+        // A READ DOES NOT TRIGGER IT, which is worth writing down because it is the obvious guess and
+        // it is wrong: a released bucket's data is still in the model maps, so a read is served from
+        // there and nothing is reconstructed. Measured while writing this -- 1184 live blocks before
+        // the reads and 1184 after. So the reload is called.
+        let released_count = released.0;
+        assert!(
+            released_count > 0,
+            "no bucket was released, so nothing is reconstructed below and this arm is vacuous"
+        );
+        let mut reconstructed = 0usize;
+        for routing_bucket in &buckets {
+            if engine.reload_released_bucket_index_blocks(1, *routing_bucket) {
+                reconstructed += 1;
+            }
+        }
+        println!(
+            "      reconstructed {reconstructed} of the {} buckets offered to the release",
+            buckets.len()
+        );
+        assert!(
+            reconstructed > 0,
+            "not one of the {} buckets came back through `reload_released_bucket`, so the stage \
+             below is checking the same blocks the release stage already checked",
+            buckets.len()
+        );
+
+        // Reads must still work, or a clean verdict above would only mean the store is empty.
+        let readable = read_back(&engine, &routed);
+        assert_eq!(
+            readable,
+            routed.len(),
+            "only {readable} of {} routed keys still read after the lifecycle paths above; a store \
+             that lost its blocks agrees with the recomputation trivially",
+            routed.len()
+        );
+
+        // NOW the reconstruct can be measured.
+        let after_reload = check(&engine, end_routing_bucket);
+        report("after reload_released_bucket", &after_reload);
+        assert!(
+            after_reload.blocks > after_release.blocks,
+            "the bucket map holds {} live blocks after {reconstructed} reloads against {} straight \
+             after the release, so the reconstruct put nothing back and this arm measures the same \
+             blocks the release stage already measured",
+            after_reload.blocks,
+            after_release.blocks
+        );
+        println!(
+            "      the reconstruct: {} blocks came back through `reload_released_bucket` ({} -> {})",
+            after_reload.blocks - after_release.blocks,
+            after_release.blocks,
+            after_reload.blocks
+        );
+
+        // THE VERDICT, at every stage.
+        for (stage, v) in [
+            ("after the writes", &fresh),
+            ("after flush", &flushed),
+            ("after compaction", &after_compact),
+            ("after release", &after_release),
+            ("after the reconstruct", &after_reload),
+        ] {
+            assert!(
+                v.filed_elsewhere.is_empty(),
+                "{stage} on 0..{end_routing_bucket}: {} of {} live blocks are filed in a bucket \
+                 their key does not compute, first {:?}. Recomputation is UNSOUND within a single \
+                 range, and no reader can derive its own bucket.",
+                v.filed_elsewhere.len(),
+                v.blocks,
+                v.filed_elsewhere.first()
+            );
+        }
+        println!(
+            "  VERDICT on 0..{end_routing_bucket}: across {} live blocks and FIVE stages -- the \
+             writes, a flush, a compaction, a release and an explicit reconstruct -- the \
+             bucket a block is filed in IS the bucket its key computes. Neither side of that is \
+             the address, which carries no bucket at all.",
+            after_reload.blocks
+        );
+    }
+}
+
+/// THE RANGE IS REACHABLE AT THE READER THAT LOOKED LIKE THE REFUTATION.
+///
+/// `bucket_index_target_buckets_for_object_key(shard, key)` returns a bucket SET, so it cannot be
+/// handed the bucket it exists to compute -- which is why it read as a reader with no bucket. But
+/// the RANGE is a different question, and `ShardState::routing_range()` is on the state the
+/// function already takes. So this is the `BlockAddress` thread's shape after all: the range is
+/// reachable and simply not consulted, not absent.
+///
+/// This holds that as a fact rather than an argument: for every object in a driven store, the
+/// buckets the lookup reports and the bucket recomputed from `shard.routing_range()` are the same
+/// single bucket. It is the positive half of the refutation's correction, and it is why the
+/// refutation now rests on COST rather than on correctness.
+///
+/// rust-internal: reads the engine's own routing range, no product behaviour
+#[test]
+#[ignore = "seeds a store; run by name"]
+fn the_loaded_range_is_reachable_from_the_state_the_bucket_set_reader_already_takes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, NARROW_END);
+    let routed = seed_routed(&engine, 400);
+    let containers = seed_container(&engine, 8, 100);
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+
+    // The shard knows its own range, and it is the one it was loaded on.
+    let (start, end) = shard.routing_range();
+    assert_eq!(
+        (start, end),
+        (0, NARROW_END),
+        "the shard reports the range 0..{end} after being loaded on 0..{NARROW_END}; if a loaded \
+         shard did not carry its own range the recomputation below would have nothing to use"
+    );
+
+    let mut compared = 0usize;
+    let mut agreed = 0usize;
+    for key in routed.iter().chain(containers.iter()) {
+        // What the lookup reports, the way the bucket-set reader reports it.
+        let mut reported: BTreeSet<u32> = BTreeSet::new();
+        for kind in crate::engine::storage_model_kinds() {
+            if let Some(entry) = shard.bucket_index.object_block_refs(kind, key) {
+                reported.extend(entry.iter().map(|block_ref| block_ref.routing_bucket));
+            }
+        }
+        if reported.is_empty() {
+            continue;
+        }
+        compared += 1;
+        // An object's blocks share ONE bucket, so the set the lookup reports is one element and
+        // the recomputation can be compared against it directly.
+        let computed = block_routing_bucket(key, start, end);
+        if reported.len() == 1 && reported.contains(&computed) {
+            agreed += 1;
+        }
+    }
+    assert_eq!(
+        compared,
+        routed.len() + containers.len(),
+        "compared {compared} objects against {} written; a lookup holding fewer would make the \
+         agreement below a statement about a subset",
+        routed.len() + containers.len()
+    );
+    println!(
+        "  {agreed} of {compared} objects: the bucket set the lookup reports is the single bucket \
+         recomputed from the range the shard itself carries. The range is reachable at the call \
+         site, so that reader is threadable and NOT the refutation."
+    );
+    assert_eq!(
+        agreed, compared,
+        "only {agreed} of {compared} objects agreed, so the recomputation does not reproduce what \
+         the lookup reports even with the loaded range in hand"
+    );
+}
+
+/// THE ONE LIVE POPULATION WHERE RECOMPUTING A BUCKET IS UNSOUND: A PRE-STAMP STORE BUILT NARROW.
+///
+/// #1973's third case is deliberately not a refusal. A store with on-disk state and NO
+/// `shard-<id>.routing-range.json` predates the stamp, and its range is ADOPTED as the legacy one --
+/// `LEGACY_START_ROUTING_BUCKET..LEGACY_END_ROUTING_BUCKET`, which is `0..u32::MAX` -- because
+/// refusing would stop every existing deployment from starting. The module's reason is that the
+/// whole keyspace "was the ONLY default a store could have been built on".
+///
+/// IT WAS THE ONLY DEFAULT. IT WAS NOT THE ONLY POSSIBILITY. `TS_SHARD_END_ROUTING_BUCKET` is a
+/// documented setting and `docs/runtime_tuning.md` told operators to "Set this before the first
+/// ingest", so a store built narrow BEFORE the stamp existed carries no stamp and is adopted onto
+/// the whole keyspace. Its blocks are in buckets the adopted range never computes.
+///
+/// For that store the index still answers correctly, because `BlockLookupRef::routing_bucket`
+/// records where a block IS. A derived read that recomputed its own bucket would look in a bucket
+/// that holds nothing and MISS. So the adopted-legacy population is the refutation of recomputation
+/// on correctness grounds, and it is the only one: everywhere else
+/// `the_bucket_a_block_is_filed_in_is_the_bucket_its_key_computes_within_one_range` shows the two
+/// agree across writes, flush, compaction and release.
+///
+/// DRIVEN, NOT ARGUED. The pre-stamp store is built by writing on the narrow range and then
+/// DELETING the stamp, which is byte-for-byte the state a pre-#1973 build left behind.
+///
+/// rust-internal: reads the engine's own placement function and stamp file, no product behaviour
+#[test]
+#[ignore = "seeds a store and reloads it; run by name"]
+fn a_pre_stamp_store_built_narrow_is_adopted_onto_a_range_that_cannot_compute_its_buckets() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let blocks = dir.path().join("blocks");
+    let indexes = dir.path().join("indexes");
+
+    // --- Build a store on the NARROW range, the way an operator who read the tuning doc would. ---
+    let built: Vec<String> = {
+        let engine = TemporalEngine::with_local_dirs(
+            64 * 1024 * 1024,
+            dir.path().join("cache"),
+            &blocks,
+            &indexes,
+        );
+        let response = engine.load_shard_with(crate::control::LoadShardRequest {
+            shard_id: 1,
+            table_name: "pre-stamp".to_string(),
+            shard_uri: "local://pre-stamp/1".to_string(),
+            start_routing_bucket: 0,
+            end_routing_bucket: NARROW_END,
+            readonly: false,
+            load_version: 1,
+            local_node_id: Some(1),
+        });
+        assert!(response.status.ok, "the narrow build must load: {:?}", response.status);
+        let keys: Vec<String> = (0..600).map(|i| format!("pre-{i:06}")).collect();
+        for chunk in keys.chunks(1_000) {
+            let commands: Vec<Command> = chunk
+                .iter()
+                .map(|key| Command::StringSet { key: key.clone(), value: vec![b'v'; 32] })
+                .collect();
+            ack(&engine.batch_execute(crate::types::BatchExecuteRequest {
+                shard_id: 1,
+                commands,
+            }));
+        }
+        engine.flush_shard_index(1);
+        keys
+    };
+
+    // --- Make it a PRE-STAMP store: remove the file #1973 added. ---
+    let stamp = indexes.join("shard-1.routing-range.json");
+    assert!(
+        stamp.exists(),
+        "the narrow build wrote no stamp at {stamp:?}, so deleting it cannot produce the pre-stamp \
+         state and this test would be measuring an ordinary load"
+    );
+    std::fs::remove_file(&stamp).expect("the stamp is removable");
+    assert!(
+        !stamp.exists(),
+        "the stamp is still present after removal; the store is not in the pre-stamp state"
+    );
+
+    // --- Reload. #1973 case 3 adopts the LEGACY range rather than refusing. ---
+    let reopened = TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache-b"),
+        &blocks,
+        &indexes,
+    );
+    let response = reopened.load_shard_with(crate::control::LoadShardRequest {
+        shard_id: 1,
+        table_name: "pre-stamp".to_string(),
+        shard_uri: "local://pre-stamp/1".to_string(),
+        start_routing_bucket: 0,
+        end_routing_bucket: NARROW_END,
+        readonly: false,
+        load_version: 1,
+        local_node_id: Some(1),
+    });
+    assert!(
+        response.status.ok,
+        "the pre-stamp store was REFUSED rather than adopted: {:?}. #1973 case 3 is not a refusal, \
+         so if this ever becomes one the population below stops existing and this finding is void",
+        response.status
+    );
+
+    let shards = reopened.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard is loaded");
+    let (start, end) = shard.routing_range();
+    println!("  the reopened shard carries the range 0..{end} after being ASKED for 0..{NARROW_END}");
+    assert_eq!(
+        (start, end),
+        (0, u32::MAX),
+        "the pre-stamp store was adopted onto 0..{end} rather than the legacy whole keyspace; the \
+         mechanism this test rests on is not the one that ran"
+    );
+
+    // --- Does a recomputation on the ADOPTED range find the blocks? ---
+    let placed = super::blocks_with_identity(&shard.bucket_index);
+    let mut blocks = 0usize;
+    let mut computed_elsewhere = 0usize;
+    for (routing_bucket, _handle, object_key, block) in &placed {
+        if block.deleted {
+            continue;
+        }
+        blocks += 1;
+        if block_routing_bucket(object_key, start, end) != *routing_bucket {
+            computed_elsewhere += 1;
+        }
+    }
+    assert!(
+        blocks > 0,
+        "the reopened store holds no live blocks, so nothing below is measured"
+    );
+
+    // The index still answers, which is what makes the derived answer the thing that would break.
+    let mut lookup_correct = 0usize;
+    for (_model, object, refs) in shard.bucket_index.object_block_lookup.iter() {
+        let sits_in: Option<u32> = placed
+            .iter()
+            .find(|(_, _, named, _)| named.as_ref() == object.as_ref())
+            .map(|(routing_bucket, ..)| *routing_bucket);
+        if refs.iter().all(|block_ref| Some(block_ref.routing_bucket) == sits_in) {
+            lookup_correct += 1;
+        }
+    }
+
+    println!(
+        "  a pre-stamp store built on 0..{NARROW_END} and adopted onto the whole keyspace: {} live \
+         blocks, and a bucket recomputed from the ADOPTED range misses {} of them ({:.2}%). The \
+         stored lookup answers correctly for {} objects, because it records where a block IS \
+         rather than where a key computes.",
+        blocks,
+        computed_elsewhere,
+        computed_elsewhere as f64 * 100.0 / blocks as f64,
+        lookup_correct
+    );
+    assert_eq!(
+        computed_elsewhere, blocks,
+        "only {computed_elsewhere} of {blocks} blocks are missed by the recomputation. If the \
+         adopted range could compute this store's buckets there would be no population where \
+         deriving a bucket is unsound, and the refutation would rest on cost alone"
+    );
+    assert!(
+        lookup_correct > 0,
+        "the stored lookup answered correctly for no object, so it is not the thing that keeps this \
+         store readable and the contrast above is unfounded"
+    );
+}
