@@ -41,3 +41,133 @@ fn new_engine(name: &str) -> TemporalEngine {
         CACHE_BYTES,
         root.join("cache"),
         root.join("blocks"),
+        root.join("indexes"),
+    );
+    engine.load_shard(SHARD_ID);
+    engine
+}
+
+fn mark(engine: &TemporalEngine, node_hash: u64, event_time_ms: u64, propagate_depth: u32) {
+    let response = engine
+        .execute(ExecuteRequest {
+            shard_id: SHARD_ID,
+            command: Command::ContextMarkSummaryDirty {
+                tenant_hash: TENANT,
+                node_hash,
+                event_time_ms,
+                reason: 1,
+                propagate_depth,
+            },
+        })
+        .response;
+    assert!(
+        matches!(response, CommandResponse::ContextObjectKey { .. }),
+        "mark should return the dirty object key, got {response:?}"
+    );
+}
+
+fn query(
+    engine: &TemporalEngine,
+    node_hash: u64,
+    start_time_ms: u64,
+    end_time_ms: u64,
+) -> Vec<ContextDirtyNode> {
+    match engine
+        .execute(ExecuteRequest {
+            shard_id: SHARD_ID,
+            command: Command::ContextQuerySummaryDirty {
+                tenant_hash: TENANT,
+                node_hash,
+                start_time_ms,
+                end_time_ms,
+                limit: None,
+            },
+        })
+        .response
+    {
+        CommandResponse::ContextSummaryDirtyNodes { nodes, .. } => nodes,
+        other => panic!("expected ContextSummaryDirtyNodes, got {other:?}"),
+    }
+}
+
+#[test]
+fn repeated_marks_for_one_node_coalesce_to_latest_and_max_depth() {
+    let engine = new_engine("coalesce");
+    // Mark the same node three times, out of order, with different depths.
+    mark(&engine, 42, 1_000, 1);
+    mark(&engine, 42, 3_000, 2);
+    mark(&engine, 42, 2_000, 1);
+
+    let nodes = query(&engine, 42, 0, 10_000);
+    assert_eq!(
+        nodes.len(),
+        1,
+        "three marks for one node must coalesce into a single dirty marker"
+    );
+    let entry = &nodes[0];
+    assert_eq!(entry.node_hash, 42);
+    assert_eq!(
+        entry.last_event_time_ms, 3_000,
+        "the coalesced entry keeps the latest event time"
+    );
+    assert_eq!(
+        entry.first_event_time_ms, 1_000,
+        "and the earliest, which is the half a single timestamp used to hide"
+    );
+    assert_eq!(
+        entry.mark_count, 3,
+        "three marks arrived, and the entry says so"
+    );
+    assert_eq!(
+        entry.propagate_depth, 2,
+        "the coalesced entry keeps the deepest requested propagate depth"
+    );
+}
+
+#[test]
+fn distinct_nodes_are_tracked_independently() {
+    let engine = new_engine("independent");
+    mark(&engine, 42, 1_000, 1);
+    mark(&engine, 99, 5_000, 3);
+
+    let node_42 = query(&engine, 42, 0, 10_000);
+    let node_99 = query(&engine, 99, 0, 10_000);
+    assert_eq!(node_42.len(), 1);
+    assert_eq!(node_99.len(), 1);
+    assert_eq!(node_42[0].last_event_time_ms, 1_000);
+    assert_eq!(node_99[0].last_event_time_ms, 5_000);
+    assert_eq!(node_99[0].propagate_depth, 3);
+}
+
+#[test]
+fn time_window_filter_still_applies() {
+    let engine = new_engine("window");
+    mark(&engine, 42, 1_000, 1);
+    mark(&engine, 42, 3_000, 1);
+
+    // Window overlapping [1000, 3000] returns the marker.
+    assert_eq!(query(&engine, 42, 2_999, 3_001).len(), 1);
+    // Window entirely after the coalesced range returns nothing.
+    assert!(query(&engine, 42, 8_000, 9_000).is_empty());
+    // Window entirely before the coalesced range returns nothing.
+    assert!(query(&engine, 42, 0, 500).is_empty());
+    // Unknown node returns nothing.
+    assert!(query(&engine, 7, 0, 10_000).is_empty());
+}
+
+#[test]
+fn coalescing_is_bounded_regardless_of_mark_count() {
+    let engine = new_engine("bounded");
+    // A hot node marked dirty hundreds of times must still be exactly one marker.
+    for i in 0..500u64 {
+        mark(&engine, 42, 1_000 + i, (i % 4) as u32);
+    }
+    let nodes = query(&engine, 42, 0, 10_000_000);
+    assert_eq!(
+        nodes.len(),
+        1,
+        "500 marks for one node must remain a single coalesced dirty marker"
+    );
+    assert_eq!(nodes[0].last_event_time_ms, 1_499, "latest event time wins");
+    assert_eq!(nodes[0].propagate_depth, 3, "max depth across marks wins");
+}

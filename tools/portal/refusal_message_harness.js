@@ -25,3 +25,58 @@ function helperFrom(file) {
   const start = page.indexOf(marker);
   if (start < 0) { return null; }
   const end = page.indexOf("\n  };", start);
+  const win = { window: null };
+  win.window = win;
+  new Function("window", page.slice(start, end + 5))(win);
+  return win.__matrixarkWhy;
+}
+
+const pages = process.argv.slice(2);
+ok("pages were given", pages.length > 0, "none");
+
+let carried = 0;
+for (const file of pages) {
+  const name = path.basename(file);
+  const why = helperFrom(file);
+  if (why === null) {
+    console.log("FAIL " + name + " does not carry the shared refusal helper");
+    failures += 1;
+    continue;
+  }
+  carried += 1;
+
+  ok(name + ": a scope refusal names the scope",
+     /admin:api_key/.test(why({ error: "insufficient_scope", required: ["admin:api_key"] }, "no")),
+     why({ error: "insufficient_scope", required: ["admin:api_key"] }, "no"));
+
+  ok(name + ": and still says what was refused",
+     /insufficient_scope/.test(why({ error: "insufficient_scope", required: ["admin:api_key"] },
+                                   "no")));
+
+  /* A rejected VALUE carries detail and no required: the detail is the whole answer. */
+  const value = why({ error: "invalid_value", detail: "extraction.provider must be one of x, y" },
+                    "Save failed.");
+  ok(name + ": a rejected value shows the reason, not the code",
+     /must be one of/.test(value) && !/^invalid_value/.test(value), value);
+
+  /* Both halves present: neither may swallow the other. */
+  const both = why({ error: "insufficient_scope", detail: "writing settings needs a write scope",
+                     required: ["admin:api_key"] }, "no");
+  ok(name + ": detail and scope both survive",
+     /write scope/.test(both) && /admin:api_key/.test(both), both);
+
+  ok(name + ": more than one acceptable scope is listed",
+     /admin:api_key or admin:audit/.test(
+       why({ error: "insufficient_scope", required: ["admin:api_key", "admin:audit"] }, "no")));
+
+  ok(name + ": an empty body falls back", why({}, "Save failed.") === "Save failed.");
+  ok(name + ": a missing body falls back", why(null, "Save failed.") === "Save failed.");
+  ok(name + ": nothing is appended when nothing was required",
+     why({ error: "boom" }, "no") === "boom");
+}
+
+ok("every page given carries the helper", carried === pages.length,
+   carried + " of " + pages.length);
+
+console.log(failures === 0 ? "PASS" : "FAILED " + failures);
+process.exit(failures === 0 ? 0 : 1);
