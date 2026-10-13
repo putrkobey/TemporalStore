@@ -238,3 +238,483 @@ impl ProxyService {
             ("POST", "/ProxyService/Ttl") => {
                 match parse_json::<ProxyKeyCommandRequest>(&request.body) {
                     Ok(req) => json_response(
+                        200,
+                        &self.table_command(req, |key| Command::CommonTtl { key }),
+                    ),
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/Exists") => {
+                match parse_json::<ProxyKeyCommandRequest>(&request.body) {
+                    Ok(req) => json_response(
+                        200,
+                        &self.table_command(req, |key| Command::CommonExists { key }),
+                    ),
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/FeatureAdd") => {
+                match parse_json::<ProxyFeatureAddCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = if let Some(policy) = req.policy {
+                            Command::FeatureAppendWithPolicy {
+                                key: req.key,
+                                points: req.points,
+                                policy,
+                            }
+                        } else {
+                            Command::FeatureAppend {
+                                key: req.key,
+                                points: req.points,
+                            }
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/FeatureQuery") => {
+                match parse_json::<ProxyFeatureQueryCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = if req.filters.is_empty() {
+                            Command::FeatureQuery {
+                                key: req.key,
+                                start_ms: req.start_ms,
+                                end_ms: req.end_ms,
+                                count: req.count,
+                            }
+                        } else {
+                            Command::FeatureQueryFiltered {
+                                key: req.key,
+                                start_ms: req.start_ms,
+                                end_ms: req.end_ms,
+                                count: req.count,
+                                filters: req.filters,
+                            }
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/FeatureReplace") => {
+                match parse_json::<ProxyFeatureReplaceCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::FeatureReplace {
+                            key: req.key,
+                            start_ms: req.start_ms,
+                            end_ms: req.end_ms,
+                            points: req.points,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/FeatureDelete") => {
+                match parse_json::<ProxyKeyCommandRequest>(&request.body) {
+                    Ok(req) => json_response(
+                        200,
+                        &self.table_command(req, |key| Command::FeatureDelete { key }),
+                    ),
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/FeatureAggQuery") => {
+                match parse_json::<ProxyFeatureAggQueryCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::FeatureAggQuery {
+                            key: req.key,
+                            start_ms: req.start_ms,
+                            end_ms: req.end_ms,
+                            aggregator: req.aggregator,
+                            count: req.count,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/SequenceAdd") => {
+                match parse_json::<ProxySequenceAddCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::SequenceAdd {
+                            key: req.key,
+                            rows: req.rows,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/SequenceQuery") => {
+                match parse_json::<ProxySequenceQueryCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::SequenceQuery {
+                            key: req.key,
+                            start_ms: req.start_ms,
+                            end_ms: req.end_ms,
+                            count: req.count,
+                            filters: req.filters,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/ControlStateIncrement") => {
+                match parse_json::<ProxyControlStateIncrementCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = if req.precision_ms.is_some() || req.ttl_ms.is_some() {
+                            Command::ControlStateIncrementWithOptions {
+                                key: req.key,
+                                timestamp_ms: req.timestamp_ms,
+                                amount: req.amount,
+                                precision_ms: req.precision_ms,
+                                ttl_ms: req.ttl_ms,
+                            }
+                        } else {
+                            Command::ControlStateIncrement {
+                                key: req.key,
+                                timestamp_ms: req.timestamp_ms,
+                                amount: req.amount,
+                            }
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/ControlStateCount") => {
+                match parse_json::<ProxyControlStateCountCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::ControlStateCount {
+                            key: req.key,
+                            start_ms: req.start_ms,
+                            end_ms: req.end_ms,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/ControlStateHset") => {
+                match parse_json::<ProxyControlStateHsetCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::ControlStateSet {
+                            family: crate::types::ControlStateFamily::Counter,
+                            key: req.key,
+                            timestamp_ms: req.timestamp_ms,
+                            amount: req.amount,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/ControlStateSelectionSet")
+            | ("POST", "/ProxyService/ControlStateFolSet") => {
+                match parse_json::<ProxyControlStateSelectionSetCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::ControlStateSelectionSet {
+                            key: req.key,
+                            value: req.value,
+                            occur_time_ms: req.occur_time_ms,
+                            ttl_ms: req.ttl_ms,
+                            selection_type: req.selection_type,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/ControlStateSelectionQuery")
+            | ("POST", "/ProxyService/ControlStateFolQuery") => {
+                match parse_json::<ProxyKeyCommandRequest>(&request.body) {
+                    Ok(req) => json_response(
+                        200,
+                        &self.table_command(req, |key| Command::ControlStateSelectionQuery { key }),
+                    ),
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/ControlStateManager") => {
+                match parse_json::<ProxyKeyCommandRequest>(&request.body) {
+                    Ok(req) => json_response(
+                        200,
+                        &self.table_command(req, |key| Command::ControlStateManager {
+                            key,
+                            op_type: None,
+                            field_list: Vec::new(),
+                            start_offset: String::new(),
+                            end_offset: String::new(),
+                            is_distinct: false,
+                        }),
+                    ),
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/HGet") => {
+                match parse_json::<ProxyHashCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::HashGet {
+                            key: req.key,
+                            field: req.field,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/HSet") => {
+                match parse_json::<ProxyHashSetCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::HashSet {
+                            key: req.key,
+                            field: req.field,
+                            value: req.value,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/HDel") => {
+                match parse_json::<ProxyHashCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::HashDelete {
+                            key: req.key,
+                            field: req.field,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/HMGet") => {
+                match parse_json::<ProxyHashMultiGetCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::HashMultiGet {
+                            key: req.key,
+                            fields: req.fields,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/HMSet") => {
+                match parse_json::<ProxyHashMultiSetCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::HashMultiSet {
+                            key: req.key,
+                            entries: req.entries,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/HGetAll") => {
+                match parse_json::<ProxyKeyCommandRequest>(&request.body) {
+                    Ok(req) => json_response(
+                        200,
+                        &self.table_command(req, |key| Command::HashGetAll { key }),
+                    ),
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/HLen") => {
+                match parse_json::<ProxyKeyCommandRequest>(&request.body) {
+                    Ok(req) => json_response(
+                        200,
+                        &self.table_command(req, |key| Command::HashLen { key }),
+                    ),
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/SAdd") => {
+                match parse_json::<ProxySetMemberCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::SetAdd {
+                            key: req.key,
+                            member: req.member,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/SMembers") => {
+                match parse_json::<ProxyKeyCommandRequest>(&request.body) {
+                    Ok(req) => json_response(
+                        200,
+                        &self.table_command(req, |key| Command::SetMembers { key }),
+                    ),
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/ProxyService/SRem") => {
+                match parse_json::<ProxySetMemberCommandRequest>(&request.body) {
+                    Ok(req) => {
+                        let command = Command::SetRemove {
+                            key: req.key,
+                            member: req.member,
+                        };
+                        json_response(
+                            200,
+                            &self.table_execute(ProxyTableExecuteRequest {
+                                namespace: req.namespace,
+                                table_name: req.table_name,
+                                command,
+                            }),
+                        )
+                    }
+                    Err(err) => self.bad_execute_request(err),
+                }
+            }
+            ("POST", "/context/ingest") | ("POST", "/ProxyService/ContextIngest") => {
+                match parse_json_borrowed::<context::ProxyContextIngestRequest>(&request.body) {
+                    Ok(req) => self.context_ingest(req),
+                    Err(err) => {
+                        self.inc_bad_request();
+                        json_response(400, &Status::error("bad_request", err.to_string()))
+                    }
+                }
+            }
+            ("POST", "/context/extract")
+            | ("POST", "/context/ingest_extract")
+            | ("POST", "/ProxyService/ContextExtract") => {
+                match parse_json_borrowed::<context::ProxyContextIngestRequest>(&request.body) {
+                    Ok(req) => self.context_extract(req),
+                    Err(err) => {
+                        self.inc_bad_request();
+                        json_response(400, &Status::error("bad_request", err.to_string()))
+                    }
+                }
+            }
+            ("POST", "/context/retrieve") | ("POST", "/ProxyService/ContextRetrieve") => {
+                match parse_json::<context::ProxyContextRetrieveRequest>(&request.body) {
+                    Ok(req) => self.context_retrieve(req),
+                    Err(err) => {
+                        self.inc_bad_request();
+                        json_response(400, &Status::error("bad_request", err.to_string()))
+                    }
+                }
+            }
+            _ => json_response(404, &Status::error("not_found", "unknown proxy route")),
+        }
+    }
+}
