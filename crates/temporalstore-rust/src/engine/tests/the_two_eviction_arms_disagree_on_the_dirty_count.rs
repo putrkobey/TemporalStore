@@ -58,3 +58,123 @@ fn seeded(dir: &std::path::Path) -> Arc<TemporalEngine> {
                 key: "wide".to_string(),
                 points,
             },
+        });
+        assert!(response.status.ok, "wide seed must ack at {chunk}");
+    }
+    // And a handful of ordinary single-page records, so the fixture is not one object.
+    for i in 0..12usize {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringSet {
+                key: format!("s{i}"),
+                value: vec![b'v'; 48],
+            },
+        });
+        assert!(response.status.ok, "string seed must ack at {i}");
+    }
+    engine
+}
+
+/// Dirty pages and dirty objects per bucket, read straight off the shard.
+fn blocks_and_objects(
+    engine: &TemporalEngine,
+) -> (
+    std::collections::BTreeMap<u32, u64>,
+    std::collections::BTreeMap<u32, u64>,
+) {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&SHARD).expect("shard is loaded");
+    let mut blocks: std::collections::BTreeMap<u32, u64> = std::collections::BTreeMap::new();
+    for (bucket_id, bucket) in shard.bucket_index.bucket_map.iter() {
+        let n = bucket
+            .block_index
+            .values()
+            .filter(|block| !block.deleted && block.dirty)
+            .count() as u64;
+        if n > 0 {
+            blocks.insert(*bucket_id, n);
+        }
+    }
+    let objects: std::collections::BTreeMap<u32, u64> = shard
+        .dirty_objects
+        .bucket_counts()
+        .into_iter()
+        .map(|(bucket_id, count)| (bucket_id, count as u64))
+        .collect();
+    (blocks, objects)
+}
+
+#[test]
+fn the_two_eviction_arms_must_agree_on_what_the_dirty_count_means() {
+    // ---- THE REGIME, asserted before anything is compared. ----
+    let regime_dir = tempfile::tempdir().expect("tempdir");
+    let regime = seeded(regime_dir.path());
+    let (blocks, objects) = blocks_and_objects(&regime);
+    println!("dirty pages per bucket:   {blocks:?}");
+    println!("dirty objects per bucket: {objects:?}");
+    let total_blocks: u64 = blocks.values().sum();
+    let total_objects: u64 = objects.values().sum();
+    println!("totals: {total_blocks} dirty pages, {total_objects} dirty objects");
+    assert!(
+        total_blocks > 0 && total_objects > 0,
+        "the fixture must be dirty at all: {total_blocks} pages, {total_objects} objects"
+    );
+    assert!(
+        total_blocks > total_objects,
+        "this fixture cannot tell a page count from an object count ({total_blocks} pages vs \
+         {total_objects} objects) -- every object holds one page, so the two arms would agree \
+         for the wrong reason. The fixture needs a multi-page object, not a different assertion."
+    );
+    drop(regime);
+
+    // ---- THE TWO ARMS, on two stores seeded identically. ----
+    let sampled_dir = tempfile::tempdir().expect("tempdir");
+    let sampled_engine = seeded(sampled_dir.path());
+    sampled_engine.use_sampled_eviction_for_test();
+    let sampled = sampled_engine.apply_storage_eviction(SHARD, 1, 64, false, false);
+
+    let full_dir = tempfile::tempdir().expect("tempdir");
+    let full_engine = seeded(full_dir.path());
+    full_engine.use_full_scan_eviction_for_test();
+    let full = full_engine.apply_storage_eviction(SHARD, 1, 64, false, false);
+
+    // Both arms must have actually selected something, or neither says anything.
+    assert!(
+        !sampled.selected_victims.is_empty(),
+        "the sampled arm selected nothing: {sampled:?}"
+    );
+    assert!(
+        !full.selected_victims.is_empty(),
+        "the full-scan arm selected nothing: {full:?}"
+    );
+
+    let by_bucket = |report: &crate::engine::reports::StorageEvictionReport| {
+        report
+            .selected_victims
+            .iter()
+            .map(|victim| (victim.routing_bucket, (victim.dirty_object_count, victim.weight)))
+            .collect::<std::collections::BTreeMap<u32, (u64, u64)>>()
+    };
+    let s = by_bucket(&sampled);
+    let f = by_bucket(&full);
+    println!("sampled   (bucket -> dirty_object_count, weight): {s:?}");
+    println!("full scan (bucket -> dirty_object_count, weight): {f:?}");
+
+    // ---- THE CLAIM: one field, one meaning. ----
+    for (bucket_id, (sampled_count, sampled_weight)) in &s {
+        if let Some((full_count, full_weight)) = f.get(bucket_id) {
+            assert_eq!(
+                sampled_count, full_count,
+                "bucket {bucket_id}: the two eviction arms disagree on `dirty_object_count` -- \
+                 the sampled arm counts PAGES whose dirty bit is set and the full-scan arm counts \
+                 OBJECTS from the dirty index. One field, two meanings, and it is multiplied by \
+                 1024 into a sort key"
+            );
+            assert_eq!(
+                sampled_weight, full_weight,
+                "bucket {bucket_id}: the two arms produced different victim WEIGHTS, so they rank \
+                 eviction candidates differently for a reason that is not eviction policy"
+            );
+        }
+    }
+}
