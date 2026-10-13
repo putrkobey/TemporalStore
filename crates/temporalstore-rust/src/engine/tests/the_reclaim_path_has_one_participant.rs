@@ -62,3 +62,67 @@ const REMOTE_PARTICIPANT_CONSTRUCTS: &[(&str, &str)] = &[
     ("TcpStream", "a socket"),
     ("UdpSocket", "a socket"),
     (".await", "an async boundary, which a local synchronous walk does not need"),
+    ("tokio::", "an async runtime"),
+    ("thread::spawn", "work handed to another thread"),
+    ("mpsc::", "a channel to another worker"),
+    ("rpc", "a remote procedure call"),
+    ("Endpoint", "a named participant other than this shard"),
+    ("peer", "a named participant other than this shard"),
+];
+
+#[test]
+fn the_reclaim_path_has_one_participant() {
+    let gc = include_str!("../../block_store/block_store_gc.rs");
+
+    println!();
+    println!("  THE BLOCK RECLAIM PATH, CHECKED FOR A SECOND PARTICIPANT");
+    println!();
+    println!("    block_store/block_store_gc.rs: {} lines", gc.lines().count());
+    println!();
+
+    let mut found: Vec<&str> = Vec::new();
+    for (needle, what) in REMOTE_PARTICIPANT_CONSTRUCTS {
+        let hits = gc.matches(needle).count();
+        println!("    {:<16} {:>3}   {what}", needle, hits);
+        if hits > 0 {
+            found.push(needle);
+        }
+    }
+    println!();
+
+    // ---- THE FILE MUST ACTUALLY BE THE RECLAIM PATH. A guard over an empty or moved file would
+    // ---- pass by finding nothing, which is the one way this arm could be vacuous.
+    assert!(
+        gc.lines().count() > 200,
+        "block_store/block_store_gc.rs is only {} lines. This arm asserts an ABSENCE, so it passes trivially \
+         over a file that has been emptied or had the reclaim logic moved elsewhere -- in which \
+         case the premise has to be re-established where that logic now lives",
+        gc.lines().count()
+    );
+    assert!(
+        gc.contains("delayed_destroy") || gc.contains("reclaim"),
+        "block_store/block_store_gc.rs no longer mentions delayed destruction or reclaim, so it is probably no \
+         longer the reclaim path and this arm is checking the wrong file"
+    );
+
+    // ---- AND IT MUST HAVE NO SECOND PARTICIPANT.
+    assert!(
+        found.is_empty(),
+        "the block reclaim path now contains {found:?}, which a reclaim involving only this shard \
+         does not need.\n\
+         \n\
+         TWELVE FIELDS OF THIS COMPARISON ARE EXCLUDED ON THE PREMISE THAT RECLAIM HAS ONE \
+         PARTICIPANT: {EXCLUDED_BY_SINGLE_PARTICIPANT:?}\n\
+         \n\
+         Each presupposes endpoints to enumerate and disable, fences, plan checksums, or per-node \
+         budgets. If reclaim is now coordinated with anything else, that premise has changed and \
+         those twelve are in scope -- so decide them deliberately rather than leaving this arm \
+         relaxed. If the construct is local (a thread used purely for parallelism within this \
+         shard, say), narrow the needle and say why in its entry."
+    );
+
+    println!("    no second participant: the twelve endpoint, fence, checksum, plan and");
+    println!("    trim-flow fields have nothing to report here, and that is why they are");
+    println!("    excluded rather than filled with degenerate values.");
+    println!();
+}
