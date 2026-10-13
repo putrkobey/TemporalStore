@@ -493,3 +493,498 @@ impl SingleNodeMeta {
     pub fn shard_placements(&self) -> BTreeMap<ShardId, ShardPlacement> {
         let state = self.inner.read().expect("meta lock poisoned");
         shard_owning_tables(&state)
+            .into_iter()
+            .filter_map(|(shard_id, table)| {
+                if table.info.state != MetaEntityState::Normal {
+                    return None;
+                }
+                // The shard's own pin wins over the table's, and an empty pin
+                // means it has none -- which is what every shard means until
+                // somebody says otherwise.
+                let pinned = state
+                    .shards
+                    .get(&shard_id)
+                    .map(|location| location.preferred_location.clone())
+                    .unwrap_or_default();
+                let preferred_location = if pinned.is_empty() {
+                    table.info.serving_options.preferred_location.clone()
+                } else {
+                    pinned
+                };
+                Some((
+                    shard_id,
+                    ShardPlacement {
+                        table_key: table_key(&table.info.namespace, &table.info.table_name),
+                        preferred_location,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// Compute the placement-aware rebalance plan for the current membership.
+    /// This is the placement-rule-honouring counterpart to
+    /// [`Self::plan_auto_rebalance_with_options`].
+    pub fn plan_placement_aware_rebalance(
+        &self,
+        options: AutoRebalanceOptions,
+    ) -> Vec<ShardReassignment> {
+        let live_servers = self.placement_targets();
+        let shard_placement = self.shard_placements();
+        // This planner drops the lock before planning, so it needs names of
+        // its own. Copied here, while the lock is still held and the names are
+        // still there to copy.
+        let shard_owners = {
+            let state = self.inner.read().expect("meta lock poisoned");
+            serving_shard_owners(&state)
+                .into_iter()
+                .map(|(shard_id, owner)| (shard_id, owner.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        compute_placement_aware_rebalance(&shard_owners, &shard_placement, &live_servers, options)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owners(pairs: &[(ShardId, &str)]) -> BTreeMap<ShardId, String> {
+        pairs
+            .iter()
+            .map(|(shard_id, addr)| (*shard_id, (*addr).to_string()))
+            .collect()
+    }
+
+    fn targets(pairs: &[(&str, &str)]) -> Vec<PlacementTarget> {
+        pairs
+            .iter()
+            .map(|(addr, location)| PlacementTarget {
+                server_addr: (*addr).to_string(),
+                location: (*location).to_string(),
+            })
+            .collect()
+    }
+
+    /// Every shard `ids` belongs to `table`, pinned to `location` ("" = anywhere).
+    fn placement(entries: &[(ShardId, &str, &str)]) -> BTreeMap<ShardId, ShardPlacement> {
+        entries
+            .iter()
+            .map(|(shard_id, table, location)| {
+                (
+                    *shard_id,
+                    ShardPlacement {
+                        table_key: (*table).to_string(),
+                        preferred_location: (*location).to_string(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    fn moves(plans: &[ShardReassignment]) -> Vec<(ShardId, &str, ShardReassignmentReason)> {
+        plans
+            .iter()
+            .map(|plan| (plan.shard_id, plan.to_server.as_str(), plan.reason))
+            .collect()
+    }
+
+    #[test]
+    fn evacuation_stays_inside_the_tables_location() {
+        // The idlest server in the cluster is in the wrong rack. Placement-blind
+        // planning would evacuate onto it and silently break the table's
+        // location contract; here the shard lands on its own rack instead.
+        let plans = compute_placement_aware_rebalance(
+            &owners(&[(1, "dead"), (2, "a1"), (3, "a1")]),
+            &placement(&[
+                (1, "ns.orders", "rack-a"),
+                (2, "ns.orders", "rack-a"),
+                (3, "ns.orders", "rack-a"),
+            ]),
+            &targets(&[("a1", "rack-a"), ("a2", "rack-a"), ("b1", "rack-b")]),
+            AutoRebalanceOptions {
+                balance_load: false,
+                ..AutoRebalanceOptions::default()
+            },
+        );
+        assert_eq!(
+            moves(&plans),
+            vec![(1, "a2", ShardReassignmentReason::OwnerUnavailable)]
+        );
+    }
+
+    #[test]
+    fn a_preference_can_name_a_whole_datacenter() {
+        // With exact string matching this is impossible to express: a table
+        // could only ever be pinned to one rack. Any server beneath dc1 now
+        // qualifies, and one outside it does not.
+        let plans = compute_placement_aware_rebalance(
+            &owners(&[(1, "dead")]),
+            &placement(&[(1, "ns.orders", "us-east/dc1")]),
+            &targets(&[
+                ("a1", "us-east/dc1/az1/rack1"),
+                ("a2", "us-east/dc1/az2/rack9"),
+                ("b1", "us-east/dc2/az1/rack1"),
+            ]),
+            AutoRebalanceOptions {
+                balance_load: false,
+                ..AutoRebalanceOptions::default()
+            },
+        );
+        assert_eq!(plans.len(), 1);
+        assert!(
+            plans[0].to_server == "a1" || plans[0].to_server == "a2",
+            "must land inside dc1, got {}",
+            plans[0].to_server
+        );
+    }
+
+    #[test]
+    fn a_shard_outside_its_preferred_datacenter_is_pulled_back_into_it() {
+        let plans = compute_placement_aware_rebalance(
+            &owners(&[(1, "b1")]),
+            &placement(&[(1, "ns.orders", "us-east/dc1")]),
+            &targets(&[
+                ("a1", "us-east/dc1/az1/rack1"),
+                ("b1", "us-east/dc2/az1/rack1"),
+            ]),
+            AutoRebalanceOptions {
+                balance_load: false,
+                ..AutoRebalanceOptions::default()
+            },
+        );
+        assert_eq!(
+            moves(&plans),
+            vec![(1, "a1", ShardReassignmentReason::LocationViolation)]
+        );
+    }
+
+    #[test]
+    fn a_deeper_preference_still_pins_to_one_rack() {
+        // The narrow case keeps working: naming every level pins exactly.
+        let plans = compute_placement_aware_rebalance(
+            &owners(&[(1, "dead")]),
+            &placement(&[(1, "ns.orders", "us-east/dc1/az2/rack9")]),
+            &targets(&[
+                ("a1", "us-east/dc1/az1/rack1"),
+                ("a2", "us-east/dc1/az2/rack9"),
+            ]),
+            AutoRebalanceOptions {
+                balance_load: false,
+                ..AutoRebalanceOptions::default()
+            },
+        );
+        assert_eq!(
+            moves(&plans),
+            vec![(1, "a2", ShardReassignmentReason::OwnerUnavailable)]
+        );
+    }
+
+    #[test]
+    fn a_preference_no_live_server_matches_falls_back_to_anywhere() {
+        // Same guard as before, now evaluated hierarchically: dc9 is empty, so
+        // the shard is placed rather than stranded.
+        let plans = compute_placement_aware_rebalance(
+            &owners(&[(1, "dead")]),
+            &placement(&[(1, "ns.orders", "us-east/dc9")]),
+            &targets(&[("a1", "us-east/dc1/az1/rack1")]),
+            AutoRebalanceOptions::default(),
+        );
+        assert_eq!(
+            moves(&plans),
+            vec![(1, "a1", ShardReassignmentReason::OwnerUnavailable)]
+        );
+    }
+
+    #[test]
+    fn a_shard_on_a_live_server_in_the_wrong_location_is_pulled_back() {
+        // Evacuation cannot catch this: the owner is perfectly healthy, it is
+        // just in a location the table no longer prefers.
+        let plans = compute_placement_aware_rebalance(
+            &owners(&[(1, "b1")]),
+            &placement(&[(1, "ns.orders", "rack-a")]),
+            &targets(&[("a1", "rack-a"), ("b1", "rack-b")]),
+            AutoRebalanceOptions {
+                balance_load: false,
+                ..AutoRebalanceOptions::default()
+            },
+        );
+        assert_eq!(
+            moves(&plans),
+            vec![(1, "a1", ShardReassignmentReason::LocationViolation)]
+        );
+        assert_eq!(plans[0].from_server.as_deref(), Some("b1"));
+    }
+
+    #[test]
+    fn a_preference_with_no_live_server_falls_back_rather_than_stranding_the_shard() {
+        // rack-a is entirely gone. Honouring the preference literally would mean
+        // placing the shard nowhere, which loses the route outright.
+        let plans = compute_placement_aware_rebalance(
+            &owners(&[(1, "dead")]),
+            &placement(&[(1, "ns.orders", "rack-a")]),
+            &targets(&[("b1", "rack-b"), ("b2", "rack-b")]),
+            AutoRebalanceOptions::default(),
+        );
+        assert_eq!(
+            moves(&plans),
+            vec![(1, "b1", ShardReassignmentReason::OwnerUnavailable)]
+        );
+    }
+
+    #[test]
+    fn a_table_is_spread_even_when_total_shard_counts_look_balanced() {
+        // Four shards of each table, two servers, four shards each: the global
+        // counts are perfectly even, so total-count balancing sees nothing to
+        // do. But each table is single-homed, and losing one node takes a whole
+        // table down. Per-table balancing is what notices.
+        let shard_owners = owners(&[
+            (1, "s1"),
+            (2, "s1"),
+            (3, "s1"),
+            (4, "s1"),
+            (5, "s2"),
+            (6, "s2"),
+            (7, "s2"),
+            (8, "s2"),
+        ]);
+        let shard_placement = placement(&[
+            (1, "ns.orders", ""),
+            (2, "ns.orders", ""),
+            (3, "ns.orders", ""),
+            (4, "ns.orders", ""),
+            (5, "ns.users", ""),
+            (6, "ns.users", ""),
+            (7, "ns.users", ""),
+            (8, "ns.users", ""),
+        ]);
+        let live = targets(&[("s1", ""), ("s2", "")]);
+
+        // Without per-table grouping the imbalance is invisible.
+        let blind = compute_placement_aware_rebalance(
+            &shard_owners,
+            &shard_placement,
+            &live,
+            AutoRebalanceOptions {
+                per_table_balance: false,
+                ..AutoRebalanceOptions::default()
+            },
+        );
+        assert!(blind.is_empty());
+
+        // With it, each table ends up spanning both servers.
+        let plans = compute_placement_aware_rebalance(
+            &shard_owners,
+            &shard_placement,
+            &live,
+            AutoRebalanceOptions::default(),
+        );
+        let mut final_owner = shard_owners.clone();
+        for plan in &plans {
+            final_owner.insert(plan.shard_id, plan.to_server.clone());
+        }
+        for table in [[1, 2, 3, 4], [5, 6, 7, 8]] {
+            let hosts = table
+                .iter()
+                .map(|shard_id| final_owner[shard_id].clone())
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                hosts.len(),
+                2,
+                "table {table:?} should span both servers, got {hosts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tables_pinned_to_different_locations_are_not_balanced_against_each_other() {
+        // rack-a holds four shards of one table and rack-b one shard of another.
+        // A planner that pooled them would try to "balance" across the racks and
+        // break both location contracts; each rack must balance on its own.
+        let plans = compute_placement_aware_rebalance(
+            &owners(&[(1, "a1"), (2, "a1"), (3, "a1"), (4, "a1"), (5, "b1")]),
+            &placement(&[
+                (1, "ns.orders", "rack-a"),
+                (2, "ns.orders", "rack-a"),
+                (3, "ns.orders", "rack-a"),
+                (4, "ns.orders", "rack-a"),
+                (5, "ns.users", "rack-b"),
+            ]),
+            &targets(&[
+                ("a1", "rack-a"),
+                ("a2", "rack-a"),
+                ("b1", "rack-b"),
+                ("b2", "rack-b"),
+            ]),
+            AutoRebalanceOptions::default(),
+        );
+        assert!(!plans.is_empty(), "rack-a is lopsided and should rebalance");
+        for plan in &plans {
+            assert!(
+                plan.to_server.starts_with('a'),
+                "orders must stay in rack-a, got {}",
+                plan.to_server
+            );
+            assert!(plan.shard_id <= 4, "the rack-b shard must not move");
+        }
+    }
+
+    #[test]
+    fn the_safe_gap_damps_churn() {
+        // Four shards on one server, none on the other. With no gap the planner
+        // levels them; with a gap of two the server is inside its allowance and
+        // the data stays put.
+        let shard_owners = owners(&[(1, "s1"), (2, "s1"), (3, "s1"), (4, "s1")]);
+        let shard_placement = placement(&[
+            (1, "ns.orders", ""),
+            (2, "ns.orders", ""),
+            (3, "ns.orders", ""),
+            (4, "ns.orders", ""),
+        ]);
+        let live = targets(&[("s1", ""), ("s2", "")]);
+
+        let levelled = compute_placement_aware_rebalance(
+            &shard_owners,
+            &shard_placement,
+            &live,
+            AutoRebalanceOptions::default(),
+        );
+        assert_eq!(levelled.len(), 2);
+
+        let damped = compute_placement_aware_rebalance(
+            &shard_owners,
+            &shard_placement,
+            &live,
+            AutoRebalanceOptions {
+                balance_safe_gap: 2,
+                ..AutoRebalanceOptions::default()
+            },
+        );
+        assert!(damped.is_empty());
+    }
+
+    #[test]
+    fn placement_falls_back_to_flat_planning_when_nothing_declares_a_location() {
+        // A cluster that sets no placement at all must plan exactly as the flat
+        // planner does, so enabling the gate is a no-op for those deployments.
+        let shard_owners = owners(&[(1, "dead"), (2, "s1"), (3, "s1")]);
+        let live = targets(&[("s1", ""), ("s2", "")]);
+        let flat = compute_auto_rebalance(
+            &shard_owners,
+            &live
+                .iter()
+                .map(|target| target.server_addr.clone())
+                .collect::<BTreeSet<_>>(),
+            AutoRebalanceOptions::default(),
+        );
+        let placement_aware = compute_placement_aware_rebalance(
+            &shard_owners,
+            &BTreeMap::new(),
+            &live,
+            AutoRebalanceOptions::default(),
+        );
+        assert_eq!(moves(&flat), moves(&placement_aware));
+    }
+
+    #[test]
+    fn a_freshly_joined_server_in_the_right_location_receives_load() {
+        let plans = compute_placement_aware_rebalance(
+            &owners(&[(1, "a1"), (2, "a1"), (3, "a1"), (4, "a1")]),
+            &placement(&[
+                (1, "ns.orders", "rack-a"),
+                (2, "ns.orders", "rack-a"),
+                (3, "ns.orders", "rack-a"),
+                (4, "ns.orders", "rack-a"),
+            ]),
+            &targets(&[("a1", "rack-a"), ("a2", "rack-a")]),
+            AutoRebalanceOptions::default(),
+        );
+        assert_eq!(
+            moves(&plans),
+            vec![
+                (4, "a2", ShardReassignmentReason::Rebalance),
+                (3, "a2", ShardReassignmentReason::Rebalance),
+            ]
+        );
+    }
+
+    #[test]
+    fn no_live_servers_yields_no_plan() {
+        let plans = compute_placement_aware_rebalance(
+            &owners(&[(1, "dead")]),
+            &placement(&[(1, "ns.orders", "rack-a")]),
+            &[],
+            AutoRebalanceOptions::default(),
+        );
+        assert!(plans.is_empty());
+    }
+
+    #[test]
+    fn max_moves_caps_every_pass() {
+        let plans = compute_placement_aware_rebalance(
+            &owners(&[(1, "dead"), (2, "dead"), (3, "dead"), (4, "dead")]),
+            &placement(&[
+                (1, "ns.orders", "rack-a"),
+                (2, "ns.orders", "rack-a"),
+                (3, "ns.orders", "rack-a"),
+                (4, "ns.orders", "rack-a"),
+            ]),
+            &targets(&[("a1", "rack-a"), ("a2", "rack-a")]),
+            AutoRebalanceOptions {
+                max_moves: 2,
+                ..AutoRebalanceOptions::default()
+            },
+        );
+        assert_eq!(plans.len(), 2);
+    }
+
+    #[test]
+    fn location_scoping_can_be_turned_off() {
+        // With scoping off the planner ignores the preference and behaves flatly,
+        // so an operator can fall back without reverting the whole feature.
+        let plans = compute_placement_aware_rebalance(
+            &owners(&[(1, "b1")]),
+            &placement(&[(1, "ns.orders", "rack-a")]),
+            &targets(&[("a1", "rack-a"), ("b1", "rack-b")]),
+            AutoRebalanceOptions {
+                location_scoped: false,
+                balance_load: false,
+                ..AutoRebalanceOptions::default()
+            },
+        );
+        assert!(plans.is_empty());
+    }
+
+    #[test]
+    fn evacuation_prefers_the_server_holding_least_of_that_table() {
+        // b1 is globally idler, but it already holds two shards of this table
+        // while b2 holds none of it. Spreading the table wins over the raw count.
+        let plans = compute_placement_aware_rebalance(
+            &owners(&[
+                (1, "dead"),
+                (2, "b1"),
+                (3, "b1"),
+                (4, "b2"),
+                (5, "b2"),
+                (6, "b2"),
+            ]),
+            &placement(&[
+                (1, "ns.orders", ""),
+                (2, "ns.orders", ""),
+                (3, "ns.orders", ""),
+                (4, "ns.users", ""),
+                (5, "ns.users", ""),
+                (6, "ns.users", ""),
+            ]),
+            &targets(&[("b1", ""), ("b2", "")]),
+            AutoRebalanceOptions {
+                balance_load: false,
+                ..AutoRebalanceOptions::default()
+            },
+        );
+        assert_eq!(
+            moves(&plans),
+            vec![(1, "b2", ShardReassignmentReason::OwnerUnavailable)]
+        );
+    }
+}
