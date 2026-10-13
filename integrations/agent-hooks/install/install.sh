@@ -74,3 +74,79 @@ cp "$DEST/.env" "$DEST/.env.example"
 
 install_codex() {
   local marketplace_root="${HOME}"
+  local marketplace_file="${marketplace_root}/.agents/plugins/marketplace.json"
+  mkdir -p "$(dirname "$marketplace_file")" "${marketplace_root}/plugins"
+  if [[ "$DEST" != "${marketplace_root}/plugins/temporalstore-agent-hooks" ]]; then
+    rm -rf "${marketplace_root}/plugins/temporalstore-agent-hooks"
+    cp -R "$DEST" "${marketplace_root}/plugins/temporalstore-agent-hooks"
+    DEST="${marketplace_root}/plugins/temporalstore-agent-hooks"
+  fi
+  MARKETPLACE_FILE="$marketplace_file" node - <<'NODE'
+const fs = require('fs');
+const file = process.env.MARKETPLACE_FILE;
+let data = { name: 'personal', interface: { displayName: 'Personal' }, plugins: [] };
+if (fs.existsSync(file)) data = JSON.parse(fs.readFileSync(file, 'utf8'));
+data.name ||= 'personal';
+data.interface ||= { displayName: 'Personal' };
+data.plugins ||= [];
+const entry = {
+  name: 'temporalstore-agent-hooks',
+  source: { source: 'local', path: './plugins/temporalstore-agent-hooks' },
+  policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
+  category: 'Productivity'
+};
+const idx = data.plugins.findIndex((item) => item.name === entry.name);
+if (idx >= 0) data.plugins[idx] = entry; else data.plugins.push(entry);
+fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n');
+NODE
+  echo "Codex marketplace updated: $marketplace_file"
+  if [[ "$SKIP_CODEX_ADD" != "1" ]] && command -v "$CODEX_BIN" >/dev/null 2>&1; then
+    "$CODEX_BIN" plugin add temporalstore-agent-hooks@personal || true
+  else
+    echo "Codex plugin add skipped. Run: $CODEX_BIN plugin add temporalstore-agent-hooks@personal"
+  fi
+}
+
+install_claude() {
+  mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
+  # Claude Code's context hook is the shell wrapper in the repo tools/ dir; it drives
+  # the same ingestion/extraction/retrieval pipeline as the Codex hook, as agent
+  # "claude". Register the full Claude Code lifecycle.
+  local hook="$REPO/tools/matrixark_claude_hook.sh"
+  CLAUDE_SETTINGS="$CLAUDE_SETTINGS" HOOK="$hook" node - <<'NODE'
+const fs = require('fs');
+const file = process.env.CLAUDE_SETTINGS;
+const hook = process.env.HOOK;
+let data = {};
+if (fs.existsSync(file)) { try { data = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (e) { data = {}; } }
+data.hooks ||= {};
+const cmd = (event) => `bash "${hook}" --event ${event}`;
+const entry = (event, timeout, matcher) => {
+  const e = { hooks: [{ type: 'command', command: cmd(event), timeout }] };
+  if (matcher) e.matcher = matcher;
+  return [e];
+};
+// UserPromptSubmit runs under a 30s budget; the rest have generous budgets.
+data.hooks.SessionStart = entry('SessionStart', 600);
+data.hooks.UserPromptSubmit = entry('UserPromptSubmit', 30);
+data.hooks.PostToolUse = entry('PostToolUse', 120, '*');
+data.hooks.Stop = entry('Stop', 120);
+data.hooks.SubagentStop = entry('SubagentStop', 120);
+data.hooks.PreCompact = entry('PreCompact', 120);
+data.hooks.SessionEnd = entry('SessionEnd', 120);
+fs.writeFileSync(file, JSON.stringify(data, null, 2) + '\n');
+NODE
+  chmod +x "$hook" 2>/dev/null || true
+  echo "Claude settings updated (full lifecycle -> $hook): $CLAUDE_SETTINGS"
+}
+
+case "$AGENT" in
+  codex) install_codex ;;
+  claude) install_claude ;;
+  both) install_codex; install_claude ;;
+  generic) echo "Generic hook launcher installed to: $DEST" ;;
+  *) echo "unsupported agent: $AGENT" >&2; exit 2 ;;
+esac
+
+echo "Installed TemporalStore agent hooks to: $DEST"
+echo "Smoke test: TEMPORALSTORE_AGENT_MODE=$MODE bash $ROOT/install/smoke_test.sh"

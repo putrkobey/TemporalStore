@@ -316,3 +316,321 @@ pub fn run_embed_drainer_loop<F: Fn() -> bool>(
     should_stop: F,
 ) {
     while !should_stop() {
+        let report = drain_embedding_dirty_once(engine, config);
+        // Back off unless the pass made PROGRESS -- not merely unless it found work.
+        //
+        // The old condition read "we scanned something" as "we did real work, so come straight
+        // back". Those differ whenever a node stays dirty: an unreachable or misconfigured
+        // encoder fails the batch, `failed` rises, the markers are deliberately left for a later
+        // pass, and the next scan returns the SAME nodes. The condition is then true forever and
+        // the loop never sleeps -- a hot spin that re-queries and rewrites the same records as
+        // fast as the CPU allows, for as long as the encoder is unavailable.
+        //
+        // `cleared` is the progress signal: markers actually retired this pass, whether by
+        // embedding them or by clearing text-less ones. A pass that cleared some and left more
+        // queued still comes straight back, which is what the original condition wanted.
+        if report.cleared == 0 {
+            std::thread::sleep(config.interval);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn drainer_engine() -> TemporalEngine {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = TemporalEngine::with_local_dirs(
+            1024 * 1024,
+            dir.path().join("cache"),
+            dir.path().join("blocks"),
+            dir.path().join("indexes"),
+        );
+        engine.load_shard(1);
+        // Leak the tempdir so the store outlives the test body (engine holds paths).
+        std::mem::forget(dir);
+        engine
+    }
+
+    fn seed_raw_node(engine: &TemporalEngine, tenant_hash: u64, node_hash: u64, text: &str) {
+        let ok = engine
+            .execute_durable(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ContextUpsertNode {
+                    tenant_hash,
+                    node: Box::new(ContextNode {
+                        node_hash,
+                        parent_hash: 0,
+                        kind: 0,
+                        canonical_name: format!("node-{node_hash}"),
+                        l0: text.to_string(),
+                        status: 1,
+                        last_event_time_ms: 1_000,
+                        l1_ref: String::new(),
+                        raw_metadata_ref: format!("src://{node_hash}"),
+                        vector: Vec::new(),
+                        embedding_model_hash: 0,
+                        embedding_updated_at_ms: 0,
+                        summary_vector: Vec::new(),
+                        summary_vector_valid_from_ms: 0,
+                        summary_vector_model_hash: 0,
+                    }),
+                },
+            })
+            .status
+            .ok;
+        assert!(ok);
+        let ok = engine
+            .execute_durable(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ContextWriteEvent {
+                    tenant_hash,
+                    node_hash,
+                    event: Box::new(ContextEvent {
+                        event_id_hash: node_hash.wrapping_mul(7).max(1),
+                        event_time_ms: 1_000,
+                        ingestion_time_ms: 1_000,
+                        kind: 0,
+                        event_type: 1,
+                        actor_hash: 1,
+                        status: 1,
+                        valid_until_ms: 0,
+                        confidence: 1.0,
+                        importance: 1.0,
+                        text: text.to_string(),
+                        source_ref: String::new(),
+                        related_node_hashes: Vec::new(),
+                        compact_attrs: Vec::new(),
+                        vector: Vec::new(),
+                    }),
+                    first_write_only: false,
+                    cold_storage: false,
+                },
+            })
+            .status
+            .ok;
+        assert!(ok);
+        // Mark it embedding-dirty (as raw-first bulk ingest would).
+        let ok = engine
+            .execute_durable(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ContextMarkEmbeddingDirty {
+                    tenant_hash,
+                    node_hash,
+                event_time_ms: 1_000,
+                reason: 2,
+                propagate_depth: 0,
+                    clear: false,
+                },
+            })
+            .status
+            .ok;
+        assert!(ok);
+    }
+
+    fn count_pending(engine: &TemporalEngine) -> usize {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextQueryEmbeddingDirty {
+                tenant_hash: 0,
+                node_hash: 0,
+                start_time_ms: 0,
+                end_time_ms: EMBED_DRAINER_MAX_TIME_MS,
+                limit: Some(1000),
+            },
+        });
+        match response.response {
+            CommandResponse::ContextEmbeddingDirtyNodes { nodes, .. } => nodes.len(),
+            _ => 0,
+        }
+    }
+
+    /// The vector as carried by the node itself.
+    fn inline_vector(engine: &TemporalEngine, tenant_hash: u64, node_hash: u64) -> Vec<f32> {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextGetNode {
+                tenant_hash,
+                node_hash,
+            },
+        });
+        match response.response {
+            CommandResponse::ContextNode { node, .. } => {
+                node.map(|node| node.vector).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    #[test]
+    fn embedding_dirty_marker_mark_query_clear_round_trip() {
+        let engine = drainer_engine();
+        let tenant_hash = 7;
+        let node_hash = 42;
+        // Independent of summary-dirty: marking embedding-dirty does not create a
+        // summary-dirty marker.
+        engine.execute_durable(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextMarkEmbeddingDirty {
+                tenant_hash,
+                node_hash,
+                event_time_ms: 500,
+                reason: 2,
+                propagate_depth: 0,
+                clear: false,
+            },
+        });
+        // Per-node query surfaces exactly one marker.
+        let per_node = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextQueryEmbeddingDirty {
+                tenant_hash,
+                node_hash,
+                start_time_ms: 0,
+                end_time_ms: EMBED_DRAINER_MAX_TIME_MS,
+                limit: Some(10),
+            },
+        });
+        match per_node.response {
+            CommandResponse::ContextEmbeddingDirtyNodes { nodes, .. } => {
+                assert_eq!(nodes.len(), 1);
+                assert_eq!(nodes[0].node_hash, node_hash);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Summary-dirty is untouched (independence).
+        let summary = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextQuerySummaryDirty {
+                tenant_hash,
+                node_hash,
+                start_time_ms: 0,
+                end_time_ms: EMBED_DRAINER_MAX_TIME_MS,
+                limit: Some(10),
+            },
+        });
+        match summary.response {
+            CommandResponse::ContextSummaryDirtyNodes { nodes, .. } => {
+                assert!(nodes.is_empty(), "embedding-dirty must not set summary-dirty");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // All-pending scan (tenant 0) returns it with its tenant hash.
+        let all = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextQueryEmbeddingDirty {
+                tenant_hash: 0,
+                node_hash: 0,
+                start_time_ms: 0,
+                end_time_ms: EMBED_DRAINER_MAX_TIME_MS,
+                limit: Some(10),
+            },
+        });
+        match all.response {
+            CommandResponse::ContextEmbeddingDirtyNodes {
+                nodes,
+                tenant_hashes,
+                ..
+            } => {
+                assert_eq!(nodes.len(), 1);
+                assert_eq!(tenant_hashes, vec![tenant_hash]);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        // Clear removes it.
+        engine.execute_durable(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ContextMarkEmbeddingDirty {
+                tenant_hash,
+                node_hash,
+                event_time_ms: 500,
+                reason: 0,
+                propagate_depth: 0,
+                clear: true,
+            },
+        });
+        assert_eq!(count_pending(&engine), 0);
+    }
+
+    #[test]
+    fn drainer_embeds_all_pending_and_clears_markers() {
+        let engine = drainer_engine();
+        // Two tenants, several nodes each: exercises the all-tenant pending scan.
+        let nodes: [(u64, u64, &str); 5] = [
+            (100, 1, "checkout payment failed with a risk score spike"),
+            (100, 2, "deployment rollout paused after latency regression"),
+            (100, 3, "user updated notification preference to email"),
+            (200, 4, "database migration added a new index column"),
+            (200, 5, "incident timeline: outage then recovery"),
+        ];
+        for (tenant, node, text) in nodes {
+            seed_raw_node(&engine, tenant, node, text);
+        }
+        assert_eq!(count_pending(&engine), 5);
+
+        let config = EmbedDrainerConfig {
+            batch_size: 64,
+            ..EmbedDrainerConfig::default()
+        };
+        let report = drain_embedding_dirty_once(&engine, &config);
+        assert_eq!(report.pending_scanned, 5);
+        assert_eq!(report.embedded, 5);
+        assert_eq!(report.cleared, 5);
+        assert_eq!(report.failed, 0);
+
+        // Every node now carries its vector -- the node record is the only place it lives.
+        for (tenant, node, _) in nodes {
+            let inline = inline_vector(&engine, tenant, node);
+            assert!(!inline.is_empty(), "node {node} has no vector of its own");
+        }
+        assert_eq!(count_pending(&engine), 0);
+
+        // A second pass is a no-op (empty pending set) -> O(pending) drains to zero.
+        let report2 = drain_embedding_dirty_once(&engine, &config);
+        assert_eq!(report2.pending_scanned, 0);
+        assert_eq!(report2.embedded, 0);
+    }
+
+    #[test]
+    fn drainer_pass_is_bounded_by_pending_not_corpus() {
+        let engine = drainer_engine();
+        // Seed nodes but only mark a couple embedding-dirty: the pass must scan
+        // only the pending set, not every node.
+        for node in 1..=6u64 {
+            // Node + event without marking dirty.
+            engine.execute_durable(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ContextUpsertNode {
+                    tenant_hash: 9,
+                    node: Box::new(ContextNode {
+                        node_hash: node,
+                        parent_hash: 0,
+                        kind: 0,
+                        canonical_name: format!("n{node}"),
+                        l0: format!("body text for node {node}"),
+                        status: 1,
+                        last_event_time_ms: 1_000,
+                        l1_ref: String::new(),
+                        raw_metadata_ref: String::new(),
+                        vector: Vec::new(),
+                        embedding_model_hash: 0,
+                        embedding_updated_at_ms: 0,
+                        summary_vector: Vec::new(),
+                        summary_vector_valid_from_ms: 0,
+                        summary_vector_model_hash: 0,
+                    }),
+                },
+            });
+        }
+        // Mark just two of them dirty (with events).
+        seed_raw_node(&engine, 9, 100, "only this one is pending");
+        seed_raw_node(&engine, 9, 101, "and this one too");
+        assert_eq!(count_pending(&engine), 2);
+
+        let report = drain_embedding_dirty_once(&engine, &EmbedDrainerConfig::default());
+        assert_eq!(report.pending_scanned, 2, "must scan only pending, not corpus");
+        assert_eq!(report.embedded, 2);
+        assert_eq!(count_pending(&engine), 0);
+    }
+}
