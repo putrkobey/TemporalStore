@@ -394,3 +394,399 @@ async fn upload_snapshot_inner<O: ObjectStore>(
         &format!("{temp_prefix}{CHECKSUMS}"),
         &snapshot.checksums_path,
     )
+    .await?;
+    for block_slab in &snapshot.block_slabs {
+        let name = block_slab.file_name().unwrap().to_string_lossy();
+        put_file(
+            object_store,
+            &format!("{temp_prefix}block_segments/{name}"),
+            block_slab,
+        )
+        .await?;
+    }
+
+    let temp_keys = object_store.list(temp_prefix).await?;
+    for temp_key in temp_keys {
+        let suffix = temp_key.trim_start_matches(temp_prefix);
+        let bytes = object_store.get(&temp_key).await?;
+        object_store
+            .put(&format!("{stable_prefix}{suffix}"), bytes)
+            .await?;
+    }
+
+    let manifest_bytes = Bytes::from(serde_json::to_vec_pretty(&snapshot.manifest)?);
+    object_store
+        .put(&format!("{stable_prefix}{MANIFEST}"), manifest_bytes)
+        .await?;
+    delete_prefix(object_store, temp_prefix).await?;
+    snapshot_ref_from_manifest(object_store, &snapshot.manifest).await
+}
+
+async fn download_snapshot_inner<O: ObjectStore>(
+    object_store: &O,
+    snapshot_ref: &SnapshotRef,
+    destination: PathBuf,
+) -> Result<LocalSnapshot, SnapshotStoreError> {
+    let prefix = prefix_from_ref(snapshot_ref);
+    let manifest_bytes = object_store.get(&format!("{prefix}{MANIFEST}")).await?;
+    let manifest: SnapshotManifest = serde_json::from_slice(&manifest_bytes)?;
+    tokio::fs::create_dir_all(destination.join("page_segments")).await?;
+
+    let index_path = destination.join(INDEX);
+    write_file(
+        &index_path,
+        object_store.get(&format!("{prefix}{INDEX}")).await?,
+    )
+    .await?;
+    let checksums_path = destination.join(CHECKSUMS);
+    write_file(
+        &checksums_path,
+        object_store.get(&format!("{prefix}{CHECKSUMS}")).await?,
+    )
+    .await?;
+
+    let mut block_slabs = Vec::new();
+    for slab in &manifest.block_slabs {
+        let path = destination.join(&slab.relative_path);
+        write_file(
+            &path,
+            object_store
+                .get(&format!("{prefix}{}", slab.relative_path))
+                .await?,
+        )
+        .await?;
+        block_slabs.push(path);
+    }
+
+    let local = LocalSnapshot {
+        manifest,
+        root_dir: destination,
+        index_path,
+        checksums_path,
+        block_slabs,
+    };
+    verify_local_snapshot(&local).await?;
+    Ok(local)
+}
+
+async fn snapshot_ref_from_manifest<O: ObjectStore>(
+    object_store: &O,
+    manifest: &SnapshotManifest,
+) -> Result<SnapshotRef, SnapshotStoreError> {
+    let mut total = 0;
+    let mut hasher = Sha256::new();
+    for entry in &manifest.checksums {
+        total += entry.byte_size;
+        hasher.update(entry.sha256.as_bytes());
+    }
+    Ok(SnapshotRef {
+        cluster_id: manifest.cluster_id.clone(),
+        shard_id: manifest.shard_id,
+        snapshot_id: manifest.snapshot_id.clone(),
+        raft_term: manifest.raft_term,
+        last_log_index: manifest.last_log_index,
+        uri: object_store.uri(&manifest.stable_prefix()),
+        byte_size: total,
+        checksum: hex::encode(hasher.finalize()),
+        created_at: manifest.created_at,
+    })
+}
+
+async fn put_file<O: ObjectStore>(
+    object_store: &O,
+    key: &str,
+    path: &Path,
+) -> Result<(), SnapshotStoreError> {
+    object_store
+        .put(key, Bytes::from(tokio::fs::read(path).await?))
+        .await?;
+    Ok(())
+}
+
+async fn write_file(path: &Path, bytes: Bytes) -> Result<(), SnapshotStoreError> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut file = tokio::fs::File::create(path).await?;
+    file.write_all(&bytes).await?;
+    file.flush().await?;
+    Ok(())
+}
+
+async fn delete_prefix<O: ObjectStore>(
+    object_store: &O,
+    prefix: &str,
+) -> Result<(), SnapshotStoreError> {
+    for key in object_store.list(prefix).await? {
+        object_store.delete(&key).await?;
+    }
+    Ok(())
+}
+
+async fn list_local_block_slabs(dir: &Path) -> Result<Vec<PathBuf>, SnapshotStoreError> {
+    let mut out = Vec::new();
+    if !dir.exists() {
+        return Ok(out);
+    }
+    let mut entries = tokio::fs::read_dir(dir).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if entry.file_type().await?.is_file() {
+            out.push(path);
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+async fn block_slab_manifests(
+    snapshot: &LocalSnapshot,
+) -> Result<Vec<BlockSlabManifest>, SnapshotStoreError> {
+    let mut out = Vec::new();
+    for path in &snapshot.block_slabs {
+        let bytes = tokio::fs::read(path).await?;
+        let file_name = path.file_name().unwrap().to_string_lossy().to_string();
+        out.push(BlockSlabManifest {
+            block_slab_id: file_name.trim_end_matches(".seg").to_string(),
+            relative_path: format!("block_segments/{file_name}"),
+            byte_size: bytes.len() as u64,
+            sha256: sha256_hex(&bytes),
+        });
+    }
+    Ok(out)
+}
+
+async fn checksum_entries(
+    snapshot: &LocalSnapshot,
+) -> Result<Vec<ChecksumEntry>, SnapshotStoreError> {
+    let mut entries = Vec::new();
+    for (relative, path) in [
+        (INDEX.to_string(), snapshot.index_path.clone()),
+        (CHECKSUMS.to_string(), snapshot.checksums_path.clone()),
+    ] {
+        let bytes = tokio::fs::read(path).await?;
+        entries.push(ChecksumEntry {
+            relative_path: relative,
+            sha256: sha256_hex(&bytes),
+            byte_size: bytes.len() as u64,
+        });
+    }
+    for slab in &snapshot.manifest.block_slabs {
+        entries.push(ChecksumEntry {
+            relative_path: slab.relative_path.clone(),
+            sha256: slab.sha256.clone(),
+            byte_size: slab.byte_size,
+        });
+    }
+    Ok(entries)
+}
+
+async fn verify_local_snapshot(snapshot: &LocalSnapshot) -> Result<(), SnapshotStoreError> {
+    for entry in &snapshot.manifest.checksums {
+        let path = snapshot.root_dir.join(&entry.relative_path);
+        let bytes = tokio::fs::read(&path).await?;
+        let actual = sha256_hex(&bytes);
+        if actual != entry.sha256 {
+            return Err(SnapshotStoreError::ChecksumMismatch {
+                path: entry.relative_path.clone(),
+                expected: entry.sha256.clone(),
+                actual,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn prefix_from_ref(snapshot_ref: &SnapshotRef) -> String {
+    format!(
+        "{}/shards/{}/snapshots/{}-{}-{}/",
+        snapshot_ref.cluster_id,
+        snapshot_ref.shard_id,
+        snapshot_ref.raft_term,
+        snapshot_ref.last_log_index,
+        snapshot_ref.snapshot_id
+    )
+}
+
+fn key_from_uri(uri: &str) -> String {
+    uri.split_once("://")
+        .map(|(_, key)| key)
+        .unwrap_or(uri)
+        .to_string()
+}
+
+fn parse_log_index(last_log_id: &str) -> u64 {
+    last_log_id
+        .rsplit([':', '-'])
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_default()
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hex::encode(hasher.finalize())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use prometheus_client::encoding::text::encode;
+    use prometheus_client::registry::Registry;
+    use tempfile::TempDir;
+
+    use super::*;
+    use crate::object_store::FileObjectStore;
+
+    async fn sample_snapshot(root: &Path, shard_id: ShardId, log_index: u64) -> LocalSnapshot {
+        let shard_root = root.join(format!("shard-{shard_id}"));
+        tokio::fs::create_dir_all(shard_root.join("page_segments"))
+            .await
+            .unwrap();
+        let index = shard_root.join(INDEX);
+        let checksums = shard_root.join(CHECKSUMS);
+        let slab = shard_root.join("page_segments").join("0001.seg");
+        tokio::fs::write(&index, b"index-bytes").await.unwrap();
+        tokio::fs::write(&checksums, b"[]").await.unwrap();
+        tokio::fs::write(&slab, b"page-segment-bytes")
+            .await
+            .unwrap();
+
+        let mut local = LocalSnapshot::new(
+            "cluster-a",
+            shard_id,
+            7,
+            log_index,
+            format!("term:7:index:{log_index}"),
+            shard_root,
+            index,
+            checksums,
+            vec![slab],
+        );
+        local.manifest.block_slabs = block_slab_manifests(&local).await.unwrap();
+        local.manifest.checksums = checksum_entries(&local).await.unwrap();
+        local
+    }
+
+    #[tokio::test]
+    async fn upload_writes_manifest_last_and_lists_visible_snapshot() {
+        let tmp = TempDir::new().unwrap();
+        let object_root = tmp.path().join("objects");
+        let store = Arc::new(FileObjectStore::with_uri_scheme(&object_root, "s3"));
+        let snapshots = S3SnapshotStore::new("cluster-a", "test", tmp.path().join("local"), store);
+        let local = sample_snapshot(&tmp.path().join("source"), 42, 100).await;
+
+        let uploaded = snapshots.upload_snapshot(local).await.unwrap();
+        assert_eq!(uploaded.shard_id, 42);
+        assert_eq!(uploaded.last_log_index, 100);
+
+        let listed = snapshots.list_snapshots(42).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].snapshot_id, uploaded.snapshot_id);
+    }
+
+    #[tokio::test]
+    async fn download_verifies_and_restores_snapshot_files() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(FileObjectStore::new(tmp.path().join("objects")));
+        let snapshots = S3SnapshotStore::new("cluster-a", "test", tmp.path().join("local"), store);
+        let local = sample_snapshot(&tmp.path().join("source"), 7, 123).await;
+        let uploaded = snapshots.upload_snapshot(local).await.unwrap();
+
+        let restored = snapshots
+            .download_snapshot(&uploaded, tmp.path().join("restore"))
+            .await
+            .unwrap();
+
+        assert_eq!(restored.manifest.shard_id, 7);
+        assert_eq!(
+            tokio::fs::read(restored.root_dir.join("block_segments/0001.seg"))
+                .await
+                .unwrap(),
+            b"page-segment-bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_with_index_bytes_and_download_by_uri_restore_payload() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(FileObjectStore::with_uri_scheme(
+            tmp.path().join("objects"),
+            "s3",
+        ));
+        let snapshots = S3SnapshotStore::new("cluster-a", "test", tmp.path().join("local"), store);
+        let local = snapshots
+            .create_local_snapshot_with_index_bytes(
+                9,
+                "term:4:index:44".to_string(),
+                Bytes::from_static(b"raft-snapshot-payload"),
+            )
+            .await
+            .unwrap();
+        let uploaded = snapshots.upload_snapshot(local).await.unwrap();
+        let restored = snapshots
+            .download_snapshot_by_uri(&uploaded.uri, tmp.path().join("restore-by-uri"))
+            .await
+            .unwrap();
+
+        assert_eq!(restored.manifest.last_log_index, 44);
+        assert_eq!(
+            tokio::fs::read(restored.index_path).await.unwrap(),
+            b"raft-snapshot-payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrupt_snapshot_fails_verification() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(FileObjectStore::new(tmp.path().join("objects")));
+        let snapshots =
+            S3SnapshotStore::new("cluster-a", "test", tmp.path().join("local"), store.clone());
+        let local = sample_snapshot(&tmp.path().join("source"), 5, 55).await;
+        let uploaded = snapshots.upload_snapshot(local).await.unwrap();
+        store
+            .put(
+                &format!(
+                    "cluster-a/shards/5/snapshots/{}-{}-{}/index.bin",
+                    uploaded.raft_term, uploaded.last_log_index, uploaded.snapshot_id
+                ),
+                Bytes::from_static(b"corrupt"),
+            )
+            .await
+            .unwrap();
+
+        let err = snapshots.verify_snapshot(&uploaded).await.unwrap_err();
+        assert!(matches!(err, SnapshotStoreError::ChecksumMismatch { .. }));
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_install_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let store = Arc::new(FileObjectStore::new(tmp.path().join("objects")));
+        let snapshots = S3SnapshotStore::new("cluster-a", "test", tmp.path().join("local"), store);
+        let local = sample_snapshot(&tmp.path().join("source"), 1, 10).await;
+        let uploaded = snapshots.upload_snapshot(local).await.unwrap();
+
+        let err = snapshots
+            .install_snapshot_guard(&uploaded, 11, tmp.path().join("restore"))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SnapshotStoreError::StaleSnapshot { .. }));
+    }
+
+    #[tokio::test]
+    async fn metrics_are_exported_with_prometheus_names() {
+        let mut registry = Registry::default();
+        let metrics = SnapshotMetrics::register(&mut registry);
+        metrics.observe_upload(3, SnapshotStatus::Success, 2048, 2);
+        metrics.set_last_success_log_index(3, 99);
+
+        let mut output = String::new();
+        encode(&mut output, &registry).unwrap();
+        assert!(output.contains("temporalstore_snapshot_upload_total"));
+        assert!(output.contains("temporalstore_snapshot_bytes"));
+        assert!(output.contains("temporalstore_snapshot_last_success_log_index"));
+    }
+}
