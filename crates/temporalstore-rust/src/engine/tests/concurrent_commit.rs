@@ -58,3 +58,124 @@ fn run_concurrent_same_shard_writes(engine: &Arc<TemporalEngine>) -> ConcurrentR
             }
         }));
     }
+    for handle in handles {
+        handle.join().expect("writer thread must not panic");
+    }
+    let fsyncs = engine.write_ahead_log_store().stats(1).syncs - syncs_before;
+    eprintln!(
+        "[concurrent_commit] writers={WRITERS} writes={total} fdatasyncs={fsyncs} ratio={:.3} fsync/write",
+        fsyncs as f64 / total as f64
+    );
+
+    // Correctness: every acked write is present and byte-exact on the live engine.
+    for w in 0..WRITERS {
+        for i in 0..PER_WRITER {
+            let get = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: format!("w{w}-k{i}"),
+                },
+            });
+            match get.response {
+                CommandResponse::Bytes { value: Some(value) } => assert_eq!(
+                    value,
+                    format!("v{w}-{i}").into_bytes(),
+                    "torn/wrong value for w{w}-k{i}"
+                ),
+                other => panic!("lost acked write w{w}-k{i}: {other:?}"),
+            }
+        }
+    }
+
+    ConcurrentRun {
+        fsyncs,
+        writes: total,
+        acked: acked.load(Ordering::Relaxed),
+    }
+}
+
+fn new_engine(dir: &std::path::Path) -> Arc<TemporalEngine> {
+    let engine = Arc::new(TemporalEngine::with_local_dirs(
+        16 * 1024,
+        dir.join("cache"),
+        dir.join("blocks"),
+        dir.join("indexes"),
+    ));
+    engine.load_shard(1);
+    engine
+}
+
+/// THE proof: with the barrier moved out of the global lock, concurrent same-shard writers
+/// coalesce their fdatasyncs (fewer fsyncs than writes); with the gate OFF the barrier stays
+/// under the lock and every write takes its own fsync. Both paths preserve all acked writes.
+#[test]
+fn concurrent_commit_coalesces_fsyncs_while_off_path_is_one_fsync_per_write() {
+    // --- Baseline: barrier under the shards lock -> group commit unreachable. ---
+    let off_dir = tempfile::tempdir().unwrap();
+    let off_engine = new_engine(off_dir.path());
+    off_engine.commit_under_lock_for_test();
+    let off = run_concurrent_same_shard_writes(&off_engine);
+    assert_eq!(off.acked, off.writes, "barrier under the lock: all writes acked");
+    // Serialized under the global lock, each sync write drives its own barrier -> exactly one
+    // fdatasync per write. This is the live-proven 1.00 fdatasync/write bottleneck.
+    assert_eq!(
+        off.fsyncs, off.writes as u64,
+        "gate OFF: each sync write takes its own fsync ({} writes, {} fsyncs)",
+        off.writes, off.fsyncs
+    );
+
+    // --- What ships: barrier out of the lock -> group commit engages. ---
+    let on_dir = tempfile::tempdir().unwrap();
+    let on = run_concurrent_same_shard_writes(&new_engine(on_dir.path()));
+    assert_eq!(on.acked, on.writes, "barrier outside the lock: all writes acked");
+    // The whole point: fewer durable barriers than writes -> coalescing is now reachable.
+    assert!(
+        on.fsyncs < on.writes as u64,
+        "gate ON: group commit must coalesce fsyncs below the write count (writes={}, fsyncs={})",
+        on.writes, on.fsyncs
+    );
+    // And it must be a MEANINGFUL reduction vs the serialized baseline, not an off-by-one.
+    assert!(
+        on.fsyncs < off.fsyncs,
+        "gate ON must take strictly fewer fsyncs than the serialized OFF baseline (on={}, off={})",
+        on.fsyncs, off.fsyncs
+    );
+}
+
+/// Durability + recovery + ordering/consistency for the concurrent path: after N concurrent
+/// same-shard writers commit with the gate ON, drop the engine and reopen over the SAME dirs so
+/// the shard is rebuilt by WAL replay. Every acked write must be recovered byte-exact -- proving
+/// the sequence reservation stayed correct (WAL order == apply order) even though the fsync ran
+/// outside the lock, and that no acked write was lost/torn/reordered.
+#[test]
+fn concurrent_commit_writes_survive_wal_replay_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = new_engine(dir.path());
+        let run = run_concurrent_same_shard_writes(&engine);
+        assert_eq!(run.acked, run.writes, "all writes acked before reload");
+        assert!(run.fsyncs < run.writes as u64, "coalescing engaged before reload");
+        // engine dropped here -> nothing flushed beyond the WAL; recovery must rebuild from it.
+    }
+
+    // Fresh engine over the same directories -> load_shard replays the WAL tail.
+    let recovered = new_engine(dir.path());
+    for w in 0..WRITERS {
+        for i in 0..PER_WRITER {
+            let get = recovered.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::StringGet {
+                    key: format!("w{w}-k{i}"),
+                },
+            });
+            match get.response {
+                CommandResponse::Bytes { value: Some(value) } => assert_eq!(
+                    value,
+                    format!("v{w}-{i}").into_bytes(),
+                    "recovery lost/corrupted w{w}-k{i}"
+                ),
+                other => panic!("recovery lost acked write w{w}-k{i}: {other:?}"),
+            }
+        }
+    }
+}
