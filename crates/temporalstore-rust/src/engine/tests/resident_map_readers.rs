@@ -382,3 +382,1157 @@ fn an_emptied_container_key_does_not_report_as_present() {
             "list",
             "phantom-list",
             Command::ListPush {
+                key: "phantom-list".to_string(),
+                member: b"m".to_vec(),
+                left: false,
+            },
+            Command::ListPop {
+                key: "phantom-list".to_string(),
+                left: false,
+            },
+        ),
+        (
+            "set",
+            "phantom-set",
+            Command::SetAdd {
+                key: "phantom-set".to_string(),
+                member: b"m".to_vec(),
+            },
+            Command::SetRemove {
+                key: "phantom-set".to_string(),
+                member: b"m".to_vec(),
+            },
+        ),
+    ];
+
+    let mut rows: Vec<(&str, i64, i64, i64, i64)> = Vec::new();
+    let mut phantom_kinds: Vec<&str> = Vec::new();
+
+    for (kind, key, add, remove) in kinds {
+        run(&engine, add);
+        // THE CONTROL SIDE OF EVERY ROW: the fixture wrote something and the key is present for the
+        // honest reason.
+        let len_before = listed_len(&engine, kind, key);
+        let exists_before = exists(&engine, key);
+        assert_eq!(
+            1, len_before,
+            "{kind}: the fixture wrote {len_before} element(s), not 1, so the removal below has \
+             nothing to prove"
+        );
+        assert_eq!(
+            1, exists_before,
+            "{kind}: EXISTS answered {exists_before} for a key holding one element, so this \
+             fixture's EXISTS says nothing"
+        );
+
+        run(&engine, remove);
+        let len_after = listed_len(&engine, kind, key);
+        assert_eq!(
+            0, len_after,
+            "{kind}: the listing still reports {len_after} element(s) after the removal, so this \
+             row never emptied its container"
+        );
+        let exists_after = exists(&engine, key);
+        if exists_after != 0 {
+            phantom_kinds.push(kind);
+        }
+        rows.push((kind, len_before, exists_before, len_after, exists_after));
+    }
+
+    println!("\n=== EXISTS after the last element of a container is removed ===");
+    println!("  kind  len before  EXISTS before  len after  EXISTS after");
+    for (kind, len_before, exists_before, len_after, exists_after) in &rows {
+        println!(
+            "  {kind:<5} {len_before:>11} {exists_before:>14} {len_after:>10} {exists_after:>13}"
+        );
+    }
+    println!(
+        "  {} of {} kind(s) report a key with no elements as present",
+        phantom_kinds.len(),
+        rows.len()
+    );
+
+    // THE DENOMINATOR. Four kinds exercised, each proven to have emptied.
+    assert_eq!(
+        4,
+        rows.len(),
+        "DENOMINATOR: {} kind(s) exercised, not the 4 this claim is about",
+        rows.len()
+    );
+    assert!(
+        phantom_kinds.is_empty(),
+        "{:?} report a container key with no elements as present. `record_exists_exact` reads \
+         `shard.<kind>.contains_key(key)`, so a removal that leaves an empty inner map behind \
+         leaves a key that EXISTS answers 1 for and every listing answers empty for",
+        phantom_kinds
+    );
+}
+
+/// AND THE SAME PHANTOM ACCEPTS A DEADLINE, which is the reader behind `EXPIRE` rather than
+/// `EXISTS`.
+///
+/// `CommonExpire` records a deadline only `for record_key in associated_record_keys(&key)` where
+/// `record_exists_exact(shard, &record_key)`, and `ttl_ms` gates on the same function before it
+/// reads `expires_at_ms`. So the phantom is not one reader answering oddly: it puts a live deadline
+/// into `shard.expires_at_ms` for a key with nothing under it, and `TTL` reports that deadline
+/// instead of the -2 that means "no such key".
+///
+/// THE CONTROL IS THE SAME KEY WITH A MEMBER STILL IN IT: `EXPIRE` must be accepted there, or this
+/// test would pass against an `EXPIRE` that had simply stopped working.
+///
+/// rust-internal: command surface only
+#[test]
+fn an_emptied_set_does_not_accept_a_deadline() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    // THE CONTROL: a set that still holds a member takes a deadline.
+    run(
+        &engine,
+        Command::SetAdd {
+            key: "ttl-control".to_string(),
+            member: b"stays".to_vec(),
+        },
+    );
+    run(
+        &engine,
+        Command::CommonExpire {
+            key: "ttl-control".to_string(),
+            ttl_ms: 600_000,
+        },
+    );
+    let control_ttl = integer_of(&run(
+        &engine,
+        Command::CommonTtl {
+            key: "ttl-control".to_string(),
+        },
+    ));
+    assert!(
+        control_ttl > 0,
+        "the control set with a live member reports TTL {control_ttl}, so EXPIRE is not working \
+         here and the subject below would pass for the wrong reason"
+    );
+
+    // THE SUBJECT: the same shape, emptied first.
+    run(
+        &engine,
+        Command::SetAdd {
+            key: "ttl-phantom".to_string(),
+            member: b"goes".to_vec(),
+        },
+    );
+    run(
+        &engine,
+        Command::SetRemove {
+            key: "ttl-phantom".to_string(),
+            member: b"goes".to_vec(),
+        },
+    );
+    assert_eq!(
+        0,
+        listed_len(&engine, "set", "ttl-phantom"),
+        "the subject set is not empty, so this test never built a phantom"
+    );
+    // NOT asserted ok: the refusal IS the fixed behaviour, and it is stronger than "no deadline was
+    // recorded". Before the cleanup this answered ok and `TTL` then reported the deadline it had
+    // recorded; now the key is genuinely absent and `CommonExpire` refuses it by name.
+    let phantom_expire = try_run(
+        &engine,
+        Command::CommonExpire {
+            key: "ttl-phantom".to_string(),
+            ttl_ms: 600_000,
+        },
+    );
+    let phantom_ttl = match try_run(
+        &engine,
+        Command::CommonTtl {
+            key: "ttl-phantom".to_string(),
+        },
+    ) {
+        Ok(response) => integer_of(&response),
+        // A refusal here says the same thing -2 says, and more loudly.
+        Err(_) => -2,
+    };
+
+    println!(
+        "\n=== EXPIRE then TTL ===\n  control (one member) EXPIRE ok, TTL {control_ttl} ms\n  \
+         emptied set         EXPIRE {:?}, TTL {phantom_ttl} (-2 means no such key)",
+        phantom_expire.as_ref().map(|_| "ok")
+    );
+
+    assert!(
+        phantom_expire.is_err(),
+        "EXPIRE was ACCEPTED for a set with no members, so `record_exists_exact` can still see the \
+         key in `shard.sets` and a deadline is now recorded against nothing"
+    );
+    assert_eq!(
+        -2, phantom_ttl,
+        "TTL answered {phantom_ttl} for a set with no members, so a deadline stands against a key \
+         every listing reports as empty"
+    );
+}
+
+// =================================================================================================
+// 2. THE OTHER FOUR READERS, ASKED ON #2017's OVER-COMPLETE STATE
+// =================================================================================================
+
+/// One key's divergence fixture: `population` members written, `removed` of them removed, and the
+/// pre-removal durable map captured so it can be put back the way a stale snapshot would.
+struct Divergence {
+    key: String,
+    members: Vec<Vec<u8>>,
+    removed: Vec<Vec<u8>>,
+    persisted_before_removal: BTreeMap<Vec<u8>, ElementEntry>,
+}
+
+fn build_divergence(
+    engine: &TemporalEngine,
+    key: &str,
+    population: usize,
+    remove_count: usize,
+) -> Divergence {
+    let members: Vec<Vec<u8>> = (0..population)
+        .map(|index| format!("{key}-member-{index:03}").into_bytes())
+        .collect();
+    for member in &members {
+        run(
+            engine,
+            Command::SetAdd {
+                key: key.to_string(),
+                member: member.clone(),
+            },
+        );
+    }
+    // What `set_index_serde` would have serialized at this moment: the map as it stands, before any
+    // removal. Captured off the live map, which is exactly what it serializes.
+    let persisted_before_removal = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 is loaded");
+        shard
+            .sets
+            .get(key)
+            .expect("the seeded key is in the resident map")
+            .clone()
+    };
+    assert_eq!(
+        population,
+        persisted_before_removal.len(),
+        "{key}: the pre-removal snapshot holds {} member(s), not the {population} written",
+        persisted_before_removal.len()
+    );
+    let removed: Vec<Vec<u8>> = members.iter().take(remove_count).cloned().collect();
+    for member in &removed {
+        run(
+            engine,
+            Command::SetRemove {
+                key: key.to_string(),
+                member: member.clone(),
+            },
+        );
+    }
+    let live_now = resident_members(engine, key).len();
+    assert_eq!(
+        population - remove_count,
+        live_now,
+        "{key}: {live_now} member(s) in the map after removing {remove_count} of {population}, so \
+         the fixture's removals did not land"
+    );
+    Divergence {
+        key: key.to_string(),
+        members,
+        removed,
+        persisted_before_removal,
+    }
+}
+
+/// EVERY READER OF THE RESIDENT MAP, ASKED ON THE STATE #2017 BUILT.
+///
+/// TWO KEYS, AND THE DISCRIMINATOR IS A COUNT. `ghost` gets a stale snapshot put back under it, so
+/// the merge is asked to resurrect; `control` gets its own real snapshot put back, so the merge is
+/// asked for something and resurrects nothing. A one-key fixture would differ from its own fix only
+/// in which address won a walk, which is the shape #2016's first mutation run survived.
+///
+/// # WHAT MOVED, AND WHY THE LOCK IS NOW SCOPED
+///
+/// The population each row was compared against came out of the index entry's component. The entry
+/// stopped naming its element, so that read returns NOTHING for every key and the per-row control
+/// fired -- correctly: it says in as many words that this fixture's page index says nothing. The
+/// population is re-attributed to the SERVING PATH, which means releasing the shard lock to ask the
+/// command surface, so the readers below run inside a scope and the comparison happens after it.
+///
+/// # AND THE MERGE RESURRECTS AGAIN, SO TWO ASSERTIONS ARE TURNED OVER RATHER THAN RE-GOLDENED
+///
+/// #2017's fix made `fill_absent_elements` ask "is there still a page at this address?". Its premise
+/// was ONE PAGE PER ELEMENT, and the collapse removed it: with one index entry a page, a page
+/// SURVIVES the removal of one of its elements, so the address stays live while the element on it is
+/// dead. Measured here at ghost map 4 against a served 2.
+///
+/// SO THE READER-4 DENOMINATOR IS RE-ATTRIBUTED, NOT RE-GOLDENED. It read `assert_eq!(6,
+/// named_by_map)` on the arithmetic "8 members written, 2 removed". The merge now restores the 2, so
+/// the maps name all 8 -- and 8 is written as the two fixtures' own populations rather than as a
+/// literal, because it is the fixture's number and not the store's.
+///
+/// AND READER 4'S SAFETY PROPERTY STILL HOLDS, FOR A BETTER REASON THAN BEFORE. Every address the
+/// resident maps name is a live page -- including the resurrected ones, whose pages are live exactly
+/// because the collapse keeps them. `compact_shard_blocks_relocating` therefore relocates nothing
+/// that is not there, and the hazard reader 2 was asserted against -- re-rendering a component for a
+/// member whose page was REMOVED -- is now unreachable rather than absent.
+///
+/// rust-internal: calls the engine's own reconcile and its map readers directly, then the commands
+#[test]
+fn the_resident_map_readers_asked_in_the_over_complete_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    // 4 written, 2 removed -> the stale snapshot is over-complete by 2.
+    let ghost = build_divergence(&engine, "ghost", 4, 2);
+    // 4 written, 0 removed -> its own snapshot is exact. THE CONTROL.
+    let control = build_divergence(&engine, "control", 4, 0);
+
+    let (rows, emitted_set_entries) = {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1 is loaded");
+
+        // The load path's input: the durable map as an index snapshot predating the removals.
+        shard
+            .sets
+            .insert_elements_for_test(&ghost.key, ghost.persisted_before_removal.clone());
+        shard
+            .sets
+            .insert_elements_for_test(&control.key, control.persisted_before_removal.clone());
+
+        let live_blocks: usize = shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .map(|bucket| {
+                bucket
+                    .block_index
+                    .values()
+                    .filter(|block| !block.deleted)
+                    .count()
+            })
+            .sum();
+        assert!(
+            live_blocks >= 6,
+            "DENOMINATOR: {live_blocks} live page(s), so the derived view is too thin for the merge \
+             below to be doing anything"
+        );
+
+        crate::engine::storage_bucket_internals::reconcile_secondary_views_from_bucket_index(
+            &engine.block_store,
+            shard,
+            None,
+        );
+
+        let mut rows: Vec<(&str, BTreeSet<Vec<u8>>)> = Vec::new();
+        for divergence in [&ghost, &control] {
+            let in_map = shard
+                .sets
+                .get(&divergence.key)
+                .map(|members| members.keys().cloned().collect::<BTreeSet<_>>())
+                .unwrap_or_default();
+            rows.push((
+                if divergence.key == "ghost" {
+                    "ghost"
+                } else {
+                    "control"
+                },
+                in_map,
+            ));
+        }
+
+        // -----------------------------------------------------------------------------------------
+        // READER 1: record_exists_exact -- KEY granularity, so an extra MEMBER cannot move it.
+        // -----------------------------------------------------------------------------------------
+        assert!(
+            crate::engine::record_exists_exact(shard, "ghost"),
+            "the ghost key has a live member and a live page, so EXISTS must be true here -- if \
+             this fails the fixture is not the over-complete state this module is about"
+        );
+        println!(
+            "  reader record_exists_exact       LATENT: key granularity \
+             (`shard.sets.contains_key`), the key is in both populations"
+        );
+
+        // -----------------------------------------------------------------------------------------
+        // READER 2: visit_model_live_blocks -- walks the map and re-renders the component.
+        // -----------------------------------------------------------------------------------------
+        let emitted_set_entries =
+            crate::engine::storage_bucket_internals::collect_model_live_block_entries(shard)
+                .into_iter()
+                .filter(|entry| entry.kind.as_str() == "set" && &*entry.object_key == "ghost")
+                .count();
+        println!(
+            "  reader visit_model_live_blocks   emitted {emitted_set_entries} live set entr(ies) \
+             for `ghost`"
+        );
+
+        // -----------------------------------------------------------------------------------------
+        // READER 3: collect_live_block_slab_ids -- walks the model maps directly.
+        // -----------------------------------------------------------------------------------------
+        crate::snapshot_probe::reset();
+        let _ = crate::engine::collect_live_block_slab_ids(shard);
+        let map_walk_addresses = crate::snapshot_probe::counts().live_slab_scan_addresses;
+        println!(
+            "  reader collect_live_block_slab_ids visited {map_walk_addresses} model-map \
+             address(es) over {live_blocks} live page(s)"
+        );
+
+        // -----------------------------------------------------------------------------------------
+        // READER 4: compact_shard_blocks_relocating -- it relocates WHAT THE MODEL MAPS NAME.
+        //
+        // Its relocation loop is `for (key, members) in shard.sets.iter_mut()` (and one arm per
+        // other model), handing each address to `compact_block_addresses` to be read off the old
+        // slab, appended to the fresh one and rewritten IN PLACE. The preamble's
+        // `collect_live_block_entries` reports are a different walk and do not bound it. So the map
+        // IS compaction's work list, and a member whose page is gone is a page compaction reads,
+        // copies onto every new slab it rolls, and keeps alive for good.
+        //
+        // THE PROPERTY THAT MAKES THAT SAFE IS THE ONE ASSERTED BELOW: every address the resident
+        // maps name is a live page in the index. It holds even though the merge resurrects, because
+        // what the merge keeps is precisely the elements whose PAGES are still live -- so the
+        // resurrection costs a wrong answer only to a reader that trusts the map for MEMBERSHIP,
+        // never a relocation of a page that is not there. Checked over all five element-bearing
+        // models, not just the set arm, because the relocation loop has an arm for each.
+        // -----------------------------------------------------------------------------------------
+        let live_addresses: BTreeSet<(u64, u64, u64)> = shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .flat_map(|bucket| bucket.block_index.values())
+            .filter(|block| !block.deleted)
+            .map(|block| {
+                (
+                    block.address.block_slab_id(),
+                    block.address.offset(),
+                    block.address.length(),
+                )
+            })
+            .collect();
+        let mut named_by_map = 0usize;
+        let mut named_but_not_live: Vec<String> = Vec::new();
+        {
+            let mut check = |model: &str, key: &str, address: &ElementEntry| {
+                named_by_map += 1;
+                let identity = (
+                    address.block_slab_id(),
+                    address.offset(),
+                    address.length(),
+                );
+                if !live_addresses.contains(&identity) {
+                    named_but_not_live.push(format!("{model}/{key}"));
+                }
+            };
+            for (key, slot) in shard.strings() {
+                check("string", key, &slot.address());
+            }
+            for (key, fields) in &shard.hashes {
+                for address in fields.values() {
+                    check("hash", key, address);
+                }
+            }
+            for (key, members) in &shard.sets {
+                for address in members.values() {
+                    check("set", key, address);
+                }
+            }
+            for (key, elements) in &shard.lists {
+                for address in elements.values() {
+                    check("list", key, address);
+                }
+            }
+            for (key, members) in &shard.zsets {
+                for (_, address) in members.values() {
+                    check("zset", key, address);
+                }
+            }
+        }
+        println!(
+            "  reader compact_shard_blocks_relocating relocates from the model maps: \
+             {named_by_map} address(es) named, {} naming no live page",
+            named_but_not_live.len()
+        );
+        // DENOMINATOR, RE-ATTRIBUTED TO THE FIXTURE THAT OWNS IT. This read 6 on the arithmetic "8
+        // written, 2 removed"; the merge restores the 2 now, so the maps name all 8. It is written
+        // as the two populations the fixture built rather than as a literal, because a floor below
+        // it would let a fixture that wrote nothing pass and a literal goes stale with the fixture.
+        let written_population = ghost.members.len() + control.members.len();
+        assert_eq!(
+            written_population, named_by_map,
+            "DENOMINATOR: the resident maps name {named_by_map} address(es), not the \
+             {written_population} this fixture wrote. The merge keeps every persisted element whose \
+             page is still live, and one entry a page keeps all of them live, so nothing is dropped"
+        );
+        assert!(
+            named_but_not_live.is_empty(),
+            "the resident maps name {} address(es) that are not live pages in the index ({:?}). \
+             `compact_shard_blocks_relocating` iterates those maps to build its relocation work \
+             list, so each of these is a page compaction reads off the old slab, copies onto the \
+             fresh one and keeps alive for good",
+            named_but_not_live.len(),
+            named_but_not_live
+        );
+
+        // -----------------------------------------------------------------------------------------
+        // READER 5: collect_upsert_index_items -- would resolve a ghost, and nothing asks it to.
+        // -----------------------------------------------------------------------------------------
+        // Nothing asks: every arm of `command_upsert_components` is an ADD/SET. A removal's
+        // component goes down `collect_command_index_items_for` instead.
+        for removal in [
+            Command::SetRemove {
+                key: "ghost".to_string(),
+                member: ghost.removed[0].clone(),
+            },
+            Command::ZSetRemove {
+                key: "ghost-z".to_string(),
+                member: b"m".to_vec(),
+            },
+            Command::ListPop {
+                key: "ghost-l".to_string(),
+                left: true,
+            },
+            Command::HashDelete {
+                key: "ghost-h".to_string(),
+                field: "f".to_string(),
+            },
+        ] {
+            assert!(
+                crate::engine::command_upsert_components(&removal, shard).is_none(),
+                "`command_upsert_components` now names a component for a REMOVAL. \
+                 `collect_upsert_index_items` resolves that component's address out of the resident \
+                 map, so a removal reaching it would build a WAL index item pinning a page the \
+                 removal dropped -- and a replay would re-install it"
+            );
+        }
+        // Asked outright, it does resolve one: the mechanism is live, only unreached. Driven with
+        // the ADD command's own component spelling, so this is the item a reachable caller would get.
+        let ghost_component = hex::encode(&ghost.removed[0]);
+        let items_for_a_ghost = crate::engine::collect_upsert_index_items(
+            shard,
+            1,
+            &[("set", "ghost".to_string(), Some(ghost_component.clone()))],
+            0,
+            1023,
+        );
+        println!(
+            "  reader collect_upsert_index_items LATENT: no removal reaches it (4 removal commands \
+             answer None from `command_upsert_components`); asked outright with the ghost's \
+             component it builds {} item(s)",
+            items_for_a_ghost.len()
+        );
+
+        (rows, emitted_set_entries)
+    };
+
+    // ---------------------------------------------------------------------------------------------
+    // THE TWO POPULATIONS, PER KEY, with the lock released so the serving path can answer.
+    // ---------------------------------------------------------------------------------------------
+    println!("\n=== resident map vs what the store serves, after a reconcile against a stale snapshot ===");
+    println!("  key      map members  served  over-reported by");
+    let mut served_by_label: Vec<(&str, usize, usize)> = Vec::new();
+    for (label, in_map) in &rows {
+        let served = served_members(&engine, label);
+        println!(
+            "  {label:<8} {:>12} {:>7} {:>17}",
+            in_map.len(),
+            served.len(),
+            in_map.len().saturating_sub(served.len())
+        );
+        let divergence = if *label == "ghost" { &ghost } else { &control };
+        // EVERY ROW'S CONTROL: the members that were never removed are on BOTH sides, or the merge
+        // dropped everything and nothing here measures what it claims.
+        for member in divergence
+            .members
+            .iter()
+            .filter(|member| !divergence.removed.iter().any(|removed| removed == *member))
+        {
+            assert!(
+                in_map.contains(member),
+                "{label}: a member that was never removed is absent from the resident map"
+            );
+            assert!(
+                served.contains(member),
+                "{label}: a member that was never removed is not served, so this row's served \
+                 population says nothing"
+            );
+        }
+        // THE REMOVALS LANDED where the store answers from -- otherwise there is no divergence.
+        for member in &divergence.removed {
+            assert!(
+                !served.contains(member),
+                "{label}: the store SERVES a member it was told to forget, so the removal did not \
+                 reach the serving path and the divergence below is not the one this arm is about"
+            );
+        }
+        served_by_label.push((label, in_map.len(), served.len()));
+    }
+
+    // THE CONTROL KEY: its snapshot is exact, so the merge has nothing to resurrect and the two
+    // populations must agree. If this diverges, nothing below is about the STALE snapshot.
+    let control_row = served_by_label
+        .iter()
+        .find(|(label, _, _)| *label == "control")
+        .expect("the control row is in the table");
+    assert_eq!(
+        control_row.1, control_row.2,
+        "THE CONTROL DIVERGED: the control key, whose snapshot is exact, holds {} member(s) in the \
+         map against {} served. Nothing below is about the stale snapshot then",
+        control_row.1, control_row.2
+    );
+    assert!(
+        control_row.2 >= 4,
+        "CONTROL FLOOR: the control key serves {} member(s), so a control at 0 over-reported \
+         members means nothing was exercised",
+        control_row.2
+    );
+
+    // THE FINDING. The ghost key's map over-reports, and the mechanism is named so that a fix goes
+    // red here rather than quietly making this arm vacuous.
+    let ghost_row = served_by_label
+        .iter()
+        .find(|(label, _, _)| *label == "ghost")
+        .expect("the ghost row is in the table");
+    assert!(
+        ghost_row.1 > ghost_row.2,
+        "the resident map holds {} member(s) for `ghost` against {} served, so \
+         `fill_absent_elements` is no longer keeping elements whose page is live but whose element \
+         is dead. That was #2017's state, re-reached because the fix tests the ADDRESS and one \
+         index entry a page keeps a page alive through the removal of one of its elements. If this \
+         has been fixed at the ELEMENT, turn the assertion over and name the mechanism",
+        ghost_row.1,
+        ghost_row.2
+    );
+    assert_eq!(
+        ghost.removed.len(),
+        ghost_row.1 - ghost_row.2,
+        "the ghost key over-reports by {} member(s), not the {} the fixture removed -- the merge is \
+         keeping or dropping elements this fixture did not ask it to",
+        ghost_row.1 - ghost_row.2,
+        ghost.removed.len()
+    );
+    // AND THE READER THAT WALKS THE MAP IS BOUNDED BY THE MAP, which is what makes the
+    // over-reporting a membership error and not a relocation one. Reader 4 already asserted that
+    // every address the maps name is live; this says reader 2 emits no more than the map holds.
+    //
+    // THE ASSERTION THIS REPLACES IS DELETED WITH ITS REASON. It read `ghost_index_members ==
+    // emitted_set_entries` and said a mismatch meant the reader was "re-rendering a component for a
+    // member whose page was removed". Both sides of it are gone: the left was the component-decoded
+    // population, which is now always 0, and the hazard is unreachable rather than absent, because
+    // the pages the resurrected members name are live. Reader 4's `named_but_not_live.is_empty()`
+    // asserts that property directly, over all five models instead of one.
+    assert!(
+        emitted_set_entries >= 1 && emitted_set_entries <= ghost_row.1,
+        "`visit_model_live_blocks` emitted {emitted_set_entries} live set entr(ies) for `ghost` \
+         against {} in the resident map it walks. It re-renders out of that map, so it can emit \
+         neither more than the map holds nor nothing at all",
+        ghost_row.1
+    );
+    println!(
+        "  => the merge resurrects {} ghost member(s): the map over-reports and the store does \
+         not, because the listing is not served from the map",
+        ghost_row.1 - ghost_row.2
+    );
+}
+
+// =================================================================================================
+// 3. THE TWO INPUTS TO ONE MERGE, AND WHY #2005's FIX DID NOT COVER BOTH
+// =================================================================================================
+
+/// BOTH INPUTS TO THE MERGE NOW ANSWER THE SAME LIVE-PAGE QUESTION.
+///
+/// #2005 fixed a resurrection on `fill_absent_elements` from the CARRY side: the delta fold's
+/// carried elements are applied once, after the page index settles, and only where a page is still
+/// at the carried address. #2017 reached the same over-complete state through the other input --
+/// the PERSISTED map read off disk, older than the page index it merges with -- which that fix
+/// never looked at. Different mechanism, and the reason the second one survived the first fix.
+///
+/// THE TWO SIDE BY SIDE, one key each, all three merged kinds. Each subject's element has a
+/// FABRICATED address that names no page -- which is what a stale snapshot's entry is, once its page
+/// is gone -- and each control's element has its real live address. A subject dropped and a control
+/// kept is the only outcome that distinguishes the filter from either "keep everything" or "keep
+/// nothing".
+///
+/// rust-internal: calls the engine's own reconcile directly
+#[test]
+fn both_inputs_to_the_merge_now_answer_the_same_live_block_question() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    run(
+        &engine,
+        Command::SetAdd {
+            key: "s".to_string(),
+            member: b"set-control".to_vec(),
+        },
+    );
+    run(
+        &engine,
+        Command::ZSetAdd {
+            key: "z".to_string(),
+            member: b"zset-control".to_vec(),
+            score: 2.5,
+        },
+    );
+    run(
+        &engine,
+        Command::ListPush {
+            key: "l".to_string(),
+            member: b"list-control".to_vec(),
+            left: false,
+        },
+    );
+
+    let mut shards = engine.shards.write().expect("engine lock poisoned");
+    let shard = shards.get_mut(&1).expect("shard 1 is loaded");
+
+    // A page address that is in NO bucket: an offset far past anything this fixture wrote, on a
+    // slab id nothing uses. This is the shape of a persisted entry whose page has been removed.
+    let live_control_address = shard
+        .sets
+        .get("s")
+        .and_then(|members| members.values().next())
+        .cloned()
+        .expect("the control set member is in the resident map");
+    // A page address in NO bucket, built off a real one so every field is in range by construction
+    // (`try_from_parts` refuses an out-of-range slab or offset, and a refusal here would read as a
+    // test bug rather than as the state being modelled). Only the slab id moves, far past anything
+    // this fixture rolled: this is the shape of a persisted entry whose page has been removed.
+    let dead_address = ElementEntry::try_from_parts(
+        live_control_address.block_slab_id().saturating_add(4_096),
+        live_control_address.offset(),
+        live_control_address.length(),
+        None,
+        None,
+    )
+    .expect("the fabricated address is in range");
+    assert!(
+        !shard.bucket_index.bucket_map.values().any(|bucket| bucket
+            .block_index
+            .values()
+            .any(|block| !block.deleted
+                && block.address.block_slab_id() == dead_address.block_slab_id()
+                && block.address.offset() == dead_address.offset())),
+        "the fabricated address matches a live page, so the subjects below would be kept for the \
+         honest reason"
+    );
+
+    // The stale-snapshot entries: one subject per merged kind, beside each kind's real element.
+    shard
+        .sets
+        .elements_mut_for_test("s")
+        .expect("set key")
+        .insert(b"set-subject".to_vec(), dead_address.clone());
+    shard
+        .zsets
+        .elements_mut_for_test("z")
+        .expect("zset key")
+        .insert(b"zset-subject".to_vec(), (9, dead_address.clone()));
+    shard
+        .lists
+        .elements_mut_for_test("l")
+        .expect("list key")
+        .insert(i64::MAX - 3, dead_address.clone());
+
+    crate::engine::storage_bucket_internals::reconcile_secondary_views_from_bucket_index(
+        &engine.block_store,
+        shard,
+        None,
+    );
+
+    let set_members: BTreeSet<Vec<u8>> = shard
+        .sets
+        .get("s")
+        .map(|members| members.keys().cloned().collect())
+        .unwrap_or_default();
+    let zset_members: BTreeSet<Vec<u8>> = shard
+        .zsets
+        .get("z")
+        .map(|members| members.keys().cloned().collect())
+        .unwrap_or_default();
+    let list_seqs: BTreeSet<i64> = shard
+        .lists
+        .get("l")
+        .map(|entries| entries.keys().copied().collect())
+        .unwrap_or_default();
+
+    println!(
+        "\n=== a persisted entry naming a page that is gone ===\n  set   {:?}\n  zset  {:?}\n  \
+         list  {:?}",
+        set_members
+            .iter()
+            .map(|member| String::from_utf8_lossy(member).to_string())
+            .collect::<Vec<_>>(),
+        zset_members
+            .iter()
+            .map(|member| String::from_utf8_lossy(member).to_string())
+            .collect::<Vec<_>>(),
+        list_seqs
+    );
+
+    // THE CONTROLS, all three: an element whose page IS live survives the merge. This is #1989's
+    // rule and the filter must not touch it.
+    assert!(
+        set_members.contains(&b"set-control".to_vec()),
+        "the set control was dropped, so the filter is keeping nothing rather than keeping live \
+         pages"
+    );
+    assert!(
+        zset_members.contains(&b"zset-control".to_vec()),
+        "the zset control was dropped"
+    );
+    assert_eq!(
+        1,
+        list_seqs
+            .iter()
+            .filter(|seq| **seq != i64::MAX - 3)
+            .count(),
+        "the list control was dropped"
+    );
+
+    // THE SUBJECTS: an element whose page is gone is not resurrected.
+    assert!(
+        !set_members.contains(&b"set-subject".to_vec()),
+        "`fill_absent_elements` resurrected a set member whose page is in no bucket"
+    );
+    assert!(
+        !zset_members.contains(&b"zset-subject".to_vec()),
+        "`fill_absent_elements` resurrected a zset member whose page is in no bucket"
+    );
+    assert!(
+        !list_seqs.contains(&(i64::MAX - 3)),
+        "`fill_absent_elements` resurrected a list element whose page is in no bucket"
+    );
+    println!("  all three subjects dropped, all three controls kept");
+}
+
+/// A BUCKET HOLDING A CONTAINER PAGE IS NEVER RELEASED, WHICH IS WHAT KEEPS THE FILTER FROM LOSING
+/// DATA.
+///
+/// This is the one place the filter could have DESTROYED something rather than declined to resurrect
+/// it, so the property it rests on is driven rather than read.
+///
+/// A RELEASED BUCKET'S PAGES ARE ABSENT FROM `bucket_index.bucket_map` ON PURPOSE while its elements
+/// are still live -- that is what a release IS. `collect_bucket_index_live_block_entries` supplements
+/// exactly those back in from the model maps, and says so: "what this returns is what the bucket index
+/// WOULD say if nothing were released". A live-page set built by walking `bucket_map` directly -- the
+/// shape that reads correctly and is wrong -- omits every released page, so if a container page could
+/// ever sit in a released bucket, the filter would drop it. Four of the reconcile's six call sites run
+/// on a live shard where a release can already have happened.
+///
+/// IT CANNOT, AND THE REASON IS AN ALLOW-LIST. `released_model_kind_is_addressable` admits exactly
+/// `string` and `context_node`, and names `set`, `zset` and `list` among the kinds held out: they are
+/// read whole through `bucket_index_component_block_addresses`, which has no point-lookup equivalent,
+/// so a released page of those kinds could not be resolved. A candidate bucket holding one is refused
+/// with `BlockKindNotAddressable`. The allow-list and the three merged kinds are disjoint.
+///
+/// SO THE FILTER'S LIVE SET IS STILL TAKEN FROM `entries` AND NOT FROM `bucket_map`, because resting
+/// a data-loss argument on a disjointness that lives in another function is how the two drift apart.
+/// Taking it from the same `entries` the derived view is built from means the filter and its subject
+/// read ONE population, and the filter can only ever remove what the derived view also lacks -- true
+/// whatever that allow-list later says.
+///
+/// THE CONTROL IS A STRING BUCKET, RELEASED IN THE SAME CALL. Without it, "the set bucket was not
+/// released" is satisfied just as well by a fixture in which nothing can be released at all, which is
+/// what the first version of this test hit.
+///
+/// rust-internal: calls the engine's own release actuator and reconcile directly
+#[test]
+fn a_bucket_holding_a_container_block_is_never_released() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    let members: Vec<Vec<u8>> = (0..4)
+        .map(|index| format!("released-member-{index:03}").into_bytes())
+        .collect();
+    for member in &members {
+        run(
+            &engine,
+            Command::SetAdd {
+                key: "released".to_string(),
+                member: member.clone(),
+            },
+        );
+    }
+    // THE CONTROL's object: a `string`, which the allow-list DOES admit. Several, under keys chosen
+    // to land in buckets of their own, so at least one bucket holds strings and no container page.
+    for index in 0..6 {
+        run(
+            &engine,
+            Command::StringSet {
+                key: format!("str-{index}"),
+                value: b"v".to_vec(),
+            },
+        );
+    }
+    // A release refuses a DIRTY bucket -- "at the shipped `eviction_dump_before_evict` false a
+    // freshly written bucket is dirty and every candidate is refused on `bucket_dirty`". The index
+    // is dumped, then the shard is put in the state a RELOAD leaves it in, which is the state the
+    // actuator is shipped to act on: `load_index_inner` clears the per-bucket and per-page dirty
+    // flags on the stated ground that reloaded data is durable, hence clean, and then refreshes the
+    // runtime flags from the live (empty on load) `dirty_objects` set.
+    engine.flush_shard_index(1);
+    let _ = engine.dump_index_catalog(1);
+
+    let (released_count, kind_refusals, set_blocks_still_indexed, set_bucket_released) = {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1 is loaded");
+        shard.dirty_objects.clear();
+        for bucket in shard.bucket_index.bucket_map.values_mut() {
+            bucket.set_dirty(false);
+            for block in bucket.block_index.blocks_mut_unaccounted() {
+                block.dirty = false;
+            }
+        }
+        crate::engine::storage_bucket_internals::refresh_bucket_runtime_flags(shard);
+        // The bucket the set's pages are filed in, before anything is released.
+        let (start, end) = shard.routing_range();
+        let set_bucket = crate::engine::block_routing_bucket("released", start, end);
+        let candidates: Vec<u32> = shard.bucket_index.bucket_map.keys().copied().collect();
+        assert!(
+            !candidates.is_empty(),
+            "no bucket to release, so this fixture wrote nothing into the index"
+        );
+        let outcome =
+            crate::engine::storage_bucket_internals::release_bucket_blocks(shard, &candidates);
+        let set_blocks: usize = shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .flat_map(|bucket| bucket.block_index.values())
+            .filter(|block| !block.deleted && block.model_id.as_str() == "set")
+            .count();
+        (
+            outcome.released_buckets.len(),
+            outcome.refusals.block_kind_not_addressable,
+            set_blocks,
+            shard.bucket_index.released_buckets.contains(&set_bucket),
+        )
+    };
+
+    println!(
+        "\n=== releasing every bucket, with a set among them ===\n  released \
+         {released_count} bucket(s); {kind_refusals} refused on BlockKindNotAddressable\n  the \
+         set's own bucket released: {set_bucket_released}; set pages still in `bucket_map`: \
+         {set_blocks_still_indexed}"
+    );
+
+    // THE CONTROL. A fixture in which nothing can be released would satisfy the finding below
+    // trivially.
+    assert!(
+        released_count >= 1,
+        "the release actuator released {released_count} bucket(s), so NOTHING in this fixture can \
+         be released and the refusal below says nothing about the set"
+    );
+    // THE FINDING: the set's bucket is refused, by KIND, and its pages stay in the index.
+    assert!(
+        kind_refusals >= 1,
+        "no bucket was refused on `BlockKindNotAddressable`, so the set's bucket was not held back \
+         by its kind"
+    );
+    assert!(
+        !set_bucket_released,
+        "the bucket holding the set's pages was RELEASED. `released_model_kind_is_addressable` has \
+         admitted a container kind, so a container page can now sit in a released bucket -- and the \
+         live-page set the merge filters against must come from \
+         `collect_bucket_index_live_block_entries`, which supplements released pages back in, and \
+         never from `bucket_index.bucket_map`, which does not"
+    );
+    assert_eq!(
+        4, set_blocks_still_indexed,
+        "the index holds {set_blocks_still_indexed} live set page(s), not the 4 written, so the \
+         release took some after all"
+    );
+
+    // Now the reconcile, on a shard whose page index is deliberately missing the released pages.
+    {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1 is loaded");
+        crate::engine::storage_bucket_internals::reconcile_secondary_views_from_bucket_index(
+            &engine.block_store,
+            shard,
+            None,
+        );
+    }
+
+    let survived = resident_members(&engine, "released");
+    println!(
+        "  resident map holds {} of the {} member(s) written",
+        survived.len(),
+        members.len()
+    );
+    for member in &members {
+        assert!(
+            survived.contains(member),
+            "a member in a RELEASED bucket was dropped by the merge. The live-page set is being \
+             built from `bucket_index.bucket_map`, which omits a released bucket's pages by design; \
+             it must come from `collect_bucket_index_live_block_entries`, which supplements them \
+             back in from the model maps"
+        );
+    }
+    assert_eq!(
+        members.len(),
+        survived.len(),
+        "the resident map holds {} member(s) against the {} written",
+        survived.len(),
+        members.len()
+    );
+}
+
+/// THE BRANCH THAT USED TO SKIP THE MERGE ENTIRELY, WHICH IS THE ONE A SCAN WOULD HAVE FALLEN
+/// THROUGH.
+///
+/// The three merges were gated on `saw_sets` / `saw_zsets` / `saw_lists`. Each is set at the TOP of
+/// its arm, BEFORE the component decode -- which is what distinguishes them from `saw_hashes`, moved
+/// INSIDE its match by #2016 for a reason that applies to an arm with no durable map behind it. So
+/// `saw_sets == false` never meant "no set entry decoded"; it meant the settled page index held NO
+/// SET PAGE AT ALL, and skipping the merge there left the deserialized persisted map standing WHOLE.
+///
+/// A store whose every set page was removed after its last base-index write therefore reloaded with
+/// a full resident map and an empty page index -- the over-complete state again, reached by the one
+/// route the merge never saw, and the one a listing served from `shard.sets` would have fallen
+/// straight through. The merges are unconditional now and the filter answers this arm too.
+///
+/// BOTH ARMS DRIVEN, and they differ by a COUNT rather than by which arm ran: the subject removes
+/// every set page (no set entry survives, the old skip branch), the control leaves one alive (the
+/// old merge branch).
+///
+/// # THE POPULATION IS NOW THE SERVED ONE, AND THE ARMS NO LONGER AGREE
+///
+/// The comparison used to be against members decoded out of the index entry's component. The entry
+/// stopped naming its element, so that population is gone -- it reads 0 on BOTH arms now, which is
+/// why the control's `assert_eq!(1, in_index)` fired. It is re-attributed to the serving path.
+///
+/// AND THE TWO ARMS COME APART, WHICH IS THE FINDING RATHER THAN A FIXTURE DETAIL. The SUBJECT arm
+/// still proves what this test was opened for: with no set page surviving, the merge runs and the
+/// map does NOT stand whole -- map 0 and served 0, where a skip leaves 3. The CONTROL arm now
+/// DIVERGES, at map 3 against a served 1, because `fill_absent_elements` tests whether a page is
+/// live at the persisted element's ADDRESS and one index entry a page keeps that page alive through
+/// the removal of its element. The #2017 fix's premise was one page per element; the collapse
+/// removed it. `set_listing_block_reads` carries the same finding from the other side.
+///
+/// So the unconditional merge is asserted where it bites -- on the arm that used to skip -- and the
+/// control's divergence is asserted as a divergence, rather than an equality being re-goldened into
+/// one that cannot hold.
+///
+/// rust-internal: calls the engine's own reconcile directly, then the command surface
+#[test]
+fn the_merge_runs_even_when_no_set_block_survived() {
+    for (label, keep_one_member) in [("no set page decoded", false), ("one set page alive", true)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on(&engine);
+
+        // A hash keeps the bucket index non-empty whichever arm runs, so the reconcile's own
+        // `bucket_map.is_empty()` early return is never what decides this.
+        run(
+            &engine,
+            Command::HashSet {
+                key: "anchor".to_string(),
+                field: "f".to_string(),
+                value: b"v".to_vec(),
+            },
+        );
+        let members: Vec<Vec<u8>> = (0..3)
+            .map(|index| format!("member-{index}").into_bytes())
+            .collect();
+        for member in &members {
+            run(
+                &engine,
+                Command::SetAdd {
+                    key: "s".to_string(),
+                    member: member.clone(),
+                },
+            );
+        }
+        let persisted = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard 1 is loaded");
+            shard.sets.get("s").expect("set key").clone()
+        };
+        let removed_count = if keep_one_member { 2 } else { 3 };
+        for member in members.iter().take(removed_count) {
+            run(
+                &engine,
+                Command::SetRemove {
+                    key: "s".to_string(),
+                    member: member.clone(),
+                },
+            );
+        }
+
+        // THE LOCK IS SCOPED so the serving path can be asked once the reconcile has run.
+        let in_map = {
+            let mut shards = engine.shards.write().expect("engine lock poisoned");
+            let shard = shards.get_mut(&1).expect("shard 1 is loaded");
+            shard.sets.insert_elements_for_test("s", persisted);
+            assert!(
+                !shard.bucket_index.bucket_map.is_empty(),
+                "{label}: the bucket index is empty, so the reconcile returns before any arm and \
+                 this says nothing about `saw_sets`"
+            );
+
+            crate::engine::storage_bucket_internals::reconcile_secondary_views_from_bucket_index(
+                &engine.block_store,
+                shard,
+                None,
+            );
+
+            shard.sets.get("s").map_or(0, |members| members.len())
+        };
+
+        let served = served_members(&engine, "s").len();
+        println!(
+            "\n=== {label} ===\n  resident map {in_map} member(s), served {served} member(s), \
+             over-reported by {}",
+            in_map.saturating_sub(served)
+        );
+
+        // THE SERVED POPULATION IS THE DENOMINATOR, and it is what each arm was built to produce.
+        let expected_served = 3 - removed_count;
+        assert_eq!(
+            expected_served, served,
+            "{label}: the store serves {served} member(s), not the {expected_served} this arm \
+             leaves alive, so the arm is not the one it means to drive"
+        );
+
+        if keep_one_member {
+            // THE CONTROL ARM. One set page survives, so this is the branch that always merged --
+            // and it is the branch where the address-liveness test now keeps the removed elements.
+            assert_eq!(
+                3, in_map,
+                "{label}: the resident map holds {in_map} member(s), not the 3 the stale snapshot \
+                 put back. `fill_absent_elements` keeps a persisted element whose ADDRESS still \
+                 names a live page, and one entry a page means a page outlives the removal of one \
+                 of its elements -- so the merge restores all three. If this reads 1 the merge has \
+                 been taught to ask about the ELEMENT and the finding below should be turned over"
+            );
+            assert!(
+                in_map > served,
+                "{label}: the resident map holds {in_map} against a served {served}, so the \
+                 divergence #2017 measured is gone and the refusal to serve listings from \
+                 `shard.sets` needs re-deriving rather than re-asserting"
+            );
+        } else {
+            // THE SUBJECT ARM. No set page survives -- the branch that used to skip the merge, and
+            // the one this test exists for. A skip leaves the deserialized map standing WHOLE at 3.
+            assert_eq!(
+                0, in_map,
+                "{label}: the resident map holds {in_map} member(s) with NO set page surviving. \
+                 The merge is unconditional so that this is 0; a skip here leaves the deserialized \
+                 persisted map standing whole at 3, which is the over-complete state by the one \
+                 route the merge never used to see"
+            );
+            assert_eq!(
+                in_map, served,
+                "{label}: the resident map holds {in_map} against a served {served}. With no page \
+                 left at any persisted address the filter refuses every element, so these must \
+                 agree at 0"
+            );
+        }
+    }
+}
