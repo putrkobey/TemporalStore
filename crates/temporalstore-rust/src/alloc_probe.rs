@@ -354,3 +354,717 @@ fn charge_class_alloc(size: usize) {
 fn charge_class_free(size: usize) {
     let _ = CURRENT_CLASS.try_with(|cell| {
         let slot = cell.get() as usize;
+        if slot < CLASS_COUNT {
+            CLASS_SLOTS[slot].frees.fetch_add(1, Ordering::Relaxed);
+            CLASS_SLOTS[slot]
+                .free_bytes
+                .fetch_add(size as u64, Ordering::Relaxed);
+        }
+    });
+}
+
+/// Run `work` with everything it allocates charged to `class`.
+///
+/// The only way to attribute an allocation, and it is called INSIDE the primitive that owns the
+/// sink. Nesting is allowed and the innermost scope wins, which is what lets the carried-page copy
+/// be told apart from the slab append it happens inside. Entering the same class twice, nested, is
+/// idempotent.
+///
+/// WITHOUT `alloc-probe` THIS IS `work()` AND NOTHING ELSE -- no atomic, no thread-local, no
+/// branch, the closure inlined through. The scopes therefore sit in production code at no cost to
+/// a production build, which is the only reason it is acceptable to put them there at all.
+#[inline]
+pub fn in_class<T>(class: AllocClass, work: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "alloc-probe")]
+    {
+        let _scope = ClassScope::enter(class);
+        work()
+    }
+    #[cfg(not(feature = "alloc-probe"))]
+    {
+        let _ = class;
+        work()
+    }
+}
+
+#[cfg(feature = "alloc-probe")]
+struct ClassScope {
+    previous: u8,
+}
+
+#[cfg(feature = "alloc-probe")]
+impl ClassScope {
+    fn enter(class: AllocClass) -> Self {
+        let previous = CURRENT_CLASS
+            .try_with(|cell| cell.replace(class.slot() as u8))
+            .unwrap_or(UNCLASSIFIED);
+        ClassScope { previous }
+    }
+}
+
+#[cfg(feature = "alloc-probe")]
+impl Drop for ClassScope {
+    /// Restored on unwind as well as on return. A panic inside a scoped primitive that left the
+    /// class set would charge the whole rest of that thread's life to it.
+    fn drop(&mut self) {
+        let _ = CURRENT_CLASS.try_with(|cell| cell.set(self.previous));
+    }
+}
+
+/// One class's share of what a span allocated.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClassCounts {
+    pub allocs: u64,
+    pub alloc_bytes: u64,
+    pub frees: u64,
+    pub free_bytes: u64,
+}
+
+impl ClassCounts {
+    /// Allocations made inside this class and not given back inside it.
+    ///
+    /// READ THIS CAREFULLY. A free is charged to the class in scope WHEN THE FREE HAPPENS, which
+    /// is not necessarily the class that allocated the block: the allocator sees a pointer and a
+    /// layout, not a history. Inside a narrow synchronous primitive almost everything freed was
+    /// allocated there too, so this separates a class that CHURNS memory from one that KEEPS it --
+    /// but a block allocated in one class and released in another is charged to the releasing one,
+    /// and no assertion in this crate is built on this number alone.
+    pub fn outstanding(&self) -> i64 {
+        self.allocs as i64 - self.frees as i64
+    }
+
+    fn since(&self, earlier: &ClassCounts) -> ClassCounts {
+        ClassCounts {
+            allocs: self.allocs.saturating_sub(earlier.allocs),
+            alloc_bytes: self.alloc_bytes.saturating_sub(earlier.alloc_bytes),
+            frees: self.frees.saturating_sub(earlier.frees),
+            free_bytes: self.free_bytes.saturating_sub(earlier.free_bytes),
+        }
+    }
+
+    fn plus(&self, other: &ClassCounts) -> ClassCounts {
+        ClassCounts {
+            allocs: self.allocs + other.allocs,
+            alloc_bytes: self.alloc_bytes + other.alloc_bytes,
+            frees: self.frees + other.frees,
+            free_bytes: self.free_bytes + other.free_bytes,
+        }
+    }
+}
+
+/// Every class's counters as of one moment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClassLedger {
+    rows: [ClassCounts; CLASS_COUNT],
+}
+
+impl ClassLedger {
+    pub fn row(&self, class: AllocClass) -> ClassCounts {
+        self.rows[class.slot()]
+    }
+
+    /// The rows added up.
+    ///
+    /// NOT the total for an operation, and never to be used as one: see `ClassifiedCounts`, whose
+    /// residual is the difference between this and a counter the rows do not feed.
+    pub fn summed(&self) -> ClassCounts {
+        self.rows
+            .iter()
+            .fold(ClassCounts::default(), |acc, row| acc.plus(row))
+    }
+
+    /// Two spans' rows added together.
+    ///
+    /// So a harness can open a span per batch and build the next batch BETWEEN spans: a probe that
+    /// assembles its fixture inside the measured window charges the store for it.
+    pub fn plus(&self, other: &ClassLedger) -> ClassLedger {
+        let mut rows = [ClassCounts::default(); CLASS_COUNT];
+        for slot in 0..CLASS_COUNT {
+            rows[slot] = self.rows[slot].plus(&other.rows[slot]);
+        }
+        ClassLedger { rows }
+    }
+
+    fn since(&self, earlier: &ClassLedger) -> ClassLedger {
+        let mut rows = [ClassCounts::default(); CLASS_COUNT];
+        for slot in 0..CLASS_COUNT {
+            rows[slot] = self.rows[slot].since(&earlier.rows[slot]);
+        }
+        ClassLedger { rows }
+    }
+
+    /// `class=allocs/bytes` pairs, biggest first, for a one-line report.
+    pub fn report_line(&self) -> String {
+        let mut rows: Vec<(AllocClass, ClassCounts)> = AllocClass::ALL
+            .iter()
+            .map(|class| (*class, self.row(*class)))
+            .collect();
+        rows.sort_by(|left, right| right.1.alloc_bytes.cmp(&left.1.alloc_bytes));
+        rows.iter()
+            .map(|(class, counts)| {
+                format!("{}={}/{}", class.label(), counts.allocs, counts.alloc_bytes)
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+/// Every class's counters right now, or `None` when the counting allocator is not installed.
+///
+/// The `Option` is the whole point. Without `alloc-probe` every row reads zero, and a zero row is
+/// indistinguishable from a class that was counted and cost nothing -- which is how an
+/// uninstrumented build masquerades as a clean measurement. Handling the `None` is not optional at
+/// the call site, because the type will not let it be.
+///
+/// There is deliberately no metrics emitter over this. A production build does not install the
+/// counting allocator, so a periodic reap would publish nine rows of zeros on every scrape -- the
+/// exact failure this `Option` exists to prevent, wearing a gauge.
+pub fn classified_now() -> Option<ClassLedger> {
+    #[cfg(feature = "alloc-probe")]
+    {
+        let mut rows = [ClassCounts::default(); CLASS_COUNT];
+        for slot in 0..CLASS_COUNT {
+            rows[slot] = ClassCounts {
+                allocs: CLASS_SLOTS[slot].allocs.load(Ordering::Relaxed),
+                alloc_bytes: CLASS_SLOTS[slot].alloc_bytes.load(Ordering::Relaxed),
+                frees: CLASS_SLOTS[slot].frees.load(Ordering::Relaxed),
+                free_bytes: CLASS_SLOTS[slot].free_bytes.load(Ordering::Relaxed),
+            };
+        }
+        Some(ClassLedger { rows })
+    }
+    #[cfg(not(feature = "alloc-probe"))]
+    {
+        None
+    }
+}
+
+/// A span measured BOTH ways at once: the whole-span counter, and the per-class ledger inside it.
+///
+/// THE RESIDUAL IS A MEASUREMENT, NOT AN IDENTITY. The span total comes from `Probe`, which the
+/// class rows do not feed, so the residual can be wrong and can be seen to be wrong. This crate
+/// shipped a residual computed from the rows it audited -- in `restore_scale`, where it read zero
+/// "by construction" -- and had to correct it. A residual that cannot fail is not a check.
+pub struct ClassSpan {
+    probe: Probe,
+    opened: ClassLedger,
+}
+
+impl ClassSpan {
+    pub fn open() -> Self {
+        ClassSpan {
+            probe: Probe::start(),
+            opened: classified_now().unwrap_or_default(),
+        }
+    }
+
+    /// What the span cost, split by class, or `None` when nothing was counting.
+    pub fn close(self) -> Option<ClassifiedCounts> {
+        let closed = classified_now()?;
+        Some(ClassifiedCounts {
+            total: self.probe.stop(),
+            classes: closed.since(&self.opened),
+        })
+    }
+}
+
+/// What a span cost, with the classes and the independent total side by side.
+#[derive(Debug, Clone, Copy)]
+pub struct ClassifiedCounts {
+    /// The whole span, from the process-wide counter. Nothing below feeds this.
+    pub total: AllocCounts,
+    /// The same span, split by what the allocations were spent on.
+    pub classes: ClassLedger,
+}
+
+impl ClassifiedCounts {
+    /// Allocations the span made that no class claimed.
+    ///
+    /// Signed: a negative residual means the rows claim more than the span made, which is what
+    /// double counting looks like and is worth failing on rather than clamping away.
+    pub fn residual_allocs(&self) -> i64 {
+        self.total.allocs as i64 - self.classes.summed().allocs as i64
+    }
+
+    pub fn residual_bytes(&self) -> i64 {
+        self.total.alloc_bytes as i64 - self.classes.summed().alloc_bytes as i64
+    }
+
+    /// The share of the span's allocated bytes that landed in a named class.
+    pub fn classified_byte_share(&self) -> f64 {
+        if self.total.alloc_bytes == 0 {
+            return 0.0;
+        }
+        self.classes.summed().alloc_bytes as f64 / self.total.alloc_bytes as f64
+    }
+
+    /// The share of the span's allocation CALLS that landed in a named class.
+    pub fn classified_call_share(&self) -> f64 {
+        if self.total.allocs == 0 {
+            return 0.0;
+        }
+        self.classes.summed().allocs as f64 / self.total.allocs as f64
+    }
+
+    /// Two spans added together, rows and independent total alike.
+    ///
+    /// The total is summed from the same `Probe` readings it always was, so a sum of spans keeps
+    /// the property the residual depends on: the total still does not come from the rows.
+    pub fn plus(&self, other: &ClassifiedCounts) -> ClassifiedCounts {
+        ClassifiedCounts {
+            total: AllocCounts {
+                allocs: self.total.allocs + other.total.allocs,
+                alloc_bytes: self.total.alloc_bytes + other.total.alloc_bytes,
+                chunk_bytes: self.total.chunk_bytes + other.total.chunk_bytes,
+                frees: self.total.frees + other.total.frees,
+                free_bytes: self.total.free_bytes + other.total.free_bytes,
+            },
+            classes: self.classes.plus(&other.classes),
+        }
+    }
+}
+
+
+/// What happened between `Probe::start()` and `Probe::stop()`.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AllocCounts {
+    pub allocs: u64,
+    pub alloc_bytes: u64,
+    /// What the allocator set aside for `alloc_bytes` of request. Never smaller, and the
+    /// difference is what an out-of-line shape pays that an inline one does not.
+    pub chunk_bytes: u64,
+    pub frees: u64,
+    pub free_bytes: u64,
+}
+
+impl AllocCounts {
+    /// Allocations that were still outstanding when the probe stopped.
+    ///
+    /// This is a difference of counts, not a live-heap measurement: a path that frees everything it
+    /// takes reports zero here while still having done the work, which is why `allocs` is reported
+    /// alongside and is usually the number that matters for latency.
+    pub fn outstanding(&self) -> i64 {
+        self.allocs as i64 - self.frees as i64
+    }
+
+    pub fn per(&self, n: usize) -> f64 {
+        if n == 0 {
+            0.0
+        } else {
+            self.allocs as f64 / n as f64
+        }
+    }
+}
+
+/// The allocation counters, or `None` when the counting allocator is not installed.
+///
+/// `Probe` and the statics behind it are for a `#[test]` that is itself gated on `alloc-probe`,
+/// and `every_counting_allocator_probe_is_gated_on_the_feature_that_installs_it` enforces exactly
+/// that -- because a test reading them without the feature measures a process where they never
+/// move and reports a table of zeros.
+///
+/// A probe that lives at a PRODUCTION call site and is read by tests on both sides of the feature
+/// cannot take that shape: it has no enclosing `#[test]` to gate. What it needs instead is to be
+/// able to tell "this span allocated nothing" from "nothing was counting", and reading the
+/// statics directly cannot -- both answer zero. This says which, so the caller can record it
+/// alongside its numbers and a reader is never shown a zero that means the opposite.
+///
+/// `restore_phase_probe` in `engine/engine_lifecycle.rs` is the caller this exists for.
+pub fn counted_now() -> Option<(u64, u64)> {
+    #[cfg(feature = "alloc-probe")]
+    {
+        Some((
+            ALLOC_CALLS.load(Ordering::Relaxed),
+            ALLOC_BYTES.load(Ordering::Relaxed),
+        ))
+    }
+    #[cfg(not(feature = "alloc-probe"))]
+    {
+        None
+    }
+}
+
+/// Span counter. Single-threaded use only: the counters are process-global, so a probe running
+/// while another thread allocates attributes that thread's work to this span.
+pub struct Probe {
+    allocs: u64,
+    alloc_bytes: u64,
+    chunk_bytes: u64,
+    frees: u64,
+    free_bytes: u64,
+}
+
+impl Probe {
+    pub fn start() -> Self {
+        Probe {
+            allocs: ALLOC_CALLS.load(Ordering::Relaxed),
+            alloc_bytes: ALLOC_BYTES.load(Ordering::Relaxed),
+            chunk_bytes: ALLOC_CHUNK_BYTES.load(Ordering::Relaxed),
+            frees: FREE_CALLS.load(Ordering::Relaxed),
+            free_bytes: FREE_BYTES.load(Ordering::Relaxed),
+        }
+    }
+
+    pub fn stop(&self) -> AllocCounts {
+        AllocCounts {
+            allocs: ALLOC_CALLS.load(Ordering::Relaxed).saturating_sub(self.allocs),
+            alloc_bytes: ALLOC_BYTES
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.alloc_bytes),
+            chunk_bytes: ALLOC_CHUNK_BYTES
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.chunk_bytes),
+            frees: FREE_CALLS.load(Ordering::Relaxed).saturating_sub(self.frees),
+            free_bytes: FREE_BYTES
+                .load(Ordering::Relaxed)
+                .saturating_sub(self.free_bytes),
+        }
+    }
+}
+
+// These assert the counters MOVE, which they only do when this module is actually installed as the
+// global allocator -- and it is installed only under the `alloc-probe` feature. Without that gate
+// they fail in every ordinary `cargo test`, asserting a property the build deliberately does not
+// have.
+#[cfg(all(test, feature = "alloc-probe"))]
+mod tests {
+    use super::*;
+
+    /// THE CHUNK COUNTER READS MORE THAN THE REQUEST COUNTER, BY THE AMOUNT THE ALLOCATOR ROUNDS.
+    ///
+    /// A counter that reported the request back would be indistinguishable from `ALLOC_BYTES` and
+    /// would silently flatter every out-of-line shape it was ever pointed at. So a size is planted
+    /// whose chunk is KNOWN and different from its request -- 100 bytes, which glibc serves from a
+    /// 112-byte chunk -- and the difference is recovered exactly.
+    ///
+    /// THIS IS ALSO THE NEGATIVE CONTROL ON THE PLATFORM FALLBACK. Where `chunk_of` cannot ask the
+    /// allocator it charges the request unchanged, and this test FAILS in that case rather than
+    /// passing quietly with a chunk column that is a copy of the request column.
+    #[test]
+    fn the_chunk_counter_reads_more_than_the_request_counter_for_a_planted_odd_size() {
+        const REQUEST: usize = 100;
+        const PLANTED: usize = 64;
+        let expected_chunk = documented_glibc_chunk(REQUEST);
+        assert_ne!(
+            REQUEST, expected_chunk,
+            "the planted size must be one the allocator rounds, or this control cannot tell a \
+             chunk reading from a request reading"
+        );
+
+        let probe = Probe::start();
+        let mut held: Vec<Vec<u8>> = Vec::with_capacity(PLANTED);
+        for _ in 0..PLANTED {
+            held.push(vec![0xA5u8; REQUEST]);
+        }
+        let counts = probe.stop();
+        std::hint::black_box(&held);
+
+        // `Vec::with_capacity` above is itself one allocation inside the span, so the planted
+        // requests are recovered as a FLOOR and the DIFFERENCE is what is asserted exactly.
+        let over = counts.chunk_bytes as i64 - counts.alloc_bytes as i64;
+        println!(
+            "planted {PLANTED} x {REQUEST} B: request {} B, chunk {} B, over {over} B",
+            counts.alloc_bytes, counts.chunk_bytes
+        );
+        assert!(
+            counts.chunk_bytes > counts.alloc_bytes,
+            "the chunk counter read {} B against the request counter's {} B; on a platform where \
+             the chunk cannot be read back this column degrades to the request column, and a \
+             comparison of an inline shape against an out-of-line one would then under-charge the \
+             out-of-line side by exactly the rounding this test exists to see",
+            counts.chunk_bytes,
+            counts.alloc_bytes
+        );
+        assert!(
+            over >= (PLANTED * (expected_chunk - REQUEST)) as i64,
+            "{PLANTED} planted {REQUEST}-byte requests are rounded to {expected_chunk} bytes each, \
+             so the chunk column owes at least {} B more than the request column and reported \
+             {over} B",
+            PLANTED * (expected_chunk - REQUEST)
+        );
+    }
+
+    /// A GROWING VECTOR IS CHARGED WHAT ITS REGROWS ACTUALLY SET ASIDE.
+    ///
+    /// `realloc` is the arm of this counter that is easiest to leave uncharged and hardest to
+    /// notice: a path that grows one buffer repeatedly takes almost no `alloc` calls, so a chunk
+    /// column that only charged `alloc` would look right on every test that does not push in a
+    /// loop. Dropping the realloc charge was planted as a mutant and SURVIVED, which is why this
+    /// exists.
+    ///
+    /// THE SPAN IS DELIBERATELY LARGE. These counters are process-global, so a parallel run's
+    /// other tests land in the reading; growing to roughly a megabyte means an uncharged realloc
+    /// arm cannot be masked without tens of thousands of foreign allocations inside the same
+    /// span, which no test in this binary does.
+    #[test]
+    fn the_chunk_counter_charges_a_growing_vector_and_not_only_its_first_allocation() {
+        const PUSHES: u64 = 1 << 17; // ~1 MiB of u64
+
+        let probe = Probe::start();
+        let mut growing: Vec<u64> = Vec::new();
+        for i in 0..PUSHES {
+            growing.push(i);
+        }
+        let counts = probe.stop();
+        std::hint::black_box(&growing);
+
+        println!(
+            "grew a vector to {} B: request {} B, chunk {} B over {} alloc call(s)",
+            PUSHES * 8,
+            counts.alloc_bytes,
+            counts.chunk_bytes,
+            counts.allocs
+        );
+        assert!(
+            counts.alloc_bytes >= PUSHES * 8,
+            "the request column charged {} B for {} B of pushes; the span did not capture the \
+             growth at all",
+            counts.alloc_bytes,
+            PUSHES * 8
+        );
+        assert!(
+            counts.chunk_bytes >= counts.alloc_bytes,
+            "the chunk column charged {} B against the request column's {} B. A chunk is never \
+             smaller than its request, so a chunk column that falls BEHIND the request column has \
+             an arm it is not charging -- and `realloc` is the arm a push storm goes through",
+            counts.chunk_bytes,
+            counts.alloc_bytes
+        );
+    }
+
+    /// THE READING AGREES WITH THE DOCUMENTED RULE AS A FLOOR, NOT AS AN EQUALITY.
+    ///
+    /// `chunk_of` asks the allocator and `documented_glibc_chunk` states the rule. Neither is
+    /// evidence for the other on its own, so they are compared here over sizes that land either
+    /// side of the floor and either side of a rounding step. A target whose allocator sizes
+    /// differently fails this rather than quietly reporting numbers from a different rule.
+    ///
+    /// THIS USED TO ASSERT EQUALITY, AND EQUALITY IS NOT A PROPERTY OF THE ALLOCATOR. glibc serves
+    /// a request from a free chunk that is BIG ENOUGH, not from one that is exactly the rule's
+    /// size: when a larger chunk is on the relevant bin it is handed over whole, and
+    /// `malloc_usable_size` then reports that larger chunk. So the reading for one request size
+    /// depends on the allocation history of the whole process, and the equality held here only
+    /// because of what this binary happened to have allocated first. It stopped holding when an
+    /// unrelated change shifted that history: a 104-byte request read back 128 where the rule says
+    /// 112, deterministically, in a run of this module alone -- and the same size read 112 when the
+    /// test ran by itself.
+    ///
+    /// SO WHAT IS ASSERTED IS WHAT IS INVARIANT. The rule is a FLOOR (a chunk is never smaller
+    /// than header-plus-rounding), the reading is a multiple of sixteen, and -- the discriminating
+    /// property, and the one the equality was really standing in for -- a request above the floor
+    /// reads back STRICTLY MORE than it asked for. That last one is what fails on a target where
+    /// `chunk_of` degrades to handing the request straight back, which is the case this test
+    /// exists to catch; an equality against a formula caught it only by accident.
+    #[test]
+    fn the_chunk_counter_agrees_with_the_documented_glibc_chunk_rule() {
+        // 1 and 24 are under the 32-byte floor; 25 is the first size above it; 104/112 straddle a
+        // rounding step; 112 is the width the tagged bucket payload would ask for.
+        // READ FROM THE POINTER, NOT FROM THE SPAN. The span counters are process-global, so a
+        // test asserting an exact figure over them fails whenever any other test in the binary
+        // allocates at the same moment -- a flake that says nothing about the property. The rule
+        // check does not need a span: it needs one pointer and the chunk behind it, which is
+        // exactly what `chunk_of` reads.
+        for request in [1usize, 24, 25, 40, 104, 112, 120, 1000] {
+            let held = vec![0u8; request];
+            let read = chunk_of(held.as_ptr() as *mut u8, request);
+            let rule = documented_glibc_chunk(request);
+            println!("  request {request:>5} B  ->  read {read:>5} B chunk, rule says {rule:>5} B");
+            assert!(
+                read >= rule,
+                "a {request}-byte request read back a {read} B chunk, BELOW the documented rule's \
+                 {rule} B. A chunk owes its request a header word and a rounding, so a reading \
+                 under the rule is not a chunk reading at all"
+            );
+            assert_eq!(
+                read % 16,
+                0,
+                "a {request}-byte request read back a {read} B chunk, which is not a multiple of \
+                 sixteen; glibc sizes every chunk in sixteens"
+            );
+            assert!(
+                read > request,
+                "a {request}-byte request read back a chunk of exactly {read} B. A chunk is \
+                 strictly wider than its request -- it carries a header word -- so this is the \
+                 degraded path handing the request straight back, and every chunk figure this \
+                 module reports would be a request figure wearing its name"
+            );
+            std::hint::black_box(&held);
+        }
+    }
+
+    #[test]
+    fn the_probe_counts_an_allocation_it_can_see() {
+        // A probe that reports zero for a known allocation is worse than no probe: it reads as
+        // "this path does not allocate". Prove it moves on something unmistakable before trusting
+        // it on something subtle.
+        let probe = Probe::start();
+        let v: Vec<u8> = Vec::with_capacity(4096);
+        let counts = probe.stop();
+        assert!(
+            counts.allocs >= 1,
+            "a 4 KB Vec must register at least one allocation, saw {}",
+            counts.allocs
+        );
+        assert!(
+            counts.alloc_bytes >= 4096,
+            "expected at least the 4096 bytes asked for, saw {}",
+            counts.alloc_bytes
+        );
+        drop(v);
+    }
+
+    #[test]
+    fn a_span_that_frees_what_it_takes_still_reports_the_work() {
+        let probe = Probe::start();
+        for _ in 0..64 {
+            let v: Vec<u8> = Vec::with_capacity(1024);
+            drop(v);
+        }
+        let counts = probe.stop();
+        assert!(
+            counts.allocs >= 64,
+            "64 allocate/free pairs must count as 64 allocations, saw {}",
+            counts.allocs
+        );
+        // Outstanding nets out; the work does not. This is the distinction the whole probe exists
+        // for, so it is asserted rather than left as a comment.
+        assert!(
+            counts.outstanding().abs() <= 8,
+            "everything taken was given back, so outstanding should be near zero, saw {}",
+            counts.outstanding()
+        );
+    }
+}
+// The counting allocator is installed only under `alloc-probe`, so a test that reads these counters
+// without that feature measures a process where they never move. Twenty-eight such tests carried
+// `#[cfg(feature = "alloc-probe")]` and thirty-one did not: the thirty-one compiled into every
+// build, appeared in `--ignored --list`, and twenty-nine of them aborted on their first line with
+// "the counting allocator is not installed". The other two printed a table of zeros instead, which
+// is the same defect with the alarm taken out. Running the ignored set on a default build therefore
+// produced failures that meant nothing, which teaches everyone to discount that run.
+//
+// Same class of probe, so: same gate. This asserts it stays that way.
+#[cfg(test)]
+mod counting_allocator_gate {
+    use std::path::Path;
+
+    const GATE: &str = "#[cfg(feature = \"alloc-probe\")]";
+    const MARKERS: [&str; 7] = [
+        "alloc_probe::Probe::start",
+        "alloc_probe::ALLOC_CALLS",
+        "alloc_probe::ALLOC_BYTES",
+        "alloc_probe::ALLOC_CHUNK_BYTES",
+        "alloc_probe::FREE_CALLS",
+        "alloc_probe::FREE_BYTES",
+        "alloc_probe::AllocCounts",
+    ];
+
+    /// Every test that reads the counting allocator carries the feature gate that installs it.
+    #[test]
+    fn every_counting_allocator_probe_is_gated_on_the_feature_that_installs_it() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut pending = vec![root];
+        let mut files_read = 0_usize;
+        let mut excised = 0_usize;
+        let mut probe_tests = 0_usize;
+        let mut violations: Vec<String> = Vec::new();
+
+        while let Some(path) = pending.pop() {
+            let Ok(entries) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let entry_path = entry.path();
+                if entry_path.is_dir() {
+                    pending.push(entry_path);
+                    continue;
+                }
+                if entry_path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                // This file holds the marker strings themselves, so it is taken out of its own
+                // haystack -- and the removal is asserted below. If this module is ever moved,
+                // the scan reads its own literals, finds them under an ungated `#[test]`, and
+                // FAILS. A guard that stops excluding itself should get louder, not quieter.
+                if entry_path.file_name().and_then(|n| n.to_str()) == Some("alloc_probe.rs") {
+                    excised += 1;
+                    continue;
+                }
+                let Ok(text) = std::fs::read_to_string(&entry_path) else {
+                    continue;
+                };
+                files_read += 1;
+                let lines: Vec<&str> = text.lines().collect();
+                let mut anchors_seen: Vec<usize> = Vec::new();
+                for (index, line) in lines.iter().enumerate() {
+                    if !MARKERS.iter().any(|marker| line.contains(marker)) {
+                        continue;
+                    }
+                    // Walk BACK to the enclosing `#[test]`. Deliberately not brace counting: a
+                    // `{` inside a string literal drifts a depth counter, and this crate writes
+                    // plenty of them. A first pass at this guard did count braces, saw 23 of the
+                    // 82 probe tests, and named two functions that do not touch the probe at all.
+                    let mut anchor = index as isize;
+                    while anchor >= 0 && lines[anchor as usize].trim() != "#[test]" {
+                        anchor -= 1;
+                    }
+                    if anchor < 0 {
+                        violations.push(format!(
+                            "{}:{}: the counting allocator is read outside any test",
+                            entry_path.display(),
+                            index + 1
+                        ));
+                        continue;
+                    }
+                    let anchor = anchor as usize;
+                    if anchors_seen.contains(&anchor) {
+                        continue;
+                    }
+                    anchors_seen.push(anchor);
+                    probe_tests += 1;
+                    let mut top = anchor;
+                    while top > 0 && lines[top - 1].trim().starts_with("#[") {
+                        top -= 1;
+                    }
+                    let mut bottom = anchor;
+                    while bottom + 1 < lines.len() && lines[bottom + 1].trim().starts_with("#[") {
+                        bottom += 1;
+                    }
+                    if !lines[top..=bottom].iter().any(|line| line.trim() == GATE) {
+                        violations.push(format!(
+                            "{}:{}: reads the counting allocator and is not gated on \
+                             `alloc-probe`, so it compiles into every build and measures a \
+                             process where the counters never move",
+                            entry_path.display(),
+                            anchor + 1
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Denominators first. Every assertion below is about a set, and a set that came back empty
+        // satisfies all of them.
+        assert!(
+            files_read > 100,
+            "the source walk found {files_read} files; this guard would pass over nothing"
+        );
+        assert_eq!(
+            1, excised,
+            "expected to take exactly one file out of the scan (this one); took {excised}"
+        );
+        assert!(
+            probe_tests >= 60,
+            "found only {probe_tests} tests reading the counting allocator across {files_read} \
+             files; there were 82 when this was written, so the scan has broken rather than the \
+             tests having gone away"
+        );
+        assert!(
+            violations.is_empty(),
+            "{} of {probe_tests} counting-allocator tests are not gated on the feature that \
+             installs the allocator:\n{}",
+            violations.len(),
+            violations.join("\n")
+        );
+    }
+}
