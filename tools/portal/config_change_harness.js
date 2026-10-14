@@ -76,3 +76,81 @@ async function deliver(text) {
   const r = release;
   release = null;
   r({ done: false, value: Buffer.from(text, "utf8") });
+  await settle();
+  await settle();
+}
+
+const win = {
+  document: {
+    getElementById: (id) => el(id),
+    querySelector: () => makeEl(), querySelectorAll: () => [],
+    createElement: () => makeEl(), addEventListener() {}, body: makeEl(),
+    get hidden() { return hidden.value; }
+  },
+  addEventListener() {},
+  location: { origin: "http://localhost", href: "http://localhost", reload() {} },
+  sessionStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  localStorage: { getItem: () => "", setItem() {}, removeItem() {} },
+  navigator: {},
+  setTimeout: () => 0, setInterval: () => 0, clearInterval() {},
+  Number, JSON, String, Math, Date, Object, Array, Promise, RegExp, Error, isNaN,
+  encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
+  TextDecoder: function () { this.decode = (v) => Buffer.from(v || []).toString("utf8"); },
+  AbortController: function () { this.abort = () => {}; this.signal = {}; },
+  FileReader: function () {}, Blob: function () {},
+  URL: { createObjectURL: () => "", revokeObjectURL() {} },
+  fetch: (url) => {
+    const u = String(url);
+    seenFetches.push(u.slice(0, 40));
+    if (u.indexOf("/v1/admin/events") >= 0) { return streaming(); }
+    if (u.indexOf("/v1/admin/overview") >= 0) {
+      overviewReads.push(Date.now());
+      return json({ checks: [], counts: {} });
+    }
+    if (u.indexOf("/v1/metrics") >= 0) {
+      return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve("") });
+    }
+    return json({ settings: {} });
+  }
+};
+win.window = win;
+
+const names = Object.keys(win);
+const values = names.map((k) => win[k]);
+scripts.forEach((body, index) => {
+  try { new Function(...names, body)(...values); }
+  catch (e) { console.log("FAIL script " + index + " threw: " + e.message); failures += 1; }
+});
+
+(async function () {
+  await settle();
+  await settle();
+  ok("the page read its checklist on load", overviewReads.length >= 1,
+     "reads: " + overviewReads.length);
+  const afterLoad = overviewReads.length;
+
+  await deliver(frame(1000));          // first sighting: records, does not re-read
+  await deliver(frame(1000));          // same value again: still nothing to do
+  ok("an unchanged configuration does not cause a re-read",
+     overviewReads.length === afterLoad,
+     "re-read " + (overviewReads.length - afterLoad) + " time(s) with nothing changed");
+
+  await deliver(frame(2000));          // changed
+  ok("a changed configuration causes exactly one re-read",
+     overviewReads.length === afterLoad + 1,
+     "re-read " + (overviewReads.length - afterLoad) + " time(s) for one change");
+
+  await deliver(frame(2000));          // and does not keep re-reading afterwards
+  ok("it does not re-read again while the value stays put",
+     overviewReads.length === afterLoad + 1,
+     "re-read " + (overviewReads.length - afterLoad) + " time(s) in total");
+
+  await deliver(frame(undefined));     // a frame with no timestamp at all
+  ok("a frame without the field changes nothing",
+     overviewReads.length === afterLoad + 1,
+     "re-read " + (overviewReads.length - afterLoad) + " time(s) in total");
+
+  console.log("     fetches: " + JSON.stringify(seenFetches));
+  console.log(failures === 0 ? "PASS" : "FAILED " + failures);
+  process.exit(failures === 0 ? 0 : 1);
+}());
