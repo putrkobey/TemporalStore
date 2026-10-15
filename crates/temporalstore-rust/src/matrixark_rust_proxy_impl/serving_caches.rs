@@ -253,3 +253,259 @@ impl SnapshotCache {
     ///
     /// The write side keeps snapshots current rather than dropping them, so this is how a
     /// patched snapshot stays accounted for; a patch that grew a shard and did not re-weigh it
+    /// would let the budget drift upward silently, which is the bug this whole type exists to
+    /// prevent. `patch` returns false to say the snapshot should be dropped instead.
+    fn patch<F>(&mut self, key: &str, patch: F)
+    where
+        F: FnOnce(&mut BTreeMap<String, String>) -> bool,
+    {
+        let Some(entry) = self.entries.get_mut(key) else {
+            return;
+        };
+        let keep = patch(Arc::make_mut(&mut entry.map));
+        if !keep || entry.map.is_empty() {
+            self.remove(key);
+            return;
+        }
+        // The payloads just changed, so anything parsed from them describes the shard as it WAS.
+        // Dropped here, in the same call that changed them, rather than invalidated from outside.
+        // The payloads just changed, so the candidates built from them describe the shard as it
+        // WAS, exactly as the parse does.
+        let dropped = entry.decoded_bytes;
+        entry.decoded = None;
+        entry.prepared.clear();
+        entry.counts = None;
+        entry.decoded_bytes = 0;
+        let was = entry.bytes;
+        let now = Self::weigh(&entry.map);
+        entry.bytes = now;
+        self.decoded_bytes = self.decoded_bytes.saturating_sub(dropped);
+        self.bytes = self.bytes.saturating_sub(was) + now;
+        self.evict_to_budget();
+    }
+
+    /// Drop the least recently used DECODES until they fit their budget, leaving the payloads.
+    fn evict_decoded_to_budget(&mut self) {
+        while self.decoded_bytes > self.decoded_budget {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .filter(|(_, entry)| entry.decoded.is_some() || !entry.prepared.is_empty())
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| key.clone())
+            else {
+                return;
+            };
+            let Some(entry) = self.entries.get_mut(&victim) else {
+                return;
+            };
+            self.decoded_bytes = self.decoded_bytes.saturating_sub(entry.decoded_bytes);
+            entry.decoded = None;
+            entry.prepared.clear();
+            // The counts are a handful of integers; they are dropped with the rest so an evicted
+            // shard has nothing derived left behind, not because they are large.
+            entry.counts = None;
+            entry.decoded_bytes = 0;
+        }
+    }
+
+    fn evict_to_budget(&mut self) {
+        while self.bytes > self.budget {
+            let Some(victim) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.used)
+                .map(|(key, _)| key.clone())
+            else {
+                return;
+            };
+            self.remove(&victim);
+        }
+    }
+}
+
+/// The snapshot budget: a sixteenth of RAM, held between 64 MiB and 512 MiB.
+///
+/// Same shape as the engine's own cache sizing, so a small box does not hand this cache a budget
+/// its RAM cannot back. `MATRIXARK_PROXY_SNAPSHOT_CACHE_BYTES` overrides it; a zero or unparsable
+/// value falls back to the derived default rather than disabling the cache, because a cache of
+/// size zero turns every sweep back into per-field reads.
+fn default_snapshot_cache_bytes() -> usize {
+    const FLOOR: usize = 64 * 1024 * 1024;
+    const CEILING: usize = 512 * 1024 * 1024;
+    if let Some(raw) = std::env::var("MATRIXARK_PROXY_SNAPSHOT_CACHE_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        if raw > 0 {
+            return raw;
+        }
+    }
+    let total = total_memory_bytes();
+    if total == 0 {
+        return FLOOR;
+    }
+    (total / 16).clamp(FLOOR, CEILING)
+}
+
+/// Total RAM in bytes, or 0 when it cannot be read.
+fn total_memory_bytes() -> usize {
+    let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") else {
+        return 0;
+    };
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("MemTotal:") {
+            if let Some(kb) = rest.split_whitespace().next() {
+                if let Ok(kb) = kb.parse::<usize>() {
+                    return kb * 1024;
+                }
+            }
+        }
+    }
+    0
+}
+
+
+/// What the serving caches are holding, for the process to report about itself.
+///
+/// The proxy's resident set has been optimised twice this week against readings that could not say
+/// which part of it was which: the payload cache, the derived cache, the candidate snapshots and
+/// the engine this process holds open are all in the same RSS, and only the last of them reported
+/// anything. Returned as a tuple rather than a struct because it has exactly one caller, the
+/// metrics render, and a struct here would be a type nothing else names.
+///
+/// `(entries, payload bytes, derived bytes, payload budget, derived budget)`.
+fn serving_cache_gauges() -> (usize, usize, usize, usize, usize) {
+    match hgetall_snapshot_cache().lock() {
+        Ok(cache) => (
+            cache.entries.len(),
+            cache.bytes,
+            cache.decoded_bytes,
+            cache.budget,
+            cache.decoded_budget,
+        ),
+        // A poisoned lock must not cost the rest of the response.
+        Err(_) => (0, 0, 0, 0, 0),
+    }
+}
+
+/// How many candidate snapshots are held, and how many scan results.
+///
+/// Both are cleared per store when it is written, so a number that keeps climbing here means
+/// writes are not reaching the invalidation, not that the cache is unbounded.
+fn serving_derived_cache_entries() -> (usize, usize) {
+    let candidates = retrieve_candidate_cache()
+        .lock()
+        .map(|cache| cache.len())
+        .unwrap_or(0);
+    let scans = matrixark_scan_cache()
+        .lock()
+        .map(|cache| cache.len())
+        .unwrap_or(0);
+    (candidates, scans)
+}
+
+fn hgetall_snapshot_cache() -> &'static Mutex<SnapshotCache> {
+    static HGETALL_SNAPSHOT_CACHE: OnceLock<Mutex<SnapshotCache>> = OnceLock::new();
+    HGETALL_SNAPSHOT_CACHE.get_or_init(|| Mutex::new(SnapshotCache::new()))
+}
+
+fn hgetall_snapshot_cache_has_entries() -> bool {
+    hgetall_snapshot_cache()
+        .lock()
+        .map(|cache| !cache.is_empty())
+        .unwrap_or(false)
+}
+
+fn record_count_cache() -> &'static Mutex<BTreeMap<String, String>> {
+    static RECORD_COUNT_CACHE: OnceLock<Mutex<BTreeMap<String, String>>> = OnceLock::new();
+    RECORD_COUNT_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn retrieve_candidate_cache() -> &'static Mutex<BTreeMap<String, Arc<RetrieveCandidateSnapshot>>> {
+    static RETRIEVE_CANDIDATE_CACHE: OnceLock<
+        Mutex<BTreeMap<String, Arc<RetrieveCandidateSnapshot>>>,
+    > = OnceLock::new();
+    RETRIEVE_CANDIDATE_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn matrixark_scan_cache() -> &'static Mutex<BTreeMap<String, Value>> {
+    static MATRIXARK_SCAN_CACHE: OnceLock<Mutex<BTreeMap<String, Value>>> = OnceLock::new();
+    MATRIXARK_SCAN_CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn clear_matrixark_scan_cache() {
+    if let Ok(mut cache) = matrixark_scan_cache().lock() {
+        cache.clear();
+    }
+}
+
+fn is_record_count_key(key: &str) -> bool {
+    key.ends_with(":record_count")
+}
+
+fn update_record_count_cache(key: &str, value: &[u8]) {
+    if !is_record_count_key(key) {
+        return;
+    }
+    if let Ok(text) = std::str::from_utf8(value) {
+        if let Ok(mut cache) = record_count_cache().lock() {
+            cache.insert(key.to_string(), text.to_string());
+        }
+    }
+}
+
+fn invalidate_record_count_cache(key: &str) {
+    if !is_record_count_key(key) {
+        return;
+    }
+    if let Ok(mut cache) = record_count_cache().lock() {
+        cache.remove(key);
+    }
+}
+
+// TemporalStore conformance with the native storage engine: the storage engine's
+// record/serving SEQUENCE is an engine-owned MONOTONIC log id, taken from the append
+// log's own iterator id and exposed read-only. It is advanced only by the append log /
+// commit and is never a client
+// read-modify-write of a stored count, so a stale read can never make it regress.
+//
+// The MatrixArk serving record-log counter (`{prefix}:record_count`) is instead computed
+// client-side (Python `_get_count()` + `_record_location(sequence)`), a read-modify-write.
+// Under SYNCHRONOUS commit a stale/low counter read makes a subsequent write REGRESS the
+// stored counter; that cascades (later turns read low, replay low sequences and OVERWRITE
+// earlier serving records -> fact records clobbered -> sync retrieval collapses to 0/14,
+// while async stays 14/14). Mirror the contract at the engine boundary: a record_count
+// write can only ADVANCE the stored counter, never lower it -> the client always reads a
+// correct high sequence -> placement never regresses. Gated (default on;
+// MATRIXARK_MONOTONIC_RECORD_COUNT=0 restores prior behavior). Inert for async, whose
+// counter already advances monotonically (the clamp only ever raises a low write).
+fn clamp_record_count_value(engine: &RecordStore, key: &str, value: Vec<u8>) -> Vec<u8> {
+    if !is_record_count_key(key) {
+        return value;
+    }
+    let Some(new_count) = std::str::from_utf8(&value)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+    else {
+        return value;
+    };
+    let existing = read_record_count(engine, key)
+        .ok()
+        .and_then(|text| text.trim().parse::<u64>().ok())
+        .unwrap_or(0);
+    if existing > new_count {
+        return existing.to_string().into_bytes();
+    }
+    value
+}
+
+fn clamp_record_count_command(engine: &RecordStore, command: Command) -> Command {
+    match command {
+        Command::StringSet { key, value } if is_record_count_key(&key) => {
+            let value = clamp_record_count_value(engine, &key, value);
+            Command::StringSet { key, value }
+        }
+        other => other,
+    }
+}
