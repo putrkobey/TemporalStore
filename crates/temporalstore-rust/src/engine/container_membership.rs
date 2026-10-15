@@ -134,3 +134,140 @@ pub(super) fn derive_membership<F>(
     kind: &str,
     blocks: impl IntoIterator<Item = ElementEntry>,
     mut read_block: F,
+) -> DerivedMembership
+where
+    F: FnMut(&ElementEntry) -> Option<Vec<u8>>,
+{
+    let mut derived = DerivedMembership::default();
+    if super::container_blocks::ElementKeySpelling::for_kind(kind).is_none() {
+        // Not a kind whose pages name elements, so there is no membership in them to derive. An
+        // empty answer that `is_complete` calls complete, because nothing failed -- the caller asked
+        // the wrong question and gets a truthful empty rather than a failure it would have to
+        // interpret.
+        return derived;
+    }
+
+    // ORDER FIRST, THEN READ. The sort is over addresses and costs nothing per page; doing it after
+    // reading would mean holding every page's bytes at once.
+    let mut ordered: Vec<ElementEntry> = blocks.into_iter().collect();
+    ordered.sort_by_key(append_position);
+    ordered.dedup_by_key(|address| append_position(address));
+
+    // What the most recent page to mention each component said about it. A tombstone and a value are
+    // the same kind of statement here -- the later one simply replaces the earlier -- which is why
+    // there is one map and not a set beside it.
+    let mut latest: BTreeMap<String, Option<Vec<u8>>> = BTreeMap::new();
+
+    for address in &ordered {
+        let Some(bytes) = read_block(address) else {
+            // COUNTED, NOT SKIPPED. #2028's fix to `insert_timestamped_secondary_view` is the
+            // recorded reason: a read failure that produces no entry and no count is a derived view
+            // that is silently short, and the derived view is the only copy.
+            derived.read_failures += 1;
+            continue;
+        };
+        derived.blocks_read += 1;
+        match decode_container_block(&bytes) {
+            ContainerBlockDecode::Framed {
+                spelling,
+                shape,
+                items,
+            } => {
+                if shape == ContainerBlockShape::LiveOnly {
+                    derived.live_only_blocks += 1;
+                }
+                for item in items {
+                    let Some(component) = component_from_element_key(spelling, &item.key) else {
+                        // A key its own page's spelling cannot render is a corrupt page, not an
+                        // absent element -- the same reading `component_from_element_key`'s own
+                        // doc comment gives it.
+                        derived.unrenderable_items += 1;
+                        continue;
+                    };
+                    latest.insert(
+                        component,
+                        if item.deleted {
+                            None
+                        } else {
+                            Some(item.value)
+                        },
+                    );
+                }
+            }
+            ContainerBlockDecode::NotFramed => {
+                derived.unframed += 1;
+            }
+            ContainerBlockDecode::Corrupt(_) => {
+                derived.undecodable += 1;
+            }
+        }
+    }
+
+    for (component, value) in latest {
+        match value {
+            Some(value) => {
+                derived.live.insert(component, value);
+            }
+            None => {
+                derived.removed.insert(component);
+            }
+        }
+    }
+    derived
+}
+
+/// Whether a compaction round may DROP the tombstones it is rewriting.
+///
+/// # THE RULE
+///
+/// A tombstone may be dropped only by a round that rewrites the container's ENTIRE page set. If one
+/// page of the object survives the round outside the rewrite, the tombstone stays -- whatever that
+/// page happens to contain.
+///
+/// # WHY THE NAIVE RULE RESURRECTS, WHICH IS THE SAME DEFECT IN NEW CLOTHES
+///
+/// The naive rule is "a fold has rewritten these elements, so the tombstones among them are spent".
+/// It is wrong because a fold does NOT see a container's whole page set. Two mechanisms in this tree
+/// leave pages behind, and either is enough:
+///
+///   * `compact_container_blocks_batched` seals a batch at `CONTAINER_BATCH_ELEMENT_CAP` elements or
+///     at `container_batch_target_bytes()`, so a container larger than one batch is rewritten into
+///     SEVERAL pages by one round; and
+///   * it skips any element whose address `CompactionRewriteStats::should_relocate` declines, so a
+///     round can leave a page in place for reasons that have nothing to do with membership.
+///
+/// So: member `m` lives in page A, is removed into tombstone T, and a round folds T into a new page
+/// B while A is not relocated. Drop the tombstone as it goes into B and the pages are A (live m) and
+/// B (silent about m) -- and `derive_membership` puts `m` back. `a_tombstone_dropped_while_an_older_block_survives_resurrects_its_element`
+/// drives exactly that sequence and asserts the resurrection, then asserts this rule declines it.
+///
+/// # WHAT THE COMPARISON DESIGN DOES, WHICH IS THE SAME ANSWER ARRIVED AT DIFFERENTLY
+///
+/// It decides `remove_tombstone` by asking whether the bucket it picked to compact is the LAST one --
+/// its buckets are ordered oldest-last, so the last bucket is the one with nothing older outside it.
+/// And its other path dumps the whole model to page 0 and deletes every other page, where the
+/// question does not arise because nothing survives to name anything. Both are this rule: a tombstone
+/// goes when the rewrite is total.
+///
+/// # A NOTE ON WHAT THIS TREE'S FOLD CAN CURRENTLY SEE
+///
+/// `compact_container_blocks_batched` takes its elements from the RESIDENT maps (`shard.sets` and the
+/// other three), and a removed element is not in them. So the fold does not visit a tombstone at all
+/// today: it neither collects one nor risks dropping one, and a tombstone survives every round
+/// untouched. That is SAFE and it is not collection -- tombstones accumulate until something walks
+/// the index rather than the resident map. This function is the rule that walk will have to obey, and
+/// it is written and driven now so that the walk cannot be added without it.
+pub(super) fn may_drop_tombstones(
+    blocks_in_container: usize,
+    blocks_being_rewritten: usize,
+    batches_this_round: usize,
+) -> bool {
+    // ASSERTED AS A CONJUNCTION OF THREE, and none of the three is implied by the others:
+    // rewriting every page is not enough if the round splits them into several pages, because a
+    // tombstone dropped into batch 1 is not seen by batch 2; and a single batch is not enough if it
+    // does not cover every page. The denominator is checked too -- a container with no pages makes
+    // the first two agree at zero, which would let a round over nothing claim a total rewrite.
+    blocks_in_container > 0
+        && blocks_being_rewritten == blocks_in_container
+        && batches_this_round == 1
+}
