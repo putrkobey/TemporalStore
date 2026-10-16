@@ -458,3 +458,923 @@ pub(super) fn context_event_matches_filter(
     event: &ContextEvent,
     current_valid_only: bool,
     as_of_ms: u64,
+    end_time_ms: u64,
+    kinds: &[u32],
+    statuses: &[u32],
+    min_confidence: f32,
+    min_importance: f32,
+) -> bool {
+    if !kinds.is_empty() && !kinds.contains(&event.event_type_code()) {
+        return false;
+    }
+    #[allow(deprecated)]
+    if !statuses.is_empty() && !statuses.contains(&event.status) {
+        return false;
+    }
+    if event.confidence < min_confidence || event.importance < min_importance {
+        return false;
+    }
+    if current_valid_only {
+        let as_of = if as_of_ms == 0 { end_time_ms } else { as_of_ms };
+        if event.primary_time_ms() > as_of {
+            return false;
+        }
+        #[allow(deprecated)]
+        if event.valid_until_ms != 0 && event.valid_until_ms <= as_of {
+            return false;
+        }
+    }
+    true
+}
+
+pub(super) fn validate_context_required(ok: bool, message: &'static str) -> Result<(), Status> {
+    if ok {
+        Ok(())
+    } else {
+        Err(Status::error("invalid_argument", message))
+    }
+}
+
+pub(super) fn validate_context_byte_len(
+    name: &'static str,
+    value_len: usize,
+    max_len: usize,
+) -> Result<(), Status> {
+    if value_len <= max_len {
+        Ok(())
+    } else {
+        Err(Status::error(
+            "invalid_argument",
+            format!("{name} is too large"),
+        ))
+    }
+}
+
+pub(super) fn validate_context_score(name: &'static str, value: f32) -> Result<(), Status> {
+    if value.is_finite() && (0.0..=1.0).contains(&value) {
+        Ok(())
+    } else {
+        Err(Status::error(
+            "invalid_argument",
+            format!("{name} must be in [0, 1]"),
+        ))
+    }
+}
+
+pub(super) fn validate_context_limit(limit: Option<usize>) -> Result<(), Status> {
+    if limit.unwrap_or_default() <= CONTEXT_MAX_LIMIT {
+        Ok(())
+    } else {
+        Err(Status::error("invalid_argument", "limit exceeds maximum"))
+    }
+}
+
+pub(super) fn validate_context_range(start_time_ms: u64, end_time_ms: u64) -> Result<(), Status> {
+    if end_time_ms > start_time_ms {
+        validate_context_timestamp(start_time_ms)?;
+        validate_context_timestamp(end_time_ms)
+    } else {
+        Err(Status::error(
+            "invalid_argument",
+            "end_time_ms must be greater than start_time_ms",
+        ))
+    }
+}
+
+pub(super) fn validate_context_timestamp(timestamp_ms: u64) -> Result<(), Status> {
+    if timestamp_ms <= u64::MAX / CONTEXT_TIMELINE_FANOUT {
+        Ok(())
+    } else {
+        Err(Status::error(
+            "invalid_argument",
+            "timestamp_ms is too large",
+        ))
+    }
+}
+
+pub(super) fn validate_context_index_name(index_name: &str) -> Result<(), Status> {
+    validate_context_required(!index_name.is_empty(), "index_name is required")?;
+    validate_context_byte_len("index_name", index_name.len(), CONTEXT_MAX_INDEX_NAME_BYTES)?;
+    if index_name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+    {
+        Ok(())
+    } else {
+        Err(Status::error(
+            "invalid_argument",
+            "index_name contains invalid characters",
+        ))
+    }
+}
+
+pub(super) fn validate_context_node(node: &ContextNode) -> Result<(), Status> {
+    validate_context_required(node.node_hash != 0, "node_hash must be non-zero")?;
+    validate_context_required(
+        !node.canonical_name.is_empty(),
+        "canonical_name is required",
+    )?;
+    validate_context_byte_len(
+        "canonical_name",
+        node.canonical_name.len(),
+        CONTEXT_MAX_CANONICAL_NAME_BYTES,
+    )?;
+    validate_context_byte_len("l0", node.l0.len(), CONTEXT_MAX_L0_BYTES)?;
+    validate_context_byte_len("l1_ref", node.l1_ref.len(), CONTEXT_MAX_REF_BYTES)?;
+    validate_context_byte_len(
+        "raw_metadata_ref",
+        node.raw_metadata_ref.len(),
+        CONTEXT_MAX_REF_BYTES,
+    )?;
+    if node.last_event_time_ms != 0 {
+        validate_context_timestamp(node.last_event_time_ms)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_context_event(event: &ContextEvent) -> Result<(), Status> {
+    validate_context_required(
+        event.primary_time_ms() != 0 && event.event_id_hash != 0,
+        "ingestion_time_ms and event_id_hash must be non-zero",
+    )?;
+    #[allow(deprecated)]
+    if event.valid_until_ms != 0 && event.valid_until_ms <= event.event_time_ms {
+        return Err(Status::error(
+            "invalid_argument",
+            "valid_until_ms must be greater than event_time_ms",
+        ));
+    }
+    validate_context_timestamp(event.primary_time_ms())?;
+    if event.event_time_ms != 0 {
+        validate_context_timestamp(event.event_time_ms)?;
+    }
+    #[allow(deprecated)]
+    if event.valid_until_ms != 0 {
+        validate_context_timestamp(event.valid_until_ms)?;
+    }
+    validate_context_score("confidence", event.confidence)?;
+    validate_context_score("importance", event.importance)?;
+    validate_context_byte_len("text", event.text.len(), CONTEXT_MAX_EVENT_TEXT_BYTES)?;
+    #[allow(deprecated)]
+    validate_context_byte_len("source_ref", event.source_ref.len(), CONTEXT_MAX_REF_BYTES)?;
+    #[allow(deprecated)]
+    if event.related_node_hashes.len() > CONTEXT_MAX_RELATED_NODE_HASHES {
+        return Err(Status::error(
+            "invalid_argument",
+            "related_node_hashes exceeds maximum",
+        ));
+    }
+    #[allow(deprecated)]
+    validate_context_byte_len(
+        "compact_attrs",
+        event.compact_attrs.len(),
+        CONTEXT_MAX_COMPACT_ATTRS_BYTES,
+    )
+}
+
+pub(super) fn validate_context_filters(
+    kinds: &[u32],
+    statuses: &[u32],
+    min_confidence: f32,
+    min_importance: f32,
+) -> Result<(), Status> {
+    if kinds.len() > CONTEXT_MAX_FILTER_VALUES || statuses.len() > CONTEXT_MAX_FILTER_VALUES {
+        return Err(Status::error("invalid_argument", "too many filter values"));
+    }
+    validate_context_score("min_confidence", min_confidence)?;
+    validate_context_score("min_importance", min_importance)
+}
+
+pub(super) fn validate_context_index_ref(index_ref: &ContextIndexRef) -> Result<(), Status> {
+    validate_context_required(
+        index_ref.primary_node_hash != 0
+            && index_ref.primary_event_time_ms != 0
+            && index_ref.event_id_hash != 0,
+        "invalid context index ref",
+    )?;
+    validate_context_timestamp(index_ref.primary_event_time_ms)
+}
+
+pub(super) fn context_index_ref_identity(index_ref: &ContextIndexRef) -> (u64, u64, u64) {
+    (
+        index_ref.primary_node_hash,
+        index_ref.primary_event_time_ms,
+        index_ref.event_id_hash,
+    )
+}
+
+pub(super) fn validate_context_index_lookup(lookup: &ContextIndexLookup) -> Result<(), Status> {
+    validate_context_index_name(&lookup.index_name)?;
+    validate_context_required(lookup.index_value_hash != 0, "index_value_hash is required")?;
+    validate_context_timestamp(lookup.start_time_ms)?;
+    validate_context_timestamp(lookup.end_time_ms)?;
+    validate_context_required(
+        lookup.start_time_ms <= lookup.end_time_ms,
+        "start_time_ms must be <= end_time_ms",
+    )
+}
+
+pub(super) fn validate_context_extracted_indexes(
+    event: &ContextEvent,
+    indexes: &ContextExtractedEventIndexes,
+) -> Result<(), Status> {
+    if !context_index_disabled(indexes, InternalContextIndex::EventKind) {
+        validate_context_required(
+            context_event_kind_hash(event) != 0,
+            "event kind is required",
+        )?;
+    }
+    if !context_index_disabled(indexes, InternalContextIndex::Status) {
+        validate_context_required(indexes.status_hash != 0, "status_hash is required")?;
+    }
+    if !context_index_disabled(indexes, InternalContextIndex::Source) {
+        validate_context_required(indexes.source_hash != 0, "source_hash is required")?;
+    }
+    if !context_index_disabled(indexes, InternalContextIndex::EventTimeBucket) {
+        validate_context_required(
+            indexes.event_time_bucket_ms != 0,
+            "event_time_bucket_ms is required",
+        )?;
+        validate_context_timestamp(indexes.event_time_bucket_ms)?;
+    }
+    if !context_index_disabled(indexes, InternalContextIndex::Entity) {
+        for entity_hash in &indexes.entity_hashes {
+            validate_context_required(*entity_hash != 0, "entity_hashes cannot contain zero")?;
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn validate_context_audit_ref(audit_ref: &ContextAuditRef) -> Result<(), Status> {
+    validate_context_required(
+        audit_ref.node_hash != 0 && audit_ref.event_time_ms != 0,
+        "audit ref node_hash and event_time_ms are required",
+    )?;
+    validate_context_timestamp(audit_ref.event_time_ms)?;
+    validate_context_byte_len(
+        "audit ref reason",
+        audit_ref.reason.len(),
+        CONTEXT_MAX_REF_BYTES,
+    )
+}
+
+pub(super) fn validate_context_pack_audit(audit: &ContextPackAudit) -> Result<(), Status> {
+    validate_context_required(
+        audit.session_hash != 0 && audit.request_time_ms != 0 && !audit.query_id.is_empty(),
+        "session_hash, request_time_ms, and query_id are required",
+    )?;
+    validate_context_byte_len("query_id", audit.query_id.len(), CONTEXT_MAX_REF_BYTES)?;
+    validate_context_timestamp(audit.request_time_ms)?;
+    if audit.selected_refs.len() > CONTEXT_MAX_AUDIT_REFS
+        || audit.blocked_refs.len() > CONTEXT_MAX_AUDIT_REFS
+    {
+        return Err(Status::error(
+            "invalid_argument",
+            "audit refs exceed maximum",
+        ));
+    }
+    for audit_ref in &audit.selected_refs {
+        validate_context_audit_ref(audit_ref)?;
+    }
+    for audit_ref in &audit.blocked_refs {
+        validate_context_audit_ref(audit_ref)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_context_dirty_node(
+    node_hash: u64,
+    event_time_ms: u64,
+    _reason: u32,
+    propagate_depth: u32,
+) -> Result<(), Status> {
+    validate_context_required(
+        node_hash != 0 && event_time_ms != 0,
+        "node_hash and event_time_ms are required",
+    )?;
+    if propagate_depth > CONTEXT_MAX_PROPAGATE_DEPTH {
+        return Err(Status::error(
+            "invalid_argument",
+            "propagate_depth exceeds maximum",
+        ));
+    }
+    validate_context_timestamp(event_time_ms)
+}
+
+pub(super) fn validate_context_entity(entity: &ContextEntity) -> Result<(), Status> {
+    validate_context_required(
+        entity.entity_hash != 0 && entity.node_hash != 0 && entity.updated_at_ms != 0,
+        "entity_hash, node_hash, and updated_at_ms are required",
+    )?;
+    validate_context_timestamp(entity.updated_at_ms)?;
+    if entity.valid_from_ms != 0 {
+        validate_context_timestamp(entity.valid_from_ms)?;
+    }
+    validate_context_score("confidence", entity.confidence)?;
+    validate_context_byte_len(
+        "entity name",
+        entity.name.len(),
+        CONTEXT_MAX_ENTITY_NAME_BYTES,
+    )?;
+    validate_context_byte_len(
+        "entity value",
+        entity.value.len(),
+        CONTEXT_MAX_ENTITY_VALUE_BYTES,
+    )?;
+    if entity.source_event_hashes.len() > CONTEXT_MAX_AUDIT_REFS {
+        return Err(Status::error(
+            "invalid_argument",
+            "source_event_hashes exceeds maximum",
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn validate_context_child_ref(child_ref: &ContextChildRef) -> Result<(), Status> {
+    validate_context_required(
+        child_ref.parent_hash != 0 && child_ref.child_hash != 0 && child_ref.updated_at_ms != 0,
+        "parent_hash, child_hash, and updated_at_ms are required",
+    )?;
+    validate_context_timestamp(child_ref.updated_at_ms)
+}
+
+pub(super) fn validate_context_embedding_vector(
+    name: &'static str,
+    vector: &[f32],
+) -> Result<(), Status> {
+    validate_context_required(!vector.is_empty(), "embedding vector is required")?;
+    if vector.len() > CONTEXT_MAX_EMBEDDING_DIM {
+        return Err(Status::error(
+            "invalid_argument",
+            format!("{name} dimension exceeds maximum"),
+        ));
+    }
+    if vector.iter().all(|value| value.is_finite()) {
+        Ok(())
+    } else {
+        Err(Status::error(
+            "invalid_argument",
+            format!("{name} contains non-finite value"),
+        ))
+    }
+}
+
+pub(super) fn validate_context_summary(summary: &ContextSummary) -> Result<(), Status> {
+    validate_context_required(
+        summary.node_hash != 0 && summary.level != 0 && summary.valid_from_ms != 0,
+        "node_hash, level, and valid_from_ms are required",
+    )?;
+    validate_context_timestamp(summary.valid_from_ms)?;
+    validate_context_byte_len(
+        "summary text",
+        summary.text.len(),
+        CONTEXT_MAX_SUMMARY_BYTES,
+    )
+}
+
+pub(super) fn validate_context_compression_event(
+    event: &ContextCompressionEvent,
+) -> Result<(), Status> {
+    validate_context_required(
+        event.compression_id_hash != 0
+            && event.node_hash != 0
+            && event.source_start_ms != 0
+            && event.source_end_ms != 0
+            && event.compressed_time_ms != 0,
+        "compression_id_hash, node_hash, source range, and compressed_time_ms are required",
+    )?;
+    validate_context_range(event.source_start_ms, event.source_end_ms)?;
+    validate_context_timestamp(event.compressed_time_ms)?;
+    validate_context_byte_len(
+        "compression summary",
+        event.summary.len(),
+        CONTEXT_MAX_SUMMARY_BYTES,
+    )
+}
+
+pub(super) fn load_context_children(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    shard: &ShardState,
+    object_key: &str,
+) -> Vec<ContextChildRef> {
+    let routing_bucket = shard_block_routing_bucket(shard, object_key);
+    shard
+        .context_children()
+        .get(object_key)
+        .map(|series| {
+            series
+                .points()
+                .filter_map(|(timeline_key, address)| {
+                    read_context_value::<ContextChildRef>(
+                        cache,
+                        block_store,
+                        shard_id,
+                        timeline_key,
+                        address,
+                        BlockIdentity::of(shard_id, "context_child", object_key, None),
+                        routing_bucket,
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The same lookup as `load_context_node`, decoding only the vector.
+///
+/// Used where a candidate is scored and discarded, which is most of them.
+/// Children dropped by the per-parent cut BEFORE any scoring.
+///
+/// The cut is by recency, which correlates with nothing a query asked for, so anything it drops is
+/// unreachable however well it matches. Retrieval still answers from what survived, so the limit
+/// reads as ordinary imperfect recall unless something counts it. Non-zero here means a parent is
+/// wide enough that retrieval cannot see all of it.
+pub static CONTEXT_CHILDREN_DROPPED_BEFORE_SCORING: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Children dropped before scoring since the last reset.
+pub fn context_children_dropped_before_scoring() -> u64 {
+    CONTEXT_CHILDREN_DROPPED_BEFORE_SCORING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reset the drop counter. For tests measuring one traversal.
+pub fn reset_context_children_dropped_before_scoring() {
+    CONTEXT_CHILDREN_DROPPED_BEFORE_SCORING.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(super) fn load_context_node_vector(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    shard: &ShardState,
+    tenant_hash: u64,
+    node_hash: u64,
+) -> Option<Vec<f32>> {
+    let object_key = context_node_key(tenant_hash, node_hash);
+    let (start_routing_bucket, end_routing_bucket) = shard.routing_range();
+    let routing_bucket = Some(crate::engine::hashing::block_routing_bucket(
+        &object_key,
+        start_routing_bucket,
+        end_routing_bucket,
+    ));
+    // EACH ARM NAMES ITS OWN OBJECT. The comment that stood at this read said both arms resolve
+    // `hashes[key][CONTEXT_NODE_FIELD]`, and the second one does not: it resolves a whole
+    // `context_node` page, which `model_map_block_address` spells `("context_node", None)`. The
+    // identity cannot be built without a kind, so the two arms had to separate -- see
+    // `execute_on_shard::load_context_node` for what the single spelling cost on the in-log path.
+    shard
+        .hashes
+        .get(&object_key)
+        .and_then(|fields| fields.get(CONTEXT_NODE_FIELD))
+        .map(|address| {
+            (
+                address,
+                BlockIdentity::of(shard_id, "hash", &object_key, Some(super::constants::CONTEXT_NODE_FIELD)),
+            )
+        })
+        .or_else(|| {
+            shard
+                .context_nodes()
+                .get(object_key.as_str())
+                .map(|address| (address, BlockIdentity::of(shard_id, "context_node", &object_key, None)))
+        })
+        .and_then(|(address, identity)| {
+            super::read_block_shared(
+                cache,
+                block_store,
+                shard_id,
+                address,
+                identity,
+                routing_bucket,
+            )
+                .and_then(|bytes| crate::types::decode_context_node_vector(&bytes))
+        })
+}
+
+pub(super) fn load_context_node(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    shard: &ShardState,
+    tenant_hash: u64,
+    node_hash: u64,
+) -> Option<ContextNode> {
+    // Same two-step lookup as the ContextGetNode command: current nodes live in the hashes map
+    // under the CONTEXT_NODE_FIELD slot; context_nodes is the pre-hashes location still read for
+    // blocks written before that move.
+    let object_key = context_node_key(tenant_hash, node_hash);
+    let (start_routing_bucket, end_routing_bucket) = shard.routing_range();
+    let routing_bucket = Some(crate::engine::hashing::block_routing_bucket(
+        &object_key,
+        start_routing_bucket,
+        end_routing_bucket,
+    ));
+    // Each arm names its own object, as in `load_context_node_vector` above.
+    shard
+        .hashes
+        .get(&object_key)
+        .and_then(|fields| fields.get(CONTEXT_NODE_FIELD))
+        .map(|address| {
+            (
+                address,
+                BlockIdentity::of(shard_id, "hash", &object_key, Some(super::constants::CONTEXT_NODE_FIELD)),
+            )
+        })
+        .or_else(|| {
+            shard
+                .context_nodes()
+                .get(object_key.as_str())
+                .map(|address| (address, BlockIdentity::of(shard_id, "context_node", &object_key, None)))
+        })
+        .and_then(|(address, identity)| {
+            // Shared, not copied: the bytes are parsed here and dropped, so owning them costs a
+            // page-sized memcpy and an allocation for nothing.
+            super::read_block_shared(
+                cache,
+                block_store,
+                shard_id,
+                address,
+                identity,
+                routing_bucket,
+            )
+                .and_then(|bytes| context_from_bytes::<ContextNode>(&bytes))
+        })
+}
+
+pub(super) fn load_context_summaries(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    shard: &ShardState,
+    object_key: &str,
+    as_of_ms: u64,
+    limit: Option<usize>,
+) -> Vec<ContextSummary> {
+    let routing_bucket = shard_block_routing_bucket(shard, object_key);
+    shard
+        .context_summaries()
+        .get(object_key)
+        .map(|series| {
+            series
+                .range(0..context_timeline_end(as_of_ms))
+                .take(context_limit(limit))
+                .filter_map(|(timeline_key, address)| {
+                    read_context_value::<ContextSummary>(
+                        cache,
+                        block_store,
+                        shard_id,
+                        timeline_key,
+                        address,
+                        BlockIdentity::of(shard_id, "context_summary", object_key, None),
+                        routing_bucket,
+                    )
+                })
+                .filter(|summary| summary.valid_from_ms <= as_of_ms)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The NEWEST summary at or before `as_of_ms`, decoding one record in the ordinary case.
+///
+/// `load_context_summaries` with `Some(1)` returns the OLDEST match, not the newest: the series is
+/// keyed by `context_timeline_key`, which is `timestamp_ms * FANOUT + disambiguator` and therefore
+/// ascends with time, so `range(0..end).take(1)` takes the earliest entry in the window. Callers
+/// that want the current summary and reach for `take(1)` get the node's first-ever version, and
+/// because a stale vector is still the right width it still produces a plausible cosine -- there is
+/// nothing to notice.
+///
+/// `load_latest_context_summary` gets the answer right but decodes the node's whole window to do
+/// it. This walks the range backwards instead, so the common case decodes exactly one record; it
+/// keeps walking only if a decode fails or an entry does not satisfy `valid_from_ms <= as_of_ms`.
+pub(super) fn load_newest_context_summary(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    shard: &ShardState,
+    object_key: &str,
+    as_of_ms: u64,
+) -> Option<ContextSummary> {
+    let routing_bucket = shard_block_routing_bucket(shard, object_key);
+    shard
+        .context_summaries()
+        .get(object_key)
+        .and_then(|series| {
+            series
+                .range(0..context_timeline_end(as_of_ms))
+                .rev()
+                .filter_map(|(timeline_key, address)| {
+                    read_context_value::<ContextSummary>(
+                        cache,
+                        block_store,
+                        shard_id,
+                        timeline_key,
+                        address,
+                        BlockIdentity::of(shard_id, "context_summary", object_key, None),
+                        routing_bucket,
+                    )
+                })
+                .find(|summary| summary.valid_from_ms <= as_of_ms)
+        })
+}
+
+pub(super) fn load_latest_context_summary(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    shard: &ShardState,
+    object_key: &str,
+    as_of_ms: u64,
+) -> Option<ContextSummary> {
+    load_context_summaries(
+        cache, block_store, shard_id, shard, object_key, as_of_ms, None,
+    )
+    .into_iter()
+    .max_by_key(|summary| summary.valid_from_ms)
+}
+
+pub(super) fn load_context_compression_events(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    shard: &ShardState,
+    tenant_hash: u64,
+    node_hashes: &[u64],
+    start_time_ms: u64,
+    end_time_ms: u64,
+    limit: Option<usize>,
+) -> Vec<ContextCompressionEvent> {
+    let mut events = Vec::new();
+    for node_hash in node_hashes
+        .iter()
+        .copied()
+        .filter(|node_hash| *node_hash != 0)
+    {
+        let object_key = context_compression_key(tenant_hash, node_hash);
+        let routing_bucket = shard_block_routing_bucket(shard, &object_key);
+        if let Some(series) = shard.context_compressions().get(&object_key[..]) {
+            events.extend(series.points().filter_map(|(timeline_key, address)| {
+                read_context_value::<ContextCompressionEvent>(
+                    cache,
+                    block_store,
+                    shard_id,
+                    timeline_key,
+                    address,
+                    BlockIdentity::of(shard_id, "context_compression", &object_key, None),
+                    routing_bucket,
+                )
+                .filter(|event| {
+                    event.source_end_ms >= start_time_ms && event.source_start_ms <= end_time_ms
+                })
+            }));
+        }
+        if events.len() >= context_limit(limit) {
+            break;
+        }
+    }
+    events.sort_by(|left, right| {
+        right
+            .source_end_ms
+            .cmp(&left.source_end_ms)
+            .then_with(|| right.compressed_time_ms.cmp(&left.compressed_time_ms))
+            .then_with(|| left.compression_id_hash.cmp(&right.compression_id_hash))
+    });
+    events.truncate(context_limit(limit));
+    events
+}
+
+pub(super) fn cosine_similarity(left: &[f32], right: &[f32]) -> f32 {
+    if left.is_empty() || left.len() != right.len() {
+        return 0.0;
+    }
+    let mut dot = 0.0_f32;
+    let mut left_norm = 0.0_f32;
+    let mut right_norm = 0.0_f32;
+    for (l, r) in left.iter().zip(right.iter()) {
+        dot += l * r;
+        left_norm += l * l;
+        right_norm += r * r;
+    }
+    if left_norm <= 0.0 || right_norm <= 0.0 {
+        return 0.0;
+    }
+    dot / (left_norm.sqrt() * right_norm.sqrt())
+}
+
+/// What a traversal found, and what it never looked at.
+///
+/// The second number is the point: a caller that only sees nodes cannot tell a
+/// short result caused by a thin tree from one caused by the per-parent cap, and
+/// the two call for opposite responses.
+pub(super) struct ContextTraversalOutcome {
+    pub nodes: Vec<ContextTraversedNode>,
+    /// Children the per-parent cap skipped before any scoring. Non-zero means the
+    /// result is bounded by the cap rather than by relevance, so a query cannot
+    /// reach what was dropped however well it matches.
+    pub children_dropped_before_scoring: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn traverse_context_tree(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    shard: &ShardState,
+    tenant_hash: u64,
+    start_node_hash: u64,
+    query_vector: &[f32],
+    max_depth: Option<u32>,
+    top_k_per_depth: Option<usize>,
+    max_children_scored_per_parent: Option<usize>,
+    max_candidate_nodes: Option<usize>,
+    leaf_only: bool,
+) -> ContextTraversalOutcome {
+    let max_depth = max_depth.unwrap_or(6).min(CONTEXT_MAX_TRAVERSAL_DEPTH);
+    let top_k = top_k_per_depth
+        .unwrap_or_else(default_traversal_top_k)
+        .max(1)
+        .min(CONTEXT_MAX_LIMIT);
+    let child_limit = max_children_scored_per_parent
+        .unwrap_or(CONTEXT_MAX_LIMIT)
+        .max(1)
+        .min(CONTEXT_MAX_LIMIT);
+    let candidate_limit = max_candidate_nodes
+        .unwrap_or_else(default_traversal_candidates)
+        .max(1)
+        .min(CONTEXT_MAX_LIMIT);
+    let mut frontier = vec![ContextTraversedNode {
+        node_hash: start_node_hash,
+        depth: 0,
+        score: 1.0,
+    }];
+    let mut results = Vec::new();
+    // Per call, unlike the process-wide counter below: a caller needs to know
+    // whether ITS result was cut, which a global total cannot tell it.
+    let mut children_dropped_before_scoring = 0usize;
+    for depth in 1..=max_depth {
+        let mut scored_layer = Vec::new();
+        for parent in &frontier {
+            let child_key = context_child_key(tenant_hash, parent.node_hash);
+            let mut children =
+                load_context_children(cache, block_store, shard_id, shard, &child_key);
+            // NEWEST first, not oldest. This cut happens BEFORE any scoring, so whatever it
+            // drops is unreachable by any query however well it matches -- and it used to sort
+            // ascending, which kept the oldest children and made the most recently ingested the
+            // first to disappear. That is the opposite of what a store keyed on time should do.
+            //
+            // This does NOT make the selection relevance-based, and it is worth being plain
+            // about that: scoring a child costs a page read (`load_context_node_vector` reads
+            // the node's page and decodes its vector), so scoring every child of a very wide
+            // parent is not affordable, and a cap has to stay. Recency is a better proxy than
+            // age, not a substitute for relevance. A parent wide enough for this cut to bind
+            // still hides children, which is what the node hierarchy in the issue addresses.
+            children.sort_by_key(|child_ref| {
+                (
+                    std::cmp::Reverse(child_ref.updated_at_ms),
+                    child_ref.child_hash,
+                )
+            });
+            let considered = children.len();
+            children.truncate(child_limit);
+            if considered > child_limit {
+                children_dropped_before_scoring += considered - child_limit;
+                // Say it, because the failure is otherwise invisible: retrieval still returns
+                // plausible results from whatever survived, so a structural limit reads as
+                // ordinary imperfect recall.
+                CONTEXT_CHILDREN_DROPPED_BEFORE_SCORING
+                    .fetch_add((considered - child_limit) as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            for child in children {
+                // Score from the vector the node itself carries. The node is addressable by
+                // the child hash already in hand; the retired separate records were not -- they
+                // were keyed by a one-way hash of (tenant, owner, level) that no reader could
+                // reconstruct without already holding the owner.
+                let vector = load_context_node_vector(
+                    cache,
+                    block_store,
+                    shard_id,
+                    shard,
+                    tenant_hash,
+                    child.child_hash,
+                )
+                .filter(|vector| !vector.is_empty());
+                let Some(vector) = vector else {
+                    continue;
+                };
+                let score = cosine_similarity(query_vector, &vector);
+                if score > 0.0 {
+                    scored_layer.push(ContextTraversedNode {
+                        node_hash: child.child_hash,
+                        depth,
+                        score,
+                    });
+                }
+            }
+        }
+        scored_layer.sort_by(|left, right| {
+            right
+                .score
+                .partial_cmp(&left.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.node_hash.cmp(&right.node_hash))
+        });
+        scored_layer.truncate(top_k);
+        let mut next_frontier = Vec::new();
+        for node in scored_layer {
+            let child_key = context_child_key(tenant_hash, node.node_hash);
+            let is_leaf =
+                load_context_children(cache, block_store, shard_id, shard, &child_key).is_empty();
+            next_frontier.push(node.clone());
+            if !leaf_only || is_leaf {
+                results.push(node);
+                if results.len() >= candidate_limit {
+                    return ContextTraversalOutcome {
+                        nodes: results,
+                        children_dropped_before_scoring,
+                    };
+                }
+            }
+        }
+        if next_frontier.is_empty() {
+            break;
+        }
+        frontier = next_frontier;
+    }
+    ContextTraversalOutcome {
+        nodes: results,
+        children_dropped_before_scoring,
+    }
+}
+
+pub(super) fn build_context_compression_event(
+    tenant_hash: u64,
+    node_hash: u64,
+    source_start_ms: u64,
+    source_end_ms: u64,
+    compressed_time_ms: u64,
+    selected: &[ContextEvent],
+    truncated: bool,
+) -> ContextCompressionEvent {
+    let mut summary = format!("Temporal compression window {source_start_ms}-{source_end_ms}:");
+    for event in selected {
+        let mut text = event.text.clone();
+        if text.len() > CONTEXT_MAX_COMPRESSION_SNIPPET_BYTES {
+            text.truncate(CONTEXT_MAX_COMPRESSION_SNIPPET_BYTES);
+        }
+        summary.push(' ');
+        summary.push_str(&text);
+    }
+    if truncated {
+        summary.push_str(" additional source events truncated.");
+    }
+    if summary.len() > CONTEXT_MAX_SUMMARY_BYTES {
+        summary.truncate(CONTEXT_MAX_SUMMARY_BYTES);
+    }
+    ContextCompressionEvent {
+        compression_id_hash: stable_object_hash(&format!(
+            "{tenant_hash}:{node_hash}:{source_start_ms}:{source_end_ms}:{}",
+            selected
+                .iter()
+                .map(|event| event.event_id_hash.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        )),
+        node_hash,
+        source_start_ms,
+        source_end_ms,
+        compressed_time_ms: if compressed_time_ms == 0 {
+            source_end_ms
+        } else {
+            compressed_time_ms
+        },
+        summary,
+    }
+}
+
+#[cfg(test)]
+mod one_map_two_flavours_of_dirtiness {
+    use super::{context_dirty_key, context_embedding_dirty_key, EMBEDDING_DIRTY_PREFIX};
+
+    /// THE TWO KEY SPACES ARE MUTUALLY NON-PREFIXING, and this test outlived the predicate it
+    /// was written for.
+    ///
+    /// It used to be the reason `is_embedding_dirty_key` was exact rather than a heuristic. That
+    /// predicate is gone -- the flavour is a field on `DirtyMark` now -- but the two key BUILDERS
+    /// are not: the command surface still emits both key spaces as the object key a command
+    /// touches. So the property still matters, for a different reason: a reader handed one of
+    /// these strings must not be able to take it for the other.
+    #[test]
+    fn neither_prefix_is_a_prefix_of_the_other() {
+        let embedding = context_embedding_dirty_key(1, 2);
+        let summary = context_dirty_key(1, 2);
+        assert!(embedding.starts_with(EMBEDDING_DIRTY_PREFIX));
+        assert!(!summary.starts_with(EMBEDDING_DIRTY_PREFIX));
+        assert!(
+            !EMBEDDING_DIRTY_PREFIX.starts_with("ctx:dirty:")
+                && !"ctx:dirty:".starts_with(EMBEDDING_DIRTY_PREFIX),
+            "the two prefixes must not nest, or one map cannot tell its flavours apart"
+        );
+    }
+}

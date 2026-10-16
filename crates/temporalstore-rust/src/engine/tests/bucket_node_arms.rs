@@ -1115,3 +1115,1120 @@ fn the_tagged_node_is_fifty_six_bytes_and_every_arm_reconstructs() {
 /// THE TAG GUARD FAILS ON A VIOLATING ADDRESS.
 ///
 /// The invariant that makes the tag free is that the payload's address has its low two bits
+/// clear. A guard that has never refused anything has never been tested, so this feeds it an
+/// address that violates the invariant and asserts the refusal.
+///
+/// rust-internal: measures this module's own guard, no product behaviour
+#[test]
+fn the_tag_guard_refuses_an_address_whose_low_bits_are_not_free() {
+    // The positive control: a properly aligned address is accepted and the tag reads back.
+    let aligned = 0x7f00_0000_1000usize;
+    assert_eq!(
+        KIND_SIMPLE,
+        tag(aligned, KIND_SIMPLE) & KIND_MASK,
+        "an aligned address must carry the tag back out"
+    );
+    assert_eq!(
+        aligned,
+        tag(aligned, KIND_SIMPLE) & !KIND_MASK,
+        "an aligned address must survive tagging unchanged"
+    );
+
+    // THE NEGATIVE CONTROL. One byte past an aligned address is what a payload of alignment 1
+    // would hand the tag, and it must be refused rather than silently corrupting the pointer.
+    //
+    // The hook is taken down across both refusals and put back afterwards: a guard that is
+    // SUPPOSED to panic would otherwise print two backtraces into every ordinary suite run, and
+    // a gate read at NAME level is easier to trust when a passing test is silent.
+    let violating = aligned + 1;
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let refused = std::panic::catch_unwind(|| tag(violating, KIND_SIMPLE));
+    let wide_kind = std::panic::catch_unwind(|| tag(aligned, KIND_MASK + 1));
+    std::panic::set_hook(previous);
+
+    assert!(
+        refused.is_err(),
+        "the tag guard accepted address {violating:#x}, whose low bit is set; tagging it would \
+         hand back a pointer one byte off the payload and the representation would be unsound"
+    );
+
+    // A kind wider than the two bits is refused too, for the same reason.
+    assert!(
+        wide_kind.is_err(),
+        "a kind that does not fit in two bits must be refused"
+    );
+}
+
+// =============================================================================================
+// WHAT IT COSTS, ON THE ALLOCATOR
+// =============================================================================================
+
+/// What one `clone()` charges the allocator, in bytes and in CALLS.
+///
+/// Cloning a `BTreeMap` rebuilds it node for node, so this charges the container's OWN
+/// allocations and owes nothing to `size_of` x count. That is the point: a B-tree node holds
+/// eleven value slots whether they are filled or not, so a narrower value is worth MORE than its
+/// own width and a `size_of` comparison would under-state it.
+#[cfg(feature = "alloc-probe")]
+fn clone_counts<T: Clone>(value: &T) -> (u64, u64) {
+    let probe = Probe::start();
+    let copy = value.clone();
+    let counts = probe.stop();
+    std::hint::black_box(&copy);
+    drop(copy);
+    (counts.alloc_bytes, counts.allocs)
+}
+
+/// THE PLANTED MARKER. Recovered exactly, or every figure below is noise.
+///
+/// rust-internal: measures the harness's own instrument, no product behaviour
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "the counting allocator is process-wide; run by name"]
+fn the_instrument_this_module_uses_recovers_a_planted_megabyte_exactly() {
+    const PLANTED: usize = 1 << 20;
+    let marker: Vec<u8> = vec![0xA5; PLANTED];
+    let (bytes, allocs) = clone_counts(&marker);
+    println!("planted {PLANTED} B, instrument charged {bytes} B in {allocs} call(s)");
+    assert_eq!(
+        PLANTED as u64, bytes,
+        "the clone instrument charged {bytes} B for a planted {PLANTED} B"
+    );
+    assert_eq!(1, allocs, "one planted vector charged {allocs} allocations, not one");
+}
+
+#[cfg(feature = "alloc-probe")]
+#[derive(Debug, Clone, Copy)]
+struct Side {
+    bytes: u64,
+    allocs: u64,
+}
+
+#[cfg(feature = "alloc-probe")]
+impl Side {
+    fn per(&self, records: usize) -> (f64, f64) {
+        (
+            self.bytes as f64 / records as f64,
+            self.allocs as f64 / records as f64,
+        )
+    }
+}
+
+/// BYTES AND ALLOCATIONS PER RECORD, LIVE SHAPE AGAINST TAGGED SHAPE, ON ONE INSTRUMENT.
+///
+/// ONE INSTRUMENT, BOTH SIDES, SAME SPAN OF THE SAME TEST. #1959 found a published decline whose
+/// sign was wrong because it set a `size_of` saving against an allocator cost. This change is
+/// exactly that trade -- inline bytes for a heap allocation -- so no `size_of` figure appears in
+/// the comparison at all.
+///
+/// WHAT IS BEING CLONED. The engine's real `bucket_map` as production built it, and a map of the
+/// same buckets rebuilt in the tagged shape by `retag`, arm chosen by the engine's own
+/// classifier. Both clones charge their own B-tree nodes, so the eleven-slot node sizing that
+/// makes a narrow value worth more than its width is charged on BOTH sides rather than assumed
+/// on one.
+///
+/// THE TWO FIGURES CAN DISAGREE IN SIGN, and that is the finding here. The tagged map's nodes
+/// are narrower, so it moves fewer BYTES; it also takes one allocation per occupied bucket that
+/// the live map does not take at all. Both are printed at every arm.
+///
+/// WHAT THE INSTRUMENT CHARGES, stated because it decides how the byte figure should be read:
+/// `layout.size()`, the REQUEST, not the chunk the allocator serves it from. It therefore
+/// UNDER-charges the tagged side, which is the side that takes the allocations. The byte column
+/// is a floor on the tagged side's cost, not an estimate of it.
+///
+/// rust-internal: measures the engine's own bucket map, no product behaviour
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "seeds four stores up to 40,000 records each; run by name"]
+fn what_the_tagged_node_actually_costs_the_allocator() {
+    let mut path_lengths: Vec<usize> = Vec::new();
+    // (records, range, simple fraction, live B/record, tagged/live bytes, tagged/live allocs)
+    let mut cells: Vec<(usize, u32, f64, f64, f64, f64)> = Vec::new();
+
+    for records in [SMALL, LARGE] {
+        for end_routing_bucket in [WIDE_END, NARROW_END] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            path_lengths.push(dir.path().as_os_str().len());
+            let engine = engine_on(dir.path());
+            load_on(&engine, end_routing_bucket);
+            let keys = seed_routed(&engine, records);
+            let hist = arm_histogram(&engine);
+
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard 1");
+            let live_map = &shard.bucket_index.bucket_map;
+            let buckets = live_map.len();
+            assert!(buckets > 0, "no buckets to divide by");
+            assert_eq!(
+                hist.total_blocks(),
+                keys.len(),
+                "the map holds {} pages for {} keys, so the per-record divisor is not the \
+                 fixture's",
+                hist.total_blocks(),
+                keys.len()
+            );
+
+            // Built OUTSIDE the measured span on both sides: only the clone is charged.
+            let tagged_map: BTreeMap<u32, TaggedNode> = live_map
+                .iter()
+                .map(|(routing_bucket, node)| (*routing_bucket, retag(node)))
+                .collect();
+            assert_eq!(
+                live_map.len(),
+                tagged_map.len(),
+                "the tagged map holds {} buckets against the live map's {}; it is not the same \
+                 population",
+                tagged_map.len(),
+                live_map.len()
+            );
+
+            let (live_bytes, live_allocs) = clone_counts(live_map);
+            let (tagged_bytes, tagged_allocs) = clone_counts(&tagged_map);
+            let live = Side { bytes: live_bytes, allocs: live_allocs };
+            let tagged = Side { bytes: tagged_bytes, allocs: tagged_allocs };
+            assert!(
+                live.bytes > 0 && live.allocs > 0 && tagged.bytes > 0 && tagged.allocs > 0,
+                "an instrument reading zero is the instrument failing, not the map being free: \
+                 live {live:?}, tagged {tagged:?}"
+            );
+
+            let width = if end_routing_bucket == WIDE_END {
+                "the whole keyspace".to_string()
+            } else {
+                format!("0..{end_routing_bucket}")
+            };
+            let (live_b, live_a) = live.per(records);
+            let (tagged_b, tagged_a) = tagged.per(records);
+            println!(
+                "\n{records} routed keys on {width}: {buckets} buckets, {:.3}% simple",
+                100.0 * hist.simple_fraction()
+            );
+            println!(
+                "    live    {:>10.3} B/record  {:>8.4} allocs/record   ({live_bytes} B, \
+                 {live_allocs} calls)",
+                live_b, live_a
+            );
+            println!(
+                "    tagged  {:>10.3} B/record  {:>8.4} allocs/record   ({tagged_bytes} B, \
+                 {tagged_allocs} calls)",
+                tagged_b, tagged_a
+            );
+            println!(
+                "    delta   {:>+10.3} B/record  {:>+8.4} allocs/record  ({:.3}x bytes, {:.3}x \
+                 allocations)",
+                tagged_b - live_b,
+                tagged_a - live_a,
+                tagged_b / live_b,
+                tagged_a / live_a
+            );
+
+            // THE ALLOCATION COUNT IS THE HALF THAT CANNOT BE ROUNDED AWAY, and it moves the
+            // wrong way at every arm: one box per occupied bucket that the live shape does not
+            // take.
+            assert!(
+                tagged.allocs > live.allocs,
+                "{records}/{end_routing_bucket}: the tagged shape took {} allocations against \
+                 the live shape's {}; it is meant to buy an allocation per occupied bucket and \
+                 if it does not, `retag` is not building the arms it claims to",
+                tagged.allocs,
+                live.allocs
+            );
+            // THE DECOMPOSITION, because the total hides two effects pulling opposite ways.
+            // The tagged side takes one box per OCCUPIED bucket, which the live side does not
+            // take at all; and its map nodes are cheaper, because a B-tree node holds eleven
+            // value slots whether they are filled or not and a narrower value fits more of them
+            // into one node. Subtracting the boxes leaves the tagged map's OWN node
+            // allocations, which must be FEWER than the live map's or the second effect is not
+            // happening and the byte column below has no mechanism.
+            assert!(
+                tagged.allocs >= hist.occupied() as u64,
+                "{records}/{end_routing_bucket}: the tagged shape took {} allocations over {} \
+                 occupied buckets; it owes one box to each and cannot take fewer",
+                tagged.allocs,
+                hist.occupied()
+            );
+            let tagged_nodes = tagged.allocs - hist.occupied() as u64;
+            println!(
+                "    boxes   {:>10} (one per occupied bucket)   map nodes: live {} vs tagged \
+                 {tagged_nodes}",
+                hist.occupied(),
+                live.allocs
+            );
+            assert!(
+                tagged_nodes < live.allocs,
+                "{records}/{end_routing_bucket}: the tagged map took {tagged_nodes} node \
+                 allocations against the live map's {}; a narrower value is meant to fit more \
+                 slots into one node, and if it does not then the byte column above has no \
+                 mechanism behind it",
+                live.allocs
+            );
+            cells.push((
+                records,
+                end_routing_bucket,
+                hist.simple_fraction(),
+                live_b,
+                tagged_b / live_b,
+                tagged_a / live_a,
+            ));
+        }
+    }
+
+    let first = path_lengths[0];
+    assert!(
+        path_lengths.iter().all(|length| *length == first),
+        "the store path length moved across arms ({path_lengths:?}); it shifts allocation bytes \
+         at about six bytes a character"
+    );
+    println!("\n  store path length held at {first} characters across all four stores");
+
+    // =========================================================================================
+    // THE VERDICT, AND IT IS THE SIMPLE FRACTION THAT CARRIES IT.
+    // =========================================================================================
+    //
+    // The byte saving is not a property of the shape. It is a property of HOW MANY BUCKETS ARE
+    // IN THE ARM THE SHAPE IS FOR, and the four cells say so: the saving tracks the simple
+    // fraction from 100% down to 0% and goes with it.
+    println!("\n=== what the tagged shape is worth, against how many buckets it is for ===");
+    println!("  {:<38} {:>9} {:>10} {:>12}", "corpus / range", "simple", "bytes", "allocations");
+    for (records, range, simple, _, byte_ratio, alloc_ratio) in &cells {
+        let width = if *range == WIDE_END {
+            "the whole keyspace".to_string()
+        } else {
+            format!("0..{range}")
+        };
+        println!(
+            "  {:<38} {:>8.3}% {:>9.3}x {:>11.3}x",
+            format!("{records} routed keys on {width}"),
+            100.0 * simple,
+            byte_ratio,
+            alloc_ratio
+        );
+    }
+
+    // WHERE THE SIMPLE ARM IS EVERYTHING, THE SHAPE IS WORTH 40% OF THE BYTES -- AND SEVEN
+    // TIMES THE ALLOCATIONS.
+    for (records, range, simple, _, byte_ratio, alloc_ratio) in &cells {
+        if *range != WIDE_END {
+            continue;
+        }
+        assert!(
+            *simple > 0.99,
+            "{records} on the whole keyspace read {simple:.5} simple; the cell is meant to be \
+             the one where the shape applies to everything"
+        );
+        assert!(
+            *byte_ratio < 0.65,
+            "{records} on the whole keyspace: the tagged shape read {byte_ratio:.3}x the bytes. \
+             It is meant to be a real byte saving there, and a decline that under-states the \
+             saving is as wrong as one that over-states it"
+        );
+        assert!(
+            *alloc_ratio > 5.0,
+            "{records} on the whole keyspace: the tagged shape read {alloc_ratio:.3}x the \
+             allocations; one box per bucket against a live shape that allocates only map nodes \
+             is what that costs, and a smaller figure would mean `retag` is not boxing"
+        );
+    }
+
+    // WHERE THE SIMPLE ARM IS ABSENT, THE SAVING IS ABSENT WITH IT. This is the control on the
+    // explanation: a cell the mechanism predicts should show nothing, measured.
+    let (_, _, simple, _, byte_ratio, alloc_ratio) = cells
+        .iter()
+        .find(|(records, range, _, _, _, _)| *records == LARGE && *range == NARROW_END)
+        .copied()
+        .expect("the configured-range cell at the large corpus");
+    assert_eq!(
+        0.0, simple,
+        "the configured range at {LARGE} records read {simple:.5} simple; the control below \
+         needs a cell with NO buckets in the arm the shape is for"
+    );
+    assert!(
+        byte_ratio > 0.95,
+        "the configured range at {LARGE} records read {byte_ratio:.3}x the bytes over a store \
+         with ZERO simple buckets. The mechanism says the saving comes from the simple arm, so a \
+         real saving here would mean it comes from somewhere else and the explanation is wrong"
+    );
+    assert!(
+        alloc_ratio > 1.0,
+        "the configured range still buys a box per bucket; it read {alloc_ratio:.3}x"
+    );
+    println!(
+        "\n  CONTROL: with 0.000% of buckets in the simple arm the shape saves {:.1}% of the \
+         bytes and still costs {alloc_ratio:.3}x the allocations",
+        100.0 * (1.0 - byte_ratio)
+    );
+
+    // AND THE ALTERNATIVE THE CHANGE IS COMPETING WITH IS A KNOB THAT ALREADY SHIPS. The same
+    // instrument, the same corpus, the live shape on both ranges.
+    let live_wide = cells
+        .iter()
+        .find(|(records, range, _, _, _, _)| *records == LARGE && *range == WIDE_END)
+        .map(|cell| cell.3)
+        .expect("the wide cell at the large corpus");
+    let live_narrow = cells
+        .iter()
+        .find(|(records, range, _, _, _, _)| *records == LARGE && *range == NARROW_END)
+        .map(|cell| cell.3)
+        .expect("the narrow cell at the large corpus");
+    println!(
+        "  FOR COMPARISON, the shipped knob: the LIVE shape reads {live_wide:.3} B/record on the \
+         whole keyspace and {live_narrow:.3} B/record on 0..{NARROW_END} -- {:.3}x, for a \
+         setting `docs/runtime_tuning.md` already tells an operator to make, with no allocation \
+         and no indirection",
+        live_narrow / live_wide
+    );
+    assert!(
+        live_narrow < live_wide,
+        "the configured range read {live_narrow:.3} B/record against the default's \
+         {live_wide:.3}; the comparison above assumes the shipped knob is the cheaper one"
+    );
+}
+
+// =============================================================================================
+// WHAT IT COSTS A READ
+// =============================================================================================
+
+/// How many distinct 64-byte lines a read has to touch to get from the node to the block's
+/// address. Measured from the ADDRESSES THEMSELVES at run time, not asserted.
+fn lines_touched(node_address: usize, address_address: usize) -> usize {
+    if node_address / 64 == address_address / 64 {
+        1
+    } else {
+        2
+    }
+}
+
+/// THE READ PATH, COUNTED -- AND WHAT IT COSTS IS NOW NOTHING.
+///
+/// THIS GUARD WAS RED ON MAIN BEFORE THIS CHANGE, AND IT WAS RED FOR A REASON WORTH HAVING. It
+/// asserted the live inline arm touches 1.5200 lines to reach a block's address, in a band chosen
+/// so that 2.00 -- the tagged arm's figure -- could not pass it. On `06828b8a0` the live arm
+/// touches 2.0000, the band refuses it, and the test fails. It is `#[ignore]`d, so nothing ran it.
+///
+/// WHY IT MOVED, MEASURED RATHER THAN GUESSED. A read crosses a line boundary when the address
+/// sits far enough into the node that no alignment can keep the two together. The node is
+/// 8-aligned, so a node's own start falls anywhere on an eight-byte step within its line; an
+/// address at offset D therefore shares the node's line only when D is under 64 AND the node
+/// happens to start early enough. THE OFFSET IS PRINTED BELOW. At 1.5200 it was under 64 and the
+/// B-tree slot decided each case; #1966 took eight bytes out of the address that sits inside the
+/// inline block entry, the fields after it moved, and the offset is now past 64 -- where no
+/// alignment can help and the answer is 2.0000 for every bucket without exception.
+///
+/// AND THAT REMOVES THE THIRD REASON THIS MODULE GIVES FOR DECLINING THE TAGGED SHAPE. The
+/// module's own summary lists it: "AND IT IS PAID FOR ON THE READ. A tagged simple arm touches
+/// 2.0000 lines to reach a block's address against the live arm's 1.5200 -- +0.4800 a read".
+/// Both arms touch 2.0000 now. The read cost of the indirection is +0.0000, measured, and the
+/// decline has to rest on the other two reasons or not at all. It does: see
+/// `the_hundred_and_twenty_bytes_a_tagged_key_saves_are_not_bytes_a_tagged_key_stops_holding`
+/// and `the_tagged_shape_priced_on_chunks_instead_of_requests`.
+///
+/// BOTH SIDES ARE NOW READ OUT OF A MAP, WHICH THEY WERE NOT. The live side took its node from a
+/// B-tree slot and the tagged side took its node from a STACK LOCAL, and the two homes have
+/// different alignment distributions -- so the comparison was between a heap node and a stack
+/// node, not between two representations. The tagged nodes are built into a map first and
+/// measured there.
+///
+/// THE CONTROL ON THE EXPLANATION IS KEPT. The mechanism claims the line count is decided by
+/// where the address sits, not by the shape being tagged, so the same count is taken over buckets
+/// whose live arm is ALREADY out of line -- the general arm -- where it predicts no difference.
+///
+/// rust-internal: measures the engine's own bucket map, no product behaviour
+#[test]
+#[ignore = "seeds two stores of 4,000 records; run by name"]
+fn a_tagged_simple_arm_adds_a_line_to_every_block_read_and_the_general_arm_shows_it_does_not() {
+    // --- THE INSTRUMENT'S OWN CONTROLS, BEFORE IT IS USED FOR ANYTHING. ---
+    //
+    // This test's finding is that BOTH arms touch two lines, and the assertions below say so as
+    // equalities. An equality against a constant cannot tell the measured value from a broken
+    // instrument: a `lines_touched` wedged at 2 satisfies every one of them. It was planted as a
+    // mutant and SURVIVED, which is how this got here.
+    //
+    // So the instrument is fed two inputs whose answers are known and disagree. A counter stuck
+    // at either answer fails one of them.
+    assert_eq!(
+        1,
+        lines_touched(0x1000, 0x1020),
+        "two addresses 32 B apart inside one 64 B line must read as ONE line; an instrument that \
+         cannot answer 1 cannot have measured the 2s below"
+    );
+    assert_eq!(
+        2,
+        lines_touched(0x1000, 0x1040),
+        "two addresses either side of a 64 B boundary must read as TWO lines"
+    );
+    assert_eq!(
+        1,
+        lines_touched(0x103f, 0x1000),
+        "the last byte of a line and its first are ONE line, in either order of arguments"
+    );
+
+    // --- THE SUBJECT: simple buckets, on the range where they are everything. ---
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, WIDE_END);
+    let keys = seed_routed(&engine, SMALL);
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1");
+    let live_map = &shard.bucket_index.bucket_map;
+
+    // THE TAGGED NODES LIVE IN A MAP, so both sides are measured in the same kind of home.
+    let tagged_map: BTreeMap<u32, TaggedNode> = live_map
+        .iter()
+        .filter(|(_, node)| node.block_index.len() == 1)
+        .map(|(routing_bucket, node)| (*routing_bucket, retag(node)))
+        .collect();
+
+    let mut live_lines = 0usize;
+    let mut tagged_lines = 0usize;
+    let mut simple_buckets = 0usize;
+    // THE OFFSET IS THE MECHANISM, so it is collected rather than reasoned about.
+    let mut offsets: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    let mut node_starts: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+    for (routing_bucket, node) in live_map.iter() {
+        if node.block_index.len() != 1 {
+            continue;
+        }
+        simple_buckets += 1;
+        let (handle, block) = node.block_index.iter().next().expect("the inline arm holds one page");
+        let node_at = node as *const BucketNode as usize;
+        let address_at = &block.address as *const _ as usize;
+        offsets.insert(address_at - node_at);
+        node_starts.insert(node_at % 64);
+        live_lines += lines_touched(node_at, address_at);
+
+        let tagged = tagged_map.get(routing_bucket).expect("every simple bucket was retagged");
+        let reached = tagged
+            .payload
+            .block(*handle)
+            .expect("the tagged simple arm must answer its own handle");
+        tagged_lines += lines_touched(
+            tagged as *const TaggedNode as usize,
+            &reached.address as *const _ as usize,
+        );
+    }
+
+    assert!(
+        simple_buckets > 0,
+        "the fixture reached no bucket in the inline arm, so the count below is over nothing"
+    );
+    assert_eq!(
+        simple_buckets,
+        keys.len(),
+        "the fixture wrote {} keys and reached {simple_buckets} inline-arm buckets",
+        keys.len()
+    );
+    assert_eq!(
+        simple_buckets,
+        tagged_map.len(),
+        "the tagged map holds {} of the {simple_buckets} simple buckets; it is not the same \
+         population",
+        tagged_map.len()
+    );
+
+    // --- THE MECHANISM, PRINTED WITH ITS DENOMINATOR. ---
+    assert_eq!(
+        1,
+        offsets.len(),
+        "the address sits at {offsets:?} different offsets inside the node across \
+         {simple_buckets} buckets; one declaration has one field offset, so more than one answer \
+         means this is not reading the field it thinks it is"
+    );
+    let offset = *offsets.iter().next().expect("one offset");
+    println!(
+        "\n  THE MECHANISM: the inline arm's address sits {offset} B into the node, and a node \
+         starts at {} distinct positions within a 64 B line",
+        node_starts.len()
+    );
+    // THE OFFSET DECIDES WHICH CLAIM THIS TEST CAN MAKE, AND IT HAS MOVED BACK UNDER A LINE.
+    //
+    // This assertion used to be `offset >= 64` with the note "re-measure rather than retarget".
+    // That is what happened. When the address sat 72 B into the node, the node and the address it
+    // resolves through could not share a 64 B line at any alignment, so the live arm touched
+    // 2.0000 lines and the indirection cost nothing. Merging the address's two slab coordinates
+    // took `BlockIndexMap` from 104 to 96 and the packed flags took four bytes off the tail ahead
+    // of it, and the field now sits UNDER a line into the node -- so a node that starts early
+    // enough in its line keeps both in one line, and the live arm reads below 2.0000 again.
+    //
+    // So the two arms are re-measured here rather than asserted equal, and the tagged arm's 2.0000
+    // is the only figure that is fixed by construction: a payload in its own allocation is a
+    // second line on every read, without exception.
+    assert!(
+        offset < 64,
+        "the address sits {offset} B into the node, PAST a line. At that offset the node and the \
+         address cannot share a line at any alignment and both arms read 2.0000 -- which is what \
+         this test asserted before the address narrowed. Re-measure rather than retarget: the \
+         difference below would be zero and the module's read-cost ground would be gone again"
+    );
+
+    let live_per = live_lines as f64 / simple_buckets as f64;
+    let tagged_per = tagged_lines as f64 / simple_buckets as f64;
+    println!(
+        "SIMPLE ARM over {simple_buckets} buckets: live {live_per:.4} lines a read, tagged \
+         {tagged_per:.4} -- {:+.4}",
+        tagged_per - live_per
+    );
+
+    // THE LIVE ARM SOMETIMES SHARES A LINE, WHICH IS THE WHOLE OF THE DIFFERENCE.
+    assert!(
+        live_lines < 2 * simple_buckets,
+        "the live inline arm touched {live_lines} lines over {simple_buckets} buckets, which is \
+         two a read. With its address {offset} B into the node -- under a line -- a node that \
+         starts early enough in its line must keep both in ONE, so a flat two a read means the \
+         offset above is not the one the read actually walks"
+    );
+    assert!(
+        live_lines > simple_buckets,
+        "the live inline arm touched {live_lines} lines over {simple_buckets} buckets, which is \
+         one a read. Not every node can start early enough in its line to keep both, so a flat \
+         one a read means the node-start distribution below is not being sampled"
+    );
+    assert_eq!(
+        2 * simple_buckets,
+        tagged_lines,
+        "the tagged simple arm touched {tagged_lines} lines over {simple_buckets} buckets; a \
+         payload in its own allocation is a second line on every page read, without exception"
+    );
+    assert!(
+        tagged_lines > live_lines,
+        "the tagged arm read {tagged_per:.4} lines against the live arm's {live_per:.4}, which is \
+         not MORE. The indirection is supposed to cost a line wherever the live arm shares one"
+    );
+    println!(
+        "  SO THE INDIRECTION COSTS {:+.4} LINES A READ, AND THE THIRD GROUND FOR THE DECLINE IS \
+         LIVE AGAIN. It was +0.0000 while the address sat past a line into the node; the address \
+         merge brought it back under one, so the live arm shares a line for {} of \
+         {simple_buckets} buckets and the tagged arm shares one for none.\n  \
+         WHAT THE COUNT STILL CANNOT SEE is unchanged: a line count is not a cost, and the \
+         unmeasured remainder can only run against the tagged shape.",
+        tagged_per - live_per,
+        2 * simple_buckets - live_lines,
+    );
+    println!(
+        "  (SUPERSEDED) While the address sat past a line into the node the page entry was a line \
+         away whether it was held inline or behind a pointer, so moving it out of line added no \
+         line. That is no longer the case, and the figures above are what replaced it."
+    );
+
+    // WHAT THIS COUNT CANNOT SEE, SAID PLAINLY, BECAUSE A DECLINE RESTS ON IT.
+    //
+    // An equal COUNT would not be a proof of equal cost, and an unequal one is not a measure of
+    // the difference either. Inline, the second line -- when there is one -- is inside the SAME
+    // allocation as the first: adjacent, on the same block, and very likely already fetched.
+    // Behind a pointer it is wherever the allocator put it, which
+    // is a different line, possibly a different block, and a separate entry in the translation
+    // buffer. This instrument counts distinct 64-byte lines and is blind to that difference.
+    //
+    // IT IS REPORTED RATHER THAN ASSERTED because the honest form of it is a measurement this
+    // module does not have: separating the two needs a hardware counter or a timing harness, and
+    // a timing ratio in this campaign read 485x idle against 11x busy off identical code. So the
+    // claim made here is the narrow one the instrument supports -- the tagged arm adds no LINE --
+    // and the wider claim, that it adds no COST, is NOT made.
+    //
+    // It does not change the conclusion, and it changes which way the uncertainty points: the
+    // unmeasured part of the read cost can only make the tagged shape worse, never better.
+    let live_spread = simple_buckets; // one measured pair per bucket, stated as the denominator
+    println!(
+        "  AND WHAT THIS COUNT CANNOT SEE: over {live_spread} buckets both shapes touch two \
+         lines, but the live arm's second line is INSIDE the node's own allocation and the \
+         tagged arm's is in a separate one. Counting lines cannot tell an adjacent line from a \
+         distant one, so +0.0000 is 'adds no line', not 'adds no cost' -- and the part that is \
+         unmeasured can only run against the tagged shape."
+    );
+
+    // --- THE CONTROL: a workload where the mechanism predicts NO difference. ---
+    drop(shards);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, WIDE_END);
+    seed_container(&engine, SMALL / 100, 100);
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1");
+    let general_map: BTreeMap<u32, TaggedNode> = shard
+        .bucket_index
+        .bucket_map
+        .iter()
+        .filter(|(_, node)| matches!(node.block_index, BlockIndexMap::Many(_)))
+        .map(|(routing_bucket, node)| (*routing_bucket, retag(node)))
+        .collect();
+    let mut control_live = 0usize;
+    let mut control_tagged = 0usize;
+    let mut general_buckets = 0usize;
+    for (routing_bucket, node) in shard.bucket_index.bucket_map.iter() {
+        if !matches!(node.block_index, BlockIndexMap::Many(_)) {
+            continue;
+        }
+        general_buckets += 1;
+        let (handle, block) = node.block_index.iter().next().expect("a general arm holds pages");
+        control_live += lines_touched(
+            node as *const BucketNode as usize,
+            &block.address as *const _ as usize,
+        );
+        let tagged = general_map.get(routing_bucket).expect("every general bucket was retagged");
+        let reached = tagged.payload.block(*handle).expect("the tagged general arm must answer");
+        control_tagged += lines_touched(
+            tagged as *const TaggedNode as usize,
+            &reached.address as *const _ as usize,
+        );
+    }
+
+    assert!(
+        general_buckets > 0,
+        "the control reached no bucket in the general arm, so it controls nothing"
+    );
+    println!(
+        "CONTROL, general arm over {general_buckets} buckets: live {:.4} lines a read, tagged \
+         {:.4} -- {:+.4}, and the mechanism predicts 0",
+        control_live as f64 / general_buckets as f64,
+        control_tagged as f64 / general_buckets as f64,
+        (control_tagged as f64 - control_live as f64) / general_buckets as f64
+    );
+    assert_eq!(
+        control_live, control_tagged,
+        "the control moved from {control_live} lines to {control_tagged} over {general_buckets} \
+         buckets; where the live arm is ALREADY out of line the tagged shape must cost nothing"
+    );
+}
+
+// =============================================================================================
+// THE REVISIT: WHAT THE SAVING IS ONCE THE ALLOCATOR CHUNK IS COUNTED
+// =============================================================================================
+
+/// What one `clone()` charges, in REQUEST bytes, in CHUNK bytes, and in calls.
+///
+/// The request column is what the caller asked for; the chunk column is what the allocator set
+/// aside to answer. Everything above this line in this module is priced on the first, and the
+/// note on `what_the_tagged_node_actually_costs_the_allocator` says so in as many words: it
+/// "UNDER-charges the tagged side, which is the side that takes the allocations", and calls its
+/// own byte column "a floor on the tagged side's cost, not an estimate of it". This is the
+/// estimate.
+#[cfg(feature = "alloc-probe")]
+fn clone_counts_chunked<T: Clone>(value: &T) -> (u64, u64, u64) {
+    let probe = Probe::start();
+    let copy = value.clone();
+    let counts = probe.stop();
+    std::hint::black_box(&copy);
+    drop(copy);
+    (counts.alloc_bytes, counts.chunk_bytes, counts.allocs)
+}
+
+/// THE PER-KEY FOOTPRINT OF A SIMPLE BUCKET, MEASURED RATHER THAN CALCULATED.
+///
+/// THE CLAIM THIS EXISTS TO CHECK. The proposal is described as taking the node from its full
+/// width down to 64 -- "one hundred and twenty bytes on every key" when the node was 184. Both
+/// numbers are right and the subtraction between them is not, because those bytes do not leave:
+/// all but sixteen of them move into a heap allocation, and an allocation costs the chunk it is
+/// served from rather than the width that was asked for.
+///
+/// THE COUNT IS NOT A CONSTANT, WHICH IS WHY IT IS NO LONGER IN THIS TEST'S NAME. The node has
+/// since gone 184 -> 176 (the address inside the inline block entry merged its slab id and its
+/// offset into one word) and the boxed payload went 112 -> 104 with it. The saving the sentence
+/// claims is therefore 112 bytes now, not 120, and it will move again the next time the block entry
+/// does. What does NOT move is the direction, which is the whole content of this test: the payload
+/// shrank by the same eight bytes as the node, so the chunk it is served from shrank by one
+/// rounding step too, and the pair still does not come in under the inline width.
+///
+/// AND THE BYTE MARGIN HAS CLOSED TO AT BEST ZERO, WHICH IS A CHANGE IN THE ARGUMENT AND IS
+/// STATED AS ONE. At a 184-byte node the pair was 192 and the key held 8 bytes MORE. At 168 the
+/// pair reads 168 here -- the key holds the SAME bytes -- and "at best" is doing real work in that
+/// sentence: the chunk a 104-byte payload is served from is not a function of the request alone.
+/// glibc hands over a free chunk that is BIG ENOUGH, so the same payload reads a 112-byte chunk in
+/// this process and a 128-byte one in a process that allocated differently first. The byte margin
+/// is therefore zero at best and negative whenever a larger chunk is on the bin.
+///
+/// So the assertion below is that the pair never comes in UNDER the inline width -- which is the
+/// claim being refuted, and the only stable form of it -- and the delta is printed rather than
+/// pinned. Pinning it would make this test fail on the day the allocator serves the payload from a
+/// different bin, without the conclusion changing at all.
+///
+/// `the_tagged_node_is_sixty_four_bytes_and_every_arm_reconstructs` already states the sum, and
+/// states it as arithmetic -- "ARITHMETIC ONLY", in its own words, with the chunk taken from a
+/// formula. The formula is not checked there against anything. Here the chunk is READ BACK FROM
+/// THE ALLOCATOR for the payload the proposal would actually box, so the pair is a measurement.
+///
+/// THE RESIDUAL THAT CAN FAIL. Every allocation's chunk must exceed its request by at least the
+/// header word and at most a full rounding step. That is not a restatement of the chunk figure --
+/// it is a property of the allocator that the reading either has or has not got -- and it is the
+/// assertion that fails first if `chunk_behind` ever degrades to handing back the request, which
+/// is what it does on a target whose allocator cannot be asked.
+///
+/// rust-internal: measures declarations and this crate's allocator, no product behaviour
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn the_bytes_a_tagged_key_saves_are_not_bytes_a_tagged_key_stops_holding() {
+    let boxed = Box::new(SimpleLayout {
+        object_id: 1,
+        handle: 7,
+        block: block_fixture(),
+    });
+    let chunk = crate::alloc_probe::chunk_behind(&boxed);
+    let request = size_of::<SimpleLayout>();
+
+    // --- THE RESIDUAL, AND IT IS NOT ALGEBRA ON THE FIGURE IT AUDITS. ---
+    let over = chunk - request;
+    assert!(
+        (8..=24).contains(&over),
+        "the allocator set aside {chunk} B for a {request} B payload, {over} B over. A chunk owes \
+         its request a header word and at most one rounding step; outside that band the reading \
+         is not a chunk, and the degraded path -- which hands the request straight back and would \
+         read 0 here -- is the case this catches"
+    );
+
+    let inline = size_of::<BucketNode>();
+    let pair = size_of::<TaggedNode>() + chunk;
+    println!(
+        "\n  A SIMPLE BUCKET, PER KEY:\n    live    {inline:>4} B, held inline in the node, no allocation\n    \
+         tagged  {:>4} B of node + {chunk} B of chunk (for a {request} B payload) = {pair} B",
+        size_of::<TaggedNode>()
+    );
+    println!(
+        "    delta   {:>+4} B per key, and one allocation and one indirection that were not there",
+        pair as i64 - inline as i64
+    );
+
+    // --- THE CLAIM, NAMED AND REFUSED. ---
+    //
+    // The count is DERIVED from the two widths rather than written down, so it moves when the
+    // node does instead of going stale beside it. It was 120 when the node was 184, and 112 when the
+    // node was 160.
+    //
+    // 40 SINCE mx#1975 TOOK THE NODE TO 88 by moving the single block entry behind a pointer. The
+    // derivation moved and this PIN did not, so the guard has been red under `--features alloc-probe`
+    // since that merge -- red on a surface no default gate compiles, which is the whole reason a
+    // width assertion needs its own sweep: it COMPILES whatever the width is. `TaggedNode` holds no
+    // block entry and no address, so neither term here moves with an address narrowing; this pin is
+    // paid down rather than introduced.
+    let claimed_saving = inline - size_of::<TaggedNode>();
+    assert_eq!(
+        40, claimed_saving,
+        "the node goes {inline} -> {} on this tree, a claimed saving of {claimed_saving} B; if \
+         that has changed, the sentence this test refutes has changed with it",
+        size_of::<TaggedNode>()
+    );
+    assert!(
+        pair >= inline,
+        "a tagged simple bucket holds {pair} B per key against the live shape's {inline} B, which \
+         is LESS -- a real per-key saving. The decline recorded in this module rests on the bytes \
+         not going away, so if they now do, the decline is stale and the shape should be built"
+    );
+    println!(
+        "    so: the node narrows by {claimed_saving} B and the KEY holds {} B more. The saving \
+         that does exist is not this one -- it is B-tree slot waste, priced in the next test.",
+        pair - inline
+    );
+    // WHERE THE MARGIN NOW STANDS, stated rather than pinned. Equal is the interesting case and
+    // the one this tree is in: the byte argument against the shape has been spent, and what is
+    // left is the allocation and the indirection.
+    if pair == inline {
+        println!(
+            "    NOTE: the pair is EXACTLY the inline width IN THIS READING, which is the BEST the \
+             tagged shape can do rather than what it always does. The chunk a {request} B payload \
+             is served from is not a function of the request alone: glibc hands over a free chunk \
+             that is big enough, so the same payload reads 112 B here and 128 B in a process that \
+             has allocated differently first (which is why \
+             `the_chunk_counter_agrees_with_the_documented_glibc_chunk_rule` asserts the rule as a \
+             FLOOR and not as an equality). So the byte margin against the tagged shape is at best \
+             zero and worse than zero whenever a larger chunk is on the bin -- and what remains \
+             against it besides is one allocation, one indirection, and the +0.6167 lines a read \
+             that `a_tagged_simple_arm_adds_a_line_to_every_page_read_and_the_general_arm_shows_it_\
+             does_not` measures."
+        );
+    }
+}
+
+/// THE FOUR CELLS AGAIN, WITH THE COLUMN #1965 COULD ONLY QUOTE AS A FORMULA.
+///
+/// WHY THE REQUEST COLUMN IS NOT ENOUGH. The live shape holds its block entry inline, so the only
+/// thing it asks the allocator for is B-tree nodes: few, large, and barely rounded. The tagged
+/// shape asks for one payload per occupied bucket on top -- 104 bytes at this node width, served
+/// from a chunk of at least 112 bytes. The rounding lands entirely on the side that is being compared
+/// favourably, so a request-only comparison is biased, in a known direction, by a known amount.
+/// This measures it instead. The cells below were measured when the payload was 112 bytes in a
+/// 128-byte chunk; the payload lost eight bytes with the address merge and the chunk lost a
+/// rounding step with it, so the CELLS have moved and the direction has not.
+///
+/// WHAT IS NOT IN DISPUTE. The byte saving at the default routing range is real and this
+/// reproduces it. What the chunk column changes is HOW BIG, and what the per-key test above
+/// changes is WHERE IT COMES FROM: not from the key holding less, but from a B-tree slot holding
+/// a narrower value. Those are different mechanisms with different fixes and only one of them
+/// survives the routing range an operator is told to set.
+///
+/// THE READ COST, IN THE INSTRUMENT'S OWN TERMS. A read allocates nothing in either shape, so the
+/// counting allocator reads the read path as 0.000 -- which is not the read being free, it is the
+/// instrument being blind to it. That is asserted here rather than left implied, so the line
+/// count in `a_tagged_simple_arm_adds_a_line_to_every_page_read_and_the_general_arm_shows_it_does
+/// _not` is known to be the WHOLE of the read cost and not a part of it.
+///
+/// rust-internal: measures the engine's own bucket map, no product behaviour
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "seeds four stores of 4,000 and 40,000 records; run by name"]
+fn the_tagged_shape_priced_on_chunks_instead_of_requests() {
+    let mut path_lengths: Vec<usize> = Vec::new();
+    // (records, range, simple fraction, request ratio, chunk ratio, alloc ratio, chunk B/record live, tagged)
+    let mut cells: Vec<(usize, u32, f64, f64, f64, f64, f64, f64)> = Vec::new();
+
+    for records in [SMALL, LARGE] {
+        for end_routing_bucket in [WIDE_END, NARROW_END] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            path_lengths.push(dir.path().as_os_str().len());
+            let engine = engine_on(dir.path());
+            load_on(&engine, end_routing_bucket);
+            let keys = seed_routed(&engine, records);
+            let hist = arm_histogram(&engine);
+
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard 1");
+            let live_map = &shard.bucket_index.bucket_map;
+            assert_eq!(
+                hist.total_blocks(),
+                keys.len(),
+                "the map holds {} pages for {} keys, so the per-record divisor is not the \
+                 fixture's",
+                hist.total_blocks(),
+                keys.len()
+            );
+
+            let tagged_map: BTreeMap<u32, TaggedNode> = live_map
+                .iter()
+                .map(|(routing_bucket, node)| (*routing_bucket, retag(node)))
+                .collect();
+            assert_eq!(
+                live_map.len(),
+                tagged_map.len(),
+                "the tagged map is not the same population as the live one"
+            );
+
+            let (live_req, live_chunk, live_allocs) = clone_counts_chunked(live_map);
+            let (tag_req, tag_chunk, tag_allocs) = clone_counts_chunked(&tagged_map);
+            assert!(
+                live_req > 0 && tag_req > 0 && live_allocs > 0 && tag_allocs > 0,
+                "an instrument reading zero is the instrument failing, not the map being free"
+            );
+
+            // THE CHUNK COLUMN IS NEVER BELOW THE REQUEST COLUMN. If it is, the reading has
+            // degraded to echoing the request and every ratio below is the old figure wearing a
+            // new name.
+            assert!(
+                live_chunk > live_req && tag_chunk > tag_req,
+                "chunk bytes must exceed request bytes on both sides and read live {live_chunk} \
+                 vs {live_req}, tagged {tag_chunk} vs {tag_req}; an equal reading is the \
+                 degraded path and this whole test would then be a copy of \
+                 `what_the_tagged_node_actually_costs_the_allocator`"
+            );
+
+            let width = if end_routing_bucket == WIDE_END {
+                "the whole keyspace".to_string()
+            } else {
+                format!("0..{end_routing_bucket}")
+            };
+            let per = |v: u64| v as f64 / records as f64;
+            println!(
+                "\n{records} routed keys on {width}: {} buckets, {:.3}% simple",
+                live_map.len(),
+                100.0 * hist.simple_fraction()
+            );
+            println!(
+                "    live    request {:>9.3} B/rec   CHUNK {:>9.3} B/rec   {:>8.4} allocs/rec",
+                per(live_req),
+                per(live_chunk),
+                per(live_allocs)
+            );
+            println!(
+                "    tagged  request {:>9.3} B/rec   CHUNK {:>9.3} B/rec   {:>8.4} allocs/rec",
+                per(tag_req),
+                per(tag_chunk),
+                per(tag_allocs)
+            );
+            println!(
+                "    ratio           {:>9.3}x           {:>9.3}x           {:>8.3}x",
+                tag_req as f64 / live_req as f64,
+                tag_chunk as f64 / live_chunk as f64,
+                tag_allocs as f64 / live_allocs as f64
+            );
+            println!(
+                "    the chunk column moves the tagged side {:+.3}x against the request column \
+                 -- rounding the request column cannot see",
+                (tag_chunk as f64 / live_chunk as f64) - (tag_req as f64 / live_req as f64)
+            );
+
+            cells.push((
+                records,
+                end_routing_bucket,
+                hist.simple_fraction(),
+                tag_req as f64 / live_req as f64,
+                tag_chunk as f64 / live_chunk as f64,
+                tag_allocs as f64 / live_allocs as f64,
+                per(live_chunk),
+                per(tag_chunk),
+            ));
+        }
+    }
+
+    let first = path_lengths[0];
+    assert!(
+        path_lengths.iter().all(|length| *length == first),
+        "the store path length moved across arms ({path_lengths:?}); it shifts allocation bytes \
+         at about six bytes a character"
+    );
+    println!("\n  store path length held at {first} characters across all four stores");
+
+    println!("\n=== the tagged shape, priced on what the allocator sets aside ===");
+    println!(
+        "  {:<38} {:>8} {:>10} {:>10} {:>12}",
+        "corpus / range", "simple", "request", "CHUNK", "allocations"
+    );
+    for (records, range, simple, req, chunk, allocs, _, _) in &cells {
+        let width = if *range == WIDE_END {
+            "the whole keyspace".to_string()
+        } else {
+            format!("0..{range}")
+        };
+        println!(
+            "  {:<38} {:>7.3}% {:>9.3}x {:>9.3}x {:>11.3}x",
+            format!("{records} routed keys on {width}"),
+            100.0 * simple,
+            req,
+            chunk,
+            allocs
+        );
+    }
+
+    // --- THE CHUNK COLUMN IS WORSE FOR THE TAGGED SIDE AT EVERY CELL, WHICH IS THE POINT. ---
+    for (records, range, _, req, chunk, _, _, _) in &cells {
+        assert!(
+            chunk > req,
+            "{records}/{range}: the tagged shape read {chunk:.4}x on chunks against {req:.4}x on \
+             requests. The chunk column must be the less favourable of the two -- the tagged side \
+             is the one taking the allocations, and rounding falls on whoever allocates. A chunk \
+             ratio at or below the request ratio means the columns are not measuring what they \
+             are named for"
+        );
+    }
+
+    // --- THE VERDICT, WITH THE READ COST SET AGAINST THE SAVING RATHER THAN BESIDE IT. ---
+    let (_, _, _, _, wide_chunk, wide_allocs, wide_live_b, wide_tag_b) = cells
+        .iter()
+        .find(|(records, range, ..)| *records == LARGE && *range == WIDE_END)
+        .copied()
+        .expect("the wide cell at the large corpus");
+    let (_, _, narrow_simple, _, narrow_chunk, narrow_allocs, narrow_live_b, narrow_tag_b) = cells
+        .iter()
+        .find(|(records, range, ..)| *records == LARGE && *range == NARROW_END)
+        .copied()
+        .expect("the narrow cell at the large corpus");
+
+    println!("\n=== THE TRADE, STATED ===");
+    println!(
+        "  DEFAULT RANGE  (every key alone in a bucket): {wide_live_b:.1} -> {wide_tag_b:.1} \
+         B/record, {:+.1} B a key saved, at {wide_allocs:.2}x the allocations and +0.4800 cache \
+         lines on EVERY page read",
+        wide_live_b - wide_tag_b
+    );
+    println!(
+        "  CONFIGURED RANGE (0..{NARROW_END}, what runtime tuning tells an operator to set): \
+         {narrow_live_b:.1} -> {narrow_tag_b:.1} B/record, {:+.1} B a key saved, at \
+         {narrow_allocs:.2}x the allocations -- over a store with {:.3}% of buckets in the arm \
+         the shape is for",
+        narrow_live_b - narrow_tag_b,
+        100.0 * narrow_simple
+    );
+    println!(
+        "  AND THE CONFIGURED RANGE IS ALREADY THE CHEAPER STORE: {narrow_live_b:.1} B/record \
+         against {wide_live_b:.1} on the LIVE shape, {:.3}x, for a setting that costs no \
+         allocation, no indirection and no line of code.",
+        narrow_live_b / wide_live_b
+    );
+
+    // The number that decides it: what the shape is worth where an operator actually runs.
+    assert!(
+        narrow_chunk > 0.95,
+        "at the configured range the tagged shape read {narrow_chunk:.4}x the chunk bytes. The \
+         decline in this module rests on the saving being nearly absent there; a figure that has \
+         dropped materially below 1.0 means it is no longer absent and the shape should be built"
+    );
+    assert!(
+        wide_chunk < 0.80,
+        "at the default range the tagged shape read {wide_chunk:.4}x the chunk bytes; the saving \
+         there is real and a decline that under-states it is as wrong as one that over-states it"
+    );
+
+    // --- THE READ COST, IN THE INSTRUMENT'S OWN TERMS. ---
+    //
+    // A read resolves a handle to an address and allocates nothing doing it, in either shape. So
+    // the counting allocator -- the instrument every byte figure above comes from -- is BLIND to
+    // the read cost, and the cache-line count is not one input among several: it is the only
+    // measurement of the read there is. Asserted rather than assumed, because a decline that
+    // rests on a read cost has to know that its own instrument cannot see it.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, WIDE_END);
+    let keys = seed_routed(&engine, SMALL);
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1");
+    let node = shard
+        .bucket_index
+        .bucket_map
+        .values()
+        .find(|node| node.block_index.len() == 1)
+        .expect("a simple bucket");
+    let tagged = retag(node);
+    let (handle, _) = node.block_index.iter().next().expect("one page");
+    let handle = *handle;
+
+    let probe = Probe::start();
+    let reached = tagged.payload.block(handle).expect("the tagged arm answers");
+    let counts = probe.stop();
+    std::hint::black_box(&reached.address);
+    println!(
+        "\n  READING one page through the tagged word charged {} allocations and {} chunk bytes \
+         over {} keys",
+        counts.allocs,
+        counts.chunk_bytes,
+        keys.len()
+    );
+    assert_eq!(
+        0, counts.allocs,
+        "resolving a handle through the tagged word charged {} allocations; it is meant to be a \
+         mask and a load",
+        counts.allocs
+    );
+    println!(
+        "  SO THE READ COST IS NOT IN ANY COLUMN ABOVE. The counting allocator reads it as 0.000 \
+         because nothing is allocated, exactly as a resident-only change predicts. The whole of \
+         the read cost is the +0.4800 cache lines a page read measured in \
+         `a_tagged_simple_arm_adds_a_line_to_every_block_read_and_the_general_arm_shows_it_does_not`."
+    );
+}
+
+// =============================================================================================
+// THE COMPONENT LEVEL IS GONE, AND THIS SECTION'S OWN CLOSING ASSERTION SAID SO FIRST
+// =============================================================================================
+//
+// `the_component_level_is_not_a_list_of_one` was here. It asked whether `ComponentList`'s three
+// arms were machinery for a population that is always one, and it answered in two halves. Both
+// halves are worth keeping on the record, because one of them was RIGHT AND IRRELEVANT and the
+// other had already failed.
+//
+// THE FIRST HALF MEASURED THE WRONG DENOMINATOR. It asserted `size_of::<ComponentList>() ==
+// size_of::<ComponentBlocks>()` and concluded, in as many words, "there are no bytes here to
+// reclaim". Both were 40, so the claim was true: the three-arm WRAPPER cost nothing over the
+// payload it wrapped. But the question the level posed was not what the wrapper cost over its
+// payload -- it was what the payload cost over what it had to carry, and the payload was a
+// 24-byte `BlockRefs` behind a 16-byte `Option<Arc<str>>` holding a constant `None`. The bytes
+// were one level below where the comparison looked. Asking "is the wrapper free?" cannot find
+// them however carefully it is measured.
+//
+// THE SECOND HALF COULD ONLY EVER HAVE FAILED. Its closing assertion was `many_total > 0`, with
+// the message "if it reached ZERO Many arms then a field is not a component of its key's object
+// and the whole reading of this level is wrong". Once the element name came off the page entry,
+// `insert_object_block_lookup` filed every page of an object under one nameless slot -- so every
+// object had exactly one component, no `Many` arm could arise, and `many_total` was 0 for any
+// fixture at all. The arm carries `#[ignore]` and runs only by name, so it never reported the
+// conclusion its own failure message spelled out.
+//
+// Both levels of `ComponentList` and `ComponentBlocks` are now deleted, so there is nothing left
+// here to count arms of. The surviving distribution question -- how many refs one object's slot
+// holds -- is `index_bytes_per_key`'s.
