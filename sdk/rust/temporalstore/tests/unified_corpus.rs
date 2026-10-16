@@ -162,3 +162,167 @@ fn unified_corpus_proxy_contract() {
             "context_upsert_embedding",
             "context_upsert_summary",
             "context_write_compression",
+            "context_write_index_ref",
+            "context_query_index_and",
+            "context_retrieve",
+            "context_ingest_resource",
+            "context_extract_resource_events",
+            "context_retrieve_with_resources",
+            "context_ingest_feedback",
+        ]
+    };
+    for required in required_commands {
+        assert!(
+            command_kinds.contains(*required),
+            "missing required context command {required}"
+        );
+    }
+
+    if full_context_corpus {
+        assert!(
+            context_case_count >= 4,
+            "expected canonical executable context parity cases"
+        );
+        assert!(
+            context_step_count >= 14,
+            "expected canonical context command coverage"
+        );
+    } else {
+        assert!(
+            context_case_count >= 1,
+            "expected a focused context parity case"
+        );
+        assert!(
+            context_step_count >= 30,
+            "expected broad focused context command coverage"
+        );
+    }
+}
+
+fn assert_required_strings(coverage: &Value, field: &str, actual: &BTreeSet<String>) {
+    let expected = coverage
+        .get(field)
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("coverage.{field} must be an array"));
+    for item in expected {
+        let value = item
+            .as_str()
+            .unwrap_or_else(|| panic!("coverage.{field} entries must be strings"));
+        assert!(
+            actual.contains(value),
+            "coverage.{field} includes missing value {value}"
+        );
+    }
+}
+
+fn validate_context_command(case_name: &str, kind: &str, command: &Value) {
+    match kind {
+        "context_upsert_node" => {
+            assert!(
+                command.get("record").and_then(Value::as_object).is_some()
+                    || command.get("node").and_then(Value::as_object).is_some(),
+                "{case_name}:{kind} needs record or node"
+            );
+        }
+        "context_upsert_child_ref" => {
+            assert!(
+                command.get("record").and_then(Value::as_object).is_some()
+                    || command
+                        .get("child_ref")
+                        .and_then(Value::as_object)
+                        .is_some(),
+                "{case_name}:{kind} needs record or child_ref"
+            );
+        }
+        "context_upsert_entity" => {
+            assert!(
+                command.get("record").and_then(Value::as_object).is_some()
+                    || command.get("entity").and_then(Value::as_object).is_some(),
+                "{case_name}:{kind} needs record or entity"
+            );
+        }
+        "context_write_event" => {
+            assert!(
+                command.get("record").and_then(Value::as_object).is_some()
+                    || command.get("event").and_then(Value::as_object).is_some(),
+                "{case_name}:{kind} needs record or event"
+            );
+        }
+        "context_write_index_ref" => {
+            assert!(
+                command.get("record").and_then(Value::as_object).is_some()
+                    || command
+                        .get("index_ref")
+                        .and_then(Value::as_object)
+                        .is_some(),
+                "{case_name}:{kind} needs record or index_ref"
+            );
+        }
+        // This command carries five scalars and no nested object: see
+        // `TemporalStoreTable::context_mark_summary_dirty`, whose arguments are
+        // exactly these. Asserting each of them by name is what makes this arm a
+        // check; an earlier version demanded a `record` or `marker` object that the
+        // command has never had, and nothing noticed because this crate did not
+        // compile.
+        "context_mark_summary_dirty" => {
+            int_field(command, "tenant_hash");
+            int_field(command, "node_hash");
+            int_field(command, "event_time_ms");
+            int_field(command, "reason");
+            int_field(command, "propagate_depth");
+        }
+        "context_write_pack_audit" => {
+            assert!(
+                command.get("record").and_then(Value::as_object).is_some()
+                    || command.get("audit").and_then(Value::as_object).is_some(),
+                "{case_name}:{kind} needs record or audit"
+            );
+        }
+        "context_upsert_summary" => {
+            assert!(
+                command.get("record").and_then(Value::as_object).is_some()
+                    || command.get("summary").and_then(Value::as_object).is_some(),
+                "{case_name}:{kind} needs record or summary"
+            );
+        }
+        // Kept record-only on purpose: the corpus's compression steps carry a
+        // `record`, so widening this with the arm above would have loosened a
+        // clause that was already correct.
+        "context_write_compression" => {
+            assert!(
+                command.get("record").and_then(Value::as_object).is_some(),
+                "{case_name}:{kind} needs record"
+            );
+        }
+        "context_upsert_embedding" => {
+            let record = command.get("record").expect("embedding record");
+            assert!(record
+                .get("vector")
+                .and_then(Value::as_array)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false));
+        }
+        "context_retrieve" | "context_retrieve_with_resources" | "context_traverse_tree" => {
+            int_field(command, "tenant_hash");
+            int_field(command, "root_node_hash");
+            assert!(command
+                .get("query_vector")
+                .and_then(Value::as_array)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false));
+        }
+        "context_assert_parity_gates" => {
+            int_field(command, "expect_passed_gates");
+            int_field(command, "root_node_hash");
+            int_field(command, "approval_node_hash");
+            assert!(command
+                .get("expect_resource_chunk_any")
+                .and_then(Value::as_array)
+                .map(|v| !v.is_empty())
+                .unwrap_or(false));
+        }
+        _ => {
+            assert!(kind.starts_with("context_"));
+        }
+    }
+}
