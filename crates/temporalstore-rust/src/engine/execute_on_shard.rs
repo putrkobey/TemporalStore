@@ -1781,3 +1781,3570 @@ pub(crate) fn execute_on_shard(
             // installing the resulting bucket cannot.
             let mut bucket_state = Vec::with_capacity(16);
             bucket_state.extend_from_slice(&next.0.to_le_bytes());
+            bucket_state.extend_from_slice(&next.1.to_le_bytes());
+            stage_meta_outcome(
+                shard_id,
+                "bucket",
+                &key,
+                start_routing_bucket,
+                end_routing_bucket,
+                Some(bucket_state),
+                None,
+                false,
+            );
+            // The outcome is the bucket the take LEFT BEHIND -- tokens and the refill moment --
+            // not the take itself. Re-running a take would recompute against a different clock;
+            // installing the resulting bucket cannot.
+            let mut bucket_state = Vec::with_capacity(16);
+            bucket_state.extend_from_slice(&next.0.to_le_bytes());
+            bucket_state.extend_from_slice(&next.1.to_le_bytes());
+            stage_meta_outcome(
+                shard_id,
+                "bucket",
+                &key,
+                start_routing_bucket,
+                end_routing_bucket,
+                Some(bucket_state),
+                None,
+                false,
+            );
+            shard.buckets.insert(std::sync::Arc::from(&key[..]), next);
+            mutated = true;
+            CommandResponse::Members {
+                members: bucket_answer(allowed, remaining, retry_after_ms),
+            }
+        }
+        Command::BucketPeek {
+            key,
+            tokens,
+            capacity,
+            refill_per_sec,
+        } => {
+            // A peek that drops a lapsed bucket has changed the shard, so it says so -- the
+            // answer below then describes a bucket at full capacity, which is what the caller
+            // would get from the next take.
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+            }
+            let now = resolve_now_ms();
+            let current = shard.buckets.get(&key[..]).copied();
+            let (allowed, remaining, retry_after_ms, _) =
+                bucket_take(current, now, tokens, capacity, refill_per_sec);
+            CommandResponse::Members {
+                members: bucket_answer(allowed, remaining, retry_after_ms),
+            }
+        }
+        Command::ZSetIncrBy {
+            key,
+            member,
+            increment,
+        } => {
+            remove_if_expired(shard, &key);
+            let old = shard
+                .zsets
+                .get(&key)
+                .and_then(|members| members.get(&member))
+                .map(|(biased, _)| *biased);
+            let score = old.map_or(0.0, zset_score_from_bits) + increment;
+            let biased = zset_score_bits(score);
+            if let Some(old_biased) = old {
+                let old_component = zset_component(&member);
+                remove_container_element(
+                    cache,
+                    block_store,
+                    shard,
+                    shard_id,
+                    "zset",
+                    &key,
+                    &old_component,
+                    start_routing_bucket,
+                    end_routing_bucket,
+                    async_storage,
+                );
+            }
+            let component = zset_component(&member);
+            let object_id = stable_block_object_id(shard_id, "zset", &key);
+            let routing_bucket =
+                block_routing_bucket(&key, start_routing_bucket, end_routing_bucket);
+            // WHICH block of this object this element is. Computed BEFORE the append, because
+            // the append stamps the ordinal into the record header AND onto the address it
+            // returns from the same value -- assigning it afterwards would leave the two
+            // disagreeing, which `decode_block_record` refuses as a page id mismatch.
+            let block_ordinal = crate::engine::state::container_block_ordinal(
+                shard,
+                "zset",
+                &key,
+                &component,
+            );
+            // The block STATES which element it is -- see `container_blocks`.
+            let block =
+                crate::engine::container_blocks::single_element_block("zset", &component, &member);
+            if let Ok(address) = append_value_of_object(
+                cache,
+                block_store,
+                shard_id,
+                &block,
+                Some(object_id),
+                // The element this block holds -- the SAME expression that derived the ordinal
+                // above and the object id beside it. All three name one block.
+                Some(component.as_str()),
+                Some(routing_bucket),
+                async_storage,
+                block_ordinal,
+            ) {
+                // THIS ARM HAD THE TWO STATEMENTS IN THE UNSAFE ORDER. It inserted into the
+                // resident map and THEN filed the bucket-index entry, so a panic between them left
+                // a mutation with no record -- the exact defect class this container removes, found
+                // in the engine rather than argued from. One call now does both, record first.
+                super::recorded_map::install_element::<super::recorded_map::ZSetKind>(
+                    shard,
+                    shard_id,
+                    &key,
+                    Some(component.clone()),
+                    member.clone(),
+                    (biased, address.clone()),
+                    true,
+                    address.clone(),
+                );
+                mutated = true;
+            }
+            CommandResponse::Bytes {
+                value: Some(zset_score_string(biased).into_bytes()),
+            }
+        }
+        Command::ZSetPop { key, min, count } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                return ExecuteOutcome {
+                    response: CommandResponse::Members {
+                        members: Vec::new(),
+                    },
+                    mutated,
+                };
+            }
+            let mut ordered = zset_ordered_members(shard, &key);
+            if !min {
+                ordered.reverse();
+            }
+            ordered.truncate(count as usize);
+            let mut members = Vec::new();
+            for (member, biased) in ordered {
+                let component = zset_component(&member);
+                remove_container_element(
+                    cache,
+                    block_store,
+                    shard,
+                    shard_id,
+                    "zset",
+                    &key,
+                    &component,
+                    start_routing_bucket,
+                    end_routing_bucket,
+                    async_storage,
+                );
+                shard.zsets.replay_remove_element(&key, &member);
+                mutated = true;
+                members.push(member);
+                members.push(zset_score_string(biased).into_bytes());
+            }
+            if mutated {
+            }
+            CommandResponse::Members { members }
+        }
+        Command::ZSetRank { key, member, rev } => {
+            remove_if_expired(shard, &key);
+            let target = shard
+                .zsets
+                .get(&key)
+                .and_then(|members| members.get(&member))
+                .map(|(biased, _)| (*biased, member.clone()));
+            CommandResponse::Bytes {
+                value: target.map(|(biased, member)| {
+                    let before = shard
+                        .zsets
+                        .get(&key)
+                        .map(|members| {
+                            members
+                                .iter()
+                                .filter(|(other, (other_biased, _))| {
+                                    // Compare the parts directly. Building two owned tuples here
+                                    // copied both member names on every member examined -- exactly
+                                    // two allocations per member, for a comparison that needs none.
+                                    let ordering = other_biased
+                                        .cmp(&biased)
+                                        .then_with(|| (*other).as_slice().cmp(member.as_slice()));
+                                    if rev {
+                                        ordering == std::cmp::Ordering::Greater
+                                    } else {
+                                        ordering == std::cmp::Ordering::Less
+                                    }
+                                })
+                                .count()
+                        })
+                        .unwrap_or(0);
+                    before.to_string().into_bytes()
+                }),
+            }
+        }
+        Command::ListPush { key, member, left } => {
+            remove_if_expired(shard, &key);
+            // READ, NOT `entry().or_default()`, WHICH CLOSES #2087 BY CONSTRUCTION.
+            //
+            // This arm was the only container command that created its map entry BEFORE the append
+            // that justifies it. A failed append therefore left an empty `BTreeMap` under the key,
+            // and `record_exists_exact` ORs `shard.lists.contains_key(key)` into its answer -- so
+            // the key reported EXISTS=1 and TYPE=list with no block behind it, and `CommonExpire`
+            // gating on the same function accepted a deadline for it.
+            //
+            // The container makes the old shape inexpressible: reading the next sequence is a READ,
+            // and the entry now comes into being only through the recorded install below.
+            let seq = match shard.lists.get(&key) {
+                Some(list) => {
+                    if left {
+                        list.keys().next().copied().map_or(0, |first| first - 1)
+                    } else {
+                        list.keys().next_back().copied().map_or(0, |last| last + 1)
+                    }
+                }
+                None => 0,
+            };
+            // Two's-complement bias makes the hex component sort lexically in list order,
+            // which is what lets recovery and range reads walk the bucket index directly.
+            let component = format!("{:016x}", (seq as u64).wrapping_sub(i64::MIN as u64));
+            let object_id = stable_block_object_id(shard_id, "list", &key);
+            let routing_bucket =
+                block_routing_bucket(&key, start_routing_bucket, end_routing_bucket);
+            // WHICH block of this object this element is. Computed BEFORE the append, because
+            // the append stamps the ordinal into the record header AND onto the address it
+            // returns from the same value -- assigning it afterwards would leave the two
+            // disagreeing, which `decode_block_record` refuses as a page id mismatch.
+            let block_ordinal = crate::engine::state::container_block_ordinal(
+                shard,
+                "list",
+                &key,
+                &component,
+            );
+            // The block STATES which element it is -- see `container_blocks`. A list's element key is
+            // its biased sequence word, which is eight bytes and is NOT the value beside it, so
+            // this is the one container kind whose frame carries both in full.
+            let block =
+                crate::engine::container_blocks::single_element_block("list", &component, &member);
+            if let Ok(address) = append_value_of_object(
+                cache,
+                block_store,
+                shard_id,
+                &block,
+                Some(object_id),
+                // The element this block holds -- the SAME expression that derived the ordinal
+                // above and the object id beside it. All three name one block.
+                Some(component.as_str()),
+                Some(routing_bucket),
+                async_storage,
+                block_ordinal,
+            ) {
+                upsert_bucket_index_block(
+                    shard,
+                    shard_id,
+                    "list",
+                    &key,
+                    Some(component.clone()),
+                    address.clone(),
+                    true,
+                );
+                super::recorded_map::install_element::<super::recorded_map::ListKind>(
+                    shard,
+                    shard_id,
+                    &key,
+                    Some(component.clone()),
+                    seq,
+                    address.clone(),
+                    true,
+                    address,
+                );
+                mutated = true;
+            }
+            let length = shard.lists.get(&key).map_or(0, BTreeMap::len) as i64;
+            CommandResponse::Integer { value: length }
+        }
+        Command::ListPop { key, left } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                return ExecuteOutcome {
+                    response: CommandResponse::Bytes { value: None },
+                    mutated,
+                };
+            }
+            // READ THE ELEMENT, THEN RECORD, THEN DROP -- the same reordering `ZSetRemove`
+            // needed and for the same reason: this arm took the address out of the resident map
+            // before the removal was recorded.
+            let popped = shard.lists.get(&key).and_then(|list| {
+                let seq = if left {
+                    list.keys().next().copied()
+                } else {
+                    list.keys().next_back().copied()
+                }?;
+                list.get(&seq).map(|address| (seq, address.clone()))
+            });
+            match popped {
+                None => CommandResponse::Bytes { value: None },
+                Some((seq, address)) => {
+                    let component = format!("{:016x}", (seq as u64).wrapping_sub(i64::MIN as u64));
+                    mutated = true;
+                    super::recorded_map::remove_element::<super::recorded_map::ListKind>(
+                        cache,
+                        block_store,
+                        shard,
+                        shard_id,
+                        &key,
+                        &component,
+                        seq,
+                        start_routing_bucket,
+                        end_routing_bucket,
+                        async_storage,
+                    );
+                    CommandResponse::Bytes {
+                        value: read_block_bytes(
+                            cache,
+                            block_store,
+                            shard_id,
+                            &address,
+                            // The element rendered two lines up, which is the one the index removal names.
+                            BlockIdentity::of(shard_id, "list", &key, Some(component.as_str())),
+                            Some(block_routing_bucket(
+                                &key,
+                                start_routing_bucket,
+                                end_routing_bucket,
+                            )),
+                        ),
+                    }
+                }
+            }
+        }
+        Command::ListRange { key, start, stop } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                return ExecuteOutcome {
+                    response: CommandResponse::Members {
+                        members: Vec::new(),
+                    },
+                    mutated,
+                };
+            }
+            // The length comes from the map itself -- `ListLen` below takes the same number the
+            // same way. Copying every address to obtain it, and to index a slice of it, meant a
+            // ten-entry block of a four-thousand-entry list copied four thousand addresses.
+            let list = shard.lists.get(&key);
+            let length = list.map_or(0, |list| list.len()) as i64;
+            let resolve = |index: i64| -> i64 {
+                if index < 0 {
+                    length + index
+                } else {
+                    index
+                }
+            };
+            let from = resolve(start).max(0);
+            let to = resolve(stop).min(length - 1);
+            let members = if from > to || length == 0 {
+                Vec::new()
+            } else {
+                // A BTreeMap iterates in key order, which is the list's order -- the same order the
+                // materialised Vec had. Only the requested span is READ: `read_block_bytes` runs
+                // `wanted` times, not `length` times, which is what stopped a ten-entry block of a
+                // four-thousand-entry list from touching four thousand blocks.
+                //
+                // `skip(from)` still ADVANCES the iterator `from` times, so reaching a late offset
+                // walks the nodes before it -- cheap per step and allocating nothing, but not
+                // free. A read near the head is O(wanted); one near the tail is O(from + wanted).
+                // An allocation probe cannot see that difference, so it is stated here rather
+                // than left for a flat byte measurement to imply otherwise.
+                let wanted = (to - from + 1) as usize;
+                list.map(|list| {
+                    list.iter()
+                        .skip(from as usize)
+                        .take(wanted)
+                        .filter_map(|(seq, address)| {
+                            // The same rendering ListPop uses, which is what the index rows
+                            // for this list were filed under.
+                            let component =
+                                format!("{:016x}", (*seq as u64).wrapping_sub(i64::MIN as u64));
+                            read_block_bytes(
+                                cache,
+                                block_store,
+                                shard_id,
+                                address,
+                                // Re-derived from the sequence the same way ListPop renders it. `.values()` used to
+                                // drop that sequence, which is why the iteration above is now `.iter()`.
+                                BlockIdentity::of(shard_id, "list", &key, Some(component.as_str())),
+                                Some(block_routing_bucket(
+                                    &key,
+                                    start_routing_bucket,
+                                    end_routing_bucket,
+                                )),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+            };
+            CommandResponse::Members { members }
+        }
+        Command::ListLen { key } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                return ExecuteOutcome {
+                    response: CommandResponse::Integer { value: 0 },
+                    mutated,
+                };
+            }
+            CommandResponse::Integer {
+                value: shard.lists.get(&key).map_or(0, BTreeMap::len) as i64,
+            }
+        }
+        Command::SetMembers { key } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                let _ = cache.invalidate(&CacheKey::set_members(shard_id, &key));
+                return ExecuteOutcome {
+                    response: CommandResponse::Members {
+                        members: Vec::new(),
+                    },
+                    mutated,
+                };
+            }
+            cached_response(cache, CacheKey::set_members(shard_id, &key), || {
+                // IDENTITY IS IN THE PAYLOAD, AND THERE IS NO LONGER ANOTHER WAY.
+                //
+                // This was the gated arm of an `if`, and the ungated arm walked the entries and
+                // answered each from the page it named. That walk's own `None` arm said why it
+                // cannot work once an entry names no element -- "an entry naming no component can
+                // only be answered by a page that names no element either" -- so with every entry
+                // nameless it dropped every member and the listing returned EMPTY, measured as
+                // `listed=0` against 40. It is deleted rather than left unreachable: an entry
+                // cannot name an element any more, so there is no state in which it would be right.
+                //
+                // Asking the PAYLOAD is the direction that resurrected a removed member once, and
+                // the two things that make it safe are both driven: the tombstone page is REACHABLE
+                // from the index, and `derive_membership` folds every page of the object by
+                // `append_position` with a value and a tombstone as the same kind of statement, so
+                // the later page wins. A hand-rolled loop over the payload lacks exactly that
+                // precedence, which is why one resurrected a member before.
+                //
+                // THE ENUMERATOR IS THE ONE THAT KEEPS TOMBSTONE ENTRIES, because withholding them
+                // would hand the fold only the pages that say "present".
+                let routing_bucket =
+                    block_routing_bucket(&key, start_routing_bucket, end_routing_bucket);
+                let addresses =
+                    super::bucket_store::bucket_index_all_block_addresses_with_tombstones(
+                        shard, "set", &key,
+                    );
+                let derived = crate::engine::container_membership::derive_membership(
+                    "set",
+                    addresses,
+                    |address| {
+                        read_block_bytes(
+                            cache,
+                            block_store,
+                            shard_id,
+                            address,
+                            BlockIdentity::of(shard_id, "set", &key, None),
+                            Some(routing_bucket),
+                        )
+                    },
+                );
+                if derived.is_complete() {
+                    GATED_LISTING_DERIVED
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return CommandResponse::Members {
+                        members: derived.live.into_values().collect(),
+                    };
+                }
+                // AN INCOMPLETE DERIVATION MUST NOT BE SERVED, and the reason is not
+                // squeamishness: a page that could not be read may have been the one carrying
+                // a tombstone, so an incomplete fold can be OVER-complete as easily as under,
+                // and there is no direction to fail safely in. The durable member map is the
+                // authority -- `reconcile_from_durable` treats it as such, and a gated removal
+                // was already shown to survive a reload in it -- so the answer comes from
+                // there and the decline is counted rather than hidden.
+                GATED_LISTING_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                CommandResponse::Members {
+                    members: shard
+                        .sets
+                        .get(&key)
+                        .map(|members| {
+                            members.iter().map(|(member, _)| member.clone()).collect()
+                        })
+                        .unwrap_or_default(),
+                }
+            })
+        }
+        Command::SetRemove { key, member } => {
+            mutated |= drop_if_expired(cache, shard_id, shard, &key);
+            let member_component = hex::encode(&member);
+            // REMOVING THE LAST MEMBER REMOVES THE KEY, as it does for the other three container
+            // kinds. `record_exists_exact` ORs `shard.sets.contains_key(key)` in beside its
+            // bucket-index answer, so an empty member map left under a live key is a key that
+            // EXISTS answers 1 for while every listing answers empty for -- and `CommonExpire`
+            // gates on the same function, so it accepted a deadline for it and `ttl_ms` then
+            // reported that deadline instead of the -2 of a missing key.
+            //
+            // THAT CLEANUP NOW LIVES INSIDE `RecordedSetContainer::remove_member`, so no arm can
+            // forget it. `HashDelete` has done it since it was written and `ZSetRemove` and
+            // `ListPop` do it in this shape; the note at `HashDelete` said in a parenthesis that
+            // sets did not need it, and they do, for the reader in the very next line of the same
+            // expression.
+            mutated |= super::recorded_map::remove_element::<super::recorded_map::SetKind>(
+                cache,
+                block_store,
+                shard,
+                shard_id,
+                &key,
+                &member_component,
+                member.clone(),
+                start_routing_bucket,
+                end_routing_bucket,
+                async_storage,
+            );
+            let _ = cache.invalidate(&CacheKey::set_members(shard_id, &key));
+            CommandResponse::Empty
+        }
+        Command::FeatureAppend { key, points } => {
+            remove_if_expired(shard, &key);
+            let routing_bucket =
+                block_routing_bucket(&key, start_routing_bucket, end_routing_bucket);
+            // HOISTED ABOVE THE SERIES BORROW. `features_mut()` borrows the whole
+            // `ShardState` where `&mut shard.features` borrowed one field, so this read of
+            // `shard.bucket_index` can no longer sit inside the append call below -- the
+            // two borrows are no longer disjoint. Taken here, before the series is
+            // borrowed, which is also the order this block reads best in.
+            let next_block_index = crate::engine::state::next_block_index_for_object(
+                &shard.bucket_index,
+                routing_bucket,
+                "feature",
+                &key,
+            );
+            let series = shard.features_mut().entry(std::sync::Arc::from(&key[..])).or_default();
+            let points = sorted_feature_points(points);
+            let mut published: Vec<ElementEntry> = Vec::new();
+            let mut replaced_any = false;
+            // feature_append_chunks_and_persists_timestamped_kv_blocks: append each
+            // timestamped feature point through the block-backed KV layout, then
+            // publish the resulting block addresses into the bucket index below.
+            if let Ok(addresses) = append_timestamped_kv_blocks(
+                cache,
+                block_store,
+                shard_id,
+                "feature",
+                &key,
+                points,
+                routing_bucket,
+                async_storage,
+                true,
+                next_block_index,
+            ) {
+                for (timestamp_ms, address) in addresses {
+                    // A replaced timestamp supersedes a block, and a superseded block must be
+                    // dropped rather than joined -- so record it and take the restating path.
+                    // `set` returns nothing where `insert` returned the superseded value,
+                    // so the question has to be asked BEFORE the write rather than read off it.
+                    if series.get(timestamp_ms).is_some() {
+                        replaced_any = true;
+                    }
+                    series.set(timestamp_ms, address.clone());
+                    published.push(address);
+                    mutated = true;
+                }
+            }
+            let trimmed = trim_timestamped_series(
+                shard_id,
+                "feature",
+                &key,
+                routing_bucket,
+                series,
+                feature_max_size,
+            );
+            mutated |= trimmed;
+            if replaced_any || trimmed {
+                // Something was superseded or evicted: the live set has to be restated in full.
+                let live_addresses = series.addresses().cloned().collect::<Vec<_>>();
+                sync_bucket_index_object_blocks(
+                    shard,
+                    shard_id,
+                    "feature",
+                    &key,
+                    live_addresses,
+                    mutated,
+                );
+            } else {
+                // A pure append. Publishing only the new blocks leaves the index in the same
+                // state, and stops an append costing the length of the series it joins:
+                // restating every address measured 4.07 MB for one point on a 3,200-point series.
+                sync_bucket_index_object_blocks_with_mode(
+                    shard,
+                    shard_id,
+                    "feature",
+                    &key,
+                    published,
+                    mutated,
+                    false,
+                );
+            }
+            let _ = cache.invalidate_record(shard_id, "feature", &key);
+            CommandResponse::Empty
+        }
+        Command::FeatureAppendWithPolicy {
+            key,
+            points,
+            policy,
+        } => {
+            remove_if_expired(shard, &key);
+            let routing_bucket =
+                block_routing_bucket(&key, start_routing_bucket, end_routing_bucket);
+            // HOISTED ABOVE THE SERIES BORROW. `features_mut()` borrows the whole
+            // `ShardState` where `&mut shard.features` borrowed one field, so this read of
+            // `shard.bucket_index` can no longer sit inside the append call below -- the
+            // two borrows are no longer disjoint. Taken here, before the series is
+            // borrowed, which is also the order this block reads best in.
+            let next_block_index = crate::engine::state::next_block_index_for_object(
+                &shard.bucket_index,
+                routing_bucket,
+                "feature",
+                &key,
+            );
+            let series = shard.features_mut().entry(std::sync::Arc::from(&key[..])).or_default();
+            let mut accepted_points = Vec::new();
+            let mut accepted_timestamps = BTreeSet::new();
+            // Process points in REQUEST order, NOT pre-collapsed by timestamp. feature ADD
+            // FIRST policy walks the point list in order and
+            // skips any ts already present, so for an in-batch duplicate timestamp the FIRST
+            // value wins. Pre-collapsing here via sorted_feature_points (last-wins) would silently
+            // keep the LAST duplicate under InsertIfAbsent. accepted_points is sorted+collapsed
+            // just before the append below (UPSERT/ReplaceExisting keep last-wins, matching).
+            for point in points {
+                let exists = series.get(point.timestamp_ms).is_some()
+                    || accepted_timestamps.contains(&point.timestamp_ms);
+                let should_write = match policy {
+                    FeatureWritePolicy::Upsert => true,
+                    FeatureWritePolicy::InsertIfAbsent => !exists,
+                    FeatureWritePolicy::ReplaceExisting => exists,
+                    FeatureWritePolicy::Block => false,
+                };
+                if should_write {
+                    accepted_timestamps.insert(point.timestamp_ms);
+                    accepted_points.push(point);
+                }
+            }
+            if !accepted_points.is_empty() {
+                if let Ok(addresses) = append_timestamped_kv_blocks(
+                    cache,
+                    block_store,
+                    shard_id,
+                    "feature",
+                    &key,
+                    sorted_feature_points(accepted_points),
+                    routing_bucket,
+                    async_storage,
+                    true,
+                next_block_index,
+            ) {
+                    for (timestamp_ms, address) in addresses {
+                        series.set(timestamp_ms, address);
+                        mutated = true;
+                    }
+                }
+            }
+            mutated |= trim_timestamped_series(
+                shard_id,
+                "feature",
+                &key,
+                routing_bucket,
+                series,
+                feature_max_size,
+            );
+            let live_addresses = series.addresses().cloned().collect::<Vec<_>>();
+            sync_bucket_index_object_blocks(
+                shard,
+                shard_id,
+                "feature",
+                &key,
+                live_addresses,
+                mutated,
+            );
+            let _ = cache.invalidate_record(shard_id, "feature", &key);
+            CommandResponse::Integer {
+                value: if mutated { 1 } else { 0 },
+            }
+        }
+        Command::FeatureQuery {
+            key,
+            start_ms,
+            end_ms,
+            count,
+        } => {
+            // Apply lazy expiry before serving, matching FeatureAggQuery/SequenceQuery and
+            // every sibling read: a key past its deadline but not yet swept must read empty,
+            // otherwise FeatureQuery and FeatureAggQuery disagree on the same expired key.
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                let _ = cache.invalidate_record(shard_id, "feature", &key);
+                return ExecuteOutcome {
+                    response: CommandResponse::FeaturePoints { points: Vec::new() },
+                    mutated,
+                };
+            }
+            cached_response(
+                cache,
+                CacheKey::feature_query(shard_id, &key, start_ms, end_ms, count),
+                || {
+                    let points = shard
+                        .features()
+                        .get(&key[..])
+                        .map(|series| {
+                            let mut block_cache = HashMap::new();
+                            // feature_append_keeps_oversized_single_timestamped_value_readable:
+                            // range queries rehydrate each timestamp through the packed
+                            // block reader, so a large single timestamped value remains
+                            // readable when it occupies its own block.
+                            series
+                                .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
+                                // Default read bound follows feature_max_size so raising the
+                                // retention cap (long-sequence use) also lifts the read limit.
+                                .take(count.unwrap_or(feature_max_size))
+                                .filter_map(|(timestamp_ms, address)| {
+                                    read_feature_point_cached(
+                                        cache,
+                                        block_store,
+                                        shard_id,
+                                        timestamp_ms,
+                                        address,
+                                        BlockIdentity::of(shard_id, "feature", &key, None),
+                                        &mut block_cache,
+                                    Some(block_routing_bucket(
+                                        &key,
+                                        start_routing_bucket,
+                                        end_routing_bucket,
+                                    )),
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    CommandResponse::FeaturePoints { points }
+                },
+            )
+        }
+        Command::FeatureQueryFiltered {
+            key,
+            start_ms,
+            end_ms,
+            count,
+            filters,
+        } => {
+            // Apply lazy expiry before serving, matching FeatureAggQuery/SequenceQuery and
+            // every sibling read: an expired-but-unswept key must read empty so filtered and
+            // aggregate reads stay consistent with each other on the same key.
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                let _ = cache.invalidate_record(shard_id, "feature", &key);
+                return ExecuteOutcome {
+                    response: CommandResponse::FeaturePoints { points: Vec::new() },
+                    mutated,
+                };
+            }
+            let limit = count.unwrap_or(feature_max_size).min(feature_max_size);
+            let points = shard
+                .features()
+                .get(&key[..])
+                .map(|series| {
+                    let mut block_cache = HashMap::new();
+                    series
+                        .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
+                        .take(limit)
+                        .filter_map(|(timestamp_ms, address)| {
+                            read_feature_point_cached(
+                                cache,
+                                block_store,
+                                shard_id,
+                                timestamp_ms,
+                                address,
+                                BlockIdentity::of(shard_id, "feature", &key, None),
+                                &mut block_cache,
+                                Some(block_routing_bucket(
+                                    &key,
+                                    start_routing_bucket,
+                                    end_routing_bucket,
+                                )),
+                            )
+                            .and_then(|point| {
+                                let row = SequenceFeatureRow::decode_feature_proto_value(
+                                    point.timestamp_ms,
+                                    &point.value,
+                                )?;
+                                filters
+                                    .iter()
+                                    .all(|filter| sequence_filter_matches(&row, filter))
+                                    .then_some(point)
+                            })
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            CommandResponse::FeaturePoints { points }
+        }
+        Command::FeatureReplace {
+            key,
+            start_ms,
+            end_ms,
+            points,
+        } => {
+            remove_if_expired(shard, &key);
+            let routing_bucket =
+                block_routing_bucket(&key, start_routing_bucket, end_routing_bucket);
+            // HOISTED ABOVE THE SERIES BORROW. `features_mut()` borrows the whole
+            // `ShardState` where `&mut shard.features` borrowed one field, so this read of
+            // `shard.bucket_index` can no longer sit inside the append call below -- the
+            // two borrows are no longer disjoint. Taken here, before the series is
+            // borrowed, which is also the order this block reads best in.
+            let next_block_index = crate::engine::state::next_block_index_for_object(
+                &shard.bucket_index,
+                routing_bucket,
+                "feature",
+                &key,
+            );
+            let series = shard.features_mut().entry(std::sync::Arc::from(&key[..])).or_default();
+            let replaced = series
+                .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
+                .map(|(timestamp_ms, _)| timestamp_ms)
+                .collect::<Vec<_>>();
+            mutated |= drop_timestamped_points(
+                shard_id,
+                "feature",
+                &key,
+                routing_bucket,
+                series,
+                &replaced,
+            );
+            let points = sorted_feature_points(points);
+            if let Ok(addresses) = append_timestamped_kv_blocks(
+                cache,
+                block_store,
+                shard_id,
+                "feature",
+                &key,
+                points,
+                routing_bucket,
+                async_storage,
+                true,
+                next_block_index,
+            ) {
+                for (timestamp_ms, address) in addresses {
+                    series.set(timestamp_ms, address);
+                    mutated = true;
+                }
+            }
+            mutated |= trim_timestamped_series(
+                shard_id,
+                "feature",
+                &key,
+                routing_bucket,
+                series,
+                feature_max_size,
+            );
+            let live_addresses = series.addresses().cloned().collect::<Vec<_>>();
+            sync_bucket_index_object_blocks(
+                shard,
+                shard_id,
+                "feature",
+                &key,
+                live_addresses,
+                mutated,
+            );
+            let _ = cache.invalidate_record(shard_id, "feature", &key);
+            CommandResponse::Empty
+        }
+        Command::FeatureDelete { key } => {
+            mutated |= drop_if_expired(cache, shard_id, shard, &key);
+            // A removal with no component: the whole series went, not one point.
+            stage_meta_outcome(
+                shard_id,
+                "feature",
+                &key,
+                start_routing_bucket,
+                end_routing_bucket,
+                None,
+                None,
+                true,
+            );
+            mutated |= shard.features_mut().remove(&key[..]).is_some();
+            mutated |= mark_bucket_index_object_deleted(shard, &key);
+            let _ = cache.invalidate_record(shard_id, "feature", &key);
+            CommandResponse::Empty
+        }
+        Command::FeatureAggQuery {
+            key,
+            start_ms,
+            end_ms,
+            aggregator,
+            count,
+        } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                let _ = cache.invalidate_record(shard_id, "feature", &key);
+                return ExecuteOutcome {
+                    response: CommandResponse::Aggregate { value: 0 },
+                    mutated,
+                };
+            }
+            // The additive "sum" aggregate over the full window can be served in O(levels) via
+            // the shared rollup ladder. Only "sum" is summable here: for features "count"/"" mean
+            // element count (aggregate_feature_values), and min/max/first/last are non-additive, so
+            // those stay on the raw path. Gated to no explicit `count` cap so it covers the whole
+            // window, matching the raw scan on the retained series.
+            let use_rollup = control_rollup_enabled
+                && aggregator.trim().eq_ignore_ascii_case("sum")
+                && count.is_none();
+            if use_rollup {
+                // Lazily materialize the numeric view of the feature series. Each point's value
+                // is parsed through the SAME aggregate_feature_values path, so the folded values
+                // are bit-identical to the raw scan; rebuild when the series length changed.
+                let feature_len = shard
+                    .features()
+                    .get(&key[..])
+                    .map(|series| series.len())
+                    .unwrap_or(0);
+                let stale = shard
+                    .feature_values()
+                    .get(&key[..])
+                    .map(|values| values.len() != feature_len)
+                    .unwrap_or(feature_len > 0);
+                if stale {
+                    let decoded: BTreeMap<u64, i64> = shard
+                        .features()
+                        .get(&key[..])
+                        .map(|series| {
+                            series
+                                .points()
+                                .filter_map(|(timestamp_ms, address)| {
+                                    read_feature_point(
+                                        cache,
+                                        block_store,
+                                        shard_id,
+                                        timestamp_ms,
+                                        address,
+                                        BlockIdentity::of(shard_id, "feature", &key, None),
+                                        Some(block_routing_bucket(
+                                            &key,
+                                            start_routing_bucket,
+                                            end_routing_bucket,
+                                        )),
+                                    )
+                                    .map(|point| {
+                                        (
+                                            timestamp_ms,
+                                            aggregate_feature_values(&[point.value], "sum"),
+                                        )
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    shard
+                        .feature_values_mut()
+                        // `Arc<str>`: this map is `ModelKey`-keyed now and joins the key
+                        // adoption, so it stops minting its own allocation per key.
+                        .insert(std::sync::Arc::from(key.as_str()), decoded);
+                    shard.feature_rollups_mut().remove(&key);
+                }
+                CommandResponse::Aggregate {
+                    value: control_rollup::feature_windowed_sum(shard, &key, start_ms, end_ms),
+                }
+            } else {
+                let values = shard
+                    .features()
+                    .get(&key[..])
+                    .map(|series| {
+                        series
+                            .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
+                            .take(count.unwrap_or(feature_max_size))
+                            .filter_map(|(timestamp_ms, address)| {
+                                read_feature_point(
+                                    cache,
+                                    block_store,
+                                    shard_id,
+                                    timestamp_ms,
+                                    address,
+                                    BlockIdentity::of(shard_id, "feature", &key, None),
+                                    Some(block_routing_bucket(
+                                        &key,
+                                        start_routing_bucket,
+                                        end_routing_bucket,
+                                    )),
+                                )
+                                .map(|point| point.value)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                CommandResponse::Aggregate {
+                    value: aggregate_feature_values(&values, &aggregator),
+                }
+            }
+        }
+        Command::SequenceAdd { key, rows } => {
+            remove_if_expired(shard, &key);
+            let routing_bucket =
+                block_routing_bucket(&key, start_routing_bucket, end_routing_bucket);
+            // HOISTED ABOVE THE SERIES BORROW. `features_mut()` borrows the whole
+            // `ShardState` where `&mut shard.features` borrowed one field, so this read of
+            // `shard.bucket_index` can no longer sit inside the append call below -- the
+            // two borrows are no longer disjoint. Taken here, before the series is
+            // borrowed, which is also the order this block reads best in.
+            let next_block_index = crate::engine::state::next_block_index_for_object(
+                &shard.bucket_index,
+                routing_bucket,
+                "feature",
+                &key,
+            );
+            let series = shard.features_mut().entry(std::sync::Arc::from(&key[..])).or_default();
+            let points = rows
+                .into_iter()
+                .filter_map(|row| {
+                    serde_json::to_vec(&row).ok().map(|value| FeaturePoint {
+                        timestamp_ms: row.timestamp_ms,
+                        value,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let points = sorted_feature_points(points);
+            if let Ok(addresses) = append_timestamped_kv_blocks(
+                cache,
+                block_store,
+                shard_id,
+                "feature",
+                &key,
+                points,
+                routing_bucket,
+                async_storage,
+                true,
+                next_block_index,
+            ) {
+                for (timestamp_ms, address) in addresses {
+                    series.set(timestamp_ms, address);
+                    mutated = true;
+                }
+            }
+            mutated |= trim_timestamped_series(
+                shard_id,
+                "feature",
+                &key,
+                routing_bucket,
+                series,
+                feature_max_size,
+            );
+            let live_addresses = series.addresses().cloned().collect::<Vec<_>>();
+            sync_bucket_index_object_blocks(
+                shard,
+                shard_id,
+                "feature",
+                &key,
+                live_addresses,
+                mutated,
+            );
+            CommandResponse::Empty
+        }
+        Command::SequenceQuery {
+            key,
+            start_ms,
+            end_ms,
+            count,
+            filters,
+        } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                return ExecuteOutcome {
+                    response: CommandResponse::SequenceRows { rows: Vec::new() },
+                    mutated,
+                };
+            }
+            let rows = shard
+                .features()
+                .get(&key[..])
+                .map(|series| {
+                    series
+                        .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
+                        .take(count)
+                        .filter_map(|(timestamp_ms, address)| {
+                            read_sequence_row(
+                                cache,
+                                block_store,
+                                shard_id,
+                                timestamp_ms,
+                                address,
+                                BlockIdentity::of(shard_id, "feature", &key, None),
+                                Some(block_routing_bucket(
+                                    &key,
+                                    start_routing_bucket,
+                                    end_routing_bucket,
+                                )),
+                            )
+                        })
+                        .filter(|row| {
+                            filters
+                                .iter()
+                                .all(|filter| sequence_filter_matches(row, filter))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            CommandResponse::SequenceRows { rows }
+        }
+        Command::SequenceBatchQuery { queries } => {
+            let groups = queries
+                .into_iter()
+                .map(
+                    |SequenceQuerySpec {
+                         key,
+                         start_ms,
+                         end_ms,
+                         count,
+                         filters,
+                     }| {
+                        if remove_if_expired(shard, &key) {
+                            mutated = true;
+                            return (key, Vec::new());
+                        }
+                        let rows = sequence_rows_in_range(
+                            cache, block_store, shard_id, shard, &key, start_ms, end_ms, count,
+                            &filters,
+                        );
+                        (key, rows)
+                    },
+                )
+                .collect();
+            CommandResponse::SequenceRowGroups { groups }
+        }
+        Command::ControlStateIncrement {
+            key,
+            timestamp_ms,
+            amount,
+        } => {
+            remove_if_expired(shard, &key);
+            let resulting = {
+                let counter = shard
+                    .control_state_mut()
+                    .entry(std::sync::Arc::from(&key[..]))
+                    .or_default()
+                    .entry(timestamp_ms)
+                    .or_default();
+                *counter += amount;
+                *counter
+            };
+            // The RESULT, not the increment. An increment replayed twice counts twice; a count
+            // installed twice is the same count, which is what makes a record idempotent.
+            stage_component_outcome(
+                shard_id,
+                "control_counter",
+                &key,
+                Some(timestamp_ms.to_string()),
+                block_routing_bucket(&key, start_routing_bucket, end_routing_bucket),
+                None,
+                Some(resulting.to_le_bytes().to_vec()),
+            );
+            persist_control_state_block(
+                cache,
+                block_store,
+                shard_id,
+                shard,
+                &key,
+                start_routing_bucket,
+                end_routing_bucket,
+                async_storage,
+            );
+            if control_rollup_enabled {
+                control_rollup::record_increment(shard, &key, timestamp_ms, amount);
+            }
+            mutated = true;
+            CommandResponse::Empty
+        }
+        Command::ControlStateIncrementWithOptions {
+            key,
+            timestamp_ms,
+            amount,
+            precision_ms,
+            ttl_ms,
+        } => {
+            remove_if_expired(shard, &key);
+            let bucket_ms = precision_ms
+                .filter(|precision_ms| *precision_ms > 0)
+                .map(|precision_ms| timestamp_ms - timestamp_ms % precision_ms)
+                .unwrap_or(timestamp_ms);
+            *shard
+                .control_state_mut()
+                .entry(std::sync::Arc::from(&key[..]))
+                .or_default()
+                .entry(bucket_ms)
+                .or_default() += amount;
+            persist_control_state_block(
+                cache,
+                block_store,
+                shard_id,
+                shard,
+                &key,
+                start_routing_bucket,
+                end_routing_bucket,
+                async_storage,
+            );
+            if let Some(ttl_ms) = ttl_ms {
+                let expires_at = resolve_now_ms().saturating_add(ttl_ms);
+                // Through `set_expiry`, never straight into `expires_at_ms`. The sweep reads the
+                // deadline-ordered mirror and nothing else, and `ensure_expiry_order` rebuilds
+                // that mirror only when it is ENTIRELY empty -- so a deadline written past the
+                // helper is invisible to every sweep for the life of the shard the moment any
+                // other key holds one, and the key is retained forever.
+                crate::engine::set_expiry(shard, key.clone(), expires_at);
+                // And recorded, already resolved. This arm writes a control-state block, the block
+                // write stages an outcome, and a record carrying outcomes is INSTALLED rather
+                // than re-executed on replay -- so a deadline that is not in the record is not in
+                // the shard after recovery. Measured before this existed: the block came back and
+                // the deadline came back as None.
+                //
+                // AFTER the block, not before. Replay installs a deadline only onto a key that
+                // already exists, and outcomes install in the order they were staged; staged
+                // first, this deadline meets a shard that has not seen the key yet and is
+                // dropped in silence. Both correct siblings here stage their component first.
+                stage_meta_outcome(
+                    shard_id,
+                    "object",
+                    &key,
+                    start_routing_bucket,
+                    end_routing_bucket,
+                    None,
+                    Some(expires_at),
+                    false,
+                );
+            }
+            if control_rollup_enabled {
+                control_rollup::record_increment(shard, &key, bucket_ms, amount);
+            }
+            mutated = true;
+            CommandResponse::Empty
+        }
+        Command::ControlStateChangeAdd {
+            key,
+            timestamp_ms,
+            value,
+            precision_ms,
+            ttl_ms,
+        } => {
+            remove_if_expired(shard, &key);
+            let bucket_ms = precision_ms
+                .filter(|precision_ms| *precision_ms > 0)
+                .map(|precision_ms| timestamp_ms - timestamp_ms % precision_ms)
+                .unwrap_or(timestamp_ms);
+            stage_component_outcome(
+                shard_id,
+                "control_change",
+                &key,
+                Some(bucket_ms.to_string()),
+                block_routing_bucket(&key, start_routing_bucket, end_routing_bucket),
+                None,
+                Some(value.clone()),
+            );
+            hll::record_change(shard, &key, bucket_ms, value);
+            if let Some(ttl_ms) = ttl_ms {
+                let expires_at = resolve_now_ms().saturating_add(ttl_ms);
+                crate::engine::set_expiry(shard, key.clone(), expires_at);
+                stage_meta_outcome(
+                    shard_id,
+                    "object",
+                    &key,
+                    start_routing_bucket,
+                    end_routing_bucket,
+                    None,
+                    Some(expires_at),
+                    false,
+                );
+            }
+            mutated = true;
+            CommandResponse::Empty
+        }
+        Command::ControlStateCount {
+            key,
+            start_ms,
+            end_ms,
+        } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                return ExecuteOutcome {
+                    response: CommandResponse::Integer { value: 0 },
+                    mutated,
+                };
+            }
+            let value = if control_rollup_enabled {
+                control_rollup::windowed_sum(shard, &key, start_ms, end_ms)
+            } else {
+                shard
+                    .control_state()
+                    .get(&key[..])
+                    .map(|series| {
+                        series
+                            .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
+                            .map(|(_, value)| *value)
+                            .sum()
+                    })
+                    .unwrap_or_default()
+            };
+            CommandResponse::Integer { value }
+        }
+        Command::ControlStateQuery {
+            key,
+            start_ms,
+            end_ms,
+            aggregator,
+        } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                return ExecuteOutcome {
+                    response: CommandResponse::Integer { value: 0 },
+                    mutated,
+                };
+            }
+            if is_control_state_change_aggregator(&aggregator) {
+                CommandResponse::Integer {
+                    value: count_control_state_changes(shard, &key, start_ms, end_ms),
+                }
+            } else if control_rollup_enabled && control_rollup::is_sum_family(&aggregator) {
+                CommandResponse::Integer {
+                    value: control_rollup::windowed_sum(shard, &key, start_ms, end_ms),
+                }
+            } else {
+                let values = shard
+                    .control_state()
+                    .get(&key[..])
+                    .map(|series| {
+                        series
+                            .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
+                            .map(|(_, value)| *value)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                CommandResponse::Integer {
+                    value: aggregate_control_state_values(&values, &aggregator),
+                }
+            }
+        }
+        Command::ControlStateDetail {
+            key,
+            start_ms,
+            end_ms,
+            count,
+        } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                return ExecuteOutcome {
+                    response: CommandResponse::FeaturePoints { points: Vec::new() },
+                    mutated,
+                };
+            }
+            let points = shard
+                .control_state()
+                .get(&key[..])
+                .map(|series| {
+                    series
+                        .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
+                        .take(count.unwrap_or(usize::MAX))
+                        .map(|(timestamp_ms, amount)| FeaturePoint {
+                            timestamp_ms: *timestamp_ms,
+                            value: amount.to_string().into_bytes(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            CommandResponse::FeaturePoints { points }
+        }
+        Command::ControlStateSet {
+            family,
+            key,
+            timestamp_ms,
+            amount,
+        } => {
+            remove_if_expired(shard, &key);
+            let key = control_state_family_key(family, &key);
+            *shard
+                .control_state_mut()
+                .entry(std::sync::Arc::from(&key[..]))
+                .or_default()
+                .entry(timestamp_ms)
+                .or_default() += amount;
+            persist_control_state_block(
+                cache,
+                block_store,
+                shard_id,
+                shard,
+                &key,
+                start_routing_bucket,
+                end_routing_bucket,
+                async_storage,
+            );
+            if control_rollup_enabled {
+                control_rollup::record_increment(shard, &key, timestamp_ms, amount);
+            }
+            mutated = true;
+            CommandResponse::Empty
+        }
+        Command::ControlStateSetAndGet {
+            family,
+            key,
+            timestamp_ms,
+            amount,
+            start_ms,
+            end_ms,
+            aggregator,
+        } => {
+            remove_if_expired(shard, &key);
+            let key = control_state_family_key(family, &key);
+            let series = shard.control_state_mut().entry(std::sync::Arc::from(&key[..])).or_default();
+            *series.entry(timestamp_ms).or_default() += amount;
+            let values = series
+                .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
+                .map(|(_, value)| *value)
+                .collect::<Vec<_>>();
+            persist_control_state_block(
+                cache,
+                block_store,
+                shard_id,
+                shard,
+                &key,
+                start_routing_bucket,
+                end_routing_bucket,
+                async_storage,
+            );
+            if control_rollup_enabled {
+                control_rollup::record_increment(shard, &key, timestamp_ms, amount);
+            }
+            mutated = true;
+            CommandResponse::Integer {
+                value: aggregate_control_state_values(&values, &aggregator),
+            }
+        }
+        Command::ControlStateSetAndGetWithOptions {
+            family,
+            key,
+            timestamp_ms,
+            amount,
+            start_ms,
+            end_ms,
+            aggregator,
+            precision_ms,
+            ttl_ms,
+            uuid,
+        } => {
+            remove_if_expired(shard, &key);
+            let key = control_state_family_key(family, &key);
+            // UUID idempotency: dedup at-least-once replays within a bounded window,
+            // mirroring the control_state dedup ledger. A duplicate is a no-op
+            // write that still returns the current windowed aggregate (idempotent).
+            let now = resolve_now_ms();
+            let is_duplicate = if let Some(uuid) = uuid.as_ref().filter(|u| !u.is_empty()) {
+                let dedup_key = format!("{key}\u{1}{uuid}");
+                gc_control_state_uuid(shard, now);
+                let dup = matches!(shard.control_state_uuid().get(&dedup_key[..]), Some(expiry) if *expiry > now);
+                if !dup {
+                    shard
+                        .control_state_uuid_mut()
+                        // `Arc<str>`, because the ledger is `ModelKey`-keyed now and joins the
+                        // key adoption. One allocation here, at the only site that inserts.
+                        .insert(
+                            std::sync::Arc::from(dedup_key.as_str()),
+                            now.saturating_add(CONTROL_STATE_UUID_DEDUP_MS),
+                        );
+                }
+                dup
+            } else {
+                false
+            };
+            let bucket_ms = precision_ms
+                .filter(|precision_ms| *precision_ms > 0)
+                .map(|precision_ms| timestamp_ms - timestamp_ms % precision_ms)
+                .unwrap_or(timestamp_ms);
+            let series = shard.control_state_mut().entry(std::sync::Arc::from(&key[..])).or_default();
+            if !is_duplicate {
+                *series.entry(bucket_ms).or_default() += amount;
+            }
+            let value = if is_control_state_change_aggregator(&aggregator) {
+                count_control_state_changes(shard, &key, start_ms, end_ms)
+            } else {
+                let values = shard
+                    .control_state()
+                    .get(&key[..])
+                    .map(|series| {
+                        series
+                            .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
+                            .map(|(_, value)| *value)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                aggregate_control_state_values(&values, &aggregator)
+            };
+            persist_control_state_block(
+                cache,
+                block_store,
+                shard_id,
+                shard,
+                &key,
+                start_routing_bucket,
+                end_routing_bucket,
+                async_storage,
+            );
+            if let Some(ttl_ms) = ttl_ms {
+                // `key` is the family-prefixed key by this point, which is the key both the
+                // record and the sweep have to name. Same two requirements as every other
+                // deadline in this file: through `set_expiry` so the deadline-ordered mirror the
+                // sweep reads learns about it, and staged -- after the block -- so it survives a
+                // replay that installs this record's block outcome instead of re-running the
+                // command.
+                let expires_at = now.saturating_add(ttl_ms);
+                crate::engine::set_expiry(shard, key.clone(), expires_at);
+                stage_meta_outcome(
+                    shard_id,
+                    "object",
+                    &key,
+                    start_routing_bucket,
+                    end_routing_bucket,
+                    None,
+                    Some(expires_at),
+                    false,
+                );
+            }
+            if control_rollup_enabled && !is_duplicate {
+                control_rollup::record_increment(shard, &key, bucket_ms, amount);
+            }
+            mutated = true;
+            CommandResponse::Integer { value }
+        }
+        Command::ControlStateFamilyQuery {
+            family,
+            key,
+            start_ms,
+            end_ms,
+            aggregator,
+        } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                return ExecuteOutcome {
+                    response: CommandResponse::Integer { value: 0 },
+                    mutated,
+                };
+            }
+            let key = control_state_family_key(family, &key);
+            if is_control_state_change_aggregator(&aggregator) {
+                CommandResponse::Integer {
+                    value: count_control_state_changes(shard, &key, start_ms, end_ms),
+                }
+            } else if control_rollup_enabled && control_rollup::is_sum_family(&aggregator) {
+                CommandResponse::Integer {
+                    value: control_rollup::windowed_sum(shard, &key, start_ms, end_ms),
+                }
+            } else {
+                let values = shard
+                    .control_state()
+                    .get(&key[..])
+                    .map(|series| {
+                        series
+                            .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
+                            .map(|(_, value)| *value)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                CommandResponse::Integer {
+                    value: aggregate_control_state_values(&values, &aggregator),
+                }
+            }
+        }
+        Command::ControlStateSelectionSet {
+            key,
+            value,
+            occur_time_ms,
+            ttl_ms,
+            selection_type,
+        } => {
+            remove_if_expired(shard, &key);
+            // FirstOrLastSet substitutes occur_time==0 with the current time BEFORE the
+            // FIRST/LAST comparison (an occur_time of 0 is replaced with the current time).
+            // occur_time defaults to 0 on the proto, so a caller that omits it must compare as
+            // "now" -- taking 0 literally made an omitted-time FIRST set always win (0 < any)
+            // and an omitted-time LAST set always lose.
+            let occur_time_ms = if occur_time_ms == 0 {
+                resolve_now_ms()
+            } else {
+                occur_time_ms
+            };
+            let should_store = shard
+                .control_state_selection
+                .get(&key[..])
+                .map(|existing| match selection_type {
+                    ControlStateSelectionType::First => occur_time_ms < existing.occur_time_ms,
+                    ControlStateSelectionType::Last => occur_time_ms > existing.occur_time_ms,
+                })
+                .unwrap_or(true);
+            if should_store {
+                // The value that WON the comparison, so a replay installs the winner instead of
+                // re-running a comparison against whatever it happens to hold.
+                stage_component_outcome(
+                    shard_id,
+                    "control_selection",
+                    &key,
+                    Some(match selection_type {
+                        ControlStateSelectionType::First => "first".to_string(),
+                        ControlStateSelectionType::Last => "last".to_string(),
+                    }),
+                    block_routing_bucket(&key, start_routing_bucket, end_routing_bucket),
+                    None,
+                    Some(value.clone()),
+                );
+                shard.control_state_selection.insert(
+                    std::sync::Arc::from(&key[..]),
+                    ControlStateSelectionValue {
+                        occur_time_ms,
+                        value,
+                        selection_type,
+                    },
+                );
+            }
+            if ttl_ms > 0 {
+                let expires_at = resolve_now_ms().saturating_add(ttl_ms);
+                crate::engine::set_expiry(shard, key.clone(), expires_at);
+                stage_meta_outcome(
+                    shard_id,
+                    "object",
+                    &key,
+                    start_routing_bucket,
+                    end_routing_bucket,
+                    None,
+                    Some(expires_at),
+                    false,
+                );
+            }
+            // A comparison this value LOST stored nothing and set no deadline, so it changed
+            // nothing. Reporting it as a mutation dirtied the shard and appended a record for a
+            // write that did not happen.
+            mutated = should_store || ttl_ms > 0;
+            CommandResponse::Empty
+        }
+        Command::ControlStateSelectionQuery { key } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                return ExecuteOutcome {
+                    response: CommandResponse::Bytes { value: None },
+                    mutated,
+                };
+            }
+            CommandResponse::Bytes {
+                value: shard
+                    .control_state_selection
+                    .get(&key[..])
+                    .map(|stored| stored.value.clone()),
+            }
+        }
+        Command::ControlStateManager {
+            key,
+            op_type,
+            field_list,
+            start_offset,
+            end_offset,
+            is_distinct,
+        } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                return ExecuteOutcome {
+                    response: CommandResponse::HashEntries {
+                        entries: Vec::new(),
+                    },
+                    mutated,
+                };
+            }
+            let entries = control_state_manager_entries(
+                shard,
+                &key,
+                op_type.as_deref(),
+                &field_list,
+                &start_offset,
+                &end_offset,
+                is_distinct,
+            );
+            CommandResponse::HashEntries { entries }
+        }
+        Command::ControlStateDebug {
+            key,
+            start_ms,
+            end_ms,
+        } => {
+            if remove_if_expired(shard, &key) {
+                mutated = true;
+                return ExecuteOutcome {
+                    response: CommandResponse::HashEntries {
+                        entries: Vec::new(),
+                    },
+                    mutated,
+                };
+            }
+            let mut entries = Vec::new();
+            entries.push(("key".to_string(), key.as_bytes().to_vec()));
+            entries.push(("start_ms".to_string(), start_ms.to_string().into_bytes()));
+            entries.push(("end_ms".to_string(), end_ms.to_string().into_bytes()));
+            for family in [
+                ControlStateFamily::Counter,
+                ControlStateFamily::Distinct,
+                ControlStateFamily::Selection,
+            ] {
+                let family_key = control_state_family_key(family, &key);
+                let name = control_state_family_name(family);
+                let series = shard.control_state().get(&family_key[..]);
+                let all_values = series
+                    .map(|series| series.values().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let window = series
+                    .map(|series| {
+                        series
+                            .range(crate::engine::timestamp_range_bounds(start_ms, end_ms))
+                            .map(|(timestamp_ms, value)| (*timestamp_ms, *value))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                entries.push((
+                    format!("{name}_events"),
+                    all_values.len().to_string().into_bytes(),
+                ));
+                entries.push((
+                    format!("{name}_sum"),
+                    all_values.iter().sum::<i64>().to_string().into_bytes(),
+                ));
+                entries.push((
+                    format!("{name}_window_events"),
+                    window.len().to_string().into_bytes(),
+                ));
+                entries.push((
+                    format!("{name}_window_sum"),
+                    window
+                        .iter()
+                        .map(|(_, value)| *value)
+                        .sum::<i64>()
+                        .to_string()
+                        .into_bytes(),
+                ));
+                entries.push((
+                    format!("{name}_window_first_timestamp_ms"),
+                    window
+                        .first()
+                        .map(|(timestamp_ms, _)| timestamp_ms.to_string())
+                        .unwrap_or_default()
+                        .into_bytes(),
+                ));
+                entries.push((
+                    format!("{name}_window_last_timestamp_ms"),
+                    window
+                        .last()
+                        .map(|(timestamp_ms, _)| timestamp_ms.to_string())
+                        .unwrap_or_default()
+                        .into_bytes(),
+                ));
+            }
+            if let Some(fol) = shard.control_state_selection.get(&key[..]) {
+                entries.push(("fol_value".to_string(), fol.value.clone()));
+                entries.push((
+                    "fol_occur_time_ms".to_string(),
+                    fol.occur_time_ms.to_string().into_bytes(),
+                ));
+                entries.push((
+                    "fol_type".to_string(),
+                    match fol.selection_type {
+                        ControlStateSelectionType::First => b"first".to_vec(),
+                        ControlStateSelectionType::Last => b"last".to_vec(),
+                    },
+                ));
+            }
+            CommandResponse::HashEntries { entries }
+        }
+        Command::ContextQueryNodeEmbeddings {
+            tenant_hash,
+            node_hashes,
+        } => {
+            let node_hashes = dedupe_nonzero_u64_preserve_order(node_hashes);
+            for node_hash in node_hashes.iter().copied() {
+                mutated |= drop_if_expired(
+                    cache,
+                    shard_id,
+                    shard,
+                    &context_node_key(tenant_hash, node_hash),
+                );
+            }
+            // One node read per hash, and the vector comes back with it -- where the separate
+            // record meant a second lookup per node on top of the node read retrieval does
+            // anyway.
+            // Every id asked about is answered for. A limit belongs on a query that searches,
+            // where the caller cannot know how many results exist; this batch is a list of ids the
+            // caller already holds, so truncating it drops nodes the caller named, with nothing in
+            // the response saying so. The sibling `ContextGetNodes` reads its whole batch, and
+            // `command_validation` already declares a key for every hash in this one.
+            let embeddings = node_hashes
+                .into_iter()
+                .filter_map(|node_hash| {
+                    let object_key = context_node_key(tenant_hash, node_hash);
+                    let node = shard
+                        .hashes
+                        .get(&object_key)
+                        .and_then(|fields| fields.get(CONTEXT_NODE_FIELD))
+                        .map(|address| (address, BlockIdentity::of(shard_id, "hash", &object_key, Some(CONTEXT_NODE_FIELD))))
+                        .or_else(|| {
+                                // THE PRE-HASHES ARM IS A WHOLE `context_node` BLOCK, not the `meta` field of a
+                                // hash. `model_map_block_address` spells it `("context_node", None)` and is the
+                                // authority; one element named for both arms is wrong for whichever arm it does
+                                // not describe, and this chain named the field for both.
+                                shard
+                                    .context_nodes()
+                                    .get(object_key.as_str())
+                                    .map(|address| (address, BlockIdentity::of(shard_id, "context_node", &object_key, None)))
+                        })
+                        .and_then(|(address, identity)| {
+                            read_block_shared(
+                                cache,
+                                block_store,
+                                shard_id,
+                                address,
+                                identity,
+                                Some(block_routing_bucket(
+                                    &object_key,
+                                    start_routing_bucket,
+                                    end_routing_bucket,
+                                )),
+                            )
+                            .and_then(|bytes| context_from_bytes::<ContextNode>(&bytes))
+                        })?;
+                    if node.vector.is_empty() {
+                        return None;
+                    }
+                    Some((node_hash, node.vector))
+                })
+                .collect();
+            CommandResponse::ContextNodeEmbeddings { embeddings }
+        }
+        Command::ContextSetNodeEmbedding {
+            tenant_hash,
+            node_hash,
+            model_hash,
+            vector,
+            updated_at_ms,
+        } => {
+            // Read-modify-write of the node record. The vector rides along with the node from
+            // here on, so a reader that has fetched the node has already paid for the vector --
+            // no second key, no second block, and no hash to invert.
+            let object_key = context_node_key(tenant_hash, node_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let existing = load_context_node(cache, block_store, shard_id, shard, &object_key);
+            match existing {
+                // No node to attach to. Writing a placeholder here would invent a node that
+                // ingest never created, so report it rather than fabricate one.
+                None => CommandResponse::ContextObjectKey {
+                    object_key: String::new(),
+                },
+                Some(mut node) => {
+                    node.vector = vector;
+                    node.embedding_model_hash = model_hash;
+                    node.embedding_updated_at_ms = updated_at_ms;
+                    // `summary_vector` is left exactly as it was read. It is a copy of the L1
+                    // SUMMARY's vector, and re-embedding the node does not re-embed the summary,
+                    // so the copy is still the summary's current vector. Clearing it here would
+                    // throw away a valid copy; overwriting it with the new node vector would
+                    // claim the summary says something it does not.
+                    mutated |= write_context_node(
+                        cache,
+                        block_store,
+                        shard_id,
+                        shard,
+                        &object_key,
+                        &node,
+                        start_routing_bucket,
+                        end_routing_bucket,
+                        async_storage,
+                    );
+                    CommandResponse::ContextObjectKey { object_key }
+                }
+            }
+        }
+        Command::ContextUpsertNode { tenant_hash, node } => {
+            let object_key = context_node_key(tenant_hash, node.node_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            mutated |= write_context_node(
+                cache,
+                block_store,
+                shard_id,
+                shard,
+                &object_key,
+                &node,
+                start_routing_bucket,
+                end_routing_bucket,
+                async_storage,
+            );
+            CommandResponse::ContextObjectKey { object_key }
+        }
+        Command::ContextGetNode {
+            tenant_hash,
+            node_hash,
+        } => {
+            let object_key = context_node_key(tenant_hash, node_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let node = shard
+                .hashes
+                .get(&object_key)
+                .and_then(|fields| fields.get(CONTEXT_NODE_FIELD))
+                .map(|address| (address, BlockIdentity::of(shard_id, "hash", &object_key, Some(CONTEXT_NODE_FIELD))))
+                .or_else(|| {
+                        // THE PRE-HASHES ARM IS A WHOLE `context_node` BLOCK, not the `meta` field of a
+                        // hash. `model_map_block_address` spells it `("context_node", None)` and is the
+                        // authority; one element named for both arms is wrong for whichever arm it does
+                        // not describe, and this chain named the field for both.
+                        shard
+                            .context_nodes()
+                            .get(object_key.as_str())
+                            .map(|address| (address, BlockIdentity::of(shard_id, "context_node", &object_key, None)))
+                })
+                .and_then(|(address, identity)| {
+                    read_block_shared(
+                        cache,
+                        block_store,
+                        shard_id,
+                        address,
+                        identity,
+                        Some(block_routing_bucket(
+                            &object_key,
+                            start_routing_bucket,
+                            end_routing_bucket,
+                        )),
+                    )
+                    .and_then(|bytes| context_from_bytes::<ContextNode>(&bytes))
+                });
+            CommandResponse::ContextNode { object_key, node }
+        }
+        Command::ContextGetNodes {
+            tenant_hash,
+            node_hashes,
+        } => {
+            // The guard runs over the same hashes the read below uses, in a pass of its own:
+            // the read borrows the shard for the whole closure, so the check cannot run
+            // inside it.
+            let node_hashes = dedupe_nonzero_u64_preserve_order(node_hashes);
+            for node_hash in node_hashes.iter().copied() {
+                mutated |= drop_if_expired(
+                    cache,
+                    shard_id,
+                    shard,
+                    &context_node_key(tenant_hash, node_hash),
+                );
+            }
+            let nodes = node_hashes
+                .into_iter()
+                .filter_map(|node_hash| {
+                    let object_key = context_node_key(tenant_hash, node_hash);
+                    shard
+                        .hashes
+                        .get(&object_key)
+                        .and_then(|fields| fields.get(CONTEXT_NODE_FIELD))
+                        .map(|address| (address, BlockIdentity::of(shard_id, "hash", &object_key, Some(CONTEXT_NODE_FIELD))))
+                        .or_else(|| {
+                                // THE PRE-HASHES ARM IS A WHOLE `context_node` BLOCK, not the `meta` field of a
+                                // hash. `model_map_block_address` spells it `("context_node", None)` and is the
+                                // authority; one element named for both arms is wrong for whichever arm it does
+                                // not describe, and this chain named the field for both.
+                                shard
+                                    .context_nodes()
+                                    .get(object_key.as_str())
+                                    .map(|address| (address, BlockIdentity::of(shard_id, "context_node", &object_key, None)))
+                        })
+                        .and_then(|(address, identity)| {
+                            read_block_shared(
+                                cache,
+                                block_store,
+                                shard_id,
+                                address,
+                                identity,
+                                Some(block_routing_bucket(
+                                    &object_key,
+                                    start_routing_bucket,
+                                    end_routing_bucket,
+                                )),
+                            )
+                            .and_then(|bytes| context_from_bytes::<ContextNode>(&bytes))
+                        })
+                })
+                .collect();
+            CommandResponse::ContextNodes { nodes }
+        }
+        Command::ContextWriteEvent {
+            tenant_hash,
+            node_hash,
+            mut event,
+            first_write_only,
+            cold_storage,
+        } => {
+            let object_key = context_event_key(tenant_hash, node_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            normalize_context_event_storage_keys(node_hash, &mut event);
+            // CONTEXT_TIMELINE_FANOUT is applied inside context_timeline_key so
+            // multiple ContextEvent writes at the same millisecond map to stable,
+            // timestamp-keyed blocks instead of overwriting one another.
+            // context_models_match_keys_timeline_blocks_and_filters keeps this
+            // key shape aligned with the context event timeline contract.
+            let timeline_key = context_timeline_key(event.primary_time_ms(), event.event_id_hash);
+            let event_id_hash = event.event_id_hash;
+            // THE MEMBERSHIP TEST FIRST, THROUGH THE READ ACCESSOR, and the write afterwards. The
+            // borrow this replaced held a `&mut` into the map across the whole block append, which
+            // the read accessor cannot hand out.
+            //
+            // AND NO EMPTY SERIES IS CREATED ANY MORE. `entry(..).or_default()` filed an empty
+            // series under the object key before the append was even attempted, so a failed append
+            // left a key behind that every length and emptiness reader counted. The shared point
+            // operation below keeps no empty series by construction: it takes the key out of the
+            // map when the series ends up empty.
+            let already_written = first_write_only
+                && shard
+                    .context_events()
+                    .get(&*object_key)
+                    .is_some_and(|series| series.get(event_id_hash).is_some());
+            // Idempotence now tests the EVENT ID, which is what first_write_only actually means:
+            // the same event written twice. Testing the timeline key made two different events
+            // that collided in the low FANOUT bits of one millisecond look like a rewrite.
+            if !already_written {
+                let value = context_bytes(&*event);
+                let routing_bucket =
+                    block_routing_bucket(&object_key, start_routing_bucket, end_routing_bucket);
+                // The BLOCK stays timestamp-keyed: blocks pack by time, and the load path recovers
+                // the timeline key from the packed point. Only the index key changes.
+                if let Ok(addresses) = append_timestamped_kv_blocks_keyed(
+                    cache,
+                    block_store,
+                    shard_id,
+                    "context_event",
+                    &object_key,
+                    vec![FeaturePoint {
+                        timestamp_ms: timeline_key,
+                        value,
+                    }],
+                    routing_bucket,
+                    async_storage && !cold_storage,
+                    !cold_storage,
+                    event_id_hash,
+                crate::engine::state::next_block_index_for_object(&shard.bucket_index, routing_bucket, "context_event", &object_key),
+            ) {
+                    for (stored_timeline_key, address) in addresses {
+                        // ONE HANDLE, AND BOTH MAPS TAKE IT. The series map and the time index are filed
+                        // under the same object key, so they share one allocation instead of minting two.
+                        // Taken here rather than before the append on purpose: the handle this borrows has
+                        // to exist already, and the page index is what holds it.
+                        let stored_key = shard
+                            .bucket_index
+                            .object_block_lookup
+                            .any_shared_object_key(&*object_key)
+                            .unwrap_or_else(|| std::sync::Arc::from(&*object_key));
+                        // THE NON-COLLECTING DOOR. This called `set_point_and_collect_live`
+                        // and bound the result to nothing -- and that result is a clone of every
+                        // address the node event series holds, so writing one event to a node
+                        // copied the whole series and dropped it.
+                        super::timestamped_series::set_point(
+                            shard.context_events_mut(),
+                            std::sync::Arc::clone(&stored_key),
+                            event_id_hash,
+                            Some(address),
+                        );
+                        shard
+                            .context_event_timeline
+                            .entry(std::sync::Arc::clone(&stored_key))
+                            .or_default()
+                            .insert(stored_timeline_key, event_id_hash);
+                        mutated = true;
+                    }
+                }
+            }
+            invalidate_context_record(cache, shard_id, &object_key);
+            if !bulk_ingest_mode()
+                && maybe_auto_compress_context_node(
+                    cache,
+                    block_store,
+                    shard_id,
+                    shard,
+                    tenant_hash,
+                    node_hash,
+                    &object_key,
+                    start_routing_bucket,
+                    end_routing_bucket,
+                    async_storage,
+                )
+            {
+                mutated = true;
+            }
+            CommandResponse::ContextObjectKey { object_key }
+        }
+        Command::ContextWriteExtractedEvent {
+            tenant_hash,
+            node_hash,
+            mut event,
+            indexes,
+            first_write_only,
+            cold_storage,
+        } => {
+            let event_object_key = context_event_key(tenant_hash, node_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &event_object_key);
+            normalize_context_event_storage_keys(node_hash, &mut event);
+            let primary_time_ms = event.primary_time_ms();
+            // Extracted events use the same CONTEXT_TIMELINE_FANOUT timeline as
+            // raw context events so index refs, filters, and event blocks share the
+            // wire-compatible timestamp key discipline.
+            let event_timeline_key = context_timeline_key(primary_time_ms, event.event_id_hash);
+            let event_id_hash = event.event_id_hash;
+            // Read first, write through the pair afterwards -- see the note on the
+            // `ContextWriteEvent` arm above for both halves of why.
+            let event_already_written = first_write_only
+                && shard
+                    .context_events()
+                    .get(&*event_object_key)
+                    .is_some_and(|series| series.get(event_id_hash).is_some());
+            // Same key discipline as ContextWriteEvent since the event rekey: the primary map
+            // is keyed by EVENT ID (idempotence tests the id), the block stays timestamp-keyed,
+            // and the time index maps the stored timeline key back to the id. This arm was
+            // missed by the rekey -- it kept inserting timeline keys into the id-keyed map and
+            // never fed the time index, so every extracted event was invisible to time-ranged
+            // queries while its write reported success.
+            if !event_already_written {
+                // `event` is boxed on this variant; the wire encoder takes the value.
+                let event_value = &*event;
+                let value = context_bytes(event_value);
+                let routing_bucket = block_routing_bucket(
+                    &event_object_key,
+                    start_routing_bucket,
+                    end_routing_bucket,
+                );
+                if let Ok(addresses) = append_timestamped_kv_blocks_keyed(
+                    cache,
+                    block_store,
+                    shard_id,
+                    "context_event",
+                    &event_object_key,
+                    vec![FeaturePoint {
+                        timestamp_ms: event_timeline_key,
+                        value,
+                    }],
+                    routing_bucket,
+                    async_storage && !cold_storage,
+                    !cold_storage,
+                    event_id_hash,
+                crate::engine::state::next_block_index_for_object(&shard.bucket_index, routing_bucket, "context_event", &event_object_key),
+            ) {
+                    for (stored_timeline_key, address) in addresses {
+                        // ONE HANDLE, AND BOTH MAPS TAKE IT. The series map and the time index are filed
+                        // under the same object key, so they share one allocation instead of minting two.
+                        // Taken here rather than before the append on purpose: the handle this borrows has
+                        // to exist already, and the page index is what holds it.
+                        let stored_key = shard
+                            .bucket_index
+                            .object_block_lookup
+                            .any_shared_object_key(&*event_object_key)
+                            .unwrap_or_else(|| std::sync::Arc::from(&*event_object_key));
+                        // THE NON-COLLECTING DOOR. This called `set_point_and_collect_live`
+                        // and bound the result to nothing -- and that result is a clone of every
+                        // address the node event series holds, so writing one event to a node
+                        // copied the whole series and dropped it.
+                        super::timestamped_series::set_point(
+                            shard.context_events_mut(),
+                            std::sync::Arc::clone(&stored_key),
+                            event_id_hash,
+                            Some(address),
+                        );
+                        shard
+                            .context_event_timeline
+                            .entry(std::sync::Arc::clone(&stored_key))
+                            .or_default()
+                            .insert(stored_timeline_key, event_id_hash);
+                        mutated = true;
+                    }
+                }
+            }
+            invalidate_context_record(cache, shard_id, &event_object_key);
+
+            let index_ref = ContextIndexRef {
+                primary_node_hash: node_hash,
+                primary_event_time_ms: primary_time_ms,
+                event_id_hash: event.event_id_hash,
+            };
+            let mut index_object_keys = Vec::new();
+            let mut write_default_index =
+                |index_name: &str, value_hash: u64, index_time_ms: u64| {
+                    if value_hash == 0 || index_time_ms == 0 {
+                        return;
+                    }
+                    let object_key =
+                        context_index_key(tenant_hash, index_name, value_hash, indexes.scope_hash);
+                    let timeline_key = context_timeline_key(index_time_ms, index_ref.event_id_hash);
+                    let value = context_bytes(&index_ref);
+                    let routing_bucket =
+                        block_routing_bucket(&object_key, start_routing_bucket, end_routing_bucket);
+                    if let Ok(addresses) = append_timestamped_kv_blocks(
+                        cache,
+                        block_store,
+                        shard_id,
+                        "context_index",
+                        &object_key,
+                        vec![FeaturePoint {
+                            timestamp_ms: timeline_key,
+                            value,
+                        }],
+                        routing_bucket,
+                        async_storage && !cold_storage,
+                        !cold_storage,
+                crate::engine::state::next_block_index_for_object(&shard.bucket_index, routing_bucket, "context_index", &object_key),
+            ) {
+                        let series = shard
+                            .context_indexes_mut()
+                            .entry(std::sync::Arc::from(object_key.as_str()))
+                            .or_default();
+                        for (timestamp_ms, address) in addresses {
+                            series.set(timestamp_ms, address);
+                            mutated = true;
+                        }
+                        invalidate_context_record(cache, shard_id, &object_key);
+                        index_object_keys.push(object_key);
+                    }
+                };
+
+            if !context_index_disabled(&indexes, InternalContextIndex::EventKind) {
+                write_default_index(
+                    "event_kind",
+                    context_event_kind_hash(&event),
+                    primary_time_ms,
+                );
+            }
+            if !context_index_disabled(&indexes, InternalContextIndex::Status) {
+                write_default_index("status", indexes.status_hash, primary_time_ms);
+            }
+            if !context_index_disabled(&indexes, InternalContextIndex::Source) {
+                write_default_index("source", indexes.source_hash, primary_time_ms);
+            }
+            if !context_index_disabled(&indexes, InternalContextIndex::EventTimeBucket) {
+                write_default_index(
+                    "event_time_bucket",
+                    indexes.event_time_bucket_ms,
+                    indexes.event_time_bucket_ms,
+                );
+            }
+            if !context_index_disabled(&indexes, InternalContextIndex::Entity) {
+                for entity_hash in &indexes.entity_hashes {
+                    write_default_index("entity", *entity_hash, primary_time_ms);
+                }
+            }
+            CommandResponse::ContextExtractedEventWrite {
+                event_object_key,
+                written_index_count: index_object_keys.len(),
+                index_object_keys,
+            }
+        }
+        Command::ContextQueryEvents {
+            tenant_hash,
+            node_hash,
+            start_time_ms,
+            end_time_ms,
+            limit,
+            max_scan,
+            current_valid_only,
+            as_of_ms,
+            kinds,
+            statuses,
+            min_confidence,
+            min_importance,
+        } => {
+            let object_key = context_event_key(tenant_hash, node_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let scan_limit = context_limit(max_scan);
+            let events = shard
+                .context_events()
+                .get(&*object_key)
+                .map(|_series| {
+                    let mut block_cache = HashMap::new();
+                    // Range the TIME INDEX, not the primary map: the primary is keyed by event
+                    // id hash now, so a time window is not contiguous in it.
+                    context_event_time_range(shard, &object_key, start_time_ms, end_time_ms)
+                        .rev()
+                        // Bound the SCAN (kMaxLimit), NOT the result: the caller's
+                        // `limit` must be applied AFTER filtering (LimitOrDefault runs
+                        // post-filter). Scan newest-first so retrieval can find recent,
+                        // serving-relevant context without walking cold history first.
+                        .take(scan_limit)
+                        .filter_map(|(timeline_key, address)| {
+                            read_context_value_cached::<ContextEvent>(
+                                cache,
+                                block_store,
+                                shard_id,
+                                timeline_key,
+                                address,
+                                BlockIdentity::of(shard_id, "context_event", &object_key, None),
+                                &mut block_cache,
+                                Some(block_routing_bucket(
+                                    &object_key,
+                                    start_routing_bucket,
+                                    end_routing_bucket,
+                                )),
+                            )
+                        })
+                        .filter(|event| {
+                            context_event_matches_filter(
+                                event,
+                                current_valid_only,
+                                as_of_ms,
+                                end_time_ms,
+                                &kinds,
+                                &statuses,
+                                min_confidence,
+                                min_importance,
+                            )
+                        })
+                        .take(context_limit(limit))
+                        .collect()
+                })
+                .unwrap_or_default();
+            CommandResponse::ContextEvents { object_key, events }
+        }
+        Command::ContextWriteIndexRef {
+            tenant_hash,
+            index_name,
+            index_value_hash,
+            scope_hash,
+            event_time_ms,
+            index_ref,
+        } => {
+            let object_key =
+                context_index_key(tenant_hash, &index_name, index_value_hash, scope_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let timeline_key = context_timeline_key(event_time_ms, index_ref.event_id_hash);
+            let value = context_bytes(&index_ref);
+            let routing_bucket =
+                block_routing_bucket(&object_key, start_routing_bucket, end_routing_bucket);
+            if let Ok(addresses) = append_timestamped_kv_blocks(
+                cache,
+                block_store,
+                shard_id,
+                "context_index",
+                &object_key,
+                vec![FeaturePoint {
+                    timestamp_ms: timeline_key,
+                    value,
+                }],
+                routing_bucket,
+                async_storage,
+                true,
+                crate::engine::state::next_block_index_for_object(&shard.bucket_index, routing_bucket, "context_index", &object_key),
+            ) {
+                let series = shard
+                    .context_indexes_mut()
+                    .entry(std::sync::Arc::from(object_key.as_str()))
+                    .or_default();
+                for (timestamp_ms, address) in addresses {
+                    series.set(timestamp_ms, address);
+                    mutated = true;
+                }
+            }
+            invalidate_context_record(cache, shard_id, &object_key);
+            CommandResponse::ContextObjectKey { object_key }
+        }
+        Command::ContextQueryIndex {
+            tenant_hash,
+            index_name,
+            index_value_hash,
+            scope_hash,
+            start_time_ms,
+            end_time_ms,
+            limit,
+        } => {
+            let object_key =
+                context_index_key(tenant_hash, &index_name, index_value_hash, scope_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let refs = shard
+                .context_indexes()
+                .get(&object_key[..])
+                .map(|series| {
+                    series
+                        .range(
+                            context_timeline_start(start_time_ms)
+                                ..context_timeline_end(end_time_ms),
+                        )
+                        .take(context_limit(limit))
+                        .filter_map(|(timeline_key, address)| {
+                            read_context_value::<ContextIndexRef>(
+                                cache,
+                                block_store,
+                                shard_id,
+                                timeline_key,
+                                address,
+                                BlockIdentity::of(shard_id, "context_index", &object_key, None),
+                                Some(block_routing_bucket(
+                                    &object_key,
+                                    start_routing_bucket,
+                                    end_routing_bucket,
+                                )),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            CommandResponse::ContextIndexRefs { object_key, refs }
+        }
+        Command::ContextQueryIndexIntersection {
+            tenant_hash,
+            predicates,
+            limit,
+        } => {
+            for predicate in &predicates {
+                mutated |= drop_if_expired(
+                    cache,
+                    shard_id,
+                    shard,
+                    &context_index_key(
+                        tenant_hash,
+                        &predicate.index_name,
+                        predicate.index_value_hash,
+                        predicate.scope_hash,
+                    ),
+                );
+            }
+            let mut scanned_ref_count = 0usize;
+            let mut deduped_ref_count = 0usize;
+            let mut candidate_refs: Option<HashMap<(u64, u64, u64), ContextIndexRef>> = None;
+
+            for predicate in &predicates {
+                let object_key = context_index_key(
+                    tenant_hash,
+                    &predicate.index_name,
+                    predicate.index_value_hash,
+                    predicate.scope_hash,
+                );
+                let mut seen_for_predicate = HashMap::new();
+                if let Some(series) = shard.context_indexes().get(&object_key[..]) {
+                    let mut block_cache = HashMap::new();
+                    for (timeline_key, address) in series.range(
+                        context_timeline_start(predicate.start_time_ms)
+                            ..context_timeline_end(predicate.end_time_ms),
+                    ) {
+                        if let Some(index_ref) = read_context_value_cached::<ContextIndexRef>(
+                            cache,
+                            block_store,
+                            shard_id,
+                            timeline_key,
+                            address,
+                            BlockIdentity::of(shard_id, "context_index", &object_key, None),
+                            &mut block_cache,
+                            Some(block_routing_bucket(
+                                &object_key,
+                                start_routing_bucket,
+                                end_routing_bucket,
+                            )),
+                        ) {
+                            scanned_ref_count += 1;
+                            let key = context_index_ref_identity(&index_ref);
+                            if seen_for_predicate.insert(key, index_ref).is_some() {
+                                deduped_ref_count += 1;
+                            }
+                        }
+                    }
+                }
+
+                candidate_refs = match candidate_refs {
+                    None => Some(seen_for_predicate),
+                    Some(mut existing) => {
+                        existing.retain(|key, _| seen_for_predicate.contains_key(key));
+                        Some(existing)
+                    }
+                };
+                if candidate_refs.as_ref().is_some_and(HashMap::is_empty) {
+                    break;
+                }
+            }
+
+            let mut refs: Vec<_> = candidate_refs.unwrap_or_default().into_values().collect();
+            refs.sort_by_key(|index_ref| {
+                (
+                    index_ref.primary_event_time_ms,
+                    index_ref.event_id_hash,
+                    index_ref.primary_node_hash,
+                )
+            });
+            refs.truncate(context_limit(limit));
+            CommandResponse::ContextIndexIntersection {
+                refs,
+                matched_index_count: predicates.len(),
+                scanned_ref_count,
+                deduped_ref_count,
+            }
+        }
+        Command::ContextWritePackAudit { tenant_hash, audit } => {
+            let object_key = context_audit_key(tenant_hash, audit.session_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let timeline_key =
+                context_timeline_key(audit.request_time_ms, stable_object_hash(&audit.query_id));
+            let value = context_bytes(&audit);
+            let routing_bucket =
+                block_routing_bucket(&object_key, start_routing_bucket, end_routing_bucket);
+            if let Ok(addresses) = append_timestamped_kv_blocks(
+                cache,
+                block_store,
+                shard_id,
+                "context_audit",
+                &object_key,
+                vec![FeaturePoint {
+                    timestamp_ms: timeline_key,
+                    value,
+                }],
+                routing_bucket,
+                async_storage,
+                true,
+                crate::engine::state::next_block_index_for_object(&shard.bucket_index, routing_bucket, "context_audit", &object_key),
+            ) {
+                let series = shard
+                    .context_audits_mut()
+                    .entry(std::sync::Arc::from(object_key.as_str()))
+                    .or_default();
+                for (timestamp_ms, address) in addresses {
+                    series.set(timestamp_ms, address);
+                    mutated = true;
+                }
+            }
+            invalidate_context_record(cache, shard_id, &object_key);
+            CommandResponse::ContextObjectKey { object_key }
+        }
+        Command::ContextQueryPackAudit {
+            tenant_hash,
+            session_hash,
+            start_time_ms,
+            end_time_ms,
+            limit,
+        } => {
+            let object_key = context_audit_key(tenant_hash, session_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let audits = shard
+                .context_audits()
+                .get(&object_key[..])
+                .map(|series| {
+                    series
+                        .range(
+                            context_timeline_start(start_time_ms)
+                                ..context_timeline_end(end_time_ms),
+                        )
+                        .take(context_limit(limit))
+                        .filter_map(|(timeline_key, address)| {
+                            read_context_value::<ContextPackAudit>(
+                                cache,
+                                block_store,
+                                shard_id,
+                                timeline_key,
+                                address,
+                                BlockIdentity::of(shard_id, "context_audit", &object_key, None),
+                                Some(block_routing_bucket(
+                                    &object_key,
+                                    start_routing_bucket,
+                                    end_routing_bucket,
+                                )),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            CommandResponse::ContextPackAudits { object_key, audits }
+        }
+        Command::ContextMarkSummaryDirty {
+            tenant_hash,
+            node_hash,
+            event_time_ms,
+            reason,
+            propagate_depth,
+        } => {
+            // In-memory, coalesced summary-dirty tracking. Repeated marks for the same
+            // node update a single hashmap entry instead of appending a new persisted
+            // block, so dirty records are bounded by distinct dirty nodes, not by events.
+            // The map is ephemeral (never written to the block store) and may be lost on
+            // restart; the async summary worker re-marks on the next event.
+            let object_key = context_dirty_key(tenant_hash, node_hash);
+            let entry = shard
+                .context_dirty_index
+                .entry(crate::engine::state::DirtyMark::summary(tenant_hash, node_hash))
+                .or_default();
+            if entry.mark_count == 0 {
+                entry.node_hash = node_hash;
+                entry.first_event_time_ms = event_time_ms;
+                entry.last_event_time_ms = event_time_ms;
+            } else {
+                entry.first_event_time_ms = entry.first_event_time_ms.min(event_time_ms);
+                entry.last_event_time_ms = entry.last_event_time_ms.max(event_time_ms);
+            }
+            entry.reason = reason;
+            entry.propagate_depth = entry.propagate_depth.max(propagate_depth);
+            entry.mark_count = entry.mark_count.saturating_add(1);
+            CommandResponse::ContextObjectKey { object_key }
+        }
+        Command::ContextQuerySummaryDirty {
+            tenant_hash,
+            node_hash,
+            start_time_ms,
+            end_time_ms,
+            limit,
+        } => {
+            // Read the single coalesced in-memory dirty entry for this node and surface it
+            // as one marker when it overlaps the requested time window. `limit` is retained
+            // for API compatibility but there is at most one coalesced marker per node.
+            let _ = limit;
+            let object_key = context_dirty_key(tenant_hash, node_hash);
+            let nodes = shard
+                .context_dirty_index
+                .get(&crate::engine::state::DirtyMark::summary(tenant_hash, node_hash))
+                .filter(|entry| {
+                    entry.mark_count > 0
+                        && entry.last_event_time_ms >= start_time_ms
+                        && entry.first_event_time_ms <= end_time_ms
+                })
+                .map(|entry| {
+                    vec![ContextDirtyNode {
+                        node_hash: entry.node_hash,
+                        first_event_time_ms: entry.first_event_time_ms,
+                        last_event_time_ms: entry.last_event_time_ms,
+                        reason: entry.reason,
+                        propagate_depth: entry.propagate_depth,
+                        mark_count: entry.mark_count,
+                    }]
+                })
+                .unwrap_or_default();
+            CommandResponse::ContextSummaryDirtyNodes { object_key, nodes }
+        }
+        Command::ContextMarkEmbeddingDirty {
+            tenant_hash,
+            node_hash,
+            event_time_ms,
+            reason,
+            propagate_depth,
+            clear,
+        } => {
+            // In-memory, coalesced embedding-dirty tracking, independent of the
+            // summary-dirty index. `clear` removes the entry (the drainer clears a
+            // node once it has been successfully embedded); otherwise repeated marks
+            // for the same node coalesce into a single entry so dirty records stay
+            // bounded by distinct dirty nodes, not by events. The map is ephemeral
+            // (never written to the block store) and re-derived after restart.
+            let object_key = context_embedding_dirty_key(tenant_hash, node_hash);
+            if clear {
+                shard
+                    .context_dirty_index
+                    .remove(&crate::engine::state::DirtyMark::embedding(
+                        tenant_hash,
+                        node_hash,
+                    ));
+            } else {
+                let entry = shard
+                    .context_dirty_index
+                    .entry(crate::engine::state::DirtyMark::embedding(tenant_hash, node_hash))
+                    .or_default();
+                if entry.mark_count == 0 {
+                    entry.tenant_hash = tenant_hash;
+                    entry.node_hash = node_hash;
+                    entry.first_event_time_ms = event_time_ms;
+                    entry.last_event_time_ms = event_time_ms;
+                } else {
+                    entry.first_event_time_ms = entry.first_event_time_ms.min(event_time_ms);
+                    entry.last_event_time_ms = entry.last_event_time_ms.max(event_time_ms);
+                }
+                entry.reason = reason;
+                entry.propagate_depth = entry.propagate_depth.max(propagate_depth);
+                entry.mark_count = entry.mark_count.saturating_add(1);
+            }
+            CommandResponse::ContextObjectKey { object_key }
+        }
+        Command::ContextQueryEmbeddingDirty {
+            tenant_hash,
+            node_hash,
+            start_time_ms,
+            end_time_ms,
+            limit,
+        } => {
+            // node_hash == 0 -> the drainer's O(pending) scan over the whole
+            // embedding-dirty index (all tenants on the shard). node_hash != 0 ->
+            // the single coalesced entry for that node. Either way this touches only
+            // the pending set, never the corpus.
+            let cap = context_limit(limit);
+            let mut nodes = Vec::new();
+            let mut tenant_hashes = Vec::new();
+            let object_key = if node_hash == 0 {
+                // Deterministic order (by object key) so a bounded drain pass is
+                // stable across calls.
+                let mut entries: Vec<_> = shard
+                    .context_dirty_index
+                    .iter()
+                    .filter(|(mark, entry)| {
+                        // THE FLAVOUR IS A FIELD NOW. This read the key's PREFIX, and its comment
+                        // explained that the test was load-bearing because `tenant_hash` is
+                        // left zero on summary marks, so the tenant clause below would admit
+                        // them on an all-tenant drain. The key carries the tenant for BOTH
+                        // flavours now, so the two cannot be confused whether or not this
+                        // clause is here -- it stays because the drain still wants only one
+                        // flavour, not because the other one would leak through.
+                        mark.flavour == crate::engine::state::DirtyFlavour::Embedding
+                            && entry.mark_count > 0
+                            && entry.last_event_time_ms >= start_time_ms
+                            && entry.first_event_time_ms <= end_time_ms
+                            && (tenant_hash == 0 || entry.tenant_hash == tenant_hash)
+                    })
+                    .collect();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                for (_, entry) in entries.into_iter().take(cap) {
+                    nodes.push(ContextDirtyNode {
+                        node_hash: entry.node_hash,
+                        first_event_time_ms: entry.first_event_time_ms,
+                        last_event_time_ms: entry.last_event_time_ms,
+                        reason: entry.reason,
+                        propagate_depth: entry.propagate_depth,
+                        mark_count: entry.mark_count,
+                    });
+                    tenant_hashes.push(entry.tenant_hash);
+                }
+                context_embedding_dirty_key(tenant_hash, 0)
+            } else {
+                let object_key = context_embedding_dirty_key(tenant_hash, node_hash);
+                if let Some(entry) =
+                    shard
+                        .context_dirty_index
+                        .get(&crate::engine::state::DirtyMark::embedding(tenant_hash, node_hash))
+                        .filter(|entry| {
+                            entry.mark_count > 0
+                                && entry.last_event_time_ms >= start_time_ms
+                                && entry.first_event_time_ms <= end_time_ms
+                        })
+                {
+                    nodes.push(ContextDirtyNode {
+                        node_hash: entry.node_hash,
+                        first_event_time_ms: entry.first_event_time_ms,
+                        last_event_time_ms: entry.last_event_time_ms,
+                        reason: entry.reason,
+                        propagate_depth: entry.propagate_depth,
+                        mark_count: entry.mark_count,
+                    });
+                    tenant_hashes.push(entry.tenant_hash);
+                }
+                object_key
+            };
+            CommandResponse::ContextEmbeddingDirtyNodes {
+                object_key,
+                nodes,
+                tenant_hashes,
+            }
+        }
+        Command::ContextUpsertEntity {
+            tenant_hash,
+            entity,
+        } => {
+            // The BLOCK is still addressed per entity -- the object id must stay unique per
+            // entity or two entities of one node would overwrite each other's bytes. Only the
+            // INDEX changes shape: the node's collection key owns a BTreeMap keyed by entity
+            // hash, so the entity's own key no longer occupies a map slot of its own.
+            let object_key = context_entity_key(tenant_hash, entity.node_hash, entity.entity_hash);
+            let collection_key = context_entity_collection_key(tenant_hash, entity.node_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            mutated |= drop_if_expired(cache, shard_id, shard, &collection_key);
+            let collection_key_for_response = collection_key.clone();
+            let object_id = stable_block_object_id(shard_id, "context_entity", &object_key);
+            let routing_bucket =
+                block_routing_bucket(&object_key, start_routing_bucket, end_routing_bucket);
+            let bytes = context_bytes(&entity);
+            if let Ok(address) = append_value(
+                cache,
+                block_store,
+                shard_id,
+                &bytes,
+                Some(object_id),
+                // `None`, matching the object id derived from ("context_entity", &object_key, None):
+                // the entity's own key IS the object key, so its block is a whole object.
+                None,
+                Some(routing_bucket),
+                async_storage,
+            ) {
+                // insert() on the entity hash OVERWRITES: an entity has one current value, and
+                // its history is the separate context_entity_update_audit series. Keying this
+                // map by time instead would silently turn every upsert into an append.
+                stage_component_outcome(
+                    shard_id,
+                    "context_entity",
+                    &collection_key,
+                    Some(entity.entity_hash.to_string()),
+                    routing_bucket,
+                    Some(address.clone()),
+                    None,
+                );
+                shard
+                    .context_entities_mut()
+                    .entry(std::sync::Arc::from(&collection_key[..]))
+                    .or_default()
+                    .set(entity.entity_hash, address);
+                mutated = true;
+            }
+            invalidate_context_record(cache, shard_id, &object_key);
+            invalidate_context_record(cache, shard_id, &collection_key_for_response);
+            CommandResponse::ContextObjectKey {
+                object_key: collection_key_for_response,
+            }
+        }
+        Command::ContextGetEntity {
+            tenant_hash,
+            node_hash,
+            entity_hash,
+        } => {
+            let collection_key = context_entity_collection_key(tenant_hash, node_hash);
+            let object_key = collection_key.clone();
+            mutated |= drop_if_expired(cache, shard_id, shard, &collection_key);
+            // THE BLOCK'S OWN KEY IS THE PER-ENTITY KEY, not the collection key this map is keyed
+            // by: `ContextUpsertEntity` files the block under `context_entity_key(..)` and derives
+            // its routing bucket from that, so a read has to name the same string or it looks in
+            // the cache under a key nothing ever wrote. The index groups entities by node; the
+            // BLOCK is still per entity, and that split is exactly what this line has to respect.
+            let entity = shard
+                .context_entities()
+                .get(&collection_key[..])
+                .and_then(|series| series.get(entity_hash))
+                .and_then(|address| {
+                    read_block_bytes(
+                        cache,
+                        block_store,
+                        shard_id,
+                        address,
+                        // THE PER-ENTITY KEY, not the collection key this map is keyed by -- the
+                        // same string the bucket below is derived from, and the one
+                        // `ContextUpsertEntity` files the block under. Filed with `None`.
+                        BlockIdentity::of(
+                            shard_id,
+                            "context_entity",
+                            &context_entity_key(tenant_hash, node_hash, entity_hash),
+                            None,
+                        ),
+                        Some(block_routing_bucket(
+                            &context_entity_key(tenant_hash, node_hash, entity_hash),
+                            start_routing_bucket,
+                            end_routing_bucket,
+                        )),
+                    )
+                    .and_then(|bytes| context_from_bytes::<ContextEntity>(&bytes))
+                });
+            CommandResponse::ContextEntity { object_key, entity }
+        }
+        Command::ContextQueryEntities {
+            tenant_hash,
+            node_hash,
+            entity_hashes,
+            limit,
+        } => {
+            let object_key = context_entity_collection_key(tenant_hash, node_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let series = shard.context_entities().get(&object_key[..]);
+            // TAKES THE ENTITY HASH, because the block's routing bucket comes from the per-entity
+            // key and this map is keyed by the node's collection key. The "every entity" arm below
+            // therefore iterates `iter()` rather than `values()`: the hash it was discarding is
+            // what names the block.
+            let read_entity = |entity_hash: u64, address: &ElementEntry| {
+                read_block_bytes(
+                    cache,
+                    block_store,
+                    shard_id,
+                    address,
+                    // The per-entity key, as the bucket below. Filed with `None`.
+                    BlockIdentity::of(
+                        shard_id,
+                        "context_entity",
+                        &context_entity_key(tenant_hash, node_hash, entity_hash),
+                        None,
+                    ),
+                    Some(block_routing_bucket(
+                        &context_entity_key(tenant_hash, node_hash, entity_hash),
+                        start_routing_bucket,
+                        end_routing_bucket,
+                    )),
+                )
+                .and_then(|bytes| context_from_bytes::<ContextEntity>(&bytes))
+            };
+            // An empty entity_hashes now means "every entity of this node" instead of "nothing".
+            // Before the fold the caller had to already know each hash, because the entities of
+            // one node were separate HashMap keys and a HashMap cannot be prefix-scanned -- so a
+            // node's entity set could not be discovered from the engine at all. Passing explicit
+            // hashes still selects exactly those, so existing callers are unaffected.
+            let entities = match (series, entity_hashes.is_empty()) {
+                (None, _) => Vec::new(),
+                (Some(series), true) => series
+                    .points()
+                    .take(context_limit(limit))
+                    .filter_map(|(entity_hash, address)| read_entity(entity_hash, address))
+                    .collect(),
+                (Some(series), false) => dedupe_nonzero_u64_preserve_order(entity_hashes)
+                    .into_iter()
+                    .take(context_limit(limit))
+                    .filter_map(|entity_hash| {
+                        series
+                            .get(entity_hash)
+                            .and_then(|address| read_entity(entity_hash, address))
+                    })
+                    .collect(),
+            };
+            CommandResponse::ContextEntities {
+                object_key,
+                entities,
+            }
+        }
+        Command::ContextUpsertChildRef {
+            tenant_hash,
+            child_ref,
+        } => {
+            let object_key = context_child_key(tenant_hash, child_ref.parent_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let existing = load_context_children(cache, block_store, shard_id, shard, &object_key);
+            let created = existing
+                .iter()
+                .all(|stored| stored.child_hash != child_ref.child_hash);
+            if created {
+                let timeline_key =
+                    context_timeline_key(child_ref.updated_at_ms, child_ref.child_hash);
+                let routing_bucket =
+                    block_routing_bucket(&object_key, start_routing_bucket, end_routing_bucket);
+                if let Ok(addresses) = append_timestamped_kv_blocks(
+                    cache,
+                    block_store,
+                    shard_id,
+                    "context_child",
+                    &object_key,
+                    vec![FeaturePoint {
+                        timestamp_ms: timeline_key,
+                        value: context_bytes(&child_ref),
+                    }],
+                    routing_bucket,
+                    async_storage,
+                    true,
+                crate::engine::state::next_block_index_for_object(&shard.bucket_index, routing_bucket, "context_child", &object_key),
+            ) {
+                    let series = shard
+                        .context_children_mut()
+                        .entry(std::sync::Arc::from(&object_key[..]))
+                        .or_default();
+                    for (timestamp_ms, address) in addresses {
+                        series.set(timestamp_ms, address);
+                        mutated = true;
+                    }
+                }
+            }
+            invalidate_context_record(cache, shard_id, &object_key);
+            CommandResponse::ContextChildRefs {
+                object_key,
+                refs: Vec::new(),
+                created: Some(created),
+            }
+        }
+        Command::ContextQueryChildren {
+            tenant_hash,
+            parent_hash,
+            limit,
+        } => {
+            let object_key = context_child_key(tenant_hash, parent_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let mut refs = load_context_children(cache, block_store, shard_id, shard, &object_key);
+            refs.sort_by_key(|child_ref| (child_ref.updated_at_ms, child_ref.child_hash));
+            // Keep the NEWEST `limit`, not the oldest. Sorting ascending and truncating handed back
+            // a parent's first children and hid everything recently added -- five children with
+            // limit 2 answered with the two oldest, and the newest was unreachable by any query.
+            //
+            // The same cut, in the same direction, is what traversal was fixed for: the most
+            // recently ingested were the first to become invisible, which is the opposite of what
+            // a store keyed on time should do. The listing stays in chronological order, which is
+            // what an unlimited query already returned.
+            let keep = context_limit(limit);
+            if refs.len() > keep {
+                refs.drain(..refs.len() - keep);
+            }
+            CommandResponse::ContextChildRefs {
+                object_key,
+                refs,
+                created: None,
+            }
+        }
+        Command::ContextTraverseTree {
+            tenant_hash,
+            start_node_hash,
+            query_vector,
+            max_depth,
+            top_k_per_depth,
+            max_children_scored_per_parent,
+            max_candidate_nodes,
+            leaf_only,
+        } => {
+            // The walk starts at one node and follows the children it finds. Those two keys
+            // are what this arm names; a node dropped further down the walk is the sweep's
+            // job, not a read's.
+            let start_node_key = context_node_key(tenant_hash, start_node_hash);
+            let start_child_key = context_child_key(tenant_hash, start_node_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &start_node_key);
+            mutated |= drop_if_expired(cache, shard_id, shard, &start_child_key);
+            let outcome = traverse_context_tree(
+                cache,
+                block_store,
+                shard_id,
+                shard,
+                tenant_hash,
+                start_node_hash,
+                &query_vector,
+                max_depth,
+                top_k_per_depth,
+                max_children_scored_per_parent,
+                max_candidate_nodes,
+                leaf_only,
+            );
+            CommandResponse::ContextTraversedNodes {
+                nodes: outcome.nodes,
+                children_dropped_before_scoring: outcome.children_dropped_before_scoring,
+            }
+        }
+        Command::ContextUpsertSummary {
+            tenant_hash,
+            summary,
+        } => {
+            let object_key = context_summary_key(tenant_hash, summary.node_hash, summary.level);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let timeline_key =
+                context_timeline_key(summary.valid_from_ms, u64::from(summary.level));
+            let routing_bucket =
+                block_routing_bucket(&object_key, start_routing_bucket, end_routing_bucket);
+            if let Ok(addresses) = append_timestamped_kv_blocks(
+                cache,
+                block_store,
+                shard_id,
+                "context_summary",
+                &object_key,
+                vec![FeaturePoint {
+                    timestamp_ms: timeline_key,
+                    value: context_bytes(&summary),
+                }],
+                routing_bucket,
+                async_storage,
+                true,
+                crate::engine::state::next_block_index_for_object(&shard.bucket_index, routing_bucket, "context_summary", &object_key),
+            ) {
+                let series = shard
+                    .context_summaries_mut()
+                    .entry(std::sync::Arc::from(&object_key[..]))
+                    .or_default();
+                for (timestamp_ms, address) in addresses {
+                    series.set(timestamp_ms, address);
+                    mutated = true;
+                }
+            }
+            invalidate_context_record(cache, shard_id, &object_key);
+            // Keep the node's copy of this vector current. The summary record just written
+            // remains the owner; the copy exists so the scoring pass, which fetches the node
+            // anyway, does not have to come back here for one field.
+            //
+            // Only the L1 level: that is the only level scoring reads a vector from, and the
+            // node has one slot, so copying L0 here would overwrite the answer with a summary
+            // nothing asks for.
+            if context_node_summary_vector_enabled()
+                && summary.level == CONTEXT_SUMMARY_LEVEL_L1
+                && !summary.vector.is_empty()
+            {
+                let node_key = context_node_key(tenant_hash, summary.node_hash);
+                if let Some(node) = load_context_node(cache, block_store, shard_id, shard, &node_key)
+                {
+                    // Never move the copy BACKWARDS. A summary can be written with an older
+                    // `valid_from_ms` than one already stored -- a backfill, a replay, a
+                    // correction -- and taking it would leave the node claiming a superseded
+                    // vector is the newest, which is precisely the read the copy answers.
+                    if node.summary_vector_valid_from_ms <= summary.valid_from_ms {
+                        let mut updated = node.clone();
+                        // Stored form, not the value as computed. The node being compared
+                        // against came off a block, and both stored vector forms round, so a raw
+                        // vector differs from its own round trip -- which would call every
+                        // ingest a change and append a second node block for each one.
+                        updated.summary_vector = context_vector_as_stored(&summary.vector);
+                        updated.summary_vector_valid_from_ms = summary.valid_from_ms;
+                        // The encoder stamp travels with the vector, or the copy becomes the one
+                        // scored vector whose encoder nothing checks.
+                        updated.summary_vector_model_hash = summary.embedding_model_hash;
+                        // Write only when the record would actually change. The ingest already
+                        // wrote the node carrying this copy, moments before the summary write
+                        // that lands here.
+                        if context_bytes(&updated) != context_bytes(&node) {
+                            mutated |= write_context_node(
+                                cache,
+                                block_store,
+                                shard_id,
+                                shard,
+                                &node_key,
+                                &updated,
+                                start_routing_bucket,
+                                end_routing_bucket,
+                                async_storage,
+                            );
+                        }
+                    }
+                }
+            }
+            CommandResponse::ContextObjectKey { object_key }
+        }
+        Command::ContextQuerySummaries {
+            tenant_hash,
+            node_hash,
+            level,
+            as_of_ms,
+            limit,
+        } => {
+            let object_key = context_summary_key(tenant_hash, node_hash, level);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let mut summaries = load_context_summaries(
+                cache,
+                block_store,
+                shard_id,
+                shard,
+                &object_key,
+                as_of_ms,
+                limit,
+            );
+            summaries.sort_by_key(|summary| summary.valid_from_ms);
+            CommandResponse::ContextSummaries {
+                object_key,
+                summaries,
+            }
+        }
+        Command::ContextQuerySummaryVectors {
+            tenant_hash,
+            node_hashes,
+            level,
+            as_of_ms,
+        } => {
+            let node_hashes = dedupe_nonzero_u64_preserve_order(node_hashes);
+            for node_hash in node_hashes.iter().copied() {
+                mutated |= drop_if_expired(
+                    cache,
+                    shard_id,
+                    shard,
+                    &context_summary_key(tenant_hash, node_hash, level),
+                );
+            }
+            // One summary read per node -- the same per-node cost the separate embedding rows
+            // had, minus the second keyspace. Only the newest summary at or before `as_of_ms`
+            // is consulted; a summary carrying no vector contributes nothing, so the caller can
+            // tell "not embedded" apart from "not summarized" by the node's absence here.
+            let vectors = node_hashes
+                .into_iter()
+                .filter_map(|node_hash| {
+                    let object_key = context_summary_key(tenant_hash, node_hash, level);
+                    // Newest, not oldest. The series ascends with time, so the previous
+                    // `take(1).next()` returned the node's FIRST summary: once a node had been
+                    // re-summarised, scoring used the superseded embedding, and a stale vector of
+                    // the right width still scores a plausible cosine, so nothing surfaced it.
+                    load_newest_context_summary(
+                        cache,
+                        block_store,
+                        shard_id,
+                        shard,
+                        &object_key,
+                        as_of_ms,
+                    )
+                    .filter(|summary| !summary.vector.is_empty())
+                    .map(|summary| ContextSummaryVector {
+                        node_hash,
+                        embedding_model_hash: summary.embedding_model_hash,
+                        vector: summary.vector,
+                    })
+                })
+                .collect();
+            CommandResponse::ContextSummaryVectors { vectors }
+        }
+        Command::ContextWriteCompressionEvent { tenant_hash, event } => {
+            let object_key = context_compression_key(tenant_hash, event.node_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let timeline_key =
+                context_timeline_key(event.compressed_time_ms, event.compression_id_hash);
+            let routing_bucket =
+                block_routing_bucket(&object_key, start_routing_bucket, end_routing_bucket);
+            if let Ok(addresses) = append_timestamped_kv_blocks(
+                cache,
+                block_store,
+                shard_id,
+                "context_compression",
+                &object_key,
+                vec![FeaturePoint {
+                    timestamp_ms: timeline_key,
+                    value: context_bytes(&event),
+                }],
+                routing_bucket,
+                async_storage,
+                true,
+                crate::engine::state::next_block_index_for_object(&shard.bucket_index, routing_bucket, "context_compression", &object_key),
+            ) {
+                let series = shard
+                    .context_compressions_mut()
+                    .entry(std::sync::Arc::from(&object_key[..]))
+                    .or_default();
+                for (timestamp_ms, address) in addresses {
+                    series.set(timestamp_ms, address);
+                    mutated = true;
+                }
+            }
+            invalidate_context_record(cache, shard_id, &object_key);
+            CommandResponse::ContextObjectKey { object_key }
+        }
+        Command::ContextQueryCompressionEvents {
+            tenant_hash,
+            node_hashes,
+            start_time_ms,
+            end_time_ms,
+            limit,
+        } => {
+            for node_hash in node_hashes.iter().copied().filter(|node_hash| *node_hash != 0) {
+                mutated |= drop_if_expired(
+                    cache,
+                    shard_id,
+                    shard,
+                    &context_compression_key(tenant_hash, node_hash),
+                );
+            }
+            let mut events = load_context_compression_events(
+                cache,
+                block_store,
+                shard_id,
+                shard,
+                tenant_hash,
+                &node_hashes,
+                start_time_ms,
+                end_time_ms,
+                limit,
+            );
+            let object_key = node_hashes
+                .iter()
+                .find(|node_hash| **node_hash != 0)
+                .map(|node_hash| context_compression_key(tenant_hash, *node_hash))
+                .unwrap_or_else(|| context_compression_key(tenant_hash, 0));
+            CommandResponse::ContextCompressionEvents {
+                object_key,
+                events: {
+                    events.truncate(context_limit(limit));
+                    events
+                },
+                source_event_count: None,
+                truncated_source_events: None,
+            }
+        }
+        Command::ContextCompressEvents {
+            tenant_hash,
+            node_hash,
+            source_start_ms,
+            source_end_ms,
+            compressed_time_ms,
+            max_source_events,
+            min_confidence,
+            min_importance,
+        } => {
+            let object_key = context_compression_key(tenant_hash, node_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &object_key);
+            let source_event_key = context_event_key(tenant_hash, node_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &source_event_key);
+            let source_limit = context_limit(max_source_events);
+            let mut selected = shard
+                .context_events()
+                .get(&*context_event_key(tenant_hash, node_hash))
+                .map(|_series| {
+                    context_event_time_range(
+                        shard,
+                        &context_event_key(tenant_hash, node_hash),
+                        source_start_ms,
+                        source_end_ms,
+                    )
+                    .filter_map(|(timeline_key, address)| {
+                        read_context_value_cold::<ContextEvent>(block_store, timeline_key, address)
+                    })
+                    .filter(|event| {
+                        event.confidence >= min_confidence && event.importance >= min_importance
+                    })
+                    .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            selected.sort_by_key(|event| (event.event_time_ms, event.event_id_hash));
+            let truncated = selected.len() > source_limit;
+            selected.truncate(source_limit);
+            if selected.is_empty() {
+                CommandResponse::ContextCompressionEvents {
+                    object_key,
+                    events: Vec::new(),
+                    source_event_count: Some(0),
+                    truncated_source_events: Some(false),
+                }
+            } else {
+                let event = build_context_compression_event(
+                    tenant_hash,
+                    node_hash,
+                    source_start_ms,
+                    source_end_ms,
+                    compressed_time_ms,
+                    &selected,
+                    truncated,
+                );
+                let timeline_key =
+                    context_timeline_key(event.compressed_time_ms, event.compression_id_hash);
+                let routing_bucket =
+                    block_routing_bucket(&object_key, start_routing_bucket, end_routing_bucket);
+                if let Ok(addresses) = append_timestamped_kv_blocks(
+                    cache,
+                    block_store,
+                    shard_id,
+                    "context_compression",
+                    &object_key,
+                    vec![FeaturePoint {
+                        timestamp_ms: timeline_key,
+                        value: context_bytes(&event),
+                    }],
+                    routing_bucket,
+                    async_storage,
+                    false,
+                crate::engine::state::next_block_index_for_object(&shard.bucket_index, routing_bucket, "context_compression", &object_key),
+            ) {
+                    let series = shard
+                        .context_compressions_mut()
+                        .entry(std::sync::Arc::from(&object_key[..]))
+                        .or_default();
+                    for (timestamp_ms, address) in addresses {
+                        series.set(timestamp_ms, address);
+                        mutated = true;
+                    }
+                }
+                invalidate_context_record(cache, shard_id, &object_key);
+                CommandResponse::ContextCompressionEvents {
+                    object_key,
+                    events: vec![event],
+                    source_event_count: Some(selected.len() as u32),
+                    truncated_source_events: Some(truncated),
+                }
+            }
+        }
+        Command::ContextQueryNodeContext {
+            tenant_hash,
+            node_hash,
+            summary_level,
+            as_of_ms,
+            cold_start_time_ms,
+            cold_end_time_ms,
+            compression_limit,
+        } => {
+            let node_key = context_node_key(tenant_hash, node_hash);
+            mutated |= drop_if_expired(cache, shard_id, shard, &node_key);
+            let node = shard
+                .hashes
+                .get(&node_key)
+                .and_then(|fields| fields.get(CONTEXT_NODE_FIELD))
+                .map(|address| (address, BlockIdentity::of(shard_id, "hash", &node_key, Some(CONTEXT_NODE_FIELD))))
+                .or_else(|| {
+                        // THE PRE-HASHES ARM IS A WHOLE `context_node` BLOCK, not the `meta` field of a
+                        // hash. `model_map_block_address` spells it `("context_node", None)` and is the
+                        // authority; one element named for both arms is wrong for whichever arm it does
+                        // not describe, and this chain named the field for both.
+                        shard
+                            .context_nodes()
+                            .get(node_key.as_str())
+                            .map(|address| (address, BlockIdentity::of(shard_id, "context_node", &node_key, None)))
+                })
+                .and_then(|(address, identity)| {
+                    read_block_shared(
+                        cache,
+                        block_store,
+                        shard_id,
+                        address,
+                        identity,
+                        Some(block_routing_bucket(
+                            &node_key,
+                            start_routing_bucket,
+                            end_routing_bucket,
+                        )),
+                    )
+                    .and_then(|bytes| context_from_bytes::<ContextNode>(&bytes))
+                });
+            let level = summary_level.unwrap_or(1).max(1);
+            let summary_key = context_summary_key(tenant_hash, node_hash, level);
+            let latest_summary = load_latest_context_summary(
+                cache,
+                block_store,
+                shard_id,
+                shard,
+                &summary_key,
+                as_of_ms,
+            );
+            let cold_window_summaries = if cold_start_time_ms == 0 && cold_end_time_ms == 0 {
+                Vec::new()
+            } else {
+                load_context_compression_events(
+                    cache,
+                    block_store,
+                    shard_id,
+                    shard,
+                    tenant_hash,
+                    &[node_hash],
+                    cold_start_time_ms,
+                    cold_end_time_ms,
+                    compression_limit,
+                )
+            };
+            CommandResponse::ContextNodeContext {
+                node_exists: node.is_some(),
+                node,
+                overall_summary_exists: latest_summary.is_some(),
+                overall_summary: latest_summary,
+                cold_window_summaries,
+            }
+        }
+    };
+    ExecuteOutcome { response, mutated }
+}
+
+/// IEEE-754 total-order bias: flip everything for negatives, set the sign for positives, so
+/// unsigned comparison of the bits is numeric comparison of the floats.
+pub(super) fn zset_score_bits(score: f64) -> u64 {
+    let bits = score.to_bits();
+    if bits & (1 << 63) != 0 {
+        !bits
+    } else {
+        bits | (1 << 63)
+    }
+}
+
+pub(super) fn zset_score_from_bits(biased: u64) -> f64 {
+    if biased & (1 << 63) != 0 {
+        f64::from_bits(biased & !(1 << 63))
+    } else {
+        f64::from_bits(!biased)
+    }
+}
+
+pub(super) fn zset_score_string(biased: u64) -> String {
+    let score = zset_score_from_bits(biased);
+    if score == score.trunc() && score.abs() < 1e17 {
+        format!("{}", score as i64)
+    } else {
+        format!("{score}")
+    }
+}
+
+/// The persisted component: the member alone, hex encoded.
+///
+/// USED TO BE SCORE BITS THEN MEMBER -- the comment this replaces said so, and the lexical order
+/// it bought was never built on: every zset serving arm that returns members in score order
+/// reads the score out of `shard.zsets` and sorts explicitly (`zset_members_in_score_range`,
+/// `zset_ordered_members`), so dropping the score from this string costs that ordering nothing.
+/// What it buys is the thing this change is for: `BlockIndex.component` for a zset entry is now
+/// the same shape as a set's, so zset can collapse to one index entry a page the way set and list
+/// already have. The score still rides every write -- see `RecordedKind::outcome_value` and the
+/// WAL outcome's `value` field -- it is simply no longer spelled into this string.
+pub(super) fn zset_component(member: &[u8]) -> String {
+    hex::encode(member)
+}
+
+/// The members whose score falls in `[min_bits, max_bits]`, in score order.
+///
+/// Same scan as `zset_ordered_members` -- the map is keyed by member, so every member has to be
+/// looked at either way -- but the score test happens BEFORE the member bytes are copied, so a
+/// narrow window copies a narrow window. The full-order helper below clones all n up front, which
+/// cost 4,115 allocations and 324 KB to return eight members from a set of 4,096.
+fn zset_members_in_score_range(
+    shard: &ShardState,
+    key: &str,
+    min_bits: u64,
+    max_bits: u64,
+    min_exclusive: bool,
+    max_exclusive: bool,
+) -> Vec<(Vec<u8>, u64)> {
+    let mut ordered: Vec<(Vec<u8>, u64)> = shard
+        .zsets
+        .get(key)
+        .map(|members| {
+            members
+                .iter()
+                .filter(|(_, (biased, _))| {
+                    let above = if min_exclusive {
+                        *biased > min_bits
+                    } else {
+                        *biased >= min_bits
+                    };
+                    let below = if max_exclusive {
+                        *biased < max_bits
+                    } else {
+                        *biased <= max_bits
+                    };
+                    above && below
+                })
+                .map(|(member, (biased, _))| (member.clone(), *biased))
+                .collect()
+        })
+        .unwrap_or_default();
+    ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    ordered
+}
+
+fn zset_ordered_members(shard: &ShardState, key: &str) -> Vec<(Vec<u8>, u64)> {
+    let mut ordered: Vec<(Vec<u8>, u64)> = shard
+        .zsets
+        .get(key)
+        .map(|members| {
+            members
+                .iter()
+                .map(|(member, (biased, _))| (member.clone(), *biased))
+                .collect()
+        })
+        .unwrap_or_default();
+    ordered.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    ordered
+}
+
+/// The whole token-bucket model in one pure function, so its arithmetic is testable with
+/// explicit clocks: refill by elapsed time at `refill_per_sec` (capped at capacity, and a
+/// clock that moved backwards refills nothing), then take if it fits. Answers
+/// (allowed, remaining AFTER the outcome, retry-after ms, state to store). An absent bucket
+/// starts full.
+pub(super) fn bucket_take(
+    current: Option<(f64, u64)>,
+    now_ms: u64,
+    tokens: f64,
+    capacity: f64,
+    refill_per_sec: f64,
+) -> (bool, f64, u64, (f64, u64)) {
+    let tokens = tokens.max(0.0);
+    let capacity = capacity.max(0.0);
+    let refill_per_sec = refill_per_sec.max(0.0);
+    let filled = match current {
+        None => capacity,
+        Some((had, last_ms)) => {
+            let elapsed_ms = now_ms.saturating_sub(last_ms);
+            (had + refill_per_sec * (elapsed_ms as f64 / 1000.0)).min(capacity)
+        }
+    };
+    if tokens <= filled {
+        let remaining = filled - tokens;
+        (true, remaining, 0, (remaining, now_ms))
+    } else {
+        let shortfall = tokens - filled;
+        let retry_after_ms = if refill_per_sec > 0.0 && tokens <= capacity {
+            (shortfall / refill_per_sec * 1000.0).ceil() as u64
+        } else {
+            // A take larger than capacity can never succeed; answer the sentinel.
+            u64::MAX
+        };
+        (false, filled, retry_after_ms, (filled, now_ms))
+    }
+}
+
+fn bucket_answer(allowed: bool, remaining: f64, retry_after_ms: u64) -> Vec<Vec<u8>> {
+    vec![
+        if allowed {
+            b"1".to_vec()
+        } else {
+            b"0".to_vec()
+        },
+        format!("{remaining:.3}").into_bytes(),
+        retry_after_ms.to_string().into_bytes(),
+    ]
+}
