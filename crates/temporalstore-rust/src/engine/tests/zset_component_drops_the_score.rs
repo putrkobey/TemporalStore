@@ -129,3 +129,265 @@ fn n_members_at_distinct_scores_survive_a_cold_reload_in_score_order() {
     let dir = tempfile::tempdir().expect("tempdir");
 
     {
+        let engine = engine_on(dir.path(), "cache-writer");
+        load_on(&engine, "zcd-present-table");
+        for index in 0..N {
+            write(
+                &engine,
+                Command::ZSetAdd {
+                    key: key.to_string(),
+                    member: member_bytes(index),
+                    score: index as f64 * 1.5,
+                },
+            );
+        }
+        for index in 0..N {
+            assert_eq!(
+                score_of(&engine, key, &member_bytes(index)),
+                Some(index as f64 * 1.5),
+                "member {index} did not read back its own score BEFORE the reload"
+            );
+        }
+        engine.unload_shard(1);
+    }
+
+    let engine = engine_on(dir.path(), "cache-reloaded");
+    load_on(&engine, "zcd-present-table");
+
+    for index in 0..N {
+        assert_eq!(
+            score_of(&engine, key, &member_bytes(index)),
+            Some(index as f64 * 1.5),
+            "member {index} did not come back at its own score after a cold reload"
+        );
+    }
+
+    let ranged = match read(
+        &engine,
+        Command::ZSetRangeByScore {
+            key: key.to_string(),
+            min: f64::MIN,
+            max: f64::MAX,
+            min_exclusive: false,
+            max_exclusive: false,
+            rev: false,
+        },
+    ) {
+        crate::types::CommandResponse::Members { members } => members,
+        other => panic!("ZSetRangeByScore answered {other:?}"),
+    };
+    assert_eq!(
+        ranged.len(),
+        2 * N,
+        "ZSetRangeByScore answered {} interleaved entries, not the {} this fixture wrote",
+        ranged.len(),
+        2 * N
+    );
+    let scores: Vec<f64> = ranged
+        .chunks(2)
+        .map(|pair| String::from_utf8_lossy(&pair[1]).parse::<f64>().expect("a score string"))
+        .collect();
+    let mut sorted = scores.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    assert_eq!(
+        scores, sorted,
+        "ZSetRangeByScore did not answer in score order after a cold reload: {scores:?}"
+    );
+    println!("[present] {N} members survived a cold reload, in score order");
+}
+
+// =================================================================================================
+// 2. REMOVED STAYS REMOVED
+// =================================================================================================
+
+/// A LOSS GUARD IS NOT A RESURRECTION GUARD -- a separate test, not one more assertion on the
+/// first, which the module doc explains.
+///
+/// rust-internal: drives ZSetAdd and ZSetRemove through a real cold reload, no external surface
+#[test]
+fn a_removed_member_stays_removed_across_a_cold_reload() {
+    const N: usize = 10;
+    let key = "zcd-removed";
+    let removed_index = 4;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let engine = engine_on(dir.path(), "cache-writer");
+        load_on(&engine, "zcd-removed-table");
+        for index in 0..N {
+            write(
+                &engine,
+                Command::ZSetAdd {
+                    key: key.to_string(),
+                    member: member_bytes(index),
+                    score: index as f64,
+                },
+            );
+        }
+        write(
+            &engine,
+            Command::ZSetRemove {
+                key: key.to_string(),
+                member: member_bytes(removed_index),
+            },
+        );
+        assert_eq!(
+            card_of(&engine, key),
+            (N - 1) as i64,
+            "DENOMINATOR: the removal did not take effect before the reload"
+        );
+        engine.unload_shard(1);
+    }
+
+    let engine = engine_on(dir.path(), "cache-reloaded");
+    load_on(&engine, "zcd-removed-table");
+
+    assert_eq!(
+        card_of(&engine, key),
+        (N - 1) as i64,
+        "ZCARD is not N-1 after a cold reload -- either the removed member came back or an \
+         unrelated one went missing"
+    );
+    assert_eq!(
+        score_of(&engine, key, &member_bytes(removed_index)),
+        None,
+        "the removed member came back after a cold reload"
+    );
+    for index in 0..N {
+        if index == removed_index {
+            continue;
+        }
+        assert_eq!(
+            score_of(&engine, key, &member_bytes(index)),
+            Some(index as f64),
+            "member {index} did not survive the cold reload at its own score"
+        );
+    }
+    println!("[removed] member {removed_index} of {N} stayed removed, the rest kept their scores");
+}
+
+// =================================================================================================
+// 3. A RESCORE LEAVES EXACTLY ONE MEMBER
+// =================================================================================================
+
+/// THE USER-VISIBLE SHAPE OF THE COLLAPSE THIS CHANGE DRIVES AT THE COMPONENT LEVEL.
+///
+/// `container_tombstone_entry::a_rescore_sweeps_its_own_tombstone_because_the_component_no_longer_
+/// spells_the_score` drives the index-entry mechanics (one live entry, zero tombstones) in the
+/// same process, without a reload. This guard asks the same question of a REAL cold reload, which
+/// is the thing a hand-built index fixture cannot stand in for.
+///
+/// rust-internal: drives ZSetAdd twice at different scores through a real cold reload
+#[test]
+fn a_rescore_leaves_exactly_one_member_across_a_cold_reload() {
+    let key = "zcd-rescore";
+    let member = b"zcd-rescored-member".to_vec();
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let engine = engine_on(dir.path(), "cache-writer");
+        load_on(&engine, "zcd-rescore-table");
+        write(
+            &engine,
+            Command::ZSetAdd {
+                key: key.to_string(),
+                member: member.clone(),
+                score: 1.0,
+            },
+        );
+        write(
+            &engine,
+            Command::ZSetAdd {
+                key: key.to_string(),
+                member: member.clone(),
+                score: 2.0,
+            },
+        );
+        assert_eq!(
+            (card_of(&engine, key), score_of(&engine, key, &member)),
+            (1, Some(2.0)),
+            "DENOMINATOR: the rescore did not already answer ZCARD==1 and ZSCORE==2 before the \
+             reload"
+        );
+        engine.unload_shard(1);
+    }
+
+    let engine = engine_on(dir.path(), "cache-reloaded");
+    load_on(&engine, "zcd-rescore-table");
+
+    assert_eq!(
+        card_of(&engine, key),
+        1,
+        "ZCARD is not 1 after a cold reload -- a rescore must not leave the member twice, once \
+         per score"
+    );
+    assert_eq!(
+        score_of(&engine, key, &member),
+        Some(2.0),
+        "ZSCORE is not 2.0 after a cold reload -- the rescore's own score did not survive"
+    );
+    println!("[rescore] ZCARD==1 and ZSCORE==2.0 survived a cold reload");
+}
+
+// =================================================================================================
+// 4. REPLAY-ONLY RECOVERY -- THE GUARD THAT CATCHES THE DATA LOSS AN EARLIER ATTEMPT MEASURED
+// =================================================================================================
+
+/// THE SCORE RIDES THE WAL OUTCOME'S `value` SLOT NOW, NOT THE COMPONENT, AND THIS IS THE ONE
+/// PATH THAT CAN ONLY REACH IT THAT WAY.
+///
+/// `replay_under_the_gate`'s mechanism, reused here rather than re-derived: an `unload_shard` is
+/// what materializes the base index, so a fixture that never unloads leaves the reload no choice
+/// but to replay the WAL through `apply_outcome_item` alone. That is the ONLY path with no page
+/// read and no index snapshot available to fall back on for the score -- which is exactly why an
+/// earlier, naive attempt at this change lost it here: the component used to carry
+/// `{biased:016x}` and the replay arm decoded the score out of that text; with the score off the
+/// component, a replay arm that still looked there would find none and either refuse the whole
+/// shard load or silently install the wrong score. Neither happens if the score rode `value`
+/// instead, which is what this guard is for.
+///
+/// rust-internal: drives one ZSetAdd through replay-only recovery, no external surface
+#[test]
+fn a_zset_write_recovered_through_replay_alone_returns_its_score() {
+    let key = "zcd-replay";
+    let member = b"zcd-replay-only-member".to_vec();
+    let score = 3.0f64;
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    {
+        let engine = engine_on(dir.path(), "cache-writer");
+        load_on(&engine, "zcd-replay-table");
+        write(
+            &engine,
+            Command::ZSetAdd {
+                key: key.to_string(),
+                member: member.clone(),
+                score,
+            },
+        );
+        assert_eq!(
+            score_of(&engine, key, &member),
+            Some(score),
+            "DENOMINATOR: the write did not even answer its own score before any reload"
+        );
+        // DELIBERATELY NO `unload_shard`. The engine is dropped here with its index never
+        // flushed, which is what forces the next load to replay rather than read a snapshot.
+    }
+
+    let engine = engine_on(dir.path(), "cache-reloaded");
+    load_on(&engine, "zcd-replay-table");
+
+    assert_eq!(
+        score_of(&engine, key, &member),
+        Some(score),
+        "the member did not come back at its own score through replay-only recovery. If it came \
+         back at NO score, or ABSENT, or the shard failed to load at all, the WAL outcome's `value` \
+         slot is not carrying the score the way `RecordedKind::outcome_value` is supposed to."
+    );
+    assert_eq!(
+        card_of(&engine, key),
+        1,
+        "ZCARD is not 1 after replay-only recovery"
+    );
+    println!("[replay-only] a zset write with no flushed index recovered its score through replay alone");
+}
