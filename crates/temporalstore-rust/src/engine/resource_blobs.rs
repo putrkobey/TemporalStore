@@ -183,3 +183,188 @@ impl TemporalEngine {
         length: u64,
     ) -> std::io::Result<(Vec<u8>, u64, bool)> {
         let path = self.resource_blob_path(tenant_hash, content_hash);
+        let mut file = std::fs::File::open(&path)?;
+        let total = file.metadata()?.len();
+        if offset >= total {
+            return Ok((Vec::new(), total, true));
+        }
+        let want = if length == 0 {
+            total - offset
+        } else {
+            length.min(total - offset)
+        };
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut bytes = vec![0u8; usize::try_from(want).unwrap_or(usize::MAX)];
+        file.read_exact(&mut bytes)?;
+        let eof = offset + want >= total;
+        Ok((bytes, total, eof))
+    }
+
+    /// Delete unreferenced blobs for one tenant, plus stale staging files. `referenced` is the
+    /// set of content hashes the caller's manifests still name; only files OLDER than
+    /// `min_age_ms` are eligible, so an upload racing the sweep keeps its blob until its
+    /// manifest lands.
+    pub fn resource_blob_sweep(
+        &self,
+        tenant_hash: u64,
+        referenced: &std::collections::HashSet<u64>,
+        min_age_ms: u64,
+    ) -> std::io::Result<(u64, u64)> {
+        let now = now_ms();
+        let old_enough = |path: &std::path::Path| -> bool {
+            std::fs::metadata(path)
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|age| age.as_millis() as u64 + min_age_ms <= now)
+                .unwrap_or(false)
+        };
+        let mut scanned = 0u64;
+        let mut deleted = 0u64;
+        let tenant_dir = self.resource_blob_root().join(format!("{tenant_hash:016x}"));
+        if let Ok(entries) = std::fs::read_dir(&tenant_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                let Some(hex) = name.strip_suffix(".bin") else {
+                    continue;
+                };
+                let Ok(content_hash) = u64::from_str_radix(hex, 16) else {
+                    continue;
+                };
+                scanned += 1;
+                if !referenced.contains(&content_hash) && old_enough(&path) {
+                    if std::fs::remove_file(&path).is_ok() {
+                        deleted += 1;
+                    }
+                }
+            }
+        }
+        let staging_dir = self.resource_blob_root().join(STAGING_DIR);
+        if let Ok(entries) = std::fs::read_dir(&staging_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                scanned += 1;
+                if old_enough(&path) && std::fs::remove_file(&path).is_ok() {
+                    deleted += 1;
+                }
+            }
+        }
+        Ok((scanned, deleted))
+    }
+
+    /// Dispatch for the blob commands. Runs before the shard lock: blobs live beside the
+    /// engine, not inside any shard's record state, and a multi-gigabyte upload must never
+    /// hold the shard write lock.
+    pub(super) fn execute_resource_blob_command(
+        &self,
+        request: &ExecuteRequest,
+    ) -> Option<ExecuteResponse> {
+        let respond = |result: Result<CommandResponse, String>| -> ExecuteResponse {
+            match result {
+                Ok(response) => ExecuteResponse {
+                    status: Status::ok(),
+                    response,
+                },
+                Err(detail) => ExecuteResponse {
+                    status: Status::error("resource_blob_error", detail),
+                    response: CommandResponse::Empty,
+                },
+            }
+        };
+        match &request.command {
+            Command::ContextResourceBlobBegin { tenant_hash } => Some(respond(
+                self.resource_blob_begin(*tenant_hash)
+                    .map(|upload_token| CommandResponse::ContextResourceBlobUpload {
+                        upload_token,
+                        bytes_total: 0,
+                    })
+                    .map_err(|err| err.to_string()),
+            )),
+            Command::ContextResourceBlobAppend {
+                upload_token,
+                payload_base64,
+                ..
+            } => Some(respond(
+                BASE64
+                    .decode(payload_base64)
+                    .map_err(|err| format!("invalid base64 payload: {err}"))
+                    .and_then(|bytes| {
+                        self.resource_blob_append(upload_token, &bytes)
+                            .map_err(|err| err.to_string())
+                    })
+                    .map(|bytes_total| CommandResponse::ContextResourceBlobUpload {
+                        upload_token: upload_token.clone(),
+                        bytes_total,
+                    }),
+            )),
+            Command::ContextResourceBlobCommit {
+                tenant_hash,
+                upload_token,
+            } => Some(respond(
+                self.resource_blob_commit(*tenant_hash, upload_token)
+                    .map(
+                        |(uri, size_bytes, content_hash)| CommandResponse::ContextResourceBlobCommitted {
+                            uri,
+                            size_bytes,
+                            content_hash,
+                        },
+                    )
+                    .map_err(|err| err.to_string()),
+            )),
+            Command::ContextResourceBlobPut {
+                tenant_hash,
+                payload_base64,
+            } => Some(respond(
+                BASE64
+                    .decode(payload_base64)
+                    .map_err(|err| format!("invalid base64 payload: {err}"))
+                    .and_then(|bytes| {
+                        self.resource_blob_put(*tenant_hash, &bytes)
+                            .map_err(|err| err.to_string())
+                    })
+                    .map(
+                        |(uri, size_bytes, content_hash)| CommandResponse::ContextResourceBlobCommitted {
+                            uri,
+                            size_bytes,
+                            content_hash,
+                        },
+                    ),
+            )),
+            Command::ContextResourceBlobFetch {
+                uri,
+                offset,
+                length,
+            } => Some(respond(match parse_resource_blob_uri(uri) {
+                None => Err(format!("not a resource blob uri: {uri}")),
+                Some((tenant_hash, content_hash)) => self
+                    .resource_blob_fetch(tenant_hash, content_hash, *offset, *length)
+                    .map(|(bytes, total_size, eof)| CommandResponse::ContextResourceBlobChunk {
+                        payload_base64: BASE64.encode(&bytes),
+                        total_size,
+                        eof,
+                    })
+                    .map_err(|err| err.to_string()),
+            })),
+            Command::ContextResourceBlobSweep {
+                tenant_hash,
+                referenced_content_hashes,
+                min_age_ms,
+            } => {
+                let referenced: std::collections::HashSet<u64> =
+                    referenced_content_hashes.iter().copied().collect();
+                Some(respond(
+                    self.resource_blob_sweep(*tenant_hash, &referenced, *min_age_ms)
+                        .map(|(scanned, deleted)| CommandResponse::ContextResourceBlobSwept {
+                            scanned,
+                            deleted,
+                        })
+                        .map_err(|err| err.to_string()),
+                ))
+            }
+            _ => None,
+        }
+    }
+}
