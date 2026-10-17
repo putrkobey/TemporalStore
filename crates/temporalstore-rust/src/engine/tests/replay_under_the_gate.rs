@@ -435,3 +435,440 @@ fn the_gate_does_not_reach_the_component_the_index_log_item_is_built_from() {
 const HASH_KEY: &str = "replay-gate-hash";
 
 fn field_name(index: usize) -> String {
+    format!("field-{index:05}")
+}
+
+fn field_value(index: usize) -> Vec<u8> {
+    format!("value-{index:05}").into_bytes()
+}
+
+/// What REPLAY rebuilt, read from the durable map -- the hash analogue of `resident_members`.
+fn resident_hash_fields(engine: &TemporalEngine) -> BTreeSet<String> {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 is loaded");
+    shard
+        .hashes
+        .get(HASH_KEY)
+        .map(|fields| fields.iter().map(|(name, _)| name.to_string()).collect())
+        .unwrap_or_default()
+}
+
+struct HashReplayArm {
+    load_ok: bool,
+    accepted: u64,
+    classified: u64,
+    resident: BTreeSet<String>,
+}
+
+/// Write `MEMBERS` fields with the gate in the given state, then reload WITHOUT an unload so the
+/// reload must replay. The hash analogue of `write_then_replay`.
+fn write_then_replay_hash(dir: &std::path::Path, gate_on: bool) -> HashReplayArm {
+    {
+        let engine = engine_with_cache(dir, "cache-writer-hash");
+        // NO GATE TO HOLD. `gate_on` is kept as the arm LABEL -- the two arms differ only in what
+        // they are named now -- so the caller still says which it drove and the printed table still
+        // has two rows. See this module s header for why the rows are identical.
+        let _ = gate_on;
+        assert!(load_on(&engine).ok, "the fixture's first load failed");
+        for index in 0..MEMBERS {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::HashSet {
+                    key: HASH_KEY.to_string(),
+                    field: field_name(index),
+                    value: field_value(index),
+                },
+            });
+            assert!(response.status.ok, "write {index} failed: {response:?}");
+        }
+        assert_eq!(
+            MEMBERS,
+            resident_hash_fields(&engine).len(),
+            "the fixture does not hold its fields BEFORE the reload, so nothing below is about a \
+             replay"
+        );
+        // Deliberately NO unload, same reason as the set fixture above.
+    }
+
+    // NO GATE TO HOLD. `gate_on` survives as the arm LABEL -- both arms now drive the same
+    // single path -- so the caller still says which arm it asked for and the printed table
+    // still has two rows. The rows being IDENTICAL is the point of keeping them.
+    let _ = gate_on;
+    crate::engine::persistence::reset_index_load_path_counts();
+    let reloaded = engine_with_cache(dir, "cache-reloaded-hash");
+    let status = load_on(&reloaded);
+    let (accepted, refused_stale, absent, undecodable) =
+        crate::engine::persistence::index_load_path_counts();
+    let arm = HashReplayArm {
+        load_ok: status.ok,
+        accepted,
+        classified: accepted + refused_stale + absent + undecodable,
+        resident: if status.ok {
+            resident_hash_fields(&reloaded)
+        } else {
+            BTreeSet::new()
+        },
+    };
+    println!(
+        "  gate {}: load_ok={} accepted={accepted} refused_stale={refused_stale} absent={absent} \
+         undecodable={undecodable} resident={}",
+        if gate_on { "ON " } else { "OFF" },
+        arm.load_ok,
+        arm.resident.len(),
+    );
+    arm
+}
+
+/// rust-internal: drives a gate-on hash store back through replay and names every field
+#[test]
+fn a_gated_hash_write_reaches_the_log_and_every_field_comes_back_through_replay() {
+    let gated_dir = tempfile::tempdir().expect("tempdir");
+    let control_dir = tempfile::tempdir().expect("tempdir");
+
+    println!("\n=== a hash store written under the gate, brought back by replay ===");
+    let gated = write_then_replay_hash(gated_dir.path(), true);
+    let control = write_then_replay_hash(control_dir.path(), false);
+
+    for (label, arm) in [("gate on", &gated), ("control", &control)] {
+        assert!(
+            arm.classified > 0,
+            "{label}: the reload classified NO index load at all, so it never reached the index \
+             decision and the replay floor below would be satisfied by absence rather than by a \
+             replay"
+        );
+        assert_eq!(
+            0, arm.accepted,
+            "{label}: the reload ACCEPTED a persisted index (accepted={}, classified={}), so it \
+             never replayed and neither arm under test was reached",
+            arm.accepted, arm.classified
+        );
+    }
+
+    assert!(
+        gated.load_ok,
+        "THE SHARD DID NOT COME UP under the gate. `apply_outcome_item`'s hash arm answers `false` \
+         when it cannot rebuild a field -- `item.component` is `None` -- and the caller treats \
+         that as a refusal that fails the whole shard load"
+    );
+    assert!(
+        control.load_ok,
+        "the GATE-OFF control did not come up either, so this fixture is broken and says nothing \
+         about the gate"
+    );
+    assert_eq!(
+        MEMBERS,
+        control.resident.len(),
+        "the GATE-OFF control recovered {} of {MEMBERS} fields, so this fixture is not durable \
+         without an unload and a short gated arm below would be the fixture's fault rather than \
+         the gate's",
+        control.resident.len()
+    );
+
+    assert_eq!(
+        MEMBERS,
+        gated.resident.len(),
+        "{} of {MEMBERS} fields came back through replay under the gate, against {} for the \
+         gate-off control on the identical sequence",
+        gated.resident.len(),
+        control.resident.len()
+    );
+    for index in 0..MEMBERS {
+        assert!(
+            gated.resident.contains(&field_name(index)),
+            "field {index} did not come back through replay under the gate"
+        );
+    }
+    assert_eq!(
+        control.resident, gated.resident,
+        "the gate changed WHICH fields survive a replay, not merely how many"
+    );
+}
+
+/// rust-internal: asks the hash index-log item builder directly, mirroring the set version exactly
+#[test]
+fn the_gate_does_not_reach_the_component_the_hash_index_log_item_is_built_from() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_with_cache(dir.path(), "cache-direct-hash");
+    assert!(load_on(&engine).ok, "the fixture's load failed");
+    for index in 0..MEMBERS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::HashSet {
+                key: HASH_KEY.to_string(),
+                field: field_name(index),
+                value: field_value(index),
+            },
+        });
+        assert!(response.status.ok, "write {index} failed");
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 is loaded");
+
+    // (1) THE MECHANISM: the component the log item is built from comes off the COMMAND for hash
+    //     too, so the collapsed index entry cannot reach it.
+    let command = Command::HashSet {
+        key: HASH_KEY.to_string(),
+        field: field_name(0),
+        value: field_value(0),
+    };
+    let named = crate::engine::command_upsert_components(&command, shard)
+        .expect("a hash set must name an upsert component");
+    println!("\n=== asked directly, under the gate (hash) ===");
+    println!("  command_upsert_components -> {named:?}");
+    assert_eq!(
+        1,
+        named.len(),
+        "a single hash set named {} components",
+        named.len()
+    );
+    let (kind, object_key, component) = named[0].clone();
+    assert_eq!("hash", kind, "the component is filed under {kind}");
+    assert_eq!(HASH_KEY, object_key.as_str(), "it names object {object_key}");
+    let component = component.expect(
+        "THE GATE REACHED THE RECORD. `command_upsert_components` no longer names a component for \
+         a hash set, so `collect_upsert_index_items` would fall to its `_ => None` arm, build no \
+         item, and the write would never reach the index log",
+    );
+    assert_eq!(
+        field_name(0),
+        component,
+        "the component is spelled {component}, not the field name `command_upsert_components` \
+         should have taken straight off the command"
+    );
+
+    // (2) GIVEN WHAT THE REAL CALLER GIVES IT, an item is built.
+    let with_component = crate::engine::collect_upsert_index_items(
+        shard,
+        1,
+        &[("hash", HASH_KEY.to_string(), Some(component.clone()))],
+        0,
+        1023,
+    );
+    println!("  with the command's component -> {} item(s)", with_component.len());
+
+    // (3) THE NEGATIVE CONTROL: the same call with no component builds NOTHING.
+    let without_component = crate::engine::collect_upsert_index_items(
+        shard,
+        1,
+        &[("hash", HASH_KEY.to_string(), None)],
+        0,
+        1023,
+    );
+    println!("  with no component    -> {} item(s)", without_component.len());
+
+    assert_eq!(
+        1,
+        with_component.len(),
+        "the builder made {} items for one component, so the counts below are not comparable",
+        with_component.len()
+    );
+    assert!(
+        without_component.is_empty(),
+        "THE NEGATIVE CONTROL DID NOT HOLD: a (\"hash\", None) component built {} item(s), so the \
+         `_ => None` fallthrough no longer drops the row and the mechanism asserted above is no \
+         longer what protects the index log. If a later step gave the builder a page-named arm, \
+         THIS is the assertion to change -- deliberately, saying so",
+        without_component.len()
+    );
+}
+
+/// EVERY KIND THAT DECLARES AN UPSERT COMPONENT MUST HAVE A COLLECTOR ARM FOR IT.
+///
+/// # THE PAIR, AND WHY HALF OF IT IS WORSE THAN NEITHER
+///
+/// Two functions have to agree for a write to reach the index log by the O(delta) path:
+///
+///   * `command_upsert_components` names what the command wrote, as `(kind, key, component)`.
+///     Naming nothing is safe: the caller falls back to a whole-object snapshot record, which is
+///     expensive and correct.
+///   * `collect_upsert_index_items` turns each of those back into the address the item carries,
+///     by looking the component up in the resident map for its kind.
+///
+/// Declaring a component the collector has no arm for is the one combination that loses. The
+/// caller sees `Some(..)` and takes the delta path, the collector falls to `_ => None` and builds
+/// nothing, and the record names NO page for a write that wrote one -- while reporting success and
+/// looking cheaper than before, because an empty record is small.
+///
+/// THAT IS NOT HYPOTHETICAL. #2232 added a `FeatureAppend` arm to the first function and there was
+/// no `feature` arm in the second, so every feature append wrote a record naming none of its
+/// pages. The hazard was already written down for the hash pairing, in this module's own failure
+/// message: the collector "would fall to its `_ => None` arm, build no item, and the write would
+/// never reach the index log". A test of one kind did not stop it being reintroduced for another.
+///
+/// # SO THIS ASKS IT OF EVERY KIND AT ONCE
+///
+/// One real command per kind the first function can name, executed against a real engine, then
+/// both halves asserted on what the command actually produced. A kind added to the first function
+/// without an arm in the second fails here, and the failure names the kind.
+///
+/// The NEGATIVE CONTROL matters as much: the same component removed must build nothing. Without
+/// it, a collector that answered an item for every input -- the obvious way to "fix" a failure
+/// here -- would pass.
+///
+///   cargo test -p temporalstore-rust --lib every_declared_component_builds_an_index_item -- --nocapture
+#[test]
+fn every_declared_component_builds_an_index_item() {
+    use crate::types::{Command, ExecuteRequest, FeaturePoint};
+
+    const T0: u64 = 1_787_270_070_000;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = std::sync::Arc::new(crate::TemporalEngine::with_local_dirs(
+        64 * 1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    ));
+    engine.load_shard(1);
+
+    // One write per kind, each the plainest form of it, so what is being tested is the pairing
+    // and not some unusual shape of the command.
+    let commands: Vec<(&str, Command)> = vec![
+        (
+            "hash",
+            Command::HashSet {
+                key: "pair-hash".to_string(),
+                field: "f".to_string(),
+                value: b"v".to_vec(),
+            },
+        ),
+        (
+            "string",
+            Command::StringSet {
+                key: "pair-string".to_string(),
+                value: b"v".to_vec(),
+            },
+        ),
+        (
+            "zset",
+            Command::ZSetAdd {
+                key: "pair-zset".to_string(),
+                member: b"m".to_vec(),
+                score: 1.0,
+            },
+        ),
+        (
+            "set",
+            Command::SetAdd {
+                key: "pair-set".to_string(),
+                member: b"m".to_vec(),
+            },
+        ),
+        (
+            "list",
+            Command::ListPush {
+                key: "pair-list".to_string(),
+                member: b"m".to_vec(),
+                left: false,
+            },
+        ),
+        (
+            "feature",
+            Command::FeatureAppend {
+                key: "pair-feature".to_string(),
+                points: vec![FeaturePoint {
+                    timestamp_ms: T0,
+                    value: vec![b'v'; 8],
+                }],
+            },
+        ),
+    ];
+
+    for (label, command) in &commands {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: command.clone(),
+        });
+        assert!(
+            response.status.ok,
+            "the {label} write failed, so this test would be asserting the pairing over a store \
+             the command never reached: {:?}",
+            response.status
+        );
+    }
+
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 is loaded");
+
+    println!();
+    println!("  kind      components   items   items without the component");
+    let mut checked = 0usize;
+    for (label, command) in &commands {
+        // POST-WRITE, which is when the real caller asks: a list push files under a sequence only
+        // knowable after the write, and a feature append under the timestamp it stored.
+        let named = crate::engine::command_upsert_components(command, shard).unwrap_or_else(|| {
+            panic!(
+                "`command_upsert_components` names nothing for a {label} write. If that is now \
+                 deliberate -- the kind went back to the whole-object snapshot path -- remove it \
+                 from this test's list and say why; a silent `None` here is a cost regression, \
+                 not a loss."
+            )
+        });
+        assert!(
+            !named.is_empty(),
+            "a {label} write named an EMPTY component list, which takes the delta path and then \
+             has nothing to put in the record"
+        );
+
+        let items = crate::engine::collect_upsert_index_items(shard, 1, &named, 0, 1023);
+        // THE STRIPPED FORM: the same components with the component dropped. This is what the
+        // collector sees when a kind has no arm, and it must build nothing.
+        let stripped: Vec<(&'static str, String, Option<String>)> = named
+            .iter()
+            .map(|(kind, key, _)| (*kind, key.clone(), None))
+            .collect();
+        let without = crate::engine::collect_upsert_index_items(shard, 1, &stripped, 0, 1023);
+
+        println!(
+            "  {label:<9} {:>10}   {:>5}   {:>26}",
+            named.len(),
+            items.len(),
+            without.len()
+        );
+
+        assert_eq!(
+            named.len(),
+            items.len(),
+            "a {label} write named {} component(s) and the collector built {} item(s). The \
+             missing arm is `(\"{label}\", Some(..))` in `collect_upsert_index_items`: the caller \
+             takes the delta path on the strength of the component being named, so an item that \
+             is not built is a page the record never mentions -- and the record gets SMALLER, so \
+             it reads as a saving.",
+            named.len(),
+            items.len()
+        );
+        checked += 1;
+    }
+
+    // --- DENOMINATOR: the loop must actually have run over every kind, or this passes by
+    // --- iterating nothing. The count is spelled out so adding a kind to the list without
+    // --- bumping it is a failure rather than a silent narrowing.
+    assert_eq!(
+        checked,
+        commands.len(),
+        "the pairing was checked for {checked} of {} kinds",
+        commands.len()
+    );
+    assert_eq!(
+        6, checked,
+        "this guard covers six kinds; a kind added to `command_upsert_components` belongs in this \
+         list too, and the number here is what makes leaving it out visible"
+    );
+
+    // --- AND THE NEGATIVE CONTROL, once, on the kind whose component is richest. A collector that
+    // --- answered an item for anything would satisfy every assertion above.
+    let string_only = crate::engine::collect_upsert_index_items(
+        shard,
+        1,
+        &[("hash", "pair-hash".to_string(), None)],
+        0,
+        1023,
+    );
+    assert!(
+        string_only.is_empty(),
+        "the collector built {} item(s) for a hash with NO component named. It is meant to answer \
+         only for a component it can resolve, so building something here means the assertions \
+         above prove nothing.",
+        string_only.len()
+    );
+}
