@@ -497,3 +497,503 @@ fn render(state: &SubsystemMetricsState) -> String {
         &mut out,
         "temporalstore_meta_placement_short",
         &[],
+        state.placement_short_now,
+    );
+
+    out.push_str(
+        "# HELP temporalstore_meta_topology_query_latency_us How long answering a table topology query took.\n",
+    );
+    out.push_str("# TYPE temporalstore_meta_topology_query_latency_us histogram\n");
+    let mut cumulative = 0_u64;
+    for (index, bound) in TOPOLOGY_LATENCY_BUCKETS_US.iter().enumerate() {
+        cumulative += state.topology_latency_us[index];
+        push(
+            &mut out,
+            "temporalstore_meta_topology_query_latency_us_bucket",
+            &[("le", &bound.to_string())],
+            cumulative,
+        );
+    }
+    push(
+        &mut out,
+        "temporalstore_meta_topology_query_latency_us_bucket",
+        &[("le", "+Inf")],
+        state.topology_latency_count,
+    );
+    push(
+        &mut out,
+        "temporalstore_meta_topology_query_latency_us_sum",
+        &[],
+        state.topology_latency_sum_us,
+    );
+    push(
+        &mut out,
+        "temporalstore_meta_topology_query_latency_us_count",
+        &[],
+        state.topology_latency_count,
+    );
+
+    out.push_str(
+        "# HELP temporalstore_meta_topology_query_failed_total Topology queries answered with an error.\n",
+    );
+    out.push_str("# TYPE temporalstore_meta_topology_query_failed_total counter\n");
+    push(
+        &mut out,
+        "temporalstore_meta_topology_query_failed_total",
+        &[],
+        state.topology_query_failed_total,
+    );
+    out.push_str(
+        "# HELP temporalstore_meta_mutation_apply_failed_total Recorded mutations that would not apply.\n",
+    );
+    out.push_str("# TYPE temporalstore_meta_mutation_apply_failed_total counter\n");
+    push(
+        &mut out,
+        "temporalstore_meta_mutation_apply_failed_total",
+        &[],
+        state.mutation_apply_failed_total,
+    );
+
+    out.push_str("# HELP temporalstore_meta_shard_divergence_total Shards found routed to a server not serving them.\n");
+    out.push_str("# TYPE temporalstore_meta_shard_divergence_total counter\n");
+    push(
+        &mut out,
+        "temporalstore_meta_shard_divergence_total",
+        &[],
+        state.divergences_total,
+    );
+
+    out.push_str(
+        "# HELP temporalstore_meta_shard_divergence Divergence state as of the last round.\n",
+    );
+    out.push_str("# TYPE temporalstore_meta_shard_divergence gauge\n");
+    for (state_label, value) in [
+        ("diverged", state.diverged_now),
+        ("settling", state.settling_now),
+        ("rate_limited", state.divergence_rate_limited),
+    ] {
+        push(
+            &mut out,
+            "temporalstore_meta_shard_divergence",
+            &[("state", state_label)],
+            value,
+        );
+    }
+
+    out.push_str(
+        "# HELP temporalstore_meta_shards_reassigned_total Shard ownership changes, by cause.\n",
+    );
+    out.push_str("# TYPE temporalstore_meta_shards_reassigned_total counter\n");
+    for (reason, value) in &state.reassigned_total {
+        push(
+            &mut out,
+            "temporalstore_meta_shards_reassigned_total",
+            &[("reason", reason)],
+            *value,
+        );
+    }
+
+    out.push_str(
+        "# HELP temporalstore_meta_retention_purged_total Tombstones forgotten by retention.\n",
+    );
+    out.push_str("# TYPE temporalstore_meta_retention_purged_total counter\n");
+    for (kind, value) in &state.purged_total {
+        push(
+            &mut out,
+            "temporalstore_meta_retention_purged_total",
+            &[("kind", kind)],
+            *value,
+        );
+    }
+
+    out.push_str("# HELP temporalstore_meta_retention_blocked Dropped servers retention cannot forget because they still own a shard.\n");
+    out.push_str("# TYPE temporalstore_meta_retention_blocked gauge\n");
+    push(
+        &mut out,
+        "temporalstore_meta_retention_blocked",
+        &[],
+        state.retention_blocked_servers,
+    );
+
+    out.push_str("# HELP temporalstore_meta_freeze_aging_capped Freeze-aging work the per-round cap held back last round.\n");
+    out.push_str("# TYPE temporalstore_meta_freeze_aging_capped gauge\n");
+    push(
+        &mut out,
+        "temporalstore_meta_freeze_aging_capped",
+        &[],
+        state.freeze_aging_capped,
+    );
+    out.push_str("# HELP temporalstore_meta_divergence_skipped Servers the divergence check did not examine last round.\n");
+    out.push_str("# TYPE temporalstore_meta_divergence_skipped gauge\n");
+    for (reason, value) in &state.divergence_skipped {
+        push(
+            &mut out,
+            "temporalstore_meta_divergence_skipped",
+            &[("reason", reason)],
+            *value,
+        );
+    }
+    out.push_str(
+        "# HELP temporalstore_meta_proxy_attachments_total Proxies attached to or released from a group by calibration.\n",
+    );
+    out.push_str("# TYPE temporalstore_meta_proxy_attachments_total counter\n");
+    for (kind, value) in &state.proxy_attachments_total {
+        push(
+            &mut out,
+            "temporalstore_meta_proxy_attachments_total",
+            &[("kind", kind)],
+            *value,
+        );
+    }
+
+    out.push_str("# HELP temporalstore_meta_calibration_shortfall_groups Proxy groups left short of their target last round.\n");
+    out.push_str("# TYPE temporalstore_meta_calibration_shortfall_groups gauge\n");
+    push(
+        &mut out,
+        "temporalstore_meta_calibration_shortfall_groups",
+        &[],
+        state.calibration_shortfall_groups,
+    );
+    out.push_str("# HELP temporalstore_meta_calibration_shortfall_proxies Proxies those groups are missing.\n");
+    out.push_str("# TYPE temporalstore_meta_calibration_shortfall_proxies gauge\n");
+    push(
+        &mut out,
+        "temporalstore_meta_calibration_shortfall_proxies",
+        &[],
+        state.calibration_shortfall_proxies,
+    );
+    out.push_str("# HELP temporalstore_meta_calibration_capped Calibration changes the per-round cap held back last round.\n");
+    out.push_str("# TYPE temporalstore_meta_calibration_capped gauge\n");
+    push(
+        &mut out,
+        "temporalstore_meta_calibration_capped",
+        &[],
+        state.calibration_capped,
+    );
+    out.push_str("# HELP temporalstore_meta_retention_capped Purges the per-round cap held back last round.\n");
+    out.push_str("# TYPE temporalstore_meta_retention_capped gauge\n");
+    push(
+        &mut out,
+        "temporalstore_meta_retention_capped",
+        &[],
+        state.retention_capped,
+    );
+
+    out.push_str(
+        "# HELP temporalstore_meta_freeze_aged_total Frozen resources aged into the dropped state.\n",
+    );
+    out.push_str("# TYPE temporalstore_meta_freeze_aged_total counter\n");
+    for (kind, value) in &state.aged_total {
+        push(
+            &mut out,
+            "temporalstore_meta_freeze_aged_total",
+            &[("kind", kind)],
+            *value,
+        );
+    }
+
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn damage(location: &str, severity: DamageSeverity, abnormal: usize, safe_mode: bool) -> LocationDamage {
+        LocationDamage {
+            location: location.to_string(),
+            severity,
+            total_servers: 4,
+            abnormal_servers: abnormal,
+            safe_mode,
+        }
+    }
+
+    fn conviction(frozen: &[&str], held: &[&str], damage: Vec<LocationDamage>) -> AdaptiveConvictionReport {
+        AdaptiveConvictionReport {
+            status: Status::ok(),
+            frozen_servers: frozen.iter().map(|addr| addr.to_string()).collect(),
+            frozen_proxies: Vec::new(),
+            held_by_safe_mode: held.iter().map(|addr| addr.to_string()).collect(),
+            damage,
+            rebooted: Vec::new(),
+            held_by_orphan_guard: Vec::new(),
+            orphaned_shards: Vec::new(),
+            detector_paused: false,
+        }
+    }
+
+    fn line(rendered: &str, needle: &str) -> String {
+        rendered
+            .lines()
+            .find(|line| line.starts_with(needle))
+            .unwrap_or_else(|| panic!("no series starting with {needle} in:\n{rendered}"))
+            .to_string()
+    }
+
+    #[test]
+    fn conviction_counters_accumulate_across_rounds() {
+        let metrics = SubsystemMetrics::new();
+        metrics.record_conviction(
+            TIER_SERVER,
+            &conviction(&["a"], &[], vec![damage("rack-1", DamageSeverity::Normal, 1, false)]),
+        );
+        metrics.record_conviction(
+            TIER_SERVER,
+            &conviction(&["b", "c"], &["d"], vec![damage("rack-1", DamageSeverity::Warning, 3, true)]),
+        );
+        let rendered = metrics.prometheus();
+        assert_eq!(
+            line(&rendered, "temporalstore_meta_convicted_total{tier=\"server\"}"),
+            "temporalstore_meta_convicted_total{tier=\"server\"} 3"
+        );
+        assert_eq!(
+            line(
+                &rendered,
+                "temporalstore_meta_conviction_held_total{tier=\"server\",guard=\"safe_mode\"}"
+            ),
+            "temporalstore_meta_conviction_held_total{tier=\"server\",guard=\"safe_mode\"} 1"
+        );
+        assert_eq!(
+            line(&rendered, "temporalstore_meta_detector_rounds_total{subsystem=\"server\"}"),
+            "temporalstore_meta_detector_rounds_total{subsystem=\"server\"} 2"
+        );
+    }
+
+    #[test]
+    fn damage_gauges_describe_only_the_latest_round() {
+        // A gauge that stuck at its worst value would keep paging after the
+        // location recovered, so each round replaces the whole set.
+        let metrics = SubsystemMetrics::new();
+        metrics.record_conviction(
+            TIER_SERVER,
+            &conviction(&[], &[], vec![damage("rack-1", DamageSeverity::Critical, 3, true)]),
+        );
+        assert_eq!(
+            line(
+                &metrics.prometheus(),
+                "temporalstore_meta_damage_severity{tier=\"server\",location=\"rack-1\"}"
+            ),
+            "temporalstore_meta_damage_severity{tier=\"server\",location=\"rack-1\"} 2"
+        );
+
+        metrics.record_conviction(
+            TIER_SERVER,
+            &conviction(&[], &[], vec![damage("rack-1", DamageSeverity::Normal, 0, false)]),
+        );
+        let rendered = metrics.prometheus();
+        assert_eq!(
+            line(
+                &rendered,
+                "temporalstore_meta_damage_severity{tier=\"server\",location=\"rack-1\"}"
+            ),
+            "temporalstore_meta_damage_severity{tier=\"server\",location=\"rack-1\"} 0"
+        );
+        assert_eq!(
+            line(
+                &rendered,
+                "temporalstore_meta_location_safe_mode{tier=\"server\",location=\"rack-1\"}"
+            ),
+            "temporalstore_meta_location_safe_mode{tier=\"server\",location=\"rack-1\"} 0"
+        );
+    }
+
+    #[test]
+    fn a_location_that_disappears_stops_reporting() {
+        let metrics = SubsystemMetrics::new();
+        metrics.record_conviction(
+            TIER_SERVER,
+            &conviction(
+                &[],
+                &[],
+                vec![
+                    damage("rack-1", DamageSeverity::Warning, 2, true),
+                    damage("rack-2", DamageSeverity::Normal, 0, false),
+                ],
+            ),
+        );
+        assert!(metrics.prometheus().contains("location=\"rack-2\""));
+
+        metrics.record_conviction(
+            TIER_SERVER,
+            &conviction(&[], &[], vec![damage("rack-1", DamageSeverity::Normal, 0, false)]),
+        );
+        assert!(!metrics.prometheus().contains("location=\"rack-2\""));
+    }
+
+    #[test]
+    fn the_two_tiers_report_separately() {
+        let metrics = SubsystemMetrics::new();
+        metrics.record_conviction(TIER_SERVER, &conviction(&["a"], &[], Vec::new()));
+        let mut proxy_round = conviction(&[], &[], Vec::new());
+        proxy_round.frozen_proxies = vec!["p1".to_string(), "p2".to_string()];
+        metrics.record_conviction(TIER_PROXY, &proxy_round);
+
+        let rendered = metrics.prometheus();
+        assert_eq!(
+            line(&rendered, "temporalstore_meta_convicted_total{tier=\"server\"}"),
+            "temporalstore_meta_convicted_total{tier=\"server\"} 1"
+        );
+        assert_eq!(
+            line(&rendered, "temporalstore_meta_convicted_total{tier=\"proxy\"}"),
+            "temporalstore_meta_convicted_total{tier=\"proxy\"} 2"
+        );
+    }
+
+    #[test]
+    fn divergence_reports_a_running_total_and_a_current_state() {
+        let metrics = SubsystemMetrics::new();
+        let mut report = ShardCheckReport {
+            diverged: vec![ShardDivergence {
+                shard_id: 1,
+                server_addr: "s1".to_string(),
+                reported_unloaded: false,
+                serving_state: String::new(),
+            }],
+            settling: vec![2, 3],
+            rate_limited: 4,
+            ..ShardCheckReport::default()
+        };
+        metrics.record_divergence(&report);
+        report.diverged.clear();
+        report.settling.clear();
+        report.rate_limited = 0;
+        metrics.record_divergence(&report);
+
+        let rendered = metrics.prometheus();
+        // The counter keeps the history...
+        assert_eq!(
+            line(&rendered, "temporalstore_meta_shard_divergence_total"),
+            "temporalstore_meta_shard_divergence_total 1"
+        );
+        // ...while the gauge says the cluster is clean right now.
+        assert_eq!(
+            line(&rendered, "temporalstore_meta_shard_divergence{state=\"diverged\"}"),
+            "temporalstore_meta_shard_divergence{state=\"diverged\"} 0"
+        );
+    }
+
+    #[test]
+    fn retention_and_aging_counters_climb_by_kind() {
+        let metrics = SubsystemMetrics::new();
+        metrics.record_retention(&MetaRetentionPlan {
+            servers: vec!["s1".to_string()],
+            proxies: vec!["p1".to_string(), "p2".to_string()],
+            tables: Vec::new(),
+            shards: vec![7],
+            blocked_servers: vec!["s2".to_string()],
+            capped: 3,
+        });
+        let aged = FreezeAgingPlan {
+            servers: vec!["s3".to_string()],
+            proxies: Vec::new(),
+            tables: Vec::new(),
+            capped: 0,
+        };
+        // A round that ran to the end: what it applied is what it planned.
+        metrics.record_freeze_aging(&aged, &aged);
+
+        let rendered = metrics.prometheus();
+        assert_eq!(
+            line(&rendered, "temporalstore_meta_retention_purged_total{kind=\"proxy\"}"),
+            "temporalstore_meta_retention_purged_total{kind=\"proxy\"} 2"
+        );
+        assert_eq!(
+            line(&rendered, "temporalstore_meta_retention_purged_total{kind=\"shard\"}"),
+            "temporalstore_meta_retention_purged_total{kind=\"shard\"} 1"
+        );
+        assert_eq!(
+            line(&rendered, "temporalstore_meta_retention_blocked"),
+            "temporalstore_meta_retention_blocked 1"
+        );
+        assert_eq!(
+            line(&rendered, "temporalstore_meta_retention_capped"),
+            "temporalstore_meta_retention_capped 3"
+        );
+        assert_eq!(
+            line(&rendered, "temporalstore_meta_freeze_aged_total{kind=\"server\"}"),
+            "temporalstore_meta_freeze_aged_total{kind=\"server\"} 1"
+        );
+    }
+
+    #[test]
+    fn reassignments_are_labelled_by_cause() {
+        let metrics = SubsystemMetrics::new();
+        metrics.record_reassignment(ShardReassignmentReason::Rebalance.as_str());
+        metrics.record_reassignment(ShardReassignmentReason::Rebalance.as_str());
+        metrics.record_reassignment(ShardReassignmentReason::OwnerDiverged.as_str());
+
+        let rendered = metrics.prometheus();
+        assert_eq!(
+            line(&rendered, "temporalstore_meta_shards_reassigned_total{reason=\"rebalance\"}"),
+            "temporalstore_meta_shards_reassigned_total{reason=\"rebalance\"} 2"
+        );
+        assert_eq!(
+            line(
+                &rendered,
+                "temporalstore_meta_shards_reassigned_total{reason=\"owner_diverged\"}"
+            ),
+            "temporalstore_meta_shards_reassigned_total{reason=\"owner_diverged\"} 1"
+        );
+    }
+
+    #[test]
+    fn label_values_are_escaped() {
+        // Locations are operator supplied, so a stray quote must not be able to
+        // break the exposition format.
+        let metrics = SubsystemMetrics::new();
+        metrics.record_conviction(
+            TIER_SERVER,
+            &conviction(
+                &[],
+                &[],
+                vec![damage("rack\"1\\odd", DamageSeverity::Normal, 0, false)],
+            ),
+        );
+        let rendered = metrics.prometheus();
+        assert!(
+            rendered.contains("location=\"rack\\\"1\\\\odd\""),
+            "unescaped label in:\\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn every_series_carries_help_and_type() {
+        // A metric without them is one Prometheus will scrape but nobody can
+        // read on a dashboard.
+        let metrics = SubsystemMetrics::new();
+        metrics.record_conviction(TIER_SERVER, &conviction(&["a"], &[], Vec::new()));
+        let rendered = metrics.prometheus();
+        let mut names = rendered
+            .lines()
+            .filter(|line| line.starts_with("# TYPE "))
+            .map(|line| line.split_whitespace().nth(2).unwrap().to_string())
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        assert!(!names.is_empty());
+        for name in names {
+            assert!(
+                rendered.contains(&format!("# HELP {name} ")),
+                "{name} has a TYPE but no HELP"
+            );
+        }
+    }
+
+    #[test]
+    fn recording_through_a_clone_shares_one_recorder() {
+        // The loops hold clones of the meta handle; they must all write to the
+        // same series rather than to private copies.
+        let metrics = SubsystemMetrics::new();
+        let clone = metrics.clone();
+        metrics.record_reassignment("rebalance");
+        clone.record_reassignment("rebalance");
+        assert_eq!(
+            line(
+                &metrics.prometheus(),
+                "temporalstore_meta_shards_reassigned_total{reason=\"rebalance\"}"
+            ),
+            "temporalstore_meta_shards_reassigned_total{reason=\"rebalance\"} 2"
+        );
+    }
+}
