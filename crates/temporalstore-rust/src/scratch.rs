@@ -94,3 +94,100 @@ fn arm_background_sweep() {
 
 #[derive(Debug, Default)]
 struct SweepReport {
+    removed: u64,
+    failed: u64,
+    kept_live: u64,
+}
+
+/// Remove `temporalstore-rust-*` directories under `dir` whose embedded process id is no
+/// longer alive. Directories of live processes are kept; so is anything whose name does not
+/// parse, and everything on platforms where liveness cannot be checked.
+fn sweep_dead_scratch_dirs(dir: &Path) -> SweepReport {
+    let mut report = SweepReport::default();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return report;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(rest) = name.strip_prefix("temporalstore-rust-") else {
+            continue;
+        };
+        // Layout: {kind}-{pid}-{nanos}-{counter}. The kind may itself contain dashes
+        // ("index-logs"), so parse from the right.
+        let mut fields = rest.rsplitn(4, '-');
+        let (Some(_counter), Some(_nanos), Some(pid)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<u32>() else { continue };
+        if pid == std::process::id() {
+            report.kept_live += 1;
+            continue;
+        }
+        match process_is_alive(pid) {
+            Some(false) => {
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    if std::fs::remove_dir_all(entry.path()).is_ok() {
+                        report.removed += 1;
+                    } else {
+                        report.failed += 1;
+                    }
+                }
+            }
+            // A live owner, or a platform where liveness cannot be checked: never guess
+            // about deleting.
+            Some(true) | None => report.kept_live += 1,
+        }
+    }
+    report
+}
+
+#[cfg(target_os = "linux")]
+fn process_is_alive(pid: u32) -> Option<bool> {
+    Some(Path::new("/proc").join(pid.to_string()).exists())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_is_alive(_pid: u32) -> Option<bool> {
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn owned_scratch_dir_survives_clones_and_dies_with_the_last() {
+        let guard = owned_scratch_dir("scratch-guard-test");
+        let path = guard.path().to_path_buf();
+        std::fs::create_dir_all(&path).expect("create scratch dir");
+        std::fs::write(path.join("probe"), b"x").expect("write probe");
+        let clone = Arc::clone(&guard);
+        drop(guard);
+        assert!(path.exists(), "a live clone must keep the directory");
+        drop(clone);
+        assert!(!path.exists(), "the last drop must remove the directory");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sweep_removes_dead_owners_and_keeps_live_ones() {
+        let base = tempfile::tempdir().expect("tempdir");
+        // pid_max caps real pids far below u32::MAX, so this owner can never be alive.
+        let dead = base.path().join("temporalstore-rust-pages-4294967295-1-2");
+        let live = base
+            .path()
+            .join(format!("temporalstore-rust-index-logs-{}-3-4", std::process::id()));
+        let unrelated = base.path().join("unrelated-dir");
+        for dir in [&dead, &live, &unrelated] {
+            std::fs::create_dir_all(dir).expect("create test dir");
+        }
+        let report = sweep_dead_scratch_dirs(base.path());
+        assert!(!dead.exists(), "a dead owner's directory must be reclaimed");
+        assert!(live.exists(), "this live process's directory must be kept");
+        assert!(unrelated.exists(), "unrelated names must never be touched");
+        assert_eq!(report.removed, 1);
+    }
+}
