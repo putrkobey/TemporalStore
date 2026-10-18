@@ -157,3 +157,642 @@ use prost::Message as _;
 
 use crate::block_store::ElementEntry;
 use crate::engine::hashing::stable_block_object_id;
+use crate::engine::state::{
+    BlockIndex, BlockSlabLiveIndex, BucketFlags, BucketNode, CoreIndex,
+};
+
+// =================================================================================================
+// FRAMING
+// =================================================================================================
+
+/// Read one protobuf varint at `offset`, returning it and the bytes it took.
+fn varint_at(bytes: &[u8], offset: usize) -> Option<(u64, usize)> {
+    let mut value = 0_u64;
+    for (index, byte) in bytes[offset..].iter().take(10).enumerate() {
+        value |= u64::from(byte & 0x7f) << (7 * index);
+        if byte & 0x80 == 0 {
+            return Some((value, index + 1));
+        }
+    }
+    None
+}
+
+fn a_ported_record() -> crate::index_log_record::IndexLogRecord {
+    crate::index_log_record::IndexLogRecord {
+        version: crate::index_log_record::INDEX_LOG_RECORD_VERSION,
+        routing_bucket: 4,
+        items: vec![crate::index_log_record::IndexItem {
+            object_id: 1,
+            block_id: 2,
+            address: 4096,
+            size: 512,
+            in_wal: true,
+            ..Default::default()
+        }],
+        sequence: 8,
+        wal_sequence: 77,
+        ..Default::default()
+    }
+}
+
+/// THE PORTED FRAME IS THE LIVE BINARY FRAME WITH ITS MARKER BYTE REMOVED, AND THE MARKER IS WHAT
+/// TELLS FOUR SHAPES APART IN ONE FILE.
+///
+/// The header of the ported record claims "same framing". It is the same checksum, the same
+/// little-endian four bytes and the same length prefix -- and it is NOT the same frame, because
+/// `log_framing` reads `0xB3` binary, `#tsf2`, `#tsf1` and a legacy unframed JSON line out of one
+/// file and picks between them by the first byte.
+///
+/// THREE CONTROLS, because two of the three claims are about a NEGATIVE result:
+///   * the live reader round-trips a LIVE frame exactly (the reader is not simply broken);
+///   * the ported decoder REFUSES a live frame (the ported decoder can refuse at all);
+///   * and only then is "the live reader does not refuse a ported frame" worth anything.
+#[test]
+fn the_ported_frame_is_the_live_binary_frame_minus_its_marker_byte() {
+    let record = a_ported_record();
+    let payload = record.encode_to_vec();
+    assert!(
+        payload.len() < 0x80,
+        "this test compares the two varints byte for byte, so the payload must fit one varint \
+         byte; it is {} B",
+        payload.len()
+    );
+
+    let live = crate::log_framing::encode_frame(&payload);
+    let ported = crate::record_framing::encode_framed(&record);
+
+    assert_eq!(
+        live[0],
+        crate::log_framing::FRAME_MAGIC_V3,
+        "the live binary frame leads with its marker"
+    );
+    assert_ne!(
+        ported[0],
+        crate::log_framing::FRAME_MAGIC_V3,
+        "the ported frame has no marker at all -- its first byte is the length"
+    );
+    assert_eq!(
+        &live[1..],
+        &ported[..],
+        "behind the marker the two frames are byte-identical: varint length, le crc32c, payload"
+    );
+
+    // CONTROL ONE -- the live reader is not simply broken: it round-trips its own frame.
+    let (consumed, body) = crate::log_framing::next_frame(&live)
+        .expect("a live frame is not corruption")
+        .expect("a live frame is complete");
+    assert_eq!(consumed, live.len(), "the whole frame is consumed");
+    assert_eq!(body, &payload[..], "and the payload comes back exactly");
+
+    // CONTROL TWO -- the ported decoder can refuse. Handed a live frame it reads the 0xB3 marker
+    // as the first byte of the length varint and claims a payload that is not there.
+    let on_live: Result<(crate::index_log_record::IndexLogRecord, usize), _> =
+        crate::record_framing::decode_framed_at(&live, 0);
+    assert!(
+        on_live.is_err(),
+        "the ported decoder must refuse a live frame, or the claim below is vacuous"
+    );
+
+    // THE CLAIM. The live reader does not refuse a ported frame. It is not recognised as framed
+    // at all, so it goes down the legacy-unframed arm instead of being surfaced as corruption.
+    let on_ported = crate::log_framing::next_frame(&ported);
+    assert!(
+        on_ported.is_ok(),
+        "a ported frame is not REFUSED by the live reader; it is mis-read: {:?}",
+        on_ported.as_ref().err()
+    );
+    let mis_read = on_ported.expect("checked ok");
+    match mis_read {
+        None => println!(
+            "MIS-READ: the live reader treats a ported frame as a TORN TAIL (no newline in the \
+             payload), which a caller truncates"
+        ),
+        Some((consumed, body)) => {
+            assert_ne!(
+                body,
+                &payload[..],
+                "a ported frame read by the live reader must not accidentally yield the payload, \
+                 or this hazard would be benign"
+            );
+            println!(
+                "MIS-READ: the live reader consumed {consumed} of {} B and handed back {} B that \
+                 are not the payload",
+                ported.len(),
+                body.len()
+            );
+        }
+    }
+}
+
+// =================================================================================================
+// THE PORTED ITEM CARRIES NO CHARACTERS
+// =================================================================================================
+
+/// EVERY ONE OF THE PORTED ITEM'S SEVEN FIELDS IS A VARINT, SO NOTHING ON IT CAN HOLD A CHARACTER.
+///
+/// This is the structural half of the refusal: the live row's `object_key` and `block_ref_key`
+/// have no counterpart on the ported item, and not because the port chose different names --
+/// because the port has no length-delimited field in which text could ride.
+///
+/// THE CONTROL IS THE WALKER ITSELF. A walker that cannot SEE a wire-type-2 field would report any
+/// message as character-free, so the same walk is run over the ported RECORD, whose `items` is a
+/// repeated message and therefore length-delimited, and is required to find one.
+#[test]
+fn the_ported_item_has_no_field_that_can_carry_a_character() {
+    let item = crate::index_log_record::IndexItem {
+        object_id: u32::MAX,
+        block_id: u32::MAX,
+        address: u64::MAX,
+        size: u32::MAX,
+        in_wal: true,
+        deleted: true,
+        model_id: u32::MAX,
+    };
+    let bytes = item.encode_to_vec();
+
+    let mut tags: Vec<(u64, u64)> = Vec::new();
+    let mut offset = 0_usize;
+    while offset < bytes.len() {
+        let (key, used) = varint_at(&bytes, offset).expect("a field key is a varint");
+        offset += used;
+        let wire_type = key & 7;
+        tags.push((key >> 3, wire_type));
+        assert_eq!(
+            wire_type, 0,
+            "field {} of the ported item is wire type {wire_type}, not a varint",
+            key >> 3
+        );
+        let (_, value_used) = varint_at(&bytes, offset).expect("a varint value");
+        offset += value_used;
+    }
+    println!("PORTED ITEM FIELDS (tag, wire type): {tags:?}");
+    assert_eq!(
+        tags.len(),
+        7,
+        "all seven of the ported item's fields must have been written, or the walk proved nothing \
+         about the ones it did not reach"
+    );
+
+    // CONTROL -- the same walk finds a length-delimited field when one exists.
+    let record = a_ported_record();
+    let record_bytes = record.encode_to_vec();
+    let mut saw_length_delimited = false;
+    let mut offset = 0_usize;
+    while offset < record_bytes.len() {
+        let (key, used) = varint_at(&record_bytes, offset).expect("a field key is a varint");
+        offset += used;
+        let wire_type = key & 7;
+        match wire_type {
+            0 => {
+                let (_, value_used) = varint_at(&record_bytes, offset).expect("a varint value");
+                offset += value_used;
+            }
+            1 => offset += 8,
+            2 => {
+                saw_length_delimited = true;
+                let (len, len_used) =
+                    varint_at(&record_bytes, offset).expect("a length is a varint");
+                offset += len_used + len as usize;
+            }
+            other => panic!("unexpected wire type {other} on the ported record"),
+        }
+    }
+    assert!(
+        saw_length_delimited,
+        "the walker must be able to SEE a wire-type-2 field, or its absence above means nothing"
+    );
+}
+
+// =================================================================================================
+// THE OBJECT ID
+// =================================================================================================
+
+/// A THIRTY-TWO-BIT OBJECT ID COLLIDES, AND IT TAKES FEW ENOUGH KEYS TO PRINT.
+///
+/// The ported item's `object_id` is a `u32`. The live row's is a `u64` and its value is
+/// `stable_block_object_id`, an FNV-1a 64. This searches for the first pair of distinct keys whose
+/// low thirty-two bits agree and asserts that the full ids of that same pair do not.
+///
+/// MEASURED, NOT ARGUED FROM A BIRTHDAY BOUND, because the question is whether THIS hash over
+/// THESE key shapes collides at a cardinality a shard reaches, and a bound computed over a uniform
+/// hash is a claim about a different function.
+///
+/// THE CONTROL IS THE SECOND ASSERTION: if the 64-bit ids of the colliding pair were also equal,
+/// the pair would be a key collision rather than a truncation collision and would say nothing
+/// about the width.
+#[test]
+fn a_thirty_two_bit_object_id_collides_long_before_the_sixty_four_bit_one_does() {
+    const CEILING: u64 = 2_000_000;
+    let mut low: HashMap<u32, String> = HashMap::new();
+    let mut collision: Option<(String, String, u64)> = None;
+    for counter in 0..CEILING {
+        let key = format!("object-key-{counter}");
+        let identity = stable_block_object_id(1, "string", &key);
+        if let Some(previous) = low.get(&(identity as u32)) {
+            collision = Some((previous.clone(), key, counter));
+            break;
+        }
+        low.insert(identity as u32, key);
+    }
+
+    let (left, right, after) = collision.expect(
+        "a 32-bit truncation of stable_block_object_id must collide within the ceiling, or the \
+         narrowing is not refuted by this test",
+    );
+    let left_id = stable_block_object_id(1, "string", &left);
+    let right_id = stable_block_object_id(1, "string", &right);
+
+    println!(
+        "TRUNCATION COLLISION after {after} distinct keys: {left:?} and {right:?}\n  \
+         64-bit: {left_id} vs {right_id}\n  32-bit: {} vs {}",
+        left_id as u32, right_id as u32
+    );
+
+    assert_ne!(left, right, "two DISTINCT keys");
+    assert_ne!(
+        left_id, right_id,
+        "their 64-bit ids are distinct -- this is a width collision, not a key collision"
+    );
+    assert_eq!(
+        left_id as u32,
+        right_id as u32,
+        "and their 32-bit truncations are the same number"
+    );
+}
+
+/// THE ROW'S OBJECT ID LANDS IN A STORED `u64` SET, AND THE TRUNCATION IS NOT A MEMBER OF IT.
+///
+/// `fold_delta_block_items` is the only thing that turns index-log items into pages. It inserts
+/// `item.object_id` into `BucketNode::object_index`, which is STORED and whose members are
+/// compared for equality against `stable_block_object_id` computed from text elsewhere in the
+/// engine. So narrowing the row's id does not cost a byte of precision, it changes the VALUE a
+/// reader matches on.
+///
+/// TWO CONTROLS. The id this test hands the fold is the real derivation, so the positive arm must
+/// find it (or the set is simply empty and the negative arm is vacuous); and the negative arm asks
+/// for the truncation widened back to `u64`, which is a number the fold was never handed.
+#[test]
+fn the_fold_stores_the_rows_object_id_as_a_u64_and_the_truncation_is_not_a_member() {
+    let key = "an-object-the-fold-files";
+    let object_id = stable_block_object_id(1, "string", key);
+    assert_ne!(
+        object_id,
+        u64::from(object_id as u32),
+        "this key's id must have bits above 32, or the two arms below are the same number"
+    );
+
+    let item = crate::index_log::IndexItem {
+        kind: crate::index_log::IndexItemKind::Block,
+        routing_bucket: 7,
+        block_ref_key: String::new(),
+        object_key: Arc::from(key),
+        model_id: "string".to_string(),
+        object_id,
+        entry: Some(ElementEntry::from_parts(1, 0, 16, None, None)),
+        deleted: false,
+    };
+
+    let mut index = CoreIndex::default();
+    let covered: BTreeSet<String> = BTreeSet::new();
+    super::super::fold_delta_block_items(&mut index, &covered, std::slice::from_ref(&item), false);
+
+    let bucket = index
+        .bucket_map
+        .get(&7)
+        .expect("the fold must have created bucket 7 from the ITEM's routing_bucket");
+
+    assert!(
+        bucket.object_index.slot_of(&object_id).is_some(),
+        "POSITIVE CONTROL: the id the fold was handed must be a member, or the set is empty and \
+         the negative arm proves nothing"
+    );
+    assert!(
+        bucket
+            .object_index
+            .slot_of(&u64::from(object_id as u32))
+            .is_none(),
+        "the 32-bit truncation is NOT a member of the stored set, so a row carrying one would \
+         name no owner"
+    );
+}
+
+// =================================================================================================
+// ROUTING BUCKET
+// =================================================================================================
+
+/// THE FOLD TAKES THE BUCKET FROM THE ROW, AND THE HALF ABOUT THE ENTRY HAS NO SUBJECT LEFT.
+///
+/// # WHY HALF OF THIS ARM IS GONE RATHER THAN REWRITTEN
+///
+/// It was `the_fold_takes_the_bucket_from_the_item_because_the_entry_comes_back_at_zero` and it
+/// drove two halves. The first asserted that `BlockIndex::routing_bucket` is write-only across a
+/// reload, against a doc comment on the field claiming a visitor injected it. That was true and it
+/// was useful, and `65c7fc562` ACTED ON IT: the field is not on the entry any more, so the claim
+/// has nothing to be about. Keeping the arm by rewriting it to assert something else, under a name
+/// that still says "because the entry comes back at zero", is the shape this tree keeps a record
+/// of -- a test outliving its subject and reading as though it still covered it.
+///
+/// So the finding is carried in the module header and the assertion is retired. That is stronger
+/// than what it asserted, not weaker: a field that is write-only across a reload cannot be read
+/// back wrong once it does not exist. The helper that built a node holding one entry went with it
+/// -- this arm was its only caller, and it constructed two fields the entry no longer declares.
+///
+/// # WHAT SURVIVES IS THE HALF THE COSTING TURNS ON
+///
+/// The row is the carrier and `fold_delta_block_items` reads the bucket off it. The field's removal
+/// does not touch that, and it is what the port's one-record-per-bucket shape is priced against.
+///
+/// THE CONTROL IS THE LOAD-BEARING HALF: the bucket must appear under the ITEM's number and NOT
+/// under zero. Without it, a fold that ignored the row and defaulted to zero would still satisfy a
+/// one-sided "bucket 9 exists" check in any store that already held a bucket 9.
+#[test]
+fn the_fold_takes_the_bucket_from_the_row_and_not_from_a_default() {
+    let item = crate::index_log::IndexItem {
+        kind: crate::index_log::IndexItemKind::Block,
+        routing_bucket: 9,
+        block_ref_key: String::new(),
+        object_key: Arc::from("the-key"),
+        model_id: "string".to_string(),
+        object_id: stable_block_object_id(1, "string", "the-key"),
+        entry: Some(ElementEntry::from_parts(1, 0, 16, None, None)),
+        deleted: false,
+    };
+    let mut index = CoreIndex::default();
+    let covered: BTreeSet<String> = BTreeSet::new();
+    super::super::fold_delta_block_items(&mut index, &covered, std::slice::from_ref(&item), false);
+    assert!(
+        index.bucket_map.contains_key(&9),
+        "the fold creates the bucket named by the ITEM's routing_bucket"
+    );
+    assert!(
+        !index.bucket_map.contains_key(&0),
+        "CONTROL: and not a bucket zero, so the 9 above is the item's number and not a default"
+    );
+}
+
+// =================================================================================================
+// THE STAMP, AT THE BASE
+// =================================================================================================
+
+/// THE FORMAT STAMP AS THIS ADOPTION WAS COSTED AGAINST IT.
+///
+/// A TRIPWIRE, DELIBERATELY. This module's cost estimate is only valid against the base value, and
+/// the recorded trap is a stale stamp landing BELOW main's and being accepted in silence. A lane
+/// that bumps the constant should see this go red and re-read the costing, not re-golden the
+/// number.
+///
+/// The bracketing pair is what makes this an exact reading rather than a one-sided comparison: a
+/// `>=` would be satisfied by every bump, which is the side a change moves.
+///
+/// # IT WENT RED AT 12 -> 13, AND THE COSTING WAS RE-READ RATHER THAN RE-GOLDENED
+///
+/// What moved the stamp: `index_log::INDEX_ITEM_SLOTS` went twelve to eleven, the element-name slot
+/// coming off the positional row. WHAT THAT DOES TO THIS MODULE'S ESTIMATE: nothing to the
+/// comparison and one slot to its subject. The costing above is a measurement of this port's
+/// protobuf record against the LIVE positional row -- 550 bytes against 595 for eight page items --
+/// and the live row just lost a slot that encoded as one byte of msgpack nil. So the live side gets
+/// 8 bytes CHEAPER on that fixture and the port's disadvantage WIDENS; the estimate moves in the
+/// direction that makes the conclusion stronger, which is why it stands.
+///
+/// AND THE EIGHT HARVESTS THE MODULE LISTS ARE NOW NINE, for whoever re-reads the list: the
+/// element-name slot leaving is a ninth thing the live row does that a `prost` field cannot express
+/// slot-for-slot, and it is the only one of them that is a FORMAT BREAK rather than a sentinel.
+#[test]
+fn the_stamp_this_adoption_was_costed_against() {
+    let current = crate::engine::SHARD_INDEX_FORMAT_VERSION;
+    println!("SHARD_INDEX_FORMAT_VERSION at the base = {current}");
+    assert_eq!(
+        current, 28,
+        "costed against 24; if this is red the stamp moved and the adoption's cost has to be \
+         re-read rather than re-goldened"
+    );
+    // RE-READ AT 26 -> 27 AND AGAIN AT 27 -> 28, AS THE MESSAGE ABOVE DEMANDS, AND THE
+    // COSTING STILL STANDS BOTH TIMES.
+    //
+    // 28 is the page -> block WRITER flip on every emitted serde key. This module costs the
+    // POSITIONAL index-log row, and a positional row carries no key names at all, so a
+    // spelling change cannot reach it: `index_log::INDEX_ITEM_SLOTS` is unmoved, the row's
+    // arity is unmoved, and `block_ref_key_from_parts` is unchanged. The one thing 28 does
+    // touch in this neighbourhood is the item KIND token, which is a value inside a slot and
+    // not a slot of its own, so the 550-against-595 comparison for eight block items stands
+    // unaltered.
+    //
+    // 27 is a PAGE ENTRY dropping the `object_key` and `model_id` it restated from the key it is
+    // filed under. This module costs the POSITIONAL index-log row, and the row is untouched: the
+    // entry's two retired keys are the SERVED index's named map, while `IndexItemRow` carries its
+    // own `block_ref_key` slot and `block_ref_key_from_parts` is unchanged -- the new
+    // `block_ref_key_parts` beside it is an addition with no slot of its own. So the
+    // 550-against-595 comparison for eight page items is untouched.
+    // RE-READ AT 23 -> 24, AS THE MESSAGE ABOVE DEMANDS, AND THE COSTING STILL STANDS.
+    //
+    // 24 is `expires_at_ms` joining `u64_ledgers` as a third domain. It was a STORED top-level key
+    // and is gone, which is 14's shape -- and the consequence is specific: an index written at 23
+    // loads with NO DEADLINES, so every key with a TTL becomes immortal until something writes its
+    // expiry again. Not a missing read; a dropped guarantee.
+    //
+    // THE INNER CONTAINER CHANGED TOO, for all three domains, and that is a correctness choice
+    // rather than a tidy one. `expires_at_ms` is a `BTreeMap` and three production sites ITERATE
+    // it, so dropping it into the `HashMap` the other two domains used would have made those walks
+    // depend on a hash seed. The other two are environment-gated and empty as shipped, so they
+    // lose nothing by becoming ordered.
+    //
+    // This module costs the POSITIONAL index-log row, which carries no struct version, so the
+    // 550-against-595 comparison for eight page items is untouched.
+    //
+    // RE-READ AT 22 -> 23, AS THE MESSAGE ABOVE DEMANDS, AND THE COSTING STILL STANDS.
+    //
+    // 23 is `strings` and `context_nodes` becoming one domain-keyed `address_maps`. `strings` was a
+    // STORED top-level key and is gone, which is 14's shape -- and the consequence is the worst of
+    // this family so far: an index written at 22 would load with EVERY STRING VALUE's address
+    // missing, so a store full of keys serves none of them. `context_nodes` was stored too and
+    // moves the same way; it has no production writer, so its table is empty either way.
+    //
+    // IT IS A SAME-SHAPE MERGE, NOT A FOLD INTO `objects`, and the distinction is costed: #2259
+    // drove that an `ElementEntry` carries a block id and a generation the 24-byte record has no
+    // field for, so a slot cannot hold one without dropping a stored fact. Keeping the value type
+    // and adding a domain key costs nothing per key -- which is the whole reason this bump buys a
+    // map rather than bytes.
+    //
+    // This module costs the POSITIONAL index-log row, which carries no struct version, so the
+    // 550-against-595 comparison for eight page items is untouched.
+    //
+    // RE-READ AT 21 -> 22, AS THE MESSAGE ABOVE DEMANDS, AND THE COSTING STILL STANDS.
+    //
+    // 22 is `control_state` and `feature_values` becoming one domain-keyed `counter_series`.
+    // `control_state` was a STORED top-level key and is gone, which is 14's shape -- a named map
+    // drops an undeclared key in silence, so without the bump an index written at 21 loads with
+    // every control-state counter series EMPTY and a windowed aggregate answers zero over a store
+    // that holds the counts. `feature_values` was `#[serde(skip)]` and becomes stored by joining a
+    // stored map, as the watermark did at 21; its writer is gated off by default so it is empty in
+    // the shipped configuration.
+    //
+    // ALSO IN THIS BUMP: the decode's canonical-key adoption follows `control_state` onto the
+    // domain's table. That is not a stamp concern -- it would have been a silent loss of key
+    // SHARING, not of data -- but it is recorded here because it is the third map that pass covers
+    // and the second time a consolidation had to carry it along.
+    //
+    // This module costs the POSITIONAL index-log row, which carries no struct version, so the
+    // 550-against-595 comparison for eight page items is untouched.
+    //
+    // RE-READ AT 20 -> 21, AS THE MESSAGE ABOVE DEMANDS, AND THE COSTING STILL STANDS.
+    //
+    // 21 is `control_state_uuid` and `context_compression_watermark` becoming one domain-keyed
+    // `u64_ledgers`. The first was a STORED top-level key and is gone, which is 14's shape -- a
+    // named map drops an undeclared key in silence. THE CONSEQUENCE IS SHARPER THAN USUAL, though:
+    // the dedup ledger loading empty does not merely lose a read, it makes a duplicate control
+    // write look new and apply twice. The second was `#[serde(skip)]` and becomes stored by joining
+    // a stored map, as the event and index series did at 20; its writer is environment-gated so it
+    // is empty in the shipped configuration and the index cost is nil.
+    //
+    // This module costs the POSITIONAL index-log row, which carries no struct version, so
+    // `index_log::INDEX_ITEM_SLOTS` and the row's shape are untouched and the 550-against-595
+    // comparison for eight page items is where it was.
+    //
+    // RE-READ AT 19 -> 20, AS THE MESSAGE ABOVE DEMANDS, AND THE COSTING STILL STANDS.
+    //
+    // 20 is the last three of the eight: `context_events`, `context_entities` and
+    // `context_indexes`. IT IS NOT THE SAME SHAPE AS 17, 18 AND 19, which is the thing worth
+    // reading here. Those removed a stored key and the stamp made an older index rebuild rather
+    // than load that map empty. `context_entities` is that case again -- but `context_events` and
+    // `context_indexes` were `#[serde(skip)]` with NO stored image at all, and `objects` IS
+    // serialized, so those two series become DURABLE for the first time. An older index carries
+    // nothing for them, so the load behaviour is the same rebuild; what is new is that every index
+    // written from here on carries more than any index before it.
+    //
+    // This module still costs the POSITIONAL index-log row, which carries no struct version, so
+    // `index_log::INDEX_ITEM_SLOTS` and the row's shape are untouched and the 550-against-595
+    // comparison for eight page items is where it was.
+    //
+    // RE-READ AT 18 -> 19, AS THE MESSAGE ABOVE DEMANDS, AND THE COSTING STILL STANDS.
+    //
+    // 19 was spent on the FEATURE series moving into the consolidated map: the largest of the eight
+    // per-element maps, and the only one the decode's canonical-key adoption pass covers. A key
+    // leaves the stored image, which is 14's shape -- a named map drops an undeclared key silently,
+    // so without the bump an index written before the move loads with every feature series EMPTY.
+    // This module costs the POSITIONAL index-log row, which carries no struct version at all, so
+    // `index_log::INDEX_ITEM_SLOTS` and the row's shape are untouched and the 550-against-595
+    // comparison for eight page items is exactly where it was.
+    //
+    // RE-READ AT 17 -> 18, AS THE MESSAGE ABOVE DEMANDS, AND THE COSTING STILL STANDS.
+    //
+    // 18 was spent on `context_audits`, `context_summaries` and `context_compressions` moving out
+    // of their own top-level fields and into the consolidated map -- three keys leaving the stored
+    // index at once, where 17 removed one. Same category as every bump before it: a change to the
+    // NAMED SERVED index. This module costs the POSITIONAL index-log row, which carries no struct
+    // version at all, so `index_log::INDEX_ITEM_SLOTS` and the row's shape are untouched and the
+    // 550-against-595 comparison for eight page items is exactly where it was.
+    //
+    // AND THE NOTE BELOW ABOUT "THE NEXT SEVEN" IS ANSWERED RATHER THAN LEFT STANDING: three of
+    // those seven landed on ONE bump here, which is the alternative that note named. Four of the
+    // eight per-element maps have moved; `features`, `context_events`, `context_entities` and
+    // `context_indexes` are what is left.
+    //
+    // RE-READ AT 16 -> 17, AS THE MESSAGE ABOVE DEMANDS, AND THE COSTING STILL STANDS.
+    //
+    // 17 was spent on `context_children` moving out of its own top-level field and into the
+    // consolidated map, which REMOVES a key from the stored index. That is the same category as
+    // every bump before it -- a change to the NAMED SERVED index -- and this module costs the
+    // POSITIONAL index-log row, which carries no struct version at all. `index_log::INDEX_ITEM_SLOTS`
+    // and the row's shape are untouched, so the 550-against-595 comparison for eight page items is
+    // exactly where it was.
+    //
+    // WORTH NOTING FOR THE NEXT SEVEN, since this is the first of eight such moves: each one
+    // removes another top-level key, and each therefore needs its own bump unless they land in a
+    // single change. A migration that reused a stamp would leave an index written at that stamp
+    // decoding without the key and losing it in silence, which is the failure this pin's whole
+    // family of guards exists to make loud.
+    //
+    // RE-READ AT 15 -> 16, AS THE MESSAGE ABOVE DEMANDS, AND THE COSTING STILL STANDS.
+    //
+    // 16 was spent on `ObjectSlot` gaining a stored form for its owned element array: the slot's
+    // image stops being the bare record's and becomes `{"r": record}` plus an `e` array when the
+    // object has one. That is a change to the SERVED index's value shape -- the same category as
+    // 14 (this very map's value becoming a consolidated record) and 15 (a sketch merge changing a
+    // bucket value) -- and this module costs the POSITIONAL index-log row, which carries no struct
+    // version at all. Nothing in `index_log::INDEX_ITEM_SLOTS` or the positional row moved, so the
+    // 550-against-595 comparison for eight page items is exactly where it was.
+    //
+    // AND THE NINE HARVESTS STAY NINE. The element-name slot leaving the row was the ninth and the
+    // only format break among them; a slot gaining a wire form in the SERVED index adds nothing to
+    // that list, because the list is about what a `prost` field cannot express slot-for-slot in the
+    // positional row.
+    //
+    // RE-READ AT 14 -> 15, AS THE MESSAGE ABOVE DEMANDS, AND THE COSTING STILL STANDS.
+    //
+    // 15 was spent on merging `control_state_change_sketch` into `control_state_changes`, whose
+    // bucket value became `hll::DistinctBucket`. That is a change to the SERVED index -- a key
+    // leaving the stored image and a value shape changing -- and this module costs the POSITIONAL
+    // index-log row, which carries no struct version at all. So the comparison below is untouched
+    // for exactly the reason the 13 -> 14 note gives, restated once rather than re-goldened.
+    //
+    // RE-READ AT 13 -> 14, WHICH IS WHAT THE MESSAGE ABOVE DEMANDED, AND THE COSTING STANDS.
+    //
+    // 14 was spent on a change to the SERVED index: `control_state_blocks`' value became a
+    // consolidated record. The stamp guards the named served index, and this module costs the
+    // POSITIONAL index-log row, which carries no struct version at all -- the module doc above
+    // says so, and that is why the slot count is the whole of that row's protection. So the
+    // 550-against-595 comparison for eight page items is untouched by this bump: nothing in
+    // `index_log::INDEX_ITEM_SLOTS` or the positional row moved, and the port's disadvantage is
+    // exactly where it was.
+    //
+    // The pin is kept rather than deleted, for the reason it was added: so a later reader cannot
+    // cost the adoption against a tree that has bumped the stamp for an unrelated reason.
+    assert!(
+        current != 27 && current != 29,
+        "bracketed, so 28 is exact and not an artefact of the comparison above"
+    );
+    // AND THE BRACKET IS DOMINATED BY THE EQUALITY ABOVE IT, noted rather than removed. An
+    // `== 14` already excludes 13 and 15; a neighbour inequality beside it can only ever fail
+    // where the equality has already failed. This campaign shipped that same redundancy into
+    // three merged changes before measuring it, so it is worth naming where it appears rather
+    // than quietly reproducing it.
+}
+
+/// THE INDEX LOG HAS NO VERSION OF ITS OWN, SO THE ROW'S SHAPE IS GUARDED BY ITS LENGTH.
+///
+/// The row's own doc states it: "The index log is POSITIONAL and carries no struct version, so a
+/// row whose length does not match the struct decoding it is REFUSED -- and the format stamp
+/// cannot help, because it guards the NAMED served index."
+///
+/// Driven rather than quoted: a live row is written, its msgpack array header is read, and the
+/// slot count is the only thing on the wire that says what shape it is.
+///
+/// THE CONTROL IS THE HEADER BYTE ITSELF. An eleven-element msgpack array is `0x9b`; asserting the
+/// count without asserting that the row IS an array would pass against any encoding at all.
+///
+/// ELEVEN, NOT TWELVE, SINCE THE ELEMENT-NAME SLOT CAME OFF THE ROW. `0x9c` is now the RETIRED
+/// shape, which is why it is the bracket below: a row this writer emits must not be the arity a
+/// stored row of the previous format carries.
+///
+/// AND THIS ARM DRIVES THE WRITER, NOT THE REFUSAL -- WHICH IS WORTH SAYING BECAUSE THE QUOTE
+/// ABOVE IS ABOUT THE READER. It proves the writer emits the current arity. It cannot see what a
+/// reader does with a short row, and until `index_log::IndexItemRow` existed the answer was that
+/// one loaded with its missing tail slot defaulted -- a stored tombstone read back live. The
+/// refusal itself is driven by
+/// `index_log::tests::a_stored_row_short_at_its_tail_is_refused_and_a_tombstone_stays_dead`,
+/// off captured bytes, and by its record-level twin. A header byte read off this binary's own
+/// output is not evidence about the decoder.
+#[test]
+fn an_index_log_row_states_its_shape_only_by_its_slot_count() {
+    let item = crate::index_log::IndexItem {
+        kind: crate::index_log::IndexItemKind::Block,
+        routing_bucket: 7,
+        block_ref_key: String::new(),
+        object_key: Arc::from("the-key"),
+        model_id: "string".to_string(),
+        object_id: 0,
+        entry: Some(ElementEntry::from_parts(1, 0, 16, None, None)),
+        deleted: false,
+    };
+    let bytes = rmp_serde::to_vec(&item).expect("a row encodes");
+    println!("ROW = {} B, first byte 0x{:02x}", bytes.len(), bytes[0]);
+    assert_eq!(
+        bytes[0], 0x9b,
+        "CONTROL: the row is a msgpack fixarray, and its header is what carries the slot count"
+    );
+    assert_ne!(
+        bytes[0], 0x9c,
+        "bracketed: a twelve-slot row would be 0x9c, which is the RETIRED shape -- so eleven is \
+         exact and the writer has not gone back to emitting the element-name slot"
+    );
+}
