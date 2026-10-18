@@ -131,3 +131,137 @@ fn a_space_ratio_whose_numerator_falls() {
                     key: format!("space-{index:06}"),
                     value: noisy_value(index, round, VALUE),
                 },
+            });
+            assert!(response.status.ok, "round {round} write {index}: {:?}", response.status);
+        }
+        rows.push(read(format!("after {} write(s)", round + 1)));
+    }
+
+    println!();
+    println!("  TWO SPACE RATIOS OVER ONE STORE -- {KEYS} keys x {VALUE} B, incompressible");
+    println!();
+    println!(
+        "    {:<20} {:>11} {:>11} {:>8} | {:>11} {:>11} {:>8}",
+        "", "total known", "live slab", "PUBLISHED", "non-purged", "live blocks", "PROPOSED"
+    );
+    for (label, total, live_slab, non_purged, live_blocks) in &rows {
+        println!(
+            "    {:<20} {:>11} {:>11} {:>7.3}x | {:>11} {:>11} {:>7.3}x",
+            label,
+            total,
+            live_slab,
+            as_x(ppm(*total, *live_slab)),
+            non_purged,
+            live_blocks,
+            as_x(ppm(*non_purged, *live_blocks)),
+        );
+    }
+    println!();
+
+    let (_, first_total, first_live_slab, first_np, first_lb) = rows[0].clone();
+    let (_, last_total, last_live_slab, last_np, last_lb) = rows[rows.len() - 1].clone();
+    println!(
+        "    published: {:.3}x -> {:.3}x     proposed: {:.3}x -> {:.3}x",
+        as_x(ppm(first_total, first_live_slab)),
+        as_x(ppm(last_total, last_live_slab)),
+        as_x(ppm(first_np, first_lb)),
+        as_x(ppm(last_np, last_lb))
+    );
+    println!(
+        "    the proposed numerator is FILE bytes and its denominator BLOCK PAYLOAD bytes, so its"
+    );
+    println!("    floor is above 1.0x even at zero garbage -- framing is in one half only.");
+    println!();
+
+    // ---- NON-VACUITY. Both ratios are over counters that can be zero.
+    for (label, total, live_slab, non_purged, live_blocks) in &rows {
+        assert!(*total > 0, "{label}: no slab bytes at all, so neither ratio means anything");
+        assert!(*live_slab > 0, "{label}: the published denominator is zero");
+        assert!(
+            *live_blocks > 0,
+            "{label}: the live tally is zero, so the proposed denominator is unavailable and this \
+             arm cannot compare the two"
+        );
+        assert!(*non_purged > 0, "{label}: the proposed numerator is zero");
+    }
+
+    // ---- THE PUBLISHED RATIO IS PINNED, which is the defect and is asserted so that re-pointing
+    // ---- its denominator makes this arm fail and say what moved.
+    assert!(
+        (as_x(ppm(last_total, last_live_slab)) - 1.0).abs() < 0.01,
+        "the published space ratio read {:.3}x after {} rewrites. It has been pinned at 1.0x \
+         because a live slab contributes its whole file -- if it now moves, the denominator \
+         changed and this comparison needs restating",
+        as_x(ppm(last_total, last_live_slab)),
+        ROUNDS
+    );
+
+    // ---- AND THE PROPOSED ONE MOVES, which is what makes the first assertion a defect rather
+    // ---- than a property of the workload. The live set never changed size; only its storage did.
+    assert!(
+        ppm(last_np, last_lb) > ppm(first_np, first_lb).saturating_mul(2),
+        "the proposed ratio went {:.3}x -> {:.3}x across {} rewrites. Its denominator counts only \
+         the blocks the index still points at, so dead blocks must push it up; if it does not \
+         move, the tally is tracking the file rather than the index",
+        as_x(ppm(first_np, first_lb)),
+        as_x(ppm(last_np, last_lb)),
+        ROUNDS
+    );
+
+    // ---- THE PUBLISHED FIELD IS THE FIGURE THIS ARM DEFINES. Both terms are restated from the
+    // ---- engine's own structures above and compared to what the status reports, so a drift
+    // ---- between the definition and the assignment fails here rather than being published.
+    let published = engine
+        .shard_stats(1)
+        .expect("a loaded shard reports stats")
+        .storage;
+    println!(
+        "    published block_space_amplification_ppm = {} ppm ({:.3}x), over {} / {}",
+        published.block_space_amplification_ppm,
+        as_x(published.block_space_amplification_ppm),
+        published.non_purged_physical_bytes,
+        published.live_block_bytes
+    );
+    println!();
+    assert_eq!(
+        published.non_purged_physical_bytes, last_np,
+        "the status publishes {} non-purged bytes where this arm computes {last_np} from the slab \
+         summary it reads directly. The numerator is `total_known - purged`; a disagreement means \
+         the assignment is over different terms than the definition",
+        published.non_purged_physical_bytes
+    );
+    assert_eq!(
+        published.live_block_bytes, last_lb,
+        "the status publishes {} live block bytes where this arm folds {last_lb} out of the \
+         index's own tally. A disagreement means the published denominator is not the tally",
+        published.live_block_bytes
+    );
+    assert_eq!(
+        published.block_space_amplification_ppm,
+        ppm(last_np, last_lb),
+        "the status publishes {} ppm where {last_np} over {last_lb} is {} ppm. The ratio must be \
+         exactly its two published terms, or a consumer cannot falsify it -- which is the reason \
+         both terms are fields at all",
+        published.block_space_amplification_ppm,
+        ppm(last_np, last_lb)
+    );
+    assert!(
+        published.block_space_amplification_ppm > published.space_amplification_ppm,
+        "the two space ratios read {} and {} ppm after {ROUNDS} rewrites of every key. The pinned \
+         one cannot see a dead block inside a live slab, so the block-granular figure must be \
+         strictly higher here -- if they agree, the new field is dividing slab-granular terms too",
+        published.block_space_amplification_ppm,
+        published.space_amplification_ppm
+    );
+
+    // ---- AND THE LIVE SET REALLY DID NOT GROW, or the rise above is just more data.
+    let live_figures: Vec<u64> = rows.iter().map(|row| row.4).collect();
+    let smallest = live_figures.iter().copied().min().unwrap_or(0);
+    let largest = live_figures.iter().copied().max().unwrap_or(0);
+    assert!(
+        largest <= smallest.saturating_mul(2),
+        "the live tally ranged {smallest}..{largest} B while the same {KEYS} keys were rewritten at \
+         a fixed value size. A live figure that moves with bytes WRITTEN rather than bytes live is \
+         the defect this arm is about"
+    );
+}
