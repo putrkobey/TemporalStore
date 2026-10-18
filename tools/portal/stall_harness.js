@@ -46,3 +46,51 @@ const scope = {
             if (!sent) { sent = true; return Promise.resolve({ done: false, value: opening.join("") }); }
             // Open and quiet: a promise that settles only if the case sends something later.
             return new Promise((resolve) => { releaseSecondChunk = resolve; });
+          },
+        };
+      },
+    },
+  }),
+  TextDecoder: function () { this.decode = (v) => (v === undefined ? "" : String(v)); },
+  AbortController: function () { this.abort = () => {}; this.signal = null; },
+  document: { hidden: false, addEventListener: () => {} },
+  window: { addEventListener: () => {} },
+  setTimeout: () => 0,
+  setInterval: (fn) => { ticker = fn; return 1; },
+  clearInterval: () => { ticker = null; },
+};
+
+const names = Object.keys(scope);
+const liveStream = new Function(...names, source + "; return liveStream;")(
+  ...names.map((k) => scope[k]));
+
+liveStream({
+  headers: () => ({}),
+  onState: (state, seconds) => states.push({ state: state, seconds: seconds }),
+  onFrame: () => {},
+});
+
+const wait = () => new Promise((r) => globalThis.setTimeout(r, 5));
+
+(async () => {
+  await wait();                       // let the opening chunk be parsed
+  const timeline = [];
+  for (const step of (input.advanceMs || [])) {
+    clock += step;
+    if (ticker) { ticker(); }
+    timeline.push({ atMs: clock - ORIGIN, states: states.map((s) => s.state).join(",") });
+  }
+  if (input.thenAKeepaliveAfterMs) {
+    clock += input.thenAKeepaliveAfterMs;
+    if (releaseSecondChunk) {
+      releaseSecondChunk({ done: false, value: ": keepalive\n\n" });
+      await wait();
+    }
+    if (ticker) { ticker(); }
+  }
+  process.stdout.write(JSON.stringify({
+    states: states,
+    timeline: timeline,
+    watchdogRegistered: ticker !== null,
+  }));
+})();
