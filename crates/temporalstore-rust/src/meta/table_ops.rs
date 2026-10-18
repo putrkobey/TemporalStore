@@ -216,3 +216,112 @@ impl SingleNodeMeta {
                 status: Status::error("bad_request", "shard_count must be > 0"),
             };
         }
+        if let Some(shard_count) = request.shard_count {
+            if shard_count < existing.shard_count {
+                return AckResponse {
+                    status: Status::error("bad_request", "shard_count cannot shrink"),
+                };
+            }
+            // Bucket ranges are derived from shard_count on every read, so
+            // raising it renumbers the whole key space -- and nothing rehashes.
+            // The data for the buckets that moved is still on the old shard,
+            // while the routing table now sends those keys to a shard that has
+            // never seen them, so the reads come back as misses rather than as
+            // errors. partition_version and first_shard_id are already pinned
+            // after creation for the same reason; this is the third knob that
+            // moves keys.
+            //
+            // Growth before anything registers is the legitimate case -- fixing
+            // the shard count of a table that is not yet holding anything -- and
+            // stays allowed.
+            if shard_count != existing.shard_count && table_owns_registered_shards(&state, &existing)
+            {
+                return AckResponse {
+                    status: Status::error(
+                        "shards_registered",
+                        "shard_count cannot change once the table's shards are registered: \
+                         the key range of every existing shard would move, and \
+                         nothing redistributes the data that moved with it",
+                    ),
+                };
+            }
+        }
+        if let Some(partition_version) = request.partition_version {
+            if partition_version != existing.partition_version {
+                return AckResponse {
+                    status: Status::error(
+                        "bad_request",
+                        "partition_version cannot change after table creation",
+                    ),
+                };
+            }
+        }
+        if let Some(first_shard_id) = request.first_shard_id {
+            if first_shard_id != existing.first_shard_id {
+                return AckResponse {
+                    status: Status::error(
+                        "bad_request",
+                        "first_shard_id cannot change after table creation",
+                    ),
+                };
+            }
+        }
+
+        let new_shard_count = request.shard_count.unwrap_or(existing.shard_count);
+        let new_replica_count = request
+            .replica_count
+            .map(|replica_count| replica_count.max(1))
+            .unwrap_or(existing.replica_count);
+        let new_serving_options = request
+            .serving_options
+            .as_ref()
+            .map(|patch| apply_serving_options_patch(existing.serving_options.clone(), patch))
+            .unwrap_or_else(|| existing.serving_options.clone());
+        if let Err(err) = validate_serving_options(&new_serving_options) {
+            return AckResponse {
+                status: Status::error("bad_request", err),
+            };
+        }
+        let changed = new_shard_count != existing.shard_count
+            || new_replica_count != existing.replica_count
+            || new_serving_options != existing.serving_options;
+        if !changed {
+            return AckResponse {
+                status: Status::error("not_modified", "table options are unchanged"),
+            };
+        }
+        let topology_version = record_topology_event(
+            &mut state,
+            "update_table",
+            format!("table:{}/{}", request.namespace, request.table_name),
+            format!("shards={new_shard_count},replicas={new_replica_count}"),
+        );
+        let table = state
+            .tables
+            .get_mut(&key)
+            .expect("table exists after update validation");
+        table.info.shard_count = new_shard_count;
+        table.info.replica_count = new_replica_count;
+        table.info.serving_options = new_serving_options;
+        table.info.topology_version = topology_version;
+        // A shard count that grew extends this table's range, and it can now
+        // reach into one it did not reach before. Where the table starts is
+        // pinned, so its index entry is unchanged -- but whether the ranges
+        // overlap is not, and that is what decides who answers.
+        let info = table.info.clone();
+        state.note_table_range(&key, &info);
+        AckResponse {
+            status: Status::ok(),
+        }
+    }
+}
+
+/// Whether any of a table's shards has been registered to a server, which is
+/// the metaserver's evidence that the table is holding data.
+fn table_owns_registered_shards(state: &MetaState, table: &TableMetaInfo) -> bool {
+    (0..table.shard_count).any(|offset| {
+        table_shard_id(table, offset)
+            .map(|shard_id| state.shards.contains_key(&shard_id))
+            .unwrap_or(false)
+    })
+}
