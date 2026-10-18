@@ -1506,3 +1506,1511 @@ fn the_point_read_path_is_one_call_site_and_it_is_a_string() {
     assert_eq!(
         kinds,
         vec!["\"string\""],
+        "the point-read kinds are {kinds:?}, not string alone -- a container kind here would mean \
+         the point lookup DOES resolve a content-derived name"
+    );
+
+    // The component-blind whole-object reader takes no component and its caller has none to give.
+    //
+    // THIS WAS THREE CALLERS -- hash twice, set once -- AND IT IS ONE. The remaining one is
+    // `HashGetAll`'s divergence-observing half, which reads the index beside `shard.hashes` so a
+    // disagreement is OBSERVED rather than suffered. That it is down to one is the same movement
+    // as the two point reads above, counted at a different door.
+    let blind_sites = execute.matches("bucket_index_component_block_addresses(").count();
+    assert_eq!(
+        blind_sites, 1,
+        "bucket_index_component_block_addresses has {blind_sites} callers in execute_on_shard.rs, \
+         not one"
+    );
+    assert!(
+        store.contains("pub(super) fn bucket_index_component_block_addresses(\n    shard: &ShardState,\n    model_id: &str,\n    object_key: &str,\n) -> Vec<(Option<Arc<str>>, ElementEntry)>"),
+        "bucket_index_component_block_addresses no longer takes exactly (shard, model_id, \
+         object_key) -- if it has gained a component argument, the reason it is NOT the obstacle \
+         here has changed"
+    );
+
+    println!(
+        "\n  [read path] bucket_index_block_address: 1 caller (read_bucket_index_value)\n  \
+         read_bucket_index_value: {read_sites} call site, kinds {kinds:?}\n  \
+         bucket_index_component_block_addresses: {blind_sites} caller, component-blind by \
+         signature\n  source read: {} + {} bytes",
+        execute.len(),
+        store.len()
+    );
+}
+
+// =================================================================================================
+// 7. THE MIS-PARSE RATE, MEASURED
+// =================================================================================================
+
+/// HOW MANY NAMES THIS STORE ALREADY HOLDS ARE ALSO WELL-FORMED ORDINALS MEANING SOMETHING ELSE.
+///
+/// #1976 assumed 0% for its spelling and measured 1.935%. #1985 measured 100% for lists. Measured
+/// here per kind over 20,000 names, against the ordinal spelling an element ordinal would have to
+/// use if it were rendered into the same fixed-width hexadecimal field the list already uses.
+///
+/// A name COUNTS as a mis-parse when it is well-formed under the ordinal spelling AND the value it
+/// yields is not the element it actually names.
+///
+/// **THE LIST ROW IS 100.000% BY CONSTRUCTION, NOT BY LUCK**, and that is the row that decides the
+/// stored shape: a list component and a sixteen-character ordinal are the same sixteen hexadecimal
+/// characters, so `"0000000000000000"` is sequence `i64::MIN` and ordinal 0 at once. ALL 20,000 and
+/// not 19,999 -- this arm was first written expecting one fixed point, and there is none, because a
+/// name equals its own ordinal only where `seq - i64::MIN == seq`.
+///
+/// rust-internal: spells names, no engine
+#[test]
+fn the_mis_parse_rate_of_an_ordinal_against_the_names_this_store_already_holds() {
+    const NAMES: usize = 20_000;
+
+    // A sixteen-character hexadecimal ordinal, the same field width a list component already is.
+    fn parses_as_ordinal(name: &str) -> Option<u64> {
+        if name.len() != 16 || !name.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return None;
+        }
+        u64::from_str_radix(name, 16).ok()
+    }
+
+    let mut rows: Vec<(&str, usize, usize)> = Vec::new();
+
+    // list: the component IS sixteen hexadecimal characters.
+    let mut list_total = 0usize;
+    let mut list_hits = 0usize;
+    for element in 0..NAMES {
+        let seq = element as i64 - (NAMES as i64 / 2);
+        let name = format!("{:016x}", (seq as u64).wrapping_sub(i64::MIN as u64));
+        list_total += 1;
+        if let Some(ordinal) = parses_as_ordinal(&name) {
+            // Well-formed. It is a MIS-parse when the ordinal's value is not the sequence the name
+            // actually means -- which is EVERY one of them. A name would equal its own ordinal only
+            // where `seq - i64::MIN == seq`, and no value satisfies that, so there is no fixed
+            // point. A first draft of this arm expected one and the measurement refused it.
+            if ordinal != seq as u64 {
+                list_hits += 1;
+            }
+        }
+    }
+    rows.push(("list", list_total, list_hits));
+
+    // zset: the member's hex and nothing else now -- the score left this string. RESTATED: an
+    // empty member used to spell a score-shaped sixteen characters and was the only way to collide
+    // with an ordinal; it spells the empty string now, which is not well-formed as an ordinal at
+    // all. The collision that survives is the same one the `set` row below measures: an
+    // EIGHT-byte member spells sixteen hexadecimal characters regardless of kind, and
+    // `member-{element}` is eight bytes for every single-digit `element`.
+    let mut zset_total = 0usize;
+    let mut zset_hits = 0usize;
+    for element in 0..NAMES {
+        let member = if element % 1_000 == 0 {
+            Vec::new()
+        } else {
+            format!("member-{element}").into_bytes()
+        };
+        let name = zset_name(&member);
+        zset_total += 1;
+        if parses_as_ordinal(&name).is_some() {
+            zset_hits += 1;
+        }
+    }
+    rows.push(("zset", zset_total, zset_hits));
+
+    // set: the member's hex and nothing else. Well-formed as an ordinal for every EIGHT-byte
+    // member, which is an ordinary member length.
+    let mut set_total = 0usize;
+    let mut set_hits = 0usize;
+    for element in 0..NAMES {
+        let member: Vec<u8> = if element % 4 == 0 {
+            format!("{element:08}").into_bytes() // exactly eight bytes
+        } else {
+            format!("member-{element}").into_bytes()
+        };
+        let name = hex::encode(&member);
+        set_total += 1;
+        if parses_as_ordinal(&name).is_some() {
+            set_hits += 1;
+        }
+    }
+    rows.push(("set", set_total, set_hits));
+
+    println!("\n  [mis-parse of a 16-character hexadecimal ordinal against existing names]");
+    for (kind, total, hits) in &rows {
+        assert!(
+            *total == NAMES,
+            "DENOMINATOR: {kind} produced {total} names, not {NAMES}"
+        );
+        println!(
+            "    {kind:<5} {hits:>6} of {total} names are well-formed ordinals of a DIFFERENT \
+             meaning  ({:>7.3}%)",
+            *hits as f64 * 100.0 / *total as f64
+        );
+    }
+
+    assert_eq!(
+        list_hits, NAMES,
+        "EVERY list name should mis-parse. There is no fixed point: a name equals its own ordinal \
+         only where `seq - i64::MIN == seq`, which no value satisfies. {list_hits} of {NAMES} did."
+    );
+    assert!(
+        zset_hits > 0,
+        "the zset row measured ZERO mis-parses over {NAMES} names. RESTATED since the score left \
+         the component: an empty member no longer collides (it spells the empty string, not a \
+         sixteen-character score), so this now rests on the same mechanism as the `set` row --\
+         `member-{{element}}` is eight bytes, and so sixteen hex characters, for every single-digit \
+         `element` -- and zero here means that stopped happening too"
+    );
+    assert!(
+        set_hits > 0,
+        "the set row measured ZERO mis-parses over {NAMES} names; an eight-byte member spells \
+         sixteen hexadecimal characters and is an ordinary member length"
+    );
+}
+
+// =================================================================================================
+// 8. THE WIDTH AND THE CEILING
+// =================================================================================================
+
+/// THE WIDTH AN ELEMENT ORDINAL WOULD TAKE, READ FROM THE FIELDS THEMSELVES, AND THE CEILING.
+///
+/// Widths come from `field_width` over a real value (#1986's rule: a hand-written table with
+/// `size_of` of the wrong type still compiles) and from `size_of` of the field's own declared type.
+///
+/// THE ARITHMETIC HERE INVERTED, AND THAT IS A THIRD REFUSAL THIS MODULE DID NOT HAVE. The case for
+/// an element ordinal was a TRADE: sixteen bytes of rendered name on every entry for two or four
+/// bytes of number. `BlockIndex::component` has been REMOVED outright rather than swapped for a
+/// narrower stand-in -- the entry went 56 bytes to 40 -- so those sixteen bytes are already banked
+/// and there is nothing left to trade. An ordinal is now an ADDED field on a structure with ZERO
+/// SLACK, and 40 is a multiple of eight, so it costs a whole word whether it is two bytes or four.
+///
+/// WHAT THIS ARM USED TO COMPUTE, so the change is legible: `field_bytes_now - component_width +
+/// ordinal` against a hand-written `field_bytes_now = 56`. With no component term in the struct
+/// that subtracts a field that is not there, and it reported 44 and 48 as NARROWINGS of a 40-byte
+/// entry -- both larger than the thing they were narrowing. Its own floor caught it: "the page
+/// entry is 40 bytes, not the 56 this arithmetic is written against; re-derive the field sum before
+/// trusting the two numbers above."
+///
+/// THE SUM IS READ OFF THE TYPES RATHER THAN WRITTEN DOWN, which is the same correction `engine_storage_state.rs`
+/// already made to its own const assert. That keeps the pair non-circular: the const assert beside
+/// the struct proves the SUM is 40 and the TYPE is 40, neither inferred from the other; this arm
+/// proves what an ADDED field does to that.
+///
+/// THE CEILING IS NOT FREE TO CHOOSE. #1994 narrowed `BlockAddress::block_id` to sixteen bits, so an
+/// element ordinal folded into the existing per-object ordinal caps at 65,535 an object -- which is
+/// exactly the ceiling of the design that prompted this work, against a measured container shape of
+/// p50 100 and one observed case at 2,000.
+///
+/// AND THE FAILURE AT IT IS NOT LOUD TODAY. `next_block_index_for_object` still ends
+/// `unwrap_or(u32::MAX).saturating_add(1)` on this revision, which hands `u32::MAX` out for ever
+/// rather than failing. That is #1985's to fix and is asserted here only as the state of the tree, so
+/// that this module does not read as though the ceiling were already safe.
+///
+/// rust-internal: widths and arithmetic, no engine
+#[test]
+fn the_width_an_element_ordinal_would_take_and_the_ceiling_that_implies() {
+    fn field_width<T>(_field: &T) -> usize {
+        std::mem::size_of::<T>()
+    }
+
+    let name: Option<std::sync::Arc<str>> = Some(std::sync::Arc::from("a-component-name"));
+    let component_width = field_width(&name);
+    let u16_ordinal = field_width(&Some(0u16));
+    let u32_ordinal = field_width(&Some(0u32));
+
+    // STILL MEASURED, THOUGH IT IS NO LONGER A FIELD OF THE ENTRY. Sixteen is the number the whole
+    // proposal was stated in, and it is what the removal actually banked -- so it is measured off
+    // the type the field used to have rather than dropped, and the paragraph below prices the
+    // ordinal against the entry as it is now.
+    assert_eq!(
+        component_width, 16,
+        "`Option<Arc<str>>` reads {component_width} bytes, not the sixteen this whole proposal was \
+         stated in"
+    );
+
+    let entry_now = std::mem::size_of::<crate::engine::state::BlockIndex>();
+    // RECONSTRUCTED FROM THE TYPES, so a field whose own width moves elsewhere fails HERE rather
+    // than passing beside a stale literal. This was the literal `56`, and the literal is how a
+    // stale sum and a stale slack came to agree with each other once before.
+    // AND THREE TERMS CAME OUT OF IT THAT HAD NO FIELD BEHIND THEM, WHICH IS WHY THE ZERO-SLACK
+    // CLAIM BELOW WAS PASSING. `kind: IndexItemKind` and `routing_bucket: u32` left `BlockIndex`
+    // in `65c7fc562` and this sum kept adding their five bytes; `object_key: Arc<str>` left on
+    // this leg. With the two retired terms in, the sum came to exactly forty against a forty-byte
+    // entry -- so `field_bytes_now == entry_now` held, and what it was asserting was that a stale
+    // over-count happened to equal the width. The comment above says "the literal is how a stale
+    // sum and a stale slack came to agree with each other once before"; this is the second time,
+    // in a sum built from types rather than a literal, because the TERM LIST was what had drifted.
+    let field_bytes_now =
+        std::mem::size_of::<crate::engine::storage_bucket_internals::StoredModelKind>()
+            + std::mem::size_of::<crate::block_store::ElementEntry>()
+            + std::mem::size_of::<bool>()
+            + std::mem::size_of::<bool>();
+    // ADDITION, NOT SUBSTITUTION. There is no name left to trade.
+    let field_bytes_with_u16 = field_bytes_now + u16_ordinal;
+    let field_bytes_with_u32 = field_bytes_now + u32_ordinal;
+    let width_with_u16 = (field_bytes_with_u16 + 7) / 8 * 8;
+    let width_with_u32 = (field_bytes_with_u32 + 7) / 8 * 8;
+
+    println!(
+        "\n  [width] the name this proposal would have traded: Option<Arc<str>> = \
+         {component_width} B, ALREADY REMOVED; Option<u16> = {u16_ordinal} B, Option<u32> = \
+         {u32_ordinal} B\n  entry now {entry_now} B holding {field_bytes_now} of field, zero \
+         slack; ADDING a u16 ordinal gives {field_bytes_with_u16} of field in {width_with_u16}, a \
+         u32 {field_bytes_with_u32} in {width_with_u32}"
+    );
+
+    assert_eq!(
+        entry_now, 24,
+        "the page entry is {entry_now} bytes, not the 24 this arithmetic is written against; \
+         re-derive the field sum before trusting the two numbers above"
+    );
+    // FIVE BYTES OF SLACK, NOT ZERO, AND THIS IS THE ASSERTION THAT WAS WRONG. It read
+    // `field_bytes_now == entry_now` -- zero slack, stated as an equality precisely because a
+    // one-sided comparison is satisfied on whichever side a change moves. The equality was the
+    // right SHAPE and the term list feeding it was not: an over-count of exactly five met a width
+    // of forty, which is a matched pair of stale numbers agreeing, the failure its own comment
+    // names.
+    //
+    // THE SLACK IS ASSERTED AS THE DIFFERENCE, which is the form that names the quantity the
+    // conclusion below turns on rather than only that two sums met.
+    assert_eq!(
+        5,
+        entry_now - field_bytes_now,
+        "the reconstructed field sum is {field_bytes_now} B inside a {entry_now} B entry, so the \
+         slack is {} and not the five every figure below is priced against",
+        entry_now - field_bytes_now
+    );
+
+    // THE INVERSION, ASSERTED IN THE DIRECTION IT NOW RUNS. This read
+    // `field_bytes_with_u16 < field_bytes_now` -- "a u16 ordinal does not narrow the field sum at
+    // all" -- which was the claim while the ordinal was replacing sixteen bytes of name. It
+    // replaces nothing now.
+    assert!(
+        field_bytes_with_u16 > field_bytes_now,
+        "adding a u16 ordinal did not grow the field sum: {field_bytes_with_u16} against \
+         {field_bytes_now}. With no element name left on the entry there is nothing for an ordinal \
+         to be traded against, so it can only add"
+    );
+    // AND IT COSTS NOTHING IN WIDTH, WHICH IS THE OPPOSITE OF WHAT THIS ARM CONCLUDED.
+    //
+    // It asserted `(48, 48)` under "both ordinal widths land on the same one: 40 is a multiple of
+    // eight, so the first field added here rounds the type up by a full word". That reasoning was
+    // sound ON A FORTY-BYTE ENTRY WITH NO SLACK, and the entry has neither: nineteen bytes of
+    // field in twenty-four leaves FIVE standing empty, and both candidate ordinals fit inside
+    // them. Two bytes or four, the entry stays twenty-four.
+    //
+    // SO THIS MODULE'S THIRD REFUSAL IS WITHDRAWN, AND SAYING SO IS THE POINT OF CORRECTING IT
+    // RATHER THAN THE NUMBER. The width objection to a TWO-BYTE element ordinal is gone: it is
+    // free. A four-byte one still costs a word, which the divergence below measures.
+    // What still refuses the route is what this module's first two refusals always were, and
+    // neither mentions width: the ordinal DOES NOT EXIST for `zset`, `set`, `list` or `hash`, and
+    // the durable model maps are the sole source for an element's identity. A reader who comes
+    // here for the width argument should find it withdrawn rather than quietly re-numbered.
+    //
+    // AND IT RE-PRICES EVERY "THE NEXT FIELD COSTS A WORD" CLAIM IN THE TREE. `engine_storage_state.rs`'s own
+    // prose now says a field up to five bytes wide is free here; this is that statement measured.
+    //
+    // AND THE TWO WIDTHS DIVERGE FOR THE FIRST TIME, WHICH NO EARLIER READING OF THIS ARM COULD
+    // HAVE SHOWN. `Option<u16>` is four bytes and `Option<u32>` is eight -- neither carries a
+    // niche -- so nineteen plus four is twenty-three and fits inside the slack, while nineteen
+    // plus eight is twenty-seven and does not. The u16 is FREE and the u32 costs a whole word.
+    // On the forty-byte entry both cost a word and the choice between them was width-neutral; it
+    // is not any more, and that is a decision this arm had no reason to record until now.
+    assert_eq!(
+        (width_with_u16, width_with_u32),
+        (24, 32),
+        "a u16 ordinal takes the entry to {width_with_u16} B and a u32 to {width_with_u32} B, not \
+         24 and 32 -- the five bytes of slack above are what the u16 fits inside and the u32 \
+         does not, and if the u16 starts crossing then the slack has gone"
+    );
+
+    // The ceiling, stated. Sixteen bits is the existing ordinal's width after #1994.
+    const BLOCK_ID_BITS: u32 = 16;
+    let ceiling = (1u64 << BLOCK_ID_BITS) - 1;
+    const MEASURED_P50_ELEMENTS: u64 = 100;
+    const MEASURED_WIDEST_ELEMENTS: u64 = 2_000;
+
+    println!(
+        "  [ceiling] a {BLOCK_ID_BITS}-bit ordinal caps at {ceiling} elements an object; measured \
+         container shape p50 {MEASURED_P50_ELEMENTS}, widest observed {MEASURED_WIDEST_ELEMENTS} \
+         -- {:.1}x headroom on the widest, not 65,000x",
+        ceiling as f64 / MEASURED_WIDEST_ELEMENTS as f64
+    );
+    assert!(
+        ceiling > MEASURED_WIDEST_ELEMENTS,
+        "a {BLOCK_ID_BITS}-bit ordinal caps at {ceiling}, below the widest measured object at \
+         {MEASURED_WIDEST_ELEMENTS}"
+    );
+
+    // And the state of the tree at that ceiling, so this module does not imply it is safe.
+    let state = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine/engine_storage_state.rs"),
+    )
+    .expect("engine_storage_state.rs is readable");
+    assert!(
+        state.len() > 100_000,
+        "DENOMINATOR: read {} bytes of engine_storage_state.rs",
+        state.len()
+    );
+    assert!(
+        state.contains("u32::try_from(highest).unwrap_or(u32::MAX).saturating_add(1)"),
+        "next_block_index_for_object no longer saturates at its ceiling. That is #1985's fix \
+         landing, and this arm should be retired rather than relaxed -- but until it does, an \
+         ordinal at the ceiling is handed out repeatedly rather than refused."
+    );
+    println!(
+        "  [ceiling] and on this revision the assignment still ends \
+         `unwrap_or(u32::MAX).saturating_add(1)`, so the failure at the ceiling is silent reuse \
+         rather than a refusal (#1985's to fix)"
+    );
+}
+
+// =================================================================================================
+// 9. THE PRIZE, MEASURED ON ONE INSTRUMENT
+// =================================================================================================
+
+/// Every page of this shard, as `(kind, key, component length)`.
+fn component_census(engine: &TemporalEngine) -> Vec<(String, String, Option<usize>)> {
+    let shards = engine.shards.read().expect("engine lock poisoned");
+    let shard = shards.get(&1).expect("shard 1 is loaded");
+    let mut rows = Vec::new();
+    for (_routing_bucket, _handle, object_key, block) in
+        super::blocks_with_identity(&shard.bucket_index)
+    {
+        rows.push((
+            block.model_id.as_str().to_string(),
+            object_key.to_string(),
+            None::<usize>,
+        ));
+    }
+    rows
+}
+
+fn seed_containers(engine: &TemporalEngine, keys: usize, members: usize) {
+    let mut commands = Vec::with_capacity(keys * members);
+    for k in 0..keys {
+        for m in 0..members {
+            match k % 3 {
+                0 => commands.push(Command::SetAdd {
+                    key: format!("c-set-{k}"),
+                    member: format!("member-{m}").into_bytes(),
+                }),
+                1 => commands.push(Command::ZSetAdd {
+                    key: format!("c-zset-{k}"),
+                    member: format!("member-{m}").into_bytes(),
+                    score: m as f64,
+                }),
+                _ => commands.push(Command::ListPush {
+                    key: format!("c-list-{k}"),
+                    member: format!("member-{m}").into_bytes(),
+                    left: false,
+                }),
+            }
+        }
+    }
+    for chunk in commands.chunks(1_000) {
+        let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+            shard_id: 1,
+            commands: chunk.to_vec(),
+        });
+        assert!(response.status.ok, "the seed must ack: {:?}", response.status);
+    }
+}
+
+fn seed_routed_strings(engine: &TemporalEngine, keys: usize) {
+    let commands: Vec<Command> = (0..keys)
+        .map(|k| Command::StringSet {
+            key: format!("s-{k}"),
+            value: vec![b'v'; 32],
+        })
+        .collect();
+    for chunk in commands.chunks(1_000) {
+        let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+            shard_id: 1,
+            commands: chunk.to_vec(),
+        });
+        assert!(response.status.ok, "the seed must ack: {:?}", response.status);
+    }
+}
+
+/// WHAT AN ELEMENT ORDINAL WOULD HAVE SAVED A PAGE, AND WHAT THE ASSIGNMENT WOULD HAVE COST.
+///
+/// Recorded so the refutation carries the number it is declining rather than waving at it.
+///
+/// ONE INSTRUMENT, BOTH COLUMNS. `ALLOC_BYTES` charges `layout.size()` -- what the caller asked for
+/// -- and `ALLOC_CHUNK_BYTES` reads `malloc_usable_size`, what was handed over. The component name is
+/// one `Arc<str>` a page, so the span measured is exactly that: every name this store holds,
+/// re-allocated as the write path allocated it, and nothing else inside the probe.
+///
+/// **THE CHUNK RULE IS A FLOOR, NOT AN EQUALITY** (#1969: a 104-byte request read 128), so the chunk
+/// column is REPORTED and the request column carries the claim.
+///
+/// **TWO POPULATIONS, NEVER A MEAN.** #1986 found the mixed histogram holds only 1 and 100 and
+/// nothing at two, so a single average over both is a number no object has. The routed population
+/// (strings, p50 1 page an object, no component at all) is measured as the control that must save
+/// ZERO -- a change to a field that is `None` on every page of it cannot pay there, and a table that
+/// showed it paying would be measuring something else.
+///
+/// Both routing ranges, two corpus sizes, store path length held and asserted.
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "counting allocator; run by name under --features alloc-probe"]
+fn what_an_element_ordinal_would_have_saved_a_block() {
+    use crate::alloc_probe::Probe;
+
+    let component_field_bytes = std::mem::size_of::<Option<std::sync::Arc<str>>>();
+    let ordinal_field_bytes = std::mem::size_of::<Option<u16>>();
+    let mut path_lengths: Vec<usize> = Vec::new();
+    let mut rows_reported = 0usize;
+
+    println!("\n  [the prize an element ordinal declines]");
+    for (range_label, end) in [
+        ("0..=1023 (shipped)", OPERATOR_END),
+        ("0..u32::MAX (legacy)", WHOLE_KEYSPACE_END),
+    ] {
+        for (size_label, keys) in [("4,000 records", 40usize), ("40,000 records", 400usize)] {
+            // --- the container population -------------------------------------------------
+            let dir = tempfile::tempdir().expect("tempdir");
+            path_lengths.push(dir.path().as_os_str().len());
+            let engine = engine_on(dir.path());
+            load_on(&engine, end);
+            seed_containers(&engine, keys, 100);
+
+            let census = component_census(&engine);
+            let named: Vec<usize> = census.iter().filter_map(|row| row.2).collect();
+            assert!(
+                !named.is_empty(),
+                "DENOMINATOR: {range_label} / {size_label} produced no page carrying a component"
+            );
+            assert_eq!(
+                named.len(),
+                census.len(),
+                "{range_label} / {size_label}: {} of {} container pages carry a component; a page \
+                 without one is not part of this claim",
+                named.len(),
+                census.len()
+            );
+
+            // The span is exactly the names: one Arc<str> a page, as the write path makes them.
+            let spellings: Vec<String> = named.iter().map(|len| "x".repeat(*len)).collect();
+            let probe = Probe::start();
+            let held: Vec<std::sync::Arc<str>> = spellings
+                .iter()
+                .map(|spelling| std::sync::Arc::from(spelling.as_str()))
+                .collect();
+            let counts = probe.stop();
+            std::hint::black_box(&held);
+
+            assert!(
+                counts.allocs >= named.len() as u64,
+                "the probe counted {} allocations for {} names, so it is not counting the span \
+                 described",
+                counts.allocs,
+                named.len()
+            );
+            assert!(
+                counts.chunk_bytes >= counts.alloc_bytes,
+                "the chunk column ({}) read below the request column ({}), which the floor rule \
+                 forbids",
+                counts.chunk_bytes,
+                counts.alloc_bytes
+            );
+
+            let blocks = named.len() as f64;
+            let mean_name = named.iter().sum::<usize>() as f64 / blocks;
+            println!(
+                "    containers  {range_label:<20} {size_label:<14} pages={:<6} name len mean \
+                 {mean_name:>5.1}\n                  ALLOC_BYTES {:>8.2} B a name   \
+                 ALLOC_CHUNK_BYTES {:>8.2} B a name   in-struct {} -> {} B",
+                named.len(),
+                counts.alloc_bytes as f64 / blocks,
+                counts.chunk_bytes as f64 / blocks,
+                component_field_bytes,
+                ordinal_field_bytes
+            );
+            rows_reported += 1;
+
+            // --- the routed population, as the control that must save nothing ---------------
+            let routed_dir = tempfile::tempdir().expect("tempdir");
+            path_lengths.push(routed_dir.path().as_os_str().len());
+            let routed = engine_on(routed_dir.path());
+            load_on(&routed, end);
+            seed_routed_strings(&routed, keys * 100);
+            let routed_census = component_census(&routed);
+            assert!(
+                !routed_census.is_empty(),
+                "DENOMINATOR: the routed control seeded no page at all"
+            );
+            let routed_named = routed_census.iter().filter(|row| row.2.is_some()).count();
+            println!(
+                "    routed      {range_label:<20} {size_label:<14} pages={:<6} pages carrying a \
+                 component={routed_named}  -> 0.00 B a page to save",
+                routed_census.len()
+            );
+            assert_eq!(
+                routed_named, 0,
+                "{routed_named} of {} routed pages carry a component; the control's whole point is \
+                 that this population has none, so an ordinal cannot pay on it",
+                routed_census.len()
+            );
+            rows_reported += 1;
+        }
+    }
+
+    assert_eq!(
+        rows_reported, 8,
+        "DENOMINATOR: {rows_reported} rows reported, not the eight (2 ranges x 2 sizes x 2 \
+         populations) this table claims"
+    );
+    let first = path_lengths[0];
+    assert!(
+        path_lengths.iter().all(|length| *length == first),
+        "the store path length moved across arms ({path_lengths:?}); allocation BYTES move with it \
+         at about six bytes a character, so a byte table across arms of different path lengths is \
+         not comparable"
+    );
+    println!(
+        "    store path held at {first} characters across all {} arms",
+        path_lengths.len()
+    );
+}
+
+// =================================================================================================
+// 10. THE CEILING'S FAILURE, DRIVEN
+// =================================================================================================
+
+/// AT THE CEILING THE ADDRESS ALREADY REFUSES, LOUDLY, AND NAMES THE EXACT CORRUPTION.
+///
+/// Item three of the question this module answers is "state the width, the ceiling it implies, and
+/// fail loudly at it -- never wrap, never saturate". Two thirds of that is already in the tree and
+/// the last third is not, and the split is worth driving rather than describing:
+///
+///   * `BlockAddress::block_id` is STORED as `u16` -- 65,535 elements an object -- while its
+///     ACCESSOR hands back `Option<u64>`. A width read off the accessor is four times too generous,
+///     which is why #1986's rule is to read it off the field.
+///   * `narrow_block_id` is CHECKED, not saturating, and its panic message names the harm:
+///     "truncating it would name a different page of the same object". Driven here.
+///   * But `next_block_index_for_object` SATURATES before it ever reaches that check, so the value
+///     that arrives at the ceiling is `u32::MAX` rather than 65,536 -- still refused, and refused for
+///     the wrong reason, by the wrong function, with no mention of the object that overflowed. That
+///     half is #1985's.
+///
+/// rust-internal: drives a panic on an address, no engine
+#[test]
+fn at_the_ceiling_the_address_refuses_rather_than_truncating() {
+    // The stored width is sixteen bits whatever the accessor's type says.
+    const CEILING: u64 = u16::MAX as u64;
+
+    let mut fits = crate::block_store::ElementEntry::try_from_parts(1, 0, 16, Some(CEILING), None)
+        .expect("an address at the ceiling is constructible");
+    assert_eq!(
+        fits.block_id(),
+        Some(CEILING),
+        "an ordinal AT the ceiling must survive the round trip, or the refusal below is refusing \
+         the wrong thing"
+    );
+
+    // One past it must PANIC, not truncate. A truncating narrow would make ordinal 65,536 and
+    // ordinal 0 the same page of the same object -- which is precisely the reuse this module is
+    // about, arrived at by arithmetic instead of by a delete.
+    let refused = std::panic::catch_unwind(move || {
+        fits.set_block_id(Some(CEILING + 1));
+        fits.block_id()
+    });
+    assert!(
+        refused.is_err(),
+        "an ordinal one past the {CEILING} ceiling was ACCEPTED and came back as {:?}; a silent \
+         truncation here is two elements sharing one identity",
+        refused.ok()
+    );
+
+    println!(
+        "\n  [ceiling driven] block_id stored as u16 -> ceiling {CEILING}; accessor type is \
+         Option<u64>, which is 4x too generous to read a width from\n  [ceiling driven] \
+         set_block_id({}) panicked rather than truncating",
+        CEILING + 1
+    );
+}
+
+// =================================================================================================
+// 11. IS THE MEMBER STORED TWICE, AT DOUBLE WIDTH? MEASURED PER KIND AND PER MEMBER WIDTH
+// =================================================================================================
+
+/// THE COMPONENT IS A SECOND COPY OF THE MEMBER AT TWO CHARACTERS A BYTE, AND IT IS MEASURED HERE
+/// RATHER THAN DERIVED FROM THE FORMAT STRING.
+///
+/// The arithmetic off the write arms says a member of n bytes costs n in the page payload and 2n again
+/// in the component, because both `set` and `zset` spell the member with `hex::encode`. That is a
+/// prediction, and predictions about this structure have been wrong four times in this campaign, so
+/// every number below comes off a seeded store and the allocator.
+///
+/// # WHAT IS MEASURED
+///
+/// For each kind and each member width: the component lengths actually found on the page entries (a
+/// HISTOGRAM, never a mean -- a mean over a bimodal population is a number no element has), and the
+/// request and chunk bytes for exactly those names, allocated as the write path allocates them.
+///
+/// # THE CONTROLS, AND WHY THERE ARE TWO
+///
+///   * `list` -- its component is SIXTEEN characters whatever the member is, so the doubling
+///     prediction says it must be FLAT across every width. A kind that moved here would mean the
+///     measurement is picking up something other than the member's spelling.
+///   * `string` -- no component at all, so it must read ZERO at every width.
+///
+/// **`ALLOC_CHUNK_BYTES` IS A FLOOR, NOT AN EQUALITY** (#1969: a 104-byte request read 128), so the
+/// chunk column is reported and the request column carries the claim.
+///
+/// Store path length held constant and asserted: allocation BYTES move with it at about six bytes a
+/// character.
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "counting allocator; run by name under --features alloc-probe"]
+fn what_a_component_costs_an_element_at_five_member_widths() {
+    use crate::alloc_probe::Probe;
+
+    const WIDTHS: [usize; 5] = [8, 16, 32, 64, 256];
+    const MEMBERS: usize = 100;
+
+    let mut path_lengths: Vec<usize> = Vec::new();
+    let mut rows = 0usize;
+    // (kind, width) -> request bytes a name, so the control's flatness can be asserted afterwards.
+    let mut request_per_name: std::collections::BTreeMap<(&str, usize), f64> =
+        std::collections::BTreeMap::new();
+
+    println!(
+        "\n  [what a component costs an element]  member payload n, component length, and the \
+         allocation behind it"
+    );
+    println!(
+        "    {:<7} {:>5} {:>9} {:>11} {:>12} {:>12} {:>8}",
+        "kind", "n", "blocks", "comp chars", "REQUEST B", "CHUNK B", "chars/n"
+    );
+
+    for kind in ["set", "zset", "list", "string"] {
+        for width in WIDTHS {
+            let dir = tempfile::tempdir().expect("tempdir");
+            path_lengths.push(dir.path().as_os_str().len());
+            let engine = engine_on(dir.path());
+            load_on(&engine, OPERATOR_END);
+
+            let key = format!("w-{kind}-{width}");
+            let mut commands = Vec::with_capacity(MEMBERS);
+            for element in 0..MEMBERS {
+                // A member of EXACTLY `width` bytes, distinct per element.
+                let mut member = format!("{element:04}").into_bytes();
+                member.resize(width, b'm');
+                match kind {
+                    "set" => commands.push(Command::SetAdd {
+                        key: key.clone(),
+                        member,
+                    }),
+                    "zset" => commands.push(Command::ZSetAdd {
+                        key: key.clone(),
+                        member,
+                        score: element as f64,
+                    }),
+                    "list" => commands.push(Command::ListPush {
+                        key: key.clone(),
+                        member,
+                        left: false,
+                    }),
+                    // The second control: one page per key, no component at all.
+                    _ => commands.push(Command::StringSet {
+                        key: format!("{key}-{element}"),
+                        value: member,
+                    }),
+                }
+            }
+            for chunk in commands.chunks(1_000) {
+                let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+                    shard_id: 1,
+                    commands: chunk.to_vec(),
+                });
+                assert!(response.status.ok, "the seed must ack: {:?}", response.status);
+            }
+
+            // The component lengths the store ACTUALLY holds, as a histogram.
+            let census = component_census(&engine);
+            let held: Vec<&(String, String, Option<usize>)> =
+                census.iter().filter(|row| row.0 == kind).collect();
+            assert_eq!(
+                held.len(),
+                MEMBERS,
+                "DENOMINATOR: {kind}/n={width} filed {} pages of this kind, not the {MEMBERS} \
+                 seeded -- the fixture does not reach the population this row claims",
+                held.len()
+            );
+            let mut histogram: std::collections::BTreeMap<Option<usize>, usize> =
+                std::collections::BTreeMap::new();
+            for row in &held {
+                *histogram.entry(row.2).or_default() += 1;
+            }
+
+            let lengths: Vec<usize> = held.iter().filter_map(|row| row.2).collect();
+            let (request, chunk) = if lengths.is_empty() {
+                (0.0, 0.0)
+            } else {
+                let spellings: Vec<String> =
+                    lengths.iter().map(|length| "x".repeat(*length)).collect();
+                let probe = Probe::start();
+                let names: Vec<std::sync::Arc<str>> = spellings
+                    .iter()
+                    .map(|spelling| std::sync::Arc::from(spelling.as_str()))
+                    .collect();
+                let counts = probe.stop();
+                std::hint::black_box(&names);
+                assert!(
+                    counts.chunk_bytes >= counts.alloc_bytes,
+                    "{kind}/n={width}: the chunk column read below the request column, which the \
+                     floor rule forbids"
+                );
+                (
+                    counts.alloc_bytes as f64 / MEMBERS as f64,
+                    counts.chunk_bytes as f64 / MEMBERS as f64,
+                )
+            };
+
+            let chars: String = histogram
+                .keys()
+                .map(|length| match length {
+                    Some(length) => length.to_string(),
+                    None => "none".to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let per_byte = match histogram.keys().next().and_then(|length| *length) {
+                Some(length) => format!("{:.2}", length as f64 / width as f64),
+                None => "-".to_string(),
+            };
+            println!(
+                "    {kind:<7} {width:>5} {:>9} {chars:>11} {request:>12.2} {chunk:>12.2} \
+                 {per_byte:>8}   histogram {:?}",
+                held.len(),
+                histogram
+            );
+            request_per_name.insert((kind, width), request);
+            rows += 1;
+        }
+    }
+
+    assert_eq!(
+        rows, 20,
+        "DENOMINATOR: {rows} rows measured, not the twenty (4 kinds x 5 widths) this table claims"
+    );
+    let first = path_lengths[0];
+    assert!(
+        path_lengths.iter().all(|length| *length == first),
+        "the store path length moved across arms ({path_lengths:?}); allocation bytes move with it \
+         at about six bytes a character"
+    );
+    println!("    store path held at {first} characters across all {rows} arms");
+
+    // ---- THE CLAIM: set and zset grow with the member, at two characters a byte ----------------
+    let set_8 = request_per_name[&("set", 8)];
+    let set_256 = request_per_name[&("set", 256)];
+    assert!(
+        set_256 > set_8 * 8.0,
+        "a set component at n=256 costs {set_256:.2} B a name against {set_8:.2} at n=8; if the \
+         cost does not grow with the member then the member is NOT being spelled into the name and \
+         the whole doubling claim is wrong"
+    );
+    let zset_8 = request_per_name[&("zset", 8)];
+    let zset_256 = request_per_name[&("zset", 256)];
+    assert!(
+        zset_256 > zset_8 * 4.0,
+        "a zset component at n=256 costs {zset_256:.2} B a name against {zset_8:.2} at n=8"
+    );
+
+    // ---- CONTROL 1: list is FLAT, because its component is fixed width ------------------------
+    let list_8 = request_per_name[&("list", 8)];
+    let list_256 = request_per_name[&("list", 256)];
+    assert_eq!(
+        list_8, list_256,
+        "the list control moved from {list_8:.2} to {list_256:.2} B a name across a 32x change in \
+         member width; its component is sixteen characters whatever the member is, so a change here \
+         means this measurement is picking up something other than the member's spelling"
+    );
+
+    // ---- CONTROL 2: string has no component, so zero at every width ---------------------------
+    for width in WIDTHS {
+        assert_eq!(
+            request_per_name[&("string", width)], 0.0,
+            "the string control charged {:.2} B a name at n={width}; a kind with no component \
+             cannot charge anything for one",
+            request_per_name[&("string", width)]
+        );
+    }
+
+    println!(
+        "\n    CLAIM     set  {set_8:.2} -> {set_256:.2} B a name over n=8 -> 256  (grows with the \
+         member)\n    CLAIM     zset {zset_8:.2} -> {zset_256:.2} B a name\n    CONTROL   list \
+         {list_8:.2} -> {list_256:.2} B a name  (FLAT: fixed-width component)\n    CONTROL   \
+         string 0.00 B a name at every width  (no component at all)"
+    );
+}
+
+// =================================================================================================
+// 12. WHO CONSUMES COMPONENT ORDER
+// =================================================================================================
+
+/// THE ORDERING PROPERTY IS CLAIMED BY THREE COMMENTS AND THE SET LISTING CONSUMES IT.
+///
+/// A zset component is score-bits-then-member and a list component is a `i64::MIN`-biased sequence,
+/// both so that LEXICAL order is the element's order. `execute_on_shard.rs` says the bias is "what
+/// lets recovery and range reads walk the bucket index directly", and `engine_storage_state.rs` says "the index
+/// component already encodes score-then-member, so recovery has the order for free". An ordinal that
+/// did not preserve that ordering would force those readers to sort -- which would be the refutation,
+/// and it is the reason this arm exists.
+///
+/// **IT IS NOT THE REFUTATION, BECAUSE NO READER TAKES ITS ORDER FROM THE COMPONENT.** Enumerated,
+/// with each consumer classified rather than counted:
+///
+///   * **RECOVERY DERIVES NOTHING FROM A COMPONENT.** This read "RECOVERY RE-KEYS BY THE DECODED
+///     VALUE. The three arms of `reconcile_secondary_views_from_bucket_index` decode each component
+///     and insert into a `BTreeMap` keyed by the MEMBER BYTES (`set`, `zset`) or by the `i64`
+///     SEQUENCE (`list`)." Those three arms are GONE. An entry has no element-name field, so there
+///     is nothing to decode: `rebuild_unserialized_model_maps_from_bucket_index` passes an empty
+///     derived map and keeps only its live-address filter, and the durable resident maps are the
+///     sole source. The order is still re-established by the map rather than inherited from a walk,
+///     and now it could not be inherited from one even if a reader wanted to.
+///   * **RANGE READS USE THE DURABLE MAPS.** `zset_members_in_score_range` and `zset_ordered_members`
+///     read `shard.zsets`, which is keyed by MEMBER and not by score -- `engine_storage_state.rs` says so directly:
+///     "is derived per query -- V1 accepts the per-range sort". `ListRange` reads `shard.lists`, keyed
+///     by the `i64` itself. Neither touches a component.
+///   * **THE THREE READERS THAT DO SORT BY COMPONENT NEED ONLY A TOTAL ORDER.**
+///     `bucket_index_component_block_addresses` sorts before returning;
+///     `ObjectBlockRefs::position` binary-searches; `storage_reporting` sorts for a stable report.
+///     Any total order satisfies all three, and an ordinal has one.
+///   * **AND THE SET LISTING CONSUMES IT NOW, WHICH REVERSES THIS SECTION.** This bullet read "OF
+///     ITS THREE CALLERS, ONE DISCARDS THE COMPONENT AND ONE READS ONLY `len()`. `SetMembers` takes
+///     `|(_, address)|`", and that was the last leg the "consumed by nobody" conclusion stood on.
+///     `SetMembers` does not walk index entries at all now: an entry naming no element "can only be
+///     answered by a page that names no element either", so that arm was deleted and the command
+///     folds the object's PAGES through `container_membership::derive_membership` -- whose map is
+///     KEYED BY THE COMPONENT SPELLING. The listing therefore comes back in component order.
+///     Measured in the arm below, on one population: write order [07, 01, 09, 03, 05, 00, 08, 02,
+///     06, 04], the whole-object door's walk in address order [01, 04, 00, 06, 05, 08, 09, 02, 03,
+///     07], and the listing [00 .. 09].
+///
+/// SO THE CONCLUSION OF THIS SECTION IS REVERSED, AND IT IS THE ONE PLACE THIS MODULE HAD BEEN
+/// COLLECTING SUPPORT FOR AN ORDINAL. It read: "the ordering property costs sixteen characters of
+/// score prefix on every zset element and buys nothing any reader on this revision consumes. That
+/// is a finding in favour of the ordinal on this axis, recorded because the refutation is about
+/// non-reuse and should not be allowed to collect support it has not earned."
+///
+/// A reader consumes it. Respelling a set's component as an ordinal would change the order
+/// `SetMembers` answers in -- from member order to ordinal order -- which is an observable change
+/// to a served answer rather than an internal one. That does not refute the ordinal by itself:
+/// `SMEMBERS` promises no order, and this module's refusal rests on non-reuse and on the fold
+/// losing a member, both of which are unchanged. What it does is remove the support, so the
+/// sentence above is withdrawn rather than left to be read as evidence.
+///
+/// THE ZSET HALF OF THE ORIGINAL CLAIM IS GONE A DIFFERENT WAY, and the two should not be confused:
+/// `zset_component` is `hex::encode(member)` alone, so there is no score prefix left to cost
+/// anything. The assertion below that the retired score-then-member claim is absent from the tree
+/// is what holds that.
+///
+/// rust-internal: reads the crate's own source and drives one reload
+#[test]
+fn the_component_ordering_property_is_consumed_by_the_set_listing() {
+    // THE WALK THIS COMPARES AGAINST WAS BUILT BY DECODING EACH ENTRY'S COMPONENT, through an
+    // `unwrap_or_default()` that turns an absent name into the EMPTY member -- the same defaulting
+    // the production readers were fixed to stop doing. With no element name on an entry it yielded
+    // ten empty members, so the instrument failed and not the read. It is read off the walk's
+    // ADDRESS order joined through `shard.sets` now; see the re-attribution at the walk itself.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine");
+    let internals = std::fs::read_to_string(root.join("storage_bucket_internals.rs"))
+        .expect("storage_bucket_internals.rs is readable");
+    let execute = std::fs::read_to_string(root.join("execute_on_shard.rs"))
+        .expect("execute_on_shard.rs is readable");
+    assert!(
+        internals.len() > 100_000 && execute.len() > 100_000,
+        "DENOMINATOR: read {} and {} bytes; a short read scores every claim below as a pass",
+        internals.len(),
+        execute.len()
+    );
+
+    // The comment that makes the list claim is still there, so this arm is answering a live claim
+    // and not a remembered one.
+    let claims = ["Two's-complement bias makes the hex component sort lexically in list order"];
+    for claim in claims {
+        assert!(
+            execute.contains(claim),
+            "the ordering claim {claim:?} is no longer in the tree, so this arm is answering \
+             nothing -- re-read the write arms before trusting it"
+        );
+    }
+
+    // THE ZSET CLAIM IS RETIRED, NOT RESTATED, which is the strongest form "consumed by no
+    // reader" can take: the (score, member) order this component used to carry by construction
+    // is not merely unread now, it does not exist any more -- `zset_component` is
+    // `hex::encode(member)` alone, so there is no score term left for anything to sort by. If
+    // that claim's TEXT is somehow still in the tree, something restored the old encoding and
+    // this change has been undone.
+    assert!(
+        !execute.contains(
+            "The persisted component: score bits then member, so lexical order is (score, \
+             member) order"
+        ),
+        "the retired zset ordering claim is back in the tree -- the score has returned to the \
+         component"
+    );
+
+    // RECOVERY DERIVES NO ELEMENT FROM A COMPONENT AT ALL, AND THAT IS A FOURTH PROXY RETIRED.
+    //
+    // This asserted three literals -- `.insert(member, entry.address);`,
+    // `.insert(seq, entry.address);` and `.insert(member, (score, entry.address));` -- as evidence
+    // that the reconcile re-keyed by the DECODED value rather than inheriting the walk's order.
+    // They are gone, and not because the arm changed shape this time: the derivation itself was
+    // removed. `rebuild_unserialized_model_maps_from_bucket_index` passes an EMPTY derived map and
+    // keeps only its live-address filter, because an entry has no element-name field to derive a
+    // member, a sequence or a field name from.
+    //
+    // SO THE PROPERTY IS NO LONGER "NO READER TAKES ITS ORDER FROM THE COMPONENT". It is that
+    // there is no component on an entry for an order to be taken from -- the defect is
+    // UNREACHABLE rather than merely absent, which is the stronger of the two things a guard can
+    // say.
+    //
+    // AND IT IS ASSERTED BY THE COMPILER, NOT BY A TEXT MATCH. This arm's own history is why: it
+    // records three text proxies that each "died of the arm changing shape", the third on a
+    // COMMENT whose wording the ban matched. A fourth absence check would be defeated by a rename.
+    // The literal below names every field of `BlockIndex` with no `..`, so a component field
+    // returning to the entry is a COMPILE ERROR here rather than a silently passing grep.
+    let _no_component_field_exists = crate::engine::state::BlockIndex {
+        model_id: crate::engine::storage_bucket_internals::StoredModelKind::Set,
+        address: crate::block_store::ElementEntry::from_parts(1, 0, 1, Some(0), Some(0)),
+        dirty: false,
+        deleted: false,
+    };
+
+    // AND THE WEAK HALF, KEPT AND LABELLED AS SUCH. A rename defeats it, which is exactly why it
+    // is not carrying the claim on its own. What it adds to the literal above is the direction: the
+    // literal says no component CAN be read, these say nothing in the reconcile still tries.
+    for retired in [
+        ".insert(member, entry.address);",
+        ".insert(seq, entry.address);",
+        ".insert(member, (score, entry.address));",
+    ] {
+        assert!(
+            !internals.contains(retired),
+            "the reconcile still carries {retired:?}, so a container element is being derived from \
+             something again -- if that something is an entry's component, this whole arm is wrong"
+        );
+    }
+
+    // RANGE READS use the durable maps, not the component.
+    assert!(
+        execute.contains("let mut ordered: Vec<(Vec<u8>, u64)> = shard\n        .zsets"),
+        "zset_members_in_score_range no longer reads shard.zsets; if it has started walking the \
+         bucket index, component order IS load-bearing"
+    );
+
+    // AND THE ONE CALLER THAT COULD HAVE CARED DOES NOT ORDER BY THE COMPONENT.
+    //
+    // RETARGETED, and the reason matters more than the new pattern. This arm used to assert the
+    // literal `filter_map(|(_, address)| {` -- that SetMembers THREW THE COMPONENT AWAY -- as a
+    // proxy for the property it means, which is that set member order is not component order.
+    // The proxy stopped holding when a carried page started needing to say which element it is:
+    // `read_block_bytes` now takes the component, so this arm binds it and passes it on. The
+    // PROPERTY did not move. Member order is still the order
+    // `bucket_index_component_block_addresses` walked in, exactly as before.
+    //
+    // So the assertion is now on what would actually break it: the component must reach
+    // `read_block_bytes` and NOTHING ELSE. If this arm ever sorts, compares or keys by it, member
+    // order becomes component order and an ordinal would change it -- which is the thing this
+    // whole module is about.
+    // THE PROXY IS RETIRED HERE. Three source-text proxies have stood for this property and all
+    // three died of the arm changing shape -- the discarded component, then the bare component in
+    // the identity slot, then `.into_iter()` with a ban on `sort`/`BTreeSet`. The third died on a
+    // COMMENT: the arm stopped sorting altogether, and the sentence explaining why it no longer
+    // needs to contains the word the ban matched. A text proxy a comment can fail is measuring the
+    // wrong thing, so the property is asserted by DRIVING instead.
+    //
+    // THE PROPERTY, STATED ONCE: `SetMembers` inherits the order
+    // `bucket_index_component_block_addresses` walked in and imposes no ordering of its own. That
+    // is what makes an ordinal safe here -- it changes the walk and the listing together, rather
+    // than leaving the listing ordered by something the component has stopped being.
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let engine = engine_on(dir.path());
+        load_on(&engine, OPERATOR_END);
+        // Members whose BYTE order and INSERTION order differ, so inheriting the walk and
+        // inheriting the write order are distinguishable answers.
+        let members: Vec<Vec<u8>> = [7usize, 1, 9, 3, 5, 0, 8, 2, 6, 4]
+            .iter()
+            .map(|index| format!("ord-member-{index:02}").into_bytes())
+            .collect();
+        for member in &members {
+            write(
+                &engine,
+                Command::SetAdd {
+                    key: "eo-set-order".to_string(),
+                    member: member.clone(),
+                },
+            );
+        }
+
+        // THE WALK'S OWN ORDER, read from the door the listing is built on.
+        //
+        // RE-ATTRIBUTED, AND THIS ARM'S OWN DOC PREDICTED THE RED. It decoded each entry's
+        // component through `hex::decode(component.as_deref().unwrap_or_default())`, and the
+        // comment above this test already said what that would do: "an `unwrap_or_default()` that
+        // turns an absent name into the EMPTY member -- the same defaulting the production readers
+        // were fixed to stop doing". With no element name on an entry it yielded ten EMPTY members
+        // and compared them against a correct listing, so the instrument failed and not the read.
+        //
+        // WHAT THE DOOR STILL GIVES IS THE ORDER, which is the only thing this comparison is about.
+        // `bucket_index_component_block_addresses` returns the object's pages sorted, and
+        // `SetMembers` is built by walking exactly that. So the walk is taken as its ADDRESS
+        // sequence and each address is turned back into its member through `shard.sets` -- the same
+        // address join the engine makes on the write path. The property is unchanged: the listing
+        // INHERITS this order and imposes none of its own.
+        let walked: Vec<Vec<u8>> = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard 1 is loaded");
+            let mut member_at: std::collections::BTreeMap<(u64, u64, u64), Vec<u8>> =
+                std::collections::BTreeMap::new();
+            for (member, address) in shard
+                .sets
+                .get("eo-set-order")
+                .expect("the fixture's set is resident")
+                .iter()
+            {
+                member_at.insert(
+                    (
+                        address.block_slab_id(),
+                        address.offset(),
+                        address.length(),
+                    ),
+                    member.clone(),
+                );
+            }
+            crate::engine::bucket_store::bucket_index_component_block_addresses(
+                shard,
+                "set",
+                "eo-set-order",
+            )
+            .into_iter()
+            .filter_map(|(_component, address)| {
+                member_at
+                    .get(&(
+                        address.block_slab_id(),
+                        address.offset(),
+                        address.length(),
+                    ))
+                    .cloned()
+            })
+            .collect()
+        };
+        assert_eq!(
+            members.len(),
+            walked.len(),
+            "DENOMINATOR: the walk yielded {} component(s) for {} members, so comparing orders \
+             below would compare different populations",
+            walked.len(),
+            members.len()
+        );
+
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::SetMembers {
+                key: "eo-set-order".to_string(),
+            },
+        });
+        assert!(response.status.ok, "the listing failed: {response:?}");
+        let listed = match response.response {
+            crate::types::CommandResponse::Members { members } => members,
+            other => panic!("expected Members, got {other:?}"),
+        };
+        // AND THIS IS WHERE THE SECTION'S CONCLUSION REVERSED. MEASURED, NOT ARGUED.
+        //
+        // This asserted `walked == listed`: that `SetMembers` INHERITS the whole-object door's
+        // order and imposes none of its own, which is what made component order free to respell.
+        // It is false now, and the mechanism is the landed change. `SetMembers` no longer walks
+        // index entries and answers each from the page it named -- that arm was deleted, because an
+        // entry naming no element "can only be answered by a page that names no element either"
+        // and it returned an EMPTY listing. It asks the PAYLOAD through
+        // `container_membership::derive_membership`, which folds every page of the object into a
+        // `BTreeMap` KEYED BY THE COMPONENT SPELLING.
+        //
+        // So the listing's order IS component order, and a reader does consume it. Measured here:
+        // the walk came back [01, 04, 00, 06, 05, 08, 09, 02, 03, 07] and the listing [00 .. 09].
+        //
+        // THE THREE ORDERS ARE ALL DISTINGUISHABLE, which is what stops this being one tautology
+        // replacing another: the write order is [07, 01, 09, 03, 05, 00, 08, 02, 06, 04], the walk
+        // is address order, and the listing is component order. The assertion below can be failed
+        // by the listing matching either of the other two.
+        let by_component: Vec<Vec<u8>> = {
+            let mut sorted = members.clone();
+            sorted.sort_by_key(|member| hex::encode(member));
+            sorted
+        };
+        assert_eq!(
+            listed, by_component,
+            "the set listing is not in component order. It is built by folding the object's pages \
+             in `derive_membership`, whose map is keyed by the component spelling, so this is the \
+             order it must come back in -- if it has stopped being, find out what imposed the new \
+             one before trusting anything else in this section"
+        );
+        assert_ne!(
+            listed, walked,
+            "the listing and the whole-object door's walk are in the SAME order, so this fixture \
+             cannot tell an inherited order from an imposed one and the reversal recorded above \
+             cannot be read off it"
+        );
+        // AND THE WALK IS NOT THE WRITE ORDER, so neither comparison above is two orders that
+        // happen to coincide.
+        assert_ne!(
+            members, walked,
+            "the fixture's write order and the walk's order are the same, so the comparisons above \
+             cannot tell an inherited order from an insertion order"
+        );
+    }
+
+    // And driven: a reload puts a list back IN ORDER even though the reconcile re-keys rather than
+    // inheriting the walk's order. Element by element, because a length check cannot see a swap.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pushed: Vec<Vec<u8>> = (0..9)
+        .map(|element| format!("ordered-{element:02}").into_bytes())
+        .collect();
+    {
+        let engine = engine_on(dir.path());
+        load_on(&engine, OPERATOR_END);
+        for member in &pushed {
+            write(
+                &engine,
+                Command::ListPush {
+                    key: "eo-order".to_string(),
+                    member: member.clone(),
+                    left: false,
+                },
+            );
+        }
+        engine.unload_shard(1);
+    }
+    let engine = engine_on(dir.path());
+    load_on(&engine, OPERATOR_END);
+    let reloaded = match engine
+        .execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::ListRange {
+                key: "eo-order".to_string(),
+                start: 0,
+                stop: -1,
+            },
+        })
+        .response
+    {
+        crate::types::CommandResponse::Members { members } => members,
+        other => panic!("a list range answered {other:?}"),
+    };
+    assert_eq!(
+        reloaded.len(),
+        pushed.len(),
+        "DENOMINATOR: the list came back with {} of {} elements",
+        reloaded.len(),
+        pushed.len()
+    );
+    for (element, (want, got)) in pushed.iter().zip(reloaded.iter()).enumerate() {
+        assert_eq!(
+            want,
+            got,
+            "position {element} came back as {:?}, not {:?} -- the order is re-established by the \
+             BTreeMap the reconcile inserts into, so this is the assertion that would fail if it \
+             were inherited from the walk instead",
+            String::from_utf8_lossy(got),
+            String::from_utf8_lossy(want)
+        );
+    }
+
+    println!(
+        "\n  [component order] 2 write-arm claims still in the tree; 3 reconcile arms re-key by the \
+         DECODED value; range reads use shard.zsets / shard.lists; 3 component-sorting readers need \
+         only a total order; SetMembers discards the component and HashLen reads len()\n  \
+         [component order] {} list elements came back in order across a reload",
+        reloaded.len()
+    );
+}
+
+// =================================================================================================
+// 13. THE STOP CONDITION: THE FOLD DELIVERS ELEMENTS THE DURABLE MAP DOES NOT HOLD
+// =================================================================================================
+
+/// AN ORDINAL LOSES THE MEMBER ON THE ONE PATH WHERE THE NAME IS THE ONLY COPY, AND THAT PATH IS
+/// ORDINARY RECOVERY.
+///
+/// The case FOR an ordinal rests on the member already being persisted twice: `set_index_serde` holds
+/// `(member bytes, address)` and `zset_index_serde` holds `(member bytes, (score, address))`, and the
+/// reconcile's own comment calls the name "a second copy of it rendered as text". If the durable map
+/// always had the member, an ordinal would have a source for the join and would need no page reads.
+///
+/// **IT DOES NOT ALWAYS HAVE IT, AND THE EXCEPTION IS NAMED IN THE SAME COMMENT**: the name's score is
+/// "the fallback for a member the durable map does not have, which is how an element folded out of the
+/// delta log arrives". Established here rather than taken on trust:
+///
+///   * `apply_key_states` folds THIRTEEN maps -- `features`, `expires_at_ms`, four `control_state_*`
+///     and seven `context_*`. **`sets`, `zsets`, `lists` and `hashes` are not among them**, asserted
+///     below at source level with the input size checked first.
+///   * `fold_delta_block_items` DOES restore the page items, so after a fold the bucket index holds
+///     pages for elements whose durable map entry was never written.
+///   * So on that path the component is the only copy of the member, which is exactly what #1989's
+///     `an_element_the_durable_map_does_not_hold_still_comes_back_from_its_name` exists to protect.
+///
+/// # THE EXPERIMENT NO LONGER HAS TO MANUFACTURE ITS STATE, AND THE PROPOSAL IS SUPERSEDED
+///
+/// It read: "Two zset members. One is dropped from the durable map only -- the shape a fold
+/// produces. Then its page entry's component is rewritten to a SIXTEEN-CHARACTER ordinal spelling,
+/// which is what a 2-byte inline page id would leave behind: a name that identifies the page and
+/// carries no member. Reload."
+///
+/// THE SECOND STEP IS GONE. `BlockIndex` has no component field, so an entry already carries no
+/// member name -- there is nothing to overwrite and no width to make it. The fixture drops the
+/// member from the durable map and reloads, which is the whole of the shape a fold produces.
+///
+/// AND THE QUESTION IT WAS PRICING DOES NOT ARISE. The experiment asked whether NARROWING the name
+/// from sixteen bytes to two was safe, and answered no. The name was not narrowed, it was removed:
+/// `engine_storage_state.rs` pins the entry at 40 bytes against the 56 it was, so all sixteen bytes a page came
+/// back and there is no two-byte residue whose safety has to be argued.
+///
+/// WHAT THE ARM STILL ASSERTS, UNCHANGED: the dropped member does not come back and the untouched
+/// one does. That was the stop condition against the ordinal; it is now a measurement of the
+/// shipped index, and it is the same claim `durable_outranks_derived` holds from the other side.
+///
+///   * The untouched member comes back -- the control, so a total loss cannot pass as this finding.
+///   * The member whose name became an ordinal **does not**, and cannot: the reconcile's zset arm
+///     requires `component.len() > 16` and the durable map has nothing, so the element is skipped and
+///     there is no second source. Its bytes are still in the page PAYLOAD, and the reconcile
+///     deliberately does not read pages -- that is the whole reason a record carries its outcomes.
+///
+/// **SO THE ORDINAL IS UNSAFE AND THIS IS THE STOP CONDITION, NOT A HURDLE.** Shipping it would be a
+/// lossy migration: an ordinary fold-backed recovery would return fewer members than were written, and
+/// nothing would report it. This engine has already shipped a member "served but undeletable" and a
+/// store answering above its own shard end; a member lost on reload is worse than either.
+///
+/// For an ordinal to be safe the FOLD would have to carry the member bytes -- which is a change to the
+/// delta record's outcome shape, not to this field, and is #1982's territory rather than this one's.
+///
+/// rust-internal: mutates the engine's own in-memory index, no external surface
+#[test]
+fn an_ordinal_loses_the_member_the_fold_delivers_without_a_durable_entry() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let engine_src = std::fs::read_to_string(root.join("engine.rs")).expect("engine.rs is readable");
+    assert!(
+        engine_src.len() > 100_000,
+        "DENOMINATOR: read {} bytes of engine.rs; a short read scores the count below as a pass",
+        engine_src.len()
+    );
+
+    // The window for one top-level item: from its `fn` line to the next top-level `fn` or `trait`.
+    //
+    // This bounded `apply_key_states` on `"\n/// Set or clear one key's entry"` -- the doc comment
+    // of the item that FOLLOWED it. That is not a property of `apply_key_states`, and when items
+    // were later added between the two the window silently grew to span them, so
+    // `folded.contains("shard.sets")` started answering about a different function. A window that
+    // widens on its own is worse than a red test, so it is bounded on itself now.
+    let window = |needle: &str| -> String {
+        let start = engine_src
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle} is in the tree"));
+        let rest = &engine_src[start + needle.len()..];
+        let end = ["\nfn ", "\ntrait ", "\npub(super) fn ", "\ntype "]
+            .iter()
+            .filter_map(|marker| rest.find(marker))
+            .min()
+            .expect("the item has a top-level successor to bound it");
+        rest[..end].to_string()
+    };
+
+    // WHAT `apply_key_states` FOLDS: twelve maps, each PER KEY. `features`, `expires_at_ms`,
+    // `control_state_changes`, `control_state_selection`, `context_nodes`, `context_events`,
+    // `context_indexes`, `context_audits`, `context_children`, `context_summaries`,
+    // `context_compressions`, `context_entities`.
+    //
+    // RE-ENUMERATED, WHICH IS WHAT THE MESSAGE BELOW DEMANDS, AND TWO THINGS HAD MOVED.
+    //
+    // THE NEEDLE BROKE, AND THAT IS THE SERIOUS ONE. Seven of these calls are turbofished now --
+    // `apply_key_state_field::<BTreeMap<u64, ElementEntry>, _>(` -- because a map whose stored
+    // blob shape differs from its resident shape has to name the type parameter. `...field(` does
+    // not match `...field::<`, so this count read FIVE against a function that folds twelve. A
+    // needle that silently stops matching makes a count read LOW, and a low count here reads as
+    // "the fold shrank" rather than as "the instrument broke", which is the more dangerous of the
+    // two misreadings. Both call forms are counted below.
+    //
+    // THE BARE IDENTIFIER IS NOT COUNTED, DELIBERATELY. It appears fourteen times in this window
+    // against twelve calls, because two of those are prose in the comments -- so counting the
+    // identifier trades one contamination for another.
+    //
+    // AND ONE MAP GENUINELY LEFT: `control_state_change_sketch`, merged into
+    // `control_state_changes` at stamp 15, so thirteen is twelve on the merits too.
+    let folded = window("fn apply_key_states(");
+    let folded_maps = folded.matches("apply_key_state_field(").count()
+        + folded.matches("apply_key_state_field::<").count();
+    assert_eq!(
+        folded_maps, 12,
+        "apply_key_states folds {folded_maps} maps, not the twelve this finding rests on -- CHECK THE NEEDLE FIRST, a call form this count cannot see reads as a map that is not folded; \
+         re-enumerate them before trusting the exclusion below"
+    );
+    // STILL EXCLUDED FROM THIS FUNCTION, and now for a different reason than when this was
+    // written. The four container maps are restored by `fold_carried_container_elements`, NOT here,
+    // because an element may only be restored once the whole fold has finished: a fold replays a
+    // suffix of the log and can add an element and then take its page away again, and applying per
+    // record would leave it in the durable map for `fill_absent_elements` to serve after a delete.
+    for container in ["shard.sets", "shard.zsets", "shard.lists", "shard.hashes"] {
+        assert!(
+            !folded.contains(container),
+            "apply_key_states now writes {container} directly. The carry must be applied AFTER the \
+             fold, against the finished page index, or a removed element comes back -- see \
+             `fold_carried_container_elements`."
+        );
+    }
+
+    // AND THE STOP CONDITION IS LIFTED, asserted where the carry actually lives. This block read
+    // `assert!(!folded.contains(container))` against `apply_key_states`, and its message said that
+    // the fold restoring the durable container maps "is the one change that would make an element
+    // ordinal safe". That change has landed: the fold now restores all four from the member bytes
+    // the delta record carries, so a folded element's identity no longer arrives by decoding the
+    // component its page was filed under. Inverted rather than deleted, because what has to keep
+    // holding is that the fold DOES carry them.
+    let carried = window("fn fold_carried_container_elements(");
+    for container in ["shard.sets", "shard.zsets", "shard.lists", "shard.hashes"] {
+        assert!(
+            carried.contains(container),
+            "the fold no longer restores {container}. The carry that lifted this stop condition has \
+             been removed, so an element a delta delivers is once again known only by its component \
+             name -- read what changed rather than restoring the old assertion."
+        );
+    }
+    assert!(
+        carried.contains("live.contains(") || carried.contains("&live"),
+        "the carry no longer filters on whether the fold left a page behind, which is the only \
+         thing stopping it from resurrecting a removed element"
+    );
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, OPERATOR_END);
+
+    let control = b"fold-control".to_vec();
+    let doomed = b"fold-doomed".to_vec();
+    write(
+        &engine,
+        Command::ZSetAdd {
+            key: "eo-fold".to_string(),
+            member: control.clone(),
+            score: 1.0,
+        },
+    );
+    write(
+        &engine,
+        Command::ZSetAdd {
+            key: "eo-fold".to_string(),
+            member: doomed.clone(),
+            score: 2.0,
+        },
+    );
+    assert_eq!(
+        blocks_of(&engine, "zset", "eo-fold").len(),
+        2,
+        "DENOMINATOR: the fixture did not file two pages"
+    );
+
+    // The shape a fold produces for ONE element: a page entry with no durable map entry.
+    //
+    // The component this used to look up (`let doomed_component = zset_name(&doomed);`) was the
+    // handle by which the rewrite below found the doomed page. There is no component to look up
+    // and no rewrite to do -- see the block below for both.
+    {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1 is loaded");
+        let removed = shard
+            .zsets
+            .elements_mut_for_test("eo-fold")
+            .expect("the zset is present")
+            .remove(doomed.as_slice());
+        assert!(
+            removed.is_some(),
+            "the durable map did not hold the doomed member, so this fixture cannot build the state \
+             a fold produces"
+        );
+
+        // THE REWRITE IS GONE, AND THE STATE IT MANUFACTURED IS THE SHIPPED STATE NOW.
+        //
+        // Thirty-five lines stood here. They removed the doomed member's page entry from
+        // `block_index`, overwrote its component with a sixteen-character ordinal spelling -- "a
+        // name that identifies the page and carries no member" -- re-inserted it, asserted exactly
+        // one entry had been rewritten, and rebuilt the object lookup. All of it existed to
+        // MANUFACTURE the state a 2-byte inline page id would leave behind.
+        //
+        // `BlockIndex` has no component field, so that state cannot be manufactured and does not
+        // need to be: an entry carries no member name of any width, ordinal or otherwise. What the
+        // fixture still builds is the half that matters -- a page entry whose element the DURABLE
+        // MAP does not hold, which is the shape a fold produces -- and that is the `remove` above,
+        // unchanged.
+        //
+        // THE FINDING BELOW IS UNCHANGED AND STILL HAS TEETH. It asserts the doomed member does
+        // NOT come back after a reload while the control does. That was the stop condition against
+        // the ordinal; it is now a statement about the shipped index, and it is the same claim the
+        // `durable_outranks_derived` arms hold from the other side -- the durable maps are the sole
+        // source, so an element they do not hold is gone from the derived view whatever its page
+        // payload still contains.
+        //
+        // AND THE PROPOSAL IT REFUSED IS SUPERSEDED RATHER THAN STILL PENDING. The experiment was
+        // pricing a NARROWING -- sixteen bytes of name down to two -- and asking whether it was
+        // safe. The name was not narrowed, it was REMOVED -- and the identity went the same way
+        // one leg later: `engine_storage_state.rs` pins the entry at 24 bytes against the 56 it was, so all
+        // sixteen of the name's bytes and all sixteen of the key's came back, and the question of
+        // whether two of them could be kept safely does not arise.
+        //
+        // AND THE REBUILD THAT STOOD HERE IS GONE WITH THE FUNCTION. The fold above files the
+        // object lookup as it places, so there was nothing for a whole-shard rebuild to add; with
+        // the identity off the entry there is nothing for it to read a key from either.
+        let _ = &shard.bucket_index;
+        println!(
+            "  [fold] dropped the doomed member from the durable map; the entry names no member \
+             at any width"
+        );
+    }
+
+    engine.unload_shard(1);
+    load_on(&engine, OPERATOR_END);
+
+    let score_of = |member: &[u8]| -> Option<f64> {
+        match engine
+            .execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::ZSetScore {
+                    key: "eo-fold".to_string(),
+                    member: member.to_vec(),
+                },
+            })
+            .response
+        {
+            crate::types::CommandResponse::Bytes { value: Some(bytes) } => {
+                String::from_utf8_lossy(&bytes).parse::<f64>().ok()
+            }
+            _ => None,
+        }
+    };
+
+    let control_score = score_of(&control);
+    let doomed_score = score_of(&doomed);
+    println!(
+        "  [fold] after the reload: control={control_score:?}  doomed={doomed_score:?}\n  [fold] \
+         the doomed member's bytes are still in the page payload, and the reconcile does not read \
+         pages"
+    );
+
+    // THE CONTROL, so a fixture that lost everything cannot pass as this finding.
+    assert_eq!(
+        control_score,
+        Some(1.0),
+        "the untouched member did not come back either, so this fixture lost the whole key and says \
+         nothing about the ordinal"
+    );
+
+    // THE FINDING.
+    assert!(
+        doomed_score.is_none(),
+        "the member came back at {doomed_score:?} from a sixteen-character ordinal name with no \
+         durable entry. If this is red, something now recovers an element's identity without the \
+         name -- and that is exactly what would LIFT this stop condition, so read what changed \
+         rather than relaxing this."
+    );
+}

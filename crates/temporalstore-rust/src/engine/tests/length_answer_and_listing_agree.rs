@@ -523,3 +523,529 @@ fn every_length_answer_still_equals_its_listing_after_a_reload() {
     load_on(&engine, OPERATOR_END);
 
     for m in 0..APPENDED {
+        write(
+            &engine,
+            Command::HashSet {
+                key: "reload-hash".to_string(),
+                field: format!("field-{m}"),
+                value: format!("value-{m}").into_bytes(),
+            },
+        );
+        write(
+            &engine,
+            Command::ListPush {
+                key: "reload-list".to_string(),
+                member: format!("member-{m}").into_bytes(),
+                left: false,
+            },
+        );
+        write(
+            &engine,
+            Command::ZSetAdd {
+                key: "reload-zset".to_string(),
+                member: format!("member-{m}").into_bytes(),
+                score: m as f64,
+            },
+        );
+        write(
+            &engine,
+            Command::SetAdd {
+                key: "reload-set".to_string(),
+                member: format!("member-{m}").into_bytes(),
+            },
+        );
+    }
+    write(
+        &engine,
+        Command::HashDelete {
+            key: "reload-hash".to_string(),
+            field: "field-0".to_string(),
+        },
+    );
+    write(
+        &engine,
+        Command::ListPop {
+            key: "reload-list".to_string(),
+            left: true,
+        },
+    );
+    write(
+        &engine,
+        Command::ZSetRemove {
+            key: "reload-zset".to_string(),
+            member: b"member-0".to_vec(),
+        },
+    );
+    write(
+        &engine,
+        Command::SetRemove {
+            key: "reload-set".to_string(),
+            member: b"member-0".to_vec(),
+        },
+    );
+
+    engine.unload_shard(1);
+    load_on(&engine, OPERATOR_END);
+
+    println!("\n=== after a reload === every pair, cold");
+    let hash_counted = length_answer(
+        &engine,
+        Command::HashLen {
+            key: "reload-hash".to_string(),
+        },
+    );
+    let hash_listed = match read(
+        &engine,
+        Command::HashGetAll {
+            key: "reload-hash".to_string(),
+        },
+    ) {
+        crate::types::CommandResponse::HashEntries { entries } => entries.len(),
+        other => panic!("HashGetAll answered {other:?}"),
+    };
+    assert_count_matches_listing("hash", hash_counted, hash_listed, EXPECTED);
+
+    let list_counted = length_answer(
+        &engine,
+        Command::ListLen {
+            key: "reload-list".to_string(),
+        },
+    );
+    let list_listed = match read(
+        &engine,
+        Command::ListRange {
+            key: "reload-list".to_string(),
+            start: 0,
+            stop: -1,
+        },
+    ) {
+        crate::types::CommandResponse::Members { members } => members.len(),
+        other => panic!("ListRange answered {other:?}"),
+    };
+    assert_count_matches_listing("list", list_counted, list_listed, EXPECTED);
+
+    let zset_counted = length_answer(
+        &engine,
+        Command::ZSetCard {
+            key: "reload-zset".to_string(),
+        },
+    );
+    let zset_returned = match read(
+        &engine,
+        Command::ZSetRange {
+            key: "reload-zset".to_string(),
+            start: 0,
+            stop: -1,
+            rev: false,
+        },
+    ) {
+        crate::types::CommandResponse::Members { members } => members,
+        other => panic!("ZSetRange answered {other:?}"),
+    };
+    assert_eq!(
+        zset_returned.len() % 2,
+        0,
+        "the reloaded listing returned an odd {} interleaved values",
+        zset_returned.len()
+    );
+    assert_count_matches_listing("zset", zset_counted, zset_returned.len() / 2, EXPECTED);
+
+    let set_listed = match read(
+        &engine,
+        Command::SetMembers {
+            key: "reload-set".to_string(),
+        },
+    ) {
+        crate::types::CommandResponse::Members { members } => members.len(),
+        other => panic!("SetMembers answered {other:?}"),
+    };
+    assert_count_matches_listing("set", set_listed as i64, set_listed, EXPECTED);
+}
+
+// =================================================================================================
+// 3. THE GUARD CAN FAIL
+// =================================================================================================
+
+/// THE EQUALITY CHECK GOES RED WHEN THE TWO NUMBERS DIFFER BY ONE.
+///
+/// `assert_count_matches_listing` is the whole module, so a version of it that could not fail would
+/// make every row above decoration. One element is dropped from the listing side -- exactly what a
+/// single refused page would do to `HashGetAll`, which is the failure this module exists to catch --
+/// and the assertion must fire. It is the same function the real rows call, not a copy.
+///
+/// rust-internal: drives the module's own assertion, no engine and no external surface
+#[test]
+#[should_panic(expected = "two answers to one question")]
+fn the_equality_check_fails_when_a_listing_comes_back_short() {
+    assert_count_matches_listing("hash", EXPECTED as i64, EXPECTED - 1, EXPECTED);
+}
+
+/// THE NON-VACUITY FLOOR GOES RED WHEN BOTH SIDES ANSWER ZERO.
+///
+/// Two empty answers satisfy the equality perfectly, and a fixture that quietly wrote nothing
+/// produces them. This is the second half of the guard and it needs its own proof: with a floor of
+/// zero declared, the check must refuse the row rather than report it clean.
+///
+/// rust-internal: drives the module's own assertion, no engine and no external surface
+#[test]
+#[should_panic(expected = "could be satisfied by two empty answers")]
+fn the_equality_check_refuses_a_row_whose_floor_is_zero() {
+    assert_count_matches_listing("hash", 0, 0, 0);
+}
+
+// =================================================================================================
+// THE PRE-CARRY ROUTE, WHICH IS WHERE THE TWO SOURCES PART
+// =================================================================================================
+
+/// THE TWO SOURCES OF A HASH LENGTH, DRIVEN THROUGH THE ROUTE THIS MODULE'S PROSE CALLS DANGEROUS.
+///
+/// # THE HOLE THIS CLOSES, STATED NARROWLY
+///
+/// The header argues that a hash count must not move onto the model map, and the surviving half of
+/// that argument is the delta-fold route: `fold_index_log_deltas` applies a record's page items for
+/// EVERY record but adds container elements only from the `key_states` blobs carrying one of
+/// `CARRIED_CONTAINER_FIELDS`, so a record written before the carry existed leaves the page index an
+/// entry and the container nothing.
+///
+/// That route IS already driven --
+/// `durable_outranks_derived::a_key_state_blob_that_carries_no_elements_leaves_the_container_maps_untouched`
+/// folds exactly an old record's blob. What nothing asserted is the thing this module is for: that a
+/// LENGTH and its LISTING still agree once the route has left the container short. So that is all
+/// this adds.
+///
+/// # WHY COMPARING THE TWO COMMANDS WOULD BE VACUOUS HERE, WHICH IS THE WHOLE DESIGN
+///
+/// `HashLen` and `HashGetAll` BOTH resolve through `bucket_index_component_block_addresses` today.
+/// Counted over all eight `Command::Hash*` arms: four read the bucket index (`HashGet`,
+/// `HashIncrBy`, `HashGetAll`, `HashLen`), one reads the container (`HashMultiGet`), one reads BOTH
+/// (`HashDelete`) and two are writes. So leaving the container short cannot make the two commands
+/// disagree -- they would keep agreeing over any container state at all, and a test that compared
+/// only them would pass this route while asserting nothing about it.
+///
+/// The agreement that decides whether a reader may move is between the two SOURCES. So this reads
+/// four numbers at each stage -- the container's count, the index's count, and both commands -- and
+/// prints all four, because the interesting fact is which of them move together.
+///
+/// # WHAT IT MEASURES, AND WHY THAT IS THE ARGUMENT AGAINST FLIPPING A READER TODAY
+///
+/// Warm, all four agree. With the container left short the way the route leaves it, the commands do
+/// not move -- they are reading the index -- and the container alone is short. **A `HashLen` reading
+/// the container at that moment would under-report**, which is the measurement, not an opinion.
+///
+/// And after an unload and a load all four agree again, because `fill_absent_elements` completes the
+/// durable map FROM the derived view. That is the fact that makes moving a reader a RELOCATION of
+/// the bucket-index dependency from read time to load time rather than a removal of it, and
+/// `durable_outranks_derived::an_element_the_durable_map_does_not_hold_still_comes_back_from_its_name`
+/// is the tripwire that pins the completion itself.
+///
+/// rust-internal: drives the engine's own unload/load cycle and reads shard state, no external
+/// surface
+#[test]
+fn the_two_sources_of_a_hash_length_part_on_the_pre_carry_route_and_a_reload_restores_them() {
+    const KEY: &str = "pre-carry-hash";
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine, OPERATOR_END);
+
+    for m in 0..APPENDED {
+        write(
+            &engine,
+            Command::HashSet {
+                key: KEY.to_string(),
+                field: format!("field-{m}"),
+                value: format!("value-{m}").into_bytes(),
+            },
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // WARM: every one of the four answers is the population.
+    // ---------------------------------------------------------------------------------------------
+    let warm = four_answers(&engine, KEY);
+    warm.print("warm");
+    assert_eq!(
+        APPENDED, warm.container,
+        "VACUITY: the container must hold the {APPENDED} fields the fixture wrote before anything \
+         is taken out of it; it holds {}",
+        warm.container,
+    );
+    warm.assert_all_agree(
+        APPENDED,
+        "warm, before the route has been driven: all four answers must be the population",
+    );
+
+    // ---------------------------------------------------------------------------------------------
+    // THE ROUTE: the container loses an element the page index still holds.
+    //
+    // Done to the container directly, which is the shape the fold leaves behind and the same shape
+    // `an_element_the_durable_map_does_not_hold_still_comes_back_from_its_name` builds. Folding a
+    // real pre-carry record would reach the same state through more moving parts than the property
+    // being checked.
+    // ---------------------------------------------------------------------------------------------
+    {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard is loaded");
+        let fields = shard
+            .hashes
+            .elements_mut_for_test(KEY)
+            .expect("the fixture's hash is in the container");
+        let removed = fields.remove("field-0");
+        assert!(
+            removed.is_some(),
+            "the fixture could not take `field-0` out of the container, so the route below was \
+             never driven and the rest of this test would measure a warm shard"
+        );
+    }
+
+    let parted = four_answers(&engine, KEY);
+    parted.print("container left short, as the route leaves it");
+
+    // THE COMMANDS PART ON THIS ROUTE TOO, now that one of the two readers has moved -- and that is
+    // asserted BELOW rather than here, after the two sources have been pinned, because it is the
+    // distance between the sources that gives each answer its meaning. See the block under
+    // `[sources part]`.
+
+    // AND THE CONTAINER ALONE IS SHORT. This is the measured reason a reader cannot simply move.
+    assert_eq!(
+        APPENDED - 1,
+        parted.container,
+        "the container holds {} rather than {} after one element was taken out of it",
+        parted.container,
+        APPENDED - 1,
+    );
+    assert_eq!(
+        APPENDED, parted.index,
+        "the bucket index holds {} rather than {APPENDED}; the route is supposed to leave the INDEX \
+         untouched and take the element only out of the container",
+        parted.index,
+    );
+    assert_ne!(
+        parted.container, parted.index,
+        "the two sources agree even though an element was taken out of one of them. Then either \
+         the container is being refilled synchronously -- in which case a reader could move today \
+         and this test should say so -- or the removal did not happen. Both are worth knowing."
+    );
+    println!(
+        "  [sources part] container {} vs index {} -- the length reads the CONTAINER under the \
+         gate, so it under-reports by {} for as long as this state stands",
+        parted.container,
+        parted.index,
+        parted.index - parted.container,
+    );
+
+    // AND EACH COMMAND IS PINNED TO THE SOURCE IT READS. This is what the stage above makes
+    // possible: the two sources hold DIFFERENT numbers at this instant, so an answer equal to one
+    // of them and not the other names the structure the command went to. Neither of these is a
+    // self-read -- the expectation is the OTHER source's number, not a stamp taken from the
+    // accessor under test.
+    //
+    // THIS REPLACES THE CLAIM THAT THE COMMANDS DO NOT MOVE. That claim -- "both of them read the
+    // index" -- was true when this test was written, and it is the half of it the reader move
+    // retired. Under `container_index_files_one_entry_a_page`, `HashLen` answers from
+    // `shard.hashes.get(&key).map(|fields| fields.len())`, so on this route it tracks the
+    // container; `HashGetAll` serves the union of the container and the page index and is
+    // untouched, so it tracks the index. The header above predicted this outright -- "a `HashLen`
+    // reading the container at that moment would under-report" -- so the prediction is restated
+    // here as the measurement it became, rather than relaxed into a looser number.
+    //
+    // AND THE MODULE CONTRACT IS NOT WEAKENED BY SAYING SO. `assert_count_matches_listing` holds
+    // wherever the two sources hold the same number, which is every state a request can be served
+    // on: this one exists between `fold_index_log_deltas` and
+    // `reconcile_secondary_views_from_bucket_index`, both inside `load_shard_with` and both before
+    // the shard is installed, which is why the fixture has to reach it by mutating the resident map
+    // directly. The reload stage below is what carries that, and it is load-bearing now rather than
+    // a coda: it is the only thing standing between a moved reader and an under-report for the life
+    // of the shard.
+    assert_eq!(
+        parted.container as i64, parted.length_command,
+        "the length command answered {} with the container holding {} and the index {}. Under the \
+         gate it reads `shard.hashes`, so on this route it must answer the CONTAINER's number -- \
+         the index's number means the gated branch was not taken and this stage is measuring the \
+         engine as it was before the reader moved",
+        parted.length_command, parted.container, parted.index,
+    );
+    // AND THE LISTING MOVED TOO, WHICH THIS ASSERTION WAS WRITTEN TO RULE OUT. It read:
+    //
+    //     assert_eq!(parted.index, parted.listing_command, "... `HashGetAll` serves the union of
+    //     the two and this change does not touch it ...")
+    //
+    // This change DOES touch it. `HashGetAll` was the fourth consumer that had to move before the
+    // element name could come off the entry: its index half read a nameless entry's component
+    // through `unwrap_or_default()` and served every page as a field called `""` whose value was
+    // the raw page FRAME. It skips a nameless entry now, and every hash entry is nameless, so the
+    // index contributes NO names and the listing follows the CONTAINER.
+    //
+    // THE PIN IS NOT WEAKENED BY BOTH COMMANDS READING ONE SOURCE, and that is worth stating
+    // because "both equal the container" sounds like a looser claim than "one each". The two
+    // sources hold DIFFERENT numbers at this instant -- that is what the stage above arranges -- so
+    // an answer equal to the container and NOT equal to the index still names the structure the
+    // command went to. Both halves are asserted rather than only the equality, because the
+    // equality alone would also hold if the two sources had quietly come to agree, and the
+    // `assert_ne!` above is what rules that out for the SOURCES while these rule it out for the
+    // ANSWERS.
+    assert_eq!(
+        parted.container, parted.listing_command,
+        "the listing returned {} elements with the container holding {} and the index {}. \
+         `HashGetAll` answers field names from `shard.hashes` now, so it must answer the \
+         CONTAINER's number; the index's number would mean a nameless entry is being defaulted to \
+         a name again -- the phantom `\"\"` field the collapse had to fix on the read path",
+        parted.listing_command, parted.container, parted.index,
+    );
+    assert_ne!(
+        parted.index, parted.listing_command,
+        "the listing answered the INDEX's number ({}) while the container holds {}, so this stage \
+         is measuring the engine as it was before the reader moved",
+        parted.index, parted.container,
+    );
+
+    // ---------------------------------------------------------------------------------------------
+    // AND A RELOAD NO LONGER PUTS THEM BACK -- INVERTED, AND IT IS THE DESIGNED CONSEQUENCE
+    // ---------------------------------------------------------------------------------------------
+    //
+    // This stage read "AND A RELOAD PUTS THEM BACK, because the completion reads the derived view",
+    // and asserted all four answers back at the population. It also said what a failure here would
+    // mean: "If the container is still short here then the completion does not cover this route,
+    // and a reader moved onto the container would under-report for the life of the shard rather
+    // than until the next load." The container IS still short, and that is not a defect that has
+    // appeared -- it is the whole point of the step this branch landed.
+    //
+    // WHAT CHANGED. The completion rebuilt the durable hash map by walking the page index and
+    // reading each entry's field name. An entry has no field name, so
+    // `rebuild_unserialized_model_maps_from_bucket_index` passes an EMPTY derived view and keeps
+    // only its live-address filter; and `shard.hashes` carries `#[serde(default)]`, so the map is
+    // written to the index snapshot and read back as it was. A reload therefore PRESERVES the
+    // container rather than re-deriving it.
+    //
+    // AND THAT IS WHY THIS IS NOT A LOSS OF COVERAGE. The healing it asserted was the derived view
+    // overwriting the durable one, which is exactly the precedence
+    // `durable_outranks_derived` exists to invert: a derived view that can silently replace the
+    // durable record is the defect, and a reload that healed this fixture would equally have
+    // healed away a real durable element the index had stopped naming. What stands in place of the
+    // healing is `fold_hash_map_completeness`, which compares the durable map against the PAGES'
+    // own payloads -- two artefacts maintained by different paths -- rather than against a view
+    // derived from one of them.
+    //
+    // THE FIXTURE'S SHORT STATE IS ARTIFICIAL, which is why preserving it is safe to assert. It is
+    // reached by mutating the resident map directly, because the state it imitates exists only
+    // between `fold_index_log_deltas` and `reconcile_secondary_views_from_bucket_index`, both
+    // inside `load_shard_with` and both before the shard is installed. No request can be served on
+    // it. What this stage now measures is the PRECEDENCE -- durable over derived -- on a store
+    // where the two provably disagree.
+    engine.unload_shard(1);
+    load_on(&engine, OPERATOR_END);
+
+    let after_reload = four_answers(&engine, KEY);
+    after_reload.print("after an unload and a load");
+    // THE INDEX IS BACK AT THE POPULATION, so the two sources still provably disagree and the
+    // assertions below are not reading an empty store.
+    assert_eq!(
+        APPENDED, after_reload.index,
+        "the bucket index holds {} rather than {APPENDED} after the reload, so the two sources no \
+         longer disagree and nothing below distinguishes durable from derived",
+        after_reload.index,
+    );
+    assert_eq!(
+        parted.container, after_reload.container,
+        "the container holds {} after the reload where it held {} before it. It is durable \
+         (`#[serde(default)]`) and nothing derives a field name from an entry any more, so a \
+         reload must PRESERVE it. A number equal to the index ({}) would mean the derived view \
+         overwrote the durable record -- the precedence `durable_outranks_derived` inverts",
+        after_reload.container, parted.container, after_reload.index,
+    );
+    // AND BOTH COMMANDS STILL AGREE WITH EACH OTHER, which is this module's standing contract and
+    // the half a changed precedence must not break.
+    after_reload.assert_commands_agree(
+        "after a reload, with the container short and the index whole: the two commands read the \
+         same source, so they must still answer the same number as each other even where that \
+         number is not the population",
+    );
+    assert_eq!(
+        after_reload.container as i64, after_reload.length_command,
+        "the length answered {} with the container holding {} after the reload, so it is no longer \
+         reading the container",
+        after_reload.length_command, after_reload.container,
+    );
+    println!(
+        "  [sources stay parted] the reload preserved the container at {} against an index of {}, \
+         so the durable map outranks the derived view across a load rather than being rebuilt from \
+         it",
+        after_reload.container, after_reload.index
+    );
+}
+
+/// The four numbers that answer "how many elements does this hash hold", read at one instant.
+struct FourAnswers {
+    container: usize,
+    index: usize,
+    length_command: i64,
+    listing_command: usize,
+}
+
+impl FourAnswers {
+    fn print(&self, stage: &str) {
+        println!(
+            "  {:<44} container {:>3}  index {:>3}  HLEN {:>3}  listing {:>3}",
+            stage, self.container, self.index, self.length_command, self.listing_command
+        );
+    }
+
+    fn assert_commands_agree(&self, why: &str) {
+        assert_eq!(
+            self.length_command, self.listing_command as i64,
+            "the length answered {} and the listing returned {} elements. {why}",
+            self.length_command, self.listing_command,
+        );
+    }
+
+    fn assert_all_agree(&self, population: usize, why: &str) {
+        self.assert_commands_agree(why);
+        assert_eq!(
+            population, self.container,
+            "the container holds {} rather than {population}. {why}",
+            self.container,
+        );
+        assert_eq!(
+            population, self.index,
+            "the bucket index holds {} rather than {population}. {why}",
+            self.index,
+        );
+        assert_eq!(
+            population as i64, self.length_command,
+            "the length command answered {} rather than {population}. {why}",
+            self.length_command,
+        );
+    }
+}
+
+/// Read all four at once, so a stage cannot compare numbers taken at different moments.
+fn four_answers(engine: &TemporalEngine, key: &str) -> FourAnswers {
+    let (container, index) = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let container = shard.hashes.get(key).map(|fields| fields.len()).unwrap_or(0);
+        let index = super::bucket_index_component_block_addresses(shard, "hash", key).len();
+        (container, index)
+    };
+    let length_command = length_answer(
+        engine,
+        Command::HashLen {
+            key: key.to_string(),
+        },
+    );
+    let listing_command = match read(
+        engine,
+        Command::HashGetAll {
+            key: key.to_string(),
+        },
+    ) {
+        crate::types::CommandResponse::HashEntries { entries } => entries.len(),
+        other => panic!("HashGetAll answered {other:?} rather than hash entries"),
+    };
+    FourAnswers {
+        container,
+        index,
+        length_command,
+        listing_command,
+    }
+}
