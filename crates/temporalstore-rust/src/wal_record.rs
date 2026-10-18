@@ -254,3 +254,260 @@ mod tests {
             version: WAL_RECORD_VERSION,
             sequence: 9,
             items: vec![block_item(1, b"payload that will be cut short")],
+        };
+        let framed = encode_framed(&record);
+        let truncated = &framed[..framed.len() - 5];
+        assert!(decode_framed_at::<WalRecord>(truncated, 0).is_err());
+    }
+
+    #[test]
+    fn varint_lengths_round_trip_across_byte_boundaries() {
+        // The header is varint-length-prefixed, so a record straddling 127/128 bytes (and each
+        // later boundary) must still frame and re-parse exactly.
+        for payload_len in [0_usize, 1, 126, 127, 128, 129, 16_383, 16_384] {
+            let record = WalRecord {
+                version: WAL_RECORD_VERSION,
+                sequence: 1,
+                items: vec![block_item(1, &vec![b'x'; payload_len])],
+            };
+            let framed = encode_framed(&record);
+            let (decoded, next_offset): (WalRecord, usize) = decode_framed_at(&framed, 0).unwrap();
+            assert_eq!(decoded.items[0].block.len(), payload_len);
+            assert_eq!(next_offset, framed.len(), "payload_len {payload_len}");
+        }
+    }
+
+    #[test]
+    fn block_address_carries_the_log_id() {
+        let item = block_item(11, b"bytes");
+        let address = block_address_from_item(4096, 512, &item).expect("a log id that fits");
+        assert!(is_wal_resident(address.block_slab_id()));
+        assert_eq!(address.offset(), 4096, "the address IS the log id");
+        assert_eq!(address.length(), 512);
+        // The item's routing bucket of 11 is NOT stamped onto the address: the item is the
+        // container that holds it, and every reader of this address reaches it through that item.
+        assert_eq!(item.routing_bucket, 11, "the item still carries the bucket");
+        assert_eq!(address.block_id(), Some(7));
+        // The object id is not stamped onto the address either, for the same reason as the bucket:
+        // the item is the container that carries it, and a reader derives it from the item's terms.
+        assert_eq!(address.generation(), Some(7), "the generation is the block id");
+    }
+
+    /// A LOG ID PAST THE ADDRESS WORD IS REFUSED, AND A LOG ID IS THE ONE OFFSET NOTHING CAPS.
+    ///
+    /// The slab target is capped so a slab offset fits in 32 bits. A log id is a position
+    /// measured from a reclaim base that only grows, so it passes 4 GiB on any store that has
+    /// written 4 GiB of log -- there is no knob to cap and nothing to clamp to. The conversion
+    /// therefore refuses, and this feeds it one past the boundary with the boundary itself as
+    /// the control.
+    #[test]
+    fn a_log_id_past_the_address_word_is_refused() {
+        let item = block_item(11, b"bytes");
+        let ceiling = crate::block_store::MAX_ADDRESSABLE_BLOCK_OFFSET;
+        assert!(
+            block_address_from_item(ceiling, 512, &item).is_ok(),
+            "the largest addressable log id must still convert, or this is not a boundary"
+        );
+        let refused = block_address_from_item(ceiling + 1, 512, &item)
+            .expect_err("a log id past the address word must be refused");
+        assert_eq!(refused.offset, ceiling + 1);
+        assert_eq!(
+            (ceiling + 1) as u32,
+            0,
+            "this log id does not truncate to a plausible offset, so it does not demonstrate \
+             what the refusal prevents"
+        );
+    }
+
+    #[test]
+    fn field_numbers_match_the_on_disk_log_item_layout() {
+        // Wire compatibility is the point of porting the field numbers, so assert on the
+        // encoding rather than trusting the attributes. routing_bucket is field 1, varint:
+        // key byte = (1 << 3) | 0 = 0x08.
+        let item = WalItem {
+            routing_bucket: 5,
+            ..Default::default()
+        };
+        assert_eq!(item.encode_to_vec(), vec![0x08, 0x05]);
+
+        // block is field 13, length-delimited: key byte = (13 << 3) | 2 = 0x6a.
+        let with_block = WalItem {
+            block: b"ab".to_vec(),
+            ..Default::default()
+        };
+        assert_eq!(with_block.encode_to_vec(), vec![0x6a, 0x02, b'a', b'b']);
+    }
+
+    /// What a write costs in the TEXT FALLBACK, against the binary record.
+    ///
+    /// This is not the headroom still available: `binary_records_enabled` and
+    /// `binary_frame_enabled` both default ON, so the text side here is the fallback the log
+    /// takes only when a flag turns it off. `what_a_record_actually_costs_on_disk` in `wal`
+    /// measures the real path and comes in BELOW the binary column below.
+    ///
+    /// This comparison used to be labelled "today", which overstated the remaining saving by
+    /// about two-fold -- the exact error the note here warned about, committed by the note. What
+    /// it is good for is what the fallback costs if anyone reaches for it.
+    #[test]
+    fn what_is_left_to_gain_from_a_binary_record() {
+        use crate::types::Command;
+        use crate::wal::{WriteAheadLogRecord, WriteAheadLogRecordMetadata};
+
+        for value_len in [64usize, 128, 1024, 4096] {
+            let value = vec![118u8; value_len];
+            let key = "scale-key-000000000";
+
+            // Exactly what the log writes: the real record, serialized and framed the same way.
+            let record = WriteAheadLogRecord {
+                shard_id: 1,
+                sequence: 1,
+                command: Some(Command::StringSet {
+                    key: key.to_string(),
+                    value: value.clone(),
+                }),
+                metadata: Some(WriteAheadLogRecordMetadata {
+                    version: crate::wal::WRITE_AHEAD_LOG_FORMAT_VERSION,
+                    timestamp_ms: 1_787_270_070_192,
+                    items: Vec::new(),
+                    batch_id: None,
+                    batch_size: None,
+                    batch_index: None,
+                }),
+                staged_blocks: Vec::new(),
+                outcomes: Vec::new(),
+            };
+            let today = crate::log_framing::encode_line(&serde_json::to_vec(&record).unwrap());
+
+            // The binary shape, carrying the same write.
+            let binary_record = WalRecord {
+                version: WAL_RECORD_VERSION,
+                sequence: 1,
+                items: vec![WalItem {
+                    routing_bucket: 8539,
+                    object_key: key.as_bytes().to_vec(),
+                    model_id: 1,
+                    key: key.as_bytes().to_vec(),
+                    value: value.clone(),
+                    timestamp_ms: 1_787_270_070_192,
+                    ..Default::default()
+                }],
+            };
+            let binary = encode_framed(&binary_record);
+
+            println!(
+                "  value {value_len:>5}B -> today {:>6}B ({:>5.2}x)   binary {:>6}B ({:>5.2}x)   {:.2}x left to gain",
+                today.len(),
+                today.len() as f64 / value_len as f64,
+                binary.len(),
+                binary.len() as f64 / value_len as f64,
+                today.len() as f64 / binary.len() as f64
+            );
+
+            assert!(
+                binary.len() < today.len(),
+                "the binary form should still be the smaller of the two at {value_len}B"
+            );
+        }
+    }
+
+    /// What it would cost to carry a payload as bytes rather than as base64.
+    ///
+    /// Base64 is a flat third whatever the bytes are. Escaping just the newline and the escape byte
+    /// costs whatever those two bytes weigh in the data -- near nothing for most payloads, and worse
+    /// than base64 only for data that is mostly newlines. Measured across shapes, including one
+    /// picked to be hostile.
+    #[test]
+    fn what_carrying_a_payload_as_bytes_would_cost() {
+        // Escape 0x0A so the payload can never contain a newline, and 0x1B so the escape is
+        // reversible. Everything else is carried as itself.
+        fn stuffed_len(bytes: &[u8]) -> usize {
+            bytes
+                .iter()
+                .map(|byte| if *byte == b'\n' || *byte == 0x1b { 2 } else { 1 })
+                .sum()
+        }
+        fn base64_len(len: usize) -> usize {
+            len.div_ceil(3) * 4
+        }
+
+        // A cheap deterministic spread of byte values, so the measurement does not depend on a
+        // random seed and does not flatter itself with a single repeated byte.
+        let spread = |len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|index| ((index * 97 + index / 251 * 13) % 256) as u8)
+                .collect()
+        };
+        let text = |len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|index| if index % 64 == 63 { b'\n' } else { b'a' + (index % 26) as u8 })
+                .collect()
+        };
+        let hostile = |len: usize| -> Vec<u8> { vec![b'\n'; len] };
+
+        for (name, make) in [
+            ("every byte value", &spread as &dyn Fn(usize) -> Vec<u8>),
+            ("text, a newline every 64", &text),
+            ("nothing but newlines", &hostile),
+        ] {
+            for len in [1024usize, 4096] {
+                let bytes = make(len);
+                let encoded = base64_len(len);
+                let stuffed = stuffed_len(&bytes);
+                println!(
+                    "  {name:<26} {len:>5}B: base64 {encoded:>6}B ({:.3}x)   as bytes {stuffed:>6}B ({:.3}x)   {:.2}x smaller",
+                    encoded as f64 / len as f64,
+                    stuffed as f64 / len as f64,
+                    encoded as f64 / stuffed as f64
+                );
+            }
+        }
+    }
+
+    /// Where a record's bytes go IN THE TEXT FALLBACK, and what carrying the value raw leaves.
+    ///
+    /// A JSON document cannot hold bytes, so the value is base64 -- a flat third on top, whatever
+    /// it is. At four kilobytes that dwarfs everything else in the record.
+    ///
+    /// The ~122-byte envelope this reports is the fallback's, not the default path's: measured
+    /// through the store at the defaults, the envelope is about 49 bytes.
+    #[test]
+    fn where_a_records_bytes_are_now() {
+        use crate::types::Command;
+        use crate::wal::{WriteAheadLogRecord, WriteAheadLogRecordMetadata};
+
+        for value_len in [64usize, 256, 1024, 4096, 16384] {
+            let record = WriteAheadLogRecord {
+                shard_id: 1,
+                sequence: 1,
+                command: Some(Command::StringSet {
+                    key: "scale-key-000000000".to_string(),
+                    value: vec![118u8; value_len],
+                }),
+                metadata: Some(WriteAheadLogRecordMetadata {
+                    version: crate::wal::WRITE_AHEAD_LOG_FORMAT_VERSION,
+                    timestamp_ms: 1_787_270_070_192,
+                    items: Vec::new(),
+                    batch_id: None,
+                    batch_size: None,
+                    batch_index: None,
+                }),
+                staged_blocks: Vec::new(),
+                outcomes: Vec::new(),
+            };
+            let framed = crate::log_framing::encode_line(&serde_json::to_vec(&record).unwrap());
+            // base64 of n bytes is 4 characters per 3, rounded up to a multiple of 4.
+            let encoded_value = value_len.div_ceil(3) * 4;
+            let envelope = framed.len() - encoded_value;
+            let if_raw = envelope + value_len;
+            println!(
+                "  value {value_len:>6}B: record {:>7}B = envelope {:>4}B + payload {:>7}B ({:.2}x) \
+                 -> carrying it raw would be {if_raw:>7}B ({:.2}x)",
+                framed.len(),
+                envelope,
+                encoded_value,
+                framed.len() as f64 / value_len as f64,
+                if_raw as f64 / value_len as f64
+            );
+        }
+    }
+}
