@@ -56,3 +56,119 @@ fn the_cached_payload_survives_its_codec_at_either_byte_distribution() {
         let encoded = encode_cached_response(&response).expect("the response encodes");
         let decoded = decode_cached_response(&encoded).expect("the response decodes");
         // THROUGH THE REAL PAIR, so the `CachedBytes` mirror is in the path. A mirror left without
+        // the annotation decodes a shape the encoder never wrote, and this is what catches it.
+        match decoded {
+            CommandResponse::Bytes { value: Some(bytes) } => assert_eq!(
+                bytes, payload,
+                "{label}: the payload did not survive encode-then-decode"
+            ),
+            other => panic!("{label}: decoded to {other:?} instead of a byte payload"),
+        }
+    }
+
+    // ---- AND `None` IS STILL `None`, not an empty payload. The two are different answers and the
+    // ---- option codec is hand-written, so this is exactly where they could be collapsed.
+    let absent = CommandResponse::Bytes { value: None };
+    let encoded = encode_cached_response(&absent).expect("the absent response encodes");
+    match decode_cached_response(&encoded).expect("the absent response decodes") {
+        CommandResponse::Bytes { value: None } => {}
+        other => panic!("an absent payload decoded as {other:?}, so absence became a value"),
+    }
+}
+
+#[test]
+fn the_encoded_payload_no_longer_depends_on_how_high_its_bytes_are() {
+    const LEN: usize = 1_024;
+    let low = encode_cached_response(&CommandResponse::Bytes { value: Some(vec![b'v'; LEN]) })
+        .expect("encodes");
+    let high = encode_cached_response(&CommandResponse::Bytes { value: Some(vec![0xFF; LEN]) })
+        .expect("encodes");
+    let uniform = encode_cached_response(&CommandResponse::Bytes {
+        value: Some(uniform_bytes(LEN)),
+    })
+    .expect("encodes");
+
+    println!();
+    println!("  encoded bytes for a {LEN} B payload, by byte distribution:");
+    println!("    all low (0x76)   {:>6}", low.len());
+    println!("    uniform          {:>6}", uniform.len());
+    println!("    all high (0xFF)  {:>6}", high.len());
+    println!(
+        "    the old integer-array encoding would have charged {} for all-high",
+        2 * LEN
+    );
+    println!();
+
+    // THE DISTRIBUTION STOPPED MATTERING, which is the property -- compared against each other
+    // rather than against a magic constant, because the envelope's own size is not the subject.
+    assert_eq!(
+        low.len(),
+        high.len(),
+        "a payload of 0x76 encoded to {} B and one of 0xFF to {} B. The byte string form charges \
+         by length alone, so these must agree -- if they differ, the payload is still being \
+         written element by element",
+        low.len(),
+        high.len()
+    );
+    assert_eq!(
+        low.len(),
+        uniform.len(),
+        "a uniform payload encoded to {} B against {} B for an all-low one, so the encoding still \
+         depends on the byte distribution",
+        uniform.len(),
+        low.len()
+    );
+
+    // AND IT IS THE PAYLOAD PLUS A SMALL CONSTANT, not a multiple of it. 64 B of slack covers the
+    // msgpack map, the variant tag and the length prefix without admitting a second copy.
+    assert!(
+        high.len() >= LEN && high.len() < LEN + 64,
+        "a {LEN} B payload encoded to {} B. It should be the payload plus a small envelope; a \
+         figure near {} means the integer-array encoding is still in use",
+        high.len(),
+        2 * LEN
+    );
+}
+
+#[test]
+fn the_old_integer_array_spelling_still_decodes() {
+    // THE POSITIVE CONTROL. This mirror has NO annotation on its payload, so the derive writes
+    // exactly what the cache held before this change: a msgpack array of integers. The visitor
+    // claims to accept that spelling, and a compatibility path nobody exercises is a claim that
+    // quietly stops being true.
+    #[derive(serde::Serialize)]
+    struct OldStyleBytes {
+        kind: &'static str,
+        value: Option<Vec<u8>>,
+    }
+
+    let payload = uniform_bytes(512);
+    let old = {
+        let mut packed = Vec::new();
+        let mut serializer = rmp_serde::Serializer::new(&mut packed).with_struct_map();
+        serde::Serialize::serialize(
+            &OldStyleBytes { kind: "bytes", value: Some(payload.clone()) },
+            &mut serializer,
+        )
+        .expect("the old spelling serializes");
+        packed
+    };
+
+    // The control has to BE the old spelling, or it proves nothing: an array of integers is longer
+    // than the payload once about half the bytes are at or above 0x80.
+    assert!(
+        old.len() > payload.len() + payload.len() / 4,
+        "the control encoded {} B for a {} B payload, which is too small to be an integer array -- \
+         it is not exercising the old spelling and so cannot show that the old spelling decodes",
+        old.len(),
+        payload.len()
+    );
+
+    match decode_cached_response(&old).expect("the old spelling decodes") {
+        CommandResponse::Bytes { value: Some(bytes) } => assert_eq!(
+            bytes, payload,
+            "the old integer-array spelling decoded to different bytes"
+        ),
+        other => panic!("the old spelling decoded as {other:?}"),
+    }
+}
