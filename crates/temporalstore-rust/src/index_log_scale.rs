@@ -1007,3 +1007,1012 @@ fn bytes_read_now() -> Option<u64> {
 }
 
 /// What one replay-shaped fold of a whole log cost, at a given base anchor.
+struct ReplayCost {
+    /// Records in the log, from the fixture.
+    records: usize,
+    /// Pieces the log is in, the one being written included.
+    pieces: usize,
+    /// Sealed pieces the fold declined to open, from their names.
+    declined: u64,
+    /// Frames the fold read off disk.
+    frames_read: u64,
+    /// Records the load path's own test would APPLY out of what the fold handed back.
+    applied: usize,
+    /// Bytes of the pieces the fold actually opened -- the ATTRIBUTED row.
+    attributed_bytes: u64,
+    /// Bytes the kernel says this process read across the whole fold -- the INDEPENDENT total.
+    total_bytes_read: u64,
+}
+
+impl ReplayCost {
+    /// The independent total minus the rows attributed to it. Fixed overhead divides away when
+    /// this is taken per record at two corpus sizes; genuine drift climbs.
+    fn residual_bytes(&self) -> i64 {
+        self.total_bytes_read as i64 - self.attributed_bytes as i64
+    }
+    fn residual_per_record(&self) -> f64 {
+        self.residual_bytes() as f64 / self.records as f64
+    }
+}
+
+/// Fold a log the way the load path does, counting what it cost.
+///
+/// `decline` chooses between the two shapes: the base anchor as the load path now passes it, or
+/// 0, which declines nothing and is what the walk did before. Everything else is identical, so
+/// the difference between two of these is the decline and nothing else.
+fn replay_cost(
+    dir: &std::path::Path,
+    shard_id: ShardId,
+    records: usize,
+    base_anchor: u64,
+    decline: bool,
+) -> ReplayCost {
+    let store = LocalIndexLogStore::new(dir);
+    let passed_anchor = if decline { base_anchor } else { 0 };
+
+    // The ATTRIBUTED row, computed before the fold from the same predicate the fold uses. The
+    // piece being written has no sealed name, so it is always counted as opened.
+    let mut attributed_bytes = 0u64;
+    let mut pieces = 0usize;
+    for path in index_log_segment_paths(dir, shard_id) {
+        let Ok(metadata) = path.metadata() else {
+            continue;
+        };
+        pieces += 1;
+        let declinable = sealed_index_log_span(&path, shard_id)
+            .is_some_and(|span| decline && piece_is_reflected_by(span, passed_anchor));
+        if !declinable {
+            attributed_bytes = attributed_bytes.saturating_add(metadata.len());
+        }
+    }
+
+    probe::reset();
+    let before = bytes_read_now().expect("APPARATUS: /proc/self/io carries no rchar line");
+    let mut applied = 0usize;
+    store
+        .for_each_delta_record_above_anchor(shard_id, 0, passed_anchor, |record| {
+            // The load path's own test, verbatim from `fold_index_log_deltas`.
+            let record_anchor = record.applied_wal_sequence.unwrap_or(0);
+            if !(base_anchor > 0 && record_anchor <= base_anchor) {
+                applied += 1;
+            }
+        })
+        .unwrap();
+    let after = bytes_read_now().expect("APPARATUS: /proc/self/io carries no rchar line");
+
+    ReplayCost {
+        records,
+        pieces,
+        declined: probe::fold_pieces_declined(),
+        frames_read: probe::fold_frames_read(),
+        applied,
+        attributed_bytes,
+        total_bytes_read: after.saturating_sub(before),
+    }
+}
+
+/// Build a log of `records` anchored deltas whose anchors CLIMB one per record.
+fn climbing_anchor_phase(dir: &std::path::Path, shard_id: ShardId, records: usize) {
+    let store = LocalIndexLogStore::new(dir);
+    for value in 0..records {
+        store
+            .append_delta(
+                shard_id,
+                vec![small_item(
+                    (value % 64) as u32,
+                    // ZERO-PADDED to eight digits at both corpus sizes, so the only field that
+                    // differs between the two fixtures is the one being varied. See
+                    // `append_phase`.
+                    &format!("tenant/1/object/{value:08}"),
+                )],
+                Vec::new(),
+                Some(value as u64 + 1),
+                None,
+                false,
+                false,
+            )
+            .unwrap();
+    }
+}
+
+/// WHAT AN INDEX-LOG REPLAY READS, AT TWO CORPUS SIZES, AND WHETHER IT IS SUPERLINEAR.
+///
+/// IT IS NOT SUPERLINEAR. Ten times the records reads exactly ten times the frames -- the fold is
+/// LINEAR in the records the log holds, and the piece count is not a second multiplier on it.
+/// That is worth stating plainly, because the write-ahead log's replay, the same shape of walk in
+/// the same store, IS superlinear: 4.01x the bytes there gave 12.45x the `statx`. This one is
+/// not, and no fix should be sold as if it were.
+///
+/// WHAT IS WRONG WITH IT IS A DIFFERENT SHAPE. The cost is linear in the WHOLE LOG while the work
+/// is linear in the SUFFIX THE BASE DOES NOT REFLECT. Whether those two come apart depends
+/// entirely on the regime, and BOTH ARE MEASURED HERE because one of them hides the defect
+/// exactly:
+///
+/// - PROPORTIONAL SUFFIX -- the base reflects a fixed FRACTION of the log. Then the applied count
+///   grows with the corpus too, the cost per applied record is flat, and there is nothing to see.
+///   This arm is the control, and it is here because it is the arm a careless fixture picks.
+/// - FIXED SUFFIX -- the base fails to reflect a fixed NUMBER of records, whatever the log holds.
+///   This is the regime a running store is in: a store dumps on a cadence, so what its base does
+///   not yet reflect is bounded by the time since the last dump, not by how large the log has
+///   grown behind it. Here the cost per applied record climbs with the corpus, and that climb IS
+///   the defect.
+///
+/// The decline puts the cost back on the suffix. In both regimes the applied counts are asserted
+/// EQUAL between the two fold shapes FIRST: a cheaper fold that applied fewer records would be a
+/// data loss, and it would satisfy every cost assertion below.
+#[test]
+fn what_an_index_log_replay_reads_at_two_corpus_sizes() {
+    // 8 KiB rather than the 64 KiB default, for the same reason
+    // `the_gate_reads_piece_names_not_every_record` uses it: the decision under measurement is
+    // PER PIECE, and at the default the small fixture is only three pieces -- a granularity at
+    // which "declined a strict subset" says almost nothing. The rolling threshold is a
+    // deployment knob, not part of the claim; what is being measured is how the cost moves with
+    // the corpus at a fixed one.
+    let _rolling = roll_at(8 * 1024);
+    const SMALL: usize = 2_000;
+    const LARGE: usize = 20_000;
+    /// Records the base does NOT reflect, the SAME NUMBER at both corpus sizes.
+    const FIXED_SUFFIX: usize = 200;
+
+    let small_dir = tempfile::tempdir().unwrap();
+    let large_dir = tempfile::tempdir().unwrap();
+    climbing_anchor_phase(small_dir.path(), 21, SMALL);
+    climbing_anchor_phase(large_dir.path(), 21, LARGE);
+
+    // Anchors climb one per record, so an anchor of N leaves exactly `records - N` records above
+    // the base.
+    let fixed = |records: usize| (records - FIXED_SUFFIX) as u64;
+    let tenth = |records: usize| (records * 9 / 10) as u64;
+
+    let small_open = replay_cost(small_dir.path(), 21, SMALL, fixed(SMALL), false);
+    let large_open = replay_cost(large_dir.path(), 21, LARGE, fixed(LARGE), false);
+    let small_decline = replay_cost(small_dir.path(), 21, SMALL, fixed(SMALL), true);
+    let large_decline = replay_cost(large_dir.path(), 21, LARGE, fixed(LARGE), true);
+    let small_tenth = replay_cost(small_dir.path(), 21, SMALL, tenth(SMALL), false);
+    let large_tenth = replay_cost(large_dir.path(), 21, LARGE, tenth(LARGE), false);
+
+    // THE DENOMINATORS, BEFORE ANY RATIO. Each fixture must be in several pieces, or a per-piece
+    // decision is not being measured; the large one must be in materially more, or the two arms
+    // differ in records without differing in the quantity the decision is made over; and the two
+    // corpora must differ tenfold.
+    assert!(
+        small_open.pieces >= 10 && large_open.pieces >= 100,
+        "fixtures rolled into {} and {} pieces -- too few to measure a per-piece decision",
+        small_open.pieces,
+        large_open.pieces
+    );
+    assert!(
+        large_open.pieces >= small_open.pieces * 5,
+        "the large fixture is in {} pieces against the small one's {} -- not a corpus difference \
+         the per-piece decision can see",
+        large_open.pieces,
+        small_open.pieces
+    );
+    assert_eq!(small_open.records * 10, large_open.records);
+    assert!(
+        small_open.frames_read > 0 && large_open.frames_read > 0,
+        "APPARATUS: a fold read no frame at all"
+    );
+
+    let per_applied = |cost: &ReplayCost| cost.frames_read as f64 / cost.applied as f64;
+    println!(
+        "index-log replay at two corpus sizes ({} and {} pieces):\n\
+         \x20 FIXED SUFFIX of {FIXED_SUFFIX} records (the regime a running store is in)\n\
+         \x20   opening every piece: {SMALL:>6} = {:>6} frames / {:>4} applied / {:>3} of {:>3} \
+         declined  ->  {LARGE:>6} = {:>6} frames / {:>4} applied / {:>3} of {:>3} declined   \
+         ({:.2}x frames, {:.2}x applied, {:.2} -> {:.2} frames per applied record)\n\
+         \x20   declining by name : {SMALL:>6} = {:>6} frames / {:>4} applied / {:>3} of {:>3} \
+         declined  ->  {LARGE:>6} = {:>6} frames / {:>4} applied / {:>3} of {:>3} declined   \
+         ({:.2}x frames, {:.2}x applied, {:.2} -> {:.2} frames per applied record)\n\
+         \x20 PROPORTIONAL SUFFIX of one record in ten (the control -- the regime that HIDES it)\n\
+         \x20   opening every piece: {SMALL:>6} = {:>6} frames / {:>4} applied  ->  {LARGE:>6} = \
+         {:>6} frames / {:>4} applied   ({:.2} -> {:.2} frames per applied record)",
+        small_open.pieces,
+        large_open.pieces,
+        small_open.frames_read,
+        small_open.applied,
+        small_open.declined,
+        small_open.pieces,
+        large_open.frames_read,
+        large_open.applied,
+        large_open.declined,
+        large_open.pieces,
+        large_open.frames_read as f64 / small_open.frames_read as f64,
+        large_open.applied as f64 / small_open.applied as f64,
+        per_applied(&small_open),
+        per_applied(&large_open),
+        small_decline.frames_read,
+        small_decline.applied,
+        small_decline.declined,
+        small_decline.pieces,
+        large_decline.frames_read,
+        large_decline.applied,
+        large_decline.declined,
+        large_decline.pieces,
+        large_decline.frames_read as f64 / small_decline.frames_read as f64,
+        large_decline.applied as f64 / small_decline.applied as f64,
+        per_applied(&small_decline),
+        per_applied(&large_decline),
+        small_tenth.frames_read,
+        small_tenth.applied,
+        large_tenth.frames_read,
+        large_tenth.applied,
+        per_applied(&small_tenth),
+        per_applied(&large_tenth),
+    );
+
+    // HALF ONE, AND IT COMES FIRST BECAUSE IT IS THE SAFETY CLAIM: the decline applies exactly
+    // the same records at both sizes. A cheaper fold that applied fewer would be a loss, not a
+    // win, and it would satisfy every cost assertion below.
+    assert_eq!(
+        small_decline.applied, small_open.applied,
+        "declining changed what the small fold applies: {} against {}",
+        small_decline.applied, small_open.applied
+    );
+    assert_eq!(
+        large_decline.applied, large_open.applied,
+        "declining changed what the large fold applies: {} against {}",
+        large_decline.applied, large_open.applied
+    );
+    assert_eq!(
+        small_open.applied, FIXED_SUFFIX,
+        "the small fold applied {} records, expected the {FIXED_SUFFIX} above the base",
+        small_open.applied
+    );
+    assert_eq!(
+        large_open.applied, FIXED_SUFFIX,
+        "the large fold applied {} records, expected the SAME {FIXED_SUFFIX} the small one did \
+         -- the suffix is what has to be held fixed for the ratio below to mean anything",
+        large_open.applied
+    );
+
+    // HALF TWO: REPLAY IS LINEAR, NOT SUPERLINEAR. Ten times the records, exactly ten times the
+    // frames. An equality rather than a bound, because a count repeats.
+    assert_eq!(
+        large_open.frames_read,
+        small_open.frames_read * 10,
+        "10x the records read {} frames against 10x {} -- replay is not linear in records",
+        large_open.frames_read,
+        small_open.frames_read
+    );
+
+    // HALF THREE: what DOES grow is the cost per record applied, and that is the defect. Ten
+    // times the corpus, the same work, ten times the reading.
+    assert!(
+        per_applied(&large_open) >= per_applied(&small_open) * 9.0,
+        "frames per applied record did not grow with the corpus: {:.2} at {SMALL} against {:.2} \
+         at {LARGE}",
+        per_applied(&small_open),
+        per_applied(&large_open)
+    );
+
+    // HALF FOUR, THE CONTROL, AND IT IS WHY THE REGIME IS NAMED: at a suffix that grows WITH the
+    // corpus the same fold is flat per applied record. The defect is invisible in that fixture,
+    // and a measurement taken there would have reported no cost at all.
+    assert!(
+        (per_applied(&large_tenth) - per_applied(&small_tenth)).abs() < 0.01,
+        "CONTROL: the proportional-suffix arm was expected to be flat per applied record and is \
+         not: {:.4} at {SMALL} against {:.4} at {LARGE}",
+        per_applied(&small_tenth),
+        per_applied(&large_tenth)
+    );
+
+    // HALF FIVE: the decline takes the fixed-suffix cost back to flat -- within a factor of two
+    // across a tenfold corpus, where opening every piece was a factor of ten.
+    assert!(
+        per_applied(&large_decline) < per_applied(&small_decline) * 2.0,
+        "declining did not make the cost flat per applied record: {:.2} at {SMALL} against {:.2} \
+         at {LARGE}",
+        per_applied(&small_decline),
+        per_applied(&large_decline)
+    );
+    assert!(
+        large_decline.declined > 0 && (large_decline.declined as usize) < large_decline.pieces,
+        "expected a strict subset of {} pieces to be declined, got {}",
+        large_decline.pieces,
+        large_decline.declined
+    );
+
+    // HALF SIX: THE RESIDUAL, from a total this file does not maintain.
+    //
+    // `rchar` is the kernel's count of bytes this process read across the whole fold; the
+    // attributed row is the bytes of the pieces the fold opened, computed from the piece names
+    // BEFORE the fold ran. What is left over is the fold's unattributed reading -- the two
+    // `/proc/self/io` samples themselves and anything else that touches a file -- and it must
+    // not grow with the corpus. Taken PER RECORD, so a fixed overhead divides away and genuine
+    // drift climbs.
+    assert!(
+        small_decline.attributed_bytes > 0 && large_decline.attributed_bytes > 0,
+        "APPARATUS: nothing was attributed -- the fold opened no piece"
+    );
+    assert!(
+        small_decline.total_bytes_read > 0 && large_decline.total_bytes_read > 0,
+        "APPARATUS: the kernel reported no bytes read at all across a fold"
+    );
+    println!(
+        "  residual (kernel rchar total minus the bytes of the pieces the fold opened): \
+         small = {} - {} = {} ({:.4} a record) | large = {} - {} = {} ({:.4} a record)",
+        small_decline.total_bytes_read,
+        small_decline.attributed_bytes,
+        small_decline.residual_bytes(),
+        small_decline.residual_per_record(),
+        large_decline.total_bytes_read,
+        large_decline.attributed_bytes,
+        large_decline.residual_bytes(),
+        large_decline.residual_per_record(),
+    );
+    assert!(
+        large_decline.residual_per_record() <= small_decline.residual_per_record().abs() + 1.0,
+        "the unattributed bytes per record CLIMBED with the corpus: {:.4} at {SMALL} against \
+         {:.4} at {LARGE} -- something reads the log that these rows do not account for",
+        small_decline.residual_per_record(),
+        large_decline.residual_per_record(),
+    );
+}
+
+/// REACHABILITY: the piece-level decline is on the load path, measured rather than argued.
+///
+/// `fold_index_log_deltas` is the only production caller of
+/// `for_each_delta_record_above_anchor`, and this asserts that reaching the load path through
+/// `LocalIndexLogStore` alone is not what exercises it -- the counter has to move from a call
+/// that goes through the engine's fold.
+///
+/// The probe is FLOORED: the test fails if the instrument produced no output at all, because a
+/// reachability run that reads zero everywhere reads exactly like a reachability run whose
+/// apparatus never spoke. Print with `--nocapture` to see the rows.
+#[test]
+fn the_load_path_fold_is_the_one_that_declines() {
+    let _rolling = roll_at(DEFAULT_INDEX_LOG_SEGMENT_BYTES);
+    const RECORDS: usize = 4_000;
+    let dir = tempfile::tempdir().unwrap();
+    climbing_anchor_phase(dir.path(), 22, RECORDS);
+    let store = LocalIndexLogStore::new(dir.path());
+    let base_anchor = (RECORDS / 2) as u64;
+
+    // Every entry point into this walk, and what each one declines. The list is DERIVED from the
+    // two methods that exist rather than written out, and floored below.
+    let mut rows: Vec<(&str, u64, u64)> = Vec::new();
+
+    probe::reset();
+    store.for_each_delta_record(22, 0, |_| {}).unwrap();
+    rows.push((
+        "for_each_delta_record (every non-load caller)",
+        probe::fold_pieces_declined(),
+        probe::fold_frames_read(),
+    ));
+
+    probe::reset();
+    store.read_delta_records(22, 0).unwrap();
+    rows.push((
+        "read_delta_records",
+        probe::fold_pieces_declined(),
+        probe::fold_frames_read(),
+    ));
+
+    probe::reset();
+    store
+        .for_each_delta_record_above_anchor(22, 0, base_anchor, |_| {})
+        .unwrap();
+    rows.push((
+        "for_each_delta_record_above_anchor (the load path)",
+        probe::fold_pieces_declined(),
+        probe::fold_frames_read(),
+    ));
+
+    println!("index-log fold entry points at base anchor {base_anchor}, over {RECORDS} records:");
+    for (name, declined, frames) in &rows {
+        println!("  {name:<52} {declined:>4} declined  {frames:>6} frames");
+    }
+
+    // THE FLOOR ON THE APPARATUS. Every row must have read something, or this measured nothing
+    // and a zero in the `declined` column means only that the walk never ran.
+    assert_eq!(rows.len(), 3, "the entry-point list lost a row: {rows:?}");
+    assert!(
+        rows.iter().all(|(_, _, frames)| *frames > 0),
+        "APPARATUS: an entry point read no frame at all, so its decline count says nothing: \
+         {rows:?}"
+    );
+    // The two that pass no anchor decline nothing, and that is the right answer for them.
+    assert_eq!(rows[0].1, 0, "{} declined a piece", rows[0].0);
+    assert_eq!(rows[1].1, 0, "{} declined a piece", rows[1].0);
+    // The load-path entry point does.
+    assert!(
+        rows[2].1 > 0,
+        "the load-path entry point declined nothing at base anchor {base_anchor} -- the decline \
+         is not reachable"
+    );
+    assert!(
+        rows[2].2 < rows[0].2,
+        "the load-path entry point read {} frames against {} -- it declined nothing in practice",
+        rows[2].2,
+        rows[0].2
+    );
+}
+
+/// What one fold of a large log cost, in every quantity this file can name.
+///
+/// The applied records are kept as their OBJECT KEYS rather than as a count. Reading too few
+/// records is silent loss and a count cannot see the difference between a fold that applied the
+/// right two hundred and one that applied two hundred of the wrong ones; the keys can, and the
+/// first half below compares them element by element.
+struct LargeFoldCost {
+    records: usize,
+    /// Files the log is in when the fold starts, the one being written included.
+    pieces: usize,
+    /// Piece paths the fold's own enumeration handed back. One per piece, and every one of them
+    /// is then name-parsed and compared whether or not the piece is opened.
+    piece_paths: u64,
+    /// Directory listings the fold performed. The enumeration is ONE listing, not one per piece.
+    dir_listings: u64,
+    /// Sealed pieces declined from their names.
+    declined: u64,
+    /// Frames the fold read off disk.
+    frames_read: u64,
+    /// Object keys of the records the load path's own test would apply, IN ORDER.
+    applied_keys: Vec<String>,
+    /// Bytes of the pieces the fold opened -- the ATTRIBUTED row.
+    attributed_bytes: u64,
+    /// Bytes the kernel says this process read across the fold -- the INDEPENDENT total.
+    total_bytes_read: u64,
+}
+
+impl LargeFoldCost {
+    fn applied(&self) -> usize {
+        self.applied_keys.len()
+    }
+    fn frames_per_applied(&self) -> f64 {
+        self.frames_read as f64 / self.applied() as f64
+    }
+    fn paths_per_applied(&self) -> f64 {
+        self.piece_paths as f64 / self.applied() as f64
+    }
+    fn pieces_per_record(&self) -> f64 {
+        self.pieces as f64 / self.records as f64
+    }
+    fn residual_bytes(&self) -> i64 {
+        self.total_bytes_read as i64 - self.attributed_bytes as i64
+    }
+    fn residual_per_record(&self) -> f64 {
+        self.residual_bytes() as f64 / self.records as f64
+    }
+}
+
+/// Fold a large log the way the load path does, counting everything it cost.
+///
+/// The same two shapes [`replay_cost`] takes -- the base anchor as the load path now passes it,
+/// or 0, which declines nothing -- with the per-piece enumeration counted as well as the frames,
+/// and the applied records kept by key.
+fn large_fold_cost(
+    dir: &std::path::Path,
+    shard_id: ShardId,
+    records: usize,
+    base_anchor: u64,
+    decline: bool,
+) -> LargeFoldCost {
+    let store = LocalIndexLogStore::new(dir);
+    let passed_anchor = if decline { base_anchor } else { 0 };
+
+    // The ATTRIBUTED row, computed before the fold from the same predicate the fold uses, and
+    // deliberately not from the fold's own counters: a row taken from the thing being audited
+    // cannot show that thing drifting.
+    let mut attributed_bytes = 0u64;
+    let mut pieces = 0usize;
+    for path in index_log_segment_paths(dir, shard_id) {
+        let Ok(metadata) = path.metadata() else {
+            continue;
+        };
+        pieces += 1;
+        let declinable = sealed_index_log_span(&path, shard_id)
+            .is_some_and(|span| decline && piece_is_reflected_by(span, passed_anchor));
+        if !declinable {
+            attributed_bytes = attributed_bytes.saturating_add(metadata.len());
+        }
+    }
+
+    probe::reset();
+    let before = bytes_read_now().expect("APPARATUS: /proc/self/io carries no rchar line");
+    let mut applied_keys: Vec<String> = Vec::new();
+    store
+        .for_each_delta_record_above_anchor(shard_id, 0, passed_anchor, |record| {
+            // The load path's own test, verbatim from `fold_index_log_deltas`.
+            let record_anchor = record.applied_wal_sequence.unwrap_or(0);
+            if !(base_anchor > 0 && record_anchor <= base_anchor) {
+                applied_keys.push(
+                    record
+                        .items
+                        .first()
+                        .map(|item| item.object_key.to_string())
+                        .unwrap_or_default(),
+                );
+            }
+        })
+        .unwrap();
+    let after = bytes_read_now().expect("APPARATUS: /proc/self/io carries no rchar line");
+
+    LargeFoldCost {
+        records,
+        pieces,
+        piece_paths: probe::piece_paths(),
+        dir_listings: probe::dir_listings(),
+        declined: probe::fold_pieces_declined(),
+        frames_read: probe::fold_frames_read(),
+        applied_keys,
+        attributed_bytes,
+        total_bytes_read: after.saturating_sub(before),
+    }
+}
+
+/// WHAT THE INDEX LOG COSTS ON A LARGE STORE, AND WHICH OF ITS COSTS STOPS BEING FLAT THERE.
+///
+/// Every other index-log measurement in this file was taken at 1,000 to 20,000 records. This one
+/// starts where they stop and goes an order of magnitude past it: 20,000 and 200,000. Two results
+/// come out of it and only one of them is the one #1915 was about.
+///
+/// WHAT HOLDS. The piece-level decline holds exactly, and holds in ABSOLUTE terms rather than per
+/// record. In the regime a running store is in -- a base that fails to reflect a FIXED NUMBER of
+/// records, because a store dumps on a cadence and what its base does not yet hold is bounded by
+/// the time since the last dump rather than by how deep the log has grown behind it -- the
+/// declining fold reads 289 frames at 20,000 records and 280 at 200,000. Ten times the corpus,
+/// the same reading. Opening every piece instead reads 20,000 and 200,000, which per record
+/// applied is 100 against 1,000.
+///
+/// WHAT DOES NOT. The fold no longer OPENS the pieces it declines, but it still ENUMERATES them,
+/// and their number is linear in the store: 0.0100 pieces per record at 20,000 and 0.0103 at
+/// 200,000. (The drift is msgpack's integer width -- a deeper log carries wider sequence numbers
+/// and so fills a piece with slightly fewer records. It is the same term
+/// `expected_sequence_width_residual` accounts for exactly on the append path.) So per record the
+/// fold actually applies, the enumeration climbs by the factor the corpus does: 200 paths for 200
+/// applied records at 20,000, and 2,056 for the same 200 at 200,000.
+///
+/// NOTHING BOUNDS THAT NUMBER BUT A DUMP. A piece leaves the log only when a completed dump's
+/// sweep unlinks it, and the last half here shows that sweep taking the whole large fixture to
+/// one piece in a single round. Between dumps the piece count is a function of records written
+/// and of nothing else -- no ceiling, no per-round cap, no separate budget for what the index
+/// costs as against what the records in it cost. Every quantity this file has already measured as
+/// "flat in listings, linear in pieces" -- the reclaim round's enumeration
+/// ([`what_a_reclaim_round_enumerates_at_two_piece_counts`]) and the background poll's per-piece
+/// `stat` ([`what_the_undumped_length_probe_enumerates`]) -- is therefore linear in the whole
+/// store, without limit, and this is the test that says so with the piece count under it.
+///
+/// WHY IT IS NOT FIXED HERE, WITH THE NUMBER BESIDE THE REASON. Bounding the piece count means
+/// merging sealed pieces into fewer, larger ones. The safety note on
+/// [`LocalIndexLogStore::for_each_delta_record_above_anchor`] rests on there being exactly ONE
+/// writer of a sealed name -- the `fs::rename` in `roll_index_log_segment_at` -- which is what
+/// makes a piece's name and its contents fixed together and so makes declining by name safe at
+/// all. A merger would be a second writer of sealed names, and declining by name is worth 200
+/// frames against 200,000 on the load path. The enumeration it would save is 2,056 path
+/// constructions behind one directory listing.
+///
+/// BOTH REGIMES ARE MEASURED, because one of them hides all of this:
+///
+/// - FIXED SUFFIX -- the base fails to reflect a fixed NUMBER of records whatever the log holds.
+///   Cost per applied record climbs with the corpus unless the fold declines.
+/// - PROPORTIONAL SUFFIX -- the base reflects a fixed FRACTION. The applied count grows with the
+///   corpus too, every per-applied-record cost is flat, and a measurement taken only here would
+///   report that the index log is free of charge at any size.
+#[test]
+fn what_the_index_log_fold_costs_on_a_large_store() {
+    // 8 KiB rather than the 64 KiB default, for the reason `what_an_index_log_replay_reads_at_
+    // two_corpus_sizes` gives: the decision under measurement is PER PIECE. The rolling
+    // threshold is a deployment knob and is held FIXED across the two arms; what is being
+    // measured is how the cost moves with the corpus at a fixed one.
+    let _rolling = roll_at(8 * 1024);
+    const SMALL: usize = 20_000;
+    const LARGE: usize = 200_000;
+    /// Records the base does NOT reflect, the SAME NUMBER at both corpus sizes.
+    const FIXED_SUFFIX: usize = 200;
+    const SHARD: ShardId = 43;
+
+    let small_dir = tempfile::tempdir().unwrap();
+    let large_dir = tempfile::tempdir().unwrap();
+    climbing_anchor_phase(small_dir.path(), SHARD, SMALL);
+    climbing_anchor_phase(large_dir.path(), SHARD, LARGE);
+
+    // Anchors climb one per record, so an anchor of N leaves exactly `records - N` above it.
+    let fixed = |records: usize| (records - FIXED_SUFFIX) as u64;
+    let tenth = |records: usize| (records * 9 / 10) as u64;
+
+    let small_fixed_open = large_fold_cost(small_dir.path(), SHARD, SMALL, fixed(SMALL), false);
+    let small_fixed_decline = large_fold_cost(small_dir.path(), SHARD, SMALL, fixed(SMALL), true);
+    let large_fixed_open = large_fold_cost(large_dir.path(), SHARD, LARGE, fixed(LARGE), false);
+    let large_fixed_decline = large_fold_cost(large_dir.path(), SHARD, LARGE, fixed(LARGE), true);
+    let small_part_open = large_fold_cost(small_dir.path(), SHARD, SMALL, tenth(SMALL), false);
+    let small_part_decline = large_fold_cost(small_dir.path(), SHARD, SMALL, tenth(SMALL), true);
+    let large_part_open = large_fold_cost(large_dir.path(), SHARD, LARGE, tenth(LARGE), false);
+    let large_part_decline = large_fold_cost(large_dir.path(), SHARD, LARGE, tenth(LARGE), true);
+
+    // ---------------------------------------------------------------------------------------
+    // THE DENOMINATORS, AND THE PROOF THE FIXTURE IS IN THE REGIME THIS TEST CLAIMS IT IS IN.
+    // None of the ratios below mean anything until these hold.
+    // ---------------------------------------------------------------------------------------
+    assert_eq!(
+        small_fixed_open.records * 10,
+        large_fixed_open.records,
+        "the two corpora do not differ tenfold"
+    );
+    assert!(
+        small_fixed_open.pieces >= 100 && large_fixed_open.pieces >= 1_000,
+        "fixtures rolled into {} and {} pieces -- too few to measure a per-piece decision on a \
+         large store",
+        small_fixed_open.pieces,
+        large_fixed_open.pieces
+    );
+    assert!(
+        large_fixed_open.pieces >= small_fixed_open.pieces * 5,
+        "the large fixture is in {} pieces against the small one's {} -- not a corpus difference \
+         the per-piece decision can see",
+        large_fixed_open.pieces,
+        small_fixed_open.pieces
+    );
+    // A fixture whose pieces all looked alike in the field the decision reads could not tell a
+    // correct decision from a constant. Every sealed piece of the large fixture must name a
+    // DISTINCT `max_applied_wal`, which is the field `piece_is_reflected_by` compares.
+    let mut named_pieces = 0usize;
+    let mut distinct_anchors = std::collections::BTreeSet::new();
+    for path in index_log_segment_paths(large_dir.path(), SHARD) {
+        if let Some(span) = sealed_index_log_span(&path, SHARD) {
+            named_pieces += 1;
+            distinct_anchors.insert(span.max_applied_wal);
+        }
+    }
+    assert!(
+        named_pieces >= 1_000,
+        "the large fixture holds {named_pieces} sealed pieces -- the decline has almost nothing \
+         to decide"
+    );
+    assert_eq!(
+        distinct_anchors.len(),
+        named_pieces,
+        "{} of the large fixture's {named_pieces} sealed pieces name the same anchor as another \
+         -- a fixture whose pieces are alike in the field the decision reads cannot tell a \
+         correct decision from a constant",
+        named_pieces - distinct_anchors.len()
+    );
+    // And every arm did some reading, so a flat cost below is not a fold that never ran.
+    for (name, cost) in [
+        ("small fixed / opening", &small_fixed_open),
+        ("small fixed / declining", &small_fixed_decline),
+        ("large fixed / opening", &large_fixed_open),
+        ("large fixed / declining", &large_fixed_decline),
+        ("small partial / opening", &small_part_open),
+        ("small partial / declining", &small_part_decline),
+        ("large partial / opening", &large_part_open),
+        ("large partial / declining", &large_part_decline),
+    ] {
+        assert!(
+            cost.frames_read > 0,
+            "APPARATUS: the {name} fold read no frame at all"
+        );
+        assert!(
+            cost.applied() > 0,
+            "APPARATUS: the {name} fold applied no record at all"
+        );
+        assert!(
+            cost.total_bytes_read > 0 && cost.attributed_bytes > 0,
+            "APPARATUS: the {name} fold reports no bytes read ({}) or none attributed ({})",
+            cost.total_bytes_read,
+            cost.attributed_bytes
+        );
+    }
+
+    println!(
+        "index log on a large store, {SMALL} -> {LARGE} records ({} -> {} pieces):\n\
+         \x20 FIXED SUFFIX of {FIXED_SUFFIX} records (the regime a running store is in)\n\
+         \x20   opening every piece : {:>7} frames / {:>6} applied / {:>5} of {:>5} declined / \
+         {:>5} paths / {:>2} listings  ->  {:>7} frames / {:>6} applied / {:>5} of {:>5} \
+         declined / {:>5} paths / {:>2} listings   ({:>8.2} -> {:>8.2} frames per applied, \
+         {:>6.2} -> {:>6.2} paths per applied)\n\
+         \x20   declining by name   : {:>7} frames / {:>6} applied / {:>5} of {:>5} declined / \
+         {:>5} paths / {:>2} listings  ->  {:>7} frames / {:>6} applied / {:>5} of {:>5} \
+         declined / {:>5} paths / {:>2} listings   ({:>8.2} -> {:>8.2} frames per applied, \
+         {:>6.2} -> {:>6.2} paths per applied)\n\
+         \x20 PROPORTIONAL SUFFIX of one record in ten (the regime that HIDES all of it)\n\
+         \x20   opening every piece : {:>7} frames / {:>6} applied  ->  {:>7} frames / {:>6} \
+         applied   ({:>8.2} -> {:>8.2} frames per applied)\n\
+         \x20   declining by name   : {:>7} frames / {:>6} applied  ->  {:>7} frames / {:>6} \
+         applied   ({:>8.2} -> {:>8.2} frames per applied)\n\
+         \x20 pieces per record {:.5} -> {:.5} | bytes attributed to the declining fold {} -> {}",
+        small_fixed_open.pieces,
+        large_fixed_open.pieces,
+        small_fixed_open.frames_read,
+        small_fixed_open.applied(),
+        small_fixed_open.declined,
+        small_fixed_open.pieces,
+        small_fixed_open.piece_paths,
+        small_fixed_open.dir_listings,
+        large_fixed_open.frames_read,
+        large_fixed_open.applied(),
+        large_fixed_open.declined,
+        large_fixed_open.pieces,
+        large_fixed_open.piece_paths,
+        large_fixed_open.dir_listings,
+        small_fixed_open.frames_per_applied(),
+        large_fixed_open.frames_per_applied(),
+        small_fixed_open.paths_per_applied(),
+        large_fixed_open.paths_per_applied(),
+        small_fixed_decline.frames_read,
+        small_fixed_decline.applied(),
+        small_fixed_decline.declined,
+        small_fixed_decline.pieces,
+        small_fixed_decline.piece_paths,
+        small_fixed_decline.dir_listings,
+        large_fixed_decline.frames_read,
+        large_fixed_decline.applied(),
+        large_fixed_decline.declined,
+        large_fixed_decline.pieces,
+        large_fixed_decline.piece_paths,
+        large_fixed_decline.dir_listings,
+        small_fixed_decline.frames_per_applied(),
+        large_fixed_decline.frames_per_applied(),
+        small_fixed_decline.paths_per_applied(),
+        large_fixed_decline.paths_per_applied(),
+        small_part_open.frames_read,
+        small_part_open.applied(),
+        large_part_open.frames_read,
+        large_part_open.applied(),
+        small_part_open.frames_per_applied(),
+        large_part_open.frames_per_applied(),
+        small_part_decline.frames_read,
+        small_part_decline.applied(),
+        large_part_decline.frames_read,
+        large_part_decline.applied(),
+        small_part_decline.frames_per_applied(),
+        large_part_decline.frames_per_applied(),
+        small_fixed_open.pieces_per_record(),
+        large_fixed_open.pieces_per_record(),
+        small_fixed_decline.attributed_bytes,
+        large_fixed_decline.attributed_bytes,
+    );
+
+    // ---------------------------------------------------------------------------------------
+    // HALF ONE, AND IT IS FIRST BECAUSE IT IS THE SAFETY CLAIM AND THE OTHER DIRECTION IS THE
+    // SILENT ONE. Reading too FEW records loses an eviction recorded only in a delta and the
+    // load still reports success; reading too many is merely slow. So the claim asserted here is
+    // the strong one: the declining fold hands back the SAME RECORDS IN THE SAME ORDER as the
+    // fold that opens every piece, element by element, in BOTH regimes and at BOTH sizes. A
+    // count would pass a fold that applied the right number of the wrong records.
+    // ---------------------------------------------------------------------------------------
+    for (name, open, declined) in [
+        ("small / fixed suffix", &small_fixed_open, &small_fixed_decline),
+        ("large / fixed suffix", &large_fixed_open, &large_fixed_decline),
+        ("small / proportional", &small_part_open, &small_part_decline),
+        ("large / proportional", &large_part_open, &large_part_decline),
+    ] {
+        assert_eq!(
+            open.applied_keys.len(),
+            declined.applied_keys.len(),
+            "{name}: declining changed HOW MANY records the fold applies, {} against {}",
+            declined.applied_keys.len(),
+            open.applied_keys.len()
+        );
+        if let Some(at) = open
+            .applied_keys
+            .iter()
+            .zip(declined.applied_keys.iter())
+            .position(|(a, b)| a != b)
+        {
+            panic!(
+                "{name}: declining changed WHICH records the fold applies -- they first differ \
+                 at position {at} of {}: opening every piece gave {:?}, declining by name gave \
+                 {:?}",
+                open.applied_keys.len(),
+                open.applied_keys[at],
+                declined.applied_keys[at]
+            );
+        }
+    }
+    assert_eq!(
+        small_fixed_open.applied(),
+        FIXED_SUFFIX,
+        "the small fold applied {} records, expected the {FIXED_SUFFIX} above the base",
+        small_fixed_open.applied()
+    );
+    assert_eq!(
+        large_fixed_open.applied(),
+        FIXED_SUFFIX,
+        "the large fold applied {} records, expected the SAME {FIXED_SUFFIX} the small one did \
+         -- holding the suffix fixed is what makes every ratio below mean anything",
+        large_fixed_open.applied()
+    );
+
+    // ---------------------------------------------------------------------------------------
+    // HALF TWO: WHAT HOLDS. The declining fold reads a FLAT NUMBER OF FRAMES -- flat in absolute
+    // terms across a tenfold corpus, not merely flat per record. #1915 measured 289 at both 2,000
+    // and 20,000; an order of magnitude further on it is still the last few pieces and nothing
+    // else.
+    // ---------------------------------------------------------------------------------------
+    assert!(
+        large_fixed_decline.frames_read <= small_fixed_decline.frames_read * 2,
+        "the declining fold read {} frames at {LARGE} records against {} at {SMALL} -- the \
+         decline does not hold at ten times the corpus",
+        large_fixed_decline.frames_read,
+        small_fixed_decline.frames_read
+    );
+    assert!(
+        large_fixed_decline.frames_read * 100 < large_fixed_open.frames_read,
+        "declining saved almost nothing at {LARGE} records: {} frames against {}",
+        large_fixed_decline.frames_read,
+        large_fixed_open.frames_read
+    );
+    // And the bytes it opens are flat with it, from the attributed row rather than the counters.
+    assert!(
+        large_fixed_decline.attributed_bytes <= small_fixed_decline.attributed_bytes * 2,
+        "the declining fold opened {} bytes at {LARGE} records against {} at {SMALL}",
+        large_fixed_decline.attributed_bytes,
+        small_fixed_decline.attributed_bytes
+    );
+
+    // ---------------------------------------------------------------------------------------
+    // HALF THREE, ORDERED after it and reading none of its values: WHAT GROWS. Opening every
+    // piece costs the whole log for a suffix's worth of work, and at this size that is a factor
+    // of ten between the two corpora.
+    // ---------------------------------------------------------------------------------------
+    assert_eq!(
+        large_fixed_open.frames_read,
+        small_fixed_open.frames_read * 10,
+        "10x the records read {} frames against 10x {} -- the fold is not linear in records",
+        large_fixed_open.frames_read,
+        small_fixed_open.frames_read
+    );
+    assert!(
+        large_fixed_open.frames_per_applied() >= small_fixed_open.frames_per_applied() * 9.0,
+        "frames per applied record did not grow with the corpus: {:.2} at {SMALL} against {:.2} \
+         at {LARGE}",
+        small_fixed_open.frames_per_applied(),
+        large_fixed_open.frames_per_applied()
+    );
+
+    // ---------------------------------------------------------------------------------------
+    // HALF FOUR, THE CONTROL, AND IT IS WHY THE REGIME IS NAMED. At a suffix that grows WITH the
+    // corpus the SAME folds are flat per applied record -- both of them, opening and declining.
+    // A measurement taken only in this fixture would report that the index log costs the same at
+    // any size, which is why this test asserts the other regime rather than choosing between
+    // them.
+    // ---------------------------------------------------------------------------------------
+    assert!(
+        (large_part_open.frames_per_applied() - small_part_open.frames_per_applied()).abs() < 0.01,
+        "CONTROL: the proportional-suffix arm was expected to be flat per applied record while \
+         opening every piece and is not: {:.4} at {SMALL} against {:.4} at {LARGE}",
+        small_part_open.frames_per_applied(),
+        large_part_open.frames_per_applied()
+    );
+    assert!(
+        large_part_decline.frames_per_applied() <= small_part_decline.frames_per_applied(),
+        "CONTROL: the proportional-suffix arm was expected to be flat per applied record while \
+         declining and is not: {:.4} at {SMALL} against {:.4} at {LARGE}",
+        small_part_decline.frames_per_applied(),
+        large_part_decline.frames_per_applied()
+    );
+
+    // ---------------------------------------------------------------------------------------
+    // HALF FIVE: WHAT DOES NOT HOLD, AND IT IS ONLY VISIBLE AT THIS SIZE. The pieces the fold
+    // declines are not opened, but they are still enumerated and name-parsed, and their NUMBER
+    // is linear in the store. Two claims, and the second is the one that matters:
+    //
+    //   - pieces per record is FLAT, which is to say the piece count grows with the corpus;
+    //   - so per record the fold APPLIES, the enumeration grows by the factor the corpus does.
+    //
+    // At 20,000 records the declining fold names 200 pieces to apply 200 records. At 200,000 it
+    // names 2,056 to apply the same 200.
+    // ---------------------------------------------------------------------------------------
+    let piece_growth =
+        large_fixed_decline.pieces_per_record() / small_fixed_decline.pieces_per_record();
+    assert!(
+        (0.95..=1.15).contains(&piece_growth),
+        "pieces per record moved by {piece_growth:.3}x between {SMALL} and {LARGE} records \
+         ({:.5} -> {:.5}) -- the piece count is not linear in the corpus and the claim below \
+         does not follow",
+        small_fixed_decline.pieces_per_record(),
+        large_fixed_decline.pieces_per_record()
+    );
+    assert_eq!(
+        large_fixed_decline.piece_paths as usize, large_fixed_decline.pieces,
+        "the declining fold enumerated {} paths for {} pieces",
+        large_fixed_decline.piece_paths, large_fixed_decline.pieces
+    );
+    assert!(
+        large_fixed_decline.paths_per_applied() >= small_fixed_decline.paths_per_applied() * 9.0,
+        "piece paths per applied record did not grow with the corpus: {:.2} at {SMALL} against \
+         {:.2} at {LARGE} -- if this ever stops holding, something has begun to bound the piece \
+         count and this test should be rewritten around whatever that is",
+        small_fixed_decline.paths_per_applied(),
+        large_fixed_decline.paths_per_applied()
+    );
+    // What it is NOT is one listing per piece. The enumeration is a single `read_dir` at every
+    // size and in both regimes, which is the reason the growth above is cheap per unit rather
+    // than free.
+    for (name, cost) in [
+        ("small fixed / opening", &small_fixed_open),
+        ("small fixed / declining", &small_fixed_decline),
+        ("large fixed / opening", &large_fixed_open),
+        ("large fixed / declining", &large_fixed_decline),
+        ("small partial / declining", &small_part_decline),
+        ("large partial / declining", &large_part_decline),
+    ] {
+        assert_eq!(
+            cost.dir_listings, 1,
+            "the {name} fold performed {} directory listings, expected exactly one",
+            cost.dir_listings
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // HALF SIX: THE RESIDUAL, from a total this file does not maintain.
+    //
+    // `rchar` is the kernel's count of bytes this process read across the fold; the attributed
+    // row is the bytes of the pieces the fold opened, computed from the piece names BEFORE the
+    // fold ran. What is left over is everything the rows do not account for, and on a store ten
+    // times the size it must not climb. Taken PER RECORD so a fixed overhead divides away.
+    // ---------------------------------------------------------------------------------------
+    println!(
+        "  residual (kernel rchar total minus the bytes of the pieces the fold opened): \
+         small = {} - {} = {} ({:.5} a record) | large = {} - {} = {} ({:.5} a record)",
+        small_fixed_decline.total_bytes_read,
+        small_fixed_decline.attributed_bytes,
+        small_fixed_decline.residual_bytes(),
+        small_fixed_decline.residual_per_record(),
+        large_fixed_decline.total_bytes_read,
+        large_fixed_decline.attributed_bytes,
+        large_fixed_decline.residual_bytes(),
+        large_fixed_decline.residual_per_record(),
+    );
+    assert!(
+        large_fixed_decline.residual_per_record()
+            <= small_fixed_decline.residual_per_record().abs() + 1.0,
+        "the unattributed bytes per record CLIMBED with the corpus: {:.5} at {SMALL} against \
+         {:.5} at {LARGE} -- something reads the log that these rows do not account for",
+        small_fixed_decline.residual_per_record(),
+        large_fixed_decline.residual_per_record(),
+    );
+    assert!(
+        large_part_decline.residual_per_record()
+            <= small_part_decline.residual_per_record().abs() + 1.0,
+        "the unattributed bytes per record CLIMBED with the corpus in the proportional regime: \
+         {:.5} at {SMALL} against {:.5} at {LARGE}",
+        small_part_decline.residual_per_record(),
+        large_part_decline.residual_per_record(),
+    );
+
+    // ---------------------------------------------------------------------------------------
+    // HALF SEVEN, LAST BECAUSE IT MUTATES THE LARGE FIXTURE: WHAT BOUNDS THE PIECE COUNT.
+    //
+    // A completed dump, and nothing else. One sweep at an anchor that reflects the whole log
+    // takes the large fixture from every piece it holds down to the one being written -- so the
+    // count is not bounded by a per-round cap or a ceiling on what the index may hold, it is
+    // bounded by how recently a dump last finished. `min_reclaimable_bytes` is `u64::MAX` here,
+    // which declines the REWRITE of the piece being written: the sealed pieces still go, which
+    // is the point -- unlinking a whole piece is not subject to the rewrite threshold, so what
+    // is measured is the sweep's own reach and not a byte budget.
+    // ---------------------------------------------------------------------------------------
+    let large_store = LocalIndexLogStore::new(large_dir.path());
+    let pieces_before = large_store.piece_count(SHARD);
+    let report = large_store
+        .gc_reflected_before_anchor(SHARD, LARGE as u64, LARGE as u64 + 1, u64::MAX)
+        .unwrap();
+    let pieces_after = large_store.piece_count(SHARD);
+    println!(
+        "  what bounds the piece count: a completed dump and nothing else -- one sweep at a \
+         reflecting anchor took {pieces_before} pieces to {pieces_after}, {} records to {}, {} \
+         bytes to {}, copying {}",
+        report.records_before,
+        report.records_after,
+        report.bytes_before,
+        report.bytes_after,
+        report.bytes_copied,
+    );
+    assert!(
+        pieces_before >= 1_000,
+        "the large fixture held {pieces_before} pieces before the sweep -- nothing to bound"
+    );
+    assert_eq!(
+        pieces_after, 1,
+        "the sweep left {pieces_after} pieces of {pieces_before}; a completed dump is supposed to \
+         be able to take the log back to the piece being written in one round"
+    );
+    assert_eq!(
+        report.bytes_copied, 0,
+        "the sweep copied {} bytes -- the sealed pieces are supposed to go by unlink, so the \
+         piece count is not bounded by a byte budget",
+        report.bytes_copied
+    );
+}

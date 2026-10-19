@@ -52,3 +52,58 @@ const MEASURED = [
     texts_per_s: 31.7, note: "fastest", same_width_as: [] }
 ];
 
+/* 1. Voyage: the measured rows are not offered, and what Voyage serves is. */
+let names = options({
+  current: "", catalogue: MEASURED.map((m) => Object.assign({}, m, { applicable: false })),
+  provider_models: [{ model: "voyage-3", note: "Voyage's general encoder." }]
+}).map((o) => o.model);
+ok("a self-hosted encoder is not offered to a hosted provider",
+   !names.some((n) => n.indexOf("/") >= 0), JSON.stringify(names));
+ok("what the provider serves is offered", names.indexOf("voyage-3") >= 0, JSON.stringify(names));
+
+/* 2. The note survives, because a name with nothing beside it is a guess. */
+let entries = options({
+  current: "", catalogue: [],
+  provider_models: [{ model: "voyage-3", note: "Voyage's general encoder." }]
+});
+ok("a hosted encoder carries its note",
+   entries.length === 1 && /Voyage's general encoder/.test(entries[0].note),
+   JSON.stringify(entries));
+
+/* 3. An OpenAI-compatible endpoint keeps both worlds. */
+names = options({
+  current: "", catalogue: MEASURED.map((m) => Object.assign({}, m, { applicable: true })),
+  provider_models: [{ model: "text-embedding-3-small", note: "cheaper" }]
+}).map((o) => o.model);
+ok("a self-hosted encoder is still offered where it can run",
+   names.filter((n) => n.indexOf("/") >= 0).length === 2, JSON.stringify(names));
+ok("and the hosted one alongside it", names.indexOf("text-embedding-3-small") >= 0,
+   JSON.stringify(names));
+
+/* 4. The floor. A build that offered nothing would pass every "is not offered" check above. */
+names = options({ current: "", catalogue: MEASURED, provider_models: [] }).map((o) => o.model);
+ok("a route that says nothing about applicability offers everything", names.length === 2,
+   JSON.stringify(names));
+
+/* 5. The configured model is always offered, even when its provider would not list it -- a
+      deployment already pointed at something must be able to see what that is. */
+entries = options({
+  current: "intfloat/multilingual-e5-large",
+  catalogue: MEASURED.map((m) => Object.assign({}, m, { applicable: false })),
+  provider_models: [{ model: "voyage-3", note: "" }]
+});
+ok("the model in use is still listed",
+   entries.some((o) => o.model === "intfloat/multilingual-e5-large"),
+   JSON.stringify(entries.map((o) => o.model)));
+
+/* 6. What the endpoint itself reported is not filtered: it comes from asking the live provider,
+      so it is by definition something that provider serves. */
+names = options({
+  current: "", catalogue: [], provider_models: [],
+  discovered: { models: ["voyage-3-lite"] }
+}).map((o) => o.model);
+ok("a model the endpoint reported is offered", names.indexOf("voyage-3-lite") >= 0,
+   JSON.stringify(names));
+
+console.log(failures ? "\n" + failures + " failure(s)" : "\nall ok");
+process.exit(failures ? 1 : 0);
