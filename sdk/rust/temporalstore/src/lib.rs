@@ -56,3 +56,62 @@ mod direct_ffi_matrixark;
 mod direct_ffi_types;
 #[cfg(feature = "direct")]
 mod direct_hash;
+#[cfg(feature = "direct")]
+mod direct_helpers;
+#[cfg(feature = "direct")]
+#[cfg(feature = "direct")]
+mod direct_key_value;
+#[cfg(feature = "direct")]
+mod direct_lifecycle;
+#[cfg(feature = "direct")]
+mod direct_matrixark_guard;
+#[cfg(feature = "direct")]
+mod direct_sequence_features;
+#[cfg(feature = "direct")]
+mod direct_set;
+#[cfg(feature = "direct")]
+pub use direct_client::Client;
+#[cfg(feature = "direct")]
+pub(crate) use direct_ffi::*;
+
+#[cfg(feature = "proxy")]
+mod proxy_client;
+#[cfg(feature = "proxy")]
+mod proxy_control_state;
+#[cfg(feature = "proxy")]
+mod proxy_control_state_fol;
+#[cfg(feature = "proxy")]
+mod proxy_control_state_hash;
+#[cfg(feature = "proxy")]
+mod proxy_control_state_manager;
+#[cfg(feature = "proxy")]
+mod proxy_feature_aggregate;
+#[cfg(feature = "proxy")]
+mod proxy_features;
+#[cfg(feature = "proxy")]
+mod proxy_hash;
+#[cfg(feature = "proxy")]
+mod proxy_helpers;
+#[cfg(feature = "proxy")]
+#[cfg(feature = "proxy")]
+mod proxy_key_value;
+#[cfg(feature = "proxy")]
+mod proxy_lifecycle;
+#[cfg(feature = "proxy")]
+mod proxy_sequence_features;
+#[cfg(feature = "proxy")]
+mod proxy_set;
+#[cfg(feature = "proxy")]
+mod proxy_transport;
+#[cfg(feature = "proxy")]
+pub use proxy_client::{ProxyClient, ProxyOptions};
+
+#[cfg(feature = "direct")]
+mod rust_c_abi_exports;
+#[cfg(feature = "direct")]
+mod rust_c_abi_helpers;
+#[cfg(feature = "direct")]
+mod rust_c_abi_matrixark_exports;
+
+#[cfg(test)]
+mod client_api_tests;
