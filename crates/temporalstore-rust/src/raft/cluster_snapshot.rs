@@ -605,3 +605,1219 @@ impl RaftCluster {
             entries_by_index.insert(entry.index, entry.clone());
         }
         let entries = entries_by_index.into_values().collect::<Vec<_>>();
+        let last_included_term = entries
+            .last()
+            .map(|entry| entry.term)
+            .unwrap_or(leader.current_term);
+        Ok(RaftSnapshot {
+            shard_id: inner.shard_id,
+            last_included_term,
+            last_included_index: leader.commit_index,
+            external_snapshot_ref: None,
+            entries,
+            state_image: None,
+            state_image_externalized: false,
+        })
+    }
+
+    /// Build the S2 state-image snapshot WITHOUT holding the cluster lock across the image
+    /// build. Applies advance `applied_index` only under the cluster write lock, so an applied
+    /// index that reads the same before and after the build proves the engine was quiescent in
+    /// between -- the image is exact at that watermark. A cluster that keeps applying gets
+    /// three such attempts; the final attempt builds under the read lock, which is consistent
+    /// by construction and no less available than the always-locked build this replaces.
+    ///
+    /// `Ok(None)` means "no image snapshot here" -- nothing applied yet, or the engine could
+    /// not serve some part of the image -- and the caller falls through to the entry-carrying
+    /// form.
+    fn create_state_image_snapshot(&self) -> Result<Option<RaftSnapshot>, RaftError> {
+        for _ in 0..3 {
+            let (shard_id, watermark, engine) = {
+                let inner = self.inner.read().expect("raft cluster lock poisoned");
+                let leader = inner
+                    .nodes
+                    .get(&inner.leader_id)
+                    .filter(|node| node.alive && node.role == RaftRole::Leader)
+                    .ok_or(RaftError::LeaderUnavailable)?;
+                if leader.applied_index == 0 {
+                    return Ok(None);
+                }
+                (inner.shard_id, leader.applied_index, leader.engine.clone())
+            };
+            let Some(image) = build_state_image(&engine, shard_id) else {
+                return Ok(None);
+            };
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            let leader = inner
+                .nodes
+                .get(&inner.leader_id)
+                .filter(|node| node.alive && node.role == RaftRole::Leader)
+                .ok_or(RaftError::LeaderUnavailable)?;
+            if leader.applied_index == watermark {
+                return Ok(Some(state_image_snapshot_at(
+                    inner.shard_id,
+                    leader,
+                    watermark,
+                    image,
+                )));
+            }
+            // Something applied while the build ran, so the image may straddle two states.
+            // Drop it and capture again from the newer watermark.
+        }
+        // The cluster would not go quiescent for three builds; take the last one under the
+        // read lock, exactly as the original path always did.
+        let inner = self.inner.read().expect("raft cluster lock poisoned");
+        let leader = inner
+            .nodes
+            .get(&inner.leader_id)
+            .filter(|node| node.alive && node.role == RaftRole::Leader)
+            .ok_or(RaftError::LeaderUnavailable)?;
+        if leader.applied_index == 0 {
+            return Ok(None);
+        }
+        Ok(build_state_image(&leader.engine, inner.shard_id).map(|image| {
+            state_image_snapshot_at(inner.shard_id, leader, leader.applied_index, image)
+        }))
+    }
+
+    /// Test hook: how many indexes a node's applied SET holds, and whether one specific index
+    /// is in it. The set and the `applied_index` scalar are filled separately, so a test that
+    /// reads only the scalar cannot see the set fall short of it.
+    #[cfg(test)]
+    pub(crate) fn applied_set_len_for_test(&self, node_id: RaftNodeId) -> usize {
+        self.inner
+            .read()
+            .expect("raft cluster lock poisoned")
+            .nodes
+            .get(&node_id)
+            .map(|node| node.applied.len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn applied_set_contains_for_test(&self, node_id: RaftNodeId, index: u64) -> bool {
+        self.inner
+            .read()
+            .expect("raft cluster lock poisoned")
+            .nodes
+            .get(&node_id)
+            .map(|node| node.applied.contains(&index))
+            .unwrap_or(false)
+    }
+
+    /// Test hook: the engine a node serves from, so a test can ask what shards it hosts.
+    #[cfg(test)]
+    pub(crate) fn node_engine_for_test(&self, node_id: RaftNodeId) -> Option<TemporalEngine> {
+        self.inner
+            .read()
+            .expect("raft cluster lock poisoned")
+            .nodes
+            .get(&node_id)
+            .map(|node| node.engine.clone())
+    }
+
+    /// Test hook: retune the compaction threshold on a live cluster.
+    #[cfg(test)]
+    pub(crate) fn set_max_applied_log_bytes_for_test(&self, bytes: u64) {
+        let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+        inner.config.max_applied_log_bytes = bytes;
+    }
+
+    /// Entries this node is holding IN MEMORY. The log is trimmed only when a snapshot is
+    /// installed, so this is what a node's residency actually costs.
+    pub fn in_memory_log_entries(&self, node_id: RaftNodeId) -> usize {
+        self.inner
+            .read()
+            .expect("raft cluster lock poisoned")
+            .nodes
+            .get(&node_id)
+            .map(|node| node.log.len())
+            .unwrap_or(0)
+    }
+
+    /// Compact the log THIS process's own node is holding, when that node is a follower.
+    ///
+    /// The leader's compaction trims the leader. In-process that trims everyone, because one
+    /// process owns every node -- but a deployed follower is a separate process that learns
+    /// only by RPC, and a follower that stays CAUGHT UP never falls behind the leader's
+    /// retained range, so it is never sent a snapshot and nothing ever trims it. Its log then
+    /// grows with the corpus instead of with the state, in memory and in its own WAL record
+    /// alike. Measured: a caught-up follower held every one of 400 entries.
+    ///
+    /// A follower compacts to its APPLIED index and no further: those entries are committed and
+    /// already in its state machine, so nothing that could still be truncated by a conflict is
+    /// discarded. The snapshot it installs carries the marker that keeps `prev_log_index` /
+    /// `prev_log_term` answerable across the trim, exactly as a leader-sent snapshot would.
+    fn maybe_compact_local_follower(&self) -> Result<Option<RaftSnapshotTriggerReport>, RaftError> {
+        let (node_id, shard_id, watermark, engine, applied_log_bytes, limit, report_base) = {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            let Some(node_id) = inner.local_node_id else {
+                // The in-process model: the leader's compaction already trims every node.
+                return Ok(None);
+            };
+            if node_id == inner.leader_id {
+                return Ok(None);
+            }
+            if !inner.config.can_trigger_snapshot {
+                return Ok(None);
+            }
+            let Some(node) = inner.nodes.get(&node_id) else {
+                return Ok(None);
+            };
+            let last_snapshot_index = node
+                .installed_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.last_included_index)
+                .unwrap_or_default();
+            if node.applied_index <= last_snapshot_index {
+                return Ok(None);
+            }
+            let logical = raft_log_bytes_after(&node.log, last_snapshot_index);
+            let applied_log_bytes = inner
+                .wal
+                .as_ref()
+                .map(|wal| wal.node_log_bytes_after(inner.shard_id, node_id, last_snapshot_index))
+                .unwrap_or(0)
+                .max(logical);
+            // The same bound, for the same reason, on the copy of this cadence a deployed
+            // follower runs. A follower's compaction builds its own state image off its own
+            // engine, so it pays the identical whole-shard read for the identical constant
+            // threshold; a bound applied to only one of two live copies leaves the other with
+            // the defect.
+            let limit = effective_max_applied_log_bytes(
+                inner.config.max_applied_log_bytes,
+                installed_image_bytes(node),
+                inner.config.snapshot_image_fraction_divisor,
+            );
+            if applied_log_bytes < limit {
+                return Ok(None);
+            }
+            (
+                node_id,
+                inner.shard_id,
+                node.applied_index,
+                node.engine.clone(),
+                applied_log_bytes,
+                limit,
+                (inner.leader_id, node.applied_index, last_snapshot_index),
+            )
+        };
+
+        // Built off the cluster lock, then confirmed by watermark -- the same discipline the
+        // leader's image build uses.
+        let Some(image) = build_state_image(&engine, shard_id) else {
+            return Ok(None);
+        };
+        // And the engine this compaction publishes is rebuilt here too, still holding nothing.
+        // It is a pure function of the snapshot, and the snapshot is fully determined by the
+        // image and the watermark -- both already in hand -- so nothing about it needs the guard.
+        // The watermark re-check below is unchanged and still decides everything; all that moves
+        // is where the rebuild happens. Worth one whole engine per compaction tick on every
+        // deployed follower: 1 of 1 rebuilds and 140 slab bytes per record, all of it previously
+        // inside the write guard.
+        let mut snapshot = RaftSnapshot {
+            shard_id,
+            // Filled under the guard below, from the log as it stands once the watermark has been
+            // re-checked. The rebuild does not read it, so it costs nothing to leave until then,
+            // and leaving it until then is what keeps this identical to the always-locked form.
+            last_included_term: 0,
+            last_included_index: watermark,
+            external_snapshot_ref: None,
+            entries: Vec::new(),
+            state_image: Some(image),
+            state_image_externalized: false,
+        };
+        #[cfg(test)]
+        self.perform_armed_follower_window_interleaving(node_id, watermark);
+        let rebuilt = rebuild_snapshot_engine(&snapshot);
+        let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+        #[cfg(test)]
+        let _guard_mark = crate::snapshot_probe::GuardMark::new();
+        let Some(node) = inner.nodes.get_mut(&node_id) else {
+            return Ok(None);
+        };
+        if node.applied_index != watermark {
+            // Something applied while the image was building; the next tick tries again. The
+            // engine rebuilt above is dropped with it -- the safe-but-wasteful direction, and the
+            // only one this check can fail in.
+            return Ok(None);
+        }
+        snapshot.last_included_term =
+            node_term_at_log_or_snapshot_index(node, watermark).unwrap_or(node.current_term);
+        publish_snapshot_state(node, snapshot, rebuilt);
+        inner.persist_configured_wal()?;
+        Ok(Some(RaftSnapshotTriggerReport {
+            triggered: true,
+            reason: "follower_applied_log_bytes_threshold".to_string(),
+            leader_id: report_base.0,
+            applied_index: report_base.1,
+            last_snapshot_index: report_base.2,
+            applied_log_bytes,
+            max_applied_log_bytes: limit,
+        }))
+    }
+
+    pub fn maybe_trigger_snapshot(&self) -> Result<RaftSnapshotTriggerReport, RaftError> {
+        // A deployed follower compacts its own log; only the leader runs the check below.
+        if let Some(report) = self.maybe_compact_local_follower()? {
+            return Ok(report);
+        }
+        let (should_trigger, report) = {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            let leader = inner
+                .nodes
+                .get(&inner.leader_id)
+                .filter(|node| node.alive && node.role == RaftRole::Leader)
+                .ok_or(RaftError::LeaderUnavailable)?;
+            let last_snapshot_index = leader
+                .installed_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.last_included_index)
+                .unwrap_or_default();
+            // What the threshold is meant to bound is the log ON DISK, so judge it by that
+            // when this node keeps one. The logical command bytes understate the footprint by
+            // the entire encoding overhead -- measured at 7x on a 30k-write corpus, which is
+            // the difference between an 8 MB bound firing at 8 MB and firing at 56 MB. The
+            // in-process model (no WAL) keeps the logical measure, which is all it has.
+            let logical_log_bytes = raft_log_bytes_after(&leader.log, last_snapshot_index);
+            let applied_log_bytes = inner
+                .local_node_id
+                .and_then(|node_id| {
+                    inner
+                        .wal
+                        .as_ref()
+                        .map(|wal| wal.node_log_bytes_after(inner.shard_id, node_id, last_snapshot_index))
+                })
+                .unwrap_or(0)
+                .max(logical_log_bytes);
+            // What this snapshot will READ is the whole shard; what it discards is the log
+            // above. A constant threshold relates the two not at all, so raise it in
+            // proportion to the image the LAST snapshot here produced -- a length already in
+            // hand, never a build -- and a snapshot never reads more than
+            // `SNAPSHOT_IMAGE_FRACTION_DIVISOR` bytes of image per byte of log it discards.
+            // The configured value stays a FLOOR: a leader with no installed image reports 0
+            // and the floor decides alone, which is why the first snapshot on a fresh shard is
+            // untouched and only the routine ones after it are paced.
+            let last_image_bytes = installed_image_bytes(leader);
+            let effective_limit = effective_max_applied_log_bytes(
+                inner.config.max_applied_log_bytes,
+                last_image_bytes,
+                inner.config.snapshot_image_fraction_divisor,
+            );
+            let mut report = RaftSnapshotTriggerReport {
+                triggered: false,
+                reason: "below_threshold".to_string(),
+                leader_id: inner.leader_id,
+                applied_index: leader.applied_index,
+                last_snapshot_index,
+                applied_log_bytes,
+                max_applied_log_bytes: effective_limit,
+            };
+            if !inner.config.can_trigger_snapshot {
+                report.reason = "disabled".to_string();
+                return Ok(report);
+            }
+            if leader.applied_index <= last_snapshot_index {
+                report.reason = "no_new_applied_logs".to_string();
+                return Ok(report);
+            }
+            if applied_log_bytes < effective_limit {
+                if effective_limit > inner.config.max_applied_log_bytes {
+                    report.reason = "below_threshold_raised_for_the_image_it_would_read"
+                        .to_string();
+                }
+                return Ok(report);
+            }
+            // Hold while a live follower still needs what this would discard, so catching it up
+            // stays a matter of sending entries rather than installing a snapshot -- but only up
+            // to a ceiling, past which a snapshot is the cheaper path anyway and an absent peer
+            // must not pin the log open.
+            //
+            // Only in a deployed process, which is the one that tracks peer progress by what
+            // peers acknowledge. The in-process cluster maintains that differently, and holding
+            // on it would stop compaction happening at all.
+            let ceiling = inner.config.max_retained_log_bytes;
+            if ceiling > 0 && applied_log_bytes < ceiling {
+                if let Some(local) = inner.local_node_id {
+                    let behind = inner
+                        .nodes
+                        .values()
+                        .filter(|node| {
+                            node.id != local
+                                && node.alive
+                                && node.replica_role.participates_in_quorum()
+                        })
+                        .any(|node| node.pipeline_state.match_index < leader.applied_index);
+                    if behind {
+                        report.reason = "held_for_a_follower_still_catching_up".to_string();
+                        return Ok(report);
+                    }
+                }
+            }
+            report.triggered = true;
+            report.reason = "applied_log_bytes_threshold".to_string();
+            (true, report)
+        };
+
+        if should_trigger {
+            let snapshot = self.create_snapshot()?;
+
+            // The engines are built HERE, holding NOTHING.
+            //
+            // An install is two halves. The expensive half rebuilds a whole engine from the image
+            // -- every slab written again, the served index read back in, 140 bytes per record per
+            // engine -- and it reads nothing but the snapshot. The cheap half moves one node's
+            // bookkeeping onto that engine. Only the cheap half has to be atomic with the check
+            // that says the node may take the snapshot, so only the cheap half needs the cluster
+            // write guard, which is the half of the lock every `propose` needs. Before this, both
+            // halves ran under it: three whole engine rebuilds and 420,000 slab bytes at 1,000
+            // records, 1,680,000 at 4,000 -- 100% of the install, at both sizes.
+            //
+            // The targets are chosen twice. This first pass only sizes the build: it decides how
+            // many engines to make and for whom, and it is allowed to be wrong.
+            let provisional = {
+                let inner = self.inner.read().expect("raft cluster lock poisoned");
+                install_targets(&inner, snapshot.last_included_index)
+            };
+            #[cfg(test)]
+            self.perform_armed_install_window_interleaving();
+            let mut prebuilt = provisional
+                .iter()
+                .map(|node_id| (*node_id, rebuild_snapshot_engine(&snapshot)))
+                .collect::<Vec<_>>();
+            // The per-node COPY of the image is a pure function of the snapshot for exactly the
+            // same reason the engine is, so it is made here too. One fewer than the targets: the
+            // last install takes the original, which is dropped when the loop ends anyway.
+            let mut spare_images = (1..provisional.len())
+                .map(|_| snapshot.clone())
+                .collect::<Vec<_>>();
+
+            let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+            #[cfg(test)]
+            let _guard_mark = crate::snapshot_probe::GuardMark::new();
+            // And this second pass is the authoritative one, read under the guard the publish
+            // happens under, so nothing it saw can have changed by the time it is acted on. Both
+            // things it reads can move while the engines build: a node's `commit_index` and
+            // `applied_index` advance with every apply, and `alive` is flipped by `set_alive`,
+            // which takes this same write guard. So the set is recomputed rather than carried.
+            //
+            // The direction that matters is one-way. A node that has DROPPED out -- it applied
+            // past the snapshot while the engine was building -- must not be published into:
+            // `publish_snapshot_state` sets `applied_index` back to the snapshot's index rather
+            // than raising it to it, so it would serve a shard that had gone backwards until the
+            // retained entries were applied again. A node that has newly JOINED the set -- it was
+            // dead and was revived -- has no engine waiting for it, and is simply built for here,
+            // under the guard. That arm keeps the installed set exactly what it would have been
+            // without any of this, which is worth more than the rebuild it costs; it is priced and
+            // forced in `a_node_revived_while_the_engines_build_is_still_installed_into`.
+            //
+            // Whatever is left over -- an engine built for a node that has since dropped out, a
+            // spare copy of the image -- is NOT discarded here. `prebuilt` and `spare_images` are
+            // declared above `inner`, so they are dropped after it: freeing a whole engine is
+            // itself work, and it happens once the guard has been released.
+            let targets = install_targets(&inner, snapshot.last_included_index);
+            let mut carried = Some(snapshot);
+            let mut targets = targets.into_iter().peekable();
+            while let Some(node_id) = targets.next() {
+                let is_last = targets.peek().is_none();
+                // Both halves of what this node needs come off the guard where one was built for
+                // it. The `None` arms are the newly-qualified node -- nothing was built for it,
+                // and it is built for here, under the guard, so that WHICH nodes install is the
+                // same set it has always been.
+                let engine = match prebuilt.iter().position(|(id, _)| *id == node_id) {
+                    Some(position) => prebuilt.swap_remove(position).1,
+                    None => rebuild_snapshot_engine(carried.as_ref().expect("held below")),
+                };
+                let Some(held) = carried.as_ref() else {
+                    break;
+                };
+                let for_this_node = if is_last {
+                    carried.take().expect("held above")
+                } else {
+                    spare_images.pop().unwrap_or_else(|| held.clone())
+                };
+                let Some(node) = inner.nodes.get_mut(&node_id) else {
+                    continue;
+                };
+                publish_snapshot_state(node, for_this_node, engine);
+            }
+            inner.persist_configured_wal()?;
+        }
+        Ok(report)
+    }
+
+    /// Perform whatever interleaving a test armed for the window in which the install loop holds
+    /// no cluster guard. Compiled out of everything but the test build.
+    #[cfg(test)]
+    fn perform_armed_install_window_interleaving(&self) {
+        match crate::snapshot_probe::take_install_window() {
+            None => {}
+            Some(crate::snapshot_probe::InstallWindow::ApplyOneMoreEntry) => {
+                let _ = self.propose(Command::StringSet {
+                    key: "an-entry-applied-while-the-engines-build".to_string(),
+                    value: vec![b'z'; 16],
+                });
+            }
+            Some(crate::snapshot_probe::InstallWindow::ReviveNode(node_id)) => {
+                let _ = self.set_alive(node_id, true);
+            }
+        }
+    }
+
+    /// The same, for the window a deployed FOLLOWER's own compaction holds nothing across. A
+    /// follower does not propose -- it learns by RPC -- so the interleaving is delivered as one
+    /// more append, committed, which is what advances its applied index past the watermark.
+    #[cfg(test)]
+    fn perform_armed_follower_window_interleaving(&self, node_id: RaftNodeId, watermark: u64) {
+        let Some(crate::snapshot_probe::InstallWindow::ApplyOneMoreEntry) =
+            crate::snapshot_probe::take_install_window()
+        else {
+            return;
+        };
+        let (term, shard_id, leader_id) = {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            let Some(node) = inner.nodes.get(&node_id) else {
+                return;
+            };
+            (node.current_term, inner.shard_id, inner.leader_id)
+        };
+        let _ = self.receive_append_entries(AppendEntriesRequest {
+            rpc: None,
+            shard_id,
+            term,
+            leader_id,
+            target_id: node_id,
+            prev_log_index: watermark,
+            prev_log_term: term,
+            entries: vec![RaftLogEntry {
+                leader_time_ms: 0,
+                term,
+                index: watermark + 1,
+                shard_id,
+                command: Command::StringSet {
+                    key: "an-entry-applied-while-the-follower-engine-builds".to_string(),
+                    value: vec![b'z'; 16],
+                },
+            }],
+            leader_commit: watermark + 1,
+        });
+    }
+
+    pub async fn publish_leader_snapshot_to_store<O>(
+        &self,
+        snapshot_store: &S3SnapshotStore<O>,
+    ) -> Result<RaftSnapshotPublishReport, RaftError>
+    where
+        O: ObjectStore + 'static,
+    {
+        let snapshot = self.create_snapshot()?;
+        let snapshot_bytes = serde_json::to_vec(&snapshot)
+            .map_err(|err| RaftError::SnapshotEncoding(err.to_string()))?;
+        let last_log_id = format!(
+            "term:{}:index:{}",
+            snapshot.last_included_term, snapshot.last_included_index
+        );
+        let local_snapshot = snapshot_store
+            .create_local_snapshot_with_index_bytes(
+                snapshot.shard_id,
+                last_log_id,
+                Bytes::from(snapshot_bytes),
+            )
+            .await
+            .map_err(|err| RaftError::SnapshotStore(err.to_string()))?;
+        let snapshot_ref = snapshot_store
+            .upload_snapshot(local_snapshot)
+            .await
+            .map_err(|err| RaftError::SnapshotStore(err.to_string()))?;
+        let raft_ref = raft_external_ref_from_snapshot_ref(&snapshot_ref);
+        {
+            let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+            inner.latest_external_snapshot_ref = Some(raft_ref.clone());
+            inner.persist_configured_wal()?;
+        }
+        Ok(RaftSnapshotPublishReport {
+            shard_id: snapshot_ref.shard_id,
+            last_log_index: snapshot_ref.last_log_index,
+            raft_ref,
+            meta_ref: shard_snapshot_ref_from_snapshot_ref(&snapshot_ref),
+        })
+    }
+
+    pub async fn publish_leader_snapshot_and_record_meta<O>(
+        &self,
+        snapshot_store: &S3SnapshotStore<O>,
+        meta: &SingleNodeMeta,
+    ) -> Result<RaftSnapshotPublishReport, RaftError>
+    where
+        O: ObjectStore + 'static,
+    {
+        let report = self
+            .publish_leader_snapshot_to_store(snapshot_store)
+            .await?;
+        let ack = meta.publish_shard_snapshot(PublishShardSnapshotRequest {
+            shard_id: report.shard_id,
+            snapshot: report.meta_ref.clone(),
+        });
+        if ack.status.ok {
+            Ok(report)
+        } else {
+            Err(RaftError::SnapshotStore(format!(
+                "metaserver rejected snapshot ref: {}",
+                ack.status.code
+            )))
+        }
+    }
+
+    pub async fn bootstrap_replica_from_external_snapshot<O>(
+        &self,
+        target_id: RaftNodeId,
+        snapshot_store: &S3SnapshotStore<O>,
+        snapshot_ref: &ShardSnapshotRef,
+        destination: PathBuf,
+    ) -> Result<RaftReplicaBootstrapPlan, RaftError>
+    where
+        O: ObjectStore + 'static,
+    {
+        let local_commit_index = self
+            .hard_state(target_id)
+            .map(|state| state.commit_index)
+            .unwrap_or_default();
+        if snapshot_ref.last_log_index < local_commit_index {
+            return Err(RaftError::StaleSnapshot {
+                snapshot_index: snapshot_ref.last_log_index,
+                local_commit_index,
+            });
+        }
+        let local_snapshot = snapshot_store
+            .download_snapshot_by_uri(&snapshot_ref.uri, destination)
+            .await
+            .map_err(|err| RaftError::SnapshotStore(err.to_string()))?;
+        let snapshot_bytes = tokio::fs::read(&local_snapshot.index_path)
+            .await
+            .map_err(|err| RaftError::SnapshotStore(err.to_string()))?;
+        validate_downloaded_snapshot_ref(
+            self.shard_id(),
+            snapshot_ref,
+            &local_snapshot.manifest,
+            &snapshot_bytes,
+        )?;
+        let mut snapshot = serde_json::from_slice::<RaftSnapshot>(&snapshot_bytes)
+            .map_err(|err| RaftError::SnapshotEncoding(err.to_string()))?;
+        snapshot.external_snapshot_ref = Some(RaftExternalSnapshotRef {
+            uri: snapshot_ref.uri.clone(),
+            checksum: snapshot_ref.checksum.clone(),
+            byte_size: snapshot_ref.byte_size,
+        });
+        // Only two scalars are wanted after the install, so keep those and MOVE the
+        // snapshot rather than copying a downloaded whole-shard image to read them.
+        let snapshot_shard_id = snapshot.shard_id;
+        let last_included_index = snapshot.last_included_index;
+        self.install_snapshot(target_id, snapshot)?;
+        {
+            let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+            inner.latest_external_snapshot_ref = Some(RaftExternalSnapshotRef {
+                uri: snapshot_ref.uri.clone(),
+                checksum: snapshot_ref.checksum.clone(),
+                byte_size: snapshot_ref.byte_size,
+            });
+            inner.persist_configured_wal()?;
+        }
+        self.catch_up(target_id)?;
+        Ok(RaftReplicaBootstrapPlan {
+            shard_id: snapshot_shard_id,
+            target_id,
+            transfer: RaftSnapshotTransferDecision {
+                mode: RaftSnapshotTransferMode::ExternalStore,
+                snapshot_bytes: snapshot_ref.byte_size,
+                threshold_bytes: DEFAULT_EXTERNAL_SNAPSHOT_THRESHOLD_BYTES,
+                external_snapshot_ref: Some(RaftExternalSnapshotRef {
+                    uri: snapshot_ref.uri.clone(),
+                    checksum: snapshot_ref.checksum.clone(),
+                    byte_size: snapshot_ref.byte_size,
+                }),
+            },
+            last_included_index,
+            catch_up_from_index: last_included_index.saturating_add(1),
+        })
+    }
+
+    /// Install `snapshot` onto `node_id`.
+    ///
+    /// The replacement engine is materialised BEFORE the cluster write guard is taken, and the
+    /// applied set with it. That engine is private: `TemporalEngine::default` builds a
+    /// `BlockStore::default`, which allocates its own scratch root per instance, so nothing in
+    /// the process can reach it until it is moved into the node below. Installing slabs into
+    /// it, writing the index base and loading the shard therefore exclude no reader and no
+    /// proposer.
+    ///
+    /// All of that used to run under `inner.write()`. A write guard excludes readers too, so a
+    /// single `propose` from another thread blocked for the length of the whole install -- a
+    /// span sized by the CORPUS (every slab, plus an applied set filled one element per
+    /// committed index) rather than by the cluster. Measured at 8,000 records: another thread's
+    /// wait for this guard went from 667 ms to 7 us, while the install itself takes ~650 ms
+    /// either way. The install did not get faster; it stopped excluding everyone else.
+    ///
+    /// What the guard has to cover is the PUBLISH, and that is the whole of what it covers now.
+    /// The three rejections are re-checked against the state as it is at the moment of the
+    /// swap, because the build ran unguarded and the node's `commit_index` may have advanced
+    /// past the snapshot in between: a snapshot that went stale while its engine was building
+    /// is rejected by the second check exactly as the single-guard version rejected it by the
+    /// first, and the built engine is dropped having touched nothing but its own scratch
+    /// directory. Two concurrent installs each build their own engine and the write guard
+    /// serialises the swap, so the later one either wins outright or is rejected as stale. The
+    /// node's state after the swap is a function of `snapshot` and of those checks alone, never
+    /// of a partially applied build -- the engine is complete before the guard is taken, and
+    /// the swap that publishes it is a single move.
+    pub fn install_snapshot(
+        &self,
+        node_id: RaftNodeId,
+        snapshot: RaftSnapshot,
+    ) -> Result<(), RaftError> {
+        // PREFLIGHT. These three answers depend only on cluster and node scalars, so they are
+        // reachable under the read guard and reject a hopeless snapshot before it costs a build.
+        let shard_id = {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            if snapshot.shard_id != inner.shard_id {
+                return Err(RaftError::SnapshotShardMismatch {
+                    snapshot_shard_id: snapshot.shard_id,
+                    cluster_shard_id: inner.shard_id,
+                });
+            }
+            let node = inner
+                .nodes
+                .get(&node_id)
+                .ok_or(RaftError::NodeNotFound(node_id))?;
+            if snapshot.last_included_index < node.commit_index {
+                return Err(RaftError::StaleSnapshot {
+                    snapshot_index: snapshot.last_included_index,
+                    local_commit_index: node.commit_index,
+                });
+            }
+            inner.shard_id
+        };
+
+        // BUILD, holding NO cluster guard.
+        let engine = build_installed_engine(shard_id, &snapshot)?;
+        let applied = installed_applied_set(&snapshot);
+
+        // PUBLISH.
+        let mut inner = self.inner.write().expect("raft cluster lock poisoned");
+        #[cfg(test)]
+        let _guard_mark = install_probe::GuardMark::new();
+        if snapshot.shard_id != inner.shard_id {
+            return Err(RaftError::SnapshotShardMismatch {
+                snapshot_shard_id: snapshot.shard_id,
+                cluster_shard_id: inner.shard_id,
+            });
+        }
+        let external_snapshot_ref = snapshot.external_snapshot_ref.clone();
+        {
+            let node = inner
+                .nodes
+                .get_mut(&node_id)
+                .ok_or(RaftError::NodeNotFound(node_id))?;
+            // RE-CHECK. The build ran off the guard, so this is the check that decides; the
+            // preflight above only saved the work when the answer was already no.
+            if snapshot.last_included_index < node.commit_index {
+                return Err(RaftError::StaleSnapshot {
+                    snapshot_index: snapshot.last_included_index,
+                    local_commit_index: node.commit_index,
+                });
+            }
+
+            node.engine = engine;
+            // votedFor is per-term (Raft Fig-2): raising the term via a snapshot must clear a
+            // stale vote, else a same-new-term candidate is wrongly rejected as already_voted
+            // (split-vote liveness stall). The receive_install_snapshot RPC wrappers pre-clear
+            // it, but the public install_snapshot / lifecycle / external-bootstrap paths reach
+            // here directly.
+            if snapshot.last_included_term > node.current_term {
+                node.voted_for = None;
+            }
+            node.current_term = node.current_term.max(snapshot.last_included_term);
+            node.commit_index = snapshot.last_included_index;
+            // R8 (§7): only retain the log tail past the snapshot boundary if the local entry
+            // AT the boundary index term-matches the snapshot. If it is absent or from a
+            // divergent term, the entries following it may belong to an uncommitted, superseded
+            // branch — discard the entire log rather than fold a divergent tail onto the
+            // snapshot's state.
+            let boundary_matches = node
+                .log
+                .iter()
+                .find(|entry| entry.index == snapshot.last_included_index)
+                .map(|entry| entry.term == snapshot.last_included_term)
+                .unwrap_or(false);
+            if !boundary_matches {
+                node.log.clear();
+            } else {
+                node.log
+                    .retain(|entry| entry.index > snapshot.last_included_index);
+            }
+            // Built above, off the guard. Filling it here cost one element per COMMITTED INDEX
+            // under the write lock -- an O(history) step inside an install that is otherwise
+            // O(state), and the second-largest thing the guard used to span.
+            node.applied = applied;
+            node.applied_index = snapshot.last_included_index;
+            node.max_applied_index = node.max_applied_index.max(snapshot.last_included_index);
+            node.installed_snapshot = Some(snapshot);
+        }
+        if let Some(snapshot_ref) = external_snapshot_ref {
+            inner.latest_external_snapshot_ref = Some(snapshot_ref);
+        }
+        inner.persist_configured_wal()?;
+        Ok(())
+    }
+
+    pub fn install_snapshot_with_lifecycle_report(
+        &self,
+        node_id: RaftNodeId,
+        snapshot: RaftSnapshot,
+    ) -> RaftSnapshotInstallReport {
+        let before_commit_index = self.commit_index(node_id).unwrap_or_default();
+        let shard_id = snapshot.shard_id;
+        let snapshot_index = snapshot.last_included_index;
+        let mut report = RaftSnapshotInstallReport {
+            shard_id,
+            node_id,
+            snapshot_index,
+            before_commit_index,
+            after_commit_index: before_commit_index,
+            freeze_started: true,
+            flush_completed: false,
+            manifest_verified: false,
+            checksum_verified: false,
+            install_completed: false,
+            tail_replay_completed: false,
+            rollback_performed: false,
+            error: None,
+        };
+
+        let preflight = {
+            let inner = self.inner.read().expect("raft cluster lock poisoned");
+            if snapshot.shard_id != inner.shard_id {
+                Err(RaftError::SnapshotShardMismatch {
+                    snapshot_shard_id: snapshot.shard_id,
+                    cluster_shard_id: inner.shard_id,
+                })
+            } else {
+                inner
+                    .nodes
+                    .get(&node_id)
+                    .ok_or(RaftError::NodeNotFound(node_id))
+                    .and_then(|node| {
+                        if snapshot.last_included_index < node.commit_index {
+                            Err(RaftError::StaleSnapshot {
+                                snapshot_index: snapshot.last_included_index,
+                                local_commit_index: node.commit_index,
+                            })
+                        } else {
+                            Ok(())
+                        }
+                    })
+            }
+        };
+        if let Err(err) = preflight {
+            report.rollback_performed = true;
+            report.error = Some(err.to_string());
+            return report;
+        }
+
+        report.flush_completed = true;
+        report.manifest_verified = true;
+        report.checksum_verified = true;
+        match self.install_snapshot(node_id, snapshot) {
+            Ok(()) => {
+                report.install_completed = true;
+                report.tail_replay_completed = self.catch_up(node_id).is_ok();
+                report.after_commit_index = self.commit_index(node_id).unwrap_or_default();
+            }
+            Err(err) => {
+                report.rollback_performed = true;
+                report.error = Some(err.to_string());
+                report.after_commit_index = self.commit_index(node_id).unwrap_or_default();
+            }
+        }
+        report
+    }
+}
+
+/// Whether a routine snapshot ending at `snapshot_index` may be published into this node.
+///
+/// Three terms, and they fail for three different reasons.
+///
+/// `alive` and the local-node filter are about WHOSE bookkeeping this process owns. A deployed
+/// process owns ONE node and keeps shadows of its peers; installing into a shadow advances its
+/// recorded commit and applied indexes and truncates its log, crediting a follower with a snapshot
+/// it was never sent, so everything downstream that asks how far behind that peer is reads a
+/// fabricated answer. With no local node id -- the in-process cluster, where every entry IS a node
+/// this process runs -- they are all local, as before.
+///
+/// `snapshot_index >= commit_index` and `snapshot_index >= applied_index` are the DIRECTION check,
+/// and they are the reason this is a function rather than a closure in the install loop. Publishing
+/// sets `applied_index` to `snapshot_index` unconditionally rather than raising it, and truncates
+/// the log below it, so a node that has already applied past `snapshot_index` would be moved
+/// BACKWARDS: until the retained entries were applied again it would serve a shard missing writes
+/// it had acknowledged. The two indexes are read separately because only `applied_index` is what
+/// publishing overwrites and only `commit_index` is what the install loop has always filtered on;
+/// asserting one and assuming the other holds is how a check like this stops being one.
+///
+/// This is a pure read of the node, so it costs nothing to evaluate twice -- which is exactly what
+/// the install loop does: once off the guard to size the engine build, and once under the guard
+/// that the publish happens under. Only the second reading decides anything.
+pub(super) fn node_accepts_snapshot(
+    node: &RaftNode,
+    snapshot_index: u64,
+    local_only: Option<RaftNodeId>,
+) -> bool {
+    node.alive
+        && local_only.map_or(true, |local| local == node.id)
+        && snapshot_index >= node.commit_index
+        && snapshot_index >= node.applied_index
+}
+
+/// How many bytes of state image a snapshot may READ for each byte of raft log it DISCARDS.
+///
+/// A snapshot's cost is the whole shard -- the served index plus every live slab -- and what it
+/// discards is the applied log accrued since the previous one. Against a constant accrual
+/// threshold those two quantities have nothing to do with each other, so bytes read per byte
+/// discarded is linear in the store: #1939 measured a snapshot on a 100,000-record store reading
+/// 14,000,140 slab bytes to discard ONE log entry, four times what the whole first snapshot of a
+/// 25,000-record store read, for a four-hundred-thousandth of the work. Requiring the accrual to
+/// reach `last_image_bytes / SNAPSHOT_IMAGE_FRACTION_DIVISOR` before a routine snapshot fires
+/// bounds that figure at the divisor, whatever the shard holds.
+///
+/// It is bought with retained raft log. Between snapshots the log may now stand at
+/// `last_image_bytes / divisor` rather than at the configured floor -- an eighth of the image at 8
+/// -- and it still returns to its floor at every snapshot. That is the trade: the log's
+/// steady-state footprint grows with the shard, and the bytes a shard reads to hold that bound
+/// stop growing with it.
+///
+/// A constant rather than a deployment knob. It is a dimensionless ratio, it is the same at every
+/// size by construction, and the deployment already sets the FLOOR through
+/// `TS_RAFT_MAX_APPLIED_LOG_BYTES`.
+pub const SNAPSHOT_IMAGE_FRACTION_DIVISOR: u64 = 8;
+
+/// The accrual a routine snapshot must have to show for itself: the configured floor, raised so a
+/// snapshot never reads more than `divisor` bytes of state image per byte of applied log it
+/// discards.
+///
+/// `configured_threshold_bytes` is a FLOOR and never a ceiling. A shard whose last image was
+/// smaller than `divisor * configured_threshold_bytes` keeps exactly the cadence it has today --
+/// the relative term can only ever make a snapshot wait for MORE to discard, never fire earlier --
+/// so nothing below the crossover changes behaviour at all.
+///
+/// `last_image_bytes` is the size of the image the PREVIOUS snapshot on this node produced, read
+/// off `installed_snapshot` where that snapshot left it. It is a length already in hand, not a
+/// build: asking the engine for the current image would run exactly the whole-store read this
+/// bound exists to ration, once per background tick instead of once per snapshot. A node that has
+/// never snapshotted has no installed image, reports 0, and leaves the floor deciding -- which is
+/// why the FIRST snapshot on a fresh shard fires precisely when it always did, and only the
+/// routine snapshots after it are paced.
+///
+/// A zero configured floor means "fire on any new applied entry": the comparison it feeds is
+/// `applied_log_bytes < threshold`, which no byte count is ever below at zero. That is how an
+/// operator pins snapshotting to every eligible tick, and the relative term is a `max` against a
+/// quantity that grows without bound, so without this guard it would silently STOP that operator's
+/// snapshots on exactly the largest shards -- the ones they were most likely pinning. A zero in
+/// either position therefore returns the configured value unchanged and leaves the caller the
+/// decision it had. (`can_trigger_snapshot` is the separate switch that turns the path off
+/// entirely, and nothing here reads or overrides it.)
+pub fn effective_max_applied_log_bytes(
+    configured_threshold_bytes: u64,
+    last_image_bytes: u64,
+    divisor: u64,
+) -> u64 {
+    if configured_threshold_bytes == 0 || divisor == 0 {
+        return configured_threshold_bytes;
+    }
+    configured_threshold_bytes.max(last_image_bytes / divisor)
+}
+
+/// The payload size of the state image a node's installed snapshot carries, or 0 when it carries
+/// none -- a node that has never snapshotted, or one whose image was externalised to a snapshot
+/// store and is not held here. Both leave the configured floor deciding on its own.
+fn installed_image_bytes(node: &RaftNode) -> u64 {
+    node.installed_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.state_image.as_ref())
+        .map(|image| image.payload_bytes() as u64)
+        .unwrap_or(0)
+}
+
+/// The nodes a routine snapshot ending at `snapshot_index` would be published into, right now.
+fn install_targets(inner: &RaftClusterInner, snapshot_index: u64) -> Vec<RaftNodeId> {
+    let local_only = inner.local_node_id;
+    inner
+        .nodes
+        .values()
+        .filter(|node| node_accepts_snapshot(node, snapshot_index, local_only))
+        .map(|node| node.id)
+        .collect()
+}
+
+/// Read the served index and THIS SHARD's slabs out of the engine. `None` when the engine
+/// cannot serve some part of it, which sends the caller to the entry-carrying snapshot instead.
+///
+/// The slab set is scoped to `shard_id`. One engine owns a single block store shared by every
+/// shard it hosts -- the append cursor and the slab counter are global to the store -- so
+/// `BlockStore::slab_ids()` answers for the whole NODE and knows nothing of shards. Walking it
+/// built a per-shard snapshot out of every shard's bytes paired with one shard's index: the
+/// image grew with the node's shard count rather than with the shard, and the receiving replica
+/// installed slabs belonging to shards it does not host.
+///
+/// The scope is the shard's LIVE slab set rather than a name or manifest partition, because
+/// there is no partition to read: two shards' blocks can land in the same slab, and such a slab
+/// is carried here for both. That set is already the authority on what a shard's index can
+/// reach -- reclaim DELETES every slab outside the union of it across loaded shards -- so a
+/// slab outside this shard's live set is one the installed index cannot address. The union is
+/// the right basis for deleting (a slab live only in shard B must survive shard A's cycle); a
+/// single shard's set is the right basis for shipping, because the replica receives that shard
+/// alone and its own union is then exactly this set.
+///
+/// Two things keep this from ever shipping less than the index can address. The live set is
+/// INTERSECTED with what the store actually holds, so a synthetic address that is not a slab
+/// file (`HOT_BLOCK_SLAB_ID`, the un-spilled hot-block sentinel, is `u64::MAX`) cannot turn a
+/// readable store into an aborted image. And an empty live set means the shard is not loaded
+/// here and the index came off disk, leaving nothing to scope by, so the whole store is carried
+/// exactly as before.
+pub(super) fn build_state_image(
+    engine: &TemporalEngine,
+    shard_id: ShardId,
+) -> Option<RaftSnapshotStateImage> {
+    let index_bytes = engine.export_index_bytes(shard_id).ok()?;
+    let block_store = engine.block_store();
+    #[cfg(test)]
+    install_probe::note_state_image_build();
+    #[cfg(test)]
+    crate::snapshot_probe::note_image_build();
+    // Read the store's slab set first, so an unreadable store still aborts the image exactly
+    // as it did before rather than silently shipping a scoped subset of nothing.
+    let present = block_store.slab_ids().ok()?;
+    let scoped = engine
+        .live_block_slab_ids(shard_id)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let slab_ids = if scoped.is_empty() {
+        present
+    } else {
+        present
+            .into_iter()
+            .filter(|block_slab_id| scoped.contains(block_slab_id))
+            .collect::<Vec<_>>()
+    };
+    let mut slabs = Vec::with_capacity(slab_ids.len());
+    for block_slab_id in slab_ids {
+        let bytes = block_store.read_slab(block_slab_id).ok()?;
+        slabs.push(RaftSnapshotStateImageSlab {
+            block_slab_id,
+            bytes,
+        });
+    }
+    let (start_routing_bucket, end_routing_bucket) = engine.shard_routing_range(shard_id);
+    Some(RaftSnapshotStateImage {
+        index_bytes,
+        next_block_id: block_store.next_block_id(),
+        slabs,
+        // The range this engine serves the shard on, which is the range the index being shipped
+        // was built on: the same function decides where a write is filed.
+        routing_range: Some(crate::engine::routing_range_stamp::RoutingRangeStamp {
+            start_routing_bucket,
+            end_routing_bucket,
+        }),
+    })
+}
+
+/// Materialise the engine a snapshot installs, holding no cluster guard.
+///
+/// Split out of `install_snapshot` so the build can run before the write guard is taken. The
+/// engine is a fresh `TemporalEngine` over its own scratch block store root and is returned by
+/// value, so it is unreachable by anything else until the caller publishes it.
+fn build_installed_engine(
+    shard_id: ShardId,
+    snapshot: &RaftSnapshot,
+) -> Result<TemporalEngine, RaftError> {
+    let engine = TemporalEngine::default();
+    if let Some(image) = &snapshot.state_image {
+        // S2: reconstruct state from the opaque image (index + slabs) in O(state) -- no
+        // full-history entry replay. Mirrors the shared-store lazy restore: install slabs,
+        // install the served index base, then load the shard so the index is read in.
+        #[cfg(test)]
+        crate::snapshot_probe::note_engine_rebuild();
+        let block_store = engine.block_store();
+        for slab in &image.slabs {
+            #[cfg(test)]
+            install_probe::note_slab_install();
+            block_store
+                .install_slab(slab.block_slab_id, &slab.bytes)
+                .map_err(|err| RaftError::SnapshotEncoding(err.to_string()))?;
+        }
+        // An image with no range cannot be installed: see `RaftSnapshotStateImage::routing_range`.
+        // Refused by name, so the failure says WHAT arrived rather than that a field was missing.
+        let routing_range = image.routing_range.ok_or_else(|| {
+            RaftError::SnapshotEncoding(format!(
+                "snapshot state image for shard {shard_id} carries no routing range, so the buckets \
+                 its index names cannot be accounted for. It was encoded before the range travelled \
+                 with the image; re-take the snapshot from a leader running this build."
+            ))
+        })?;
+        engine
+            .install_index_bytes(shard_id, &image.index_bytes, routing_range)
+            .map_err(|err| RaftError::SnapshotEncoding(err.to_string()))?;
+        engine.load_shard(shard_id);
+    } else {
+        engine.load_shard(shard_id);
+        for entry in &snapshot.entries {
+            // The second entry-carrying snapshot installer. It replays the same entries as
+            // `install_snapshot_state`, so it must resolve deadlines the same way: against
+            // the leader's stamp, not against whenever this install happened to run.
+            engine.execute_raft_apply_at(
+                ExecuteRequest {
+                    shard_id: entry.shard_id,
+                    command: entry.command.clone(),
+                },
+                Some(entry.leader_time_ms),
+            );
+        }
+    }
+    Ok(engine)
+}
+
+/// The applied set a snapshot install leaves behind, built off the cluster guard.
+fn installed_applied_set(snapshot: &RaftSnapshot) -> std::collections::BTreeSet<u64> {
+    let mut applied = std::collections::BTreeSet::new();
+    if snapshot.state_image.is_some() {
+        // The image carries no entries, so seed the applied set from the covered index
+        // range (mirrors the existing snapshot-install applied-set fill in raft.rs), so
+        // `applied_index`-derived accounting stays consistent with the entry-carrying path.
+        // The range is INCLUSIVE of `last_included_index`: that index IS applied -- it is the
+        // index the snapshot is taken AT, not one past the end -- and `applied_index` is set
+        // to it immediately below, so an exclusive range leaves the set one short of the
+        // scalar that is supposed to summarise it.
+        #[cfg(test)]
+        install_probe::note_applied_fill(snapshot.last_included_index);
+        applied.extend(1..=snapshot.last_included_index);
+    } else {
+        applied.extend(snapshot.entries.iter().map(|entry| entry.index));
+    }
+    applied
+}
+
+/// Counted instrumentation for what an install does, and for WHERE it does it.
+///
+/// Every counter is thread-local. An install runs on its caller's thread, so a test reads only
+/// its own work and a test running in parallel cannot pollute it -- which a process-global
+/// counter could not promise. `GuardMark` is armed for exactly the span in which this thread
+/// holds the cluster write guard and disarms in `Drop`, so no early return can leave it set and
+/// attribute later work to a guard that is no longer held.
+#[cfg(test)]
+pub(crate) mod install_probe {
+    use std::cell::Cell;
+    use std::thread::LocalKey;
+
+    thread_local! {
+        static UNDER_GUARD: Cell<bool> = Cell::new(false);
+        static SLABS_TOTAL: Cell<u64> = Cell::new(0);
+        static SLABS_UNDER_GUARD: Cell<u64> = Cell::new(0);
+        static APPLIED_TOTAL: Cell<u64> = Cell::new(0);
+        static APPLIED_UNDER_GUARD: Cell<u64> = Cell::new(0);
+        static STATE_IMAGE_BUILDS: Cell<u64> = Cell::new(0);
+    }
+
+    pub(crate) struct GuardMark;
+
+    impl GuardMark {
+        pub(crate) fn new() -> Self {
+            UNDER_GUARD.with(|flag| flag.set(true));
+            Self
+        }
+    }
+
+    impl Drop for GuardMark {
+        fn drop(&mut self) {
+            UNDER_GUARD.with(|flag| flag.set(false));
+        }
+    }
+
+    fn bump(counter: &'static LocalKey<Cell<u64>>, by: u64) {
+        counter.with(|value| value.set(value.get().saturating_add(by)));
+    }
+
+    fn under_guard() -> bool {
+        UNDER_GUARD.with(|flag| flag.get())
+    }
+
+    pub(crate) fn note_slab_install() {
+        bump(&SLABS_TOTAL, 1);
+        if under_guard() {
+            bump(&SLABS_UNDER_GUARD, 1);
+        }
+    }
+
+    pub(crate) fn note_applied_fill(count: u64) {
+        bump(&APPLIED_TOTAL, count);
+        if under_guard() {
+            bump(&APPLIED_UNDER_GUARD, count);
+        }
+    }
+
+    pub(crate) fn note_state_image_build() {
+        bump(&STATE_IMAGE_BUILDS, 1);
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct Counts {
+        pub(crate) slabs_total: u64,
+        pub(crate) slabs_under_guard: u64,
+        pub(crate) applied_total: u64,
+        pub(crate) applied_under_guard: u64,
+        pub(crate) state_image_builds: u64,
+    }
+
+    pub(crate) fn reset() {
+        SLABS_TOTAL.with(|value| value.set(0));
+        SLABS_UNDER_GUARD.with(|value| value.set(0));
+        APPLIED_TOTAL.with(|value| value.set(0));
+        APPLIED_UNDER_GUARD.with(|value| value.set(0));
+        STATE_IMAGE_BUILDS.with(|value| value.set(0));
+    }
+
+    pub(crate) fn counts() -> Counts {
+        Counts {
+            slabs_total: SLABS_TOTAL.with(|value| value.get()),
+            slabs_under_guard: SLABS_UNDER_GUARD.with(|value| value.get()),
+            applied_total: APPLIED_TOTAL.with(|value| value.get()),
+            applied_under_guard: APPLIED_UNDER_GUARD.with(|value| value.get()),
+            state_image_builds: STATE_IMAGE_BUILDS.with(|value| value.get()),
+        }
+    }
+}
+
+fn state_image_snapshot_at(
+    shard_id: ShardId,
+    leader: &RaftNode,
+    watermark: u64,
+    image: RaftSnapshotStateImage,
+) -> RaftSnapshot {
+    // Term AT the applied watermark, derived from the log/installed snapshot (entries are
+    // dropped, so it cannot come from entries.last()).
+    let last_included_term = leader
+        .log
+        .iter()
+        .find(|entry| entry.index == watermark)
+        .map(|entry| entry.term)
+        .or_else(|| {
+            leader.installed_snapshot.as_ref().and_then(|snap| {
+                (snap.last_included_index == watermark).then_some(snap.last_included_term)
+            })
+        })
+        .unwrap_or(leader.current_term);
+    RaftSnapshot {
+        shard_id,
+        last_included_term,
+        last_included_index: watermark,
+        external_snapshot_ref: None,
+        entries: Vec::new(),
+        state_image: Some(image),
+        state_image_externalized: false,
+    }
+}
