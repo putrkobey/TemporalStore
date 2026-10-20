@@ -581,3 +581,586 @@ mod tests {
     fn resolve(available: bool, pairs: &[(&str, &str)]) -> StorageBackend {
         StorageBackendConfig::from_parts(available, &getter(pairs)).resolve()
     }
+
+    #[test]
+    fn no_config_falls_back_to_raft() {
+        // Matches the historical default and keeps the path opt-in.
+        assert_eq!(resolve(false, &[]), StorageBackend::RaftReplication);
+        assert_eq!(
+            StorageBackendConfig::from_parts(false, &getter(&[])).replication_mode(),
+            ReplicationMode::Raft
+        );
+    }
+
+    #[test]
+    fn matrixobject_wins_when_available_even_with_shared_dir() {
+        let backend = resolve(
+            true,
+            &[
+                (TS_SHARED_STORE_DIR, "/mnt/shared"),
+                (TS_MATRIXOBJECT_BUCKET, "prod-bucket"),
+                (TS_SHARED_STORE_CLUSTER_ID, "cluster-7"),
+            ],
+        );
+        assert_eq!(
+            backend,
+            StorageBackend::MatrixObject {
+                bucket: "prod-bucket".to_string(),
+                cluster_id: "cluster-7".to_string(),
+                store_dir: PathBuf::from(DEFAULT_MATRIXOBJECT_STORE_DIR),
+            }
+        );
+        assert_eq!(backend.replication_mode(), ReplicationMode::SharedStore);
+        assert!(backend.is_shared_storage());
+    }
+
+    #[test]
+    fn shared_path_used_when_matrixobject_absent_but_dir_configured() {
+        let backend = resolve(false, &[(TS_SHARED_STORE_DIR, "/mnt/shared")]);
+        assert_eq!(
+            backend,
+            StorageBackend::SharedPath {
+                root: PathBuf::from("/mnt/shared"),
+                cluster_id: DEFAULT_SHARED_STORE_CLUSTER_ID.to_string(),
+            }
+        );
+        assert_eq!(backend.replication_mode(), ReplicationMode::SharedStore);
+    }
+
+    #[test]
+    fn default_matrixobject_bucket_when_unset() {
+        let backend = resolve(true, &[]);
+        assert_eq!(
+            backend,
+            StorageBackend::MatrixObject {
+                bucket: DEFAULT_MATRIXOBJECT_BUCKET.to_string(),
+                cluster_id: DEFAULT_SHARED_STORE_CLUSTER_ID.to_string(),
+                store_dir: PathBuf::from(DEFAULT_MATRIXOBJECT_STORE_DIR),
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_raft_override_beats_all_shared_config() {
+        let backend = resolve(
+            true,
+            &[
+                (TS_STORAGE_BACKEND, "raft"),
+                (TS_SHARED_STORE_DIR, "/mnt/shared"),
+            ],
+        );
+        assert_eq!(backend, StorageBackend::RaftReplication);
+    }
+
+    #[test]
+    fn explicit_shared_override_prefers_path_over_matrixobject() {
+        let backend = resolve(
+            true,
+            &[
+                (TS_STORAGE_BACKEND, "shared"),
+                (TS_SHARED_STORE_DIR, "/mnt/shared"),
+            ],
+        );
+        assert_eq!(
+            backend,
+            StorageBackend::SharedPath {
+                root: PathBuf::from("/mnt/shared"),
+                cluster_id: DEFAULT_SHARED_STORE_CLUSTER_ID.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn explicit_shared_override_without_dir_falls_back_to_auto() {
+        // Asked for shared but nothing configured: still pick best available
+        // (matrixobject here) rather than a broken shared-path.
+        assert_eq!(
+            resolve(true, &[(TS_STORAGE_BACKEND, "shared")]),
+            StorageBackend::MatrixObject {
+                bucket: DEFAULT_MATRIXOBJECT_BUCKET.to_string(),
+                cluster_id: DEFAULT_SHARED_STORE_CLUSTER_ID.to_string(),
+                store_dir: PathBuf::from(DEFAULT_MATRIXOBJECT_STORE_DIR),
+            }
+        );
+        // ...and raft when nothing at all is available.
+        assert_eq!(
+            resolve(false, &[(TS_STORAGE_BACKEND, "shared")]),
+            StorageBackend::RaftReplication
+        );
+    }
+
+    #[test]
+    fn matrixobject_override_without_feature_falls_back() {
+        // Override asks for matrixobject but the feature isn't compiled: fall
+        // through to the next best (configured shared path, else raft).
+        assert_eq!(
+            resolve(
+                false,
+                &[
+                    (TS_STORAGE_BACKEND, "matrixobject"),
+                    (TS_SHARED_STORE_DIR, "/mnt/shared"),
+                ],
+            ),
+            StorageBackend::SharedPath {
+                root: PathBuf::from("/mnt/shared"),
+                cluster_id: DEFAULT_SHARED_STORE_CLUSTER_ID.to_string(),
+            }
+        );
+        assert_eq!(
+            resolve(false, &[(TS_STORAGE_BACKEND, "matrixobject")]),
+            StorageBackend::RaftReplication
+        );
+    }
+
+    #[test]
+    fn blank_and_unknown_values_are_ignored() {
+        // Blank bucket/dir/override behave as unset.
+        let backend = resolve(
+            true,
+            &[
+                (TS_STORAGE_BACKEND, "   "),
+                (TS_MATRIXOBJECT_BUCKET, "  "),
+                (TS_SHARED_STORE_DIR, ""),
+            ],
+        );
+        assert_eq!(
+            backend,
+            StorageBackend::MatrixObject {
+                bucket: DEFAULT_MATRIXOBJECT_BUCKET.to_string(),
+                cluster_id: DEFAULT_SHARED_STORE_CLUSTER_ID.to_string(),
+                store_dir: PathBuf::from(DEFAULT_MATRIXOBJECT_STORE_DIR),
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn build_shared_object_store_maps_backends() {
+        // Raft => no shared store.
+        assert!(StorageBackend::RaftReplication
+            .build_shared_object_store()
+            .unwrap()
+            .is_none());
+        // SharedPath => a usable FileObjectStore rooted at the configured dir.
+        let dir = tempfile::tempdir().unwrap();
+        let store = StorageBackend::SharedPath {
+            root: dir.path().to_path_buf(),
+            cluster_id: "c".to_string(),
+        }
+        .build_shared_object_store()
+        .unwrap()
+        .expect("shared path yields an object store");
+        store
+            .put("probe", bytes::Bytes::from_static(b"ok"))
+            .await
+            .unwrap();
+        assert_eq!(&store.get("probe").await.unwrap()[..], b"ok");
+    }
+
+    #[test]
+    fn describe_is_stable_and_readable() {
+        assert_eq!(
+            StorageBackend::RaftReplication.describe(),
+            "raft-replication"
+        );
+        assert!(resolve(true, &[])
+            .describe()
+            .starts_with("shared-storage:matrixobject"));
+    }
+
+    // ---- auto / reachability-probe decision table --------------------------
+
+    use std::cell::Cell;
+
+    fn decide(
+        available: bool,
+        pairs: &[(&str, &str)],
+        probe: &ReachabilityProbe<'_>,
+    ) -> BackendDecision {
+        StorageBackendConfig::from_parts(available, &getter(pairs)).resolve_decision_with_probe(probe)
+    }
+
+    #[test]
+    fn auto_endpoint_reachable_selects_matrixobject() {
+        let d = decide(
+            true,
+            &[(TS_MATRIXOBJECT_ENDPOINT, "http://obj:17200")],
+            &|_: &str| true,
+        );
+        assert_eq!(
+            d.backend,
+            StorageBackend::MatrixObject {
+                bucket: DEFAULT_MATRIXOBJECT_BUCKET.to_string(),
+                cluster_id: DEFAULT_SHARED_STORE_CLUSTER_ID.to_string(),
+                store_dir: PathBuf::from(DEFAULT_MATRIXOBJECT_STORE_DIR),
+            }
+        );
+        assert!(d.reason.contains("reachable"), "reason: {}", d.reason);
+        assert_eq!(d.replication_mode(), ReplicationMode::SharedStore);
+    }
+
+    #[test]
+    fn auto_endpoint_unreachable_downgrades_to_shared_dir() {
+        let d = decide(
+            true,
+            &[
+                (TS_MATRIXOBJECT_ENDPOINT, "obj:17200"),
+                (TS_SHARED_STORE_DIR, "/mnt/shared"),
+            ],
+            &|_: &str| false,
+        );
+        assert_eq!(
+            d.backend,
+            StorageBackend::SharedPath {
+                root: PathBuf::from("/mnt/shared"),
+                cluster_id: DEFAULT_SHARED_STORE_CLUSTER_ID.to_string(),
+            }
+        );
+        assert!(d.reason.contains("UNREACHABLE"), "reason: {}", d.reason);
+        assert!(d.reason.contains("downgraded"), "reason: {}", d.reason);
+    }
+
+    #[test]
+    fn auto_endpoint_unreachable_no_shared_dir_downgrades_to_raft() {
+        let d = decide(
+            true,
+            &[(TS_MATRIXOBJECT_ENDPOINT, "obj:17200")],
+            &|_: &str| false,
+        );
+        assert_eq!(d.backend, StorageBackend::RaftReplication);
+        assert!(d.reason.contains("UNREACHABLE"), "reason: {}", d.reason);
+    }
+
+    #[test]
+    fn auto_no_endpoint_selects_node_local_matrixobject() {
+        // Feature available but no endpoint configured: historical node-local
+        // behavior, and the probe must never be consulted.
+        let d = decide(true, &[], &|_: &str| panic!("probe must not run without an endpoint"));
+        assert!(matches!(d.backend, StorageBackend::MatrixObject { .. }));
+        assert!(d.reason.contains("node-local"), "reason: {}", d.reason);
+    }
+
+    #[test]
+    fn auto_endpoint_ignored_when_feature_absent() {
+        // No matrixobject feature: endpoint is irrelevant, pick shared-dir, and
+        // never probe (nothing to probe).
+        let d = decide(
+            false,
+            &[
+                (TS_MATRIXOBJECT_ENDPOINT, "obj:17200"),
+                (TS_SHARED_STORE_DIR, "/mnt/shared"),
+            ],
+            &|_: &str| panic!("probe must not run when matrixobject is unavailable"),
+        );
+        assert_eq!(
+            d.backend,
+            StorageBackend::SharedPath {
+                root: PathBuf::from("/mnt/shared"),
+                cluster_id: DEFAULT_SHARED_STORE_CLUSTER_ID.to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn forced_matrixobject_override_skips_probe() {
+        // Explicit override forces matrixobject even with an endpoint that would
+        // fail a probe — the probe must not be called.
+        let d = decide(
+            true,
+            &[
+                (TS_STORAGE_BACKEND, "matrixobject"),
+                (TS_MATRIXOBJECT_ENDPOINT, "obj:17200"),
+            ],
+            &|_: &str| panic!("forced override must skip the probe"),
+        );
+        assert!(matches!(d.backend, StorageBackend::MatrixObject { .. }));
+        assert!(d.reason.contains("forced"), "reason: {}", d.reason);
+    }
+
+    #[test]
+    fn auto_probe_called_exactly_once_with_endpoint() {
+        let calls = Cell::new(0u32);
+        let seen = Cell::new(String::new());
+        let probe = |endpoint: &str| {
+            calls.set(calls.get() + 1);
+            seen.set(endpoint.to_string());
+            true
+        };
+        let d = decide(true, &[(TS_MATRIXOBJECT_ENDPOINT, "obj:9999")], &probe);
+        assert!(matches!(d.backend, StorageBackend::MatrixObject { .. }));
+        assert_eq!(calls.get(), 1);
+        assert_eq!(seen.take(), "obj:9999");
+    }
+
+    #[test]
+    fn parse_endpoint_host_port_forms() {
+        assert_eq!(
+            parse_endpoint_host_port("http://host:17200"),
+            Some(("host".to_string(), 17200))
+        );
+        assert_eq!(
+            parse_endpoint_host_port("host:1234/some/path?q=1"),
+            Some(("host".to_string(), 1234))
+        );
+        assert_eq!(
+            parse_endpoint_host_port("bare-host"),
+            Some(("bare-host".to_string(), DEFAULT_OBJECT_STORE_PORT))
+        );
+        assert_eq!(
+            parse_endpoint_host_port("matrixobject://obj.internal"),
+            Some(("obj.internal".to_string(), DEFAULT_OBJECT_STORE_PORT))
+        );
+        assert_eq!(parse_endpoint_host_port("   "), None);
+        assert_eq!(parse_endpoint_host_port("host:notaport"), None);
+    }
+
+    #[test]
+    fn default_endpoint_probe_detects_open_and_closed_ports() {
+        use std::net::TcpListener;
+        // Bound, listening port -> reachable.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let endpoint = format!("127.0.0.1:{}", addr.port());
+        assert!(default_endpoint_probe(&endpoint));
+        // Closed port (drop the listener first) -> unreachable.
+        let closed = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
+        assert!(!default_endpoint_probe(&format!("127.0.0.1:{closed}")));
+        // Unparseable endpoint -> unreachable.
+        assert!(!default_endpoint_probe("   "));
+    }
+}
+
+#[cfg(test)]
+mod disk_cache_tier_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn shared_path() -> StorageBackend {
+        StorageBackend::SharedPath {
+            root: PathBuf::from("/mnt/shared"),
+            cluster_id: "c".to_string(),
+        }
+    }
+
+    fn matrixobject() -> StorageBackend {
+        StorageBackend::MatrixObject {
+            bucket: "b".to_string(),
+            cluster_id: "c".to_string(),
+            store_dir: PathBuf::from(DEFAULT_MATRIXOBJECT_STORE_DIR),
+        }
+    }
+
+    #[test]
+    fn shared_storage_keeps_the_disk_tier_and_local_storage_does_not() {
+        std::env::remove_var("TS_CACHE_DISK_TIER");
+        // Both halves asserted: a rule that only ever answered "false" would still satisfy the
+        // half this change is motivated by.
+        assert!(matrixobject().wants_disk_cache_tier());
+        assert!(shared_path().wants_disk_cache_tier());
+        assert!(!StorageBackend::RaftReplication.wants_disk_cache_tier());
+    }
+
+    #[test]
+    fn one_box_with_nothing_configured_gets_no_disk_tier() {
+        // With nothing configured the resolver returns RaftReplication -- the backend a single
+        // box and a raft node both land on -- so both run memory + their own disk.
+        std::env::remove_var("TS_CACHE_DISK_TIER");
+        let resolved = StorageBackendConfig::default().resolve();
+        assert_eq!(resolved, StorageBackend::RaftReplication);
+        assert!(!resolved.wants_disk_cache_tier());
+    }
+
+    #[test]
+    fn the_operator_override_wins_in_both_directions() {
+        std::env::set_var("TS_CACHE_DISK_TIER", "0");
+        assert!(!matrixobject().wants_disk_cache_tier());
+        std::env::set_var("TS_CACHE_DISK_TIER", "1");
+        assert!(StorageBackend::RaftReplication.wants_disk_cache_tier());
+        // An empty value must not be read as "off" -- it means "unset".
+        std::env::set_var("TS_CACHE_DISK_TIER", "");
+        assert!(!StorageBackend::RaftReplication.wants_disk_cache_tier());
+        assert!(matrixobject().wants_disk_cache_tier());
+        std::env::remove_var("TS_CACHE_DISK_TIER");
+    }
+}
+
+/// Env var: force the standalone/distributed topology explicitly.
+pub const TS_STANDALONE: &str = "TS_STANDALONE";
+/// Env var: opt into the distributed topology without naming a metaserver.
+pub const TS_DISTRIBUTED: &str = "TS_DISTRIBUTED";
+
+/// Values of `TS_META_ADDR` that name no metaserver at all.
+const META_ADDR_SENTINELS: [&str; 5] = ["", "local", "none", "standalone", "off"];
+
+/// Truthy exactly as the datanode has always read these flags.
+/// Is this node running as a **single node** - no metaserver, no peers?
+///
+/// This is the one implementation of that rule. The datanode decides whether to
+/// register with a metaserver from it, and [`DeploymentProfile`] names the node
+/// from it. A second copy would let the name in the log drift away from the
+/// topology it claims to describe, which is the failure this function exists to
+/// make impossible.
+///
+/// Single-node is the default: a fresh datanode with no configuration is one
+/// box. A node opts into the distributed topology with a real `TS_META_ADDR` or
+/// `TS_DISTRIBUTED=1`; `TS_STANDALONE` forces the answer and wins over both.
+pub fn single_node(meta_addr_raw: Option<&str>) -> bool {
+    let meta_addr_is_real = meta_addr_raw
+        .map(|value| !META_ADDR_SENTINELS.contains(&value.trim().to_ascii_lowercase().as_str()))
+        .unwrap_or(false);
+    match std::env::var(TS_STANDALONE)
+        .ok()
+        .map(|value| value.trim().to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("1") | Some("true") | Some("yes") | Some("on") => true,
+        Some("0") | Some("false") | Some("no") | Some("off") => false,
+        _ => !(meta_addr_is_real || crate::env_flag::env_bool(TS_DISTRIBUTED, false)),
+    }
+}
+
+/// The **shape** a node is deployed in, as distinct from [`StorageBackend`],
+/// which says where durable bytes live.
+///
+/// The two are not the same axis, and conflating them is why a single process
+/// used to announce itself as `raft-replication`: one box and a raft member
+/// resolve to the same backend and hold the same tiers (memory plus this node's
+/// own disk), and differ in how many nodes there are. Shared storage is the
+/// only profile that adds a tier, because it is the only one with a distance
+/// between a node and the authoritative copy.
+///
+/// Derived, never configured. A profile an operator could set independently of
+/// the topology would be a second source of truth able to disagree with the one
+/// the node is actually running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeploymentProfile {
+    /// One node, one process, no metaserver and no peers.
+    OneBox,
+    /// Several nodes, each holding its own durable copy, kept in step by the
+    /// raft log. This is what scaling out means by default here - shared
+    /// storage is the opt-in, raft is what a distributed node gets otherwise.
+    Raft,
+    /// Several nodes over one authoritative shared store.
+    SharedStorage,
+}
+
+impl DeploymentProfile {
+    /// Name the deployment from the backend it resolved and whether it stands alone.
+    pub fn resolve(backend: &StorageBackend, single_node: bool) -> Self {
+        match backend {
+            StorageBackend::MatrixObject { .. } | StorageBackend::SharedPath { .. } => {
+                Self::SharedStorage
+            }
+            StorageBackend::RaftReplication if single_node => Self::OneBox,
+            StorageBackend::RaftReplication => Self::Raft,
+        }
+    }
+
+    /// Short stable name, for logs and `/metrics`.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::OneBox => "one-box",
+            Self::Raft => "raft",
+            Self::SharedStorage => "shared-storage",
+        }
+    }
+
+    /// The tiers this profile actually keeps bytes in - the operator-facing
+    /// statement of what storage it needs provisioned.
+    pub fn durable_tiers(&self) -> &'static str {
+        match self {
+            Self::OneBox | Self::Raft => "memory + local disk",
+            Self::SharedStorage => "memory + local disk + shared store (disk cache tier)",
+        }
+    }
+
+    /// Does this profile span more than one node?
+    pub fn is_scaled(&self) -> bool {
+        !matches!(self, Self::OneBox)
+    }
+}
+
+#[cfg(test)]
+mod deployment_profile_tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn shared_path() -> StorageBackend {
+        StorageBackend::SharedPath {
+            root: PathBuf::from("/srv/shared"),
+            cluster_id: "temporalstore".to_string(),
+        }
+    }
+
+    #[test]
+    fn one_node_on_raft_is_a_one_box_not_a_raft_cluster() {
+        let profile = DeploymentProfile::resolve(&StorageBackend::RaftReplication, true);
+        assert_eq!(profile, DeploymentProfile::OneBox);
+        assert!(!profile.is_scaled());
+    }
+
+    #[test]
+    fn several_nodes_on_raft_are_the_scaled_default() {
+        let profile = DeploymentProfile::resolve(&StorageBackend::RaftReplication, false);
+        assert_eq!(profile, DeploymentProfile::Raft);
+        assert!(profile.is_scaled());
+    }
+
+    #[test]
+    fn shared_storage_stays_shared_storage_whatever_the_node_count() {
+        for alone in [true, false] {
+            assert_eq!(
+                DeploymentProfile::resolve(&shared_path(), alone),
+                DeploymentProfile::SharedStorage
+            );
+        }
+    }
+
+    #[test]
+    fn only_shared_storage_asks_for_a_third_tier() {
+        assert_eq!(
+            DeploymentProfile::OneBox.durable_tiers(),
+            DeploymentProfile::Raft.durable_tiers()
+        );
+        assert_ne!(
+            DeploymentProfile::SharedStorage.durable_tiers(),
+            DeploymentProfile::Raft.durable_tiers()
+        );
+    }
+
+    #[test]
+    fn the_tiers_a_profile_names_are_the_tiers_the_backend_builds() {
+        // The profile's operator-facing sentence and wants_disk_cache_tier() must
+        // agree, or a deploy script provisions storage the node never opens.
+        let cases = [
+            (StorageBackend::RaftReplication, true),
+            (StorageBackend::RaftReplication, false),
+            (shared_path(), false),
+        ];
+        for (backend, alone) in cases {
+            let profile = DeploymentProfile::resolve(&backend, alone);
+            let names_shared = profile.durable_tiers().contains("shared store");
+            assert_eq!(
+                names_shared,
+                matches!(profile, DeploymentProfile::SharedStorage),
+                "{} named the wrong tiers",
+                profile.describe()
+            );
+        }
+    }
+
+    #[test]
+    fn a_sentinel_meta_addr_is_not_a_metaserver() {
+        for sentinel in ["", "local", "none", "standalone", "off", " LOCAL "] {
+            assert!(
+                META_ADDR_SENTINELS.contains(&sentinel.trim().to_ascii_lowercase().as_str()),
+                "{sentinel:?} should name no metaserver"
+            );
+        }
+        assert!(!META_ADDR_SENTINELS.contains(&"10.0.0.4:17001"));
+    }
+}
