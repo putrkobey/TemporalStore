@@ -783,3 +783,1574 @@ pub(crate) fn item_from_proto(
     }
 }
 
+/// WHETHER THIS RECORD'S LEADER CLOCK STAMP HAS A READER.
+///
+/// `metadata.timestamp_ms` is the leader's wall clock at the moment of the write, and on the
+/// branch that RE-EXECUTES a command it is load-bearing. `engine::lifecycle`'s replay loop pins
+/// the thread clock to it before executing, so a relative TTL in the command resolves to the
+/// deadline the leader logged rather than to one extended by the restart clock -- the comment on
+/// that line calls it "resolve-then-log", and `wal_replay_reads_an_unstamped_record_against_the_live_clock`
+/// holds both halves of the rule.
+///
+/// A RECORD CARRYING OUTCOMES NEVER REACHES THAT LINE. The same loop installs the recorded items
+/// and `continue`s above `set_replay_clock_ms`, because an installed outcome already carries the
+/// absolute deadline the leader resolved; nothing about it is re-derived from a clock. So on the
+/// shape this log writes by default -- `append_outcomes_locked` sets no command at all, "the items
+/// say what the batch did" -- the stamp was six or seven fsynced bytes per append with no reader.
+///
+/// # WHY THIS NEEDS NO FORMAT MARKER AND NO MIGRATION
+///
+/// Absence already has a defined meaning that is already implemented. The decoder copies this
+/// field verbatim, so an omitted stamp arrives as zero, and the replay loop reads a zero as "this
+/// record never carried one, leave the live clock in charge" -- `.filter(|stamp| *stamp > 0)`,
+/// added for records written before the log carried a stamp. A record written by this build is
+/// therefore read correctly by a build that predates this change, and one written before it keeps
+/// its stamp and is read as it always was.
+///
+/// # WHAT WOULD MAKE THIS WRONG
+///
+/// Replay starting to resolve anything against the clock on the OUTCOME branch. The guard for
+/// that is `only_the_shape_that_re_executes_carries_the_leader_stamp`, which asserts both arms:
+/// the stamp present where it is read and absent where it is not. If that test fails because
+/// replay has changed, this function is the thing to change, not the test.
+pub(crate) fn leader_stamp_has_a_reader(record: &WriteAheadLogRecord) -> bool {
+    record.outcomes.is_empty()
+}
+
+fn metadata_to_proto(
+    metadata: &WriteAheadLogRecordMetadata,
+    stamp_has_a_reader: bool,
+) -> Result<v1::EngineWalMetadata, String> {
+    // The descriptive item list travels verbatim rather than field by field. It is off by default,
+    // every field of it is derived from the command beside it, and modelling it would risk losing
+    // one for no measurable saving.
+    let items = if metadata.items.is_empty() {
+        Vec::new()
+    } else {
+        vec![v1::EngineWalItem {
+            item_kind: 0,
+            model: 0,
+            object_key: None,
+            bucket_id: None,
+            object_id: None,
+            block_id: None,
+            ttl_ms: None,
+            deleted: false,
+            meta_log: false,
+            block_log: false,
+            component: None,
+            block: None,
+            value: Some(serde_json::to_vec(&metadata.items).map_err(|err| err.to_string())?),
+            kind_name: Some(String::from("__verbatim_items")),
+            kind_code: None,
+            routing_bucket: None,
+            timestamp_ms: None,
+            entry_id: None,
+            object_deleted: false,
+        }]
+    };
+    Ok(v1::EngineWalMetadata {
+        // Omitted while it is the current version, which is exactly what the record's own serde
+        // form already does: "a record that does not say otherwise is current". The binary form
+        // said it on every record, so one encoding of a record stated something the other left
+        // out. `version` is a plain proto3 field, so a zero is not written at all.
+        version: if metadata.version == crate::wal::WRITE_AHEAD_LOG_FORMAT_VERSION {
+            0
+        } else {
+            metadata.version
+        },
+        // Written only where replay reads it. See [`leader_stamp_has_a_reader`]: a plain proto3
+        // field, so a zero is not written at all, and a zero is already read as "no stamp".
+        timestamp_ms: if stamp_has_a_reader {
+            metadata.timestamp_ms
+        } else {
+            0
+        },
+        items,
+        batch_id: metadata.batch_id,
+        batch_size: metadata.batch_size,
+        batch_index: metadata.batch_index,
+    })
+}
+
+fn metadata_from_proto(
+    metadata: v1::EngineWalMetadata,
+) -> Result<WriteAheadLogRecordMetadata, String> {
+    let items = match metadata.items.into_iter().next() {
+        Some(carried) if carried.kind_name.as_deref() == Some("__verbatim_items") => {
+            serde_json::from_slice(&carried.value.unwrap_or_default())
+                .map_err(|err| err.to_string())?
+        }
+        _ => Vec::new(),
+    };
+    Ok(WriteAheadLogRecordMetadata {
+        // Absent means current, the reading half of the rule above. No record has ever been
+        // written with a zero here, so nothing legitimate is being read as current.
+        version: if metadata.version == 0 {
+            crate::wal::WRITE_AHEAD_LOG_FORMAT_VERSION
+        } else {
+            metadata.version
+        },
+        timestamp_ms: metadata.timestamp_ms,
+        items,
+        batch_id: metadata.batch_id,
+        batch_size: metadata.batch_size,
+        batch_index: metadata.batch_index,
+    })
+}
+
+/// The record split into the part written by hand and the part left to the generated encoder.
+///
+/// Fields one to three are written here; four to six are still a `prost` message. The split is
+/// what lets the command borrow: only the command carries a payload worth not copying, and it is
+/// the one field the generated encoder cannot be handed a borrow of.
+struct RecordParts<'a> {
+    command: Option<crate::raft::wal_proto::CommandEncoding<'a>>,
+    /// The outcome items, derived from the record but not copied out of it.
+    items: Vec<DerivedItem<'a>>,
+    /// Fields four to six only. proto3 omits a scalar holding its default and `command` is None,
+    /// so encoding this writes the tail and nothing else -- which is why the bytes come out in
+    /// tag order and identical to encoding the whole record at once.
+    tail: v1::EngineWalRecord,
+    len: usize,
+}
+
+fn record_parts(record: &WriteAheadLogRecord) -> Result<RecordParts<'_>, String> {
+    let command = match record.command.as_ref() {
+        Some(command) => Some(
+            crate::raft::wal_proto::command_encoding(command).map_err(|err| err.to_string())?,
+        ),
+        None => None,
+    };
+    let tail = v1::EngineWalRecord {
+        shard_id: 0,
+        sequence: 0,
+        command: None,
+        metadata: record
+            .metadata
+            .as_ref()
+            .map(|metadata| metadata_to_proto(metadata, leader_stamp_has_a_reader(record)))
+            .transpose()?,
+        // Written by hand below, from the outcomes themselves, for the reason the staged blocks
+        // are: filling this copied every outcome's `value` into a proto message before the encoder
+        // copied it again into the frame, and the bytes allocated per append tracked the outcome
+        // value one for one. `the_hand_written_item_is_the_same_item` holds the hand-written form
+        // against this one -- which the test helper `owned_bytes` still builds -- byte for byte.
+        items: Vec::new(),
+        // Written by hand below, from the pages themselves. A staged page is a whole page, and
+        // filling this field copied every one of them before the encoder copied them again.
+        staged_blocks: Vec::new(),
+    };
+    let implied_length = implied_block_length(record);
+    let command_key = strippable_command_key(record);
+    let items = record
+        .outcomes
+        .iter()
+        .map(|item| derive_item(item, record.shard_id, implied_length, command_key.as_deref()))
+        .collect::<Vec<_>>();
+    let items_len = record
+        .outcomes
+        .iter()
+        .zip(items.iter())
+        .map(|(item, derived)| {
+            crate::raft::wal_proto::len_delimited_len(5, wal_item_body_len(item, derived))
+        })
+        .sum::<usize>();
+    let len = crate::raft::wal_proto::varint_field_len(1, record.shard_id)
+        + crate::raft::wal_proto::varint_field_len(2, record.sequence)
+        + command.as_ref().map_or(0, |command| command.encoded_len_at(3))
+        + tail.encoded_len()
+        + items_len
+        + record
+            .staged_blocks
+            .iter()
+            .map(|block| {
+                crate::raft::wal_proto::len_delimited_len(
+                    6,
+                    staged_block_body_len(block, implied_staged_object_id(record)),
+                )
+            })
+            .sum::<usize>();
+    Ok(RecordParts {
+        command,
+        items,
+        tail,
+        len,
+    })
+}
+
+impl RecordParts<'_> {
+    fn put(&self, record: &WriteAheadLogRecord, out: &mut Vec<u8>) -> Result<(), String> {
+        crate::raft::wal_proto::put_varint_field(1, record.shard_id, out);
+        crate::raft::wal_proto::put_varint_field(2, record.sequence, out);
+        if let Some(command) = self.command.as_ref() {
+            command.put_at(3, out);
+        }
+        // Ascending field order, the order prost would have written them: the tail carries field
+        // four, the outcomes are field five, the staged blocks are field six.
+        self.tail.encode(out).map_err(|err| err.to_string())?;
+        for (item, derived) in record.outcomes.iter().zip(self.items.iter()) {
+            put_wal_item(5, item, derived, out);
+        }
+        let implied = implied_staged_object_id(record);
+        for block in &record.staged_blocks {
+            crate::raft::wal_proto::put_staged_block(6, block, implied, out);
+        }
+        Ok(())
+    }
+}
+
+/// The object id a staged block need not repeat, if the record already says it once.
+///
+/// Only when the record carries exactly one outcome and one block: then the block belongs to
+/// that outcome and nothing else, so dropping the id from the block loses nothing a reader
+/// cannot put back. With more than one of either, every block writes its own.
+pub(crate) fn implied_staged_object_id(record: &WriteAheadLogRecord) -> Option<u64> {
+    if record.outcomes.len() == 1 && record.staged_blocks.len() == 1 {
+        return Some(record.outcomes[0].object_id);
+    }
+    None
+}
+
+/// Bytes a staged page occupies as a `WalStagedBlock` body.
+///
+/// Deliberately a call to the writer's own measurement rather than a second copy of the rule.
+/// This length reserves the buffer the writer then fills, so if the two ever disagree the record
+/// is written into the wrong number of bytes -- and they did disagree, because this was a
+/// separate copy that still measured a varint after the writer had moved to a fixed field.
+fn staged_block_body_len(block: &crate::wal::StagedBlock, implied: Option<u64>) -> usize {
+    crate::raft::wal_proto::staged_block_body_len(block, implied)
+}
+
+/// A record measured but not yet written.
+///
+/// `encode` below builds the payload into its own buffer and the framing layer then copies it
+/// into a second one, so a write carries the record twice. Handing the framing layer a length and
+/// a writer instead lets it reserve once and have the payload land in the bytes that go to disk.
+///
+/// The length has to be exact, which is the whole reason this can exist: `RecordParts::len` is
+/// asserted equal to the bytes written, for every arm, by
+/// `the_borrowing_encoder_writes_the_same_bytes`.
+pub(crate) struct PreparedRecord<'a> {
+    parts: RecordParts<'a>,
+}
+
+impl PreparedRecord<'_> {
+    /// Bytes the payload will occupy: the marker, then the record.
+    pub(crate) fn payload_len(&self) -> usize {
+        self.parts.len + 1
+    }
+
+    pub(crate) fn put(
+        &self,
+        record: &WriteAheadLogRecord,
+        out: &mut Vec<u8>,
+    ) -> Result<(), String> {
+        out.push(RAW_PAYLOAD_MARKER);
+        self.parts.put(record, out)
+    }
+}
+
+/// Measure a record so it can be framed without an intermediate buffer.
+pub(crate) fn prepare(record: &WriteAheadLogRecord) -> Result<PreparedRecord<'_>, String> {
+    Ok(PreparedRecord {
+        parts: record_parts(record)?,
+    })
+}
+
+/// Encode a record as protobuf, marker byte first.
+pub(crate) fn encode(record: &WriteAheadLogRecord) -> Result<Vec<u8>, String> {
+    // Few calls and the most bytes of any class: the record is built as whole buffers, so an
+    // allocation COUNT reports this as very nearly free while the byte column says it is the
+    // largest single thing a write allocates.
+    crate::alloc_probe::in_class(crate::alloc_probe::AllocClass::LogRecord, || {
+        encode_inner(record)
+    })
+}
+
+fn encode_inner(record: &WriteAheadLogRecord) -> Result<Vec<u8>, String> {
+    let parts = record_parts(record)?;
+    if compress_records_enabled() {
+        // Compression cannot use the borrowing writer above: that path reserves the frame from
+        // `payload_len()` before the payload exists, and how long a compressed payload will be is
+        // not knowable until it has been compressed. So this arm builds the payload first and the
+        // frame around it, which is what the escaping arm below has always done.
+        //
+        // The buffer it builds into is kept between records rather than allocated per append. At a
+        // four-kilobyte record that allocation measured 4,682 B, nearly half of everything this
+        // path allocated, and none of it had to be new: the bytes are consumed before `encode`
+        // returns.
+        let compressed = ENCODE_SCRATCH.with(|cell| -> Result<Option<Vec<u8>>, String> {
+            let mut scratch = cell.borrow_mut();
+            scratch.clear();
+            scratch.reserve(parts.len);
+            parts.put(record, &mut scratch)?;
+            let compressed = compress_payload(&scratch);
+            if scratch.capacity() > MAX_ENCODE_SCRATCH_BYTES {
+                // One outsized record should not leave every thread that saw it holding the buffer.
+                *scratch = Vec::new();
+            }
+            Ok(compressed)
+        })?;
+        if let Some(compressed) = compressed {
+            let escaping = !crate::log_framing::binary_frame_enabled();
+            let mut out = Vec::with_capacity(compressed.len() + 8);
+            out.push(if escaping {
+                COMPRESSED_ESCAPED_PAYLOAD_MARKER
+            } else {
+                COMPRESSED_RAW_PAYLOAD_MARKER
+            });
+            if escaping {
+                out.extend_from_slice(&escape_newlines(&compressed));
+            } else {
+                out.extend_from_slice(&compressed);
+            }
+            return Ok(out);
+        }
+        // Not worth compressing. Fall through and write it the way it would have been written
+        // anyway, under its own marker -- a reader cannot tell that this record was considered.
+    }
+    if crate::log_framing::binary_frame_enabled() {
+        // The frame declares its own length, so the payload is written as produced -- which means
+        // the marker can go in FIRST and the message encode straight after it. `encode` appends,
+        // so there is no second buffer and no second copy of the payload. That copy was the whole
+        // record again: at a four-kilobyte value it was four kilobytes to prepend one byte.
+        let mut out = Vec::with_capacity(parts.len + 1);
+        out.push(RAW_PAYLOAD_MARKER);
+        parts.put(record, &mut out)?;
+        return Ok(out);
+    }
+    // The escaping fallback still needs the payload on its own, because escaping rewrites it.
+    let mut encoded = Vec::with_capacity(parts.len);
+    parts.put(record, &mut encoded)?;
+    let mut out = Vec::with_capacity(encoded.len() + 8);
+    out.push(BINARY_PAYLOAD_MARKER);
+    out.extend_from_slice(&escape_newlines(&encoded));
+    Ok(out)
+}
+
+/// Decode a payload this module wrote. The caller has already checked the marker byte.
+pub(crate) fn decode(payload: &[u8]) -> Result<WriteAheadLogRecord, String> {
+    let body = &payload[1..];
+    let marker = payload.first().copied();
+    let escaped = marker == Some(BINARY_PAYLOAD_MARKER)
+        || marker == Some(COMPRESSED_ESCAPED_PAYLOAD_MARKER);
+    let compressed = marker == Some(COMPRESSED_RAW_PAYLOAD_MARKER)
+        || marker == Some(COMPRESSED_ESCAPED_PAYLOAD_MARKER);
+    let unescaped;
+    let framed: &[u8] = if escaped {
+        unescaped = unescape_newlines(body)?;
+        unescaped.as_slice()
+    } else {
+        body
+    };
+    let inflated;
+    let bytes: &[u8] = if compressed {
+        inflated = decompress_payload(framed)?;
+        inflated.as_slice()
+    } else {
+        framed
+    };
+    let message = v1::EngineWalRecord::decode(bytes).map_err(|err| err.to_string())?;
+    // Absent is a legitimate record now, not a malformed one: it carries results instead.
+    let command = match message.command.and_then(|command| command.kind) {
+        Some(kind) => Some(
+            crate::raft::wal_proto::command_from_proto(kind).map_err(|err| err.to_string())?,
+        ),
+        None => None,
+    };
+    // The carried block states the length its address covers, so it is read off the block
+    // before the items that point at it. Same shape as the implied object id below, and the same
+    // one-of-each rule.
+    let implied_length = if message.items.len() == 1 && message.staged_blocks.len() == 1 {
+        let carried =
+            message.staged_blocks[0].block.len() + crate::block_store::BLOCK_RECORD_HEADER_LEN;
+        Some(carried as u64)
+    } else {
+        None
+    };
+    // The command is decoded above, so a key an item did not write is available here. Same
+    // shape as `implied_length`: read off the record, handed to every item.
+    let command_key = command_object_key(command.as_ref());
+    let outcomes = message
+        .items
+        .into_iter()
+        .map(|item| {
+            item_from_proto(item, message.shard_id, implied_length, command_key.as_deref())
+        })
+        .collect::<Vec<_>>();
+    // A block with no object id of its own takes it from the outcome it belongs to. The writer
+    // drops it only when there is exactly one of each, so there is never a question of which
+    // outcome an unlabelled block means.
+    //
+    // Taken from the RESTORED outcome rather than from the wire field, and that is the whole
+    // ordering constraint of this change: an outcome may not have written its id either, so a
+    // wire field that is absent on both would leave the block holding nothing.
+    let implied = if outcomes.len() == 1 && message.staged_blocks.len() == 1 {
+        Some(outcomes[0].object_id)
+    } else {
+        None
+    };
+    Ok(WriteAheadLogRecord {
+        shard_id: message.shard_id,
+        sequence: message.sequence,
+        command,
+        metadata: message.metadata.map(metadata_from_proto).transpose()?,
+        staged_blocks: message
+            .staged_blocks
+            .into_iter()
+            .map(|block| StagedBlock {
+                object_id: block.object_id.or(implied).unwrap_or_default(),
+                // Never defaulted the way the object id is. An absent component MEANS the page is
+                // its whole object, and inventing one would make a string page claim to be an
+                // element; an absent one on a record written before this field existed means the
+                // same thing that record has always meant.
+                component: block.component.map(std::sync::Arc::from),
+                bytes: block.block,
+            })
+            .collect(),
+        outcomes,
+    })
+}
+
+
+#[cfg(test)]
+mod command_key_tests {
+    use super::*;
+    use crate::types::Command;
+    use crate::wal::{WalOutcomeItem, WriteAheadLogRecord};
+
+    fn outcome(key: &str, component: Option<&str>) -> WalOutcomeItem {
+        WalOutcomeItem {
+            kind: "string".to_string(),
+            object_key: key.to_string(),
+            component: component.map(str::to_string),
+            object_id: crate::engine::hashing::stable_block_object_id(
+                7,
+                "string",
+                key,
+            ),
+            routing_bucket: 11,
+            address: None,
+            value: None,
+            ttl: None,
+            deleted: false,
+            meta: false,
+        }
+    }
+
+    fn record(command: Option<Command>, outcomes: Vec<WalOutcomeItem>) -> WriteAheadLogRecord {
+        WriteAheadLogRecord {
+            shard_id: 7,
+            sequence: 3,
+            command,
+            metadata: None,
+            staged_blocks: Vec::new(),
+            outcomes,
+        }
+    }
+
+    /// An outcome staged against its own command's key stops repeating it, and comes back whole.
+    ///
+    /// The round trip is the point, not the saving: `object_id` is DERIVED from `object_key`, so
+    /// a key restored after the derivation would produce a different id and a silently wrong
+    /// index. Comparing the decoded item field for field is what catches that.
+    #[test]
+    fn an_outcome_drops_the_key_its_command_already_names() {
+        let key = "tenant/1/object/9";
+        let with_command = record(
+            Some(Command::StringSet {
+                key: key.to_string(),
+                value: b"v".to_vec(),
+            }),
+            vec![outcome(key, None)],
+        );
+        // Premise first: the extractor has to return the very string the outcome carries, or
+        // nothing is stripped and every byte figure below is measuring something else.
+        assert_eq!(
+            command_object_key(with_command.command.as_ref()).as_deref(),
+            Some(key),
+            "the command-key extractor does not return the outcome's key"
+        );
+        let encoded = encode(&with_command).expect("encodes");
+
+        // The control differs in ONE thing: the outcome names a key the command does not, so the
+        // strip cannot fire. Same command, same key LENGTH. A record with no command at all
+        // would have measured the command's absence, which is larger than the key it saves --
+        // that was the first version of this fixture, and it compared two differences at once.
+        let unstripped = record(
+            Some(Command::StringSet {
+                key: key.to_string(),
+                value: b"v".to_vec(),
+            }),
+            vec![outcome("tenant/1/object/8", None)],
+        );
+        let bare = encode(&unstripped).expect("encodes");
+        assert!(
+            encoded.len() < bare.len(),
+            "stripping saved nothing: {} bytes against {}",
+            encoded.len(),
+            bare.len()
+        );
+        eprintln!(
+            "\n  one outcome: {} B when the command names the key, {} B when it does not \
+             ({} B saved)\n",
+            encoded.len(),
+            bare.len(),
+            bare.len() - encoded.len()
+        );
+
+        let decoded = decode(&encoded).expect("record round-trips");
+        assert_eq!(decoded.outcomes.len(), 1);
+        assert_eq!(decoded.outcomes[0].object_key, key, "the key must come back");
+        assert_eq!(
+            decoded.outcomes[0].object_id, with_command.outcomes[0].object_id,
+            "the id derives from the key, so a late restore changes it"
+        );
+    }
+
+    /// An outcome whose key is NOT the command's still carries it.
+    ///
+    /// The rule compares rather than assumes, so a staged outcome against an associated record
+    /// keeps its own key. Without this the strip would be a guess that silently rewrote keys.
+    #[test]
+    fn an_outcome_with_a_different_key_still_writes_it() {
+        let with_command = record(
+            Some(Command::StringSet {
+                key: "tenant/1/object/9".to_string(),
+                value: b"v".to_vec(),
+            }),
+            vec![outcome("tenant/1/object/OTHER", None)],
+        );
+        let encoded = encode(&with_command).expect("encodes");
+        let decoded = decode(&encoded).expect("record round-trips");
+        assert_eq!(
+            decoded.outcomes[0].object_key, "tenant/1/object/OTHER",
+            "an outcome that names a different key must keep it"
+        );
+        assert_eq!(
+            decoded.outcomes[0].object_id, with_command.outcomes[0].object_id
+        );
+    }
+
+    /// A record with several outcomes KEEPS its keys, because stripping them costs more.
+    ///
+    /// This is the opposite of what the change set out to do, and the measurement is why. A
+    /// packed write stages one outcome per component, all naming the same key, and with
+    /// compression on those repeats cost almost nothing: eight of them encode to 88 bytes
+    /// unstripped and 119 stripped. Removing the repetition takes away exactly the redundancy
+    /// zstd was feeding on.
+    ///
+    /// So the strip is limited to single-outcome records, and this pins that boundary from the
+    /// other side: the keys must still be on the wire here, and the record must still round-trip.
+    #[test]
+    fn a_record_with_several_outcomes_keeps_its_keys() {
+        let key = "tenant/1/object/9";
+        let outcomes = (0..8)
+            .map(|index| outcome(key, Some(&format!("c{index}"))))
+            .collect::<Vec<_>>();
+        let record = record(
+            Some(Command::StringSet {
+                key: key.to_string(),
+                value: b"v".to_vec(),
+            }),
+            outcomes,
+        );
+        assert!(
+            strippable_command_key(&record).is_none(),
+            "a record with more than one outcome must not strip: compression already has it"
+        );
+
+        let encoded = encode(&record).expect("encodes");
+        let decoded = decode(&encoded).expect("round-trips");
+        assert_eq!(decoded.outcomes.len(), 8);
+        for (index, item) in decoded.outcomes.iter().enumerate() {
+            assert_eq!(item.object_key, key, "outcome {index} lost its key");
+            assert_eq!(
+                item.object_id, record.outcomes[index].object_id,
+                "outcome {index} came back with a different id"
+            );
+        }
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::Command;
+    use crate::wal::{StagedBlock, WriteAheadLogRecord, WriteAheadLogRecordMetadata};
+
+    /// The encoder this replaced: build the whole message, owning every payload, then serialise.
+    ///
+    /// Kept here because it is the specification. The hand-written head is only allowed to exist
+    /// if it produces exactly these bytes -- a record already on disk is read by the generated
+    /// decoder, and a head that decoded correctly but differed byte for byte would still be a
+    /// format change, silently, on every record written from here on.
+    fn owned_bytes(record: &WriteAheadLogRecord) -> Vec<u8> {
+        let message = v1::EngineWalRecord {
+            shard_id: record.shard_id,
+            sequence: record.sequence,
+            command: record.command.as_ref().map(|command| v1::WalCommand {
+                kind: Some(crate::raft::wal_proto::command_to_proto(command).unwrap()),
+            }),
+            metadata: record
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata_to_proto(metadata, leader_stamp_has_a_reader(record)))
+                .transpose()
+                .unwrap(),
+            items: record
+                .outcomes
+                .iter()
+                .map(|item| {
+                    item_to_proto(
+                        item,
+                        record.shard_id,
+                        implied_block_length(record),
+                        strippable_command_key(record).as_deref(),
+                    )
+                })
+                .collect(),
+            staged_blocks: record
+                .staged_blocks
+                .iter()
+                .map(|block| v1::WalStagedBlock {
+                    // The same rule the borrowing encoder applies, so the two agree byte for
+                    // byte: a block drops the object id the record already says once.
+                    object_id: crate::raft::wal_proto::staged_block_object_id(
+                        block,
+                        implied_staged_object_id(record),
+                    ),
+                    block: block.bytes.clone(),
+                    routing_bucket: None,
+                    component: block.component.as_deref().map(str::to_string),
+                })
+                .collect(),
+        };
+        let mut encoded = Vec::with_capacity(message.encoded_len());
+        message.encode(&mut encoded).unwrap();
+        encoded
+    }
+
+    /// A record big and repetitive enough to be worth compressing, which most real ones are.
+    fn compressible_record() -> WriteAheadLogRecord {
+        let mut record = record_with(Some(Command::StringSet {
+            key: "compressible".to_string(),
+            // Repetition is the point: a real record repeats field names, scope keys and policy
+            // blocks, and a payload of one byte over and over would flatter the codec in a way
+            // those do not. This alternates, so it is compressible without being trivial.
+            value: (0..4096u32).map(|index| (index % 7) as u8).collect(),
+        }));
+        record.outcomes = vec![crate::wal::WalOutcomeItem {
+            kind: "page".to_string(),
+            object_key: "tenant/1/object/9".to_string(),
+            component: Some("body".to_string()),
+            object_id: 9,
+            routing_bucket: 8539,
+            address: None,
+            value: Some(vec![3; 512]),
+            ttl: Some(60_000),
+            deleted: false,
+            meta: false,
+        }];
+        record
+    }
+
+    /// Build the compressed payload by hand, so decoding is tested without touching the
+    /// environment: what a reader must accept is a property of the bytes, not of a flag.
+    fn compressed_payload(record: &WriteAheadLogRecord, escaping: bool) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        record_parts(record).unwrap().put(record, &mut encoded).unwrap();
+        let compressed = zstd::stream::encode_all(encoded.as_slice(), COMPRESSION_LEVEL).unwrap();
+        let mut out = Vec::new();
+        if escaping {
+            out.push(COMPRESSED_ESCAPED_PAYLOAD_MARKER);
+            out.extend_from_slice(&escape_newlines(&compressed));
+        } else {
+            out.push(COMPRESSED_RAW_PAYLOAD_MARKER);
+            out.extend_from_slice(&compressed);
+        }
+        out
+    }
+
+    /// The frames the append path writes declare their decompressed length.
+    ///
+    /// This is the positive control for the reused decompressor. `decompress_payload` falls back
+    /// to the allocating decoder whenever a frame declares nothing, and that fallback is silent by
+    /// design -- so if the append path ever stopped declaring a length, every read would quietly
+    /// take the slow path and no test would fail. This is the test that would fail instead.
+    #[test]
+    fn the_frames_the_append_path_writes_declare_their_length() {
+        let record = compressible_record();
+        let mut encoded = Vec::new();
+        record_parts(&record).unwrap().put(&record, &mut encoded).unwrap();
+
+        let written = compress_payload(&encoded).expect("a compressible record compresses");
+        assert_eq!(
+            declared_inflated_len(&written),
+            Some(encoded.len()),
+            "the frame must declare exactly the length the decompressor is sized for",
+        );
+
+        // The streaming encoder wrote every compressed record in a log older than this change, and
+        // it declares nothing. That is the case the fallback exists for, not a defect.
+        let streamed = zstd::stream::encode_all(encoded.as_slice(), COMPRESSION_LEVEL).unwrap();
+        assert_eq!(
+            declared_inflated_len(&streamed),
+            None,
+            "a streamed frame declares no length, so it must take the fallback",
+        );
+    }
+
+    /// Both shapes of frame inflate to the same bytes, whichever path they take.
+    #[test]
+    fn a_frame_inflates_the_same_whether_or_not_it_declares_a_length() {
+        let record = compressible_record();
+        let mut encoded = Vec::new();
+        record_parts(&record).unwrap().put(&record, &mut encoded).unwrap();
+
+        let declared = compress_payload(&encoded).expect("a compressible record compresses");
+        let streamed = zstd::stream::encode_all(encoded.as_slice(), COMPRESSION_LEVEL).unwrap();
+
+        assert_eq!(decompress_payload(&declared).unwrap(), encoded, "declared frame");
+        assert_eq!(decompress_payload(&streamed).unwrap(), encoded, "streamed frame");
+    }
+
+    /// A declared length past the bound is refused, because the length came off disk.
+    #[test]
+    fn a_declared_length_past_the_bound_is_refused() {
+        assert_eq!(capacity_within_bound(0), Some(0));
+        assert_eq!(
+            capacity_within_bound(MAX_REUSED_INFLATE_BYTES as u64),
+            Some(MAX_REUSED_INFLATE_BYTES),
+        );
+        assert_eq!(capacity_within_bound(MAX_REUSED_INFLATE_BYTES as u64 + 1), None);
+        assert_eq!(capacity_within_bound(u64::MAX), None);
+    }
+
+    /// What `encode` allocates, compressed against raw.
+    ///
+    /// The compressed arm builds three buffers per record: the payload, the compressed copy of it,
+    /// and the output the compressed copy is then memcpy'd into. `compress_to_buffer` could put the
+    /// compressor straight into the output and remove the middle one. This measures what that is
+    /// worth before anyone writes it.
+    #[test]
+    #[ignore]
+    #[cfg(feature = "alloc-probe")]
+    fn what_encoding_a_record_allocates() {
+        let record = compressible_record();
+        let runs = 64usize;
+
+
+        std::env::set_var("TS_WAL_COMPRESS_RECORDS", "0");
+        let raw_len = encode(&record).unwrap().len();
+        let probe = crate::alloc_probe::Probe::start();
+        for _ in 0..runs {
+            std::hint::black_box(encode(std::hint::black_box(&record)).unwrap());
+        }
+        let raw = probe.stop();
+
+        std::env::set_var("TS_WAL_COMPRESS_RECORDS", "1");
+        let squeezed_len = encode(&record).unwrap().len();
+        let probe = crate::alloc_probe::Probe::start();
+        for _ in 0..runs {
+            std::hint::black_box(encode(std::hint::black_box(&record)).unwrap());
+        }
+        let squeezed = probe.stop();
+
+        println!(
+            "  ENCODE raw        {raw_len:>6} B out | {:>5.1} allocs {:>8.0} B per record",
+            raw.allocs as f64 / runs as f64,
+            raw.alloc_bytes as f64 / runs as f64,
+        );
+        println!(
+            "  ENCODE compressed {squeezed_len:>6} B out | {:>5.1} allocs {:>8.0} B per record | the compress arm adds {:>5.1} allocs and {:>8.0} B",
+            squeezed.allocs as f64 / runs as f64,
+            squeezed.alloc_bytes as f64 / runs as f64,
+            (squeezed.allocs as f64 - raw.allocs as f64) / runs as f64,
+            (squeezed.alloc_bytes as f64 - raw.alloc_bytes as f64) / runs as f64,
+        );
+
+        std::env::remove_var("TS_WAL_COMPRESS_RECORDS");
+    }
+
+    /// Whether building the proto tail copies each outcome value before the encoder copies it.
+    ///
+    /// `staged_blocks` was taken out of the proto struct for exactly this reason -- the comment in
+    /// `record_parts` says filling it copied every page before the encoder copied them again. The
+    /// `items` field is still filled the ordinary way, and every outcome carries an owned value.
+    /// If that value is copied, the bytes allocated per append rise with it, one for one.
+    #[test]
+    #[ignore]
+    #[cfg(feature = "alloc-probe")]
+    fn does_the_outcome_value_get_copied() {
+        for value_len in [512usize, 4096, 16384] {
+            let mut record = record_with(Some(Command::StringSet {
+                key: "k".to_string(),
+                value: vec![1u8; 16],
+            }));
+            record.outcomes = vec![crate::wal::WalOutcomeItem {
+                kind: "page".to_string(),
+                object_key: "tenant/1/object/9".to_string(),
+                component: Some("body".to_string()),
+                object_id: 9,
+                routing_bucket: 8539,
+                address: None,
+                value: Some(vec![7u8; value_len]),
+                ttl: Some(60_000),
+                deleted: false,
+                meta: false,
+            }];
+
+            let mut out = Vec::with_capacity(1024 * 1024);
+            let prepared = prepare(&record).unwrap();
+            out.clear();
+            prepared.put(&record, &mut out).unwrap();
+            let payload_len = out.len();
+
+            let runs = 32usize;
+            let probe = crate::alloc_probe::Probe::start();
+            for _ in 0..runs {
+                let prepared = prepare(std::hint::black_box(&record)).unwrap();
+                out.clear();
+                prepared.put(&record, &mut out).unwrap();
+                std::hint::black_box(out.len());
+            }
+            let counts = probe.stop();
+
+            println!(
+                "  ITEMS outcome value {value_len:>6} B | payload {payload_len:>6} B | {:>5.1} allocs {:>8.0} B per append",
+                counts.allocs as f64 / runs as f64,
+                counts.alloc_bytes as f64 / runs as f64,
+            );
+        }
+        println!("  (if the bytes rise with the value, the outcome payload is being copied)");
+    }
+
+    /// The hand-written item encoder writes exactly what `item_to_proto` writes, for every shape.
+    ///
+    /// This is the whole basis for the hand-written encoder existing. It is not enough that the
+    /// bytes decode -- they have to be the SAME bytes, because a log holds records written by both
+    /// and a length that disagrees with what was written corrupts every record after it.
+    ///
+    /// The cross product below is chosen for presence rather than for variety. proto3 `optional`
+    /// means explicit presence, so `Some(0)` and `Some("")` are written where a plain field holding
+    /// its default is omitted, and that distinction is the one a hand-written encoder gets wrong.
+    /// So the axes are: an empty and a non-empty string, a zero and a non-zero integer, absent and
+    /// present optionals, both booleans, a kind with a code and a kind without one, a component
+    /// that parses as a number and one that does not, and an address whose object id repeats the
+    /// item's (which is dropped) against one that does not.
+    #[test]
+    fn the_hand_written_item_is_the_same_item() {
+        use prost::Message;
+
+        const SHARD: crate::types::ShardId = 7;
+
+        let addresses = [
+            None,
+            // object_id repeats the item's, so `item_to_proto` drops it from the address.
+            Some(crate::block_store::ElementEntry::from_parts(
+                42, 1_048_576, 4096, Some(7), Some(9),
+            )),
+            // and one that does not repeat it, so it stays.
+            Some(crate::block_store::ElementEntry::from_parts(
+                42, 0, 0, None, Some(4_242),
+            )),
+        ];
+
+        let mut checked = 0usize;
+        // `list` and `zset` were missing, and kind drives both `kind_code` and
+        // `numeric_component`, so the matrix skipped exactly the two kinds whose outcomes replay
+        // refuses in list_recovery and zset_recovery.
+        for kind in [
+            "page", "feature", "context_index", "an_unmapped_kind_name", "list", "zset",
+        ] {
+            for object_key in ["", "tenant/1/object/9"] {
+                for object_id in [0u64, 9] {
+                    // The last is the shape a list outcome actually carries: sixteen hex
+                    // digits of the biased sequence.
+                    for component in [
+                        None, Some(""), Some("body"), Some("1788748713578"),
+                        Some("8000000000000005"),
+                    ] {
+                        for value in [None, Some(Vec::new()), Some(vec![7u8; 5])] {
+                            for ttl in [None, Some(0u64), Some(60_000)] {
+                                for (deleted, meta) in
+                                    [(false, false), (true, false), (false, true), (true, true)]
+                                {
+                                    for routing_bucket in [0u32, 8539] {
+                                        for address in addresses.iter() {
+                                            let item = crate::wal::WalOutcomeItem {
+                                                kind: kind.to_string(),
+                                                object_key: object_key.to_string(),
+                                                component: component.map(str::to_string),
+                                                object_id,
+                                                routing_bucket,
+                                                address: address.clone(),
+                                                value: value.clone(),
+                                                ttl,
+                                                deleted,
+                                                meta,
+                                            };
+
+                                            let expected_body =
+                                                item_to_proto(&item, SHARD, None, None).encode_to_vec();
+                                            let derived = derive_item(&item, SHARD, None, None);
+
+                                            assert_eq!(
+                                                wal_item_body_len(&item, &derived),
+                                                expected_body.len(),
+                                                "length disagrees for {item:?}",
+                                            );
+
+                                            let mut mine = Vec::new();
+                                            put_wal_item(5, &item, &derived, &mut mine);
+
+                                            let mut theirs = Vec::new();
+                                            prost::encoding::encode_key(
+                                                5,
+                                                prost::encoding::WireType::LengthDelimited,
+                                                &mut theirs,
+                                            );
+                                            prost::encoding::encode_varint(
+                                                expected_body.len() as u64,
+                                                &mut theirs,
+                                            );
+                                            theirs.extend_from_slice(&expected_body);
+
+                                            assert_eq!(mine, theirs, "bytes differ for {item:?}");
+
+                                            // The two assertions above compare ENCODERS. Neither
+                                            // decodes, so a field the decoder drops is invisible
+                                            // to both -- and an outcome whose address comes back
+                                            // absent is exactly what `wal_replay_outcome_refused`
+                                            // reports, with the component intact beside it.
+                                            let decoded =
+                                                item_from_proto(item_to_proto(&item, SHARD, None, None), SHARD, None, None);
+                                            assert_eq!(
+                                                decoded.address.is_some(),
+                                                item.address.is_some(),
+                                                "the address vanished in the round trip: {item:?}",
+                                            );
+                                            assert_eq!(
+                                                decoded.kind, item.kind,
+                                                "kind changed in the round trip for {item:?}",
+                                            );
+                                            checked += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // A positive control: an assertion loop that ran zero times would pass just as quietly.
+        assert!(checked > 3_000, "only {checked} shapes checked");
+        println!("  ITEMENC {checked} shapes, byte-identical");
+    }
+
+    #[test]
+    fn a_compressed_payload_decodes_to_the_record_that_made_it() {
+        let record = compressible_record();
+        for escaping in [false, true] {
+            let payload = compressed_payload(&record, escaping);
+            let back = decode(&payload).expect("compressed payload decodes");
+            assert_eq!(record, back, "escaping={escaping}");
+        }
+    }
+
+    #[test]
+    fn a_log_holding_every_encoding_reads_end_to_end() {
+        // What a log looks like across a configuration change: records written under different
+        // settings, sitting next to each other, all of which must still read.
+        let record = compressible_record();
+        let mut encoded = Vec::new();
+        record_parts(&record).unwrap().put(&record, &mut encoded).unwrap();
+
+        let mut raw = vec![RAW_PAYLOAD_MARKER];
+        raw.extend_from_slice(&encoded);
+        let mut escaped = vec![BINARY_PAYLOAD_MARKER];
+        escaped.extend_from_slice(&escape_newlines(&encoded));
+
+        for payload in [
+            raw,
+            escaped,
+            compressed_payload(&record, false),
+            compressed_payload(&record, true),
+        ] {
+            assert_eq!(record, decode(&payload).expect("payload decodes"));
+        }
+    }
+
+    #[test]
+    fn a_payload_under_the_floor_is_left_alone() {
+        // Compressing a tiny payload costs more than it gives back; the page store measured that
+        // and chose this floor, so the check is that the floor is honoured, not that it is right.
+        let tiny = vec![1u8; COMPRESSION_MIN_BYTES - 1];
+        assert!(compress_payload(&tiny).is_none());
+    }
+
+    #[test]
+    fn a_payload_that_would_not_shrink_is_left_alone() {
+        // Random bytes do not compress. Writing them "compressed" would add a frame header to a
+        // payload that got no smaller, so the encoder declines.
+        let mut incompressible = Vec::with_capacity(4096);
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..4096 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            incompressible.push((state >> 24) as u8);
+        }
+        assert!(compress_payload(&incompressible).is_none());
+    }
+
+    #[test]
+    fn compression_is_worth_doing_on_a_record_shaped_like_a_real_one() {
+        let record = compressible_record();
+        let mut encoded = Vec::new();
+        record_parts(&record).unwrap().put(&record, &mut encoded).unwrap();
+        let compressed = compress_payload(&encoded).expect("a repetitive record compresses");
+        assert!(
+            compressed.len() * 2 < encoded.len(),
+            "expected better than 2x, got {} -> {}",
+            encoded.len(),
+            compressed.len()
+        );
+    }
+
+    #[test]
+    fn the_flag_decides_what_is_written_and_never_what_is_read() {
+        // One test rather than several: these set a process-wide variable, and separate tests
+        // would race each other inside the same binary.
+        let record = compressible_record();
+
+        std::env::set_var("TS_WAL_COMPRESS_RECORDS", "1");
+        let compressed = encode(&record).expect("encodes with compression on");
+        // "0", not unset. Unset is ON now, and this line said "off" while meaning "default" -- the
+        // kind of test that keeps passing through exactly the change it should have caught.
+        std::env::set_var("TS_WAL_COMPRESS_RECORDS", "0");
+        let plain = encode(&record).expect("encodes with compression off");
+
+        assert!(
+            matches!(
+                compressed.first(),
+                Some(&COMPRESSED_RAW_PAYLOAD_MARKER) | Some(&COMPRESSED_ESCAPED_PAYLOAD_MARKER)
+            ),
+            "compression on should write a compressed marker, got {:?}",
+            compressed.first()
+        );
+        assert!(
+            matches!(
+                plain.first(),
+                Some(&RAW_PAYLOAD_MARKER) | Some(&BINARY_PAYLOAD_MARKER)
+            ),
+            "compression off should write an uncompressed marker, got {:?}",
+            plain.first()
+        );
+        assert!(compressed.len() < plain.len());
+
+        // The flag is off now, and the compressed record still reads. That is the contract: a
+        // deployment that turns this off does not lose the log it already wrote.
+        assert_eq!(record, decode(&compressed).expect("still decodes with the flag off"));
+        assert_eq!(record, decode(&plain).expect("uncompressed decodes"));
+    }
+
+    #[test]
+    fn compression_is_on_when_nothing_says_otherwise() {
+        // The default is the whole point: a log nobody configured is the log almost every
+        // deployment writes. Asserted through `encode`, not by reading the flag, because what
+        // matters is which marker reaches the file.
+        let record = compressible_record();
+        std::env::remove_var("TS_WAL_COMPRESS_RECORDS");
+        let written = encode(&record).expect("encodes with nothing set");
+        assert!(
+            matches!(
+                written.first(),
+                Some(&COMPRESSED_RAW_PAYLOAD_MARKER) | Some(&COMPRESSED_ESCAPED_PAYLOAD_MARKER)
+            ),
+            "an unconfigured deployment should compress, got marker {:?}",
+            written.first()
+        );
+        assert_eq!(record, decode(&written).expect("and it reads back"));
+
+        // Every spelling its neighbours accept turns it off, which is what the old read did not do.
+        for spelling in ["0", "false", "no", "off", "OFF"] {
+            std::env::set_var("TS_WAL_COMPRESS_RECORDS", spelling);
+            let plain = encode(&record).expect("encodes with compression off");
+            assert!(
+                matches!(
+                    plain.first(),
+                    Some(&RAW_PAYLOAD_MARKER) | Some(&BINARY_PAYLOAD_MARKER)
+                ),
+                "{spelling:?} should turn compression off, got marker {:?}",
+                plain.first()
+            );
+        }
+        std::env::remove_var("TS_WAL_COMPRESS_RECORDS");
+    }
+
+    fn record_with(command: Option<Command>) -> WriteAheadLogRecord {
+        WriteAheadLogRecord {
+            shard_id: 7,
+            sequence: 42,
+            command,
+            metadata: None,
+            staged_blocks: Vec::new(),
+            outcomes: Vec::new(),
+        }
+    }
+
+    fn cases() -> Vec<(&'static str, WriteAheadLogRecord)> {
+        let long_key = "k".repeat(300);
+        let mut with_metadata = record_with(Some(Command::StringSet {
+            key: "m".to_string(),
+            value: vec![1, 2, 3],
+        }));
+        with_metadata.metadata = Some(WriteAheadLogRecordMetadata {
+            version: crate::wal::WRITE_AHEAD_LOG_FORMAT_VERSION,
+            timestamp_ms: 1_787_270_070_192,
+            items: Vec::new(),
+            batch_id: Some(11),
+            batch_size: Some(3),
+            batch_index: Some(1),
+        });
+        let mut with_blocks = record_with(Some(Command::StringSet {
+            key: "p".to_string(),
+            value: vec![9; 10],
+        }));
+        with_blocks.staged_blocks = vec![StagedBlock {
+            object_id: 900,
+            component: None,
+            bytes: vec![7; 4096],
+        }];
+        let mut with_outcomes = record_with(Some(Command::StringSet {
+            key: "o".to_string(),
+            value: vec![4; 20],
+        }));
+        with_outcomes.outcomes = vec![crate::wal::WalOutcomeItem {
+            kind: "page".to_string(),
+            object_key: "tenant/1/object/9".to_string(),
+            component: Some("body".to_string()),
+            object_id: 9,
+            routing_bucket: 8539,
+            address: None,
+            // An outcome carries a payload of its own, so one case has to populate it.
+            value: Some(vec![8; 128]),
+            ttl: Some(60_000),
+            deleted: false,
+            meta: false,
+        }];
+        let mut everything = record_with(Some(Command::HashSet {
+            key: "k".to_string(),
+            field: "f".to_string(),
+            value: vec![2; 64],
+        }));
+        everything.metadata = Some(WriteAheadLogRecordMetadata {
+            version: crate::wal::WRITE_AHEAD_LOG_FORMAT_VERSION,
+            timestamp_ms: 1_787_270_070_192,
+            items: Vec::new(),
+            batch_id: Some(4),
+            batch_size: Some(2),
+            batch_index: Some(0),
+        });
+        everything.outcomes = vec![crate::wal::WalOutcomeItem {
+            kind: "page".to_string(),
+            object_key: "tenant/1/object/10".to_string(),
+            component: None,
+            object_id: 10,
+            routing_bucket: 1,
+            address: None,
+            value: None,
+            ttl: None,
+            deleted: true,
+            meta: true,
+        }];
+        everything.staged_blocks = vec![
+            StagedBlock {
+                object_id: 10,
+                component: None,
+                bytes: vec![1; 4096],
+            },
+            StagedBlock {
+                object_id: 11,
+                component: None,
+                bytes: Vec::new(),
+            },
+        ];
+        let mut zeroed = record_with(Some(Command::StringSet {
+            key: "z".to_string(),
+            value: vec![0],
+        }));
+        zeroed.shard_id = 0;
+        zeroed.sequence = 0;
+
+        vec![
+            (
+                "string set",
+                record_with(Some(Command::StringSet {
+                    key: "key".to_string(),
+                    value: vec![1, 2, 3, 4],
+                })),
+            ),
+            (
+                "string set, empty value",
+                record_with(Some(Command::StringSet {
+                    key: "key".to_string(),
+                    value: Vec::new(),
+                })),
+            ),
+            (
+                "string set, empty key",
+                record_with(Some(Command::StringSet {
+                    key: String::new(),
+                    value: vec![5],
+                })),
+            ),
+            (
+                "string set, both empty",
+                record_with(Some(Command::StringSet {
+                    key: String::new(),
+                    value: Vec::new(),
+                })),
+            ),
+            (
+                "string set, key past one varint byte",
+                record_with(Some(Command::StringSet {
+                    key: long_key,
+                    value: vec![6; 5000],
+                })),
+            ),
+            (
+                "string set ex, ttl set",
+                record_with(Some(Command::StringSetEx {
+                    key: "key".to_string(),
+                    value: vec![1, 2],
+                    ttl_ms: 60_000,
+                })),
+            ),
+            // The trap the arm list documents: a zero TTL cannot round-trip through the modelled
+            // form, so it must go verbatim. If the borrowing encoder ever disagreed with
+            // `command_to_proto` about which arm this takes, this case is where it would show.
+            (
+                "string set ex, zero ttl goes verbatim",
+                record_with(Some(Command::StringSetEx {
+                    key: "key".to_string(),
+                    value: vec![1, 2],
+                    ttl_ms: 0,
+                })),
+            ),
+            (
+                "hash set",
+                record_with(Some(Command::HashSet {
+                    key: "key".to_string(),
+                    field: "field".to_string(),
+                    value: vec![3; 100],
+                })),
+            ),
+            (
+                "hash set, empty field",
+                record_with(Some(Command::HashSet {
+                    key: "key".to_string(),
+                    field: String::new(),
+                    value: vec![3],
+                })),
+            ),
+            (
+                "not modelled, goes verbatim",
+                record_with(Some(Command::StringDelete {
+                    key: "key".to_string(),
+                })),
+            ),
+            ("no command", record_with(None)),
+            ("with outcomes", with_outcomes),
+            // Every tag at once: the hand-written head, the generated tail, and the hand-written
+            // field six behind it. If the three ever stopped writing in tag order, this is the
+            // case that says so.
+            ("every field populated", everything),
+            ("zero shard and sequence", zeroed),
+            ("with metadata", with_metadata),
+            ("with staged pages", with_blocks),
+        ]
+    }
+
+    /// The head written by hand must be byte for byte what the owned message produced.
+    ///
+    /// Only the body is compared: the marker and the escaping around it are framing, shared by
+    /// both paths and untouched by this change.
+    fn outcome_with_object_id(object_id: u64) -> crate::wal::WalOutcomeItem {
+        crate::wal::WalOutcomeItem {
+            kind: "page".to_string(),
+            object_key: "tenant/1/object/9".to_string(),
+            component: None,
+            object_id,
+            routing_bucket: 8539,
+            address: None,
+            value: None,
+            ttl: None,
+            deleted: false,
+            meta: false,
+        }
+    }
+
+    /// An address does not restate the length of a block the record carries, and it comes back.
+    ///
+    /// The address covers the block record whole -- its header and then its bytes -- so a record
+    /// carrying the bytes already states the length. Stripped only when the two AGREE, which is
+    /// what keeps a compressed block correct: it stores fewer bytes than it carries, so the
+    /// derivation does not match and the address writes its own length as before.
+    #[test]
+    fn an_address_does_not_restate_a_carried_blocks_length() {
+        let bytes = vec![3u8; 64];
+        let stored = (bytes.len() + crate::block_store::BLOCK_RECORD_HEADER_LEN) as u64;
+        let mut record = record_with(None);
+        // The address says the item's own object id, which is the shape that round trips: an
+        // address holding NONE is given the item's on read, by the rule above this one.
+        record.outcomes = vec![crate::wal::WalOutcomeItem {
+            address: Some(crate::block_store::ElementEntry::from_parts(
+                0,
+                4096,
+                stored,
+                Some(1),
+                Some(0x1234_5678_9ABC_DEF0),
+            )),
+            ..outcome_with_object_id(0x1234_5678_9ABC_DEF0)
+        }];
+        record.staged_blocks = vec![crate::wal::StagedBlock {
+            object_id: 0x1234_5678_9ABC_DEF0,
+            component: None,
+            bytes,
+        }];
+
+        let encoded = encode(&record).expect("encode");
+        assert_eq!(
+            decode(&encoded).expect("decode"),
+            record,
+            "the length must come back off the block"
+        );
+
+        // A block that STORED fewer bytes than it carries -- what compression produces -- cannot
+        // be implied by what it carries, so its length is written and the record is longer.
+        let mut compressed = record.clone();
+        compressed
+            .outcomes[0]
+            .address
+            .as_mut()
+            .expect("address")
+            .set_length(stored - 8);
+        let longer = encode(&compressed).expect("encode");
+        assert!(
+            longer.len() > encoded.len(),
+            "a length that cannot be implied has to be written: {} vs {}",
+            longer.len(),
+            encoded.len()
+        );
+        assert_eq!(
+            decode(&longer).expect("decode"),
+            compressed,
+            "a length that was written comes back as itself"
+        );
+    }
+
+    /// A record does not restate the current format version, and absent reads as current.
+    ///
+    /// The record's serde form already omits it -- "a record that does not say otherwise is
+    /// current" -- while the binary form said it on every record, so one encoding of a record
+    /// stated something the other left out.
+    #[test]
+    fn a_record_does_not_restate_the_current_format_version() {
+        let mut record = record_with(None);
+        record.metadata = Some(WriteAheadLogRecordMetadata {
+            version: crate::wal::WRITE_AHEAD_LOG_FORMAT_VERSION,
+            timestamp_ms: 1_787_270_070_192,
+            items: Vec::new(),
+            batch_id: None,
+            batch_size: None,
+            batch_index: None,
+        });
+
+        let encoded = encode(&record).expect("encode");
+        assert_eq!(
+            decode(&encoded).expect("decode"),
+            record,
+            "an absent version reads as the current one"
+        );
+
+        // A record written under any other version says so, and is longer for saying it.
+        let mut other = record.clone();
+        other.metadata.as_mut().expect("metadata").version =
+            crate::wal::WRITE_AHEAD_LOG_FORMAT_VERSION + 1;
+        let longer = encode(&other).expect("encode");
+        assert!(
+            longer.len() > encoded.len(),
+            "a version that is not current has to be written: {} vs {}",
+            longer.len(),
+            encoded.len()
+        );
+        assert_eq!(
+            decode(&longer).expect("decode"),
+            other,
+            "and it comes back as what it was"
+        );
+    }
+
+    /// An item whose object id is the hash of its own fields does not write it, and comes back.
+    ///
+    /// The second half is the ordering this change turns on. A staged block already drops its id
+    /// when the record's single outcome says it -- so once that outcome drops its id too, a
+    /// reader taking the block's id from the WIRE field would find it absent on both and hand
+    /// back a zero. From the restored outcome it is right. Silently wrong on the durability path
+    /// is the failure this exists to catch.
+    #[test]
+    fn an_item_does_not_write_the_object_id_it_can_derive() {
+        let mut record = record_with(None);
+        let derivable = crate::engine::hashing::stable_block_object_id(
+            record.shard_id,
+            "page",
+            "tenant/1/object/9",
+        );
+        record.outcomes = vec![outcome_with_object_id(derivable)];
+        record.staged_blocks = vec![crate::wal::StagedBlock {
+            object_id: derivable,
+            component: None,
+            bytes: vec![3; 64],
+        }];
+
+        let encoded = encode(&record).expect("encode");
+        let back = decode(&encoded).expect("decode");
+        assert_eq!(
+            back.outcomes[0].object_id, derivable,
+            "the item's id comes back derived"
+        );
+        assert_eq!(
+            back.staged_blocks[0].object_id, derivable,
+            "and the block takes it from the RESTORED item, not from a wire field that is absent"
+        );
+        assert_eq!(back, record, "the whole record must round trip");
+
+        // And it is genuinely smaller. An id that is NOT the hash of the item cannot be put back
+        // and has to be written, so the same record comes out longer. Without the rule these two
+        // would encode to the same length.
+        let mut foreign = record.clone();
+        foreign.outcomes[0].object_id = derivable ^ 0xFFFF;
+        foreign.staged_blocks[0].object_id = derivable ^ 0xFFFF;
+        let longer = encode(&foreign).expect("encode");
+        assert!(
+            longer.len() > encoded.len(),
+            "an id that cannot be derived has to be written: {} vs {}",
+            longer.len(),
+            encoded.len()
+        );
+        assert_eq!(
+            decode(&longer).expect("decode"),
+            foreign,
+            "an id that was written comes back as itself"
+        );
+    }
+
+    /// One block for one outcome says the object id once, and a reader puts it back.
+    ///
+    /// The id is a 64-bit hash, so a second copy costs nine bytes on every single-value write.
+    /// Dropping it is only safe while there is exactly one outcome and one block: then the
+    /// block belongs to that outcome and nothing else.
+    #[test]
+    fn one_block_for_one_outcome_says_the_object_id_once() {
+        let mut record = record_with(None);
+        record.outcomes = vec![outcome_with_object_id(0x1234_5678_9ABC_DEF0)];
+        record.staged_blocks = vec![crate::wal::StagedBlock {
+            object_id: 0x1234_5678_9ABC_DEF0,
+            component: None,
+            bytes: vec![3; 64],
+        }];
+
+        let encoded = encode(&record).expect("encode");
+        let back = decode(&encoded).expect("decode");
+        assert_eq!(
+            back.staged_blocks[0].object_id, record.staged_blocks[0].object_id,
+            "the reader must put the omitted id back"
+        );
+        assert_eq!(back, record, "the whole record must round trip");
+
+        // And it is genuinely smaller. The same record whose block does NOT match its outcome
+        // cannot imply the id and has to write it, so it comes out longer. Without the rule
+        // these two would encode to the same length.
+        let mut unmatched = record.clone();
+        unmatched.staged_blocks[0].object_id = 0x0FED_CBA9_8765_4321;
+        let longer = encode(&unmatched).expect("encode");
+        assert!(
+            longer.len() > encoded.len(),
+            "an id that cannot be implied has to be written: {} vs {}",
+            longer.len(),
+            encoded.len()
+        );
+        assert_eq!(decode(&longer).expect("decode"), unmatched);
+    }
+
+    /// With more than one of either, every block says its own id.
+    #[test]
+    fn two_blocks_each_say_their_own_object_id() {
+        let mut record = record_with(None);
+        record.outcomes = vec![outcome_with_object_id(11), outcome_with_object_id(22)];
+        record.staged_blocks = vec![
+            crate::wal::StagedBlock {
+                object_id: 11,
+                component: None,
+                bytes: vec![1; 8],
+            },
+            crate::wal::StagedBlock {
+                object_id: 22,
+                component: None,
+                bytes: vec![2; 8],
+            },
+        ];
+        let back = decode(&encode(&record).expect("encode")).expect("decode");
+        assert_eq!(back.staged_blocks[0].object_id, 11);
+        assert_eq!(back.staged_blocks[1].object_id, 22);
+        assert_eq!(back, record);
+    }
+
+    #[test]
+    fn the_borrowing_encoder_writes_the_same_bytes() {
+        for (label, record) in cases() {
+            let parts = record_parts(&record).expect("parts");
+            let mut ours = Vec::with_capacity(parts.len);
+            parts.put(&record, &mut ours).expect("put");
+            let theirs = owned_bytes(&record);
+            assert_eq!(ours, theirs, "bytes differ for {label}");
+            // The reserved length has to be exact, or the append allocates twice.
+            assert_eq!(parts.len, ours.len(), "reserved length wrong for {label}");
+            assert_eq!(
+                parts.len,
+                theirs.len(),
+                "reserved length disagrees with the message for {label}"
+            );
+        }
+    }
+
+    /// And what it writes still decodes to the record that went in.
+    ///
+    /// Byte equality already implies this, but only while the case list covers every arm. This
+    /// asserts the property directly, so a case added without a matching arm still fails.
+    #[test]
+    fn what_it_writes_decodes_back() {
+        for (label, record) in cases() {
+            let encoded = encode(&record).expect("encode");
+            let decoded = decode(&encoded).expect("decode");
+            assert_eq!(decoded.shard_id, record.shard_id, "shard for {label}");
+            assert_eq!(decoded.sequence, record.sequence, "sequence for {label}");
+            assert_eq!(
+                serde_json::to_vec(&decoded.command).unwrap(),
+                serde_json::to_vec(&record.command).unwrap(),
+                "command for {label}"
+            );
+            assert_eq!(
+                decoded.staged_blocks.len(),
+                record.staged_blocks.len(),
+                "staged pages for {label}"
+            );
+        }
+    }
+}
