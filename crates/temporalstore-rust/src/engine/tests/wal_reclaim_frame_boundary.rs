@@ -450,3 +450,456 @@ fn a_failed_sweep_and_an_empty_one_no_longer_report_the_same_thing() {
     );
 
     assert!(
+        !report.wal_sweep_failed,
+        "an untouched shard's sweep reports a failure; the term is reading something other than \
+         the sweep's own outcome"
+    );
+    assert!(
+        !report.index_log_sweep_failed,
+        "an untouched shard's index-log sweep reports a failure"
+    );
+    // The zeros this arm reports are honest, and the term is what says so.
+    assert_eq!(
+        (report.wal_records_removed, report.wal_bytes_before),
+        (0, 0),
+        "APPARATUS: this arm is meant to be the nothing-to-do case"
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// CAN IT KEEP UP, AND IS ANYTHING BOUNDED PER CYCLE
+// ---------------------------------------------------------------------------------------------
+
+/// Rounds of "write, then reclaim" at two corpus sizes, on the half that now frees something.
+///
+/// The question a bound has to answer is not whether it frees bytes but whether it frees them
+/// faster than they accrue. Each round writes `DELTA` batches and then sweeps, and the test
+/// records what accrued against what was released.
+///
+/// TWELVE ROUNDS, and twelve rounds cannot establish an asymptote -- that limit is stated here
+/// rather than argued past. What twelve do establish is that the release is not a start-up
+/// transient and that the log returns to a floor every round rather than ratcheting.
+///
+/// rust-internal: drives the write-ahead log's own reclaim, no product behaviour
+#[test]
+fn reclaim_frees_more_than_accrues_at_both_corpus_sizes() {
+    const ROUNDS: usize = 12;
+    const DELTA: usize = 8;
+    const ITEMS: usize = 64;
+    let mut shape = Vec::new();
+
+    for corpus in [64usize, 640] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = LocalWriteAheadLogStore::new(dir.path());
+        seed_batches(&store, corpus, ITEMS);
+
+        // FIXTURE. A stage with nothing to do reports zero, which reads exactly like a stage that
+        // refused, so the log has to be shown to hold records before any zero below means
+        // anything.
+        let seeded_bytes = log_bytes(dir.path());
+        let seeded_sequence = store.stats(SHARD).last_sequence;
+        assert!(
+            seeded_sequence >= corpus as u64 && seeded_bytes > 0,
+            "APPARATUS corpus={corpus}: the log reached sequence {seeded_sequence} in \
+             {seeded_bytes} B after {corpus} batches, so the sweep below has less to do than this \
+             arm claims"
+        );
+        eprintln!(
+            "RECLAIM ROUND corpus={corpus}: seeded to sequence {seeded_sequence} across {} pieces, \
+             {seeded_bytes} B",
+            log_pieces(dir.path()).len(),
+        );
+
+        let mut accrued_total = 0u64;
+        let mut released_total = 0u64;
+        let mut floors = Vec::new();
+        // The log's length after the previous round's sweep. What the writer adds on top of it
+        // is what accrued, and it is measured from the file rather than from anything the sweep
+        // reports -- a sweep that miscounts must not also supply the figure that checks it.
+        let mut settled = log_bytes(dir.path());
+        for round in 0..ROUNDS {
+            seed_batches(&store, DELTA, ITEMS);
+            let grown = log_bytes(dir.path());
+            let accrued = grown.saturating_sub(settled);
+
+            // Retain only the newest DELTA records, so every round has the same work to do. The
+            // retain point is a SEQUENCE, which keeps ascending across rounds; the frame count
+            // does not, because each sweep rewrites the piece.
+            let last_sequence = store.stats(SHARD).last_sequence;
+            let report = store
+                .gc_before_sequence_unchecked(
+                    SHARD,
+                    last_sequence.saturating_sub(DELTA as u64).saturating_add(1),
+                )
+                .expect("the sweep runs");
+            // Released and floor from the FILESYSTEM, not from the report: whole pieces the sweep
+            // unlinks never appear in `bytes_before`/`bytes_after`, and this is also the residual
+            // that keeps the sweep from marking its own work.
+            let floor = log_bytes(dir.path());
+            let released = grown.saturating_sub(floor);
+            settled = floor;
+            accrued_total += accrued;
+            released_total += released;
+            floors.push(floor);
+
+            if round < 3 || round == ROUNDS - 1 {
+                eprintln!(
+                    "RECLAIM ROUND corpus={corpus} round={round} last_sequence={last_sequence} \
+                     accrued={accrued} B released={released} B floor={floor} B removed={} records \
+                     copied={} B pieces_dropped={} ({} B)",
+                    report.records_removed,
+                    report.bytes_copied,
+                    report.dropped_segments,
+                    report.dropped_segment_bytes,
+                );
+            }
+        }
+
+        // The bound is REACHABLE: the log comes back to the same floor every round instead of
+        // ratcheting upward. Asserted on the last three rather than on all twelve, because the
+        // first rounds still carry the seeded corpus down.
+        // Within a band rather than to the byte: a record carries a varint timestamp, so the last
+        // digits of these counts move between rounds and the claim does not rest on them. What is
+        // asserted is that the floor does not RATCHET -- the spread stays under a percent, and
+        // round eleven does not sit above round two.
+        let tail = &floors[floors.len() - 3..];
+        let spread = tail.iter().max().unwrap() - tail.iter().min().unwrap();
+        let mean = tail.iter().sum::<u64>() / tail.len() as u64;
+        assert!(
+            spread * 100 <= mean,
+            "corpus={corpus}: the log settled at {tail:?} over the last three rounds -- a spread \
+             of {spread} B against a mean of {mean} B, so the reclaim is not returning it to a \
+             floor"
+        );
+        assert!(
+            *floors.last().unwrap() * 10 <= floors[2] * 11,
+            "corpus={corpus}: the floor moved from {} B at round 2 to {} B at round {}, so it is \
+             ratcheting rather than settling",
+            floors[2],
+            floors.last().unwrap(),
+            ROUNDS - 1
+        );
+        assert!(
+            released_total >= accrued_total,
+            "corpus={corpus}: {ROUNDS} rounds released {released_total} B against \
+             {accrued_total} B accrued, so the sweep does not keep up with the writer"
+        );
+        eprintln!(
+            "RECLAIM ROUND corpus={corpus}: {ROUNDS} rounds, accrued {accrued_total} B, released \
+             {released_total} B, settled floor {} B",
+            floors[floors.len() - 1]
+        );
+        shape.push((corpus, floors[floors.len() - 1], released_total / ROUNDS as u64));
+    }
+
+    // FLAT or GROWING, both quantities, with the ratio over a corpus factor of 10.
+    let (small_corpus, small_floor, small_release) = shape[0];
+    let (large_corpus, large_floor, large_release) = shape[1];
+    eprintln!(
+        "RECLAIM ROUND corpus {small_corpus} -> {large_corpus} (10x): settled floor {small_floor} \
+         -> {large_floor} B, mean release per round {small_release} -> {large_release} B",
+    );
+    let floor_ratio = large_floor as f64 / small_floor.max(1) as f64;
+    assert!(
+        (0.95..1.05).contains(&floor_ratio),
+        "the floor the log settles at is {small_floor} B at {small_corpus} batches and \
+         {large_floor} B at {large_corpus} -- {floor_ratio:.4}x over a corpus factor of 10. The \
+         floor is what the sweep RETAINS, which is the same DELTA records either way, so it is \
+         expected FLAT in the corpus"
+    );
+    // The release per round is priced by the round's own work, not by the store: the same DELTA
+    // records cost the same to free at ten times the corpus. Within 5%, because the last digits
+    // of a byte count move between runs.
+    let ratio = large_release as f64 / small_release.max(1) as f64;
+    assert!(
+        (0.95..1.05).contains(&ratio),
+        "the mean release per round moved by {ratio:.4}x over a corpus factor of 10, so it is \
+         priced by the store rather than by the round"
+    );
+    eprintln!("RECLAIM ROUND release per round is FLAT in the corpus: ratio {ratio:.4}x");
+}
+
+/// What bounds a single pass, named. The answer is NOT "nothing".
+///
+/// Two mechanisms, both real, both in `wal.rs`:
+///
+/// * `TS_WAL_RECLAIM_MAX_SEGMENTS_PER_PASS` (default 1,024) caps how many whole sealed pieces
+///   one pass unlinks, explicitly so the lock every append needs is not held for a whole
+///   backlog. Pieces go from the front in order, so stopping early leaves the rest exactly where
+///   the next pass looks.
+/// * `reclaim_is_worth_rewriting` declines the rewrite entirely when it would copy more than
+///   `TS_WAL_RECLAIM_MIN_COPY_BYTES` (default 64 MiB) to free less than
+///   `TS_WAL_RECLAIM_MIN_FREED_PERCENT` (default 25%) of what it copies, reporting
+///   `skipped_not_worth_rewrite`.
+///
+/// The second is a WORTH gate rather than a bound -- it decides whether a pass runs, not how
+/// much it does -- and the active piece's rewrite itself is unbounded: it copies every retained
+/// byte. So one pass is bounded in the pieces it unlinks and unbounded in the bytes it copies.
+/// This test holds the observable half of that: the refusal terms are separately named, so a
+/// caller can say which one fired.
+///
+/// rust-internal: reads the write-ahead log's own reclaim report, no product behaviour
+#[test]
+fn a_pass_names_which_refusal_term_fired() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = LocalWriteAheadLogStore::new(dir.path());
+    seed_batches(&store, 8, 64);
+
+    // A sweep that does its work names no refusal.
+    let worked = store
+        .gc_before_sequence_unchecked(SHARD, 4)
+        .expect("the sweep runs");
+    assert!(worked.records_removed > 0, "APPARATUS: the sweep had no work");
+    assert!(!worked.skipped_not_worth_rewrite);
+    assert!(!worked.clamped_by_block_retention);
+    assert!(!worked.clamped_by_durable_index);
+
+    // The block-retention floor, driven on its own. It is the term that stops a reclaim removing
+    // the only copy of a page the served index still points at.
+    store.set_block_retention_floor(SHARD, 1);
+    let clamped = store
+        .gc_before_sequence_unchecked(SHARD, 8)
+        .expect("the sweep runs");
+    eprintln!(
+        "RECLAIM TERM block-retention floor: clamped={} removed={} effective_retain={}",
+        clamped.clamped_by_block_retention,
+        clamped.records_removed,
+        clamped.effective_retain_from_sequence,
+    );
+    assert!(
+        clamped.clamped_by_block_retention,
+        "a retain point of 8 above a floor of 1 did not report the clamp, so the term that says \
+         WHY a pass kept records is not being set"
+    );
+    assert_eq!(
+        clamped.records_removed, 0,
+        "the floor is at sequence 1, so nothing above it may go"
+    );
+
+    // And the durable-index clamp, which is the anchored wrapper's own term.
+    store.clear_block_retention_floor(SHARD);
+    let anchor = crate::wal::DurableIndexAnchor::proven_durable_through(SHARD, 2);
+    let anchored = store
+        .gc_before_sequence(SHARD, 9, &anchor)
+        .expect("the sweep runs");
+    eprintln!(
+        "RECLAIM TERM durable-index anchor: clamped={} removed={} retain_asked={} effective={}",
+        anchored.clamped_by_durable_index,
+        anchored.records_removed,
+        anchored.retain_from_sequence,
+        anchored.effective_retain_from_sequence,
+    );
+    assert!(
+        anchored.clamped_by_durable_index,
+        "a retain point past what the anchor proves did not report the clamp"
+    );
+    assert_eq!(
+        anchored.retain_from_sequence, 9,
+        "the report must carry the sequence the caller ASKED for, so a narrowed reclaim is \
+         visible as narrowed rather than as a smaller request that succeeded exactly"
+    );
+}
+
+/// THE POSITIVE ARM. A sweep that genuinely fails must SAY so.
+///
+/// The test above shows the term is not stuck on; this one shows it is not stuck off. Without
+/// both, `wal_sweep_failed: false` hard-coded would pass everything -- a term that can only ever
+/// be observed in its quiet state is not a term.
+///
+/// The failure is manufactured by damaging a record's payload after it was written, which is
+/// what `next_frame` is there to catch: a complete frame whose digest does not match its payload
+/// is committed corruption and returns `Err`, and that `Err` is what the caller drops with
+/// `.ok()`.
+///
+/// rust-internal: reads the engine's own maintenance entry point, no product behaviour
+#[test]
+fn a_sweep_that_fails_says_so_instead_of_reporting_three_zeros() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = release_engine(dir.path());
+    for index in 0..400usize {
+        let _ = engine.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringSet {
+                key: format!("k-{index:08}"),
+                value: vec![b'v'; 64],
+            },
+        });
+    }
+
+    let piece = find_wal_piece(dir.path()).expect("APPARATUS: the engine wrote no log piece");
+    let frames = frames_of(&piece);
+    assert!(
+        frames.len() >= 8,
+        "APPARATUS: the log holds {} frames, so there is nothing for a sweep to do",
+        frames.len()
+    );
+
+    // FAIL THE SWEEP AND NOTHING ELSE.
+    //
+    // Damaging the log's BYTES was tried first and is the wrong lever: the dump's step 1 flushes
+    // the write-ahead log before it materializes anything, that flush reads the log end to end,
+    // and a damaged record stops the DUMP rather than the sweep -- measured, `flush` and the
+    // sweep both refused and the dump answered `None`, so there was no report to read at all.
+    // (That the dump refuses a log it cannot read is the right behaviour; it is simply not this
+    // test's subject.)
+    //
+    // So block the one file only the sweep writes. The reclaim rewrites survivors into
+    // `<piece>.jsonl.tmp` and renames it into place; a DIRECTORY sitting on that name fails the
+    // `File::create` and nothing before it. The walk runs, the decision is made, and the sweep
+    // then returns `Err` at the moment it tries to commit -- which is exactly the shape the
+    // caller's `.ok()` discards.
+    let blocked = piece.with_extension("jsonl.tmp");
+    std::fs::create_dir(&blocked).expect("the blocker is creatable");
+    eprintln!(
+        "RECLAIM TERM blocked the sweep's temp path {} ({} frames in the log)",
+        blocked.display(),
+        frames.len()
+    );
+
+    // APPARATUS, both halves: the flush the dump depends on must still SUCCEED, and the sweep
+    // must actually FAIL. Without the first the dump answers None; without the second this arm
+    // is measuring a sweep that worked.
+    assert!(
+        engine.write_ahead_log_store().flush(SHARD).is_ok(),
+        "APPARATUS: the flush the dump takes before anything else failed, so a None below would \
+         be the dump bailing rather than the sweep refusing"
+    );
+
+    let report = engine
+        .dump_and_reclaim_index_logs_with_min_reclaimable(SHARD, 0)
+        .expect("APPARATUS: the dump itself did not complete, so there is no report to read");
+
+    eprintln!(
+        "RECLAIM TERM refused sweep: wal_sweep_failed={} wal_records_removed={} \
+         wal_bytes_before={} wal_bytes_after={}",
+        report.wal_sweep_failed,
+        report.wal_records_removed,
+        report.wal_bytes_before,
+        report.wal_bytes_after,
+    );
+
+    assert!(
+        report.wal_sweep_failed,
+        "the sweep refused a damaged log and the report says it did not fail. Its three release \
+         fields are {} / {} / {} -- exactly what an empty log reports, which is the rendering \
+         this term exists to break",
+        report.wal_records_removed, report.wal_bytes_before, report.wal_bytes_after
+    );
+    // And the reason the term is needed at all: the three numbers really are the empty-log ones.
+    assert_eq!(
+        (
+            report.wal_records_removed,
+            report.wal_bytes_before,
+            report.wal_bytes_after
+        ),
+        (0, 0, 0),
+        "APPARATUS: a failed sweep no longer reports defaults, so the term is guarding a \
+         rendering that has stopped happening -- check `.ok()` / `unwrap_or_default()` in \
+         `dump_and_reclaim_index_logs_with_min_reclaimable`"
+    );
+}
+
+/// The shard's active log piece, wherever the engine put it.
+fn find_wal_piece(root: &Path) -> Option<std::path::PathBuf> {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        for entry in std::fs::read_dir(&next).ok()?.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("shard-1.wal") && !name.ends_with(".lock"))
+                .unwrap_or(false)
+            {
+                return Some(path);
+            }
+        }
+    }
+    None
+}
+
+/// THE INSTRUMENT, CONTROLLED. A blind instrument reads zero exactly like an exact one does.
+///
+/// `log_bytes` is what the rounds test measures accrual and release with, and it is independent
+/// of the sweep only if it is actually reading the filesystem. So plant a known number of bytes
+/// where it has to see them and require it back EXACTLY -- not "more than before", which a
+/// stuck-open instrument would also satisfy.
+///
+/// The residual beside it is the other direction: bytes written where the walk cannot see them
+/// must NOT be counted. `/proc/thread-self/io` is the kernel's own figure for this thread --
+/// per-thread and not `/proc/self/io`, which is process-wide and has charged a measured span
+/// 3,194 bytes a background thread wrote under a full-suite run.
+///
+/// rust-internal: measures the test's own byte instrument, no product behaviour
+#[test]
+fn the_byte_instrument_recovers_exactly_what_was_planted() {
+    const PLANTED: u64 = 4_096;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = LocalWriteAheadLogStore::new(dir.path());
+    seed_batches(&store, 4, 16);
+
+    let before = log_bytes(dir.path());
+    assert!(
+        before > 0,
+        "APPARATUS: the log measured 0 B before anything was planted, so a recovery of exactly \
+         {PLANTED} below would be an instrument reading one file rather than the log"
+    );
+
+    let thread_io_before = thread_bytes_written();
+    // Planted INSIDE the log directory, where the walk must see it.
+    std::fs::write(dir.path().join("planted.bin"), vec![0u8; PLANTED as usize])
+        .expect("the marker is writable");
+    let after = log_bytes(dir.path());
+    let thread_io_after = thread_bytes_written();
+
+    let recovered = after.saturating_sub(before);
+    eprintln!(
+        "RECLAIM INSTRUMENT planted {PLANTED} B, walk recovered {recovered} B \
+         (log {before} -> {after} B); this thread's kernel wchar moved {} B",
+        thread_io_after.saturating_sub(thread_io_before)
+    );
+    assert_eq!(
+        recovered, PLANTED,
+        "the walk recovered {recovered} B of a planted {PLANTED} B. An instrument that cannot \
+         recover a known write cannot be trusted when it reports a zero"
+    );
+
+    // And the negative direction: a file planted OUTSIDE the log directory must not be counted,
+    // or the instrument is measuring the machine rather than the log.
+    let elsewhere = tempfile::tempdir().expect("tempdir");
+    std::fs::write(elsewhere.path().join("unrelated.bin"), vec![0u8; PLANTED as usize])
+        .expect("the decoy is writable");
+    assert_eq!(
+        log_bytes(dir.path()),
+        after,
+        "a file written outside the log directory changed the log's measured size, so the \
+         instrument is not bounded by what it claims to measure"
+    );
+
+    // The kernel's own figure has to have moved at all, or it is an identity rather than a
+    // reading -- a residual computed against a counter that never moves is always 0.
+    assert!(
+        thread_io_after > thread_io_before,
+        "this thread's kernel wchar did not move across two {PLANTED} B writes ({} -> {}), so it \
+         is not being read from where this thread's writes are counted",
+        thread_io_before,
+        thread_io_after
+    );
+}
+
+/// Bytes THIS THREAD has written, per the kernel.
+///
+/// `/proc/thread-self/io`, never `/proc/self/io`: the process-wide counter includes every other
+/// thread in the test binary, and under a full-suite run that has charged a measured span bytes
+/// a background thread an earlier test left running wrote.
+fn thread_bytes_written() -> u64 {
+    std::fs::read_to_string("/proc/thread-self/io")
+        .ok()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("wchar: ")?.trim().parse::<u64>().ok())
+        })
+        .unwrap_or(0)
+}

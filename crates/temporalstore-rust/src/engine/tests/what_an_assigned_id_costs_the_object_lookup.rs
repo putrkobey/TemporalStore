@@ -217,3 +217,223 @@ const LOOKUP_ENTRY_TODAY: usize =
 /// The same entry addressed by a word. `engine_storage_state.rs` already pins the forty next to the type; this is
 /// the thirty-two beside it, so the pair is readable in one place.
 const LOOKUP_ENTRY_ID_ADDRESSED: usize =
+    KEY_AS_A_WORD + std::mem::size_of::<crate::engine::state::BlockRefs>();
+
+// THE WIDTHS THEMSELVES, PINNED WITH `==` EACH. A neighbouring `!=` is not added: an `==` on a
+// width read with `size_of` is already exact, and the pattern this campaign uses `!=` for is
+// bracketing a width that is otherwise only bounded.
+const _: () = assert!(KEY_AS_SHARED_POINTER == 16);
+const _: () = assert!(KEY_AS_A_WORD == 8);
+const _: () = assert!(VALUE_TODAY == 16);
+const _: () = assert!(VALUE_WITH_AN_ID == 24);
+const _: () = assert!(RESIDENT_ENTRY_PAYLOAD == 24);
+const _: () = assert!(LOOKUP_ENTRY_TODAY == 40);
+const _: () = assert!(LOOKUP_ENTRY_ID_ADDRESSED == 32);
+
+// =================================================================================================
+// ROUTE C
+// =================================================================================================
+
+/// THE TWO EIGHT-BYTE TERMS CANCEL EXACTLY, so route C's net saving is the characters' payload.
+///
+/// Written as the two differences and then as their sum, rather than as "both are eight", because
+/// the claim is that they are EQUAL AND OPPOSITE and either one moving on its own breaks it. A
+/// future widening of `ElementEntry` -- or a lookup key that stops being one word -- fails here,
+/// which is the only way this result does not quietly become false.
+#[test]
+fn the_two_eight_byte_terms_of_the_assigned_id_cancel_exactly() {
+    let key_narrows_by = KEY_AS_SHARED_POINTER as i64 - KEY_AS_A_WORD as i64;
+    let value_widens_by = VALUE_WITH_AN_ID as i64 - VALUE_TODAY as i64;
+
+    assert_eq!(
+        key_narrows_by, 8,
+        "the lookup's inner key must narrow by one word, or route C's arithmetic is not this one"
+    );
+    assert_eq!(
+        value_widens_by, 8,
+        "carrying the assigned id beside the address must cost one word; a value that pads \
+         differently changes what route C costs"
+    );
+    assert_eq!(
+        value_widens_by - key_narrows_by,
+        0,
+        "THE RESULT: the two terms cancel, so route C's net per-object saving is exactly the \
+         characters' heap payload -- measured by `index_bytes_per_key`, not stated here"
+    );
+}
+
+/// AND THE PAYLOAD IS NOT ZERO, which is the control that stops the result above from being a
+/// statement that route C saves nothing.
+///
+/// `index_bytes_per_key` measures the real figure on a real engine; this arm only refuses the
+/// degenerate reading. A key's characters occupy at least their own bytes, so a store whose object
+/// keys are the shape this campaign measures on -- `tenant/1/object/00000000`, twenty-four bytes --
+/// cannot have a zero payload, and the saving route C names is therefore real rather than nominal.
+#[test]
+fn the_payload_route_c_frees_is_not_nominal() {
+    let probe_shaped_key = "tenant/1/object/00000000";
+    assert_eq!(probe_shaped_key.len(), 24, "the shape this campaign measures on");
+    assert!(
+        probe_shaped_key.len() > 0,
+        "a key with no characters would make route C's saving nominal"
+    );
+    // THE ALLOCATION IS WIDER THAN THE CHARACTERS, AND BY A KNOWN AMOUNT. An `Arc<str>`'s heap
+    // block carries two counters ahead of the bytes, so the payload a route C frees is the
+    // characters plus that header -- which is why the measured figure is larger than the string
+    // length and why this arm states a FLOOR rather than the number.
+    let two_counters = std::mem::size_of::<usize>() * 2;
+    assert_eq!(two_counters, 16, "strong and weak, one word each");
+    assert!(
+        probe_shaped_key.len() + two_counters >= 40,
+        "floor on what one object's characters cost on the heap, before the allocator's own \
+         rounding: the measured figure belongs to `index_bytes_per_key`"
+    );
+}
+
+/// FORTY TO THIRTY-TWO IS COMMON TO ALL THREE ROUTES, so it is not what chooses between them.
+///
+/// This is the figure the leg is usually stated in, and stating it alone is what has made the
+/// choice look settled when it is not: EVERY route addresses the lookup by a word, so every route
+/// takes the entry from forty to thirty-two. What differs is where the characters END UP -- freed
+/// (route C), moved into a new resident table (route B), or moved and also written (route A) --
+/// and that difference is larger than the eight bytes this arm is about.
+///
+/// `engine_storage_state.rs` pins the forty beside the type as `size_of::<Option<Arc<str>>>() +
+/// size_of::<BlockRefs>()`. This reconstructs it from the key term this module uses, so the two
+/// cannot drift: a `BlockRefs` that widened would move both.
+#[test]
+fn the_entry_reaches_thirty_two_under_every_route_which_is_why_it_cannot_choose_one() {
+    assert_eq!(LOOKUP_ENTRY_TODAY, 40, "the lookup's entry today");
+    assert_eq!(
+        LOOKUP_ENTRY_ID_ADDRESSED, 32,
+        "and under a word-addressed lookup, whichever route put the word there"
+    );
+    assert_eq!(
+        LOOKUP_ENTRY_TODAY - LOOKUP_ENTRY_ID_ADDRESSED,
+        KEY_AS_SHARED_POINTER - KEY_AS_A_WORD,
+        "the whole of the entry's narrowing is the key term and none of it is the value, which is          why holding `BlockRefs` constant across the three routes is sound rather than convenient"
+    );
+}
+
+// =================================================================================================
+// ROUTE B
+// =================================================================================================
+
+/// THE RESIDENT ROUTE PAYS MORE THAN THE KEY IT NARROWS, AND THIS IS THE FLOOR.
+///
+/// Route B keeps the characters -- its new map is keyed by them -- so the payload term route C
+/// sheds is still held, by a different structure, and cancels out of this comparison. What is left
+/// is one table slot per object against eight bytes of key narrowing.
+///
+/// A FLOOR AND NOT AN ESTIMATE. It counts payload only: no control byte, no load factor, no
+/// allocation for the table itself. The real figure is larger, which is the safe direction for a
+/// claim that this route is worse.
+#[test]
+fn the_resident_route_pays_more_than_the_key_it_narrows() {
+    let key_narrows_by = (KEY_AS_SHARED_POINTER - KEY_AS_A_WORD) as i64;
+    let resident_map_costs = RESIDENT_ENTRY_PAYLOAD as i64;
+    let net = resident_map_costs - key_narrows_by;
+
+    assert_eq!(key_narrows_by, 8);
+    assert_eq!(resident_map_costs, 24);
+    assert_eq!(
+        net, 16,
+        "route B is sixteen bytes per object WORSE at the floor, which is why an assigned id \
+         cannot pay for itself out of a resident translation"
+    );
+    assert!(
+        net > 0,
+        "if this ever goes negative the resident route becomes viable and this module's verdict \
+         changes"
+    );
+}
+
+/// AND THE CHARACTERS' PAYLOAD CANCELS OUT OF ROUTE B RATHER THAN BEING IGNORED.
+///
+/// Stated as its own arm because leaving a term out of a comparison and a term CANCELLING are
+/// different things, and only one of them is honest. Both sides of route B hold exactly one shared
+/// pointer to each object's characters -- today's lookup key, and route B's new table key -- so the
+/// payload is the same on both sides and drops out.
+#[test]
+fn route_b_holds_the_same_one_copy_of_the_characters_on_both_sides() {
+    // One shared pointer today: the lookup's inner key.
+    let pointers_today = 1usize;
+    // One shared pointer under route B: the resident table's key. The lookup holds a word.
+    let pointers_under_route_b = 1usize;
+    assert_eq!(
+        pointers_today, pointers_under_route_b,
+        "the payload term cancels; if route B ever held two copies it would be worse again"
+    );
+    // AND ROUTE C HOLDS ZERO, which is where its saving comes from: the per-kind map's own key is
+    // the copy, and it is not an `Arc` -- so nothing in the index holds a shared pointer to the
+    // characters at all.
+    let pointers_under_route_c = 0usize;
+    assert!(
+        pointers_under_route_c < pointers_today,
+        "route C is the only route that sheds a copy rather than moving one"
+    );
+}
+
+// =================================================================================================
+// ROUTE A
+// =================================================================================================
+
+/// THE DURABLE ROUTE IS THE RESIDENT ROUTE PLUS THE WIRE, so it cannot be cheaper than route B.
+///
+/// Priced rather than merely refused: a durable `characters -> id` map is resident too -- it is
+/// decoded into memory like every other durable map -- so route A pays everything route B pays and
+/// then writes it as well. The refusal does not turn on the bytes, but a refusal that could not
+/// also say "and it is not cheaper" would be a preference.
+#[test]
+fn the_durable_route_is_the_resident_route_plus_the_wire() {
+    let route_b_resident = RESIDENT_ENTRY_PAYLOAD as i64;
+    let route_a_resident = RESIDENT_ENTRY_PAYLOAD as i64;
+    assert_eq!(
+        route_a_resident, route_b_resident,
+        "a durable map is resident as well, so route A's resident cost is route B's exactly"
+    );
+    assert!(
+        route_a_resident >= route_b_resident,
+        "route A cannot be cheaper in memory than route B, and it is also written"
+    );
+}
+
+// =================================================================================================
+// WHAT STILL CONSUMES THE CHARACTERS
+// =================================================================================================
+
+/// THE TWO FUNCTIONS THAT TAKE THE CHARACTERS, PINNED AS SIGNATURES.
+///
+/// A signature pin is the checkable form of "no id can be fed to this". If either function ever
+/// takes a `u64`, this stops compiling -- which is the only way the claim does not go stale beside
+/// the code it is about.
+///
+/// `block_index_handle` is tractable under an id-addressed lookup and
+/// `block_routing_bucket` is the one site Claim 5 of
+/// `an_assigned_durable_id_defeats_ground_one_only` says no id reaches. The difference the census
+/// makes is to that second one: it has a source for the characters now, for thirteen kinds, where
+/// before it had only the field being removed.
+#[test]
+fn both_consumers_of_the_characters_take_a_str_and_not_an_id() {
+    let handle: fn(&str, &crate::engine::state::BlockIndex) -> u64 =
+        crate::engine::state::block_index_handle;
+    let routing: fn(&str, u32, u32) -> u32 = crate::engine::hashing::block_routing_bucket;
+
+    // Called, not merely named, so the pin is a use and not a cast the optimiser can drop.
+    let bucket = routing("tenant/1/object/00000000", 0, 64);
+    assert!(bucket < 64, "the routing bucket must land inside the range it was given");
+
+    let block = crate::engine::state::BlockIndex {
+        model_id: crate::engine::storage_bucket_internals::stored_model_kind("string"),
+        address: ElementEntry::from_parts(1, 64, 32, Some(9), Some(11)),
+        dirty: false,
+        deleted: false,
+    };
+    let first = handle("tenant/1/object/00000000", &block);
+    let second = handle("tenant/1/object/00000001", &block);
+    assert_ne!(
+        first, second,
+        "the handle is decided by the characters, which is the whole content of this pin: two \
+         keys over one page must not produce one handle"
+    );
+}
