@@ -255,3 +255,1035 @@ pub(super) fn encode_block_record(
         logical_len: payload.len(),
         stored_len,
         compression,
+    })
+}
+
+fn encode_block_record_payload(
+    payload: &[u8],
+    options: BlockStoreOptions,
+) -> Result<(Vec<u8>, BlockRecordCompression), BlockStoreError> {
+    crate::alloc_probe::in_class(crate::alloc_probe::AllocClass::BlockBytes, || {
+        encode_block_record_payload_inner(payload, options)
+    })
+}
+
+/// The encode itself. Split out so the allocation class above covers a whole function body rather
+/// than a span the early return skips: an uncompressed write takes that return, and it is the one
+/// a scope wrapped around the tail would have missed.
+fn encode_block_record_payload_inner(
+    payload: &[u8],
+    options: BlockStoreOptions,
+) -> Result<(Vec<u8>, BlockRecordCompression), BlockStoreError> {
+    if !options.compression_enabled || payload.len() < options.compression_min_bytes {
+        return Ok((payload.to_vec(), BlockRecordCompression::None));
+    }
+    // Reuse one compression context per thread, the mirror of the decoder below.
+    //
+    // `zstd::stream::encode_all` constructs a compressor, uses it once and drops it, and a
+    // compressor allocates its working buffers up front. Measured by sweeping value sizes
+    // through a write: cost is flat at 2.0 B allocated per payload byte on both sides of a
+    // step between 192 and 256 bytes worth 32,535 B per write -- and 256 is
+    // `BLOCK_RECORD_COMPRESSION_MIN_BYTES`, so the step IS this call. At the 1,244-byte average
+    // of a soak corpus that is about 80% of everything a write allocates.
+    //
+    // The level is per-call rather than fixed, so it is set on the held compressor each time;
+    // that is a parameter update, not a rebuild. A compressor is `&mut` to compress, so this is
+    // thread-local for the same reason the decompressor is: one shared instance would serialise
+    // every writer behind a lock on a path that is otherwise concurrent.
+    //
+    // The stored bytes CHANGE -- the bulk API frames a stream without the content-size header
+    // the streaming call writes, so output is a little smaller. Both are ordinary zstd frames,
+    // both decode through the path below and through the streaming fallback, so a record written
+    // by either build reads on either. It is still a change to what lands on disk.
+    let level = options.compression_level.clamp(-7, 22);
+    let compressed = ZSTD_COMPRESSOR.with(|cell| {
+        let mut compressor = cell.borrow_mut();
+        compressor.set_compression_level(level)?;
+        compressor.compress(payload)
+    })?;
+    if compressed.len() < payload.len() {
+        Ok((compressed, BlockRecordCompression::Zstd))
+    } else {
+        Ok((payload.to_vec(), BlockRecordCompression::None))
+    }
+}
+
+pub(super) fn decode_block_record(
+    record: &[u8],
+    address: &ElementEntry,
+) -> Result<DecodedBlockRecord, BlockStoreError> {
+    if record.len() < BLOCK_RECORD_HEADER_LEN || !record.starts_with(BLOCK_RECORD_MAGIC) {
+        return Ok(DecodedBlockRecord {
+            payload: record.to_vec(),
+            logical_len: record.len(),
+            compression: BlockRecordCompression::None,
+        });
+    }
+    if record.len() < BLOCK_RECORD_SMALLEST_HEADER_LEN {
+        return Err(corrupt_block_envelope(address, "short header"));
+    }
+    let header = parse_block_record_header(record, address)?;
+    if let (Some(address_block_id), Some(record_block_id)) = (address.block_id(), header.block_id) {
+        if address_block_id != record_block_id {
+            return Err(corrupt_block_envelope(
+                address,
+                format!("page id mismatch: address {address_block_id}, record {record_block_id}"),
+            ));
+        }
+    }
+    // THE CHECK BELOW CANNOT FIRE, AND THE ROUTING-BUCKET ARM THAT SAT UNDER IT IS NOW GONE.
+    //
+    // `parse_block_record_header` returns `object_id: None` and returned `routing_bucket: None` --
+    // the record header carries NEITHER FIELD AT ALL, and `encode_block_record` discards both
+    // (`let _ = (object_id, routing_bucket);`) -- so both `if let` pairs failed to match on every
+    // read ever taken. Mutating each to fail unconditionally (`|| true`) left 89 of 89 block-store
+    // and address-footprint tests green; the same mutation on the block-id arm above turned 23 of
+    // those 89 red, so the harness does notice a check that breaks.
+    //
+    // SO THERE WAS NO ADDRESS-VERSUS-RECORD CROSS-CHECK ON THE ROUTING BUCKET TO LOSE. Its address
+    // side is gone with the field, and its record side never existed: no record can be built that
+    // makes it fire, which is the strongest statement available about a check. What replaces it is
+    // not in this function -- `validate_bucket_ownership_index_from_entries` compares where a page
+    // is FILED against where its KEY routes, which are two independent answers, and
+    // `BucketReleaseRefusal::BlockRoutingMismatch` refuses a release on the same comparison.
+    //
+    // THE OBJECT-ID ARM IS LEFT IN PLACE rather than deleted, because the payload checksum does
+    // NOT cover what it names. `block_record_checksum_field` is a CRC32C over the payload alone:
+    // it binds a record to ITSELF, never to the address that reached it. An intact record belonging
+    // to a different object verifies perfectly. So the object-id arm is the one detector here worth
+    // having, and reinstating it means carrying the object id on the wire -- a FORMAT change and a
+    // decision for whoever owns the format, not a tidy-up. The routing bucket would only ever have
+    // caught a subset of what the object id catches, being a many-to-one function of it, for four
+    // more bytes on every record; if one of the two is ever carried it should be the object id.
+    //
+    // WHAT WAS DELETED, and why it is not the same case: a third arm compared
+    // `address.slab_id()` against `header.slab_id`. That one was vacuous by construction rather
+    // than merely dead. `BlockAddress::slab_id()` returns `Some(self.block_slab_id)`
+    // unconditionally, and `block_slab_id` is the slab file `BlockStore::read` just opened, so
+    // the address side of the comparison was never an independent claim -- it was "which file am
+    // I holding". The record side, had it been written, came from the same variable the file path
+    // came from (`append_block_of_object` builds both from `inner.block_slab_id`). The two sides
+    // agree in every reachable state INCLUDING a reused slab id, where a record in the new slab
+    // stamps the reused number and a stale address naming that number compares it against itself.
+    // Carrying the field would have bought no discrimination at any offset in the format.
+    // THE OBJECT-ID CROSS-CHECK STOOD HERE AND WAS ALREADY UNFIREABLE, which is why it went with
+    // the field rather than being rebuilt around a derived value. `encode_block_record` takes an
+    // `object_id` and discards it; `parse_block_record_header` returns `None` for it
+    // unconditionally. So no record can be built whose header disagrees with anything, and
+    // `the_envelope_carries_a_crc_not_a_digest` asserts that `None` in place. Rebuilding the check
+    // against an id DERIVED from the key would have been strictly worse than deleting it: both
+    // sides would come from the same terms, so it could only ever compare a value with itself.
+    // The length check below is not an identity check, but it IS the only thing besides the block
+    // ordinal that stands between a stale address and a different record's bytes: the address
+    // hands `read_range` a length, and a record at that offset whose header states a different
+    // stored size is refused here. A misdirected read therefore has to land on an exact record
+    // boundary AND match that record's total encoded length before the block ordinal is even
+    // consulted.
+    if record.len() != header.header_len + header.stored_len {
+        return Err(corrupt_block_envelope(
+            address,
+            "payload length mismatch".to_string(),
+        ));
+    }
+    let payload = decode_block_record_payload(&record[header.header_len..], &header, address)?;
+    verify_block_record_checksum(&payload, &header.checksum, address)?;
+    Ok(DecodedBlockRecord {
+        payload,
+        logical_len: header.payload_len,
+        compression: header.compression,
+    })
+}
+
+pub(super) fn logical_range_from_slab(
+    slab: &[u8],
+    block_slab_id: u64,
+    offset: u64,
+    size: u64,
+) -> Result<LogicalRangeRead, BlockStoreError> {
+    if size == 0 {
+        return Ok(LogicalRangeRead {
+            bytes: Vec::new(),
+            compressed_records_read: 0,
+        });
+    }
+    if slab.len() < BLOCK_RECORD_HEADER_LEN || !slab.starts_with(BLOCK_RECORD_MAGIC) {
+        let start = offset as usize;
+        let end = start.saturating_add(size as usize).min(slab.len());
+        let bytes = if start >= slab.len() {
+            Vec::new()
+        } else {
+            slab[start..end].to_vec()
+        };
+        return Ok(LogicalRangeRead {
+            bytes,
+            compressed_records_read: 0,
+        });
+    }
+
+    let requested_start = offset as usize;
+    let requested_end = requested_start.saturating_add(size as usize);
+    let mut physical_offset = 0usize;
+    let mut logical_offset = 0usize;
+    let mut out = Vec::with_capacity(size as usize);
+    let mut compressed_records_read = 0_u64;
+
+    while physical_offset < slab.len() && out.len() < size as usize {
+        let remaining = &slab[physical_offset..];
+        let address = ElementEntry::from_parts(block_slab_id, physical_offset as u64, 0, None, None);
+        if remaining.len() < BLOCK_RECORD_HEADER_LEN || !remaining.starts_with(BLOCK_RECORD_MAGIC) {
+            return Err(corrupt_block_envelope(
+                &address,
+                "mixed raw bytes after page envelope",
+            ));
+        }
+        if remaining.len() < BLOCK_RECORD_SMALLEST_HEADER_LEN {
+            return Err(corrupt_block_envelope(&address, "short header"));
+        }
+        let header = parse_block_record_header(remaining, &address)?;
+        let record_len = header.header_len.saturating_add(header.stored_len);
+        if remaining.len() < record_len {
+            return Err(corrupt_block_envelope(
+                &address,
+                "payload length mismatch".to_string(),
+            ));
+        }
+        let address = ElementEntry::from_parts(0, 0, record_len as u64, header.block_id, header.object_id);
+        let payload = decode_block_record_payload(
+            &remaining[header.header_len..record_len],
+            &header,
+            &address,
+        )?;
+        verify_block_record_checksum(&payload, &header.checksum, &address)?;
+        if header.compression == BlockRecordCompression::Zstd {
+            compressed_records_read += 1;
+        }
+
+        let logical_end = logical_offset.saturating_add(header.payload_len);
+        let overlap_start = requested_start.max(logical_offset);
+        let overlap_end = requested_end.min(logical_end);
+        if overlap_start < overlap_end {
+            let payload_start = overlap_start - logical_offset;
+            let payload_end = overlap_end - logical_offset;
+            out.extend_from_slice(&payload[payload_start..payload_end]);
+        }
+
+        physical_offset = physical_offset.saturating_add(record_len);
+        logical_offset = logical_end;
+    }
+
+    Ok(LogicalRangeRead {
+        bytes: out,
+        compressed_records_read,
+    })
+}
+
+/// Reads a header, whose fields are varints and so can only be read in order.
+///
+/// There is no declared header length to check against: the header ends where the walk ends.
+fn parse_block_record_header(
+    record: &[u8],
+    address: &ElementEntry,
+) -> Result<BlockRecordHeader, BlockStoreError> {
+    if !record.starts_with(BLOCK_RECORD_MAGIC) {
+        return Err(corrupt_block_envelope(address, "not a block record"));
+    }
+    if record.len() < BLOCK_RECORD_HEADER_LEN {
+        return Err(corrupt_block_envelope(address, "short header"));
+    }
+    let checksum = record[BLOCK_RECORD_CHECKSUM_OFFSET..BLOCK_RECORD_CHECKSUM_OFFSET + BLOCK_RECORD_CHECKSUM_LEN]
+        .try_into()
+        .expect("block checksum slice");
+    let sized = u32::from_le_bytes(
+        record[BLOCK_RECORD_LENGTH_OFFSET..BLOCK_RECORD_LENGTH_OFFSET + 4]
+            .try_into()
+            .expect("block size slice"),
+    );
+    let block_size = (sized & BLOCK_RECORD_LENGTH_MASK) as usize;
+    let codec = (sized >> BLOCK_RECORD_CODEC_SHIFT) as u8;
+    let block_id = u16::from_le_bytes(
+        record[BLOCK_RECORD_BLOCK_ID_OFFSET..BLOCK_RECORD_BLOCK_ID_OFFSET + 2]
+            .try_into()
+            .expect("block id slice"),
+    );
+    let compression = match codec {
+        BLOCK_RECORD_COMPRESSION_NONE => BlockRecordCompression::None,
+        BLOCK_RECORD_COMPRESSION_ZSTD => BlockRecordCompression::Zstd,
+        codec => {
+            return Err(corrupt_block_envelope(
+                address,
+                format!("unsupported compression codec {codec}"),
+            ));
+        }
+    };
+    // The header carries the STORED size, because that is what a slab walk steps by. For an
+    // uncompressed block the stored bytes ARE the block, so the two sizes are one number. For a
+    // compressed one the decompressed size is the block's own first four bytes -- which is
+    // readable here without decompressing anything, so callers that only want to ACCOUNT for
+    // logical bytes (slab summaries, logical range reads) get the right number for free.
+    let payload_len = match compression {
+        BlockRecordCompression::None => block_size,
+        BlockRecordCompression::Zstd => {
+            let at = BLOCK_RECORD_HEADER_LEN;
+            if record.len() < at + 4 {
+                return Err(corrupt_block_envelope(
+                    address,
+                    "compressed block has no decompressed size",
+                ));
+            }
+            u32::from_le_bytes(
+                record[at..at + 4]
+                    .try_into()
+                    .expect("decompressed size slice"),
+            ) as usize
+        }
+    };
+    Ok(BlockRecordHeader {
+        header_len: BLOCK_RECORD_HEADER_LEN,
+        payload_len,
+        stored_len: block_size,
+        checksum,
+        block_id: Some(u64::from(block_id)),
+        // The index holds these. A record that repeated them could only ever agree or be wrong.
+        object_id: None,
+        routing_bucket: None,
+        compression,
+    })
+}
+
+thread_local! {
+    /// One zstd decompression context per thread, reused across page reads.
+    ///
+    /// Thread-local rather than a shared pool: a decompressor is `&mut` for the duration of a
+    /// decompress, so sharing one would serialise every reader behind a lock on a path that is
+    /// otherwise concurrent.
+    static ZSTD_DECOMPRESSOR: std::cell::RefCell<zstd::bulk::Decompressor<'static>> =
+        std::cell::RefCell::new(
+            zstd::bulk::Decompressor::new().expect("zstd decompressor construction"),
+        );
+
+    /// The write-side mirror. Level is set per call, so the level chosen here is only a starting
+    /// point and never the one a record is actually compressed at.
+    static ZSTD_COMPRESSOR: std::cell::RefCell<zstd::bulk::Compressor<'static>> =
+        std::cell::RefCell::new(
+            zstd::bulk::Compressor::new(0).expect("zstd compressor construction"),
+        );
+}
+
+fn decode_block_record_payload(
+    stored_payload: &[u8],
+    header: &BlockRecordHeader,
+    address: &ElementEntry,
+) -> Result<Vec<u8>, BlockStoreError> {
+    match header.compression {
+        BlockRecordCompression::None => Ok(stored_payload.to_vec()),
+        BlockRecordCompression::Zstd => {
+            // Reuse one decompression context per thread instead of building one per read.
+            //
+            // `zstd::stream::decode_all` constructs a fresh streaming decoder each call, and a
+            // decoder allocates its window buffer up front. Measured over 120 freshly written
+            // summary records: the block-store read allocated ~132 KB per address to return a
+            // 344-byte payload, about 380x the data, and that read was 78% of the whole cost of
+            // fetching a record. The window is the same size whatever the record is, so the
+            // smaller the record the worse the ratio -- which is the wrong way round for a point
+            // read.
+            //
+            // `header.payload_len` is the exact decompressed size, so the bulk API needs no
+            // guessed capacity. The length check below still runs: it guards against a record
+            // whose header disagrees with its payload, which is corruption, not a size hint.
+            // `payload_len` comes out of the record header, and the bulk API allocates that much
+            // BEFORE anything is decompressed or checked -- so a header that lies (corruption, a
+            // truncated write, a hostile record) would turn into an allocation of whatever it
+            // claims. The old streaming call sized its buffer from what it actually decompressed
+            // and could not be steered this way, so this bound is guarding a hazard the reuse
+            // introduces, not one that was already here.
+            //
+            // Above the ceiling, fall back to the streaming decoder: it pays the window
+            // allocation, but a record that large is not the case being optimised, and the
+            // fallback keeps behaviour identical rather than failing a read that used to work.
+            const ZSTD_TRUSTED_PAYLOAD_CEILING: usize = 64 << 20;
+            // A compressed block states its decompressed size in its own first four bytes.
+            if stored_payload.len() < 4 {
+                return Err(corrupt_block_envelope(
+                    address,
+                    "compressed block has no decompressed size",
+                ));
+            }
+            let (size_bytes, frame) = stored_payload.split_at(4);
+            let logical_len = u32::from_le_bytes(
+                size_bytes.try_into().expect("decompressed size slice"),
+            ) as usize;
+            let payload = if logical_len <= ZSTD_TRUSTED_PAYLOAD_CEILING {
+                ZSTD_DECOMPRESSOR
+                    .with(|decompressor| decompressor.borrow_mut().decompress(frame, logical_len))
+                    .map_err(|err| {
+                        corrupt_block_envelope(address, format!("zstd decompression failed: {err}"))
+                    })?
+            } else {
+                zstd::stream::decode_all(Cursor::new(frame)).map_err(|err| {
+                    corrupt_block_envelope(address, format!("zstd decompression failed: {err}"))
+                })?
+            };
+            if payload.len() != logical_len {
+                return Err(corrupt_block_envelope(
+                    address,
+                    format!(
+                        "decompressed length {} does not match the size the block states, {}",
+                        payload.len(),
+                        logical_len
+                    ),
+                ));
+            }
+            Ok(payload)
+        }
+    }
+}
+
+/// Build the 32-byte checksum field for a new (v7) record: CRC32C little-endian in the first
+/// four bytes, a marker so the field is self-describing, then zero padding.
+fn block_record_checksum_field(payload: &[u8]) -> [u8; BLOCK_RECORD_CHECKSUM_LEN] {
+    crate::checksum::crc32c(payload).to_le_bytes()
+}
+
+/// Verify a page record's payload against its stored CRC32C.
+fn verify_block_record_checksum(
+    payload: &[u8],
+    expected_checksum: &[u8; BLOCK_RECORD_CHECKSUM_LEN],
+    address: &ElementEntry,
+) -> Result<(), BlockStoreError> {
+    let stored = u32::from_le_bytes(*expected_checksum);
+    let actual = crate::checksum::crc32c(payload);
+    if stored == actual {
+        return Ok(());
+    }
+    Err(BlockStoreError::ChecksumMismatch {
+        block_slab_id: address.block_slab_id(),
+        offset: address.offset(),
+        length: address.length(),
+        expected: format!("{stored:08x}"),
+        actual: format!("{actual:08x}"),
+    })
+}
+
+pub(super) fn corrupt_block_envelope(
+    address: &ElementEntry,
+    reason: impl Into<String>,
+) -> BlockStoreError {
+    BlockStoreError::CorruptBlockEnvelope {
+        block_slab_id: address.block_slab_id(),
+        offset: address.offset(),
+        reason: reason.into(),
+    }
+}
+
+pub(super) fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+/// The digest as the 32 bytes it is, for storing.
+///
+/// `sha256_hex` remains for the places that want text -- a report, an error message. What it does
+/// not do any more is decide the in-memory representation of every page in the index.
+pub(super) fn sha256_bytes(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SlabSummary {
+    pub(super) logical_bytes: u64,
+    pub(super) first_block_id: Option<u64>,
+    pub(super) last_block_id: Option<u64>,
+}
+
+pub(super) fn summarize_slab(
+    slab: &[u8],
+    block_slab_id: u64,
+) -> Result<SlabSummary, BlockStoreError> {
+    if slab.len() < BLOCK_RECORD_HEADER_LEN || !slab.starts_with(BLOCK_RECORD_MAGIC) {
+        return Ok(SlabSummary {
+            logical_bytes: slab.len() as u64,
+            first_block_id: None,
+            last_block_id: None,
+        });
+    }
+    let mut physical_offset = 0usize;
+    let mut summary = SlabSummary::default();
+    while physical_offset < slab.len() {
+        let remaining = &slab[physical_offset..];
+        let address = ElementEntry::from_parts(block_slab_id, physical_offset as u64, 0, None, None);
+        if remaining.len() < BLOCK_RECORD_HEADER_LEN || !remaining.starts_with(BLOCK_RECORD_MAGIC) {
+            return Err(corrupt_block_envelope(
+                &address,
+                "mixed raw bytes after page envelope",
+            ));
+        }
+        if remaining.len() < BLOCK_RECORD_SMALLEST_HEADER_LEN {
+            return Err(corrupt_block_envelope(&address, "short header"));
+        }
+        let header = parse_block_record_header(remaining, &address)?;
+        let record_len = header.header_len.saturating_add(header.stored_len);
+        if remaining.len() < record_len {
+            return Err(corrupt_block_envelope(
+                &address,
+                "payload length mismatch".to_string(),
+            ));
+        }
+        if let Some(block_id) = header.block_id {
+            summary.first_block_id = Some(
+                summary
+                    .first_block_id
+                    .map_or(block_id, |current| current.min(block_id)),
+            );
+            summary.last_block_id = Some(
+                summary
+                    .last_block_id
+                    .map_or(block_id, |current| current.max(block_id)),
+            );
+        }
+        summary.logical_bytes = summary
+            .logical_bytes
+            .saturating_add(header.payload_len as u64);
+        physical_offset = physical_offset.saturating_add(record_len);
+    }
+    Ok(summary)
+}
+
+/// The scan reads a prefix big enough to hold a header. There is one header size now.
+const BLOCK_RECORD_WIDEST_HEADER_LEN: usize = BLOCK_RECORD_HEADER_LEN;
+
+/// Read buffer for the page-id scan.
+///
+/// Sized so a bufferful spans many records rather than one: at the ~300-byte records the live
+/// store holds, this is ~800 per fill, which is the difference between thousands of reads for a
+/// slab and millions.
+const BLOCK_RECORD_SCAN_BUFFER_BYTES: usize = 256 * 1024;
+
+/// TS_BLOCK_INDEX_CHECKSUMS: recompute and record a hex digest per page record while inspecting.
+///
+/// Default OFF. `inspect_slab` runs at every engine open, and this hashes each payload a second
+/// time -- `decode_block_record` has already verified the stored checksum -- then allocates a
+/// 64-character String for it. Measured on a live-store copy, slab verification ran at 13.5 MB/s
+/// against hundreds of MB/s for sha256 alone.
+///
+/// ONE caller reads the field: `block_address_api_ready` in
+/// `StorageDataStructureApiParityReport`, which required `checksum.is_some()` on a block index
+/// entry. An earlier version of this
+/// comment claimed nothing read it -- wrong by exactly one -- and switching the hashing off left
+/// that report permanently `ready: false` behind a `block_address_metadata_incomplete` blocker on
+/// every default deployment. The report now asks for the checksum only when this is enabled, so
+/// the two agree in both positions of the flag.
+pub(crate) fn block_index_checksums_enabled() -> bool {
+    std::env::var("TS_BLOCK_INDEX_CHECKSUMS")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            value == "1" || value == "true" || value == "yes"
+        })
+        .unwrap_or(false)
+}
+
+/// Count the blocks in a slab, and its size, WITHOUT decoding any of them.
+///
+/// `inspect_slab` calls `decode_block_record` on every record, which verifies its CRC32C and
+/// decompresses it. That is a full integrity pass over the whole store, and the reclaim planner --
+/// which is what puts `slab_reports()` on every maintenance round -- reads only two fields out of
+/// the result: the slab's size and how many blocks it holds.
+///
+/// Stepping between records needs the header alone: `header_len + stored_len` is the record's
+/// length. So this walks headers and stops at the first one that will not parse, reporting the
+/// count up to there.
+///
+/// **This is not `inspect_slab`'s count on a corrupt slab, and must not be used where that
+/// matters.** `inspect_slab` stops when `decode_block_record` fails, which includes a record whose
+/// HEADER is intact and whose BODY fails its checksum; this walk steps over that record and keeps
+/// counting. So a slab with a corrupted body reports MORE blocks here than there.
+///
+/// That is tolerable for the one caller -- the reclaim planner, which turns the count into a
+/// garbage estimate and a sort key. Over-counting makes such a slab sort earlier as a reclaim
+/// candidate, and reclaim still removes a slab only when nothing references it, so the effect is
+/// bounded to ordering. Anything that needs corruption DETECTED (the recovery report, the boundary
+/// report) must keep calling `inspect_slab`, which is why this did not replace it.
+pub(super) fn count_slab_blocks(slab: &[u8], block_slab_id: u64) -> (u64, u64) {
+    let physical_bytes = slab.len() as u64;
+    if slab.is_empty() {
+        return (0, 0);
+    }
+    if slab.len() < BLOCK_RECORD_HEADER_LEN || !slab.starts_with(BLOCK_RECORD_MAGIC) {
+        // Unframed bytes: `inspect_slab` calls this one block, and so does this.
+        return (1, physical_bytes);
+    }
+    let mut block_count = 0u64;
+    let mut physical_offset = 0usize;
+    while physical_offset < slab.len() {
+        let remaining = &slab[physical_offset..];
+        if remaining.len() < BLOCK_RECORD_SMALLEST_HEADER_LEN
+            || !remaining.starts_with(BLOCK_RECORD_MAGIC)
+        {
+            break;
+        }
+        let address =
+            ElementEntry::from_parts(block_slab_id, physical_offset as u64, 0, None, None);
+        let Ok(header) = parse_block_record_header(remaining, &address) else {
+            break;
+        };
+        let record_len = header.header_len.saturating_add(header.stored_len);
+        if record_len == 0 || remaining.len() < record_len {
+            break;
+        }
+        block_count = block_count.saturating_add(1);
+        physical_offset = physical_offset.saturating_add(record_len);
+    }
+    (block_count, physical_bytes)
+}
+
+pub(super) fn inspect_slab(slab: &[u8], block_slab_id: u64) -> BlockStoreSlabReport {
+    let mut report = BlockStoreSlabReport {
+        block_slab_id,
+        physical_bytes: slab.len() as u64,
+        ..BlockStoreSlabReport::default()
+    };
+    let mut object_ids = BTreeSet::new();
+    let mut routing_buckets = BTreeSet::new();
+    if slab.is_empty() {
+        return report;
+    }
+    if slab.len() < BLOCK_RECORD_HEADER_LEN || !slab.starts_with(BLOCK_RECORD_MAGIC) {
+        report.logical_bytes = slab.len() as u64;
+        report.block_count = 1;
+        report.readable_prefix_physical_bytes = slab.len() as u64;
+        return report;
+    }
+
+    let mut physical_offset = 0usize;
+    while physical_offset < slab.len() {
+        let remaining = &slab[physical_offset..];
+        let mut address = ElementEntry::from_parts(block_slab_id, physical_offset as u64, 0, None, None);
+        if remaining.len() < BLOCK_RECORD_HEADER_LEN || !remaining.starts_with(BLOCK_RECORD_MAGIC) {
+            record_slab_inspection_error(
+                &mut report,
+                address.offset(),
+                corrupt_block_envelope(&address, "mixed raw bytes after page envelope").to_string(),
+            );
+            break;
+        }
+        if remaining.len() < BLOCK_RECORD_SMALLEST_HEADER_LEN {
+            record_slab_inspection_error(
+                &mut report,
+                address.offset(),
+                corrupt_block_envelope(&address, "short header").to_string(),
+            );
+            break;
+        }
+        let header = match parse_block_record_header(remaining, &address) {
+            Ok(header) => header,
+            Err(err) => {
+                record_slab_inspection_error(&mut report, address.offset(), err.to_string());
+                break;
+            }
+        };
+        let record_len = header.header_len.saturating_add(header.stored_len);
+        if remaining.len() < record_len {
+            record_slab_inspection_error(
+                &mut report,
+                address.offset(),
+                corrupt_block_envelope(&address, "payload length mismatch".to_string()).to_string(),
+            );
+            break;
+        }
+        address.set_length(record_len as u64);
+        address.set_block_id(header.block_id);
+        match decode_block_record(&remaining[..record_len], &address) {
+            Ok(decoded) => {
+                report.block_count = report.block_count.saturating_add(1);
+                report.logical_bytes = report
+                    .logical_bytes
+                    .saturating_add(decoded.logical_len as u64);
+                report.block_index_entries.push(BlockStoreBlockIndexReport {
+                    block_slab_id: block_slab_id,
+                    offset: address.offset(),
+                    length: address.length(),
+                    compact_slab_address: address.compact_slab_address(),
+                    compact_slab_id: address.compact_slab_id(),
+                    compact_slab_offset: address.compact_slab_offset(),
+                    // Always `None`: the record header carries no slab id, and the slab a record
+                    // sits in is `block_slab_id` two lines up. A report field that restated it
+                    // would be the same number twice.
+                    storage_slab_id: None,
+                    object_id: header.object_id,
+                    model_id: None,
+                    block_id: header.block_id,
+                    block_size: decoded.logical_len as u64,
+                    stored_size: header.stored_len as u64,
+                    dirty: false,
+                    deleted: decoded.logical_len == 0,
+                    block_in_log: false,
+                    routing_bucket: header.routing_bucket,
+                    // Re-hashing the payload here doubled the sha256 work of every engine open
+                    // to fill a field no caller reads. `decode_block_record` above has already
+                    // verified this record's stored checksum. Opt in with
+                    // TS_BLOCK_INDEX_CHECKSUMS=1 when inspecting a slab by hand.
+                    checksum: block_index_checksums_enabled()
+                        .then(|| sha256_hex(&decoded.payload)),
+                });
+                report.block_index_count = report.block_index_entries.len() as u64;
+                if decoded.compression == BlockRecordCompression::Zstd {
+                    report.compressed_records = report.compressed_records.saturating_add(1);
+                }
+                if let Some(object_id) = header.object_id {
+                    object_ids.insert(object_id);
+                    report.object_count = object_ids.len() as u64;
+                }
+                if let Some(routing_bucket) = header.routing_bucket {
+                    routing_buckets.insert(routing_bucket);
+                    report.routing_bucket_count = routing_buckets.len() as u64;
+                    report.first_routing_bucket = routing_buckets.first().copied();
+                    report.last_routing_bucket = routing_buckets.last().copied();
+                }
+                if let Some(block_id) = header.block_id {
+                    report.first_block_id = Some(
+                        report
+                            .first_block_id
+                            .map_or(block_id, |current| current.min(block_id)),
+                    );
+                    report.last_block_id = Some(
+                        report
+                            .last_block_id
+                            .map_or(block_id, |current| current.max(block_id)),
+                    );
+                }
+            }
+            Err(err) => {
+                record_slab_inspection_error(&mut report, address.offset(), err.to_string());
+                break;
+            }
+        }
+        physical_offset = physical_offset.saturating_add(record_len);
+        report.readable_prefix_physical_bytes = physical_offset as u64;
+    }
+    report
+}
+
+fn record_slab_inspection_error(
+    report: &mut BlockStoreSlabReport,
+    offset: u64,
+    error: String,
+) {
+    report.has_corruption = true;
+    report.first_error_offset = Some(offset);
+    report.first_error = Some(error);
+}
+
+/// The page record format, which there is only one of.
+#[cfg(test)]
+mod block_record_format_tests {
+    use super::*;
+
+    fn address() -> ElementEntry {
+        ElementEntry::from_parts(1, 0, 0, None, None)
+    }
+
+    /// What the record carries comes back; what the index carries does not.
+    ///
+    /// A block record holds a checksum, its size and its block id. The object id, the routing
+    /// bucket and the slab id used to be repeated here as well, where they could only ever agree
+    /// with the index or be wrong. They are gone, and this states that they are: reading them
+    /// back as `None` is the contract, not an oversight.
+    #[test]
+    fn a_record_carries_its_size_and_block_id_and_nothing_the_index_holds() {
+        let payload = b"header field round trip payload";
+        // A block id is an index inside its object, so it is small by construction.
+        let block_id: u64 = 9;
+
+        let encoded = encode_block_record(
+            payload,
+            block_id,
+            Some(0x99AA_BBCC_DDEE_F001),
+            Some(0x0BAD_C0DE),
+            BlockStoreOptions::default(),
+        )
+        .expect("encode");
+        assert_eq!(
+            encoded.bytes.len(),
+            BLOCK_RECORD_HEADER_LEN + payload.len(),
+            "one header size, whatever the values"
+        );
+        let header = parse_block_record_header(&encoded.bytes, &address()).expect("parse");
+        assert_eq!(header.block_id, Some(block_id), "block id");
+        assert_eq!(header.payload_len, payload.len());
+        assert_eq!(header.stored_len, payload.len());
+        assert_eq!(header.object_id, None, "the index holds the object id");
+        assert_eq!(header.routing_bucket, None, "the index holds the routing bucket");
+        let decoded = decode_block_record(&encoded.bytes, &address()).expect("decode");
+        assert_eq!(decoded.payload, payload);
+    }
+
+    /// THE RECORD HEADER CARRIES NEITHER IDENTITY IT IS HANDED, and that is what makes one of the
+    /// two cross-checks in `decode_block_record` unfireable rather than merely unfired.
+    ///
+    /// `encode_block_record` takes `object_id` and `routing_bucket` and discards both
+    /// (`let _ = (object_id, routing_bucket);`); `parse_block_record_header` returns both as `None`
+    /// unconditionally. So no record can be built whose header disagrees with an address about
+    /// either -- which is the strongest form of the statement #1969 made by mutation, and the reason
+    /// the routing-bucket arm was deleted with the field rather than left as a branch nothing
+    /// reaches.
+    #[test]
+    fn the_header_carries_neither_identity_it_is_handed() {
+        let encoded = encode_block_record(
+            b"a record handed an object id and a routing bucket",
+            7,
+            Some(0x0123_4567_89ab_cdef),
+            Some(4_155_475_953),
+            BlockStoreOptions::default(),
+        )
+        .expect("the record encodes");
+
+        // DENOMINATOR: the record really was built, and really carries the BLOCK ID it was handed --
+        // so "the header carries nothing" is not what is being asserted.
+        let at = crate::block_store::ElementEntry::from_parts(
+            0,
+            0,
+            encoded.bytes.len() as u64,
+            None,
+            None,
+        );
+        let header = parse_block_record_header(&encoded.bytes, &at).expect("the header parses");
+        assert_eq!(
+            Some(7),
+            header.block_id,
+            "the header must carry the block id it was handed, or this test cannot tell a field the \
+             format omits from a format it failed to write"
+        );
+
+        assert_eq!(
+            None, header.object_id,
+            "the record header has no object id field, so an address-versus-record check on the \
+             object id cannot fire. Carrying it is a FORMAT change and a decision for whoever owns \
+             the format."
+        );
+        assert_eq!(
+            None, header.routing_bucket,
+            "the record header has no routing bucket field either -- and the address does not carry \
+             one now, so BOTH sides of that comparison are gone. There was no cross-check to lose."
+        );
+    }
+
+    /// AND THE ONE CROSS-CHECK THAT CAN FIRE, DRIVEN WITH A MISMATCHED RECORD.
+    ///
+    /// The block-id arm is the only address-versus-record comparison on this read path with a record
+    /// side, and this is it failing: a record written as block 3 of its object, read through an
+    /// address that claims block 4, is REFUSED. Without this, "one of the two can fire" is a claim
+    /// about the source rather than about the decoder.
+    ///
+    /// WITH THE HONEST READ AS ITS DENOMINATOR, because a decoder that refused everything would pass
+    /// the refusal half on its own.
+    #[test]
+    fn the_surviving_cross_check_refuses_a_mismatched_record() {
+        let payload = b"block three of its object".to_vec();
+        let encoded = encode_block_record(&payload, 3, None, None, BlockStoreOptions::default())
+            .expect("the record encodes");
+        let len = encoded.bytes.len() as u64;
+
+        let honest = crate::block_store::ElementEntry::from_parts(0, 0, len, Some(3), None);
+        let decoded = decode_block_record(&encoded.bytes, &honest).expect("the honest read");
+        assert_eq!(payload, decoded.payload, "denominator: the honest address reads its record");
+
+        let mismatched = crate::block_store::ElementEntry::from_parts(0, 0, len, Some(4), None);
+        let refusal = decode_block_record(&encoded.bytes, &mismatched)
+            .expect_err("a record stating block 3 must not read through an address claiming 4");
+        assert!(
+            refusal.to_string().contains("page id mismatch"),
+            "the refusal must name the block id: {refusal}"
+        );
+
+        // AND AN ADDRESS THAT OMITS THE BLOCK ID READS THROUGH UNCHECKED, which is what
+        // "presence-gated" means and why dropping the field would disable the detector silently
+        // rather than loudly.
+        let stripped = crate::block_store::ElementEntry::from_parts(0, 0, len, None, None);
+        assert!(
+            decode_block_record(&encoded.bytes, &stripped).is_ok(),
+            "an address carrying no block id must read through: the check is gated on presence"
+        );
+    }
+
+    /// Every field sits at a constant offset, so a reader takes one without walking.
+    #[test]
+    fn a_field_is_read_by_offset_not_by_walking() {
+        let payload = b"offsets are constants";
+        let block_id: u64 = u64::from(u16::MAX);
+        let encoded =
+            encode_block_record(payload, block_id, None, None, BlockStoreOptions::default())
+                .expect("encode");
+
+        let at = BLOCK_RECORD_BLOCK_ID_OFFSET;
+        let read_directly = u16::from_le_bytes(encoded.bytes[at..at + 2].try_into().unwrap());
+        assert_eq!(
+            u64::from(read_directly),
+            block_id,
+            "the block id is one slice at a constant offset"
+        );
+
+        let at = BLOCK_RECORD_LENGTH_OFFSET;
+        let sized = u32::from_le_bytes(encoded.bytes[at..at + 4].try_into().unwrap());
+        assert_eq!((sized & BLOCK_RECORD_LENGTH_MASK) as usize, payload.len());
+        assert_eq!(
+            (sized >> BLOCK_RECORD_CODEC_SHIFT) as u8,
+            BLOCK_RECORD_COMPRESSION_NONE,
+            "the codec shares the size word rather than taking a byte of its own"
+        );
+    }
+
+    /// The checksum is a CRC32C of the payload, in the four bytes after the magic.
+    #[test]
+    fn the_checksum_is_a_crc32c_of_the_payload() {
+        let payload = b"page payload that is long enough to be interesting";
+        let encoded =
+            encode_block_record(payload, 7, None, None, BlockStoreOptions::default())
+                .expect("encode");
+        let at = BLOCK_RECORD_CHECKSUM_OFFSET;
+        let stored = u32::from_le_bytes(
+            encoded.bytes[at..at + BLOCK_RECORD_CHECKSUM_LEN]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(stored, crate::checksum::crc32c(payload));
+        assert_eq!(BLOCK_RECORD_CHECKSUM_LEN, 4, "the field is the checksum, nothing more");
+    }
+
+    /// A record whose payload was altered after the fact is refused.
+    #[test]
+    fn a_corrupted_record_is_rejected() {
+        let payload = b"payload that will be corrupted after the fact";
+        let mut encoded =
+            encode_block_record(payload, 1, None, None, BlockStoreOptions::default())
+                .expect("encode");
+        let last = encoded.bytes.len() - 1;
+        encoded.bytes[last] ^= 0xFF;
+        let err = decode_block_record(&encoded.bytes, &address()).expect_err("must be refused");
+        assert!(
+            matches!(err, BlockStoreError::ChecksumMismatch { .. }),
+            "expected a checksum mismatch, got {err:?}"
+        );
+    }
+
+    /// A header that ends before its fields do is refused rather than read past.
+    #[test]
+    fn a_truncated_header_is_rejected() {
+        let payload = b"truncation payload";
+        let encoded =
+            encode_block_record(payload, 1, None, None, BlockStoreOptions::default())
+                .expect("encode");
+        for keep in [0, 1, BLOCK_RECORD_HEADER_LEN - 1] {
+            let err = parse_block_record_header(&encoded.bytes[..keep], &address())
+                .expect_err("a short record must be refused");
+            assert!(
+                matches!(err, BlockStoreError::CorruptBlockEnvelope { .. }),
+                "expected a corrupt envelope at {keep}, got {err:?}"
+            );
+        }
+    }
+}
+
+
+#[cfg(test)]
+mod reused_zstd_context_tests {
+    use super::*;
+
+    fn zstd_header(payload_len: usize, stored_len: usize) -> BlockRecordHeader {
+        BlockRecordHeader {
+            header_len: BLOCK_RECORD_HEADER_LEN,
+            payload_len,
+            stored_len,
+            checksum: [0_u8; BLOCK_RECORD_CHECKSUM_LEN],
+            block_id: Some(1),
+            // The record no longer carries these; the index does.
+            object_id: None,
+            routing_bucket: None,
+            compression: BlockRecordCompression::Zstd,
+        }
+    }
+
+    /// The stored bytes of a compressed block, which begin with its decompressed size.
+    ///
+    /// The header carries the STORED size, so the decompressed one has to be somewhere the
+    /// decoder can reach, and it is the first four bytes of the block's own bytes.
+    fn stored_bytes(original_len: usize, compressed: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(compressed.len() + 4);
+        out.extend_from_slice(&(original_len as u32).to_le_bytes());
+        out.extend_from_slice(compressed);
+        out
+    }
+
+    fn address_for(payload_len: usize) -> ElementEntry {
+        ElementEntry::from_parts(1, 0, payload_len as u64, Some(1), Some(1))
+    }
+
+    /// Round-trip at several sizes through the shared thread-local context.
+    ///
+    /// Sizes straddle BLOCK_RECORD_COMPRESSION_MIN_BYTES (256) so both the compressed and the
+    /// uncompressed branch are exercised, and the largest is well past any single decompress
+    /// buffer -- a bulk decompressor given the wrong capacity truncates rather than erroring, so
+    /// "it worked for the size I tried" is not evidence.
+    #[test]
+    fn a_compressed_record_round_trips_through_the_reused_context() {
+        for len in [1usize, 64, 255, 256, 257, 4096, 200_000] {
+            // Compressible content: random bytes would not compress, so the Zstd branch would
+            // never be taken and the test would silently cover nothing.
+            let original: Vec<u8> = (0..len).map(|i| (i % 7) as u8).collect();
+            let compressed = zstd::stream::encode_all(
+                std::io::Cursor::new(&original[..]),
+                BLOCK_RECORD_COMPRESSION_LEVEL,
+            )
+            .expect("compresses");
+            let stored = stored_bytes(original.len(), &compressed);
+            let header = zstd_header(original.len(), stored.len());
+            let decoded = decode_block_record_payload(&stored, &header, &address_for(len))
+                .expect("a well-formed compressed record must decode");
+            assert_eq!(
+                original, decoded,
+                "length {len} did not survive the reused decompression context"
+            );
+        }
+    }
+
+    /// The same context serves many reads in a row without carrying state between them.
+    #[test]
+    fn the_context_stays_correct_across_consecutive_reads_of_different_sizes() {
+        let sizes = [4096usize, 17, 900, 3, 60_000];
+        for _ in 0..3 {
+            for len in sizes {
+                let original: Vec<u8> = (0..len).map(|i| (i % 11) as u8).collect();
+                let compressed = zstd::stream::encode_all(
+                    std::io::Cursor::new(&original[..]),
+                    BLOCK_RECORD_COMPRESSION_LEVEL,
+                )
+                .expect("compresses");
+                let stored = stored_bytes(original.len(), &compressed);
+            let header = zstd_header(original.len(), stored.len());
+                let decoded = decode_block_record_payload(&stored, &header, &address_for(len))
+                    .expect("decodes");
+                assert_eq!(original, decoded, "size {len} was wrong on a reused context");
+            }
+        }
+    }
+
+    /// A block that lies about its decompressed size is refused, not served.
+    ///
+    /// The size moved: the header carries the STORED size now, and the decompressed size is
+    /// the first four bytes of the block's own bytes. That is where a lie can be told, and the
+    /// bulk decompressor allocates the claimed size before decompressing anything -- so the lie
+    /// is acted on before it is checked, which is why it has to be checked afterwards.
+    #[test]
+    fn a_block_that_lies_about_its_decompressed_size_is_refused() {
+        let original: Vec<u8> = (0..1000).map(|i| (i % 5) as u8).collect();
+        let compressed = zstd::stream::encode_all(
+            std::io::Cursor::new(&original[..]),
+            BLOCK_RECORD_COMPRESSION_LEVEL,
+        )
+        .expect("compresses");
+        // The frame really holds 1000 bytes; the block says 4242.
+        let stored = stored_bytes(4242, &compressed);
+        let header = zstd_header(4242, stored.len());
+        assert!(
+            decode_block_record_payload(&stored, &header, &address_for(1000)).is_err(),
+            "a stated size that disagrees with the frame must be an error, not a short read"
+        );
+    }
+}
