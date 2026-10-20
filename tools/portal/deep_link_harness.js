@@ -47,3 +47,200 @@ function extentFrom(start) {
 }
 
 const panes = [];
+const paneOpen = /<section[^>]*class="pane"[^>]*>/g;
+let open;
+while ((open = paneOpen.exec(markup)) !== null) {
+  const id = (open[0].match(/\sid="([^"]*)"/) || [])[1] || null;
+  panes.push({ id, start: open.index, end: extentFrom(open.index),
+               hidden: /\shidden[\s>]/.test(open[0]) });
+}
+
+if (!panes.length) { console.log("FAIL the page declares no panes"); process.exit(1); }
+
+/* ---------- the extents have to be worth trusting ---------- */
+/* A scan that silently matched nothing, or ran to the end of the file, would make every
+   containment answer below come out "no" -- and every assertion that a link does NOT go somewhere
+   would pass. So the extents are checked before they are used. */
+ok("every pane's extent was found", panes.every((p) => p.end > p.start),
+   panes.map((p) => p.id + ":" + p.start + ".." + p.end).join(" "));
+ok("every pane is named", panes.every((p) => p.id));
+ok("the panes do not overlap and are in order",
+   panes.every((p, i) => i === 0 || panes[i - 1].end <= p.start),
+   panes.map((p) => p.id + ":" + p.start + ".." + p.end).join(" "));
+ok("no pane's extent swallows the rest of the document",
+   panes[panes.length - 1].end <= markup.length);
+
+const ids = new Map();
+const idAttr = /\sid="([^"]+)"/g;
+let found;
+while ((found = idAttr.exec(markup)) !== null) {
+  if (!ids.has(found[1])) { ids.set(found[1], found.index); }
+}
+
+function paneHolding(id) {
+  if (!ids.has(id)) { return null; }
+  const at = ids.get(id);
+  return panes.find((p) => at > p.start && at < p.end) || null;
+}
+
+const inside = [...ids.keys()].filter((id) => {
+  const holder = paneHolding(id);
+  return holder && holder.id !== id;
+});
+ok("some element is nested inside a pane", inside.length > 0,
+   "nothing is contained by anything; the containment test would be vacuous");
+
+/* ---------- a DOM that knows what contains what ---------- */
+function makeEl(spec) {
+  return Object.assign({
+    id: spec.id,
+    hidden: !!spec.hidden,
+    tabIndex: 0,
+    scrolled: 0,
+    dataset: Object.assign({}, spec.dataset),
+    attrs: Object.assign({}, spec.attrs),
+    addEventListener() {},
+    setAttribute(k, v) { this.attrs[k] = String(v); },
+    getAttribute(k) { return k in this.attrs ? this.attrs[k] : null; },
+    focus() {},
+    click() {},
+    scrollIntoView() { this.scrolled += 1; },
+    closest() { return null; },
+  });
+}
+
+const tabTags = [...markup.matchAll(/<button[^>]*role="tab"[\s\S]*?>/g)].map((m) => m[0]);
+if (!tabTags.length) { console.log("FAIL the page declares no tabs"); process.exit(1); }
+
+function build(hash) {
+  const tabs = tabTags.map((tag) => makeEl({
+    id: (tag.match(/\sid="([^"]*)"/) || [])[1],
+    dataset: { pane: (tag.match(/data-pane="([^"]*)"/) || [])[1] },
+    attrs: { "aria-selected": (tag.match(/aria-selected="([^"]*)"/) || [])[1] || "false" },
+  }));
+  const paneEls = panes.map((p) => makeEl({ id: p.id, hidden: p.hidden }));
+  const byId = new Map();
+  tabs.concat(paneEls).forEach((el) => byId.set(el.id, el));
+
+  const doc = {
+    querySelectorAll(selector) {
+      if (selector === ".tabs button") { return tabs; }
+      if (selector === ".pane") { return paneEls; }
+      return [];
+    },
+    getElementById(id) {
+      if (byId.has(id)) { return byId.get(id); }
+      if (!ids.has(id)) { return null; }
+      const holder = paneHolding(id);
+      const el = makeEl({ id });
+      /* The whole point: the real ancestor, taken from the real markup. */
+      el.closest = (selector) =>
+        (selector === ".pane" && holder) ? byId.get(holder.id) || null : null;
+      byId.set(id, el);
+      return el;
+    },
+  };
+
+  const listeners = {};
+  const win = {
+    location: { hash: hash || "" },
+    addEventListener(type, fn) { (listeners[type] = listeners[type] || []).push(fn); },
+  };
+  const src = [...page.matchAll(/<script>([\s\S]*?)<\/script>/g)]
+    .map((m) => m[1]).find((s) => s.includes("window.wireTabs = function"));
+  if (!src) { console.log("FAIL the page carries no tab helper"); process.exit(1); }
+  new Function("window", "document", src)(win, doc);
+  win.wireTabs();
+
+  return {
+    doc,
+    selected: () => tabs.filter((t) => t.getAttribute("aria-selected") === "true").map((t) => t.id),
+    visible: () => paneEls.filter((p) => !p.hidden).map((p) => p.id),
+    go(next) {
+      win.location.hash = next;
+      (listeners.hashchange || []).forEach((fn) => fn({}));
+    },
+    listens: (type) => (listeners[type] || []).length > 0,
+  };
+}
+
+/* ---------- what a fresh page with no fragment does ---------- */
+const plain = build("");
+const fallback = plain.selected().join();
+ok("with no fragment the page opens on its own default tab", plain.selected().length === 1,
+   plain.selected().join(", "));
+ok("with no fragment exactly one pane is visible", plain.visible().length === 1);
+
+/* ---------- the fragments the strip actually links to ---------- */
+/* Derived, not listed: whichever ids the caller names, plus one taken from a pane that is not the
+   default, so this file still has something to check on a page nobody passed fragments for. */
+const derived = inside.filter((id) => {
+  const holder = paneHolding(id);
+  return holder && "tab-" + holder.id.replace(/^pane-/, "") !== fallback;
+});
+const checks = wanted.length ? wanted : (derived.length ? ["#" + derived[0]] : []);
+ok("there is a fragment to follow", checks.length > 0,
+   "no id lives inside a pane other than the default one");
+
+const handled = [];
+checks.forEach((fragment) => {
+  const name = fragment.replace(/^#/, "");
+  const holder = paneHolding(name);
+  if (!holder) {
+    /* Not every link into a page names something a tab holds. The key portal answers "where does
+       the first key come from" in a <details> above the tablist, and the strip helper unfolds it
+       -- a different mechanism, checked by folded_answer_harness. Failing here would report a
+       working link as broken; the check that the target EXISTS lives in the Python test, which
+       covers every link on every page rather than only the ones this file was handed. */
+    console.log("skip " + fragment + " is not inside a tab pane" +
+                (ids.has(name) ? "" : " (and no element has that id)"));
+    return;
+  }
+  handled.push(fragment);
+  ok("the page has somewhere to send " + fragment, true);
+
+  const run = build(fragment);
+  const want = "tab-" + holder.id.replace(/^pane-/, "");
+  ok("arriving at " + fragment + " opens the tab that holds it",
+     run.selected().join() === want, run.selected().join(", ") + " (wanted " + want + ")");
+  ok("arriving at " + fragment + " leaves exactly one pane visible",
+     run.visible().join() === holder.id, run.visible().join(", "));
+  ok("arriving at " + fragment + " scrolls to it once the pane is showing",
+     run.doc.getElementById(name).scrolled > 0,
+     "the pane opened but the reader is left at the top of it");
+});
+
+/* ---------- the same page, no navigation ---------- */
+/* The strip is on the setup page too. Clicking a segment that points into this page loads nothing:
+   the URL gains a fragment and that is the entire event. */
+if (handled.length) {
+  const name = handled[0].replace(/^#/, "");
+  const holder = paneHolding(name);
+  if (holder) {
+    const run = build("");
+    ok("the page listens for the fragment changing under it", run.listens("hashchange"));
+    run.go(checks[0]);
+    ok("changing the fragment without reloading still opens the tab",
+       run.selected().join() === "tab-" + holder.id.replace(/^pane-/, ""),
+       run.selected().join(", "));
+  }
+}
+
+/* ---------- fragments that mean nothing here ---------- */
+const unknown = build("#no-such-anchor-exists");
+ok("a fragment naming nothing leaves the default tab up", unknown.selected().join() === fallback,
+   unknown.selected().join(", "));
+
+const outside = [...ids.keys()].find((id) => !paneHolding(id));
+if (outside) {
+  const run = build("#" + outside);
+  ok("a fragment outside the tabs (#" + outside + ") leaves the default tab up",
+     run.selected().join() === fallback, run.selected().join(", "));
+}
+
+const weird = build("#%E0%A4%A");
+ok("a fragment that is not valid escaping is survivable", weird.selected().join() === fallback,
+   weird.selected().join(", "));
+
+console.log(failures === 0 ? "PASS" : "FAILED " + failures);
+process.exit(failures === 0 ? 0 : 1);

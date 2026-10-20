@@ -889,3 +889,894 @@ fn classify_logical_size(len: u64) -> u8 {
 }
 
 /// The inverse of [`classify_logical_size`]. `None` for code 0, which means "no class recorded".
+fn declass_logical_size(code: u8) -> Option<u64> {
+    if code == 0 {
+        return None;
+    }
+    let exponent = (code as u16 - 1) >> 4;
+    let mantissa = (code as u16 - 1) & 15;
+    Some((16u64 + mantissa as u64) << exponent)
+}
+
+/// `skip_serializing_if` for the size class, so a record with no class writes no key and an image
+/// of such records is byte-identical to one written before the field existed.
+fn is_zero_u8(value: &u8) -> bool {
+    *value == 0
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ObjectRecordWire {
+    #[serde(rename = "a")]
+    address: u64,
+    #[serde(rename = "n", default)]
+    page_size: u32,
+    #[serde(rename = "f", default)]
+    flags: u16,
+    #[serde(rename = "m", default)]
+    model_id: u8,
+    /// The uncompressed size class. `default`, and SKIPPED WHEN UNKNOWN, so an image whose records
+    /// have no class is byte-identical to one written before the field existed.
+    #[serde(rename = "u", default, skip_serializing_if = "is_zero_u8")]
+    logical_size_class: u8,
+    // THE `t` KEY IS GONE WITH THE DEADLINE WORD, AND NO STORED BYTES MOVE WITH IT. It was
+    // `skip_serializing_if = "Option::is_none"` and nothing ever set a deadline, so no image this
+    // binary or any before it wrote carries a `t` at all -- there is nothing for a reader to drop,
+    // which is why this costs no format stamp. A record that did carry one is refused rather than
+    // misread, because bits 1, 2 and 10 retired into `RESERVED`.
+}
+
+impl From<ObjectRecord> for ObjectRecordWire {
+    fn from(record: ObjectRecord) -> Self {
+        Self {
+            address: record.address,
+            page_size: record.page_size,
+            logical_size_class: record.logical_size_class,
+            flags: record.flags.bits(),
+            model_id: record.model_id,
+        }
+    }
+}
+
+impl TryFrom<ObjectRecordWire> for ObjectRecord {
+    type Error = ObjectRecordRefusal;
+
+    /// REFUSES, AS AN `Err` AND NEVER AS A PANIC.
+    ///
+    /// This decoder runs on the load path. A panic there makes a store UNOPENABLE, where a refusal
+    /// falls back to replaying the operation log and rebuilding the index correctly. So every
+    /// disagreement below returns a named error, and none of them asserts.
+    fn try_from(wire: ObjectRecordWire) -> Result<Self, Self::Error> {
+        let reserved = wire.flags & RecordFlags::RESERVED;
+        if reserved != 0 {
+            return Err(ObjectRecordRefusal::ReservedFlagBitsSet { bits: reserved });
+        }
+        let flags = RecordFlags(wire.flags);
+        // THE DEADLINE AGREEMENT CHECKS WENT WITH THE FIELD, and nothing replaces them: the two
+        // tag bits they reconciled are in `RESERVED` now, so the reserved-bit check above refuses a
+        // record carrying either of them before this point is reached. One refusal, earlier,
+        // instead of three.
+        Ok(Self {
+            address: wire.address,
+            page_size: wire.page_size,
+            flags,
+            model_id: wire.model_id,
+            // ABSENT IN EVERY IMAGE WRITTEN BEFORE THIS FIELD, and `serde(default)` reads that as
+            // 0 -- "not known" -- which is why this costs no format stamp. An older record is not
+            // mis-read, it is counted as uncovered.
+            logical_size_class: wire.logical_size_class,
+        })
+    }
+}
+
+/// Every way this type refuses, each NAMED, so a log line says which one fired.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ObjectRecordRefusal {
+    /// A writer newer than this reader set a bit this reader does not understand.
+    ReservedFlagBitsSet { bits: u16 },
+    /// The inline arm carries a page ordinal's presence but not a nonzero value. Use the layout
+    /// arm, which is where a multi-page object belongs regardless.
+    NonZeroBlockOrdinalDoesNotFitInline { block_id: u64 },
+    /// A page identity wider than the sixteen bits the stored form accepts.
+    BlockIdentityOutOfRange { block_id: u64 },
+    /// A page longer than the stored size field can name.
+    BlockSizeDoesNotFit { length: u64 },
+    /// The address word is a handle and no layout was supplied for it.
+    LayoutHandleWithNoLayout { handle: BlockLayoutHandle },
+    /// The address word does not decode to an address this store can name.
+    AddressWordOutOfRange { word: u64 },
+}
+
+impl std::fmt::Display for ObjectRecordRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ReservedFlagBitsSet { bits } => write!(
+                f,
+                "ReservedFlagBitsSet: the stored record sets reserved flag bits {bits:#06x}, so it \
+                 was written by a newer reader; refusing rather than reading it with those bits' \
+                 meaning dropped"
+            ),
+            Self::NonZeroBlockOrdinalDoesNotFitInline { block_id } => write!(
+                f,
+                "NonZeroBlockOrdinalDoesNotFitInline: page ordinal {block_id} has no room in the \
+                 inline arm's twenty-four bytes, which carry the ordinal's presence and an implied \
+                 value of zero; a nonzero ordinal is a multi-page object and belongs in the layout \
+                 arm"
+            ),
+            Self::BlockIdentityOutOfRange { block_id } => write!(
+                f,
+                "BlockIdentityOutOfRange: page identity {block_id} is wider than the stored form \
+                 accepts; truncating it would name a different page of the same object"
+            ),
+            Self::BlockSizeDoesNotFit { length } => write!(
+                f,
+                "BlockSizeDoesNotFit: page length {length} is wider than the stored size field"
+            ),
+            Self::LayoutHandleWithNoLayout { handle } => write!(
+                f,
+                "LayoutHandleWithNoLayout: the address word is handle {} and no layout was supplied",
+                handle.get()
+            ),
+            Self::AddressWordOutOfRange { word } => write!(
+                f,
+                "AddressWordOutOfRange: address word {word:#018x} does not decode to an address \
+                 this store can name"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ObjectRecordRefusal {}
+
+/// Rebuild an address word from its halves, for a caller holding a slab and an offset.
+///
+/// Here rather than at a call site because the packing is the stored shape's, not this type's.
+pub(super) fn address_word_from_parts(block_slab_id: u32, offset: u32) -> u64 {
+    make_block_address_word(block_slab_id, offset)
+}
+
+// =================================================================================================
+// THE SLOT: ONE RECORD AND, WHEN THERE IS MORE THAN ONE ELEMENT, ONE OWNED ARRAY
+// =================================================================================================
+
+/// What a consolidated per-kind map stores for one object: the fixed-width record, plus an owned
+/// element array for the objects that have more than one element.
+///
+/// # WHY THE PAYLOAD SITS BESIDE THE RECORD AND NOT INSIDE IT
+///
+/// Both shapes are thirty-two bytes. Only one of them keeps [`ObjectRecord`] `Copy`.
+///
+/// Putting `Option<Box<Vec<_>>>` *inside* the record would strip `Copy` from it, which turns every
+/// implicit copy at every use site into a move or a clone. Those sites are invisible to a grep --
+/// an implicit copy has no syntax -- so the only enumeration of them is a compiler error list, and
+/// the width proofs the record carries (`size_of == 24`, `align_of == 8`, the field sum, and the
+/// test that prints them) would all have to be restated at the same time. That is a blast-radius
+/// cost, not a byte cost, and it buys nothing: the slot below is the same thirty-two bytes with the
+/// record's width, its alignment, its `Copy` and all four of its proofs left exactly as they were.
+///
+/// # WHY THERE IS NO LAYOUT TAG BIT FOR "HAS A PAYLOAD"
+///
+/// `Option<Box<T>>` is self-describing. The null pointer is not a legal `Box`, so the language
+/// carries the discrimination in the representation itself and `size_of::<Option<Box<T>>>()` is
+/// eight, the same as the bare pointer. A flag bit saying "the payload is present" would therefore
+/// be a SECOND source of truth for a fact the first one already answers exactly -- and this type's
+/// own decoder refuses precisely that class of disagreement in four named variants, among them
+/// [`ObjectRecordRefusal::DeadlineTaggedButAbsentOnTheWire`]. Adding a bit whose only job is to
+/// agree with the niche would be manufacturing the defect those variants exist to catch.
+///
+/// This is not a reduction of the shape it follows. A C-style union is NOT self-describing, so a
+/// design built on one must spend a byte on an explicit layout tag: the tag is the only thing that
+/// can say which arm is live. The niche gives the same discrimination for ZERO bytes. The mechanism
+/// is the same one; it is simply cheaper here, because the language pays for it.
+///
+/// Reserved flag bits are therefore spent only on a distinction the niche CANNOT express -- which
+/// inline layout the address word is carrying -- and not on whether a payload exists at all.
+///
+/// # THE PAYLOAD IS ONE ALLOCATION CHAIN, NOT A SIDE TABLE
+///
+/// A sorted contiguous array is the right shape for this access pattern rather than a compromise
+/// for it: these series are append-mostly timestamped key-value, where an array appends in
+/// amortised O(1) and binary-searches in O(log N). Measured against the per-kind
+/// `BTreeMap`-in-a-`HashMap` shape it replaces, at a thousand elements it is **49,120 B against
+/// 24,056 B -- 2.042x -- in 170 allocations against 2**; the B-tree shape allocates a 280-byte
+/// root node for a single element before any element byte is stored, and that node is paid per key
+/// per kind. Owned per slot, there is no outer map to pay for and no second key copy.
+///
+/// `Box<Vec<_>>` rather than `Box<[_]>` on purpose: a boxed slice is a FAT pointer, sixteen bytes,
+/// which would push this type to forty. The boxed `Vec` is a thin pointer at eight, and costs one
+/// further indirection plus the `Vec` header -- measured at a flat sixteen heap bytes and one
+/// allocation more than a single-buffer layout at every length tested, which is not a price worth
+/// `unsafe` to avoid.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "ObjectSlotWire", into = "ObjectSlotWire")]
+pub(super) struct ObjectSlot {
+    /// The fixed-width record, unchanged and still `Copy`.
+    pub(super) record: ObjectRecord,
+    /// The owned element array, for an object whose elements do not fit the record's inline arms.
+    ///
+    /// ON THE WIRE NOW, under the key `e` of [`ObjectSlotWire`], and skipped when empty so an
+    /// element-free slot stores only its record. This is the change the previous note deferred:
+    /// the array had no stored form, the tenancy witness refused a durable tenant on that basis,
+    /// and `SHARD_INDEX_FORMAT_VERSION` moves with this so an image written either side of it is
+    /// refused and replayed rather than mis-read.
+    ///
+    /// PRIVATE TO THIS MODULE, AND THAT IS THE ENFORCEMENT RATHER THAN A STYLE CHOICE. The
+    /// only path that puts elements here is [`ObjectSlot::set_owned_elements`], and it
+    /// demands a tenancy witness whose durable arm cannot be spelled -- see
+    /// [`OwnedElementTenancy`]. A `pub(super)` field would let any engine module assign the
+    /// array directly, and the witness would then be advice rather than a check.
+    many: Option<Box<Vec<(u64, ElementEntry)>>>,
+}
+
+/// THE WIDTH, PINNED AS ITS OWN EQUALITY, for the same reason the record's is: an inequality
+/// against a neighbour passes at every width.
+///
+/// 24, NOT 32: the record lost its deadline word, so the slot that wraps it lost the same eight
+/// bytes. The arithmetic is the record's 16 plus the eight the optional owned array costs, which is
+/// the claim the assertion below this one makes at the site that makes it.
+const _: () = assert!(std::mem::size_of::<ObjectSlot>() == 24);
+const _: () = assert!(std::mem::align_of::<ObjectSlot>() == 8);
+
+/// THE RECORD IS UNCHANGED BY ITS OWN NEIGHBOUR. Restated here rather than left to the record's
+/// own asserts, because the whole argument for this shape is that wrapping the record did not cost
+/// the record anything -- so the claim is asserted at the site that makes it.
+const _: () = assert!(std::mem::size_of::<ObjectRecord>() == 16);
+const _: () = assert!(std::mem::align_of::<ObjectRecord>() == 8);
+
+/// THE SLOT IS THE RECORD PLUS ONE POINTER AND NOTHING ELSE -- no padding, no tag word. If a
+/// future field lands between them this steps and says so, rather than hiding inside a width that
+/// happened to stay put.
+const _: () = assert!(
+    std::mem::size_of::<ObjectSlot>()
+        == std::mem::size_of::<ObjectRecord>()
+            + std::mem::size_of::<Option<Box<Vec<(u64, ElementEntry)>>>>()
+);
+
+/// AND THE OWNING POINTER IS THIN. `Box<[T]>` is a fat pointer at sixteen bytes and would make the
+/// slot forty; this asserts the eight the shape depends on, so a change of payload type that
+/// silently widened it is a build failure and not a measurement surprise.
+const _: () = assert!(std::mem::size_of::<Option<Box<Vec<(u64, ElementEntry)>>>>() == 8);
+
+/// WHICH TENANT MAY PUT ELEMENTS IN THE OWNED ARRAY -- AND THE ARM THAT CANNOT BE SPELLED.
+///
+/// A tenant of the consolidated map registers a kind and then writes slots for it. Two tenancies
+/// are possible, and they differ only in what a dump is expected to carry:
+///
+///   * `RebuiltAtLoad` -- the elements are re-derived from the bucket index on load, so an empty
+///     stored image costs a rebuild and nothing else. Two of the eight candidate maps are this
+///     shape: they are `skip_serializing` already, so nothing was going to be written for them.
+///   * `DurableOnTheWire` -- the elements ARE the stored copy. The other six are this shape,
+///     declared `#[serde(default)]` with no `skip_serializing`, and for them an empty stored
+///     image is not a rebuild. It is the rows, gone.
+///
+/// The owned array has no stored form -- see `many` above, and the test named in the deletion
+/// list below, which measures that rather than restating it. So the second tenancy is not merely
+/// discouraged here, it was UNSPELLABLE: its witness field had an uninhabited type,
+/// which has no values, so there is nothing a call site can put in the hole and the registration
+/// does not compile. Issue #2165.
+///
+/// # WHY A WITNESS, AND NOT A FLAG, A COMMENT OR A LIST OF KINDS
+///
+/// The hazard this exists for is that the lossy change LOOKS like the safe one. Both are "point a
+/// context map at `objects` and write slots for it"; what separates them is one serde attribute
+/// on a field the migration may well delete, and it is visible in neither `objects`' declaration
+/// nor the candidate map's own attribute. A `durable: bool` parameter is satisfied by writing
+/// `false`. A doc note is satisfied by not reading it. A hand-kept list of durable kinds goes
+/// stale beside the call sites it describes, and then the guard passes because its list changed
+/// rather than its subject. A type with no inhabitants is checked by the compiler, at the one
+/// site where the decision is actually taken.
+///
+/// What it does not check is a tenant that claims `RebuiltAtLoad` while meaning the other thing.
+/// That is why the arm carries its kind: the claim and the tenant it is made for sit together in
+/// the diff, which is the half a reviewer can see and a compiler cannot.
+pub(super) enum OwnedElementTenancy {
+    /// The elements are re-derived at load, and the stored image is not expected to carry them.
+    RebuiltAtLoad(StoredModelKind),
+    /// The elements are the stored copy, carried under `e` of [`ObjectSlotWire`].
+    ///
+    /// CONSTRUCTIBLE NOW. It was not while the array had no stored form, and the hole it carried
+    /// (an uninhabited enum) is deleted with this change exactly as its own
+    /// doc instructed: keeping the witness afterwards would refuse a registration that had become
+    /// correct, and a guard that fires on correct code gets deleted rather than obeyed.
+    DurableOnTheWire {
+        /// The tenant making the claim.
+        kind: StoredModelKind,
+    },
+}
+
+
+impl ObjectSlot {
+    /// A slot holding one record and no element array.
+    pub(super) fn from_record(record: ObjectRecord) -> Self {
+        Self { record, many: None }
+    }
+
+    /// The record, by value. It is `Copy`, which is the point of keeping the payload outside it.
+    pub(super) fn record(&self) -> ObjectRecord {
+        self.record
+    }
+
+    /// The record, mutably, for the callers that set flags or an address in place.
+    pub(super) fn record_mut(&mut self) -> &mut ObjectRecord {
+        &mut self.record
+    }
+
+    /// How many elements the owned array holds. Zero when there is no array, which is NOT the same
+    /// statement as "the object has no elements": an object whose elements fit the record's inline
+    /// arms carries them there and has no array at all. This counts the array.
+    pub(super) fn owned_element_count(&self) -> usize {
+        self.many.as_ref().map_or(0, |elements| elements.len())
+    }
+
+    /// THE OWNED ARRAY, READ-ONLY. The counterpart to [`ObjectSlot::set_owned_elements`] on the
+    /// read side, and deliberately NOT a re-exposure of the field: `many` stays private, the
+    /// write surface stays the one door that demands a tenancy witness, and a caller that holds
+    /// `&[..]` cannot put an array here or reorder the one that is present.
+    ///
+    /// `None` and `Some(&[])` are DIFFERENT ANSWERS and that is why this returns the `Option`
+    /// rather than a slice that flattens the absent arm to empty. An emptied array gives up its
+    /// allocation, so "no points" has exactly one spelling -- `None` -- and a reader that could
+    /// not tell the two apart is the second representation of one state this shape exists to
+    /// avoid. [`ObjectSlot::owned_element_count`] answers the length question; this one answers
+    /// the presence question and hands back the stored order.
+    pub(super) fn owned_elements(&self) -> Option<&[(u64, ElementEntry)]> {
+        self.many.as_deref().map(|elements| elements.as_slice())
+    }
+
+    /// THE ONLY DOOR INTO THE OWNED ELEMENT ARRAY, AND IT ASKS WHICH TENANCY IS BEING CLAIMED.
+    ///
+    /// `many` is private to this module, so this is the whole write surface for the array rather
+    /// than the recommended one. A caller names its tenant and says whether the elements are
+    /// re-derived at load or are themselves the stored copy. The second was unspellable while the
+    /// array had no stored form; it has one now, under `e` of [`ObjectSlotWire`], so both arms are
+    /// reachable and the claim is a statement a reviewer checks rather than one a type refuses.
+    /// See [`OwnedElementTenancy`].
+    ///
+    /// Sorted on the way in, which is what keeps the array's own access argument true: the type
+    /// doc claims a sorted contiguous array that binary-searches in O(log N), and a door that
+    /// accepted an arbitrary order would be the one place that claim stopped holding.
+    pub(super) fn set_owned_elements(
+        &mut self,
+        tenancy: OwnedElementTenancy,
+        mut elements: Vec<(u64, ElementEntry)>,
+    ) {
+        // BOTH ARMS ARE REACHABLE NOW, and the match stays because the claim and the tenant it is
+        // made for still belong together in a diff -- which is the half a reviewer can see and a
+        // compiler cannot. What it no longer does is refuse the durable arm: the array has a stored
+        // form under `e` of `ObjectSlotWire`, so a tenant claiming its elements are the stored copy
+        // is making a claim that is now true.
+        match tenancy {
+            OwnedElementTenancy::RebuiltAtLoad(_) => {}
+            OwnedElementTenancy::DurableOnTheWire { .. } => {}
+        }
+        elements.sort_unstable_by_key(|(when, _)| *when);
+        self.many = Some(Box::new(elements));
+    }
+}
+
+impl From<ObjectRecord> for ObjectSlot {
+    fn from(record: ObjectRecord) -> Self {
+        Self::from_record(record)
+    }
+}
+
+/// A SERIES IN THE STORED SHAPE, INTO A SLOT. `OwnedTimestampedSeries` has the same conversion and
+/// every fixture for a series map used it, so a migrated map's fixtures read exactly as they did.
+///
+/// The array's sorted invariant comes free: a `BTreeMap` iterates in key order, so the collected
+/// array is already sorted by instant and no sort is needed to establish what every reader
+/// binary-searches on.
+impl From<std::collections::BTreeMap<u64, ElementEntry>> for ObjectSlot {
+    fn from(points: std::collections::BTreeMap<u64, ElementEntry>) -> Self {
+        let points: Vec<(u64, ElementEntry)> = points.into_iter().collect();
+        Self {
+            record: ObjectRecord::default(),
+            many: if points.is_empty() {
+                None
+            } else {
+                Some(Box::new(points))
+            },
+        }
+    }
+}
+
+/// THE THREE THE MAPS ACTUALLY CALL, DELEGATED RATHER THAN REACHED THROUGH.
+///
+/// Every one of these forwards to the record and adds nothing. They exist so that wrapping the
+/// record did not become a rewrite of its readers: a site that said `slot.address()` before the
+/// payload field existed says exactly that afterwards. The alternative -- making each of the five
+/// call sites spell `.record().address()` -- would have put the wrapper in the middle of code that
+/// has no interest in it, and would grow with every tenant rather than staying at five.
+///
+/// They are also the seam the consolidated map wants: a reader asks the SLOT where the object
+/// lives, and whether that answer comes from an inline arm of the record or from the owned array
+/// is the slot's business and not the caller's.
+impl ObjectSlot {
+    /// Where the object's single page lives. Panics on the handle arm, exactly as the record does
+    /// and for the record's own stated reason -- see [`ObjectRecord::address`].
+    /// The object's uncompressed size as the record knows it, or `None` when it carries no class.
+    pub(super) fn logical_size(&self) -> Option<u64> {
+        self.record.logical_size()
+    }
+
+    /// Record the uncompressed size, handing back what it displaced.
+    pub(super) fn set_logical_size(&mut self, len: u64) -> Option<u64> {
+        self.record.set_logical_size(len)
+    }
+
+    pub(super) fn address(&self) -> ElementEntry {
+        self.record.address()
+    }
+
+    /// The same question as an `Err` rather than a panic, for the load path.
+    pub(super) fn try_address(&self) -> Result<ElementEntry, ObjectRecordRefusal> {
+        self.record.try_address()
+    }
+
+    /// Point the slot at a page. Touches only what the record's own setter touches; the owned
+    /// element array is untouched, which is the whole reason it is a separate field.
+    pub(super) fn set_address(&mut self, address: &ElementEntry) {
+        self.record.set_address(address);
+    }
+}
+
+// =================================================================================================
+// THE SLOT AS A TIMESTAMPED SERIES
+// =================================================================================================
+
+/// THE OWNED ARRAY, READ AND WRITTEN AS A TIMESTAMPED SERIES.
+///
+/// This is what the owned array was built for: a per-element kind's points live in `many`, one
+/// contiguous allocation per object, instead of a `BTreeMap` of its own per object key.
+///
+/// # WHY THE ARRAY AND NOT A B-TREE, MEASURED RATHER THAN ARGUED
+///
+/// Marginal cost of one key with N points, against the `BTreeMap`-inside-a-`HashMap` shape this
+/// replaces -- measured on the counting allocator, and independently in a standalone harness that
+/// agreed to three significant figures:
+///
+/// | N     | per-kind map        | owned array     | ratio |
+/// |-------|---------------------|-----------------|-------|
+/// | 1     | 312 B / 4 allocs    | 48 B / 2        | 6.50x |
+/// | 100   | 5,080 B / 20        | 2,424 B / 2     | 2.10x |
+/// | 1,000 | 49,120 B / 170      | 24,056 B / 2    | 2.04x |
+/// | 3,200 | 156,192 B / 535     | 76,824 B / 2    | 2.03x |
+///
+/// The single-point row decomposes to one allocation: a `BTreeMap` holding ONE element allocates a
+/// 280-byte root node, paid per key per kind before a single element byte is stored.
+///
+/// And the array is FIXED WIDTH AND KEPT SORTED, which is not a detail. #2122 measured that a
+/// variable-length, linear-scan payload is 3.0-17.8x worse on misses, so the compactness that makes
+/// such a buffer small is also what stops it being binary-searchable. `(u64, ElementEntry)` is
+/// twenty-four fixed bytes, so [`TimestampedSeries::get`] binary-searches in O(log N) and
+/// [`TimestampedSeriesWrite::set`] appends in amortised O(1) at the tail, which is where an
+/// append-mostly series writes.
+///
+/// # THE POINTS LIVE ONLY IN `many`, AND THAT IS DELIBERATE FOR THE FIRST TENANT
+///
+/// The record's inline address arm is NOT consulted here. A series could in principle keep its
+/// single point inline and spend no allocation at all, and that would beat the 48 B row above --
+/// but it would make every read merge two sources, and a reader that disagreed with a writer about
+/// which source held a point is precisely the divergence class this campaign keeps finding. One
+/// source of truth for the first tenant; the inline arm is a measured follow-up, not a
+/// precondition, because every figure in the table above is already an owned-array figure.
+impl super::timestamped_series::TimestampedSeries for ObjectSlot {
+    fn len(&self) -> usize {
+        self.many.as_ref().map_or(0, |points| points.len())
+    }
+
+    fn get(&self, at: u64) -> Option<&ElementEntry> {
+        let points = self.many.as_ref()?;
+        points
+            .binary_search_by_key(&at, |(instant, _)| *instant)
+            .ok()
+            .map(|found| &points[found].1)
+    }
+
+    fn addresses(&self) -> impl Iterator<Item = &ElementEntry> {
+        self.many
+            .as_deref()
+            .map(|points| points.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .map(|(_, address)| address)
+    }
+
+    fn points(&self) -> impl Iterator<Item = (u64, &ElementEntry)> {
+        self.many
+            .as_deref()
+            .map(|points| points.as_slice())
+            .unwrap_or(&[])
+            .iter()
+            .map(|(instant, address)| (*instant, address))
+    }
+
+    fn points_mut(&mut self) -> impl Iterator<Item = (u64, &mut ElementEntry)> {
+        self.many
+            .as_deref_mut()
+            .map(|points| points.as_mut_slice())
+            .unwrap_or(&mut [])
+            .iter_mut()
+            .map(|(instant, address)| (*instant, address))
+    }
+
+    /// TWO BINARY SEARCHES AND A SLICE, which is why a window belongs on the trait at all: a
+    /// sorted array answers it more cheaply than a tree does, so requiring it costs the trait
+    /// nothing in generality. See the method's own note for the test this passes.
+    ///
+    /// `partition_point` answers the first index whose point FAILS the predicate, which is the
+    /// insertion position -- so each bound becomes one search and the window is the slice between
+    /// them. The `max(start)` keeps an inverted or empty window as an empty slice rather than a
+    /// panic on a reversed range.
+    fn range(
+        &self,
+        bounds: impl std::ops::RangeBounds<u64>,
+    ) -> impl DoubleEndedIterator<Item = (u64, &ElementEntry)> {
+        use std::ops::Bound;
+        let points = self
+            .many
+            .as_deref()
+            .map(|points| points.as_slice())
+            .unwrap_or(&[]);
+        let start = match bounds.start_bound() {
+            Bound::Unbounded => 0,
+            Bound::Included(&at) => points.partition_point(|(instant, _)| *instant < at),
+            Bound::Excluded(&at) => points.partition_point(|(instant, _)| *instant <= at),
+        };
+        let end = match bounds.end_bound() {
+            Bound::Unbounded => points.len(),
+            Bound::Included(&at) => points.partition_point(|(instant, _)| *instant <= at),
+            Bound::Excluded(&at) => points.partition_point(|(instant, _)| *instant < at),
+        };
+        points[start..end.max(start)]
+            .iter()
+            .map(|(instant, address)| (*instant, address))
+    }
+}
+
+impl ObjectSlot {
+    /// The series as the `BTreeMap` the stored shape and the reports are written against.
+    ///
+    /// MATERIALISED, and only on paths that want that shape: the key-state capture, which must keep
+    /// carrying what it has always carried, and the validator's report, whose own type is the
+    /// B-tree. `OwnedTimestampedSeries` has the same method for the same two callers. A serving
+    /// read goes through `TimestampedSeries` and allocates nothing.
+    /// THE SINGLE ADDRESS'S PARTS, DELEGATED, so a caller that held a bare address keeps reading
+    /// the same words off the row that replaced it.
+    ///
+    /// These exist because the string map's value became a slot. Every one of its readers wanted a
+    /// part of the address rather than the address itself -- the slab, the offset, the length, the
+    /// page ordinal -- and making each of them write `.address().slab()` would put the same
+    /// projection at thirty-odd call sites. `address()` already delegates to the record; these
+    /// delegate one step further, and each panics through `address()` on a multi-page row for the
+    /// reason stated there.
+    pub(super) fn block_slab_id(&self) -> u64 {
+        self.address().block_slab_id()
+    }
+
+    /// The offset within the slab.
+    pub(super) fn offset(&self) -> u64 {
+        self.address().offset()
+    }
+
+    /// How many bytes the single page covers.
+    pub(super) fn length(&self) -> u64 {
+        self.address().length()
+    }
+
+    /// Which page of the object this is, or `None` while the block lives in the log.
+    pub(super) fn block_id(&self) -> Option<u64> {
+        self.address().block_id()
+    }
+
+    /// The generation, when the row carries one.
+    pub(super) fn generation(&self) -> Option<u64> {
+        self.address().generation()
+    }
+
+    pub(super) fn to_btree(&self) -> std::collections::BTreeMap<u64, ElementEntry> {
+        self.owned_elements()
+            .unwrap_or(&[])
+            .iter()
+            .map(|(at, address)| (*at, address.clone()))
+            .collect()
+    }
+}
+
+impl super::timestamped_series::TimestampedSeriesWrite for ObjectSlot {
+    /// Record an address at one instant, KEEPING THE ARRAY SORTED.
+    ///
+    /// The sort order is what [`TimestampedSeries::points`] promises and what
+    /// [`TimestampedSeries::get`] binary-searches, so an unsorted insert would silently break both
+    /// -- `get` would miss points that are present, which reads as a deletion.
+    ///
+    /// `binary_search_by_key` answers the insertion position on a miss, so the common case -- an
+    /// append at or near the tail of an append-mostly series -- is a `Vec::insert` at the end,
+    /// which is amortised O(1) and copies nothing.
+    fn set(&mut self, at: u64, address: ElementEntry) {
+        let points = self.many.get_or_insert_with(|| Box::new(Vec::new()));
+        match points.binary_search_by_key(&at, |(instant, _)| *instant) {
+            Ok(found) => points[found].1 = address,
+            Err(position) => points.insert(position, (at, address)),
+        }
+    }
+
+    /// Forget the point at one instant, if any.
+    ///
+    /// AN EMPTIED ARRAY GIVES UP ITS ALLOCATION rather than keeping a zero-length buffer, so that
+    /// `many.is_none()` means "no points" with no second way to spell it. A slot holding
+    /// `Some(empty)` would answer `len() == 0` and still carry a heap allocation, which is both a
+    /// cost and a second representation of one state.
+    fn clear(&mut self, at: u64) {
+        let Some(points) = self.many.as_deref_mut() else {
+            return;
+        };
+        if let Ok(found) = points.binary_search_by_key(&at, |(instant, _)| *instant) {
+            points.remove(found);
+        }
+        if points.is_empty() {
+            self.many = None;
+        }
+    }
+}
+
+// =================================================================================================
+// THE WRITE-BACK DOOR AND THE ORDINAL IT USED TO DROP IN SILENCE
+// =================================================================================================
+
+/// HOW MANY TIMES THE WRITE-BACK DOOR WAS HANDED A PAGE ORDINAL IT CANNOT HOLD.
+///
+/// `ObjectRecord::set_address` writes the inline arm, which keeps a page ordinal's PRESENCE and
+/// not its value -- correct, and measured: a single-page object has page zero by construction, and
+/// 400 of 400 live addresses on a real store carried ordinal 0. A nonzero ordinal belongs in the
+/// layout arm.
+///
+/// The conversion path refuses such an entry by name, as
+/// [`ObjectRecordRefusal::NonZeroBlockOrdinalDoesNotFitInline`]. The write-back door did not: it
+/// wrote the presence bit and dropped the value, silently.
+///
+/// # WHY THIS IS A COUNTER AND NOT YET A REFUSAL
+///
+/// Making `set_address` refuse would be the obvious fix and is the wrong one TODAY, because the
+/// correct destination for a multi-page object does not exist yet -- it arrives with the owned
+/// element array. That leaves a refusing caller two options and both are worse than the bug:
+///
+///   * FATAL turns a recovery path into a store that cannot be opened, which this tree has twice
+///     established as the worst outcome available on a load path.
+///   * SKIP drops the page's address, which is silent data loss -- the same class as the
+///     behaviour being fixed, reached by a different mechanism.
+///
+/// So what ships is OBSERVABILITY: today's behaviour, counted, with the count exposed and asserted
+/// zero. It should never fire, because every map holding a record today is single-page. If it ever
+/// does, we learn before it costs anything, and the counter's call site is where the routing to the
+/// owned array will go.
+///
+/// A NAMED `TODO` WITH NO INSTRUMENT IS WHAT LET THIS SURVIVE. The asymmetry between the two paths
+/// was documented in prose and contradicted by the code, and no test fed either path a nonzero
+/// ordinal, so nothing could tell. A counter asserted zero is the instrument that prose was not.
+///
+/// [`ObjectRecord::try_set_address`] is the refusing door, reachable and tested now, for the
+/// callers that will be able to handle it once there is somewhere for such an object to go.
+static DROPPED_NONZERO_BLOCK_ORDINALS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// How many nonzero page ordinals the write-back door has dropped.
+pub(crate) fn dropped_nonzero_block_ordinals() -> u64 {
+    DROPPED_NONZERO_BLOCK_ORDINALS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Forget the count, so a test measures its own writes rather than the suite before it.
+pub(crate) fn reset_dropped_nonzero_block_ordinals() {
+    DROPPED_NONZERO_BLOCK_ORDINALS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+impl ObjectRecord {
+    /// Point the record at a page, REFUSING an address the inline arm cannot hold faithfully.
+    ///
+    /// This is [`ObjectRecord::set_address`] with the refusal the conversion path already makes,
+    /// by the same named variant, so the two halves of one contract agree. It exists now, ahead of
+    /// any caller that can act on it, because a refusal that is unreachable is untestable -- and
+    /// the defect this closes survived precisely because nothing ever drove the condition.
+    ///
+    /// Callers migrate to this once a multi-page object has a destination. Until then
+    /// `set_address` keeps today's behaviour and counts.
+    pub(super) fn try_set_address(
+        &mut self,
+        address: &ElementEntry,
+    ) -> Result<(), ObjectRecordRefusal> {
+        if let Some(block_id) = address.block_id() {
+            if block_id != 0 {
+                return Err(ObjectRecordRefusal::NonZeroBlockOrdinalDoesNotFitInline {
+                    block_id: u64::from(block_id),
+                });
+            }
+        }
+        self.set_address(address);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod the_handle_arm_now_has_something_to_point_into {
+    use super::{
+        ElementEntry, ObjectRecord, BlockAddress, BlockLayout, BlockLayoutHandle, BlockLayoutStore,
+    };
+
+    fn an_entry() -> ElementEntry {
+        ElementEntry::from_parts(7, 64, 128, Some(3), None)
+    }
+
+    /// Handle zero names nothing, and no issued handle is ever zero.
+    ///
+    /// `BlockLayoutHandle` derives `Default`, so this is the property that keeps a record which
+    /// never had a layout from reading whatever landed in the first slot.
+    #[test]
+    fn handle_zero_names_nothing_and_is_never_issued() {
+        let mut store = BlockLayoutStore::default();
+        assert!(store.get(BlockLayoutHandle::default()).is_none(), "the default handle resolved");
+        assert!(store.get(BlockLayoutHandle::from_stored(0)).is_none(), "handle zero resolved");
+
+        for _ in 0..4 {
+            let handle = store.insert(BlockLayout::default());
+            assert_ne!(0, handle.get(), "an issued handle must never be zero");
+        }
+        assert_eq!(4, store.len());
+        assert!(store.get(BlockLayoutHandle::from_stored(0)).is_none(), "handle zero resolved");
+    }
+
+    /// A record whose address word is a HANDLE gives its rows back unchanged through the store.
+    ///
+    /// This is the arm that existed and could not be reached: the record carries the handle, the
+    /// store holds the layout, and nothing is lost in either direction.
+    #[test]
+    fn a_record_and_its_layout_round_trip_through_the_store() {
+        let mut store = BlockLayoutStore::default();
+        let address = an_entry();
+
+        // The handle has to be known before the record is built, which is why the store issues it
+        // first and the layout is filed under the same handle afterwards.
+        let reserved = store.insert(BlockLayout::default());
+        let (record, layout) =
+            ObjectRecord::from_object_rows_with_layout(&address, 9, Some(1_700), true, reserved)
+                .expect("the layout arm refused an entry it is documented to hold");
+        assert!(
+            matches!(record.page_address(), BlockAddress::Many(_)),
+            "the record should carry a handle, not an inline address"
+        );
+
+        // File the real layout in the slot the handle already names.
+        let replaced = store.remove(reserved);
+        assert!(replaced.is_some(), "the reserved slot should have held the placeholder");
+        let handle = store.insert(layout);
+
+        let held = store.get(handle).expect("the filed layout should resolve");
+        let (back_address, back_model) = record
+            .into_object_rows(Some(held))
+            .expect("unfolding a record through its layout refused");
+        assert_eq!(address, back_address, "the address row changed");
+        assert_eq!(9, back_model, "the model id changed");
+    }
+
+    /// A stale handle stops resolving rather than naming the next layout in its slot.
+    ///
+    /// AND THE REUSE IS ASSERTED, because without it this test passes for the wrong reason: if the
+    /// second layout landed in a FRESH slot the ABA case would never be exercised and the stale
+    /// handle would fail to resolve trivially. So the slot count is pinned at one.
+    #[test]
+    fn a_stale_handle_does_not_resolve_to_the_layout_that_replaced_it() {
+        let mut store = BlockLayoutStore::default();
+
+        let first = store.insert(BlockLayout::default());
+        assert!(store.get(first).is_some());
+        assert!(store.remove(first).is_some(), "the first layout should have been there");
+        assert!(store.get(first).is_none(), "a removed handle still resolved");
+
+        let second = store.insert(BlockLayout::default());
+        assert_eq!(
+            1,
+            store.slots.len(),
+            "the vacated slot was NOT reused, so this test would not have exercised a stale handle"
+        );
+        assert_ne!(
+            first.get(),
+            second.get(),
+            "the slot was reused and the handle did not change, so a stale handle is \
+             indistinguishable from a live one"
+        );
+        assert!(
+            store.get(first).is_none(),
+            "the stale handle resolved to the layout that took its slot"
+        );
+        assert!(store.get(second).is_some(), "the live handle did not resolve");
+        assert_eq!(1, store.len(), "one layout should be filed");
+    }
+
+    /// Removing a handle twice is not a second removal, and neither is removing a fabricated one.
+    #[test]
+    fn a_handle_that_names_nothing_removes_nothing() {
+        let mut store = BlockLayoutStore::default();
+        let handle = store.insert(BlockLayout::default());
+        assert!(store.remove(handle).is_some());
+        assert!(store.remove(handle).is_none(), "the same handle removed twice");
+        assert!(
+            store.remove(BlockLayoutHandle::from_stored(9_999)).is_none(),
+            "a fabricated handle removed something"
+        );
+        assert!(store.is_empty(), "the store should be empty");
+        assert_eq!(0, store.len());
+    }
+}
+
+#[cfg(test)]
+mod what_moving_one_kinds_refs_onto_its_record_would_cost {
+    use super::{BlockLayout, BlockLayoutStore, StoredBlock};
+
+    /// glibc, which is what production uses: the crate's only `#[global_allocator]` is behind
+    /// `cfg(all(test, feature = "alloc-probe"))`.
+    fn chunk(request: usize) -> usize {
+        if request == 0 {
+            return 0;
+        }
+        let rounded = (request + 8 + 15) / 16 * 16;
+        if rounded < 32 { 32 } else { rounded }
+    }
+
+    /// BEFORE BUILDING IT: is an object's refs on its record cheaper than a lookup entry?
+    ///
+    /// The slice under consideration stops filing one kind in `ObjectBlockLookup` and hangs its
+    /// block refs off the object's own record instead. That is their shape -- one node per key,
+    /// everything else behind one word -- but shape is not a saving, and this campaign has refused
+    /// seven routes that looked right and measured wrong. So the arithmetic goes first.
+    ///
+    /// The two sides, per object holding ONE block:
+    ///
+    ///   TODAY  a `BTreeMap<Arc<str>, BlockRefs>` entry under the kind. The key `Arc` is SHARED
+    ///          with the page index and costs nothing extra here, so the entry is the node slot
+    ///          plus the 24-byte `BlockRefs` inline in it.
+    ///
+    ///   MOVED  the record already exists in `objects` for this kind and already holds the key,
+    ///          so the key is free on this side too. What is added is a store slot and a layout:
+    ///          the layout's `Vec<StoredBlock>` buffer, and the refs beside it.
+    #[test]
+    fn the_two_shapes_priced_side_by_side() {
+        let pair = std::mem::size_of::<StoredBlock>();
+        let layout_inline = std::mem::size_of::<BlockLayout>();
+        let refs_inline = 24; // BlockRefs, pinned in engine_storage_state.rs
+
+        // TODAY: a B-tree node holds up to 11 entries; a one-element map allocates a 280-byte root
+        // and the steady-state occupancy of a leaf is about 5.8 of 11. Per entry at steady state:
+        let node_bytes_per_entry = 288.0 / 5.8;
+        let today = node_bytes_per_entry + refs_inline as f64;
+
+        // MOVED: one store slot (generation + Option<BlockLayout>, inline in the arena's Vec) plus
+        // one exact-capacity page buffer. The arena's own Vec amortises, so per object it is the
+        // slot inline plus the buffer chunk.
+        let slot_inline = 4 + 4 + layout_inline; // generation, padding, the Option<BlockLayout>
+        let buffer = chunk(pair * 1);
+        let moved = slot_inline as f64 + buffer as f64 + refs_inline as f64;
+
+        println!();
+        println!("  per object holding one block, chunk bytes:");
+        println!("    StoredBlock                {pair} B");
+        println!("    BlockLayout inline         {layout_inline} B");
+        println!("    BlockRefs inline          {refs_inline} B");
+        println!();
+        println!("    TODAY  lookup entry       {today:>7.1} B  (node {node_bytes_per_entry:.1} + refs {refs_inline})");
+        println!("    MOVED  record + layout    {moved:>7.1} B  (slot {slot_inline} + buffer {buffer} + refs {refs_inline})");
+        println!("    delta                     {:>7.1} B  ({})", moved - today,
+                 if moved < today { "MOVED is cheaper" } else { "MOVED is MORE EXPENSIVE" });
+        println!();
+
+        // The arena's growth is amortised, so confirm the slot really is inline rather than a
+        // per-object allocation -- otherwise the figure above understates the moved side.
+        let mut store = BlockLayoutStore::default();
+        for _ in 0..64 {
+            store.insert(BlockLayout::default());
+        }
+        assert_eq!(64, store.len(), "the arena did not take 64 layouts");
+
+        // This test exists to PRICE the change, not to bless it. Assert only what was measured,
+        // so the number is recorded and a later shape change has to re-run it rather than inherit
+        // a claim.
+        assert!(pair > 0 && layout_inline > 0, "the shapes have a size");
+    }
+}
