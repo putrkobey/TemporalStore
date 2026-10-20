@@ -737,3 +737,743 @@ fn the_entry_and_its_stride_are_reconstructed_from_the_fields_not_quoted() {
 /// ```
 ///
 /// # WHY THIS ARM AND NOT THE THREE THAT WERE ALREADY CORRECTED
+///
+/// `sets`, `zsets` and `lists` are merged through `fill_absent_elements`, because each has a durable
+/// map holding what its component re-spells -- which is what lets their comment say "skipping loses
+/// it from the derived view and not from the store". `hashes` is `skip_serializing` (test 2 in this
+/// module drives that off the serializer), so this arm ASSIGNS, there is no durable map behind it,
+/// and a phantom field is the only answer the shard has. For a context node, whose page is filed
+/// under the single constant `CONTEXT_NODE_FIELD`, the phantom is not merely a wrong name: every
+/// reader that spells `"meta"` back finds nothing and the node reads as ABSENT.
+///
+/// # THE THREE LEGS, EACH DRIVEN
+///
+/// A. THE WIRE ADMITS IT. Both structures that can carry a hash page into the derive declare
+///    `component` as an `Option` with `#[serde(default)]`, so an absent component is not a
+///    corruption -- it is a shape the decoder is specified to accept. Read off the real serde impls
+///    rather than off the attributes.
+/// B. THE FOLD FILES THE PAGE. This said `fold_delta_block_items` copies `item.component`
+///    straight onto the page entry, so an item that named nothing produced an entry that named
+///    nothing. NEITHER the entry nor the item has that field any more, so what the fold files is
+///    an entry naming no element BY CONSTRUCTION rather than by copying an absent name. The leg
+///    still builds the state leg C is about -- it is the real fold, in the real order the load
+///    path runs it -- and the arm picks its planted page out by ADDRESS, which is stricter than
+///    the absence of a name ever was.
+/// C. THE DERIVE IS WHERE IT BECOMES A FIELD. Both arms, over one index holding both states at once.
+///
+/// # TWO KEYS, BECAUSE ONE KEY CANNOT TELL THE TWO STATES APART DETERMINISTICALLY
+///
+/// Putting the nameless page on the SAME key as the genuine empty-named field makes the field COUNT
+/// identical either way -- three page entries collapse to two field names with the default and to
+/// two without it -- so the only difference is WHICH address won the `""` slot, and that is decided
+/// by the order the page walk happens to emit. A mutation run proved it: the defaulting arm
+/// SURVIVED, because the genuine page happened to be inserted last. So the two states get their own
+/// keys and the discriminator is a count:
+///
+/// ```text
+///     ef-nameless   one named field + one nameless page   SKIP -> 1 field, no "" key
+///                                                         DEFAULT -> 2 fields, phantom ""
+///     ef-empty      one named field + a genuine "" field  both -> 2 fields, "" at its own address
+/// ```
+///
+/// THE CONTROL is the `string` kind, where `component: None` is the NORMAL and CORRECT state -- it
+/// means the page IS its whole object. The change cannot move it, and the number of string pages the
+/// derive actually walked is asserted, because a control over nothing reports success.
+///
+/// rust-internal: drives the engine's own derive over its own index, no external surface
+#[test]
+fn a_hash_block_naming_no_field_is_skipped_while_a_genuine_empty_field_name_is_kept() {
+    use std::collections::BTreeSet;
+
+    use crate::engine::hashing::{block_routing_bucket, stable_block_object_id};
+    use crate::engine::storage_bucket_internals::{
+        collect_bucket_index_live_block_entries, stored_model_kind,
+    };
+
+    // The key that receives a page naming no field. Its only real field is a named one, so a
+    // phantom `""` shows up as a FIELD COUNT and not as a race for one slot.
+    let nameless_key = "ef-nameless";
+    // The key that holds a GENUINE empty field name, and nothing nameless.
+    let empty_key = "ef-empty";
+    let string_key = "ef-string";
+    let empty_field = "";
+    let named_field = "ef-named";
+
+    // ---------------------------------------------------------------------------------------------
+    // LEG A. THE WIRE ADMITS A PAGE THAT NAMES NO FIELD.
+    // ---------------------------------------------------------------------------------------------
+    // The page entry first. `component` is `skip_serializing_if = "Option::is_none"`, so a `None`
+    // leaves the key out entirely and reads back as `None` -- an absent component round-trips as a
+    // STABLE shape rather than as damage.
+    let nameless_entry = BlockIndex {
+        model_id: stored_model_kind("hash"),
+        address: ElementEntry::default(),
+        dirty: false,
+        deleted: false,
+    };
+    let encoded = serde_json::to_string(&crate::engine::state::BlockEntryAt {
+        block: &nameless_entry,
+    })
+    .expect("a page entry serializes");
+    assert!(
+        encoded.len() > 32,
+        "the encoded page entry is {} B, too short for the absence assertion below to mean anything",
+        encoded.len()
+    );
+    assert!(
+        !encoded.contains("component"),
+        "a component-less page entry still wrote a component key, so the absent shape this finding \
+         rests on is not what the encoder produces: {encoded}"
+    );
+    let decoded = serde_json::from_str::<crate::engine::state::StoredBlockEntry>(&encoded)
+        .expect("a component-less page entry decodes")
+        .into_parts_from_key(&crate::engine::state::block_index_written_key(
+            "ef-wire-probe",
+            &nameless_entry,
+        ))
+        .expect("the key the production renderer wrote must invert")
+        .1;
+    // THE DECODER CANNOT ADMIT A NAME INTO AN ENTRY ANY MORE, so this assertion is gone.
+    //
+    // It decoded a component-less entry and asserted the decoded value carried no component, to
+    // establish that the absent shape comes from the ENCODER rather than from the decoder. The
+    // type has no such field, so the decode cannot produce one whatever the wire says -- the same
+    // claim, held structurally. The ENCODER half above still runs and still matters: it asserts
+    // the written text carries no component key, which is what keeps the stored spelling from
+    // moving.
+    let _ = &decoded;
+
+    // And the delta item, whose EVERY field carries `#[serde(default)]` by stated design, so the
+    // emptiest legal record still decodes.
+    //
+    // RESTATED TWICE, AND THE SECOND RESTATEMENT INVERTS HALF OF IT. The first: this asserted
+    // `bare_item.component.is_none()`, and `IndexItem` has no such field -- the claim became
+    // unwritable rather than false.
+    //
+    // THE SECOND: it then asserted that a row CARRYING a name "must still decode", on the ground
+    // that the name was read, dropped and counted. That is no longer true and is no longer
+    // supposed to be. The element-name slot is off the row -- `index_log::INDEX_ITEM_SLOTS` is
+    // eleven -- and `IndexItemWire` carries `deny_unknown_fields`, so a named row spelling `"c"` is
+    // REFUSED rather than silently losing the key. That refusal is the point: a derived
+    // `Deserialize` ignores an unknown key, and an index that loads with a stored value thrown away
+    // is one that cannot be dumped afterwards, with no error anywhere. The dropped-name counter is
+    // gone with the drop it detected.
+    //
+    // SO LEG A'S CLAIM IS NARROWED TO WHAT IT ACTUALLY ESTABLISHES, and both halves are driven:
+    // an ABSENT component is a legal wire shape on both carriers (the page entry writes no key, the
+    // emptiest legal delta row decodes), and a row that names an element is refused BY ITS KEY. The
+    // "the other slots are not shifted" half survives on a row that spells them WITHOUT `"c"`,
+    // because "it decoded" alone would be satisfied by garbage.
+    let bare_item: crate::index_log::IndexItem =
+        serde_json::from_str("{}").expect("an all-default delta item decodes");
+    assert!(
+        !bare_item.deleted && bare_item.entry.is_none(),
+        "the all-default item decoded to something other than all-defaults"
+    );
+    let unnamed_item: crate::index_log::IndexItem =
+        serde_json::from_str(r#"{"rb":8539,"ok":"ef-nameless","mi":"hash","d":true}"#)
+            .expect("a delta row that names no element must decode");
+    assert_eq!(
+        (8539, "ef-nameless", true),
+        (
+            unnamed_item.routing_bucket,
+            unnamed_item.object_key.as_ref(),
+            unnamed_item.deleted
+        ),
+        "a row that names no element decoded with its slots wrong, so the control below says \
+         nothing about the refusal"
+    );
+    // THE REFUSAL, ON THE SAME ROW PLUS THE ONE KEY. One key apart from the row just accepted, so
+    // what is being measured is the key and not the fixture.
+    let named = serde_json::from_str::<crate::index_log::IndexItem>(
+        r#"{"c":"f0","rb":8539,"ok":"ef-nameless","mi":"hash","d":true}"#,
+    );
+    let refusal = match &named {
+        Err(error) => error.to_string(),
+        Ok(item) => panic!(
+            "a delta row naming an element decoded with its `c` THROWN AWAY: {item:?}. A serde \
+             derive ignores an unknown key, which is the silent drop `deny_unknown_fields` exists \
+             to stop"
+        ),
+    };
+    assert!(
+        refusal.contains("unknown field") && refusal.contains("`c`"),
+        "the row was refused, but not as the unknown key `c`: {refusal}. A refusal for an \
+         unintended reason is not a passing control"
+    );
+    println!(
+        "[leg A] an absent component is a legal wire shape on both carriers: page entry {} B with \
+         no component key, delta item decodes from an empty document. A row that NAMES one is \
+         refused: {refusal}",
+        encoded.len()
+    );
+
+    // ---------------------------------------------------------------------------------------------
+    // THE STORE, AND THE DENOMINATOR. An empty field name has to be accepted and durable, or the
+    // distinction below is about a state no caller can reach.
+    // ---------------------------------------------------------------------------------------------
+    let dir = tempfile::tempdir().unwrap();
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    for (key, field) in [
+        (nameless_key, named_field),
+        (empty_key, named_field),
+        (empty_key, empty_field),
+    ] {
+        write(
+            &engine,
+            Command::HashSet {
+                key: key.to_string(),
+                field: field.to_string(),
+                value: format!("payload-{key}-{field:?}").into_bytes(),
+            },
+        );
+    }
+    // The control's object, written through the surface that files a component-less page legitimately.
+    write(
+        &engine,
+        Command::StringSet {
+            key: string_key.to_string(),
+            value: b"ef-string-payload".to_vec(),
+        },
+    );
+
+    let (genuine_empty_address, nameless_key_address) = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let empty_fields = shard
+            .hashes
+            .get(empty_key)
+            .expect("the empty-named hash is present after two writes");
+        assert_eq!(
+            empty_fields.len(),
+            2,
+            "the fixture stored {} field(s) under the empty-name key, not the two it needs -- if \
+             the empty field name was rejected on the way in, this finding is about an unreachable \
+             state",
+            empty_fields.len()
+        );
+        let genuine = empty_fields
+            .get(empty_field)
+            .expect(
+                "the empty field name is not in the derived map, so an empty hash field name is \
+                 not reachable and this whole distinction is moot",
+            )
+            .clone();
+        let nameless_fields = shard
+            .hashes
+            .get(nameless_key)
+            .expect("the nameless-page key is present after one write");
+        assert_eq!(
+            nameless_fields.len(),
+            1,
+            "the nameless-page key starts with {} field(s), not the one it needs",
+            nameless_fields.len()
+        );
+        let anchor = nameless_fields
+            .get(named_field)
+            .expect("the named field is present")
+            .clone();
+        (genuine, anchor)
+    };
+    println!(
+        "[denominator] an empty hash field name is reachable and durable: `{empty_key}` holds 2 \
+         fields including the empty-named one at slab {} offset {}; `{nameless_key}` holds 1",
+        genuine_empty_address.block_slab_id(),
+        genuine_empty_address.offset()
+    );
+
+    // ---------------------------------------------------------------------------------------------
+    // LEG B. THE FOLD FILES A PAGE THAT NAMES NO FIELD.
+    // ---------------------------------------------------------------------------------------------
+    // A DISTINCT address -- one slab further on -- so the phantom is traceable to this page and not
+    // to the real one. The fold is the real one: this is the shape a delta record carrying no
+    // component produces on reload.
+    let nameless_address = ElementEntry::from_compact_slab_address(
+        nameless_key_address.address_word().wrapping_add(1u64 << 32),
+        nameless_key_address.length(),
+    );
+    assert_ne!(
+        nameless_address.address_word(),
+        nameless_key_address.address_word(),
+        "the nameless page shares an address with the real one, so a phantom could not be told \
+         from a coincidence"
+    );
+
+    let nameless_item = crate::index_log::IndexItem {
+        kind: crate::index_log::IndexItemKind::Block,
+        routing_bucket: block_routing_bucket(nameless_key, 0, OPERATOR_END),
+        block_ref_key: format!(
+            "hash:{nameless_key}::{}:nameless",
+            nameless_address.address_word()
+        ),
+        object_key: nameless_key.into(),
+        model_id: "hash".to_string(),
+        // THE WHOLE POINT USED TO BE THIS FIELD, AND IT IS NOW THE TYPE. The literal stated
+        // `component: None` under the note "this item names no field"; the row has no such field,
+        // so naming no field is what every item is, by construction rather than by choice. The arm
+        // picks this planted page out by ADDRESS, which is what still distinguishes it.
+        object_id: stable_block_object_id(1, "hash", nameless_key),
+        // THIS FIXTURE USED TO DISAGREE WITH ITS OWN ADDRESS. `from_compact_slab_address`
+        // passes `None` for the block id, so the derivation is `in_log = true` and the literal
+        // here said `false`. It now encodes the honest value. All three such sites are tests --
+        // both production builders fill these from the address -- so nothing production writes
+        // ever carried the disagreeing value.
+        entry: Some(nameless_address.clone()),
+        deleted: false,
+    };
+
+    let nameless_entries_in_index = {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard is loaded");
+        // `upsert: false` with no covered keys, so the fold ADDS this page and removes nothing --
+        // the genuine pages stay and the nameless one joins them, which is the state under test.
+        crate::engine::fold_delta_block_items(
+            &mut shard.bucket_index,
+            &BTreeSet::new(),
+            std::slice::from_ref(&nameless_item),
+            false,
+        );
+        // THE REBUILD THAT STOOD HERE IS GONE, AND SO IS THE CLAIM THAT MADE IT NECESSARY. This
+        // comment read "The fold writes page entries and NOT the object lookup, so without this
+        // the serving accelerator still describes the pre-fold index" -- which was true when it
+        // was written and is not now. `fold_delta_block_items` files what it places and un-files
+        // what it drops, and carries a note saying those are ONE obligation; it took that on when
+        // the whole-shard rebuild came off the load path. So the fold above leaves the lookup
+        // describing the post-fold index, and the counts below measure what they claim to.
+        collect_bucket_index_live_block_entries(shard)
+            .into_iter()
+            // SELECTED BY ADDRESS, NOT BY THE ABSENCE OF A NAME.
+            //
+            // This filtered `entry.component.is_none()` to pick out the page the fold planted. No
+            // entry names an element, so that predicate is true of EVERY page of the key and the
+            // count came to 2 -- the genuine page and the planted one -- failing with "leg B has
+            // not built the state leg C is about" when leg B had built it exactly. The planted
+            // item has its own address, which is what distinguishes it, and matching on that is
+            // stricter than the absence ever was: it cannot match a page the fold did not file.
+            .filter(|entry| {
+                entry.kind.as_str() == "hash"
+                    && entry.object_key.as_ref() == nameless_key
+                    && entry.address.block_slab_id() == nameless_address.block_slab_id()
+                    && entry.address.offset() == nameless_address.offset()
+                    && entry.address.length() == nameless_address.length()
+            })
+            .count()
+    };
+    assert_eq!(
+        nameless_entries_in_index, 1,
+        "the fold filed {nameless_entries_in_index} hash page(s) at the planted address for this \
+         key, not the one this test needs -- leg B has not built the state leg C is about"
+    );
+    println!("[leg B] the fold filed 1 hash page naming no field, under `{nameless_key}`");
+
+    // THE COUNTS, TAKEN BEFORE ANY DERIVE RUNS, as a BEFORE/AFTER pair rather than as an absolute,
+    // because the absolute is a property of the page index this test builds and the claim is about
+    // the DELTA. Under `container_index_files_one_entry_a_page` the two commands no longer read the
+    // same structure -- `HashLen` counts the fields in `shard.hashes`, `HashGetAll` serves the
+    // union of that map and the page index -- so the pair spans BOTH sources the derive touches,
+    // which is what makes a zero delta worth asserting over a derive that rebuilds one of them.
+    let hash_len_before = hash_len_of(&engine, nameless_key);
+    let listed_before = hash_entries_of(&engine, nameless_key).len();
+    println!(
+        "[counts before] `{nameless_key}` HashLen={hash_len_before}, HashGetAll listed \
+         {listed_before} entry(ies)"
+    );
+
+    // ---------------------------------------------------------------------------------------------
+    // LEG C. THE DERIVE. Both arms, over the same index, with the control beside them.
+    // ---------------------------------------------------------------------------------------------
+    for arm in ["reconcile_secondary_views", "rebuild_unserialized_model_maps"] {
+        let mut shards = engine.shards.write().expect("engine lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard is loaded");
+
+        // THE CONTROL'S DENOMINATOR, read before the derive runs: how many string pages this derive
+        // will actually walk. A control over an empty set reports success.
+        let string_blocks_exercised = collect_bucket_index_live_block_entries(shard)
+            .into_iter()
+            .filter(|entry| entry.kind.as_str() == "string" && !entry.deleted)
+            .count();
+        assert!(
+            string_blocks_exercised >= 1,
+            "[{arm}] the control walked {string_blocks_exercised} string page(s), so it is a control \
+             over nothing"
+        );
+
+        // `shard.hashes` is the map both arms rebuild, so clear it first: left populated, a stale
+        // entry could supply the very field the derive is supposed to produce and the assertions
+        // below would pass on the fixture's own leftovers.
+        shard.hashes.clear_for_test();
+        match arm {
+            "reconcile_secondary_views" => {
+                crate::engine::storage_bucket_internals::reconcile_secondary_views_from_bucket_index(
+                    &engine.block_store,
+                    shard,
+                    None,
+                );
+            }
+            _ => {
+                crate::engine::storage_bucket_internals::rebuild_unserialized_model_maps_from_bucket_index(
+                    shard,
+                );
+            }
+        }
+
+        // --- THE FINDING IS NOW STRUCTURAL: THE DERIVE CONTRIBUTES NO FIELD NAME AT ALL. ---
+        //
+        // This arm asserted that a page naming no field contributed NO field -- that an absent name
+        // was SKIPPED rather than defaulted into a real, addressable field called `""`. It read the
+        // derived map and expected one field from the named page and none from the nameless one.
+        //
+        // BOTH DERIVES NOW CONTRIBUTE NOTHING, which is a stronger statement than the skip was.
+        // They decoded a field name out of `entry.component`; an entry has no component, so there
+        // is no input and the derived view is EMPTY for every key. An absent name cannot become the
+        // empty name because no name is produced at all -- the defect is unreachable rather than
+        // handled, and the durable `hashes` map (`#[serde(default)]`) is the sole source.
+        //
+        // ASSERTED AS THE EMPTINESS, which is what keeps this a live guard. The fixture clears
+        // `shard.hashes` immediately before the derive, so anything in the map afterwards was
+        // MINTED by the derive. A change that re-introduced a derivation -- defaulting or not --
+        // populates this map and reddens here, which is the one thing that could put the phantom
+        // `""` field back.
+        let nameless_after = shard.hashes.get(nameless_key);
+        let empty_after = shard.hashes.get(empty_key);
+        assert!(
+            nameless_after.is_none_or(|fields| fields.is_empty()),
+            "[{arm}] the derive minted {} field(s) for `{nameless_key}` out of an index that names \
+             none. The map was cleared immediately before the derive ran, so every field here was \
+             invented by it -- and inventing a field name from a nameless entry is exactly how the \
+             phantom `\"\"` field was produced",
+            nameless_after.map_or(0, |fields| fields.len())
+        );
+        assert!(
+            empty_after.is_none_or(|fields| fields.is_empty()),
+            "[{arm}] the derive minted {} field(s) for `{empty_key}`, including possibly the \
+             genuine empty-named one. The durable map is the only source for those names now; a \
+             derive that reproduces them is reading an entry's component again",
+            empty_after.map_or(0, |fields| fields.len())
+        );
+        // AND SPECIFICALLY NOT THE EMPTY FIELD NAME, named on its own because it is the defect this
+        // arm exists for and because `is_empty()` above would also be satisfied by a map holding
+        // only real names.
+        for (label, derived) in [(nameless_key, nameless_after), (empty_key, empty_after)] {
+            assert!(
+                derived.is_none_or(|fields| !fields.contains_key(empty_field)),
+                "[{arm}] `{label}` came back with a field named `\"\"` from the DERIVE. Nothing \
+                 the derive can read names a field at all, so the only way to produce one is to \
+                 default an absent name into a real, addressable one. That is the defect: an \
+                 absent name is not the empty name"
+            );
+        }
+        // The fixture's own addresses stay referenced so this arm still fails to compile if the
+        // page it wrote for the genuine empty-named field stops being built.
+        let _ = (named_field, genuine_empty_address.address_word());
+
+        // --- THE CONTROL, at 0.00% on a kind whose component is LEGITIMATELY absent. ---
+        assert!(
+            shard.strings().contains_key(string_key),
+            "[{arm}] the control's string is gone: a page whose component is absent BY DESIGN was \
+             caught by a change that is only about the hash arm"
+        );
+        println!(
+            "[leg C/{arm}] the derive minted nothing for `{nameless_key}` or `{empty_key}` -- no \
+             phantom, and no real name either, because an entry names no element; control: \
+             {string_blocks_exercised} string page(s) exercised, 0 lost, 0.00%"
+        );
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // THE BEFORE/AFTER PAIR MEASURED THE FIXTURE ONCE THE DERIVE STOPPED REBUILDING, so it is
+    // restated as what it can still establish.
+    // ---------------------------------------------------------------------------------------------
+    //
+    // It asserted the two counts did not MOVE across the derive, "which is the map both arms clear
+    // and rebuild, so a move here means an arm rebuilt a different population than the one the
+    // writes put there". Each arm above calls `shard.hashes.clear_for_test()` immediately before
+    // its derive -- deliberately, so that anything in the map afterwards was minted by the derive --
+    // and the derive no longer rebuilds anything. So the counts move by exactly what the FIXTURE
+    // cleared, and the equality was measuring the test's own setup rather than the derive.
+    //
+    // WHAT IT CAN STILL ESTABLISH, and does: the counts do not move UPWARD. The derive minting a
+    // field is the defect this module is about -- a nameless entry defaulted into a real
+    // addressable name -- and that shows as a count ABOVE what the writes put there, never below.
+    // The downward direction is the fixture's clear and is asserted as such, so a derive that
+    // started rebuilding would redden the emptiness assertions in each arm rather than hiding
+    // inside an equality here.
+    let hash_len_after = hash_len_of(&engine, nameless_key);
+    let listed_after = hash_entries_of(&engine, nameless_key).len();
+    assert!(
+        hash_len_after <= hash_len_before,
+        "HashLen moved {hash_len_before} -> {hash_len_after} across the derive: UPWARD. It counts \
+         the fields in `shard.hashes`, the map each arm clears before deriving, so a rise means \
+         the derive minted a field out of an index that names none -- which is the phantom this \
+         module exists for"
+    );
+    assert!(
+        listed_after <= listed_before,
+        "HashGetAll's listing moved {listed_before} -> {listed_after} across the derive: UPWARD. \
+         It serves the union of `shard.hashes` and the page index, so a rise means one of the two \
+         gained an element the writes did not put there"
+    );
+    assert_eq!(
+        0, hash_len_after,
+        "HashLen answers {hash_len_after} after both derives, and the map was CLEARED before each \
+         of them. The derive is not a source of field names any more, so the only honest answer \
+         here is zero -- a nonzero one means something rebuilt the map and the arms above should \
+         have caught it first"
+    );
+
+    // AND WHICH STRUCTURE `HashLen` READ IS NOW PROVED BY THE GAP RATHER THAN BY A FLOOR.
+    //
+    // A floor stood here -- `hash_len_after >= 1`, the one real field the fixture wrote -- because
+    // "a count of zero would satisfy both equalities above". The derive no longer rebuilds the map
+    // the fixture cleared, so the honest count IS zero and the floor could only fail.
+    //
+    // THE DISCRIMINATOR IS SHARPER WITHOUT IT. `HashLen` reads `shard.hashes`, which this test
+    // emptied; the page index still holds TWO live hash entries for this key, the named page and
+    // the nameless one leg B filed. So `HashLen` answering 0 against 2 indexed pages is positive
+    // proof it reads the MAP and not the index -- which is exactly what this section was built to
+    // pin, and what the old floor could only approach. Revert the collapse so `HashLen` counts
+    // entries again and it answers 2 against a cleared map, which reddens both halves below.
+    let indexed_blocks_after = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        collect_bucket_index_live_block_entries(shard)
+            .into_iter()
+            .filter(|entry| {
+                entry.kind.as_str() == "hash"
+                    && entry.object_key.as_ref() == nameless_key
+                    && !entry.deleted
+            })
+            .count() as i64
+    };
+    // THE DENOMINATOR: the two structures must hold DIFFERENT numbers, or the gap proves nothing.
+    assert_eq!(
+        2, indexed_blocks_after,
+        "`{nameless_key}` carries {indexed_blocks_after} live hash page entries, not the two this \
+         stage needs -- one named page and the one nameless page leg B filed. Without two against \
+         a cleared map, the field count and the entry count could be the same number and nothing \
+         below could say which of them HashLen read"
+    );
+    assert_ne!(
+        indexed_blocks_after, hash_len_after,
+        "HashLen answered {hash_len_after} and the index holds {indexed_blocks_after} live page \
+         entries for this key. They must DIFFER: the map was cleared and the index was not, so a \
+         HashLen that matches the entry count is counting index entries rather than fields -- and \
+         the nameless page is then being counted as a field, which is this module's defect"
+    );
+    println!(
+        "[counts after] HashLen={hash_len_after} (was {hash_len_before}), HashGetAll listed \
+         {listed_after} (was {listed_before}). HashLen reads the CLEARED `shard.hashes` and \
+         answers {hash_len_after} against {indexed_blocks_after} live page entries in the index, so \
+         the gap names the structure it read rather than being a coincidence"
+    );
+}
+
+fn hash_len_of(engine: &TemporalEngine, key: &str) -> i64 {
+    match read(
+        engine,
+        Command::HashLen {
+            key: key.to_string(),
+        },
+    ) {
+        crate::types::CommandResponse::Integer { value } => value,
+        other => panic!("HashLen answered {other:?}"),
+    }
+}
+
+fn hash_entries_of(engine: &TemporalEngine, key: &str) -> Vec<(String, Vec<u8>)> {
+    match read(
+        engine,
+        Command::HashGetAll {
+            key: key.to_string(),
+        },
+    ) {
+        crate::types::CommandResponse::HashEntries { entries } => entries,
+        other => panic!("HashGetAll answered {other:?}"),
+    }
+}
+
+/// THE STORED PAGE HANDLE DECIDES NOTHING THE FOLD FILES, SO CHANGING ITS DERIVATION IS INERT.
+///
+/// # THE CLAIM THIS EXISTS TO STOP BEING A CITATION
+///
+/// `IndexItem::block_ref_key` is built by `index_log::block_ref_key_from_parts`, whose THIRD term
+/// is the element name: `kind:object_key:component:slab:offset:length:block_id:generation`.
+///
+/// TWO ROUTES FILL THAT TERM, AND THEY USED TO DISAGREE. `engine::collect_upsert_index_items`
+/// passed the element's own name through; the entry walk in `collect_command_index_items_for`
+/// takes the entry's own key from `state::block_index_written_key`, which passes `None` because
+/// the page entry has no element name left to give it. So one physical page was described by two
+/// different handle spellings depending on which emitter produced the row.
+///
+/// THEY AGREE NOW -- both pass `None` -- AND THIS GUARD IS WHAT MADE CONVERGING THEM SAFE.
+/// Converging them changes the handle every upsert row stores and every stored row rebuilds, and
+/// that is inert only because nothing reads the handle back. Before this guard existed that was a
+/// sentence in a doc comment: `strip_block_ref_key_repeat`'s documentation rests the whole
+/// omit-and-rebuild scheme on it -- "find WHO READS THE RECONSTRUCTION first" -- and records that
+/// it once got the consequence backwards. A claim load-bearing enough to be corrected in place is
+/// load-bearing enough to be driven.
+///
+/// IT IS NOT RETIRED WITH THE DISAGREEMENT IT LICENSED. The property it states -- that a stored
+/// handle decides nothing -- is what keeps the omit-and-rebuild scheme honest for a later change
+/// to any of the eight terms. And the named arm below is now a spelling NO writer produces, which
+/// makes it a better negative arm than it was while something still wrote it.
+///
+/// # WHY THE FOLD IS THE RIGHT SUBJECT AND THE ONLY ONE
+///
+/// `fold_delta_block_items` is the only thing in the crate that turns index-log items into page
+/// entries, and `BucketNode::insert_block` computes the map's key with `block_index_handle`, from
+/// the page's OWN fields. So the stored handle has no route into the index by construction -- and
+/// a property that holds by construction is exactly the kind that a later change breaks without
+/// anything failing.
+///
+/// # THE THREE ARMS, AND WHY NONSENSE IS ONE OF THEM
+///
+/// Two arms would show only that the two spellings agree, which is a weaker claim than that the
+/// handle is unread: a fold that happened to parse either spelling into the same thing would pass.
+/// The third arm is a string that is no derivation of anything, so the only way all three can file
+/// the same entry is if none of them is consulted.
+///
+/// rust-internal: drives the engine's own fold over its own index, no external surface
+#[test]
+fn the_stored_block_handle_decides_nothing_the_fold_files() {
+    use crate::engine::hashing::{block_routing_bucket, stable_block_object_id};
+    use crate::engine::state::CoreIndex;
+    use std::collections::BTreeSet;
+
+    let kind = "hash";
+    let object_key = "handle-unread";
+    // ONLY A HANDLE TERM NOW. The row itself cannot carry an element name, so this varies the one
+    // place a name can still appear -- the third term of the handle derivation -- which is exactly
+    // the term under test.
+    let component = "f0";
+    let address = ElementEntry::from_parts(42, 1_048_576, 4096, Some(7), None);
+    let routing_bucket = block_routing_bucket(object_key, 0, OPERATOR_END);
+    let object_id = stable_block_object_id(1, kind, object_key);
+
+    let authority = |named: Option<&str>| {
+        crate::index_log::block_ref_key_from_parts(
+            kind,
+            object_key,
+            named,
+            address.block_slab_id(),
+            address.offset(),
+            address.length(),
+            address.block_id().unwrap_or_default(),
+            address.generation().unwrap_or_default(),
+        )
+    };
+    let named = authority(Some(component));
+    let unnamed = authority(None);
+    let nonsense = "not-a-derivation-of-anything".to_string();
+
+    // THE PLANT IS REAL. Without these the arms below could be three spellings of one string, and
+    // the guard would read as a tree fact while asserting only its own fixture.
+    assert_ne!(
+        named, unnamed,
+        "the named and unnamed spellings are the same string, so this fixture does not vary the \
+         term under test"
+    );
+    assert_ne!(named, nonsense, "the nonsense arm is the authority's own output");
+    assert_ne!(unnamed, nonsense, "the nonsense arm is the authority's own output");
+    assert!(
+        named.contains(&format!(":{component}:")),
+        "the named spelling must actually carry the element name, got {named:?}"
+    );
+    assert!(
+        !unnamed.contains(&format!(":{component}:")),
+        "the unnamed spelling must not carry the element name, got {unnamed:?}"
+    );
+
+    // What the fold FILED, including the handle the map ALLOCATED -- which is the sharper half of
+    // the claim: the key an entry is filed under is computed from the page, not read off the row.
+    let census = |handle: &str| -> Vec<(u32, String, String, u64, u64, u64, bool, u64)> {
+        let item = crate::index_log::IndexItem {
+            kind: crate::index_log::IndexItemKind::Block,
+            routing_bucket,
+            block_ref_key: handle.to_string(),
+            object_key: object_key.into(),
+            model_id: kind.to_string(),
+            object_id,
+            entry: Some(address.clone()),
+            deleted: false,
+        };
+        let mut index = CoreIndex::default();
+        // `upsert: false` with no covered keys, so the fold ADDS and removes nothing.
+        crate::engine::fold_delta_block_items(
+            &mut index,
+            &BTreeSet::new(),
+            std::slice::from_ref(&item),
+            false,
+        );
+        let named = super::BlockObjects::of(&index);
+        let mut rows = Vec::new();
+        for bucket in index.bucket_map.values() {
+            for (allocated, block) in bucket.block_index.iter() {
+                rows.push((
+                    // FROM THE NODE, WHICH IS WHERE THE BUCKET LIVES. This read
+                    // `page.routing_bucket` until that field left the entry in
+                    // `65c7fc562`; it is the same number, taken from the structure
+                    // that still holds it, so the census row is unchanged. The object
+                    // key is the same move one field later.
+                    bucket.routing_bucket,
+                    block.model_id.as_str().to_string(),
+                    named.at(bucket.routing_bucket, *allocated).as_ref().to_string(),
+                    block.address.block_slab_id(),
+                    block.address.offset(),
+                    block.address.length(),
+                    block.deleted,
+                    *allocated,
+                ));
+            }
+        }
+        rows.sort();
+        rows
+    };
+
+    let from_named = census(&named);
+    let from_unnamed = census(&unnamed);
+    let from_nonsense = census(&nonsense);
+
+    println!("[handle] named    {named:?}");
+    println!("[handle] unnamed  {unnamed:?}");
+    println!("[handle] nonsense {nonsense:?}");
+    println!("[handle] named arm filed:    {from_named:?}");
+    println!("[handle] unnamed arm filed:  {from_unnamed:?}");
+    println!("[handle] nonsense arm filed: {from_nonsense:?}");
+
+    // THE SUBJECT COMES FIRST, AND THE ORDER IS DELIBERATE.
+    //
+    // The floor below is what stops three empty vectors comparing equal. But if the floor ran
+    // first, a mutation that makes the fold CONSULT the handle would redden the floor -- "the fold
+    // did not run" -- which is a true statement about the wrong thing. Asserting the equality
+    // first makes such a mutation fail here, naming the arm whose handle was rejected. A fold that
+    // files nothing at all still cannot pass: the equalities hold vacuously and the floor catches
+    // it two lines down.
+    assert_eq!(
+        from_named, from_unnamed,
+        "dropping the element name from the STORED handle changed what the fold filed, so the \
+         handle IS read back and converging the two derivations is not inert"
+    );
+    assert_eq!(
+        from_named, from_nonsense,
+        "a stored handle that is no derivation of anything changed what the fold filed, so the \
+         fold consults it"
+    );
+
+    // ANTI-VACUITY. Three empty censuses are equal to each other.
+    for (label, rows) in [
+        ("named", &from_named),
+        ("unnamed", &from_unnamed),
+        ("nonsense", &from_nonsense),
+    ] {
+        assert_eq!(
+            1,
+            rows.len(),
+            "the {label}-handle arm filed {} page(s), not the one this guard is about -- the fold \
+             filed nothing, so the equalities above were over empty censuses",
+            rows.len()
+        );
+    }
+}
