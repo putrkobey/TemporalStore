@@ -40,3 +40,87 @@ impl ProxyClient {
     ) -> Result<Vec<FeaturePoint>> {
         self.feature_query_filtered(key, start_ts, end_ts, Some(count as usize), filters)
     }
+
+    pub fn feature_add(&self, key: &str, points: &[FeaturePoint]) -> Result<()> {
+        self.feature_add_with_policy(key, points, None)
+    }
+
+    pub fn feature_add_with_policy(
+        &self,
+        key: &str,
+        points: &[FeaturePoint],
+        policy: Option<FeatureWritePolicy>,
+    ) -> Result<()> {
+        let body = self.proxy_service_body(
+            key,
+            &[
+                ("format", serde_json::json!("protobuf")),
+                ("points", serde_json::to_value(points).map_err(json_error)?),
+                ("policy", serde_json::to_value(policy).map_err(json_error)?),
+            ],
+        );
+        self.proxy_service_execute("/ProxyService/FeatureAdd", body)
+            .map(|_| ())
+    }
+
+    pub fn feature_query(
+        &self,
+        key: &str,
+        start_ms: u64,
+        end_ms: u64,
+        count: Option<usize>,
+    ) -> Result<Vec<FeaturePoint>> {
+        self.feature_query_filtered(key, start_ms, end_ms, count, &[])
+    }
+
+    pub fn feature_query_filtered(
+        &self,
+        key: &str,
+        start_ms: u64,
+        end_ms: u64,
+        count: Option<usize>,
+        filters: &[FeatureFilter],
+    ) -> Result<Vec<FeaturePoint>> {
+        let body = self.proxy_service_body(
+            key,
+            &[
+                ("start_ms", serde_json::json!(start_ms)),
+                ("end_ms", serde_json::json!(end_ms)),
+                ("count", serde_json::json!(count)),
+                ("format", serde_json::json!("protobuf")),
+                (
+                    "filters",
+                    serde_json::to_value(filters).map_err(json_error)?,
+                ),
+            ],
+        );
+        let response = self.proxy_service_execute("/ProxyService/FeatureQuery", body)?;
+        response_feature_points(response)
+    }
+
+    pub fn feature_replace(
+        &self,
+        key: &str,
+        start_ms: u64,
+        end_ms: u64,
+        points: &[FeaturePoint],
+    ) -> Result<()> {
+        let body = self.proxy_service_body(
+            key,
+            &[
+                ("start_ms", serde_json::json!(start_ms)),
+                ("end_ms", serde_json::json!(end_ms)),
+                ("points", serde_json::to_value(points).map_err(json_error)?),
+            ],
+        );
+        self.proxy_service_execute("/ProxyService/FeatureReplace", body)
+            .map(|_| ())
+    }
+
+    pub fn feature_delete(&self, key: &str) -> Result<()> {
+        let body = self.proxy_service_body(key, &[]);
+        self.proxy_service_execute("/ProxyService/FeatureDelete", body)
+            .map(|_| ())
+    }
+
+}
