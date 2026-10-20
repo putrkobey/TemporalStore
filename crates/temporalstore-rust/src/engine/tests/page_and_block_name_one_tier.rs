@@ -171,3 +171,695 @@ fn mirror_get(engine: &TemporalEngine, key: &str) {
         },
     });
     assert!(
+        response.status.ok,
+        "read of {key} failed: {:?}",
+        response.status
+    );
+}
+
+/// The segment rule, against the three words in this repository that would be corrupted by a
+/// substring sweep.
+///
+/// `stoppage` is in `LICENSE` (Apache-2.0, "work stoppage"), `pagehide` and `homepage` are in
+/// `tools/portal` and in four `Cargo.toml` files. A regex without a boundary rule rewrites all
+/// three, and the LICENSE one is a licence-text change.
+#[test]
+fn the_segment_rule_leaves_words_that_merely_contain_the_letters_alone() {
+    assert_eq!(canonical_tier_name("page_reads"), "block_reads");
+    assert_eq!(canonical_tier_name("page_index_entries"), "block_index_entries");
+    assert_eq!(canonical_tier_name("staged_pages"), "staged_blocks");
+    assert_eq!(canonical_tier_name("page"), "block");
+    assert_eq!(canonical_tier_name("pages"), "blocks");
+
+    // Already canonical: the function is idempotent, which is what makes it direction-agnostic.
+    assert_eq!(canonical_tier_name("block_reads"), "block_reads");
+    assert_eq!(canonical_tier_name("block_index_entries"), "block_index_entries");
+
+    // Words that merely contain the letters.
+    for untouched in ["stoppage", "homepage", "pagehide", "pagination", "repaged"] {
+        assert_eq!(
+            canonical_tier_name(untouched),
+            untouched,
+            "{untouched} is not the storage tier and must survive the sweep unchanged"
+        );
+    }
+}
+
+/// `page_address` and `block_address` are published as ONE type, and the contract says so.
+///
+/// This is the pair the contract document describes as logical against physical. In this engine
+/// both entries carry the string `ElementEntry`, because one `ElementEntry` is both the address
+/// of a page and the address of the block backing it. If a future change gives the physical
+/// half an identity of its own, these two stop being equal and this fails -- which is the point
+/// at which the contract document becomes true of this engine and the rename becomes wrong.
+#[test]
+fn the_published_contract_names_one_type_for_both_address_spellings() {
+    let contract = crate::engine::reports::PublicStorageContract::default();
+    let encoded = serde_json::to_value(&contract).expect("the contract must serialize");
+
+    assert_eq!(
+        contract.page_address, contract.block_address,
+        "page_address is published as {:?} and block_address as {:?}; in this engine both are \
+         one ElementEntry, and a difference here means the two words have stopped naming one \
+         tier -- see the module header before renaming either",
+        contract.page_address, contract.block_address,
+    );
+    assert!(
+        !contract.page_address.is_empty(),
+        "the address entries must name a type, not an empty string"
+    );
+    assert_eq!(
+        contract.page_address, "ElementEntry",
+        "the published address type moved; re-read the module header, because the whole \
+         one-tier finding rests on both spellings resolving to this type"
+    );
+
+    // Denominator, printed. Provenance: `PublicStorageContract` declares 17 fields, of which
+    // these are the page-spelled ones -- counted at 2701ed26e with
+    // `awk '/pub struct PublicStorageContract/,/^}/' engine/engine_reports.rs | grep -c 'pub page_'`.
+    let block_keys: Vec<&String> = encoded
+        .as_object()
+        .expect("the contract must serialize as an object")
+        .keys()
+        .filter(|key| key.split('_').any(|segment| segment == "page"))
+        .collect();
+    println!("contract page-spelled keys: {block_keys:?}");
+    let found: Vec<&str> = block_keys.iter().map(|key| key.as_str()).collect();
+    assert_eq!(
+        found, PAGE_SPELLED_CONTRACT_KEYS,
+        "the published contract carries the page-spelled keys {found:?} and this file declares \
+         {PAGE_SPELLED_CONTRACT_KEYS:?}. A key that LEFT was retired, which is a change to the \
+         published report and not a rename; a key that ARRIVED is a published page spelling \
+         nothing has held"
+    );
+}
+
+/// Every mirror pair on the canonical shard stats carries one value, and the POPULATION
+/// of pairs is the declared one.
+///
+/// Driven over a real engine rather than a default, because a `Default` is all zeroes and
+/// an equality between two zeroes is not a measurement. Each pair is asserted NON-ZERO
+/// first, so this cannot pass by comparing nothing.
+///
+/// FIVE CLAUSES, because the agreement check is the easy half. The hard half is that the
+/// agreement check keeps being APPLIED to the pairs that exist:
+///
+///   1. the rosters are well formed -- every listed spelling canonicalises to the name it
+///      is listed under, no name is on both rosters, and a retired name's survivor is the
+///      block spelling;
+///   2. the set of canonical names published under two or more spellings IS
+///      [`TWINNED_ON_SHARD_STATS`], in both directions, so a pair that leaves without a
+///      roster move fails, and a pair that arrives unnoticed fails too;
+///   3. each declared pair is present under exactly the two spellings declared;
+///   4. each retired name is present under exactly its surviving spelling;
+///   5. the spellings of each declared pair hold one value, and that value is not zero on
+///      every spelling.
+#[test]
+fn every_page_named_shard_stat_agrees_with_its_block_twin() {
+    // --- CLAUSE 1: the rosters are well formed, before anything is measured. ---
+    for (canonical, pair) in TWINNED_ON_SHARD_STATS {
+        for spelling in pair {
+            assert_eq!(
+                canonical_tier_name(spelling),
+                *canonical,
+                "{spelling} is listed under {canonical} and canonicalises to {} instead",
+                canonical_tier_name(spelling)
+            );
+        }
+        assert_ne!(
+            pair[0], pair[1],
+            "{canonical} lists one spelling twice, so its agreement check would compare a \
+             value with itself"
+        );
+        assert!(
+            !SINGLE_ON_SHARD_STATS
+                .iter()
+                .any(|(retired, _)| retired == canonical),
+            "{canonical} is on both rosters; it is either twinned or down to one spelling"
+        );
+    }
+    for (canonical, survivor) in SINGLE_ON_SHARD_STATS {
+        assert_eq!(
+            canonical_tier_name(survivor),
+            *canonical,
+            "{survivor} is listed as the survivor of {canonical} and canonicalises to {} instead",
+            canonical_tier_name(survivor)
+        );
+        assert_eq!(
+            survivor, canonical,
+            "{canonical} is recorded as retired down to {survivor}, which is not the block \
+             spelling. The block spelling is the one that survives a retirement on this tier -- \
+             see the module header -- and keeping the other half publishes the tier under the \
+             word this crate does not use"
+        );
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+
+    // Write ten keys, then read them back from a restart with a COLD cache directory, so the
+    // read counters cannot be served from memory and every mirror below is non-zero.
+    {
+        let engine = mirror_engine(&root, "cache-write");
+        for index in 0..10 {
+            mirror_set(&engine, &format!("mirror-{index}"), vec![b'm'; 512]);
+        }
+    }
+    let engine = mirror_engine(&root, "cache-read");
+    for index in 0..10 {
+        mirror_get(&engine, &format!("mirror-{index}"));
+    }
+    // Then ten writes ON THE SAME ENGINE, because the stats below are one snapshot and the
+    // write mirror is zero on an engine that has only read. The first run of this test asserted
+    // the write pair against 0 == 0 and its own non-vacuity clause caught it.
+    for index in 10..20 {
+        mirror_set(&engine, &format!("mirror-{index}"), vec![b'm'; 512]);
+    }
+
+    let stats = engine.loaded_shard_stats();
+    assert_eq!(stats.len(), 1, "expected exactly one loaded shard");
+    let encoded =
+        serde_json::to_value(&stats[0].storage).expect("the canonical storage stats must serialize");
+
+    let groups = mirror_groups(&encoded);
+    for (canonical, members) in &groups {
+        let on_a_roster = members.len() >= 2
+            || SINGLE_ON_SHARD_STATS
+                .iter()
+                .any(|(retired, _)| retired == canonical);
+        if !on_a_roster {
+            continue;
+        }
+        let rendered: Vec<String> = members
+            .iter()
+            .map(|(key, held)| format!("{key}={held}"))
+            .collect();
+        println!("mirror {canonical}: {}", rendered.join(" "));
+    }
+
+    // --- CLAUSE 2: the mirrored population IS the declared one, in both directions. ---
+    let mut published_pairs: Vec<&str> = groups
+        .iter()
+        .filter(|(_, members)| members.len() >= 2)
+        .map(|(canonical, _)| canonical.as_str())
+        .collect();
+    published_pairs.sort_unstable();
+    let mut declared_pairs: Vec<&str> = TWINNED_ON_SHARD_STATS
+        .iter()
+        .map(|(canonical, _)| *canonical)
+        .collect();
+    declared_pairs.sort_unstable();
+    assert_eq!(
+        published_pairs, declared_pairs,
+        "the canonical shard stats publish a different set of mirror pairs than this file \
+         declares. Published {published_pairs:?}, declared {declared_pairs:?}. A name that LEFT \
+         the published set was retired without being moved to SINGLE_ON_SHARD_STATS, so the pair \
+         it names is now compared by nothing; a name that ARRIVED is a new pair no assertion has \
+         ever held. Move it to the right roster rather than editing this list to match whatever \
+         the engine now emits"
+    );
+
+    // --- CLAUSE 3: each declared pair is present under exactly its two spellings. ---
+    for (canonical, pair) in TWINNED_ON_SHARD_STATS {
+        let members = groups.get(*canonical).unwrap_or_else(|| {
+            panic!(
+                "{canonical} is declared twinned and is not published under ANY spelling; the \
+                 canonical names on the shard stats are {:?}",
+                groups.keys().collect::<Vec<_>>()
+            )
+        });
+        let mut spellings: Vec<&str> = members.iter().map(|(key, _)| key.as_str()).collect();
+        spellings.sort_unstable();
+        let mut wanted: Vec<&str> = pair.to_vec();
+        wanted.sort_unstable();
+        assert_eq!(
+            spellings, wanted,
+            "{canonical} is published as {spellings:?} and declared as {wanted:?}; a spelling \
+             was renamed or removed without moving this entry"
+        );
+    }
+
+    // --- CLAUSE 4: each retired name is present under exactly its surviving spelling. ---
+    for (canonical, survivor) in SINGLE_ON_SHARD_STATS {
+        let members = groups.get(*canonical).unwrap_or_else(|| {
+            panic!(
+                "{canonical} is recorded as retired down to {survivor} and is not published \
+                 under any spelling at all; retiring a twin publishes one name, not none"
+            )
+        });
+        let spellings: Vec<&str> = members.iter().map(|(key, _)| key.as_str()).collect();
+        assert_eq!(
+            spellings,
+            vec![*survivor],
+            "{canonical} is recorded as retired down to {survivor} and is published as \
+             {spellings:?}"
+        );
+    }
+
+    // --- CLAUSE 5: agreement, and non-vacuity, per declared pair. ---
+    for (canonical, _) in TWINNED_ON_SHARD_STATS {
+        let members = &groups[*canonical];
+        let first = &members[0];
+        for other in &members[1..] {
+            assert_eq!(
+                first.1, other.1,
+                "{} and {} both resolve to {canonical} and are published from one source, so \
+                 they cannot differ: {} against {}",
+                first.0, other.0, first.1, other.1
+            );
+        }
+        let nonzero = members
+            .iter()
+            .any(|(_, held)| held.as_u64().map(|value| value > 0).unwrap_or(false));
+        assert!(
+            nonzero,
+            "{canonical} is zero on every spelling ({members:?}); the workload above did not \
+             reach it, so this pair was compared vacuously"
+        );
+    }
+}
+
+/// The three facts that make `page` and `block` ONE tier here are checked, not asserted
+/// in prose.
+///
+/// WHY THIS EXISTS AS A TEST. The module header used to carry these as bullets, and three
+/// of its five citations named things that had already stopped existing:
+/// `PageIndexNamedBy` and `PageEntryAt` were renamed to `BlockIndexNamedBy` and
+/// `BlockEntryAt` by a later slice of the same work, and `PAGE_SIZE` and `page_ordinal`
+/// were only ever named in order to be denied. Each of those four tokens occurred exactly
+/// ONCE in this crate, and the occurrence was the header itself. A header that cites
+/// itself is a header that has stopped reading the tree.
+///
+/// So the three facts are scanned for. If a page-named identity type, a page-named
+/// identity FIELD or a page SIZE constant is reintroduced, this fails and names the file
+/// and line, instead of a doc comment quietly becoming untrue.
+///
+/// WHAT IS ALLOWED, AND WHY THE MATCHERS NEED NO EXCLUSION LIST. Each matcher requires
+/// the line to BE a declaration: the trimmed line starts with an optional `pub` and then
+/// the declaring token. A doc line starts with `//`, a serde attribute with `#`, and a
+/// JSON key inside a fixture string with a quote, so prose, aliases and fixtures cannot
+/// match and nothing has to be remembered and excluded by path -- including this file,
+/// which names all three forms above in its own comments. `StoragePageAddressSample` and
+/// `StoragePageIndexEntrySample` do not begin with `Page` and are deliberately untouched:
+/// they are report projections, not identities.
+///
+/// THREE NON-VACUITY CLAUSES, because a scan that finds nothing looks the same as a clean
+/// tree: the walk reached a floor of files and recursed, and each matcher is exercised on
+/// a line it must report and on a line it must not.
+#[test]
+fn no_page_named_identity_type_field_or_size_constant_exists_in_this_crate() {
+    const MIN_FILES: usize = 100;
+
+    /// `struct Page...`, `enum Page...`, `type Page...`, `trait Page...` -- a type whose
+    /// name BEGINS with the tier word, which is what an identity type would look like.
+    fn declares_a_page_named_type(line: &str) -> bool {
+        let code = strip_leading_visibility(line);
+        ["struct ", "enum ", "type ", "trait "]
+            .iter()
+            .any(|keyword| {
+                code.strip_prefix(keyword)
+                    .is_some_and(|rest| rest.starts_with("Page"))
+            })
+    }
+
+    /// `page_id:` or `page_ordinal:` as a FIELD on a struct.
+    fn declares_a_page_named_identity_field(line: &str) -> bool {
+        let code = strip_leading_visibility(line);
+        ["page_id", "page_ordinal"].iter().any(|field| {
+            code.strip_prefix(*field)
+                .is_some_and(|rest| rest.trim_start().starts_with(':'))
+        })
+    }
+
+    /// `const PAGE_SIZE` / `static PAGE_SIZE` -- a page SIZE tier.
+    fn declares_a_page_size_constant(line: &str) -> bool {
+        let code = strip_leading_visibility(line);
+        ["const ", "static "].iter().any(|keyword| {
+            code.strip_prefix(keyword)
+                .is_some_and(|rest| rest.trim_start().starts_with("PAGE_SIZE"))
+        })
+    }
+
+    /// The line with leading whitespace and one leading `pub`/`pub(..)` removed.
+    fn strip_leading_visibility(line: &str) -> &str {
+        let code = line.trim_start();
+        match code.strip_prefix("pub") {
+            Some(rest) => {
+                let rest = rest.trim_start();
+                match rest.strip_prefix('(') {
+                    Some(inner) => match inner.find(')') {
+                        Some(close) => inner[close + 1..].trim_start(),
+                        None => rest,
+                    },
+                    None => rest,
+                }
+            }
+            None => code,
+        }
+    }
+
+    // --- NON-VACUITY: each matcher still matches, in both directions. ---
+    assert!(
+        declares_a_page_named_type("pub struct PageAddress {"),
+        "the type matcher no longer reports a page-named type declaration"
+    );
+    assert!(
+        declares_a_page_named_type("    type PageIndex = BlockIndexMap;"),
+        "the type matcher misses a type alias"
+    );
+    assert!(
+        !declares_a_page_named_type("pub struct StoragePageAddressSample {"),
+        "the type matcher reports a report projection, which is allowed and must stay"
+    );
+    assert!(
+        !declares_a_page_named_type("//!   * [`crate::engine::state::PageIndexNamedBy`] is a type"),
+        "the type matcher reports a doc line, so it would fail on this very file"
+    );
+    assert!(
+        declares_a_page_named_identity_field("    pub page_id: u64,"),
+        "the field matcher no longer reports a page-named identity field"
+    );
+    assert!(
+        declares_a_page_named_identity_field("    page_ordinal: Option<u64>,"),
+        "the field matcher misses a private field"
+    );
+    assert!(
+        !declares_a_page_named_identity_field("        \"page_id\": 4,"),
+        "the field matcher reports a JSON key in a fixture string, which is stored data and must \
+         keep its spelling"
+    );
+    assert!(
+        !declares_a_page_named_identity_field("    #[serde(default, alias = \"page_id\")]"),
+        "the field matcher reports a serde alias, which is how older stored data still decodes"
+    );
+    assert!(
+        declares_a_page_size_constant("const PAGE_SIZE: usize = 1 << 20;"),
+        "the constant matcher no longer reports a page size constant"
+    );
+    assert!(
+        !declares_a_page_size_constant("//!   * There is no page SIZE tier: no PAGE_SIZE exists"),
+        "the constant matcher reports a doc line"
+    );
+    assert!(
+        !declares_a_page_size_constant("    let page_size = record.page_size;"),
+        "the constant matcher reports a local binding"
+    );
+
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files: Vec<std::path::PathBuf> = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|err| panic!("read_dir {} failed: {err}", dir.display()));
+        for entry in entries {
+            let entry = entry.expect("dir entry readable");
+            let path = entry.path();
+            let kind = entry.file_type().expect("file type readable");
+            if kind.is_dir() {
+                stack.push(path);
+            } else if kind.is_file() && path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+
+    // --- NON-VACUITY: the walk ran and recursed. ---
+    assert!(
+        files.len() >= MIN_FILES,
+        "the walk found {} files under {}, floor is {MIN_FILES} -- that is a broken walk, not a \
+         clean tree",
+        files.len(),
+        root.display()
+    );
+    assert!(
+        files
+            .iter()
+            .filter(|path| path.parent() != Some(root.as_path()))
+            .count()
+            > 0,
+        "the walk did not recurse, so most of this crate was not scanned"
+    );
+
+    // --- NON-VACUITY: the walk can still SEE a block-named declaration of each shape, so a
+    // clean page-named result is a fact about the spelling and not about the scan. ---
+    let mut block_named_types = 0usize;
+    let mut block_named_id_fields = 0usize;
+    let mut findings: Vec<String> = Vec::new();
+    for path in &files {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|err| panic!("read {} failed: {err}", path.display()));
+        for (number, line) in text.lines().enumerate() {
+            let code = strip_leading_visibility(line);
+            if ["struct ", "enum ", "type ", "trait "].iter().any(|keyword| {
+                code.strip_prefix(keyword)
+                    .is_some_and(|rest| rest.starts_with("Block"))
+            }) {
+                block_named_types += 1;
+            }
+            if code
+                .strip_prefix("block_id")
+                .is_some_and(|rest| rest.trim_start().starts_with(':'))
+            {
+                block_named_id_fields += 1;
+            }
+            let what = if declares_a_page_named_type(line) {
+                Some("a page-named type")
+            } else if declares_a_page_named_identity_field(line) {
+                Some("a page-named identity field")
+            } else if declares_a_page_size_constant(line) {
+                Some("a page SIZE constant")
+            } else {
+                None
+            };
+            if let Some(what) = what {
+                findings.push(format!(
+                    "{}:{} declares {what}: {}",
+                    path.display(),
+                    number + 1,
+                    line.trim()
+                ));
+            }
+        }
+    }
+    assert!(
+        block_named_types > 0,
+        "the walk found no Block-named type declaration either, so the matcher is looking at \
+         nothing rather than at a crate with one spelling"
+    );
+    assert!(
+        block_named_id_fields > 0,
+        "the walk found no `block_id` field declaration, so the field matcher is looking at \
+         nothing"
+    );
+    println!(
+        "scanned {} files; {block_named_types} Block-named type declarations and \
+         {block_named_id_fields} `block_id` fields are the spelling that is used",
+        files.len()
+    );
+
+    assert!(
+        findings.is_empty(),
+        "every identity on this tier is spelled `block`, and there is no page SIZE tier; the \
+         module header rests on that. These declarations contradict it:\n{}",
+        findings.join("\n")
+    );
+}
+
+/// The page-spelled keys the STORED OBJECT RECORD emits, named as a set.
+///
+/// `BlockLayout` is spelled `blocks` in Rust and emits `pages`, so the identifier says nothing
+/// about the contract and a scan over identifiers cannot see this key at all.
+///
+/// # WHY THIS IS NOT A `DURABLE_NAMES` ENTRY
+///
+/// `DURABLE_NAMES` in `block_store.rs` checks one direction: every listed name must still be
+/// spelled by SOME site outside the list. For this key that check can never go red. The string
+/// `"pages"` has 747 other sites in this crate -- it is also the on-disk directory the block
+/// store lives in (`<data>/pages`, set by `docker/single-node-entrypoint.sh`,
+/// `docker/docker-compose.cloud-api.yml` and `tools/deploy_profile_common.sh`) -- so the
+/// substring survives the serde rename being deleted outright. A registry entry for `pages`
+/// would be a guard that cannot fail, which is worse than no entry: it reads as covered.
+///
+/// So this key is pinned where it is EMITTED instead, on both halves of the round trip.
+///
+/// THE WRITER HAS SINCE MOVED, so the emitted key is `blocks` and `pages` is the alias a store
+/// written by an earlier build is read through. The decode clause below drives BOTH spellings and
+/// asserts they land on the same layout, which is the guarantee that replaced the old clause
+/// asserting the block spelling was refused.
+const BLOCK_SPELLED_RECORD_KEYS: &[&str] = &["blocks"];
+
+/// The stored layout emits the page spelling, and still reads one back.
+///
+/// THREE CLAUSES, because "the key is there" is the easy half:
+///
+///   1. ENCODE -- the emitted key set is the declared one, so adding or dropping an emitted
+///      key on this record has to be deliberate;
+///   2. the Rust field name is NOT what is emitted, so the clause above is a fact about the
+///      wire and not about the identifier (without this, the test would still pass if someone
+///      deleted the `rename` AND renamed the field to `pages`, which is a different change);
+///   3. DECODE -- a record written by an older build loads, and the block spelling is NOT
+///      silently accepted in its place. A guard that only reads the ENCODE cannot tell a
+///      retained wire name from an accepted alias, and those have opposite consequences for a
+///      store already on disk.
+#[test]
+fn the_stored_object_layout_emits_the_block_spelling_and_reads_both_back() {
+    use crate::engine::object_record::BlockLayout;
+
+    // ---- CLAUSE 1: ENCODE ----
+    let encoded =
+        serde_json::to_value(BlockLayout::default()).expect("the stored layout must serialize");
+    let emitted: Vec<&str> = encoded
+        .as_object()
+        .expect("the stored layout must serialize as an object")
+        .keys()
+        .map(|key| key.as_str())
+        .collect();
+    assert_eq!(
+        emitted, BLOCK_SPELLED_RECORD_KEYS,
+        "the stored object layout emits {emitted:?} and this file declares \
+         {BLOCK_SPELLED_RECORD_KEYS:?}. This build writes the canonical spelling; the page \
+         spelling survives only as the alias the DECODE clause below drives, so a key that left \
+         this set is a writer move and a key that arrived is a second spelling going to disk"
+    );
+
+    // ---- CLAUSE 2: THE IDENTIFIER IS NOT THE CONTRACT ----
+    //
+    // Reading the emitted set cannot establish this, so this clause reads the SOURCE. If
+    // someone deleted the `rename` and renamed the field to the wire name, the clause
+    // above would still see exactly the declared set and pass, while the canonical
+    // identifier left the crate with nothing red. The two names have to be checked where
+    // they sit together.
+    let declared = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/engine/object_record.rs"),
+    )
+    .expect("the stored-record source must be readable");
+    assert!(
+        declared.contains(r#"rename = "blocks", alias = "pages""#),
+        "`object_record.rs` no longer carries the canonical rename with the page alias beside \
+         it. Dropping the ALIAS is the dangerous half: the emitted set does not move, so the \
+         ENCODE clause stays green while every layout an earlier build wrote stops loading"
+    );
+    assert!(
+        declared.contains("    blocks: Vec<StoredBlock>,"),
+        "the stored layout's field is no longer the canonical `blocks`. This crate spells the \
+         tier `block` and only the WIRE carries `pages`, so a page-spelled field here means \
+         the retained name has been promoted back into the identifier surface"
+    );
+
+    // ---- CLAUSE 3: DECODE, AND THE ALIAS THAT MUST NOT EXIST ----
+    let written_by_an_older_build = r#"{"pages":[{"address":42,"length":7,"block_id":3,"has_block_id":true,"has_generation":false}]}"#;
+    let decoded: BlockLayout = serde_json::from_str(written_by_an_older_build)
+        .expect("a layout written under the page spelling must still load");
+    assert_eq!(
+        decoded.len(),
+        1,
+        "the page-spelled payload decoded to {} blocks rather than 1, so the key was accepted \
+         and the blocks behind it were dropped -- which loses an object's data without failing",
+        decoded.len()
+    );
+    let as_block_spelled = written_by_an_older_build.replace("pages", "blocks");
+    assert_ne!(
+        as_block_spelled, written_by_an_older_build,
+        "the substitution changed nothing, so the clause below is comparing the payload against \
+         itself and would pass however the layout decodes"
+    );
+    let canonical: BlockLayout = serde_json::from_str(&as_block_spelled).expect(
+        "a layout written under the canonical spelling -- which is what THIS build emits -- must \
+         load, or the writer flip has produced bytes its own reader cannot take",
+    );
+    assert_eq!(
+        canonical.len(),
+        decoded.len(),
+        "the canonical spelling decoded to {} blocks and the stored one to {}. They are one key \
+         under two names, so a difference means one of them is dropping the blocks behind it",
+        canonical.len(),
+        decoded.len()
+    );
+}
+
+/// THE INDEX-LOG ITEM KIND TAKES BOTH SPELLINGS, AND THIS IS THE VARIANT SHAPE RATHER THAN A FIELD.
+///
+/// `IndexItemKind::Block` is tagged `block` on the wire as of the writer flip, and `page` is the
+/// token it still ACCEPTS. It is not a field name: it is the VALUE of an index-log item's kind,
+/// and the index log is replayed on recovery, so the stored token is read back out of bytes an
+/// older build wrote. `serde(rename)` on a variant replaces the accepted token exactly as it does
+/// on a field, so the reader had to be widened BEFORE the writer moved -- and a unit-variant enum
+/// has no `default` to fall back to, which makes this one LOUD rather than silent in both
+/// directions: an unaccepted token is a decode error, and a decode error on an index-log replay is
+/// a store that will not come up.
+///
+/// FOUR CLAUSES, and the last two are not padding:
+///
+///   1. the writer emits `block`, which is the flip this release carries. Without this clause the
+///      reader arms could both pass while the writer sat wherever it happened to be.
+///   2. the frozen `page` token still decodes to `Block`. This is now the clause driven from a
+///      literal THIS BUILD NO LONGER WRITES, which is what keeps it honest: it is the installed
+///      base on disk, not a round trip through the current writer.
+///   3. the `block` token decodes to `Block`, so what clause 1 writes is what the reader takes.
+///   4. `object` and `meta` still decode to themselves. An alias that collided with a sibling
+///      token would make one variant unreachable, and serde reports a duplicate token for unit
+///      variants at NEITHER compile nor decode time -- the first declaration simply wins, so the
+///      collision would present as an item kind quietly decoding to the wrong variant.
+#[test]
+fn the_index_log_item_kind_reader_takes_the_block_spelling_and_the_page_spelling() {
+    use crate::index_log::IndexItemKind;
+
+    // Frozen, and READ-ONLY from here: every build through `SHARD_INDEX_FORMAT_VERSION` 27
+    // tagged a block item with this, and those bytes are still on disk.
+    const ITEM_KIND_AT_STAMP_27: &str = r#""page""#;
+
+    // What this build writes.
+    const ITEM_KIND_WRITTEN_NOW: &str = r#""block""#;
+
+    // ---- CLAUSE 1: THE WRITER EMITS THE CANONICAL TOKEN ----
+    assert_eq!(
+        serde_json::to_string(&IndexItemKind::Block).expect("the item kind must serialize"),
+        ITEM_KIND_WRITTEN_NOW,
+        "[CLAUSE writer] a block item is not tagged `block` on the wire. The reader accepts both \
+         tokens, so this is the only clause that says which one goes to disk -- and an item \
+         written under the retired token would be read by a future build that has dropped the \
+         alias as an unknown variant, which fails the whole replay"
+    );
+    assert_ne!(
+        ITEM_KIND_WRITTEN_NOW, ITEM_KIND_AT_STAMP_27,
+        "the two tokens are the same string, so clauses 2 and 3 are one clause twice"
+    );
+
+    // ---- CLAUSE 2: THE STORED TOKEN STILL LANDS ----
+    let stored: IndexItemKind = serde_json::from_str(ITEM_KIND_AT_STAMP_27)
+        .expect("an index-log item tagged with the stored spelling must still decode");
+    assert_eq!(
+        stored,
+        IndexItemKind::Block,
+        "[CLAUSE stored-tag] the stored `page` token decoded to {stored:?} rather than `Block`"
+    );
+
+    // ---- CLAUSE 3: AND SO DOES THE ONE THE WRITER NOW EMITS ----
+    let canonical: IndexItemKind = serde_json::from_str(ITEM_KIND_WRITTEN_NOW).expect(
+        "an index-log item tagged `block` must decode -- this build writes that token, so a \
+         failure here is a store whose own replay cannot read what it just wrote, and unlike a \
+         named field it fails LOUDLY and takes the whole replay with it",
+    );
+    assert_eq!(
+        canonical,
+        IndexItemKind::Block,
+        "[CLAUSE block-tag] the `block` token decoded to {canonical:?} rather than `Block`"
+    );
+
+    // ---- CLAUSE 4: AND NO SIBLING TOKEN WAS CAPTURED ----
+    for (token, expected) in [
+        (r#""object""#, IndexItemKind::Object),
+        (r#""meta""#, IndexItemKind::Meta),
+    ] {
+        let decoded: IndexItemKind = serde_json::from_str(token)
+            .unwrap_or_else(|err| panic!("the item kind token {token} stopped decoding: {err}"));
+        assert_eq!(
+            decoded, expected,
+            "[CLAUSE sibling-tags] {token} decoded to {decoded:?} rather than {expected:?}. An \
+             alias that collided with a sibling token would present exactly like this -- quietly, \
+             because a duplicate token on a unit variant is reported at neither compile nor \
+             decode time and the first declaration wins"
+        );
+    }
+}
