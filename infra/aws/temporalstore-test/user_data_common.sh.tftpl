@@ -19,3 +19,47 @@ for _ in $(seq 1 60); do
   sleep 2
 done
 
+mkdir -p \
+  /opt/temporalstore/bin \
+  /opt/temporalstore/conf \
+  /opt/temporalstore/monitoring-ui \
+  /var/log/temporalstore \
+  /mnt/temporalstore-shared/storage \
+  /mnt/temporalstore-shared/wal \
+  /mnt/temporalstore-shared/page \
+  /mnt/temporalstore-shared/index \
+  /mnt/temporalstore-shared/snapshots
+
+cat >/opt/temporalstore/node.env <<EOF
+TEMPORALSTORE_SHARED_PATH=/mnt/temporalstore-shared
+TEMPORALSTORE_CACHE_PATH=
+EOF
+
+cat >/etc/nginx/sites-available/temporalstore-monitoring <<'EOF'
+server {
+  listen 8088 default_server;
+  listen [::]:8088 default_server;
+  server_name _;
+
+  root /opt/temporalstore/monitoring-ui;
+  index index.html;
+
+  location / {
+    try_files $uri $uri/ /index.html;
+  }
+
+  location /logs/ {
+    alias /var/log/temporalstore/;
+    autoindex on;
+  }
+
+  location = /metrics {
+    default_type text/plain;
+    return 200 "temporalstore_monitoring_ui_up 1\n";
+  }
+}
+EOF
+
+rm -f /etc/nginx/sites-enabled/default
+ln -sf /etc/nginx/sites-available/temporalstore-monitoring /etc/nginx/sites-enabled/temporalstore-monitoring
+systemctl enable --now nginx
