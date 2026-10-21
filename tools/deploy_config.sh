@@ -52,3 +52,58 @@ fi
 echo "[deploy-config] source repo: ${src}"
 for f in config/temporalstore.toml scripts/with_config.sh tools/matrixark_load_config.py; do
   [[ -f "${src}/${f}" ]] || { echo "[deploy-config] MISSING ${src}/${f}" >&2; exit 1; }
+done
+
+# --- 1. place config + launcher + loader under /opt/temporalstore -------------
+install -d "${PREFIX}/config" "${PREFIX}/scripts" "${PREFIX}/tools"
+install -m 0755 "${src}/scripts/with_config.sh"        "${PREFIX}/scripts/with_config.sh"
+install -m 0755 "${src}/tools/matrixark_load_config.py" "${PREFIX}/tools/matrixark_load_config.py"
+# also drop a copy of this deploy script so it can be re-run from the node.
+install -m 0755 "${src}/tools/deploy_config.sh"        "${PREFIX}/tools/deploy_config.sh" 2>/dev/null || true
+if [[ -f "$CONF_DST" && "$force_config" -eq 0 ]]; then
+  echo "[deploy-config] keeping existing ${CONF_DST} (use --force-config to replace)"
+else
+  install -m 0644 "${src}/config/temporalstore.toml" "$CONF_DST"
+  echo "[deploy-config] installed ${CONF_DST}"
+fi
+
+# --- 2. wire each installed unit's ExecStart through the launcher -------------
+wired=0
+for unit in "${UNITS[@]}"; do
+  # only touch units systemd actually knows about on this node.
+  if ! systemctl cat "${unit}.service" >/dev/null 2>&1; then
+    continue
+  fi
+  cur="$(systemctl show -p ExecStart --value "${unit}.service" 2>/dev/null || true)"
+  [[ -z "$cur" ]] && { echo "[deploy-config] ${unit}: no ExecStart, skipping"; continue; }
+  # extract the real command line from: { path=… ; argv[]=<cmd> ; ignore_errors=… }
+  argv="$(printf '%s' "$cur" | sed -n 's/.*argv\[\]=\(.*\) ; ignore_errors.*/\1/p')"
+  [[ -z "$argv" ]] && argv="$(printf '%s' "$cur" | sed -n 's/.*argv\[\]=\(.*\) ;.*/\1/p')"
+  [[ -z "$argv" ]] && { echo "[deploy-config] ${unit}: could not parse ExecStart, skipping"; continue; }
+  if printf '%s' "$argv" | grep -q "with_config.sh"; then
+    echo "[deploy-config] ${unit}: already wired, skipping"
+    continue
+  fi
+  dropin_dir="/etc/systemd/system/${unit}.service.d"
+  install -d "$dropin_dir"
+  {
+    echo "# Route ExecStart through the config launcher (managed by deploy_config.sh)."
+    echo "# Original command is preserved; env still wins over the config file."
+    echo "[Service]"
+    echo "ExecStart="
+    echo "ExecStart=${PREFIX}/scripts/with_config.sh ${CONF_DST} ${argv}"
+  } > "${dropin_dir}/${DROPIN_NAME}"
+  echo "[deploy-config] ${unit}: wired -> ${dropin_dir}/${DROPIN_NAME}"
+  wired=$((wired + 1))
+done
+
+# --- 3. reload (+ optional restart) ------------------------------------------
+systemctl daemon-reload
+echo "[deploy-config] daemon-reload done (${wired} unit(s) newly wired)"
+if [[ "$do_restart" -eq 1 ]]; then
+  for unit in "${UNITS[@]}"; do
+    systemctl cat "${unit}.service" >/dev/null 2>&1 || continue
+    systemctl restart "${unit}.service" && echo "[deploy-config] restarted ${unit}"
+  done
+fi
+echo "[deploy-config] done. Services will read ${CONF_DST} on (next) start."
