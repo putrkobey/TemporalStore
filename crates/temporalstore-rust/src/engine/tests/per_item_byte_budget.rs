@@ -2003,3 +2003,2009 @@ fn the_biased_countdown_saturates_at_the_top_and_is_exact_below_it() {
         assert_eq!(
             Some(ms),
             BucketTtl::from_ms(Some(ms)).ms(),
+            "a countdown of {ms} must round-trip through the biased representation exactly"
+        );
+    }
+
+    let top = BucketTtl::from_ms(Some(u64::MAX));
+    assert_eq!(
+        Some(u64::MAX - 1),
+        top.ms(),
+        "the one countdown the bias cannot hold must saturate one below the top"
+    );
+    assert_ne!(
+        Some(0),
+        top.ms(),
+        "a countdown of u64::MAX came back as zero -- that is a wrapping bias, and zero means an \
+         expiry that is due"
+    );
+    assert!(top.is_some(), "a saturated countdown is still a countdown, not an absence");
+
+    // Absent and zero are two states, not one.
+    assert_eq!(None, BucketTtl::ABSENT.ms());
+    assert!(!BucketTtl::ABSENT.is_some());
+    assert_eq!(Some(0), BucketTtl::from_ms(Some(0)).ms());
+    assert!(
+        BucketTtl::from_ms(Some(0)).is_some(),
+        "a countdown of zero must report as present; a bucket whose expiry is due is exactly \
+         what `ttl_bucket_count` is counting"
+    );
+    assert_ne!(
+        BucketTtl::ABSENT,
+        BucketTtl::from_ms(Some(0)),
+        "absent and zero must not compare equal"
+    );
+    assert_eq!(BucketTtl::ABSENT, BucketTtl::default(), "a fresh node holds no countdown");
+}
+
+/// THE COUNTDOWN REACHES BOTH REPORTS, AND AN EMPTY EXPIRY TABLE CLEARS IT.
+///
+/// The representation is held by the tests above; this is its other half, and it exists because a
+/// mutation run said it did not. Three production readers carry the countdown out of the node --
+/// `refresh_bucket_runtime_flags`, which computes it, and the two reports that publish it -- and
+/// a mutant in each of the three survived every test in the tree that names a bucket flag:
+///
+///   * `refresh_bucket_runtime_flags` leaving a countdown of ZERO where it should clear. Zero is
+///     "this bucket's expiry is due", so this one does not read as a bug anywhere; it reads as a
+///     store whose every bucket is about to expire.
+///   * `bucket_store::runtime_report` publishing `ttl_ms: None` on every row. `ttl_bucket_count`
+///     is computed from the node and not from the row, so the count stays right while every row
+///     says the opposite.
+///   * `storage_physical_index_report` doing the same.
+///
+/// `bucket_store_reports_all_layout_states_and_runtime_flags` builds its nodes by hand and never
+/// runs a refresh; `bucket_runtime_flags_match_full_sweep` compares the targeted refresh against
+/// a full sweep, so a mutation in the shared computation moves both sides and cancels. Neither
+/// could have caught any of the three, which is why the value is asserted here and not the flag.
+#[test]
+fn the_countdown_reaches_both_reports_and_an_empty_expiry_table_clears_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = budget_engine(dir.path());
+    for key in ["countdown-a", "countdown-b"] {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: key.to_string(),
+                value: vec![b'v'; 16],
+            },
+        });
+        assert!(response.status.ok, "the seed must ack: {:?}", response.status);
+    }
+
+    // --- NOTHING EXPIRES. Every bucket must report ABSENT, not a countdown of zero. ---
+    {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        assert!(
+            !shard.bucket_index.bucket_map.is_empty(),
+            "denominator: no buckets, so every assertion below is vacuous"
+        );
+        for (routing_bucket, bucket) in &shard.bucket_index.bucket_map {
+            assert_eq!(
+                None,
+                bucket.ttl_ms.ms(),
+                "bucket {routing_bucket} holds nothing that expires and reports a countdown of \
+                 {:?}; a countdown of zero here means every bucket in the store is due",
+                bucket.ttl_ms.ms()
+            );
+            assert!(!bucket.ttl_ms.is_some(), "bucket {routing_bucket} reports a countdown it does not have");
+        }
+        let report = crate::engine::bucket_store::runtime_report(shard);
+        assert_eq!(
+            0, report.ttl_bucket_count,
+            "no key has an expiry, so no bucket should be counted as holding one"
+        );
+        assert!(
+            report.buckets.iter().all(|row| row.ttl_ms.is_none()),
+            "a published row carries a countdown no bucket holds"
+        );
+    }
+
+    // --- ONE KEY IS ARMED. The VALUE has to arrive, not just the flag. ---
+    const ARMED_MS: u64 = 600_000;
+    let response = engine.execute(ExecuteRequest {
+        shard_id: 1,
+        command: Command::CommonExpire {
+            key: "countdown-a".to_string(),
+            ttl_ms: ARMED_MS,
+        },
+    });
+    assert!(response.status.ok, "arming must ack: {:?}", response.status);
+
+    {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let report = crate::engine::bucket_store::runtime_report(shard);
+        assert_eq!(1, report.ttl_bucket_count, "exactly one bucket now holds an expiry");
+        let armed: Vec<u64> = report.buckets.iter().filter_map(|row| row.ttl_ms).collect();
+        assert_eq!(
+            1,
+            armed.len(),
+            "exactly one published row must carry the countdown; {} did",
+            armed.len()
+        );
+        // The BOUNDS are what make this a test of the value rather than of its presence: zero is
+        // what a cleared countdown looks like, and ARMED_MS + 1 is what the stored bias looks
+        // like if it ever escapes the accessor.
+        assert!(
+            armed[0] > 0 && armed[0] <= ARMED_MS,
+            "the published countdown is {}; it must be a real number of milliseconds, neither \
+             zero nor the biased value the node holds internally",
+            armed[0]
+        );
+    }
+
+    let physical = engine.storage_physical_index_report(1);
+    let published: Vec<u64> = physical
+        .bucket_nodes
+        .iter()
+        .filter_map(|bucket| bucket.ttl_ms)
+        .collect();
+    assert_eq!(
+        1,
+        published.len(),
+        "the physical index report must publish the countdown too; {} of its {} bucket rows \
+         carried one",
+        published.len(),
+        physical.bucket_nodes.len()
+    );
+    assert!(
+        published[0] > 0 && published[0] <= ARMED_MS,
+        "the physical report published a countdown of {}",
+        published[0]
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// WHAT IT COSTS AT TWO LARGE CORPUS SIZES, AND WHAT AN INSTRUMENT THAT IS NOT `size_of` SEES.
+// -------------------------------------------------------------------------------------------
+
+/// The counting allocator, used here as the SECOND instrument.
+///
+/// `Clone` on a `BTreeMap` rebuilds the tree node for node, so the bytes charged across one
+/// `clone()` are the map's own nodes -- the key array, the value array, the node header and every
+/// slot a node has not filled. That number is measured by the allocator and owes nothing to
+/// `size_of` x count, which is what makes the difference between them a reading rather than an
+/// identity. A residual computed from one instrument twice cannot notice anything.
+#[cfg(feature = "alloc-probe")]
+fn clone_alloc_bytes<T: Clone>(value: &T) -> u64 {
+    let probe = Probe::start();
+    let copy = value.clone();
+    let counts = probe.stop();
+    std::hint::black_box(&copy);
+    drop(copy);
+    counts.alloc_bytes
+}
+
+/// THE PLANTED MARKER. Recovered exactly, or every residual below is noise.
+///
+/// The failure this guards against is the one that reads as good news: an instrument that reports
+/// near zero makes a structure look free. A megabyte is planted and has to come back as a
+/// megabyte -- not less, which would be blindness, and not much more, which would be the probe
+/// charging for something other than the clone.
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn the_clone_instrument_recovers_a_planted_megabyte_exactly() {
+    const PLANTED: usize = 1 << 20;
+    let marker: Vec<u8> = vec![0xA5; PLANTED];
+    let measured = clone_alloc_bytes(&marker);
+    println!(
+        "planted {PLANTED} B, instrument charged {measured} B ({:.4}x)",
+        measured as f64 / PLANTED as f64
+    );
+    assert_eq!(
+        PLANTED as u64, measured,
+        "the clone instrument charged {measured} B for a planted {PLANTED} B; a residual taken \
+         with it would be measuring the instrument"
+    );
+}
+
+/// WHAT THE BUCKET NODE COSTS AT TWO LARGE CORPUS SIZES, IN TOTAL AND PER RECORD.
+///
+/// Two corpora three times apart, both large, because the question this module exists to answer
+/// is what the structure costs a STORE and not what it costs one bucket. The per-record figure is
+/// the one that multiplies out to any scale, and it is only usable if it is flat -- a per-record
+/// cost that grows with the corpus is a finding, not a budget, and the flatness check below says
+/// which of the two it is.
+///
+/// THE STORE PATH LENGTH IS HELD CONSTANT and asserted: `tempfile` names every directory with the
+/// same number of characters, and allocation bytes move with the path at about six bytes per
+/// character, so an arm whose path was one character longer would report a different residual for
+/// a reason that has nothing to do with the structure.
+///
+/// THE DIRTY FRACTION IS PRINTED because it is what prices the one decline this module could not
+/// settle from widths alone: the two `#[serde(skip)]` log claims are sixteen bytes that touch no
+/// stored shape, and moving them into a side map keyed by bucket is a win exactly when few
+/// buckets are dirty and a loss when most are.
+///
+/// THE RESIDUAL IS THE POINT OF THE SECOND INSTRUMENT. `size_of` x count is what the node
+/// occupies; the map that holds the nodes charges more than that, and the difference -- key
+/// arrays, node headers, unfilled slots and whatever each node owns on the heap -- is reported
+/// rather than assumed away, so a change in it is visible.
+#[test]
+#[ignore = "seeds 80,000 then 240,000 records; run by name"]
+fn what_the_bucket_node_costs_at_two_large_corpus_sizes() {
+    let mut path_lengths: Vec<usize> = Vec::new();
+    let mut per_record: Vec<(usize, f64)> = Vec::new();
+
+    for (label, strings_n, series_keys, series_points) in [
+        ("80,000 records", 40_000usize, 40usize, 1_000usize),
+        ("240,000 records", 120_000usize, 120usize, 1_000usize),
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        path_lengths.push(dir.path().as_os_str().len());
+        let engine = budget_engine(dir.path());
+        budget_seed(&engine, strings_n, series_keys, series_points);
+
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        let counts = count_items(shard);
+
+        assert_eq!(
+            strings_n + series_keys * series_points,
+            counts.records,
+            "denominator: the shard must hold every record seeded"
+        );
+        assert!(
+            counts.bucket_nodes > 0,
+            "denominator: no routing buckets, so every figure below divides by nothing"
+        );
+
+        let width = size_of::<BucketNode>();
+        let accounted = width * counts.bucket_nodes;
+        // The width this structure carried before the tombstone index stopped spending a
+        // sixteen-byte enum on a case it is in 2.32% of the time. A literal, because the shape it
+        // names no longer exists to be measured; `what_each_declined_shape_of_the_bucket_node_
+        // would_cost` holds a mirror of it to 200, and a mirror of the shape before that to 208,
+        // so neither literal can drift away from what it claims.
+        const WIDTH_BEFORE: usize = 200;
+        let before = WIDTH_BEFORE * counts.bucket_nodes;
+
+        let dirty_buckets = shard
+            .bucket_index
+            .bucket_map
+            .values()
+            .filter(|bucket| bucket.dirty())
+            .count();
+
+        println!("\n=== {label} ===");
+        println!(
+            "  records={} buckets={} page entries={}",
+            counts.records, counts.bucket_nodes, counts.block_index_entries
+        );
+        println!(
+            "  BucketNode: {width} B x {} = {accounted} B ({:.2} MiB), {:.2} B/record",
+            counts.bucket_nodes,
+            accounted as f64 / (1024.0 * 1024.0),
+            accounted as f64 / counts.records as f64
+        );
+        println!(
+            "  before this change: {WIDTH_BEFORE} B x {} = {before} B ({:.2} MiB), {:.2} B/record \
+             -- and 208 B x that before #1958",
+            counts.bucket_nodes,
+            before as f64 / (1024.0 * 1024.0),
+            before as f64 / counts.records as f64
+        );
+        println!(
+            "  SAVED: {} B ({:.2} MiB), {:.2} B/record, {:.1}% of the structure",
+            before - accounted,
+            (before - accounted) as f64 / (1024.0 * 1024.0),
+            (before - accounted) as f64 / counts.records as f64,
+            100.0 * (before - accounted) as f64 / before as f64
+        );
+        println!(
+            "  dirty buckets: {dirty_buckets} of {} ({:.1}%)",
+            counts.bucket_nodes,
+            100.0 * dirty_buckets as f64 / counts.bucket_nodes as f64
+        );
+
+        #[cfg(feature = "alloc-probe")]
+        {
+            let measured = clone_alloc_bytes(&shard.bucket_index.bucket_map);
+            let residual = measured as i64 - accounted as i64;
+            println!(
+                "  the map that holds them, charged by the allocator: {measured} B ({:.2} MiB)",
+                measured as f64 / (1024.0 * 1024.0)
+            );
+            println!(
+                "  RESIDUAL outside the node widths: {residual} B, {:.2} B/bucket -- key arrays, \
+                 node headers, unfilled slots and what each node owns on the heap",
+                residual as f64 / counts.bucket_nodes as f64
+            );
+            assert!(
+                residual > 0,
+                "the allocator charged {measured} B for a map of {} nodes whose widths add up to \
+                 {accounted} B; a residual at or below zero means the two instruments are not \
+                 independent and the subtraction is an identity",
+                counts.bucket_nodes
+            );
+        }
+
+        per_record.push((
+            counts.records,
+            accounted as f64 / counts.records as f64,
+        ));
+    }
+
+    assert_eq!(2, path_lengths.len(), "both arms must have run");
+    assert_eq!(
+        path_lengths[0], path_lengths[1],
+        "the store path length moved between arms ({} then {}); allocation bytes move with it at \
+         about six bytes a character",
+        path_lengths[0], path_lengths[1]
+    );
+
+    let (small_records, small) = per_record[0];
+    let (big_records, big) = per_record[1];
+    assert!(
+        big_records > small_records,
+        "the second arm must be the larger corpus, or the flatness claim compares nothing"
+    );
+    let ratio = big / small;
+    println!(
+        "\n=== flatness: {small:.2} B/record at {small_records} -> {big:.2} B/record at \
+         {big_records} ({ratio:.3}x) ==="
+    );
+    assert!(
+        ratio < 1.25,
+        "BucketNode costs {small:.2} B/record at {small_records} records and {big:.2} at \
+         {big_records} ({ratio:.3}x) -- it is growing with the corpus, which is a finding and not \
+         a budget"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// THE OBJECT SIDE OF THE NODE: HOW MANY OBJECTS A BUCKET ACTUALLY HOLDS.
+//
+// `object_index` and `deleted_object_index` are 16 bytes each and both are `ObjectIndex`, which
+// already tiers: `Empty` costs nothing beyond the tag, `One` holds the id inline, and only
+// `Many` allocates. Whether that tiering is the right shape -- and whether a further tier would
+// pay -- is a question about the DISTRIBUTION of objects per bucket, and a mean cannot answer
+// it. A mean of 1.02 is consistent with "almost every bucket holds one" and with "most hold one
+// and a handful hold thousands", and those have opposite answers.
+//
+// So this reports a HISTOGRAM, at two corpus sizes, over a seed that produces every model shape
+// the engine files into buckets -- and asserts that the multi-object case is reached at all,
+// because a fixture that only ever produces one object per bucket cannot tell a correct tiering
+// from a constant.
+// -------------------------------------------------------------------------------------------
+
+/// The objects-per-bucket distribution of one shard, for one of the two object indexes.
+#[derive(Default)]
+struct Occupancy {
+    /// `buckets[n]` is how many buckets hold exactly `n` objects, for `n` up to 8; everything
+    /// above lands in `over_eight` and is described by `max` and `total`.
+    buckets: [usize; 9],
+    over_eight: usize,
+    max: usize,
+    total_objects: usize,
+    total_buckets: usize,
+}
+
+impl Occupancy {
+    fn observe(&mut self, len: usize) {
+        self.total_buckets += 1;
+        self.total_objects += len;
+        self.max = self.max.max(len);
+        if len <= 8 {
+            self.buckets[len] += 1;
+        } else {
+            self.over_eight += 1;
+        }
+    }
+
+    fn at_least(&self, n: usize) -> usize {
+        let below: usize = self.buckets[..n.min(9)].iter().sum();
+        self.total_buckets - below
+    }
+
+    fn mean(&self) -> f64 {
+        if self.total_buckets == 0 {
+            0.0
+        } else {
+            self.total_objects as f64 / self.total_buckets as f64
+        }
+    }
+
+    fn report(&self, label: &str) {
+        println!("  {label}: {} buckets, {} objects, mean {:.4}, max {}",
+            self.total_buckets, self.total_objects, self.mean(), self.max);
+        for n in 0..=8 {
+            if self.buckets[n] == 0 {
+                continue;
+            }
+            println!(
+                "    holds {n:>2}: {:>8} buckets  ({:>6.2}%)",
+                self.buckets[n],
+                100.0 * self.buckets[n] as f64 / self.total_buckets as f64
+            );
+        }
+        if self.over_eight > 0 {
+            println!(
+                "    holds >8: {:>8} buckets  ({:>6.2}%)",
+                self.over_eight,
+                100.0 * self.over_eight as f64 / self.total_buckets as f64
+            );
+        }
+    }
+}
+
+fn occupancy_of(shard: &crate::engine::state::ShardState) -> (Occupancy, Occupancy) {
+    let mut live = Occupancy::default();
+    let mut tombstones = Occupancy::default();
+    for bucket in shard.bucket_index.bucket_map.values() {
+        live.observe(bucket.object_index.object_count());
+        tombstones.observe(bucket.deleted_object_index.object_count());
+    }
+    (live, tombstones)
+}
+
+/// A seed that produces every model shape this engine files into a bucket, not just the two the
+/// rest of this module uses.
+///
+/// The shapes matter to the question, because they reach the object index differently. A string
+/// and a feature series are one object each: one key, no component, one id. A hash, a set, a
+/// zset and a list are one object PER MEMBER, because the object id is hashed over
+/// `shard:kind:key:component` and the member name is the component -- while the ROUTING bucket is
+/// hashed over the key alone. So a single hash with eight fields files eight distinct object ids
+/// into one bucket, and a seed without them cannot produce the multi-object case on purpose.
+///
+/// `deletes` then removes a fraction of the string keys, which is the only thing that writes
+/// `deleted_object_index` at all.
+///
+/// `collections` selects the mix: with it off the seed is strings and feature series only, which
+/// is the shape the rest of this module seeds and the one that produces no multi-object bucket
+/// at all.
+fn objside_seed(engine: &TemporalEngine, scale: usize, collections: bool) {
+    // Strings: one object per key, the shape the rest of the module seeds.
+    for chunk_start in (0..scale * 4).step_by(1_000) {
+        let commands = (chunk_start..(chunk_start + 1_000).min(scale * 4))
+            .map(|i| Command::StringSet {
+                key: format!("s{i}"),
+                value: vec![b'v'; 32],
+            })
+            .collect::<Vec<_>>();
+        if commands.is_empty() {
+            continue;
+        }
+        let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+            shard_id: 1,
+            commands,
+        });
+        assert!(response.status.ok, "string seed must ack: {:?}", response.status);
+    }
+
+    // Hashes: eight fields per key, so eight component object ids on one routing key.
+    let commands = (0..if collections { scale } else { 0 })
+        .flat_map(|i| {
+            (0..8).map(move |f| Command::HashSet {
+                key: format!("h{i}"),
+                field: format!("f{f}"),
+                value: vec![b'h'; 24],
+            })
+        })
+        .collect::<Vec<_>>();
+    for chunk in commands.chunks(1_000) {
+        let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+            shard_id: 1,
+            commands: chunk.to_vec(),
+        });
+        assert!(response.status.ok, "hash seed must ack: {:?}", response.status);
+    }
+
+    // Sorted sets and lists: four members each, the same one-object-per-member shape.
+    let collection_keys = if collections { scale } else { 0 };
+    let commands = (0..collection_keys)
+        .flat_map(|i| {
+            (0..4).map(move |m| Command::ZSetAdd {
+                key: format!("z{i}"),
+                member: format!("m{m}").into_bytes(),
+                score: m as f64,
+            })
+        })
+        .chain((0..collection_keys).flat_map(|i| {
+            (0..4).map(move |m| Command::ListPush {
+                key: format!("l{i}"),
+                member: format!("i{m}").into_bytes(),
+                left: false,
+            })
+        }))
+        .chain((0..collection_keys).flat_map(|i| {
+            (0..4).map(move |m| Command::SetAdd {
+                key: format!("t{i}"),
+                member: format!("e{m}").into_bytes(),
+            })
+        }))
+        .collect::<Vec<_>>();
+    for chunk in commands.chunks(1_000) {
+        let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+            shard_id: 1,
+            commands: chunk.to_vec(),
+        });
+        assert!(response.status.ok, "collection seed must ack: {:?}", response.status);
+    }
+
+    // Feature series: one object, many points.
+    for k in 0..(scale / 100).max(1) {
+        for chunk_start in (0..1_000usize).step_by(500) {
+            let points = (chunk_start..(chunk_start + 500).min(1_000))
+                .map(|t| crate::types::FeaturePoint {
+                    timestamp_ms: 1_700_000_000_000 + t as u64,
+                    value: vec![b'f'; 32],
+                })
+                .collect::<Vec<_>>();
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command: Command::FeatureAppend {
+                    key: format!("f{k}"),
+                    points,
+                },
+            });
+            assert!(response.status.ok, "feature seed must ack: {:?}", response.status);
+        }
+    }
+
+    // Deletes: one string key in twenty. The only writer of `deleted_object_index`.
+    let commands = (0..scale * 4)
+        .step_by(20)
+        .map(|i| Command::CommonDelete { key: format!("s{i}") })
+        .collect::<Vec<_>>();
+    for chunk in commands.chunks(1_000) {
+        let response = engine.batch_execute(crate::types::BatchExecuteRequest {
+            shard_id: 1,
+            commands: chunk.to_vec(),
+        });
+        assert!(response.status.ok, "delete seed must ack: {:?}", response.status);
+    }
+}
+
+/// THE DISTRIBUTION, AS A HISTOGRAM, AT TWO CORPUS SIZES AND TWO SHAPE MIXES.
+///
+/// This is the measurement the object side of the node turns on, and it is reported before any
+/// representation is priced, because the numbers decide which representations are even worth
+/// pricing. A MEAN CANNOT ANSWER IT: a mean near one is consistent with "almost every bucket
+/// holds one object" and with "most hold one and a few hold hundreds", and those two want
+/// opposite representations.
+///
+/// TWO MIXES, because the answer is not a property of the engine alone. A string or a feature
+/// series is ONE object: one key, no component, one id, one bucket. A hash, a set, a sorted set
+/// or a list is one object PER MEMBER, because the object id is hashed over
+/// `shard:kind:key:component` while the ROUTING bucket is hashed over the key alone -- so a hash
+/// with eight fields files eight distinct ids into the one bucket its key routes to. A store of
+/// strings and series therefore has NO multi-object buckets at all, and a store with collections
+/// in it has as many objects in a bucket as that key has members. Reporting one mix and calling
+/// it the distribution would have been reporting the seed.
+///
+/// THE MULTI-OBJECT CASE IS ASSERTED PRESENT in the mix that is supposed to produce it, and
+/// asserted ABSENT in the mix that is not. A fixture that only ever produces one object per
+/// bucket would report a perfect histogram for a representation that had thrown the second
+/// object away; a fixture whose two mixes could not be told apart would prove that the mix is
+/// not what decides this.
+///
+/// THE STORE PATH LENGTH IS HELD CONSTANT across the arms and asserted, the same way the other
+/// corpus tests in this module hold it: allocation bytes move with the path at about six bytes a
+/// character. Counts are immune to it, and these are counts -- the assertion is here so the arms
+/// stay comparable if a later reader adds an allocator reading to them.
+#[test]
+#[ignore = "seeds four corpora; run by name"]
+fn how_many_objects_a_bucket_holds_at_two_corpus_sizes_and_two_shape_mixes() {
+    let mut path_lengths: Vec<usize> = Vec::new();
+    // (mix, records, mean, share holding exactly one, share holding two or more, tombstone share)
+    let mut summary: Vec<(&'static str, usize, f64, f64, f64, f64)> = Vec::new();
+
+    for (mix, collections) in [("strings and series only", false), ("every model shape", true)] {
+        for (size, scale) in [("small corpus", 2_000usize), ("large corpus", 20_000usize)] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            path_lengths.push(dir.path().as_os_str().len());
+            let engine = budget_engine(dir.path());
+            objside_seed(&engine, scale, collections);
+
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            let (live, tombstones) = occupancy_of(shard);
+            let counts = count_items(shard);
+
+            assert!(
+                live.total_buckets > 0,
+                "denominator: no routing buckets, so every share below divides by nothing"
+            );
+            assert!(
+                live.total_objects > 0,
+                "denominator: the shard holds no objects, so the histogram is a row of zeroes"
+            );
+
+            println!("\n=== {mix}, {size}: objects per bucket ===");
+            println!("  buckets={} records={}", live.total_buckets, counts.records);
+            live.report("object_index (live)");
+            tombstones.report("deleted_object_index (tombstones)");
+
+            let multi = live.at_least(2);
+            // The single case has to be reached in BOTH mixes, or the histogram is a constant.
+            assert!(
+                live.buckets[1] > 0,
+                "{mix}: no bucket holds exactly one object; the inline arm was never built"
+            );
+            if collections {
+                assert!(
+                    multi > 0,
+                    "{mix}: the fixture produced {} buckets and not one of them holds two \
+                     objects; a histogram from a fixture that cannot reach the multi-object case \
+                     cannot tell a correct representation from a constant",
+                    live.total_buckets
+                );
+                assert!(
+                    live.max >= 2,
+                    "{mix}: the widest bucket holds {} object(s); the multi-entry arm was never \
+                     constructed",
+                    live.max
+                );
+            } else {
+                // The CONTROL on the claim that the mix is what decides this. If a store of
+                // strings and series also produced multi-object buckets, the explanation above
+                // would be wrong and the two mixes would not be measuring different things.
+                assert_eq!(
+                    0, multi,
+                    "{mix}: {multi} buckets hold two or more objects, but a string and a series \
+                     are one object each -- either routing is colliding keys into one bucket or \
+                     the explanation this module gives for the multi-object case is wrong"
+                );
+            }
+
+            let single_share = 100.0 * live.buckets[1] as f64 / live.total_buckets as f64;
+            let multi_share = 100.0 * multi as f64 / live.total_buckets as f64;
+            let carrying = tombstones.total_buckets - tombstones.buckets[0];
+            let tombstone_share = 100.0 * carrying as f64 / tombstones.total_buckets as f64;
+            println!(
+                "  SHARES: exactly one {single_share:.2}%, two or more {multi_share:.2}%, \
+                 buckets carrying any tombstone {tombstone_share:.2}%"
+            );
+            summary.push((
+                mix,
+                counts.records,
+                live.mean(),
+                single_share,
+                multi_share,
+                tombstone_share,
+            ));
+        }
+    }
+
+    assert_eq!(4, path_lengths.len(), "all four arms must have run");
+    let first = path_lengths[0];
+    for (at, length) in path_lengths.iter().enumerate() {
+        assert_eq!(
+            first, *length,
+            "the store path length moved at arm {at} ({first} then {length})"
+        );
+    }
+
+    println!("\n=== the distribution, summarised ===");
+    println!(
+        "  {:<26} {:>9} {:>8} {:>10} {:>12} {:>12}",
+        "mix", "records", "mean", "holds one", "holds two+", "tombstoned"
+    );
+    for (mix, records, mean, single, multi, tomb) in &summary {
+        println!(
+            "  {mix:<26} {records:>9} {mean:>8.4} {single:>9.2}% {multi:>11.2}% {tomb:>11.2}%"
+        );
+    }
+
+    // --- FLATNESS: each mix must report the same distribution at both corpus sizes. ---
+    for pair in [(0usize, 1usize), (2usize, 3usize)] {
+        let (mix, small_records, small_mean, small_one, _, small_tomb) = summary[pair.0];
+        let (mix_big, big_records, big_mean, big_one, _, big_tomb) = summary[pair.1];
+        assert_eq!(mix, mix_big, "the summary rows are not paired by mix");
+        assert!(big_records > small_records, "the second arm must be the larger corpus");
+        assert!(
+            (big_one - small_one).abs() < 1.0,
+            "{mix}: {small_one:.2}% of buckets hold one object at {small_records} records and \
+             {big_one:.2}% at {big_records}; the distribution is moving with the corpus, which \
+             is a finding and not a budget"
+        );
+        assert!(
+            (big_tomb - small_tomb).abs() < 1.0,
+            "{mix}: the tombstone-carrying share moved from {small_tomb:.2}% to {big_tomb:.2}% \
+             across the corpus"
+        );
+        println!(
+            "  {mix}: mean {small_mean:.4} -> {big_mean:.4} across a tenfold corpus"
+        );
+    }
+
+    // --- THE TWO MIXES MUST DIFFER, or the seed is not what this test says it is. ---
+    let simple_multi = summary[1].4;
+    let mixed_multi = summary[3].4;
+    assert!(
+        mixed_multi > simple_multi + 10.0,
+        "the two mixes reported {simple_multi:.2}% and {mixed_multi:.2}% of buckets holding two \
+         or more objects; if the mix does not change the distribution then one seed was used \
+         twice and this test compares an arm with itself"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// THE CANDIDATES FOR THE OBJECT SIDE, MEASURED AGAINST EACH OTHER.
+//
+// Each shape below is a MIRROR built from the same field types as the live declaration, so the
+// widths are measurements and not estimates, and the mirror is checked against the declaration
+// FIRST -- without that check every row is fiction.
+// -------------------------------------------------------------------------------------------
+
+/// The shape BEFORE this change: the same tiering with a search tree in the rare arm.
+#[derive(Clone)]
+enum MirrorTiered {
+    Empty,
+    One(u64),
+    Many(Box<BTreeSet<u64>>),
+}
+
+/// The DECLARATION, restated: the same tiering with the rare arm holding a sorted run.
+///
+/// Checked against `ObjectIndex` twice below -- once on width, and once on what the allocator
+/// charges for a clone of the whole distribution, which is the check that would catch a mirror
+/// that had the right width and the wrong arm.
+#[derive(Clone)]
+enum MirrorSortedRun {
+    Empty,
+    One(u64),
+    Many(Box<Vec<u64>>),
+}
+
+/// No tiering at all: one heap set per bucket, always. Eight bytes of field.
+#[derive(Clone)]
+struct MirrorAlwaysBoxed(Box<BTreeSet<u64>>);
+
+/// No tiering and no box: the set held inline, which is what the field was before the tiering.
+#[derive(Clone)]
+struct MirrorInline(BTreeSet<u64>);
+
+/// The DECLARATION of the tombstone side, restated: absence costs a pointer and nothing else.
+#[derive(Clone)]
+struct MirrorAbsentIsFree(Option<Box<ObjectIndex>>);
+
+fn mirror_tiered(ids: &[u64]) -> MirrorTiered {
+    match ids.len() {
+        0 => MirrorTiered::Empty,
+        1 => MirrorTiered::One(ids[0]),
+        _ => MirrorTiered::Many(Box::new(ids.iter().copied().collect())),
+    }
+}
+
+fn mirror_sorted_run(ids: &[u64]) -> MirrorSortedRun {
+    match ids.len() {
+        0 => MirrorSortedRun::Empty,
+        1 => MirrorSortedRun::One(ids[0]),
+        _ => {
+            let mut run = ids.to_vec();
+            run.sort_unstable();
+            MirrorSortedRun::Many(Box::new(run))
+        }
+    }
+}
+
+fn mirror_absent_is_free(ids: &[u64]) -> MirrorAbsentIsFree {
+    if ids.is_empty() {
+        MirrorAbsentIsFree(None)
+    } else {
+        MirrorAbsentIsFree(Some(Box::new(ids.iter().copied().collect())))
+    }
+}
+
+/// The ids each bucket's live and tombstone indexes hold, read off a seeded shard.
+fn object_id_rows(shard: &crate::engine::state::ShardState) -> (Vec<Vec<u64>>, Vec<Vec<u64>>) {
+    let mut live = Vec::new();
+    let mut tombstones = Vec::new();
+    for bucket in shard.bucket_index.bucket_map.values() {
+        live.push(bucket.object_index.iter().copied().collect::<Vec<u64>>());
+        tombstones.push(bucket.deleted_object_index.iter().copied().collect::<Vec<u64>>());
+    }
+    (live, tombstones)
+}
+
+/// EVERY CANDIDATE'S WIDTH, AND THE MIRROR CHECKED AGAINST THE DECLARATION FIRST.
+///
+/// The check is the whole reason these are numbers. A mirror that has drifted from the live type
+/// reports whatever it was last written to report, and the table underneath it stays plausible.
+#[test]
+fn what_each_shape_of_the_object_index_would_cost_in_width() {
+    // --- The controls: each mirror of a LIVE shape must be that shape. ---
+    assert_eq!(
+        size_of::<ObjectIndex>(),
+        size_of::<MirrorSortedRun>(),
+        "the mirror of the live tiering is {} bytes against the declaration's {}; it has drifted \
+         and every row below is fiction",
+        size_of::<MirrorSortedRun>(),
+        size_of::<ObjectIndex>()
+    );
+    assert_eq!(
+        align_of::<ObjectIndex>(),
+        align_of::<MirrorSortedRun>(),
+        "the mirror's alignment does not match the declaration's"
+    );
+    assert_eq!(
+        size_of::<DeletedObjectIndex>(),
+        size_of::<MirrorAbsentIsFree>(),
+        "the mirror of the tombstone side is {} bytes against the declaration's {}",
+        size_of::<MirrorAbsentIsFree>(),
+        size_of::<DeletedObjectIndex>()
+    );
+
+    let rows: Vec<(&str, usize, &str)> = vec![
+        ("rare arm a search tree (before)", size_of::<MirrorTiered>(), "Empty / One(u64) / Many(Box<BTreeSet>)"),
+        ("rare arm a sorted run (the live shape)", size_of::<MirrorSortedRun>(), "Empty / One(u64) / Many(Box<Vec>)"),
+        ("no tiering, always boxed", size_of::<MirrorAlwaysBoxed>(), "Box<BTreeSet> only"),
+        ("no tiering, held inline", size_of::<MirrorInline>(), "BTreeSet held in the node"),
+        ("absence costs a pointer (the tombstone side)", size_of::<MirrorAbsentIsFree>(), "Option<Box<ObjectIndex>>"),
+    ];
+    println!("{:<32} {:>6}  {}", "shape", "width", "representation");
+    for (name, width, note) in &rows {
+        println!("{name:<32} {width:>6}  {note}");
+    }
+
+    // --- The widths that decide the accounting. ---
+    assert_eq!(16, size_of::<ObjectIndex>(), "ObjectIndex width moved");
+    assert_eq!(8, size_of::<DeletedObjectIndex>(), "DeletedObjectIndex width moved");
+    assert_eq!(16, size_of::<MirrorTiered>(), "the tree in the rare arm cost the same width");
+    assert_eq!(8, size_of::<MirrorAlwaysBoxed>(), "a bare box is one pointer");
+    assert_eq!(24, size_of::<MirrorInline>(), "an inline BTreeSet is three words");
+    assert_eq!(8, size_of::<MirrorAbsentIsFree>(), "Option<Box<T>> rides the null niche");
+
+    // --- WHY THE TIERING CANNOT REACH EIGHT BYTES, stated as a property and not an opinion. ---
+    //
+    // The eight-byte form of this shape is a single word that holds either an object id or a
+    // pointer, told apart by a bit the id does not use. This engine's object id is
+    // `stable_block_object_id`, a 64-bit FNV-1a over `shard:kind:key`, and it reserves
+    // nothing: the assertion below walks real keys and shows the ids reaching both ends of the
+    // range, so there is no bit a tag could take without losing ids.
+    let mut low_bit_set = 0usize;
+    let mut high_bit_set = 0usize;
+    let mut sampled = 0usize;
+    for i in 0..4_096u64 {
+        let id = crate::engine::hashing::stable_block_object_id(1, "string", &format!("s{i}"));
+        sampled += 1;
+        if id & 1 == 1 {
+            low_bit_set += 1;
+        }
+        if id & (1 << 63) != 0 {
+            high_bit_set += 1;
+        }
+    }
+    assert_eq!(4_096, sampled, "the id sample must have run");
+    println!(
+        "object ids over {sampled} real keys: {low_bit_set} with the low bit set, \
+         {high_bit_set} with the high bit set"
+    );
+    assert!(
+        low_bit_set > 0 && high_bit_set > 0,
+        "an object id that never set the low bit ({low_bit_set}) or never set the high bit \
+         ({high_bit_set}) would leave a tag somewhere to sit; it sets both, so the one-word form \
+         of this tiering would drop ids"
+    );
+    // And it is not merely that both occur: both occur often enough that no bit is a tag.
+    assert!(
+        low_bit_set > sampled / 4 && high_bit_set > sampled / 4,
+        "the id sample must show both bits in general use, not as rare outliers"
+    );
+}
+
+/// WHAT THE OBJECT SIDE COSTS, EVERY SHAPE, ON THE MEASURED DISTRIBUTION.
+///
+/// Width is only half of this structure's cost: the rare arm allocates, and at the measured
+/// occupancy the rare arm is not rare. This charges every candidate with the counting allocator
+/// over the SAME object-id rows read off a seeded shard, so the comparison is between
+/// representations of one distribution rather than between two guesses.
+///
+/// The `Vec` that holds the mirrors allocates too, and its own allocation is subtracted and
+/// reported rather than folded in, so a width difference between candidates cannot be mistaken
+/// for a heap difference.
+///
+/// THE STORE PATH LENGTH IS HELD CONSTANT and asserted: allocation bytes move with the path at
+/// about six bytes a character.
+#[cfg(feature = "alloc-probe")]
+#[test]
+#[ignore = "seeds two corpora and charges five representations; run by name"]
+fn what_the_object_side_of_the_bucket_node_costs() {
+    let mut path_lengths: Vec<usize> = Vec::new();
+    let mut per_bucket: Vec<(&'static str, f64)> = Vec::new();
+
+    for (label, scale) in [("small corpus", 2_000usize), ("large corpus", 20_000usize)] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        path_lengths.push(dir.path().as_os_str().len());
+        let engine = budget_engine(dir.path());
+        objside_seed(&engine, scale, true);
+
+        let (live_rows, tombstone_rows, block_indexes, block_arms) = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard is loaded");
+            let (live, dead) = object_id_rows(shard);
+            // THE NEXT TERM, carried out of the same shard so it is the same distribution.
+            let blocks: Vec<BlockIndexMap> = shard
+                .bucket_index
+                .bucket_map
+                .values()
+                .map(|bucket| bucket.block_index.clone())
+                .collect();
+            let mut arms = [0usize; 3];
+            for bucket in shard.bucket_index.bucket_map.values() {
+                let at = match bucket.block_index.len() {
+                    0 => 0,
+                    1 => 1,
+                    _ => 2,
+                };
+                arms[at] += 1;
+            }
+            (live, dead, blocks, arms)
+        };
+        let buckets = live_rows.len();
+        assert!(buckets > 0, "denominator: no buckets, so every per-bucket figure is nothing");
+        let multi = live_rows.iter().filter(|ids| ids.len() >= 2).count();
+        assert!(
+            multi > 0,
+            "the fixture reached no multi-object bucket, so the rare arm was never built and \
+             four of the five rows below would be measuring the same empty shape"
+        );
+
+        // Built once, outside the probe, so what the probe charges is the CLONE and not the
+        // construction.
+        let tiered: Vec<MirrorTiered> = live_rows.iter().map(|ids| mirror_tiered(ids)).collect();
+        let sorted: Vec<MirrorSortedRun> =
+            live_rows.iter().map(|ids| mirror_sorted_run(ids)).collect();
+        let always: Vec<MirrorAlwaysBoxed> = live_rows
+            .iter()
+            .map(|ids| MirrorAlwaysBoxed(Box::new(ids.iter().copied().collect())))
+            .collect();
+        let inline: Vec<MirrorInline> = live_rows
+            .iter()
+            .map(|ids| MirrorInline(ids.iter().copied().collect()))
+            .collect();
+
+        let tomb_tiered: Vec<MirrorTiered> =
+            tombstone_rows.iter().map(|ids| mirror_tiered(ids)).collect();
+        let tomb_absent: Vec<MirrorAbsentIsFree> =
+            tombstone_rows.iter().map(|ids| mirror_absent_is_free(ids)).collect();
+
+        // THE DECLARATIONS THEMSELVES, charged the same way. These are the controls: a mirror
+        // that matched on width and not on arm would pass every width assertion and report a
+        // heap figure for a shape the engine does not have.
+        let declared_live: Vec<ObjectIndex> = live_rows
+            .iter()
+            .map(|ids| ids.iter().copied().collect::<ObjectIndex>())
+            .collect();
+        let declared_tomb: Vec<DeletedObjectIndex> = tombstone_rows
+            .iter()
+            .map(|ids| ids.iter().copied().collect::<DeletedObjectIndex>())
+            .collect();
+        let declared_live_bytes = clone_alloc_bytes(&declared_live);
+        let declared_tomb_bytes = clone_alloc_bytes(&declared_tomb);
+
+        // The spine each candidate's vector allocates for itself, charged separately so it is
+        // not read as heap the representation owns.
+        let spine = |width: usize| (width * buckets) as u64;
+
+        let sorted_bytes = clone_alloc_bytes(&sorted);
+        assert_eq!(
+            declared_live_bytes, sorted_bytes,
+            "the declaration charged {declared_live_bytes} B and its mirror {sorted_bytes} B for \
+             the same ids; the mirror is not describing the live arm and the table below is \
+             fiction"
+        );
+        let absent_bytes = clone_alloc_bytes(&tomb_absent);
+        assert_eq!(
+            declared_tomb_bytes, absent_bytes,
+            "the tombstone declaration charged {declared_tomb_bytes} B and its mirror \
+             {absent_bytes} B for the same ids"
+        );
+
+        let rows: Vec<(&'static str, usize, u64)> = vec![
+            ("live index: rare arm a search tree (before)", size_of::<MirrorTiered>(), clone_alloc_bytes(&tiered)),
+            ("live index: rare arm a sorted run (now)", size_of::<ObjectIndex>(), declared_live_bytes),
+            ("live index: no tiering, always boxed", size_of::<MirrorAlwaysBoxed>(), clone_alloc_bytes(&always)),
+            ("live index: no tiering, held inline", size_of::<MirrorInline>(), clone_alloc_bytes(&inline)),
+        ];
+
+        println!("\n=== {label}: {buckets} buckets, {multi} of them multi-object ===");
+        println!(
+            "  {:<40} {:>6} {:>14} {:>14} {:>12}",
+            "shape", "width", "heap bytes", "field bytes", "total/bucket"
+        );
+        for (name, width, charged) in &rows {
+            let heap = charged.saturating_sub(spine(*width));
+            let field = spine(*width);
+            println!(
+                "  {:<40} {:>6} {:>14} {:>14} {:>12.2}",
+                name,
+                width,
+                heap,
+                field,
+                (heap + field) as f64 / buckets as f64
+            );
+            per_bucket.push((name, (heap + field) as f64 / buckets as f64));
+        }
+
+        let tomb_rows: Vec<(&'static str, usize, u64)> = vec![
+            ("tombstone index: the full enum (before)", size_of::<MirrorTiered>(), clone_alloc_bytes(&tomb_tiered)),
+            ("tombstone index: absence costs a pointer (now)", size_of::<DeletedObjectIndex>(), declared_tomb_bytes),
+        ];
+        for (name, width, charged) in &tomb_rows {
+            let heap = charged.saturating_sub(spine(*width));
+            let field = spine(*width);
+            println!(
+                "  {:<40} {:>6} {:>14} {:>14} {:>12.2}",
+                name,
+                width,
+                heap,
+                field,
+                (heap + field) as f64 / buckets as f64
+            );
+            per_bucket.push((name, (heap + field) as f64 / buckets as f64));
+        }
+
+        // --- THE SAVING, AND THE SHARE THE TOMBSTONE TRADE TURNS ON. ---
+        // What the probe charges for a clone of one of these vectors is ALREADY the field
+        // bytes plus the heap: the clone reallocates the vector's own spine, which is exactly
+        // `width x buckets`. Adding the spine on top would count the field bytes twice -- at the
+        // OLD width in the before arm and the NEW width in the after arm, which inflates the
+        // saving by exactly the difference being claimed.
+        //
+        // THE CONTROL FOR THAT, and it is available for free: in the before arm the tombstone
+        // side holds nothing at all on the heap, every bucket being in the arm that allocates
+        // nothing, so what the probe charges for it must be the spine EXACTLY. If it is not,
+        // the charge is not what this arithmetic assumes and both totals are wrong.
+        let tomb_before_charge = clone_alloc_bytes(&tomb_tiered);
+        assert_eq!(
+            spine(size_of::<MirrorTiered>()),
+            tomb_before_charge,
+            "a vector of {buckets} indexes that allocate nothing was charged \
+             {tomb_before_charge} B against a spine of {} B; the probe is charging for \
+             something other than the clone and the totals below are not what they say",
+            spine(size_of::<MirrorTiered>())
+        );
+
+        let before = clone_alloc_bytes(&tiered) + tomb_before_charge;
+        let now = declared_live_bytes + declared_tomb_bytes;
+        assert!(
+            now < before,
+            "the object side charges {now} B where the shape before charged {before} B; the \
+             change this module documents is not a saving on this distribution"
+        );
+        let carrying = tombstone_rows.iter().filter(|ids| !ids.is_empty()).count();
+        println!(
+            "  OBJECT SIDE: {before} B before, {now} B now -- saved {} B ({:.2} MiB), \
+             {:.2} B/bucket",
+            before - now,
+            (before - now) as f64 / (1024.0 * 1024.0),
+            (before - now) as f64 / buckets as f64
+        );
+        println!(
+            "  buckets carrying a tombstone: {carrying} of {buckets} ({:.2}%) -- the pointer \
+             shape wins below about a quarter and loses above it",
+            100.0 * carrying as f64 / buckets as f64
+        );
+        assert!(
+            carrying * 4 < buckets,
+            "{carrying} of {buckets} buckets carry a tombstone; above about a quarter the \
+             nullable-pointer shape costs more than the enum it replaced and the decision \
+             recorded here is stale"
+        );
+
+        // --- THE PAGE INDEX, PRICED RATHER THAN NAMED -- AND IT IS NO LONGER THE DOMINANT TERM. ---
+        //
+        // This note used to read "the page index is 104 of the node's 176 -- 56.5%" and name it as
+        // the next thing to change. It WAS changed: the single page is behind a pointer now, the page
+        // index is a 24-byte list header, and it is now a quarter of the node rather than over
+        // half. What the note got right is the question it posed -- whether an inline arm earns its
+        // width -- and what it could not see is that the answer depends on the ROUTING RANGE, which
+        // decides how many buckets hold exactly one page. `inline_arm_trade.rs` is that
+        // measurement. The census and the allocator reading below are still the right place for the
+        // NEXT change to start, and they are measured here rather than assumed.
+        let block_charge = clone_alloc_bytes(&block_indexes);
+        let block_spine = spine(size_of::<BlockIndexMap>());
+        let block_heap = block_charge.saturating_sub(block_spine);
+        let block_multi = block_arms[2];
+        assert_eq!(
+            buckets,
+            block_arms.iter().sum::<usize>(),
+            "the page arm census counted {} buckets against {buckets}",
+            block_arms.iter().sum::<usize>()
+        );
+        println!(
+            "  NEXT TERM -- the page index: {} B of field x {buckets} = {block_spine} B, plus \
+             {block_heap} B on the heap ({:.2} B/bucket), {:.1}% of the node's width",
+            size_of::<BlockIndexMap>(),
+            block_heap as f64 / buckets as f64,
+            100.0 * size_of::<BlockIndexMap>() as f64 / size_of::<BucketNode>() as f64
+        );
+        println!(
+            "    its arms: {} buckets hold no page, {} hold exactly one (inline), {block_multi} \
+             hold several (a map) -- {:.2}% on the map arm",
+            block_arms[0],
+            block_arms[1],
+            100.0 * block_multi as f64 / buckets as f64
+        );
+        if block_multi > 0 {
+            println!(
+                "    the map arm alone charges {:.1} B a bucket that is on it",
+                block_heap as f64 / block_multi as f64
+            );
+        }
+
+        std::hint::black_box((&tiered, &sorted, &always, &inline, &tomb_tiered, &tomb_absent));
+        std::hint::black_box((&declared_live, &declared_tomb, &block_indexes));
+    }
+
+    assert_eq!(2, path_lengths.len(), "both arms must have run");
+    assert_eq!(
+        path_lengths[0], path_lengths[1],
+        "the store path length moved between arms ({} then {}); allocation bytes move with it",
+        path_lengths[0], path_lengths[1]
+    );
+
+    println!("\n=== flatness across the two corpora ===");
+    let half = per_bucket.len() / 2;
+    for index in 0..half {
+        let (name, small) = per_bucket[index];
+        let (name_big, big) = per_bucket[index + half];
+        assert_eq!(name, name_big, "the two arms reported shapes in different orders");
+        let ratio = if small > 0.0 { big / small } else { 1.0 };
+        println!("  {name:<44} {small:>9.2} -> {big:>9.2} B/bucket  ({ratio:.3}x)");
+        assert!(
+            ratio < 1.25,
+            "{name} costs {small:.2} B/bucket at the small corpus and {big:.2} at the large \
+             ({ratio:.3}x) -- it grows with the corpus, which is a finding and not a budget"
+        );
+    }
+}
+
+/// THE READ PATH, PRICED. A representation that makes the common lookup slower to make the
+/// structure smaller is declined here, with the number that declines it.
+///
+/// `contains` is the read this structure exists for: the object fold asks it once per page, and
+/// the delete path asks it once per key. The sweep below asks it over the WHOLE measured
+/// distribution rather than over one object, because a microbench on a single index measures the
+/// wrong regime -- a bucket holding one id and a bucket holding eight take different paths and
+/// the distribution is nearly half and half.
+///
+/// ABBA ORDER, not interleaving. The two arms run A, B, B, A and each arm's two readings are
+/// summed, so a warm-up or a drift that favours whichever ran first cancels instead of being
+/// attributed to a representation.
+#[test]
+#[ignore = "sweeps the whole distribution four times; run by name"]
+fn the_read_path_of_each_object_index_shape_is_priced() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = budget_engine(dir.path());
+    objside_seed(&engine, 2_000, true);
+
+    let live_rows = {
+        let shards = engine.shards.read().expect("engine lock poisoned");
+        let shard = shards.get(&1).expect("shard is loaded");
+        object_id_rows(shard).0
+    };
+    let buckets = live_rows.len();
+    assert!(buckets > 0, "denominator: no buckets to sweep");
+    let multi = live_rows.iter().filter(|ids| ids.len() >= 2).count();
+    assert!(
+        multi > 0,
+        "the sweep reached no multi-object bucket, so it prices only the arm the two shapes share"
+    );
+
+    let tiered: Vec<MirrorTiered> = live_rows.iter().map(|ids| mirror_tiered(ids)).collect();
+    // The AFTER arm is the declaration itself, not a mirror of it: a read-path comparison that
+    // timed a mirror would be timing something the engine does not run.
+    let sorted: Vec<ObjectIndex> = live_rows
+        .iter()
+        .map(|ids| ids.iter().copied().collect::<ObjectIndex>())
+        .collect();
+
+    // Every id that is present, plus one that is not, per bucket. The absent probe is what makes
+    // this a search rather than a hit on the first element.
+    let probes: Vec<Vec<u64>> = live_rows
+        .iter()
+        .map(|ids| {
+            let mut probe = ids.clone();
+            probe.push(0xFFFF_FFFF_FFFF_FFFF);
+            probe
+        })
+        .collect();
+
+    let sweep_tiered = || {
+        let mut hits = 0usize;
+        for (index, probe) in probes.iter().enumerate() {
+            for id in probe {
+                let found = match &tiered[index] {
+                    MirrorTiered::Empty => false,
+                    MirrorTiered::One(held) => held == id,
+                    MirrorTiered::Many(set) => set.contains(id),
+                };
+                hits += usize::from(found);
+            }
+        }
+        hits
+    };
+    let sweep_sorted = || {
+        let mut hits = 0usize;
+        for (index, probe) in probes.iter().enumerate() {
+            for id in probe {
+                hits += usize::from(sorted[index].contains(id));
+            }
+        }
+        hits
+    };
+
+    const ROUNDS: usize = 40;
+    let mut tree_ns = 0u128;
+    let mut run_ns = 0u128;
+    let mut tree_hits = 0usize;
+    let mut run_hits = 0usize;
+
+    // A, B, B, A -- repeated, so an order effect cancels rather than being attributed.
+    for _ in 0..ROUNDS {
+        let t0 = std::time::Instant::now();
+        tree_hits += sweep_tiered();
+        tree_ns += t0.elapsed().as_nanos();
+
+        let t1 = std::time::Instant::now();
+        run_hits += sweep_sorted();
+        run_ns += t1.elapsed().as_nanos();
+
+        let t2 = std::time::Instant::now();
+        run_hits += sweep_sorted();
+        run_ns += t2.elapsed().as_nanos();
+
+        let t3 = std::time::Instant::now();
+        tree_hits += sweep_tiered();
+        tree_ns += t3.elapsed().as_nanos();
+    }
+
+    // --- The two arms must agree on the ANSWER, or the faster one is faster at being wrong. ---
+    assert_eq!(
+        tree_hits, run_hits,
+        "the two representations answered {tree_hits} and {run_hits} hits over the same probes; \
+         a timing comparison between shapes that disagree is meaningless"
+    );
+    let probe_count: usize = probes.iter().map(|p| p.len()).sum();
+    assert!(
+        tree_hits > 0,
+        "the sweep found nothing; a `contains` that never hits prices only the miss path"
+    );
+    assert!(
+        tree_hits < probe_count * 2 * ROUNDS,
+        "the sweep hit on every probe including the absent one, so the miss path was never taken"
+    );
+
+    let lookups = (probe_count * 2 * ROUNDS) as f64;
+    println!(
+        "{buckets} buckets ({multi} multi-object), {probe_count} probes, {ROUNDS} ABBA rounds"
+    );
+    println!(
+        "  tree in the rare arm : {:>12} ns total, {:>7.2} ns/lookup",
+        tree_ns,
+        tree_ns as f64 / lookups
+    );
+    println!(
+        "  sorted run in it     : {:>12} ns total, {:>7.2} ns/lookup",
+        run_ns,
+        run_ns as f64 / lookups
+    );
+    println!(
+        "  the run is {:.3}x the tree's time per lookup",
+        run_ns as f64 / tree_ns as f64
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// DIRECTION DECIDES THE TEST.
+//
+// An object index that LOSES an entry is silent data loss: the object is still in the store, the
+// bucket still routes to it, and nothing finds it -- `object_manager`'s fold stops reporting it
+// and the delete path stops retiring its pages. An index that KEEPS too much is merely fat. So
+// every assertion below is the strong form: the FULL SET of entries, element by element, against
+// a control built with the container the arm used to be, in both the single and the multi case,
+// and with the transition driven in both directions -- a bucket that grows from one object to
+// many, and one that shrinks back.
+// -------------------------------------------------------------------------------------------
+
+/// The control: what a search-tree set makes of the same operations.
+///
+/// It is the container this arm held before, so a disagreement between the two is exactly the
+/// regression this change could cause, and the comparison is against something that was already
+/// correct rather than against a second copy of the code under test.
+fn control_set(ids: &[u64]) -> BTreeSet<u64> {
+    ids.iter().copied().collect()
+}
+
+fn entries(index: &ObjectIndex) -> Vec<u64> {
+    index.iter().copied().collect()
+}
+
+/// THE SLOT ARRAY IS DEDUPLICATED AFTER EVERY MUTATION, AND WHAT IT WRITES IS STILL ASCENDING.
+///
+/// WHAT THIS TEST USED TO SAY. It was
+/// `the_sorted_run_stays_sorted_and_deduplicated_through_every_mutation`, and it asserted that
+/// ITERATION was strictly ascending -- because the arm was a sorted run, the stored spelling was the
+/// iteration order, and `contains` answered by bisection. ALL THREE HAVE NOW MOVED: the arm is a SLOT
+/// ARRAY so iteration is in slot order, `contains` is a walk, and the stored spelling is the slot
+/// array itself.
+///
+/// THE THIRD MOVED LAST AND THIS TEST IS WHERE IT IS RECORDED. It read "the stored spelling is still
+/// ascending, because the Serialize impl sorts rather than taking the container's order", and that
+/// was true until a slot had to survive a load: a sorted spelling cannot carry a position, so the
+/// wire became slot order with a null for a placeholder and the format stamp paid for it. RESTATED
+/// rather than re-goldened -- the assertion that reversed is called out at the point it reversed.
+///
+/// SO THE CLAIM SPLITS IN TWO AND BOTH HALVES ARE DRIVEN HERE. The SET is unchanged -- same ids, no
+/// duplicates, same membership answers, compared element by element against the container the arm
+/// used to be. The ORDER claim is now that the WIRE is the SLOT ARRAY: `serde_json` of the index must
+/// be the ids in the slots they were filed into, which for this fixture is not ascending.
+///
+/// AND THE FIXTURE IS CHOSEN SO SLOT ORDER IS NOT ASCENDING, which is the only way either half can
+/// fail visibly: every id but the first belongs BEFORE something already filed, so an implementation
+/// that wrote slot order would write them backwards and an implementation that compacted would
+/// renumber on every remove.
+#[test]
+fn the_slot_array_stays_deduplicated_and_what_it_writes_is_now_the_slot_array() {
+    let inserted = [900u64, 5, 700, 1, 800, 0, u64::MAX, 400];
+    let mut index = ObjectIndex::default();
+    let mut control = BTreeSet::new();
+
+    for (step, id) in inserted.iter().enumerate() {
+        let index_said = index.insert(*id);
+        let control_said = control.insert(*id);
+        assert_eq!(
+            control_said, index_said,
+            "step {step}: inserting {id} answered {index_said}, the control answered \
+             {control_said}"
+        );
+        assert_eq!(
+            control.iter().copied().collect::<Vec<u64>>(),
+            index.sorted_ids(),
+            "step {step}: after inserting {id} the array and the control hold different entries"
+        );
+        // THE WIRE IS THE SLOT ARRAY, stated directly rather than inferred from the comparison
+        // above. REVERSED: this asserted the written sequence was strictly ASCENDING, which was the
+        // claim that no stored byte moved. The element type is nullable now, because a placeholder
+        // is a stored position rather than an omission.
+        let written: Vec<Option<u64>> =
+            serde_json::from_str(&serde_json::to_string(&index).expect("serializes"))
+                .expect("a sequence of nullable ids");
+        assert_eq!(
+            inserted[..=step].iter().map(|id| Some(*id)).collect::<Vec<Option<u64>>>(),
+            written,
+            "step {step}: what the index writes is not the slots it filed: {written:?}"
+        );
+        // AND THE SET IT WRITES IS STILL WHAT IT HOLDS, which is the half that did not move.
+        let mut written_ids: Vec<u64> = written.iter().filter_map(|slot| *slot).collect();
+        written_ids.sort_unstable();
+        assert_eq!(
+            control.iter().copied().collect::<Vec<u64>>(),
+            written_ids,
+            "step {step}: what the index writes is not what it holds"
+        );
+        // And the slot an id is in is the slot it was given. Every id filed so far keeps its
+        // position, which an append-or-refill array guarantees and a sorted run did not.
+        for (expected_slot, filed) in inserted[..=step].iter().enumerate() {
+            assert_eq!(
+                index.slot_of(filed),
+                Some(expected_slot),
+                "step {step}: id {filed} moved off slot {expected_slot}, so an insert renumbered it"
+            );
+        }
+    }
+
+    // SLOT ORDER IS NOT ASCENDING on this fixture, which is what makes the two halves above
+    // distinguishable. Asserted, because a fixture that happened to file in order would pass an
+    // ASCENDING Serialize impl and a positional one alike -- the direction of the trap reversed
+    // with the change, and the control is still the thing that closes it.
+    let slot_order: Vec<u64> = entries(&index);
+    assert_eq!(
+        inserted.to_vec(),
+        slot_order,
+        "the ids are not in the slots they were filed into, so nothing above observes stability"
+    );
+    assert_ne!(
+        slot_order,
+        index.sorted_ids(),
+        "the fixture's slot order is already ascending, so an ascending Serialize impl would pass \
+         the wire assertions above for the wrong reason"
+    );
+
+    // Re-inserting every id must change nothing and must answer false.
+    for id in &inserted {
+        assert!(!index.insert(*id), "re-inserting {id} reported a new entry");
+    }
+    assert_eq!(
+        control.iter().copied().collect::<Vec<u64>>(),
+        index.sorted_ids(),
+        "re-inserting every held id changed the set"
+    );
+    assert_eq!(inserted.len(), index.object_count(), "a duplicate reached the array");
+    assert_eq!(
+        inserted.len(),
+        index.slot_count(),
+        "re-inserting a held id took a new slot, so the array grows on a no-op"
+    );
+
+    // Removing, in a different order, and an id that was never held. The slot a REMOVAL leaves is a
+    // placeholder, so every id above it keeps its position -- the half a sorted run got wrong.
+    assert!(!index.remove(&123_456), "removing an absent id reported a removal");
+    let highest = index.slot_of(&400).expect("400 is filed");
+    for id in [700u64, 0, u64::MAX, 900] {
+        let slot_of_victim = index.slot_of(&id).expect("the victim is filed");
+        assert!(index.remove(&id), "removing held id {id} reported nothing");
+        control.remove(&id);
+        assert_eq!(
+            control.iter().copied().collect::<Vec<u64>>(),
+            index.sorted_ids(),
+            "after removing {id} the array and the control disagree"
+        );
+        assert_eq!(
+            index.id_at(slot_of_victim),
+            None,
+            "the slot {id} was in did not become a placeholder, so the array compacted"
+        );
+        assert_eq!(
+            index.slot_of(&400),
+            Some(highest),
+            "removing {id} moved id 400 off slot {highest}: the hole was closed rather than left"
+        );
+    }
+
+    // And the fixture reached both arms, or it proved one of them and not the other.
+    assert!(
+        matches!(index, ObjectIndex::Many(_)),
+        "the fixture never built the multi-entry arm, so it cannot tell it from a constant"
+    );
+}
+
+/// THE TRANSITION, DRIVEN IN BOTH DIRECTIONS.
+///
+/// One object becomes many and many becomes one again, and at every step the whole set is compared
+/// element by element against the control. Compared as a SET, through `sorted_ids`: the arm is a slot
+/// array now, so its iteration order is the order ids were FILED and not an ordering of ids, and a
+/// comparison against a search tree's order would be comparing two different questions.
+///
+/// THE SHRINK DIRECTION IS THE ONE THAT CAN LOSE AN ENTRY SILENTLY, and it has a second hazard now.
+/// It used to be only "which id survives" -- an implementation taking the first rather than the only
+/// keeps the count right and the contents wrong. The slot array adds "does the survivor keep its
+/// slot", and the two cases below differ by exactly that: removing the LAST of two leaves the survivor
+/// in slot 0 with nothing above it, so giving the allocation back renumbers nothing and is allowed;
+/// removing the FIRST of two leaves the survivor in slot 1, so giving it back would renumber the
+/// survivor to slot 0 and retire slot 1. That is the collapse #2023 drove as "the collapse retired
+/// ordinal 1", and it is the one that no longer happens. Both are driven, because an implementation
+/// that refused BOTH collapses would keep a box for the rest of a bucket's life and an implementation
+/// that allowed both would lose the slot.
+#[test]
+fn an_object_set_survives_growing_past_one_and_shrinking_back() {
+    // Chosen so "keep the first" and "keep the last" give different answers at every shrink.
+    let ids = [500u64, 100, 900, 300];
+
+    let mut index = ObjectIndex::default();
+    let mut control: BTreeSet<u64> = BTreeSet::new();
+
+    assert!(index.is_empty(), "a fresh index must be empty");
+    assert_eq!(0, index.object_count(), "a fresh index must hold nothing");
+    assert_eq!(0, index.slot_count(), "a fresh index must have no slots either");
+
+    // --- GROW: Empty -> One -> Many. ---
+    index.insert(ids[0]);
+    control.insert(ids[0]);
+    assert!(
+        matches!(index, ObjectIndex::One(held) if held == ids[0]),
+        "one id must be held inline"
+    );
+    assert_eq!(control_set(&ids[..1]).into_iter().collect::<Vec<u64>>(), index.sorted_ids());
+    assert_eq!(
+        index.slot_of(&ids[0]),
+        Some(0),
+        "the inline id must answer slot 0, or `One` and a one-slot array are distinguishable"
+    );
+
+    for (at, id) in ids.iter().enumerate().skip(1) {
+        index.insert(*id);
+        control.insert(*id);
+        assert!(
+            matches!(index, ObjectIndex::Many(_)),
+            "at {at} ids the index must have taken the multi-entry arm"
+        );
+        assert_eq!(
+            control.iter().copied().collect::<Vec<u64>>(),
+            index.sorted_ids(),
+            "growing to {} ids lost or gained an entry",
+            at + 1
+        );
+        assert_eq!(
+            index.slot_of(id),
+            Some(at),
+            "id {id} did not append into slot {at}, so growing renumbers"
+        );
+        for held in &control {
+            assert!(index.contains(held), "the index stopped finding {held} after growing");
+        }
+    }
+    assert_eq!(
+        ids.len(),
+        index.slot_count(),
+        "growing by appends left {} slots for {} ids",
+        index.slot_count(),
+        ids.len()
+    );
+
+    // --- SHRINK: Many -> One -> Empty, removing back down from the TOP. Every victim is the last
+    // slot, so every removal trims a tail and nothing is left holding a placeholder -- which is what
+    // makes the array end at `Empty` rather than at an array of holes.
+    for id in ids.iter().rev() {
+        index.remove(id);
+        control.remove(id);
+        assert_eq!(
+            control.iter().copied().collect::<Vec<u64>>(),
+            index.sorted_ids(),
+            "shrinking past {id} lost or kept the wrong entry"
+        );
+        for held in &control {
+            assert!(index.contains(held), "the index stopped finding {held} after shrinking");
+            assert!(
+                index.slot_of(held).is_some(),
+                "{held} is contained but has no slot, so the two readers disagree"
+            );
+        }
+        assert_eq!(control.len(), index.object_count(), "the count disagrees with the control");
+        assert_eq!(
+            control.len(),
+            index.slot_count(),
+            "removing from the TOP left {} slots for {} ids, so a tail of placeholders was kept",
+            index.slot_count(),
+            control.len()
+        );
+    }
+
+    assert!(index.is_empty(), "removing every id must leave the index empty");
+    assert!(
+        matches!(index, ObjectIndex::Empty),
+        "an index that has been emptied must be back in the arm that costs nothing, or a bucket \
+         that briefly held two objects keeps an allocation for the rest of its life"
+    );
+
+    // --- THE TWO COLLAPSES, which differ by whether anything would be renumbered. ---
+    //
+    // (i) REMOVE THE LAST OF TWO. The survivor is in slot 0 with no slot above it, so `One` and the
+    // array are indistinguishable through `slot_of`/`id_at` and the allocation goes back.
+    let mut two: ObjectIndex = [500u64, 100].into_iter().collect();
+    assert_eq!(two.slot_of(&500), Some(0), "500 was filed first and must hold slot 0");
+    assert_eq!(two.slot_of(&100), Some(1), "100 was filed second and must hold slot 1");
+    assert!(two.remove(&100), "removing the id in the last slot must report a removal");
+    assert!(
+        matches!(two, ObjectIndex::One(500)),
+        "after shrinking to one the remaining id must be 500, held inline; it is {two:?}"
+    );
+    assert_eq!(two.id_at(0), Some(500), "slot 0 must still name 500");
+    assert_eq!(two.id_at(1), None, "there must be no slot 1");
+
+    // (ii) REMOVE THE FIRST OF TWO. The survivor is in slot 1, so the arm must STAY, placeholder and
+    // all. This is the case the old `shrink` collapsed, retiring slot 1 and renumbering the survivor.
+    let mut two: ObjectIndex = [500u64, 100].into_iter().collect();
+    assert!(two.remove(&500), "removing the id in slot 0 must report a removal");
+    assert!(
+        matches!(two, ObjectIndex::Many(_)),
+        "the arm collapsed with a live id in slot 1: that renumbers the survivor to slot 0 and \
+         retires slot 1. It is {two:?}"
+    );
+    assert_eq!(two.object_count(), 1, "one id must be left");
+    assert_eq!(two.slot_count(), 2, "the placeholder must still occupy slot 0");
+    assert_eq!(two.id_at(0), None, "slot 0 must be a placeholder");
+    assert_eq!(two.id_at(1), Some(100), "slot 1 must still name 100");
+    assert_eq!(two.sorted_ids(), vec![100u64], "the survivor is not the right id");
+    // And removing the survivor gives everything back, because no live slot is left to preserve.
+    assert!(two.remove(&100), "removing the survivor must report a removal");
+    assert!(matches!(two, ObjectIndex::Empty), "an emptied array must cost nothing; it is {two:?}");
+}
+
+/// THE TOMBSTONE SIDE HAS EXACTLY ONE SPELLING FOR "NOTHING", AND GIVES THE ALLOCATION BACK.
+///
+/// The shape only pays while a bucket that carries no tombstone costs one null pointer, so a
+/// bucket that carried one and had it cleared has to return to that state rather than keeping an
+/// empty box for the rest of its life. Two buckets holding no tombstone must also compare equal,
+/// which they cannot if "nothing" has two spellings.
+#[test]
+fn the_tombstone_index_gives_its_allocation_back_when_it_empties() {
+    let mut tombstones = DeletedObjectIndex::default();
+    assert!(tombstones.is_empty(), "a fresh tombstone index holds nothing");
+    assert_eq!(0, tombstones.object_count());
+    assert!(!tombstones.contains(&7), "a fresh index cannot contain anything");
+    assert!(!tombstones.remove(&7), "removing from a fresh index reports nothing");
+    assert_eq!(
+        DeletedObjectIndex::default(),
+        tombstones,
+        "an index that has never held anything must equal a fresh one"
+    );
+
+    tombstones.extend([9u64, 4, 9]);
+    // SORTED, not iterated: the arm is a slot array, so `iter` yields the order the ids were filed
+    // (9 then 4) while `sorted_ids` -- which is what the Serialize impl writes -- is ascending.
+    assert_eq!(vec![9u64, 4], tombstones.iter().copied().collect::<Vec<u64>>());
+    assert_eq!(vec![4u64, 9], tombstones.sorted_ids());
+    assert_eq!(2, tombstones.object_count(), "the repeated id must have collapsed");
+    assert!(tombstones.contains(&9) && tombstones.contains(&4));
+    assert_ne!(
+        DeletedObjectIndex::default(),
+        tombstones,
+        "an index holding two ids must not equal an empty one"
+    );
+
+    assert!(tombstones.remove(&4));
+    assert_eq!(vec![9u64], tombstones.iter().copied().collect::<Vec<u64>>());
+    assert!(tombstones.remove(&9));
+    assert!(tombstones.is_empty(), "removing the last id must leave it empty");
+    assert_eq!(
+        DeletedObjectIndex::default(),
+        tombstones,
+        "an index emptied by removal must compare EQUAL to a fresh one; it does not, so \
+         `nothing` has two spellings and the empty state is still carrying an allocation"
+    );
+
+    // The round trip: emptied, it writes and loads as the empty sequence it always did.
+    let json = serde_json::to_string(&tombstones).expect("serializes");
+    assert_eq!("[]", json, "an emptied tombstone index must still spell itself []");
+    let loaded: DeletedObjectIndex = serde_json::from_str("[]").expect("loads");
+    assert_eq!(DeletedObjectIndex::default(), loaded, "an empty sequence must load as nothing");
+    let loaded: DeletedObjectIndex = serde_json::from_str("[5,5,2]").expect("loads");
+    assert_eq!(
+        vec![5u64, 2],
+        loaded.iter().copied().collect::<Vec<u64>>(),
+        "a loaded sequence arrives in the slots the WIRE order hands out: it is re-filed through \
+         `insert`, so 5 takes slot 0 and 2 takes slot 1"
+    );
+    assert_eq!(
+        vec![2u64, 5],
+        loaded.sorted_ids(),
+        "a loaded sequence must still be DEDUPLICATED, and sortable back to what the tree form \
+         iterated"
+    );
+    assert_eq!(
+        "[2,5]",
+        serde_json::to_string(&loaded).expect("serializes"),
+        "and must WRITE ascending whatever slots it loaded into, or a reload would move the bytes"
+    );
+}
+
+/// THE STORED SPELLING OF THE OBJECT SIDE DID NOT MOVE, DRIVEN IN BOTH DIRECTIONS.
+///
+/// The strings below are CAPTURED BYTES, not expectations written by hand: each one is what a
+/// binary built at `5f86d420f` wrote for the same fixture, read out of that binary's own output.
+/// Driving it that way is the point -- the two representations are different containers holding
+/// the same ids, and whether they write the same sequence is a question about two binaries and
+/// not about one reading of the code.
+///
+///   * NEW WRITE, OLD BYTES. Every fixture serializes to exactly the string the older binary
+///     wrote for it, key for key and element for element.
+///   * OLD WRITE, NEW READ. Every one of those strings loads here and recovers the object sets
+///     ELEMENT BY ELEMENT, compared against a control built from the container the arm used to
+///     hold -- so a run that arrived out of order, short an id, or carrying a duplicate fails.
+///
+/// The sets span the cases that can differ: nothing, one, several, and the extremes of the id
+/// range -- `0` and `u64::MAX`, which are where a representation that reserved a bit for a tag
+/// would have lost an id.
+#[test]
+fn the_stored_spelling_of_the_object_side_moved_in_exactly_the_live_object_list() {
+    // (name, live ids, tombstone ids, the bytes `5f86d420f` wrote)
+    let fixtures: Vec<(&str, Vec<u64>, Vec<u64>, &str)> = vec![
+        (
+            "nothing on either side",
+            vec![],
+            vec![],
+            "{\"routing_slot\":7,\"layout\":\"MultiObject\",\"dirty\":true,\"deleted\":false,\
+             \"meta_loaded\":true,\"loading\":false,\"in_memory\":true,\"ttl_ms\":5000,\
+             \"dirty_generation\":3,\"last_dump_sequence\":11,\"object_index\":[],\
+             \"deleted_object_index\":[],\"page_index\":{}}",
+        ),
+        (
+            "one object, no tombstone",
+            vec![42],
+            vec![],
+            "{\"routing_slot\":7,\"layout\":\"MultiObject\",\"dirty\":true,\"deleted\":false,\
+             \"meta_loaded\":true,\"loading\":false,\"in_memory\":true,\"ttl_ms\":5000,\
+             \"dirty_generation\":3,\"last_dump_sequence\":11,\"object_index\":[42],\
+             \"deleted_object_index\":[],\"page_index\":{}}",
+        ),
+        (
+            "one object, one tombstone",
+            vec![42],
+            vec![42],
+            "{\"routing_slot\":7,\"layout\":\"MultiObject\",\"dirty\":true,\"deleted\":false,\
+             \"meta_loaded\":true,\"loading\":false,\"in_memory\":true,\"ttl_ms\":5000,\
+             \"dirty_generation\":3,\"last_dump_sequence\":11,\"object_index\":[42],\
+             \"deleted_object_index\":[42],\"page_index\":{}}",
+        ),
+        (
+            "several objects and several tombstones, both ends of the id range",
+            vec![9, 1, u64::MAX, 0, 7],
+            vec![u64::MAX, 0],
+            "{\"routing_slot\":7,\"layout\":\"MultiObject\",\"dirty\":true,\"deleted\":false,\
+             \"meta_loaded\":true,\"loading\":false,\"in_memory\":true,\"ttl_ms\":5000,\
+             \"dirty_generation\":3,\"last_dump_sequence\":11,\
+             \"object_index\":[0,1,7,9,18446744073709551615],\
+             \"deleted_object_index\":[0,18446744073709551615],\"page_index\":{}}",
+        ),
+        (
+            "several objects, no tombstone",
+            vec![300, 200, 100],
+            vec![],
+            "{\"routing_slot\":7,\"layout\":\"MultiObject\",\"dirty\":true,\"deleted\":false,\
+             \"meta_loaded\":true,\"loading\":false,\"in_memory\":true,\"ttl_ms\":5000,\
+             \"dirty_generation\":3,\"last_dump_sequence\":11,\"object_index\":[100,200,300],\
+             \"deleted_object_index\":[],\"page_index\":{}}",
+        ),
+    ];
+
+    assert_eq!(5, fixtures.len(), "all five captured spellings must be driven");
+    // WHAT MOVED, AS A LITERAL PAIR PER FIXTURE and never computed from the node under test.
+    //
+    // The live object list is written in SLOT order now rather than ascending, so the two fixtures
+    // that file more than one object in a non-ascending order write different bytes. Every other
+    // byte -- including the whole tombstone side, which stays ascending because nothing names a
+    // tombstone by slot -- is still compared against what the older binary wrote.
+    //
+    // Stated as (fixture, old spelling, new spelling) rather than re-captured wholesale, so the
+    // diff says which field moved and a move anywhere else still fails the equality below.
+    let object_list_moved: [(&str, &str, &str); 2] = [
+        (
+            "several objects and several tombstones, both ends of the id range",
+            "\"object_index\":[0,1,7,9,18446744073709551615]",
+            "\"object_index\":[9,1,18446744073709551615,0,7]",
+        ),
+        (
+            "several objects, no tombstone",
+            "\"object_index\":[100,200,300]",
+            "\"object_index\":[300,200,100]",
+        ),
+    ];
+    let mut reached_moved = 0usize;
+    let mut round_trip_bytes_differed = 0usize;
+    let mut reached_unmoved = 0usize;
+    let mut reached_multi_live = 0usize;
+    let mut reached_multi_dead = 0usize;
+
+    for (name, live, dead, captured) in &fixtures {
+        let node = BucketNode {
+            routing_bucket: 7,
+            layout: BucketLayoutState::MultiObject,
+            flags: BucketFlags::default().with(BucketFlags::DIRTY, true).with(BucketFlags::DELETED, false).with(BucketFlags::META_LOADED, true).with(BucketFlags::LOADING, false).with(BucketFlags::IN_MEMORY, true),
+            ttl_ms: BucketTtl::from_ms(Some(5_000)),
+            dirty_generation: 3,
+            first_dirty_wal_sequence: 41,
+            first_dirty_index_log_sequence: 42,
+            object_index: live.iter().copied().collect(),
+            deleted_object_index: dead.iter().copied().collect(),
+            block_index: BlockIndexMap::default(),
+            tombstone_elements: TombstoneElements::default(),
+        };
+        if live.len() >= 2 {
+            reached_multi_live += 1;
+        }
+        if dead.len() >= 2 {
+            reached_multi_dead += 1;
+        }
+
+        // --- NEW WRITE, against the bytes the older binary produced, MINUS ONE KEY. ---
+        //
+        // `last_dump_sequence` is the only difference, and it is DERIVED from the captured string
+        // rather than written out again by hand: the expectation is the older binary's own bytes
+        // with that one key deleted, so every other byte is still being compared against what
+        // `5f86d420f` wrote. The assertion below that the deletion changed something is what stops
+        // this reading as an equality against itself.
+        let mut expected_now = captured.replace("\"last_dump_sequence\":11,", "");
+        match object_list_moved.iter().find(|(fixture, _, _)| fixture == name) {
+            Some((_, was, now)) => {
+                assert!(
+                    expected_now.contains(was),
+                    "{name}: the captured spelling does not contain {was}, so the stated move is \
+                     against bytes this fixture never wrote"
+                );
+                expected_now = expected_now.replace(was, now);
+                assert!(
+                    !expected_now.contains(was),
+                    "{name}: the stated move left the old spelling in place"
+                );
+                reached_moved += 1;
+            }
+            None => {
+                // Nothing to move: with fewer than two objects filed, slot order IS ascending, so
+                // the positional spelling and the ascending one are the same bytes.
+                assert!(
+                    live.len() < 2,
+                    "{name}: {} objects are filed and no move is stated for this fixture, so a \
+                     spelling that moved would be read as one that did not",
+                    live.len()
+                );
+                reached_unmoved += 1;
+            }
+        }
+        assert_ne!(
+            *captured, expected_now,
+            "{name}: the captured spelling does not contain the key this change removes, so the \
+             expectation below is the captured string unmodified and proves nothing about the \
+             removal"
+        );
+        let written = serde_json::to_string(&crate::engine::state::NodeNamedBy(&node, &[])).expect("a node serializes");
+        assert_eq!(
+            expected_now, written,
+            "{name}: the stored spelling moved against what 5f86d420f wrote, in some way other \
+             than dropping last_dump_sequence"
+        );
+
+        // --- OLD WRITE, NEW READ, element by element against the control. ---
+        let loaded: BucketNode = serde_json::from_str(captured).expect("the older bytes must load");
+        let control_live: Vec<u64> = control_set(live).into_iter().collect();
+        let control_dead: Vec<u64> = control_set(dead).into_iter().collect();
+        assert_eq!(
+            control_live,
+            loaded.object_index.iter().copied().collect::<Vec<u64>>(),
+            "{name}: the live object set did not come back element for element"
+        );
+        assert_eq!(
+            control_dead,
+            loaded.deleted_object_index.iter().copied().collect::<Vec<u64>>(),
+            "{name}: the tombstone set did not come back element for element"
+        );
+        assert_eq!(control_live.len(), loaded.object_index.object_count(), "{name}: live count moved");
+        assert_eq!(
+            control_dead.len(),
+            loaded.deleted_object_index.object_count(),
+            "{name}: tombstone count moved"
+        );
+        for id in &control_live {
+            assert!(loaded.object_index.contains(id), "{name}: {id} loaded but cannot be found");
+        }
+        for id in &control_dead {
+            assert!(
+                loaded.deleted_object_index.contains(id),
+                "{name}: tombstone {id} loaded but cannot be found"
+            );
+        }
+
+        // AND WHAT IT LOADED WRITES BACK TO ITS OWN BYTES, which is a DIFFERENT expectation from
+        // the new write above and was briefly conflated with it.
+        //
+        // The new write is in slot order, because a freshly built node filed its objects in the
+        // fixture's order. A node LOADED from the older ascending bytes has its objects in
+        // ASCENDING slots -- that is where the old loader would have put them too -- so it
+        // re-serializes as the ascending sequence it came from. An older index therefore rewrites
+        // as itself and no store renumbers by being read.
+        //
+        // So this compares against the captured bytes WITHOUT the stated move applied, and the
+        // assertion below that the two expectations differ is what stops this reading as a
+        // duplicate of the one above.
+        let expected_round_trip = captured.replace("\"last_dump_sequence\":11,", "");
+        let round =
+            serde_json::to_string(&crate::engine::state::NodeNamedBy(&loaded, &[])).expect("a loaded node re-serializes");
+        assert_eq!(
+            expected_round_trip, round,
+            "{name}: a load-then-write did not round-trip to the bytes it was read from, so \
+             reading an older index moves its slots"
+        );
+        if object_list_moved.iter().any(|(fixture, _, _)| fixture == name) {
+            assert_ne!(
+                expected_round_trip, expected_now,
+                "{name}: the new write and the load-then-write expect the same bytes on a fixture \
+                 whose spelling moved, so one of the two assertions is redundant"
+            );
+            round_trip_bytes_differed += 1;
+        }
+    }
+
+    // --- NON-VACUITY: the fixtures must reach the arms this change touched. ---
+    assert!(
+        round_trip_bytes_differed == 2,
+        "{round_trip_bytes_differed} fixtures showed a new write and a load-then-write expecting \
+         different bytes. Both fixtures whose spelling moved must, or the claim that an older index \
+         rewrites as itself is not being driven"
+    );
+    assert!(
+        reached_moved == 2,
+        "the stated move was applied to {reached_moved} fixtures, not the two that file more than \
+         one object out of order. A move applied to none would make every equality below an \
+         equality against the old bytes"
+    );
+    assert!(
+        reached_unmoved >= 2,
+        "only {reached_unmoved} fixtures were asserted NOT to move, so nothing here shows the \
+         change is confined to the arm that holds several objects"
+    );
+    assert!(
+        reached_multi_live >= 2,
+        "only {reached_multi_live} fixtures hold two or more objects; the arm this change \
+         rewrote would barely be driven"
+    );
+    assert!(
+        reached_multi_dead >= 1,
+        "no fixture holds two or more tombstones, so the tombstone side's boxed arm is untested"
+    );
+
+    // --- A SPELLING THAT DIFFERS MUST BE SEEN TO DIFFER. ---
+    //
+    // The control for the comparison above: every assertion in this test is an equality against
+    // a captured string, and an equality that cannot fail proves nothing. One byte is changed in
+    // a captured spelling and the same comparison must reject it.
+    let (_, _, _, captured) = &fixtures[3];
+    let injected = captured.replace("\"object_index\":[0,1,7,9", "\"object_index\":[1,7,9");
+    assert_ne!(*captured, injected.as_str(), "the injection must change the string");
+    let short: BucketNode = serde_json::from_str(&injected).expect("the injected bytes load");
+    assert_ne!(
+        vec![0u64, 1, 7, 9, u64::MAX],
+        short.object_index.iter().copied().collect::<Vec<u64>>(),
+        "a spelling with an id removed compared EQUAL to the full one; the element-by-element \
+         comparison above cannot report a difference and proves nothing"
+    );
+    assert_eq!(4, short.object_index.object_count(), "the injected spelling must hold one id fewer");
+}
+
+/// A TOMBSTONE'S ELEMENT NAME IS ON THE WIRE, AND AN ORDINARY NODE STILL SPELLS WHAT IT DID.
+///
+/// The element a removal is about moved OFF the page entry and onto the bucket, which makes it a
+/// stored format in a new place. Two things have to hold and they pull in opposite directions, so
+/// both are driven here rather than one being inferred from the other:
+///
+///   * A NODE WITH NO REMOVAL MUST NOT GROW A KEY.
+///     `the_stored_spelling_of_a_bucket_node_did_not_move` above is that half, and it asserts the
+///     exact byte string -- so the skip-when-empty is already held by a golden that fails on an
+///     added key. This arm only re-states the consequence: the key is ABSENT, not `[]`.
+///   * A NODE WITH A REMOVAL MUST CARRY THE ELEMENT AND READ IT BACK. Without this the row is
+///     written and dropped, and a removal survives a reload as a tombstone entry nothing can
+///     identify: the next re-add cannot find it to clear, so it is restated for ever, and the
+///     retention stops being bounded at one row per distinct element removed. That is the
+///     "a removal must keep working across a cold reload" property, at the layer that decides it.
+///
+/// THE ROUND TRIP IS THE ASSERTION, not the presence of the key. A key that is written and then
+/// IGNORED on the way in -- which is what an unlisted name does, because the node's field resolver
+/// maps anything it does not know to `Ignore` -- produces exactly the same serialized bytes as a
+/// key that works. So the row is read back and compared whole.
+#[test]
+fn a_bucket_nodes_tombstone_rows_survive_the_wire() {
+    let address =
+        crate::block_store::ElementEntry::from_parts(3, 128, 48, Some(2), Some(99));
+    let mut node = wire_fixture(Some(5_000));
+    node.record_tombstone_element(
+        &std::sync::Arc::from("tw/set"),
+        crate::engine::storage_bucket_internals::stored_model_kind("set"),
+        "6d2d31",
+        &address,
+    );
+    assert_eq!(
+        1,
+        node.tombstone_elements.len(),
+        "the fixture did not record a row, so the round trip below would hold vacuously"
+    );
+
+    let bytes = serde_json::to_string(&crate::engine::state::NodeNamedBy(&node, &[])).expect("a node serializes");
+    assert!(
+        bytes.contains("\"tombstone_elements\":"),
+        "a node holding a removal did not write the element it is about: {bytes}"
+    );
+    assert!(
+        bytes.contains("6d2d31"),
+        "the key is written but the element name is not in it: {bytes}"
+    );
+
+    // AND THE EMPTY NODE IS STILL SILENT, stated here beside its opposite so the two cannot drift.
+    let empty =
+        serde_json::to_string(&crate::engine::state::NodeNamedBy(&wire_fixture(Some(5_000)), &[])).expect("a node serializes");
+    assert!(
+        !empty.contains("tombstone_elements"),
+        "a bucket that has never had a removal grew a key: {empty}"
+    );
+
+    let back: BucketNode = serde_json::from_str(&bytes).expect("a node deserializes");
+    assert_eq!(
+        node.tombstone_elements, back.tombstone_elements,
+        "the tombstone rows did not survive the wire: wrote {:?}, read {:?}",
+        node.tombstone_elements, back.tombstone_elements
+    );
+    assert_eq!(
+        Some((3, 128, 48)),
+        back.tombstone_element_block(
+            "tw/set",
+            crate::engine::storage_bucket_internals::stored_model_kind("set"),
+            "6d2d31"
+        ),
+        "the reloaded node cannot answer which page this element's tombstone is on, which is the \
+         question a re-add asks to clear it"
+    );
+}
