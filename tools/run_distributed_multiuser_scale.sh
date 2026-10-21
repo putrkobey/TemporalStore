@@ -13,3 +13,18 @@ SHARDS="${TS_MU_SHARDS:-32}"
 USERS="${TS_MU_USERS:-32}"
 STRINGS="${TS_MU_STRINGS_PER_USER:-600}"
 FEATURES="${TS_MU_FEATURES_PER_USER:-300}"
+ITERATIONS="${TS_MU_ITERATIONS:-3}"
+MEMORY_BYTES="${TS_MU_MEMORY_BYTES:-524288}"
+VALUE_BYTES="${TS_MU_VALUE_BYTES:-96}"
+GROWTH="${TS_MU_SCALE_GROWTH_PERCENT:-60}"
+
+cargo run --release -p temporalstore-rust --bin distributed_multiuser_scale_harness -- \
+  --datanodes "${DATANODES}" \
+  --shards "${SHARDS}" \
+  --users "${USERS}" \
+  --string-records-per-user "${STRINGS}" \
+  --feature-points-per-user "${FEATURES}" \
+  --iterations "${ITERATIONS}" \
+  --memory-bytes "${MEMORY_BYTES}" \
+  --value-bytes "${VALUE_BYTES}" \
+  --scale-growth-percent "${GROWTH}"
