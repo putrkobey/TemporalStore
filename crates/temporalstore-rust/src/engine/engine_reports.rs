@@ -1064,3 +1064,3202 @@ pub struct BucketDumpFollowerRetentionBlock {
     pub manifest_id: String,
     #[serde(rename = "manifest_wal_sequence")]
     pub manifest_wal_sequence: u64,
+    pub manifest_index_log_sequence: u64,
+    #[serde(rename = "cursor_wal_sequence")]
+    pub cursor_wal_sequence: u64,
+    pub cursor_index_log_sequence: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BucketDumpRaftSnapshotRetentionBlock {
+    pub snapshot_id: String,
+    pub manifest_id: String,
+    #[serde(rename = "manifest_wal_sequence")]
+    pub manifest_wal_sequence: u64,
+    pub manifest_index_log_sequence: u64,
+    #[serde(rename = "snapshot_wal_sequence")]
+    pub snapshot_wal_sequence: u64,
+    pub snapshot_index_log_sequence: u64,
+    pub last_included_index: u64,
+    pub last_included_term: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageLifecyclePlan {
+    pub shard_id: ShardId,
+    #[serde(alias = "dirty_slots")]
+    pub dirty_buckets: Vec<u32>,
+    pub selected_dump_buckets: Vec<u32>,
+    #[serde(rename = "undumped_wal_records", default)]
+    pub undumped_wal_records: u64,
+    /// The same suffix, counted in OBJECT MUTATIONS rather than in log records.
+    ///
+    /// Reported beside `undumped_wal_records` and NOT compared against any threshold. The two
+    /// disagree by whatever factor the writer batches -- 2,000 against 4 on the same 2,000
+    /// objects -- and only this one is the work a restart redoes. Switching
+    /// `min_undumped_wal_records` to compare against it is a one-line change that needs a default
+    /// expressed in the new unit; it can only ever make the gate fire EARLIER, because a record
+    /// carries at least one mutation, so it cannot lengthen the window a restart must replay.
+    #[serde(default)]
+    pub undumped_wal_objects: u64,
+    #[serde(default)]
+    pub dump_delayed: bool,
+    /// Every bucket's storage summary, or `None` when this round did not look.
+    ///
+    /// AN EMPTY VECTOR AND "I DID NOT LOOK" ARE DIFFERENT ANSWERS, and before this field became
+    /// an `Option` they were the same value. Populating it means walking every live page in the
+    /// shard, which the plan did unconditionally because this is an OUTPUT field -- so an idle
+    /// shard paid a whole-shard walk every maintenance round to fill a vector that every consumer
+    /// reduces to a count or a sum.
+    ///
+    /// The walk is now conditional (see `storage_lifecycle_plan`), and `None` is what a round
+    /// that skipped it reports. It is NOT "the shard has no buckets": a settled shard holding
+    /// millions of live pages reports `None` here on every round. Consumers must not paper over
+    /// it with `unwrap_or_default()` -- a zero derived that way is indistinguishable from a
+    /// measured zero, and publishing one as a metric is how an idle shard comes to look empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket_summaries: Option<Vec<BucketStorageSummary>>,
+    pub live_block_slab_ids: Vec<u64>,
+    pub stale_block_slab_ids: Vec<u64>,
+    #[serde(default)]
+    pub reclaim_candidates: Vec<StorageReclaimCandidate>,
+    #[serde(alias = "delayed_destroy_page_segment_ids")]
+    pub delayed_destroy_block_slab_ids: Vec<u64>,
+    pub reclaimable_physical_bytes: u64,
+    pub reasons: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageReclaimCandidate {
+    #[serde(rename = "block_segment_id", alias = "page_segment_id")]
+    pub block_slab_id: u64,
+    pub physical_bytes: u64,
+    pub live_physical_bytes: u64,
+    pub stale_physical_bytes: u64,
+    pub block_count: u64,
+    pub live_block_refs: u64,
+    pub stale_block_estimate: u64,
+    pub live_ref_density_basis_points: u64,
+    pub reclaim_score: u64,
+    pub reason: String,
+}
+
+/// What a compaction round would relocate, and why, composed from per-object answers.
+///
+/// `relocatable_block_refs` is the whole decision: zero means no object holds a page on a slab
+/// anyone wants emptied, so a round would roll a fresh slab, copy every live page onto it
+/// verbatim, and leave the slab it emptied behind as the reason the next round runs.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShardCompactionRelocationHint {
+    pub shard_id: ShardId,
+    /// Objects the hint was asked about. The denominator: zero here makes every count below
+    /// trivially zero for a reason that has nothing to do with compaction.
+    pub examined_object_count: u64,
+    pub relocatable_object_count: u64,
+    pub relocatable_block_refs: u64,
+    /// Slabs carrying dead space that objects still hold pages on: compaction's job.
+    pub drain_block_slab_ids: Vec<u64>,
+    /// Slabs holding nothing but dead space: the collector's job, and nothing compaction can act
+    /// on. A round triggered by these is the self-retrigger.
+    pub collector_only_block_slab_ids: Vec<u64>,
+    pub relocatable_block_refs_by_model: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageBlockGcReplayCursor {
+    pub cursor_id: String,
+    pub shard_id: ShardId,
+    pub retain_from_block_slab_id: u64,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageBlockGcDependencyBlock {
+    #[serde(rename = "block_segment_id", alias = "page_segment_id")]
+    pub block_slab_id: u64,
+    pub dependency: String,
+    #[serde(default)]
+    pub owner_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_from_block_slab_id: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retain_until_unix_ms: Option<u64>,
+    #[serde(default)]
+    pub reason: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageBlockGcDependencyPlan {
+    pub shard_id: ShardId,
+    pub safe_to_reclaim: bool,
+    pub candidate_block_slab_ids: Vec<u64>,
+    pub reclaimable_block_slab_ids: Vec<u64>,
+    pub blocked_block_slab_ids: Vec<u64>,
+    pub live_block_slab_ids: Vec<u64>,
+    pub manifest_block_slab_ids: Vec<u64>,
+    pub shared_store_cursor_count: usize,
+    pub checkpoint_snapshot_floor: Option<u64>,
+    pub raft_snapshot_install_floor: Option<u64>,
+    pub delayed_destroy_grace_ms: u64,
+    #[serde(default)]
+    pub live_ref_block_count: usize,
+    #[serde(default)]
+    pub bucket_dump_manifest_block_count: usize,
+    #[serde(default)]
+    pub shared_store_cursor_block_count: usize,
+    #[serde(default)]
+    pub raft_snapshot_ref_block_count: usize,
+    #[serde(default)]
+    pub checkpoint_snapshot_floor_block_count: usize,
+    #[serde(default)]
+    pub raft_snapshot_install_floor_block_count: usize,
+    #[serde(default)]
+    pub delayed_destroy_grace_block_count: usize,
+    pub dependency_blocks: Vec<StorageBlockGcDependencyBlock>,
+    pub blocker_reasons: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicStorageContract {
+    pub page_address: String,
+    pub block_address: String,
+    pub page_index_entry: String,
+    pub block_index_entry: String,
+    pub object_index_entry: String,
+    pub storage_zone: String,
+    pub stream: String,
+    #[serde(alias = "segment")]
+    pub slab: String,
+    /// NOT folded into [`Self::slab`], deliberately.
+    ///
+    /// This struct is a CATALOG of the public storage vocabulary, one entry per published name,
+    /// and its keys are the wire. `slab` sits right beside it, so folding the two would delete a
+    /// published entry rather than rename a field -- a wire change wearing a rename's clothes.
+    /// Everywhere else in the crate a band is spelled slab; here the older name is the payload.
+    pub band: String,
+    #[serde(alias = "slot")]
+    pub bucket: String,
+    pub append_watermark: String,
+    pub compaction_watermark: String,
+    #[serde(rename = "tombstone")]
+    pub delete_marker: String,
+    pub gc_eligibility: String,
+    pub follower_cursor_safety: String,
+    pub compatibility_aliases: BTreeMap<String, String>,
+}
+
+impl Default for PublicStorageContract {
+    fn default() -> Self {
+        fn text(value: &str) -> String {
+            value.to_string()
+        }
+
+        let mut compatibility_aliases = BTreeMap::new();
+        compatibility_aliases.insert(text("page_store"), text("StorageZone"));
+        compatibility_aliases.insert(text("block_store"), text("ElementEntry"));
+        compatibility_aliases.insert(text("object_index"), text("ObjectIndexEntry"));
+        compatibility_aliases.insert(text("page_segment_id"), text("segment_id"));
+        compatibility_aliases.insert(text("wal"), text("AppendWatermark"));
+        compatibility_aliases.insert(text("stream_blob"), text("Stream"));
+
+        Self {
+            page_address: text("ElementEntry"),
+            block_address: text("ElementEntry"),
+            page_index_entry: text("PageIndexEntry"),
+            block_index_entry: text("BlockIndexEntry"),
+            object_index_entry: text("ObjectIndexEntry"),
+            storage_zone: text("StorageZone"),
+            stream: text("Stream"),
+            slab: text("Segment"),
+            band: text("Band"),
+            bucket: text("Slot"),
+            append_watermark: text("AppendWatermark"),
+            compaction_watermark: text("CompactionWatermark"),
+            delete_marker: text("Tombstone"),
+            gc_eligibility: text("GcEligibility"),
+            follower_cursor_safety: text("FollowerCursorSafety"),
+            compatibility_aliases,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicStorageFeatureShapes {
+    pub page_address_fields: Vec<String>,
+    pub block_address_fields: Vec<String>,
+    pub page_index_entry_fields: Vec<String>,
+    pub block_index_entry_fields: Vec<String>,
+    pub object_index_entry_fields: Vec<String>,
+    pub storage_zone_fields: Vec<String>,
+    pub stream_fields: Vec<String>,
+    #[serde(alias = "segment_fields")]
+    pub slab_fields: Vec<String>,
+    /// NOT folded into [`Self::slab_fields`], for the reason on [`PublicStorageContract::band`].
+    pub band_fields: Vec<String>,
+    #[serde(alias = "slot_fields")]
+    pub bucket_fields: Vec<String>,
+    pub append_watermark_fields: Vec<String>,
+    pub compaction_watermark_fields: Vec<String>,
+    #[serde(rename = "tombstone_fields")]
+    pub delete_marker_fields: Vec<String>,
+    pub gc_eligibility_fields: Vec<String>,
+    pub follower_cursor_safety_fields: Vec<String>,
+}
+
+impl Default for PublicStorageFeatureShapes {
+    fn default() -> Self {
+        Self {
+            page_address_fields: public_storage_strings(&[
+                "shard_id",
+                "zone_id",
+                "segment_id",
+                "page_id",
+                "offset",
+                "length",
+                "generation",
+            ]),
+            block_address_fields: public_storage_strings(&[
+                "shard_id", "zone_id", "block_id", "offset", "length", "checksum",
+            ]),
+            page_index_entry_fields: public_storage_strings(&[
+                "logical_key",
+                "timestamp_range",
+                "page_addresses",
+                "append_watermark",
+                "generation",
+            ]),
+            block_index_entry_fields: public_storage_strings(&[
+                "page_address",
+                "block_address",
+                "band",
+                "checksum",
+                "generation",
+            ]),
+            object_index_entry_fields: public_storage_strings(&[
+                "model",
+                "table",
+                "object_key",
+                "page_chain",
+                "tombstone",
+                "generation",
+            ]),
+            storage_zone_fields: public_storage_strings(&[
+                "zone_id",
+                "total_bytes",
+                "used_bytes",
+                "stale_bytes",
+                "segments",
+            ]),
+            stream_fields: public_storage_strings(&[
+                "stream_id",
+                "segments",
+                "rollover_count",
+                "sealed_segment_count",
+            ]),
+            slab_fields: public_storage_strings(&[
+                "segment_id",
+                "band",
+                "start_offset",
+                "sealed",
+                "generation",
+            ]),
+            band_fields: public_storage_strings(&[
+                "band",
+                "block_range",
+                "reclaim_state",
+                "generation",
+            ]),
+            bucket_fields: public_storage_strings(&[
+                "slot_id",
+                "dirty_generation",
+                "object_refs",
+                "page_refs",
+                "tombstones",
+                "owner_mismatch_count",
+            ]),
+            append_watermark_fields: public_storage_strings(&[
+                "shard_id",
+                "slot_id",
+                "log_index",
+                "timestamp_ms",
+            ]),
+            compaction_watermark_fields: public_storage_strings(&[
+                "shard_id",
+                "safe_generation",
+                "safe_timestamp_ms",
+                "follower_floor",
+            ]),
+            delete_marker_fields: public_storage_strings(&[
+                "ref",
+                "generation",
+                "deleted_at_ms",
+                "reason",
+            ]),
+            gc_eligibility_fields: public_storage_strings(&[
+                "ref",
+                "eligible_after_ms",
+                "has_tombstone",
+                "follower_safe",
+                "reclaimable_bytes",
+            ]),
+            follower_cursor_safety_fields: public_storage_strings(&[
+                "min_follower_cursor",
+                "blocked_reclaim_bytes",
+                "safe_to_reclaim",
+            ]),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageLifecycleReport {
+    pub shard_id: ShardId,
+    #[serde(default)]
+    pub public_storage_contract: PublicStorageContract,
+    #[serde(default)]
+    pub public_storage_feature_shapes: PublicStorageFeatureShapes,
+    #[serde(default = "effective_storage_tuning_from_env")]
+    pub effective_storage_tuning: BTreeMap<String, StorageContractValue>,
+    #[serde(default = "default_storage_lifecycle_metrics")]
+    pub storage_lifecycle_metrics: BTreeMap<String, u64>,
+    #[serde(default = "default_storage_write_contract_empty")]
+    pub storage_write_contract: BTreeMap<String, StorageContractValue>,
+    #[serde(default = "default_storage_read_contract_empty")]
+    pub storage_read_contract: BTreeMap<String, StorageContractValue>,
+    #[serde(default = "default_storage_cold_scan_contract_empty")]
+    pub storage_cold_scan_contract: BTreeMap<String, StorageContractValue>,
+    #[serde(default = "default_storage_manager_contract_empty")]
+    pub storage_manager_contract: BTreeMap<String, StorageContractValue>,
+    #[serde(default = "default_storage_index_contract_empty")]
+    pub storage_index_contract: BTreeMap<String, StorageContractValue>,
+    #[serde(default = "default_storage_cache_contract_empty")]
+    pub storage_cache_contract: BTreeMap<String, StorageContractValue>,
+    #[serde(default = "default_storage_reclaim_contract_empty")]
+    pub storage_reclaim_contract: BTreeMap<String, StorageContractValue>,
+    #[serde(default = "default_storage_safety_snapshot")]
+    pub storage_safety_snapshot: StorageSafetySnapshot,
+    #[serde(default = "default_storage_watermark_snapshot")]
+    pub storage_watermark_snapshot: StorageWatermarkSnapshot,
+    #[serde(default = "default_storage_gc_snapshot")]
+    pub storage_gc_snapshot: StorageGcSnapshot,
+    #[serde(default = "default_storage_index_snapshot")]
+    pub storage_index_snapshot: StorageIndexSnapshot,
+    #[serde(default = "default_storage_topology_snapshot")]
+    pub storage_topology_snapshot: StorageTopologySnapshot,
+    #[serde(default = "default_storage_write_sequence")]
+    pub storage_write_sequence: Vec<String>,
+    #[serde(default = "default_storage_read_sequence")]
+    pub storage_read_sequence: Vec<String>,
+    #[serde(default = "default_storage_cold_scan_sequence")]
+    pub storage_cold_scan_sequence: Vec<String>,
+    #[serde(default = "default_storage_lifecycle_phases")]
+    pub storage_lifecycle_phases: Vec<String>,
+    #[serde(default = "default_storage_cache_layers")]
+    pub storage_cache_layers: Vec<String>,
+    #[serde(default = "default_storage_cache_semantics")]
+    pub storage_cache_semantics: Vec<String>,
+    #[serde(default = "default_storage_reclaim_semantics")]
+    pub storage_reclaim_semantics: Vec<String>,
+    #[serde(default = "default_storage_reclaim_scope")]
+    pub storage_reclaim_scope: StorageReclaimScope,
+    pub plan: StorageLifecyclePlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dump_manifest: Option<BucketDumpManifest>,
+    pub cache_entries_removed: usize,
+    pub cache_disk_bytes_removed: u64,
+    #[serde(rename = "cache_warmup_block_refs", default)]
+    pub cache_warmup_block_refs: usize,
+    #[serde(default)]
+    pub cache_warmup: StorageCacheWarmupReport,
+    #[serde(alias = "delayed_destroy_purged_segments")]
+    pub delayed_destroy_purged_slabs: Vec<u64>,
+    pub delayed_destroy_purged_bytes: u64,
+    /// Slabs the purge's last-chance re-check found LIVE and put back in the store.
+    ///
+    /// Reported because it is an alarm an operator has to be able to see: it means the collector
+    /// quarantined a slab something still needed, and the re-check is the only reason the bytes
+    /// are still here. A round that restores is not a round that reclaimed nothing -- it is a
+    /// round that caught a bug, and the bug is upstream of the purge.
+    #[serde(default)]
+    pub delayed_destroy_restored_slabs: Vec<u64>,
+    #[serde(default)]
+    pub delayed_destroy_restored_bytes: u64,
+    #[serde(default)]
+    pub manifest_prune_plan: BucketDumpManifestPrunePlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_prune_report: Option<BucketDumpManifestPruneReport>,
+    #[serde(default)]
+    pub install_roll_forward_reports: Vec<BucketDumpInstallRollForwardReport>,
+    #[serde(default)]
+    pub object_lifecycle: StorageObjectLifecycleReport,
+}
+
+impl Default for StorageLifecycleReport {
+    fn default() -> Self {
+        Self {
+            shard_id: ShardId::default(),
+            public_storage_contract: PublicStorageContract::default(),
+            public_storage_feature_shapes: PublicStorageFeatureShapes::default(),
+            effective_storage_tuning: effective_storage_tuning_from_env(),
+            storage_lifecycle_metrics: default_storage_lifecycle_metrics(),
+            storage_write_contract: default_storage_write_contract_empty(),
+            storage_read_contract: default_storage_read_contract_empty(),
+            storage_cold_scan_contract: default_storage_cold_scan_contract_empty(),
+            storage_manager_contract: default_storage_manager_contract_empty(),
+            storage_index_contract: default_storage_index_contract_empty(),
+            storage_cache_contract: default_storage_cache_contract_empty(),
+            storage_reclaim_contract: default_storage_reclaim_contract_empty(),
+            storage_safety_snapshot: default_storage_safety_snapshot(),
+            storage_watermark_snapshot: default_storage_watermark_snapshot(),
+            storage_gc_snapshot: default_storage_gc_snapshot(),
+            storage_index_snapshot: default_storage_index_snapshot(),
+            storage_topology_snapshot: default_storage_topology_snapshot(),
+            storage_write_sequence: default_storage_write_sequence(),
+            storage_read_sequence: default_storage_read_sequence(),
+            storage_cold_scan_sequence: default_storage_cold_scan_sequence(),
+            storage_lifecycle_phases: default_storage_lifecycle_phases(),
+            storage_cache_layers: default_storage_cache_layers(),
+            storage_cache_semantics: default_storage_cache_semantics(),
+            storage_reclaim_semantics: default_storage_reclaim_semantics(),
+            storage_reclaim_scope: default_storage_reclaim_scope(),
+            plan: StorageLifecyclePlan::default(),
+            dump_manifest: None,
+            cache_entries_removed: 0,
+            cache_disk_bytes_removed: 0,
+            cache_warmup_block_refs: 0,
+            cache_warmup: StorageCacheWarmupReport::default(),
+            delayed_destroy_purged_slabs: Vec::new(),
+            delayed_destroy_purged_bytes: 0,
+            delayed_destroy_restored_slabs: Vec::new(),
+            delayed_destroy_restored_bytes: 0,
+            manifest_prune_plan: BucketDumpManifestPrunePlan::default(),
+            manifest_prune_report: None,
+            install_roll_forward_reports: Vec::new(),
+            object_lifecycle: StorageObjectLifecycleReport::default(),
+        }
+    }
+}
+
+impl StorageLifecycleReport {
+    pub fn refresh_public_lifecycle_metrics(&mut self) {
+        let mut metrics = default_storage_lifecycle_metrics();
+        let plan = &self.plan;
+        let object_lifecycle = &self.object_lifecycle;
+        let follower_retention_block_count = self.manifest_prune_plan.follower_blocks.len() as u64;
+
+        fn put(metrics: &mut BTreeMap<String, u64>, name: &str, value: u64) {
+            metrics.insert(name.to_string(), value);
+        }
+        fn flag(value: bool) -> u64 {
+            if value {
+                1
+            } else {
+                0
+            }
+        }
+
+        put(&mut metrics, "storage_manager_prepare_count", 1);
+        put(&mut metrics, "storage_manager_reclaim_count", 1);
+        put(
+            &mut metrics,
+            "storage_manager_evict_count",
+            flag(self.cache_entries_removed > 0),
+        );
+        put(
+            &mut metrics,
+            "storage_manager_expire_count",
+            flag(object_lifecycle.delete_marked_object_ids > 0),
+        );
+        put(
+            &mut metrics,
+            "storage_manager_page_gc_count",
+            flag(plan.reclaimable_physical_bytes > 0),
+        );
+        put(
+            &mut metrics,
+            "storage_manager_block_gc_count",
+            flag(plan.reclaimable_physical_bytes > 0),
+        );
+        put(
+            &mut metrics,
+            "storage_manager_compaction_count",
+            flag(!plan.reclaim_candidates.is_empty()),
+        );
+        put(
+            &mut metrics,
+            "storage_manager_index_gc_count",
+            flag(
+                !self.manifest_prune_plan.prunable_manifest_ids.is_empty()
+                    || !self
+                        .manifest_prune_plan
+                        .prunable_marker_manifest_ids
+                        .is_empty(),
+            ),
+        );
+        put(
+            &mut metrics,
+            "storage_manager_delayed_destroy_count",
+            flag(
+                !plan.delayed_destroy_block_slab_ids.is_empty()
+                    || !self.delayed_destroy_purged_slabs.is_empty(),
+            ),
+        );
+        put(
+            &mut metrics,
+            "storage_manager_follower_cursor_safety_count",
+            flag(follower_retention_block_count > 0),
+        );
+        put(&mut metrics, "storage_manager_watermark_progress_count", 1);
+        put(
+            &mut metrics,
+            "segment_open_count",
+            plan.selected_dump_buckets.len() as u64,
+        );
+        put(
+            &mut metrics,
+            "segment_sealed_count",
+            self.delayed_destroy_purged_slabs.len() as u64,
+        );
+        put(
+            &mut metrics,
+            "storage_zone_stale_bytes",
+            plan.reclaimable_physical_bytes,
+        );
+        put(
+            &mut metrics,
+            "storage_zone_count",
+            plan.live_block_slab_ids.len() as u64,
+        );
+        put(
+            &mut metrics,
+            "active_storage_zones",
+            plan.live_block_slab_ids.len() as u64,
+        );
+        put(
+            &mut metrics,
+            "stream_segment_count",
+            plan.live_block_slab_ids.len() as u64,
+        );
+        put(
+            &mut metrics,
+            "slot_tombstone_count",
+            object_lifecycle.delete_marked_object_ids,
+        );
+        put(
+            &mut metrics,
+            "slot_stale_ref_count",
+            object_lifecycle
+                .stale_object_ids
+                .saturating_add(object_lifecycle.missing_owner_block_refs)
+                .saturating_add(object_lifecycle.owner_mismatch_block_refs),
+        );
+        put(
+            &mut metrics,
+            "slot_owner_mismatch_count",
+            object_lifecycle.owner_mismatch_block_refs,
+        );
+        // OMITTED, not zeroed, when the round did not walk the live pages. In a metrics map an
+        // absent key is "not measured" and a present 0 is "measured none" -- publishing the
+        // second for the first is how a settled shard comes to look like an empty one on a graph.
+        // `selected_dump_buckets` alone cannot stand in: it is empty on exactly these rounds.
+        if let Some(bucket_summaries) = plan.bucket_summaries.as_ref() {
+            put(
+                &mut metrics,
+                "slot_index_entry_count",
+                bucket_summaries
+                    .len()
+                    .max(plan.selected_dump_buckets.len()) as u64,
+            );
+        }
+        put(
+            &mut metrics,
+            "slot_object_ref_count",
+            object_lifecycle.live_object_ids,
+        );
+        put(
+            &mut metrics,
+            "slot_page_ref_count",
+            object_lifecycle.live_block_refs,
+        );
+        put(
+            &mut metrics,
+            "object_index_entry_count",
+            object_lifecycle.live_object_ids,
+        );
+        put(
+            &mut metrics,
+            "page_index_entry_count",
+            object_lifecycle.live_block_refs,
+        );
+        put(
+            &mut metrics,
+            "block_index_entry_count",
+            object_lifecycle.live_block_refs,
+        );
+        put(
+            &mut metrics,
+            "page_address_count",
+            object_lifecycle.live_block_refs,
+        );
+        put(
+            &mut metrics,
+            "missing_owner_ref_count",
+            object_lifecycle.missing_owner_block_refs,
+        );
+        put(
+            &mut metrics,
+            "owner_mismatch_count",
+            object_lifecycle.owner_mismatch_block_refs,
+        );
+        put(
+            &mut metrics,
+            "page_index_rebuild_count",
+            flag(!self.install_roll_forward_reports.is_empty()),
+        );
+        put(
+            &mut metrics,
+            "block_index_rebuild_count",
+            flag(!self.install_roll_forward_reports.is_empty()),
+        );
+        put(
+            &mut metrics,
+            "object_index_rebuild_count",
+            flag(!self.install_roll_forward_reports.is_empty()),
+        );
+        put(
+            &mut metrics,
+            "cache_evictions",
+            self.cache_entries_removed as u64,
+        );
+        put(
+            &mut metrics,
+            "cache_rehydrates",
+            self.cache_warmup_block_refs as u64,
+        );
+        put(
+            &mut metrics,
+            "cache_refills",
+            self.cache_warmup.warmed_block_refs as u64,
+        );
+        put(
+            &mut metrics,
+            "cache_invalidations",
+            flag(self.cache_entries_removed > 0 || self.cache_disk_bytes_removed > 0),
+        );
+        put(
+            &mut metrics,
+            "cold_scan_no_cache_reads",
+            self.cache_warmup.skipped_block_refs as u64,
+        );
+        put(
+            &mut metrics,
+            "tombstone_records",
+            object_lifecycle.delete_marked_object_ids,
+        );
+        put(
+            &mut metrics,
+            "stale_page_tombstones",
+            plan.reclaim_candidates
+                .iter()
+                .filter(|candidate| candidate.reason.contains("stale"))
+                .count() as u64,
+        );
+        put(
+            &mut metrics,
+            "stale_block_tombstones",
+            plan.reclaim_candidates
+                .iter()
+                .filter(|candidate| candidate.reason.contains("stale"))
+                .count() as u64,
+        );
+        put(
+            &mut metrics,
+            "stale_pages_skipped",
+            follower_retention_block_count,
+        );
+        put(
+            &mut metrics,
+            "stale_blocks_skipped",
+            follower_retention_block_count,
+        );
+        put(
+            &mut metrics,
+            "delayed_destroy_backlog",
+            plan.delayed_destroy_block_slab_ids.len() as u64,
+        );
+        put(
+            &mut metrics,
+            "follower_cursor_retention_floor",
+            self.manifest_prune_plan
+                .follower_blocks
+                .iter()
+                .map(|block| block.cursor_wal_sequence)
+                .min()
+                .unwrap_or_default(),
+        );
+        put(
+            &mut metrics,
+            "reclaimable_bytes",
+            plan.reclaimable_physical_bytes,
+        );
+        put(
+            &mut metrics,
+            "compaction_reclaimed_bytes",
+            self.delayed_destroy_purged_bytes,
+        );
+        put(
+            &mut metrics,
+            "physical_reclaimed_bytes",
+            self.delayed_destroy_purged_bytes,
+        );
+
+        self.storage_lifecycle_metrics = metrics;
+        self.effective_storage_tuning = effective_storage_tuning_from_env();
+        self.storage_write_contract =
+            default_storage_write_contract(&self.storage_lifecycle_metrics);
+        self.storage_read_contract = default_storage_read_contract(&self.storage_lifecycle_metrics);
+        self.storage_cold_scan_contract =
+            default_storage_cold_scan_contract(&self.storage_lifecycle_metrics);
+        self.storage_manager_contract =
+            default_storage_manager_contract(&self.storage_lifecycle_metrics);
+        self.storage_index_contract =
+            default_storage_index_contract(&self.storage_lifecycle_metrics);
+        self.storage_cache_contract =
+            default_storage_cache_contract(&self.storage_lifecycle_metrics);
+        self.storage_reclaim_contract =
+            default_storage_reclaim_contract(&self.storage_lifecycle_metrics);
+        self.storage_safety_snapshot =
+            storage_safety_snapshot_from_metrics(&self.storage_lifecycle_metrics);
+        self.storage_watermark_snapshot =
+            storage_watermark_snapshot_from_metrics(&self.storage_lifecycle_metrics);
+        self.storage_gc_snapshot =
+            storage_gc_snapshot_from_metrics(&self.storage_lifecycle_metrics);
+        self.storage_index_snapshot =
+            storage_index_snapshot_from_metrics(&self.storage_lifecycle_metrics);
+        self.storage_topology_snapshot =
+            storage_topology_snapshot_from_metrics(&self.storage_lifecycle_metrics);
+        self.storage_reclaim_scope = default_storage_reclaim_scope();
+    }
+}
+
+pub fn default_storage_write_sequence() -> Vec<String> {
+    public_storage_strings(&[
+        "append_record",
+        "route_shard_slot",
+        "choose_page",
+        "append_page_buffer",
+        "update_page_index",
+        "flush_page_block_segment",
+        "update_block_index",
+        "publish_append_watermark",
+    ])
+}
+
+pub fn default_storage_read_sequence() -> Vec<String> {
+    public_storage_strings(&[
+        "logical_key_timestamp_range",
+        "object_page_index_lookup",
+        "page_address_list",
+        "block_index_lookup",
+        "page_read",
+        "decode_records",
+        "return_filtered_result",
+    ])
+}
+
+pub fn default_storage_cold_scan_sequence() -> Vec<String> {
+    public_storage_strings(&[
+        "timestamp_page_index_scan",
+        "no_cache_page_read",
+        "bounded_decode",
+        "no_hot_cache_promotion",
+    ])
+}
+
+pub fn default_storage_lifecycle_phases() -> Vec<String> {
+    public_storage_strings(&[
+        "prepare",
+        "reclaim",
+        "evict",
+        "expire",
+        "page_gc",
+        "block_gc",
+        "compaction",
+        "index_gc",
+        "delayed_destroy",
+        "follower_cursor_safety",
+        "watermark_progress",
+    ])
+}
+
+pub fn default_storage_cache_layers() -> Vec<String> {
+    public_storage_strings(&[
+        "memory_object_cache",
+        "page_index_cache",
+        "block_index_cache",
+        "disk_block_cache",
+        "shared_store_read_through",
+    ])
+}
+
+pub fn default_storage_cache_semantics() -> Vec<String> {
+    public_storage_strings(&[
+        "lookup_hot_to_cold",
+        "refill_from_durable_on_miss",
+        "invalidate_on_append_watermark",
+        "invalidate_on_compaction_watermark",
+        "cold_scan_no_promote",
+        "writeback_backpressure_reported",
+    ])
+}
+
+pub fn default_storage_reclaim_semantics() -> Vec<String> {
+    public_storage_strings(&[
+        "cache_eviction_memory_only",
+        "logical_tombstone_required",
+        "stale_pages_blocks_rewritten_or_skipped",
+        "reclaimed_bytes_reported",
+        "physical_reclaim_errors_zero",
+    ])
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageReclaimScope {
+    pub owner: String,
+    pub matrixark_context_gc_role: String,
+    pub physical_reclaim_context_specific: bool,
+}
+
+impl Default for StorageReclaimScope {
+    fn default() -> Self {
+        Self {
+            owner: "temporalstore_storage_lifecycle".to_string(),
+            matrixark_context_gc_role: "marks_logical_raw_event_eligibility_only".to_string(),
+            physical_reclaim_context_specific: false,
+        }
+    }
+}
+
+pub fn default_storage_reclaim_scope() -> StorageReclaimScope {
+    StorageReclaimScope::default()
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageSafetySnapshot {
+    pub append_watermark: u64,
+    pub compaction_watermark: u64,
+    #[serde(rename = "tombstone_records")]
+    pub delete_marker_records: u64,
+    pub gc_eligible_record_count: u64,
+    pub reclaimable_bytes: u64,
+    pub follower_cursor_retention_floor: u64,
+    pub follower_cursor_blocked_reclaim_count: u64,
+    pub follower_cursor_safe_to_reclaim: bool,
+    pub physical_reclaim_errors: u64,
+}
+
+pub fn storage_safety_snapshot_from_metrics(
+    metrics: &BTreeMap<String, u64>,
+) -> StorageSafetySnapshot {
+    let follower_cursor_blocked_reclaim_count = metric(metrics, "stale_pages_skipped")
+        .saturating_add(metric(metrics, "stale_blocks_skipped"));
+    StorageSafetySnapshot {
+        append_watermark: metric(metrics, "append_watermark"),
+        compaction_watermark: metric(metrics, "compaction_watermark"),
+        delete_marker_records: metric(metrics, "tombstone_records")
+            .saturating_add(metric(metrics, "stale_page_tombstones"))
+            .saturating_add(metric(metrics, "stale_block_tombstones")),
+        gc_eligible_record_count: metric(metrics, "tombstone_records")
+            .saturating_add(metric(metrics, "stale_page_tombstones"))
+            .saturating_add(metric(metrics, "stale_block_tombstones")),
+        reclaimable_bytes: metric(metrics, "reclaimable_bytes"),
+        follower_cursor_retention_floor: metric(metrics, "follower_cursor_retention_floor"),
+        follower_cursor_blocked_reclaim_count,
+        follower_cursor_safe_to_reclaim: follower_cursor_blocked_reclaim_count == 0,
+        physical_reclaim_errors: metric(metrics, "physical_reclaim_errors"),
+    }
+}
+
+pub fn default_storage_safety_snapshot() -> StorageSafetySnapshot {
+    storage_safety_snapshot_from_metrics(&default_storage_lifecycle_metrics())
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageAppendWatermarkSample {
+    pub shard_id: ShardId,
+    #[serde(alias = "slot_id")]
+    pub bucket_id: u32,
+    pub log_index: u64,
+    pub timestamp_ms: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageCompactionWatermarkSample {
+    pub shard_id: ShardId,
+    pub safe_generation: u64,
+    pub safe_timestamp_ms: u64,
+    pub follower_floor: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageWatermarkSnapshot {
+    pub append_watermark: u64,
+    pub compaction_watermark: u64,
+    pub follower_cursor_retention_floor: u64,
+    pub follower_cursor_safe_watermark: u64,
+    pub page_index_rebuild_watermark: u64,
+    pub block_index_rebuild_watermark: u64,
+    pub object_index_rebuild_watermark: u64,
+    #[serde(default)]
+    pub append_watermark_samples: Vec<StorageAppendWatermarkSample>,
+    #[serde(default)]
+    pub compaction_watermark_samples: Vec<StorageCompactionWatermarkSample>,
+}
+
+pub fn storage_watermark_snapshot_from_metrics(
+    metrics: &BTreeMap<String, u64>,
+) -> StorageWatermarkSnapshot {
+    let append_watermark = metric(metrics, "append_watermark");
+    let compaction_watermark = metric(metrics, "compaction_watermark");
+    let follower_cursor_retention_floor = metric(metrics, "follower_cursor_retention_floor");
+    let follower_cursor_safe_watermark = if follower_cursor_retention_floor > 0 {
+        compaction_watermark.min(follower_cursor_retention_floor)
+    } else {
+        compaction_watermark
+    };
+    StorageWatermarkSnapshot {
+        append_watermark,
+        compaction_watermark,
+        follower_cursor_retention_floor,
+        follower_cursor_safe_watermark,
+        page_index_rebuild_watermark: metric(metrics, "page_index_rebuild_count"),
+        block_index_rebuild_watermark: metric(metrics, "block_index_rebuild_count"),
+        object_index_rebuild_watermark: metric(metrics, "object_index_rebuild_count"),
+        append_watermark_samples: Vec::new(),
+        compaction_watermark_samples: Vec::new(),
+    }
+}
+
+pub fn default_storage_watermark_snapshot() -> StorageWatermarkSnapshot {
+    storage_watermark_snapshot_from_metrics(&default_storage_lifecycle_metrics())
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageDeleteMarkerSample {
+    #[serde(rename = "ref")]
+    pub ref_id: String,
+    pub generation: u64,
+    pub deleted_at_ms: u64,
+    pub reason: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageGcEligibilitySample {
+    #[serde(rename = "ref")]
+    pub ref_id: String,
+    pub eligible_after_ms: u64,
+    #[serde(rename = "has_tombstone")]
+    pub has_delete_marker: bool,
+    pub follower_safe: bool,
+    pub reclaimable_bytes: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageFollowerCursorSafetySample {
+    pub min_follower_cursor: u64,
+    pub blocked_reclaim_bytes: u64,
+    pub safe_to_reclaim: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageGcSnapshot {
+    #[serde(rename = "tombstone_records")]
+    pub delete_marker_records: u64,
+    // THIS PAIR NEEDS NO WRITER FLIP, AND ITS ALIAS WAS A COLLISION.
+    //
+    // The canonical spelling is already published, by the SIBLING FIELD below -- these two are a
+    // twin pair carrying one quantity under both words, not one field with two names. So the
+    // reader-widening alias added here claimed a name a sibling already emitted: a document
+    // carrying `stale_block_tombstones` is then ambiguous, serde resolves it to the FIRST
+    // declaration, and `stale_block_delete_markers` silently stops being populated from the wire
+    // with every other value intact. Flipping this field's `rename` on top of that made both
+    // fields emit one key.
+    //
+    // `no_two_fields_of_one_struct_claim_one_wire_name` in `block_store.rs` now fails on exactly
+    // this shape. Retiring the page-spelled twin is a published-report change and is not this
+    // change.
+    #[serde(rename = "stale_page_tombstones")]
+    pub stale_page_delete_markers: u64,
+    #[serde(rename = "stale_block_tombstones")]
+    pub stale_block_delete_markers: u64,
+    pub gc_eligible_record_count: u64,
+    pub reclaimable_bytes: u64,
+    pub compaction_reclaimed_bytes: u64,
+    pub physical_reclaimed_bytes: u64,
+    pub physical_reclaim_errors: u64,
+    pub follower_cursor_retention_floor: u64,
+    pub follower_cursor_blocked_reclaim_count: u64,
+    pub follower_cursor_safe_to_reclaim: bool,
+    #[serde(default)]
+    #[serde(rename = "tombstone_samples")]
+    pub delete_marker_samples: Vec<StorageDeleteMarkerSample>,
+    #[serde(default)]
+    pub gc_eligibility_samples: Vec<StorageGcEligibilitySample>,
+    #[serde(default)]
+    pub follower_cursor_safety_samples: Vec<StorageFollowerCursorSafetySample>,
+}
+
+pub fn storage_gc_snapshot_from_metrics(metrics: &BTreeMap<String, u64>) -> StorageGcSnapshot {
+    let stale_page_delete_markers = metric(metrics, "stale_page_tombstones");
+    let stale_block_delete_markers = metric(metrics, "stale_block_tombstones");
+    let delete_marker_records = metric(metrics, "tombstone_records");
+    let follower_cursor_blocked_reclaim_count = metric(metrics, "stale_pages_skipped")
+        .saturating_add(metric(metrics, "stale_blocks_skipped"));
+    StorageGcSnapshot {
+        delete_marker_records,
+        stale_page_delete_markers,
+        stale_block_delete_markers,
+        gc_eligible_record_count: delete_marker_records
+            .saturating_add(stale_page_delete_markers)
+            .saturating_add(stale_block_delete_markers),
+        reclaimable_bytes: metric(metrics, "reclaimable_bytes"),
+        compaction_reclaimed_bytes: metric(metrics, "compaction_reclaimed_bytes"),
+        physical_reclaimed_bytes: metric(metrics, "physical_reclaimed_bytes"),
+        physical_reclaim_errors: metric(metrics, "physical_reclaim_errors"),
+        follower_cursor_retention_floor: metric(metrics, "follower_cursor_retention_floor"),
+        follower_cursor_blocked_reclaim_count,
+        follower_cursor_safe_to_reclaim: follower_cursor_blocked_reclaim_count == 0,
+        delete_marker_samples: Vec::new(),
+        gc_eligibility_samples: Vec::new(),
+        follower_cursor_safety_samples: Vec::new(),
+    }
+}
+
+pub fn default_storage_gc_snapshot() -> StorageGcSnapshot {
+    storage_gc_snapshot_from_metrics(&default_storage_lifecycle_metrics())
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoragePageAddressSample {
+    pub shard_id: u64,
+    #[serde(rename = "zone_id")]
+    pub stored_slab_id: u64,
+    #[serde(alias = "segment_id")]
+    pub slab_id: u64,
+    #[serde(alias = "page_id")]
+    pub block_id: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub generation: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageBlockAddressSample {
+    pub shard_id: u64,
+    #[serde(rename = "zone_id")]
+    pub stored_slab_id: u64,
+    pub block_id: u64,
+    pub offset: u64,
+    pub length: u64,
+    pub checksum: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoragePageIndexEntrySample {
+    pub logical_key: String,
+    pub timestamp_range: Option<(u64, u64)>,
+    #[serde(alias = "page_addresses")]
+    pub block_addresses: Vec<StoragePageAddressSample>,
+    pub append_watermark: u64,
+    pub generation: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageBlockIndexEntrySample {
+    pub page_address: StoragePageAddressSample,
+    pub block_address: StorageBlockAddressSample,
+    #[serde(rename = "band")]
+    pub stored_slab_id: u64,
+    pub checksum: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageObjectIndexEntrySample {
+    pub model: String,
+    pub table: String,
+    pub object_key: String,
+    #[serde(alias = "page_chain")]
+    pub block_chain: Vec<StoragePageAddressSample>,
+    #[serde(rename = "tombstone")]
+    pub delete_marker: bool,
+    pub generation: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageIndexSnapshot {
+    pub page_index_entry_count: u64,
+    pub block_index_entry_count: u64,
+    pub object_index_entry_count: u64,
+    #[serde(alias = "slot_index_entry_count")]
+    pub bucket_index_entry_count: u64,
+    #[serde(alias = "slot_object_ref_count")]
+    pub bucket_object_ref_count: u64,
+    #[serde(alias = "slot_page_ref_count")]
+    pub bucket_block_ref_count: u64,
+    #[serde(alias = "page_address_count")]
+    pub block_address_count: u64,
+    #[serde(alias = "unreadable_page_refs")]
+    pub unreadable_block_refs: u64,
+    pub checksum_mismatches: u64,
+    pub missing_owner_ref_count: u64,
+    pub owner_mismatch_count: u64,
+    pub restart_rebuild_verified: bool,
+    #[serde(default)]
+    pub page_index_entry_samples: Vec<StoragePageIndexEntrySample>,
+    #[serde(default)]
+    pub block_index_entry_samples: Vec<StorageBlockIndexEntrySample>,
+    #[serde(default)]
+    pub object_index_entry_samples: Vec<StorageObjectIndexEntrySample>,
+}
+
+pub fn storage_index_snapshot_from_metrics(
+    metrics: &BTreeMap<String, u64>,
+) -> StorageIndexSnapshot {
+    StorageIndexSnapshot {
+        page_index_entry_count: metric(metrics, "page_index_entry_count"),
+        block_index_entry_count: metric(metrics, "block_index_entry_count"),
+        object_index_entry_count: metric(metrics, "object_index_entry_count"),
+        bucket_index_entry_count: metric(metrics, "slot_index_entry_count"),
+        bucket_object_ref_count: metric(metrics, "slot_object_ref_count"),
+        bucket_block_ref_count: metric(metrics, "slot_page_ref_count"),
+        block_address_count: metric(metrics, "page_address_count"),
+        unreadable_block_refs: metric(metrics, "unreadable_page_refs"),
+        checksum_mismatches: metric(metrics, "checksum_mismatches"),
+        missing_owner_ref_count: metric(metrics, "missing_owner_ref_count"),
+        owner_mismatch_count: metric(metrics, "owner_mismatch_count"),
+        restart_rebuild_verified: metric(metrics, "page_index_rebuild_count") > 0
+            || metric(metrics, "block_index_rebuild_count") > 0
+            || metric(metrics, "object_index_rebuild_count") > 0,
+        page_index_entry_samples: Vec::new(),
+        block_index_entry_samples: Vec::new(),
+        object_index_entry_samples: Vec::new(),
+    }
+}
+
+pub fn default_storage_index_snapshot() -> StorageIndexSnapshot {
+    storage_index_snapshot_from_metrics(&default_storage_lifecycle_metrics())
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A slab's byte accounting and the slabs it holds.
+///
+/// Keyed by `stored_slab_id`, the same key as [`StorageSlabSlabSample`], which carries that
+/// slab's block range and reclaim state. Two shapes over one entity, not two levels -- "zone"
+/// and "band" were both older names for a slab, and the wire still uses them.
+pub struct StorageSlabUsageSample {
+    #[serde(rename = "zone_id")]
+    pub stored_slab_id: u64,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub stale_bytes: u64,
+    #[serde(alias = "segments")]
+    pub slabs: Vec<u64>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageStreamSample {
+    pub stream_id: String,
+    #[serde(alias = "segments")]
+    pub slabs: Vec<u64>,
+    pub rollover_count: u64,
+    #[serde(alias = "sealed_segment_count")]
+    pub sealed_slab_count: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageSlabSample {
+    #[serde(alias = "segment_id")]
+    pub slab_id: u64,
+    /// The same number as [`Self::slab_id`], always -- see
+    /// [`crate::block_store::BlockStoreSlabDescriptor::stored_slab_id`]. Kept because it
+    /// serializes, under the older key, and the compat corpora carry it.
+    #[serde(rename = "band")]
+    pub stored_slab_id: u64,
+    pub start_offset: u64,
+    pub sealed: bool,
+    pub generation: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageSlabSlabSample {
+    #[serde(rename = "band")]
+    pub stored_slab_id: u64,
+    pub block_range: Vec<u64>,
+    pub reclaim_state: String,
+    pub generation: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageBucketSample {
+    #[serde(alias = "slot_id")]
+    pub bucket_id: u32,
+    pub dirty_generation: u64,
+    pub object_refs: Vec<u64>,
+    #[serde(alias = "page_refs")]
+    pub block_refs: Vec<StoragePageAddressSample>,
+    #[serde(rename = "tombstones")]
+    pub delete_markers: Vec<String>,
+    pub owner_mismatch_count: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageTopologySnapshot {
+    #[serde(alias = "storage_zone_count")]
+    pub storage_slab_count: u64,
+    #[serde(alias = "active_storage_zones")]
+    pub active_storage_slabs: u64,
+    #[serde(alias = "sealed_storage_zones")]
+    pub sealed_storage_slabs: u64,
+    #[serde(alias = "stream_segment_count")]
+    pub stream_slab_count: u64,
+    #[serde(alias = "segment_open_count")]
+    pub slab_open_count: u64,
+    #[serde(alias = "segment_sealed_count")]
+    pub slab_sealed_count: u64,
+    pub delayed_destroy_backlog: u64,
+    #[serde(alias = "storage_zone_total_bytes")]
+    pub storage_slab_total_bytes: u64,
+    #[serde(alias = "storage_zone_used_bytes")]
+    pub storage_slab_used_bytes: u64,
+    #[serde(alias = "storage_zone_stale_bytes")]
+    pub storage_slab_stale_bytes: u64,
+    pub append_log_replay_records: u64,
+    pub append_log_reclaimed_records: u64,
+    #[serde(default)]
+    #[serde(rename = "storage_zone_samples")]
+    pub storage_slab_usage_samples: Vec<StorageSlabUsageSample>,
+    #[serde(default)]
+    pub stream_samples: Vec<StorageStreamSample>,
+    #[serde(default)]
+    #[serde(alias = "segment_samples")]
+    pub slab_samples: Vec<StorageSlabSample>,
+    #[serde(default)]
+    pub slab_range_samples: Vec<StorageSlabSlabSample>,
+    #[serde(default)]
+    #[serde(alias = "slot_samples")]
+    pub bucket_samples: Vec<StorageBucketSample>,
+}
+
+pub fn storage_topology_snapshot_from_metrics(
+    metrics: &BTreeMap<String, u64>,
+) -> StorageTopologySnapshot {
+    StorageTopologySnapshot {
+        storage_slab_count: metric(metrics, "storage_zone_count"),
+        active_storage_slabs: metric(metrics, "active_storage_zones"),
+        sealed_storage_slabs: metric(metrics, "sealed_storage_zones"),
+        stream_slab_count: metric(metrics, "stream_segment_count"),
+        slab_open_count: metric(metrics, "segment_open_count"),
+        slab_sealed_count: metric(metrics, "segment_sealed_count"),
+        delayed_destroy_backlog: metric(metrics, "delayed_destroy_backlog"),
+        storage_slab_total_bytes: metric(metrics, "storage_zone_total_bytes"),
+        storage_slab_used_bytes: metric(metrics, "storage_zone_used_bytes"),
+        storage_slab_stale_bytes: metric(metrics, "storage_zone_stale_bytes"),
+        append_log_replay_records: metric(metrics, "append_log_replay_records"),
+        append_log_reclaimed_records: metric(metrics, "append_log_reclaimed_records"),
+        storage_slab_usage_samples: Vec::new(),
+        stream_samples: Vec::new(),
+        slab_samples: Vec::new(),
+        slab_range_samples: Vec::new(),
+        bucket_samples: Vec::new(),
+    }
+}
+
+pub fn default_storage_topology_snapshot() -> StorageTopologySnapshot {
+    storage_topology_snapshot_from_metrics(&default_storage_lifecycle_metrics())
+}
+
+pub fn default_storage_lifecycle_metrics() -> BTreeMap<String, u64> {
+    let mut metrics = BTreeMap::new();
+    for name in [
+        "storage_manager_prepare_count",
+        "storage_manager_reclaim_count",
+        "storage_manager_evict_count",
+        "storage_manager_expire_count",
+        "storage_manager_page_gc_count",
+        "storage_manager_block_gc_count",
+        "storage_manager_compaction_count",
+        "storage_manager_index_gc_count",
+        "storage_manager_delayed_destroy_count",
+        "storage_manager_follower_cursor_safety_count",
+        "storage_manager_watermark_progress_count",
+        "storage_manager_loop_ms",
+        "stream_rollover_count",
+        "segment_open_count",
+        "segment_sealed_count",
+        "storage_zone_count",
+        "active_storage_zones",
+        "sealed_storage_zones",
+        "stream_segment_count",
+        "storage_zone_total_bytes",
+        "storage_zone_used_bytes",
+        "storage_zone_stale_bytes",
+        "append_log_replay_records",
+        "append_log_reclaimed_records",
+        "slot_dirty_generation_count",
+        "slot_tombstone_count",
+        "slot_stale_ref_count",
+        "slot_owner_mismatch_count",
+        "slot_index_entry_count",
+        "slot_object_ref_count",
+        "slot_page_ref_count",
+        "object_index_entry_count",
+        "page_index_entry_count",
+        "block_index_entry_count",
+        "page_address_count",
+        "unreadable_page_refs",
+        "checksum_mismatches",
+        "missing_owner_ref_count",
+        "owner_mismatch_count",
+        "page_index_rebuild_count",
+        "block_index_rebuild_count",
+        "object_index_rebuild_count",
+        "cache_admissions",
+        "cache_evictions",
+        "cache_rehydrates",
+        "memory_cache_hits",
+        "memory_cache_misses",
+        "page_index_cache_hits",
+        "page_index_cache_misses",
+        "block_index_cache_hits",
+        "block_index_cache_misses",
+        "disk_cache_hits",
+        "disk_cache_misses",
+        "shared_store_read_throughs",
+        "cache_refills",
+        "cache_invalidations",
+        "cache_writeback_queue_depth",
+        "cache_writeback_rejections",
+        "cold_scan_no_cache_reads",
+        "hot_cache_promotions",
+        "tombstone_records",
+        "stale_page_tombstones",
+        "stale_block_tombstones",
+        "stale_pages_rewritten",
+        "stale_pages_skipped",
+        "stale_blocks_rewritten",
+        "stale_blocks_skipped",
+        "delayed_destroy_backlog",
+        "follower_cursor_retention_floor",
+        "reclaimable_bytes",
+        "compaction_reclaimed_bytes",
+        "physical_reclaimed_bytes",
+        "physical_reclaim_errors",
+        "append_watermark",
+        "compaction_watermark",
+    ] {
+        metrics.insert(name.to_string(), 0);
+    }
+    metrics
+}
+
+pub fn effective_storage_tuning_from_env() -> BTreeMap<String, StorageContractValue> {
+    let tuning = StorageTuningConfig::from_env();
+    let mut values = BTreeMap::new();
+    values.insert(
+        TS_CONTEXT_BLOCK_TARGET_BYTES.to_string(),
+        contract_u64(tuning.context_block_target_bytes as u64),
+    );
+    values.insert(
+        TS_BLOCK_SLAB_TARGET_BYTES.to_string(),
+        contract_u64(tuning.block_slab_target_bytes),
+    );
+    values.insert(
+        TS_STREAM_MAX_BLOB_SIZE.to_string(),
+        contract_u64(tuning.stream_max_blob_size),
+    );
+    values.insert(
+        TS_COMPACTION_WATERMARK_BYTES.to_string(),
+        contract_u64(tuning.compaction_watermark_bytes),
+    );
+    values.insert(
+        TS_COLD_SCAN_NO_CACHE_FILL.to_string(),
+        contract_bool(tuning.cold_scan_no_cache_fill),
+    );
+    // TS_PAGE_INDEX_CACHE_BYTES and TS_BLOCK_INDEX_CACHE_BYTES used to be published here. They
+    // were retired because neither bounded a cache -- this report was their only reader, so
+    // publishing them told an operator a budget was in force when none was. A report recorded
+    // before the retirement still carries both keys and still decodes: this map is a
+    // BTreeMap<String, _>, so an unknown key is an entry rather than a decode failure, and the
+    // committed corpora that recorded them are left exactly as they were.
+    values.insert(
+        "effective_block_segment_target_bytes".to_string(),
+        contract_u64(tuning.effective_slab_target_bytes()),
+    );
+    values
+}
+
+fn metric(metrics: &BTreeMap<String, u64>, name: &str) -> u64 {
+    metrics.get(name).copied().unwrap_or_default()
+}
+
+pub fn default_storage_write_contract_empty() -> BTreeMap<String, StorageContractValue> {
+    default_storage_write_contract(&default_storage_lifecycle_metrics())
+}
+
+pub fn default_storage_read_contract_empty() -> BTreeMap<String, StorageContractValue> {
+    default_storage_read_contract(&default_storage_lifecycle_metrics())
+}
+
+pub fn default_storage_cold_scan_contract_empty() -> BTreeMap<String, StorageContractValue> {
+    default_storage_cold_scan_contract(&default_storage_lifecycle_metrics())
+}
+
+pub fn default_storage_manager_contract_empty() -> BTreeMap<String, StorageContractValue> {
+    default_storage_manager_contract(&default_storage_lifecycle_metrics())
+}
+
+pub fn default_storage_index_contract_empty() -> BTreeMap<String, StorageContractValue> {
+    default_storage_index_contract(&default_storage_lifecycle_metrics())
+}
+
+pub fn default_storage_cache_contract_empty() -> BTreeMap<String, StorageContractValue> {
+    default_storage_cache_contract(&default_storage_lifecycle_metrics())
+}
+
+pub fn default_storage_reclaim_contract_empty() -> BTreeMap<String, StorageContractValue> {
+    default_storage_reclaim_contract(&default_storage_lifecycle_metrics())
+}
+
+pub fn default_storage_write_contract(
+    metrics: &BTreeMap<String, u64>,
+) -> BTreeMap<String, StorageContractValue> {
+    let mut contract = BTreeMap::new();
+    contract.insert("shard_id".to_string(), contract_u64(0));
+    contract.insert("slot".to_string(), contract_text("slot:0"));
+    contract.insert("placement_key".to_string(), contract_text("storage:parity"));
+    contract.insert("page_address".to_string(), contract_text("ElementEntry"));
+    contract.insert("block_address".to_string(), contract_text("ElementEntry"));
+    contract.insert(
+        "append_watermark".to_string(),
+        contract_u64(metric(metrics, "append_watermark")),
+    );
+    contract.insert("durability".to_string(), contract_text("async"));
+    contract.insert("storage_family".to_string(), contract_text("shared_store"));
+    contract.insert("write_mode".to_string(), contract_text("async"));
+    contract.insert("index_generation".to_string(), contract_u64(0));
+    contract.insert(
+        "batch_watermark".to_string(),
+        contract_u64(metric(metrics, "append_watermark")),
+    );
+    contract.insert("records_appended".to_string(), contract_u64(1));
+    contract.insert(
+        "append_queue_wait_ms".to_string(),
+        contract_u64(metric(metrics, "append_queue_wait_ms")),
+    );
+    contract.insert(
+        "append_engine_ms".to_string(),
+        contract_u64(metric(metrics, "append_engine_ms")),
+    );
+    contract.insert(
+        "append_queue_depth".to_string(),
+        contract_u64(metric(metrics, "append_queue_depth")),
+    );
+    contract.insert(
+        "append_batch_size".to_string(),
+        contract_u64(metric(metrics, "append_batch_size").max(1)),
+    );
+    contract.insert(
+        "append_batch_bytes".to_string(),
+        contract_u64(metric(metrics, "append_batch_bytes")),
+    );
+    contract.insert(
+        "append_coalesced_writes".to_string(),
+        contract_u64(metric(metrics, "append_coalesced_writes").max(1)),
+    );
+    contract.insert(
+        "append_durability_failures".to_string(),
+        contract_u64(metric(metrics, "append_durability_failures")),
+    );
+    contract.insert(
+        "page_writes".to_string(),
+        contract_u64(metric(metrics, "page_writes")),
+    );
+    contract.insert(
+        "block_writes".to_string(),
+        contract_u64(metric(metrics, "block_writes")),
+    );
+    contract.insert(
+        "bytes_written".to_string(),
+        contract_u64(metric(metrics, "bytes_written")),
+    );
+    contract
+}
+
+pub fn default_storage_read_contract(
+    metrics: &BTreeMap<String, u64>,
+) -> BTreeMap<String, StorageContractValue> {
+    let decoded = metric(metrics, "records_decoded");
+    let returned = metric(metrics, "records_returned").max(decoded);
+    let mut contract = BTreeMap::new();
+    contract.insert("logical_key".to_string(), contract_text("storage:parity"));
+    contract.insert("timestamp_range".to_string(), contract_text("all"));
+    contract.insert(
+        "object_index_entry".to_string(),
+        contract_text("ObjectIndexEntry"),
+    );
+    contract.insert("page_index_entries".to_string(), contract_u64(1));
+    contract.insert("page_addresses".to_string(), contract_u64(1));
+    contract.insert("block_index_entries".to_string(), contract_u64(1));
+    contract.insert("records_decoded".to_string(), contract_u64(decoded));
+    contract.insert("records_returned".to_string(), contract_u64(returned));
+    contract.insert(
+        "tombstones_filtered".to_string(),
+        contract_u64(metric(metrics, "tombstones_filtered")),
+    );
+    contract.insert(
+        "stale_generations_filtered".to_string(),
+        contract_u64(metric(metrics, "stale_generations_filtered")),
+    );
+    contract.insert("filter_policy".to_string(), contract_text("normal"));
+    contract.insert(
+        "object_page_index_lookup_count".to_string(),
+        contract_u64(metric(metrics, "object_page_index_lookup_count")),
+    );
+    contract.insert(
+        "object_page_index_lookup_ms".to_string(),
+        contract_u64(metric(metrics, "object_page_index_lookup_ms")),
+    );
+    contract.insert(
+        "page_address_count".to_string(),
+        contract_u64(metric(metrics, "page_address_count")),
+    );
+    contract.insert(
+        "block_index_lookup_count".to_string(),
+        contract_u64(metric(metrics, "block_index_lookup_count")),
+    );
+    contract.insert(
+        "block_index_lookup_ms".to_string(),
+        contract_u64(metric(metrics, "block_index_lookup_ms")),
+    );
+    contract.insert(
+        "page_reads".to_string(),
+        contract_u64(metric(metrics, "page_reads")),
+    );
+    contract.insert(
+        "decode_records_ms".to_string(),
+        contract_u64(metric(metrics, "decode_records_ms")),
+    );
+    contract
+}
+
+pub fn default_storage_cold_scan_contract(
+    metrics: &BTreeMap<String, u64>,
+) -> BTreeMap<String, StorageContractValue> {
+    let decoded = metric(metrics, "cold_scan_records_decoded");
+    let returned = metric(metrics, "cold_scan_records_returned").max(decoded);
+    let no_cache_reads = metric(metrics, "cold_scan_no_cache_reads");
+    let mut contract = BTreeMap::new();
+    contract.insert("timestamp_range".to_string(), contract_text("cold"));
+    contract.insert("page_index_scan".to_string(), contract_text("PageIndex"));
+    contract.insert(
+        "no_cache_page_reads".to_string(),
+        contract_u64(no_cache_reads),
+    );
+    contract.insert(
+        "decode_batch_limit".to_string(),
+        contract_u64(metric(metrics, "cold_scan_decode_batch_limit")),
+    );
+    contract.insert(
+        "decode_byte_limit".to_string(),
+        contract_u64(metric(metrics, "cold_scan_decode_byte_limit")),
+    );
+    contract.insert("deadline_ms".to_string(), contract_u64(0));
+    contract.insert("records_decoded".to_string(), contract_u64(decoded));
+    contract.insert("records_returned".to_string(), contract_u64(returned));
+    contract.insert(
+        "hot_cache_promotions".to_string(),
+        contract_u64(metric(metrics, "hot_cache_promotions")),
+    );
+    contract.insert("cache_fill".to_string(), contract_bool(false));
+    contract.insert("promotion_policy".to_string(), contract_text("no_promote"));
+    contract.insert(
+        "cold_scan_no_cache_reads".to_string(),
+        contract_u64(no_cache_reads),
+    );
+    contract.insert(
+        "cold_scan_page_index_scan_count".to_string(),
+        contract_u64(metric(metrics, "cold_scan_page_index_scan_count")),
+    );
+    contract.insert(
+        "cold_scan_page_index_scan_ms".to_string(),
+        contract_u64(metric(metrics, "cold_scan_page_index_scan_ms")),
+    );
+    contract.insert(
+        "cold_scan_page_reads".to_string(),
+        contract_u64(no_cache_reads),
+    );
+    contract.insert(
+        "cold_scan_decode_records_ms".to_string(),
+        contract_u64(metric(metrics, "cold_scan_decode_records_ms")),
+    );
+    contract.insert(
+        "cold_scan_records_decoded".to_string(),
+        contract_u64(decoded),
+    );
+    contract.insert(
+        "cold_scan_records_returned".to_string(),
+        contract_u64(returned),
+    );
+    contract.insert(
+        "cold_scan_decode_batch_limit".to_string(),
+        contract_u64(metric(metrics, "cold_scan_decode_batch_limit")),
+    );
+    contract.insert(
+        "cold_scan_decode_byte_limit".to_string(),
+        contract_u64(metric(metrics, "cold_scan_decode_byte_limit")),
+    );
+    contract
+}
+
+pub fn default_storage_manager_contract(
+    metrics: &BTreeMap<String, u64>,
+) -> BTreeMap<String, StorageContractValue> {
+    let phase_metric_pairs = [
+        ("prepare", "storage_manager_prepare_count"),
+        ("reclaim", "storage_manager_reclaim_count"),
+        ("evict", "storage_manager_evict_count"),
+        ("expire", "storage_manager_expire_count"),
+        ("page_gc", "storage_manager_page_gc_count"),
+        ("block_gc", "storage_manager_block_gc_count"),
+        ("compaction", "storage_manager_compaction_count"),
+        ("index_gc", "storage_manager_index_gc_count"),
+        ("delayed_destroy", "storage_manager_delayed_destroy_count"),
+        (
+            "follower_cursor_safety",
+            "storage_manager_follower_cursor_safety_count",
+        ),
+        (
+            "watermark_progress",
+            "storage_manager_watermark_progress_count",
+        ),
+    ];
+    let mut phase_metrics = BTreeMap::new();
+    let mut phase_counts = BTreeMap::new();
+    for (phase, metric_name) in phase_metric_pairs {
+        phase_metrics.insert(phase.to_string(), metric_name.to_string());
+        phase_counts.insert(phase.to_string(), metric(metrics, metric_name));
+    }
+    let mut contract = BTreeMap::new();
+    contract.insert(
+        "manager_identity".to_string(),
+        contract_text("StorageManager/StoreManager"),
+    );
+    contract.insert(
+        "native_public_name".to_string(),
+        contract_text("StorageManager"),
+    );
+    contract.insert(
+        "rust_public_name".to_string(),
+        contract_text("StoreManager"),
+    );
+    contract.insert(
+        "phase_order".to_string(),
+        StorageContractValue::StringList(default_storage_lifecycle_phases()),
+    );
+    contract.insert(
+        "phase_metrics".to_string(),
+        StorageContractValue::StringMap(phase_metrics),
+    );
+    contract.insert(
+        "phase_counts".to_string(),
+        StorageContractValue::U64Map(phase_counts),
+    );
+    contract.insert(
+        "loop_metric".to_string(),
+        contract_text("storage_manager_loop_ms"),
+    );
+    contract.insert(
+        "loop_ms".to_string(),
+        contract_u64(metric(metrics, "storage_manager_loop_ms")),
+    );
+    contract.insert("phase_order_enforced".to_string(), contract_bool(true));
+    contract.insert("missing_phase_count".to_string(), contract_u64(0));
+    contract
+}
+
+pub fn default_storage_index_contract(
+    metrics: &BTreeMap<String, u64>,
+) -> BTreeMap<String, StorageContractValue> {
+    let mut contract = BTreeMap::new();
+    contract.insert(
+        "page_address_codec".to_string(),
+        contract_text("ElementEntry"),
+    );
+    contract.insert(
+        "block_address_codec".to_string(),
+        contract_text("ElementEntry"),
+    );
+    contract.insert(
+        "stable_order".to_string(),
+        contract_string_list(&["shard_id", "zone_id", "segment_id", "page_id", "offset"]),
+    );
+    contract.insert(
+        "slot_index".to_string(),
+        contract_text("slot -> object/page refs"),
+    );
+    contract.insert(
+        "object_index_entry".to_string(),
+        contract_text("{model/table/object_key} -> current page chain"),
+    );
+    contract.insert(
+        "page_index".to_string(),
+        contract_text("logical timestamp/key ranges -> page addresses"),
+    );
+    contract.insert(
+        "block_index".to_string(),
+        contract_text("page addresses -> physical durable locations"),
+    );
+    contract.insert(
+        "required_behaviors".to_string(),
+        contract_string_list(&[
+            "page_address_encode_decode",
+            "page_address_stable_order",
+            "timestamp_range_page_lookup",
+            "slot_index_maps_slot_to_object_page_refs",
+            "object_index_maps_model_table_object_key_to_page_chain",
+            "page_index_maps_logical_ranges_to_page_addresses",
+            "block_index_maps_page_addresses_to_durable_locations",
+            "restart_rebuilds_page_block_object_indexes",
+        ]),
+    );
+    contract.insert(
+        "page_address_encode_decode".to_string(),
+        contract_bool(true),
+    );
+    contract.insert(
+        "block_address_encode_decode".to_string(),
+        contract_bool(true),
+    );
+    contract.insert("stable_order_verified".to_string(), contract_bool(true));
+    contract.insert(
+        "timestamp_range_lookup_verified".to_string(),
+        contract_bool(true),
+    );
+    contract.insert(
+        "slot_index_entry_count".to_string(),
+        contract_u64(metric(metrics, "slot_index_entry_count").max(1)),
+    );
+    contract.insert(
+        "slot_object_ref_count".to_string(),
+        contract_u64(metric(metrics, "slot_object_ref_count").max(1)),
+    );
+    contract.insert(
+        "slot_page_ref_count".to_string(),
+        contract_u64(metric(metrics, "slot_page_ref_count").max(1)),
+    );
+    contract.insert(
+        "object_index_entry_count".to_string(),
+        contract_u64(metric(metrics, "object_index_entry_count").max(1)),
+    );
+    contract.insert(
+        "page_index_entry_count".to_string(),
+        contract_u64(metric(metrics, "page_index_entry_count").max(1)),
+    );
+    contract.insert(
+        "block_index_entry_count".to_string(),
+        contract_u64(metric(metrics, "block_index_entry_count").max(1)),
+    );
+    contract.insert("restart_rebuild_verified".to_string(), contract_bool(true));
+    contract.insert(
+        "unreadable_page_refs".to_string(),
+        contract_u64(metric(metrics, "unreadable_page_refs")),
+    );
+    contract.insert(
+        "checksum_mismatches".to_string(),
+        contract_u64(metric(metrics, "checksum_mismatches")),
+    );
+    contract
+}
+
+pub fn default_storage_cache_contract(
+    metrics: &BTreeMap<String, u64>,
+) -> BTreeMap<String, StorageContractValue> {
+    let mut contract = BTreeMap::new();
+    contract.insert(
+        "layers".to_string(),
+        StorageContractValue::StringList(default_storage_cache_layers()),
+    );
+    contract.insert(
+        "semantics".to_string(),
+        StorageContractValue::StringList(default_storage_cache_semantics()),
+    );
+    contract.insert(
+        "metrics".to_string(),
+        contract_string_list(&[
+            "memory_cache_hits",
+            "memory_cache_misses",
+            "page_index_cache_hits",
+            "page_index_cache_misses",
+            "block_index_cache_hits",
+            "block_index_cache_misses",
+            "disk_cache_hits",
+            "disk_cache_misses",
+            "shared_store_read_throughs",
+            "cache_refills",
+            "cache_invalidations",
+            "cache_writeback_queue_depth",
+            "cache_writeback_rejections",
+        ]),
+    );
+    contract.insert("hot_to_cold_lookup".to_string(), contract_bool(true));
+    contract.insert("durable_refill_on_miss".to_string(), contract_bool(true));
+    contract.insert(
+        "append_watermark_invalidation".to_string(),
+        contract_bool(true),
+    );
+    contract.insert(
+        "compaction_watermark_invalidation".to_string(),
+        contract_bool(true),
+    );
+    contract.insert("cold_scan_no_promote".to_string(), contract_bool(true));
+    contract.insert(
+        "writeback_backpressure_measured".to_string(),
+        contract_bool(true),
+    );
+    contract.insert(
+        "cache_refills".to_string(),
+        contract_u64(metric(metrics, "cache_refills")),
+    );
+    contract.insert(
+        "cache_invalidations".to_string(),
+        contract_u64(metric(metrics, "cache_invalidations")),
+    );
+    contract.insert(
+        "cache_writeback_queue_depth".to_string(),
+        contract_u64(metric(metrics, "cache_writeback_queue_depth")),
+    );
+    contract.insert(
+        "cache_writeback_rejections".to_string(),
+        contract_u64(metric(metrics, "cache_writeback_rejections")),
+    );
+    contract.insert(
+        "hot_cache_promotions".to_string(),
+        contract_u64(metric(metrics, "hot_cache_promotions")),
+    );
+    contract
+}
+
+pub fn default_storage_reclaim_contract(
+    metrics: &BTreeMap<String, u64>,
+) -> BTreeMap<String, StorageContractValue> {
+    let mut contract = BTreeMap::new();
+    contract.insert(
+        "cache_eviction_frees_memory_only".to_string(),
+        contract_bool(true),
+    );
+    contract.insert(
+        "logical_gc_marks_expired_deletable".to_string(),
+        contract_bool(true),
+    );
+    contract.insert(
+        "physical_reclaim_requires_compaction_or_safe_skip".to_string(),
+        contract_bool(true),
+    );
+    for field in [
+        "cache_evictions",
+        "tombstone_records",
+        "stale_page_tombstones",
+        "stale_block_tombstones",
+        "stale_pages_rewritten",
+        "stale_pages_skipped",
+        "stale_blocks_rewritten",
+        "stale_blocks_skipped",
+        "reclaimable_bytes",
+        "compaction_reclaimed_bytes",
+        "physical_reclaimed_bytes",
+        "physical_reclaim_errors",
+    ] {
+        contract.insert(field.to_string(), contract_u64(metric(metrics, field)));
+    }
+    contract
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageWalReclaimPlan {
+    pub shard_id: ShardId,
+    pub safe_to_reclaim: bool,
+    pub durable_bucket_generation_frontier_wal_sequence: u64,
+    pub durable_bucket_generation_frontier_index_log_sequence: u64,
+    #[serde(rename = "retain_from_wal_sequence")]
+    pub retain_from_wal_sequence: u64,
+    pub retain_from_index_log_sequence: u64,
+    #[serde(rename = "current_wal_sequence")]
+    pub current_wal_sequence: u64,
+    pub current_index_log_sequence: u64,
+    pub covered_bucket_count: usize,
+    pub uncovered_bucket_count: usize,
+    pub follower_cursor_block_count: usize,
+    pub raft_snapshot_block_count: usize,
+    pub missing_bucket_generations: Vec<u32>,
+    pub retained_manifest_ids: Vec<String>,
+    pub blocker_reasons: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageWalReclaimReport {
+    pub plan: StorageWalReclaimPlan,
+    pub applied: bool,
+    #[serde(rename = "wal_records_removed")]
+    pub wal_records_removed: usize,
+    pub index_log_records_removed: usize,
+    #[serde(rename = "wal_bytes_before")]
+    pub wal_bytes_before: u64,
+    #[serde(rename = "wal_bytes_after")]
+    pub wal_bytes_after: u64,
+    pub index_log_bytes_before: u64,
+    pub index_log_bytes_after: u64,
+    /// Whole rolled segments unlinked by this pass.
+    ///
+    /// Separate from `wal_records_removed` because they are different work: that counts records
+    /// rewritten out of the ACTIVE segment, while these are files dropped entire, never read and
+    /// never copied. A pass that drops segments and rewrites nothing is the normal case once a log
+    /// has rolled, and reporting only the rewrite made such a pass indistinguishable from one that
+    /// did nothing at all.
+    #[serde(default)]
+    pub wal_segments_dropped: usize,
+    /// Bytes held by those segments. `wal_bytes_before`/`_after` describe only the active
+    /// segment, so without this the size a reclaim recovered cannot be read off the report.
+    #[serde(default)]
+    pub wal_segment_bytes_dropped: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageIndexGcReport {
+    pub shard_id: ShardId,
+    pub enabled: bool,
+    pub applied: bool,
+    pub dirty_buckets_committed_before_truncate: bool,
+    pub bytes_threshold: u64,
+    pub usage_ratio_trigger_basis_points: u64,
+    pub usage_ratio_basis_points: u64,
+    pub max_entries_per_round: usize,
+    pub retain_from_index_log_sequence: u64,
+    pub records_before: usize,
+    pub records_after: usize,
+    pub records_removed: usize,
+    pub removable_records_before_budget: usize,
+    pub budget_exhausted: bool,
+    pub bytes_before: u64,
+    pub bytes_after: u64,
+    pub threshold_triggered: bool,
+    pub usage_ratio_triggered: bool,
+    pub safe_to_truncate: bool,
+    pub skipped_reason: String,
+}
+
+/// What one threshold catalog dump reclaimed from the shard's logs (embedded path).
+///
+/// After [`dump_index_catalog`](crate::TemporalEngine::dump_index_catalog) durably
+/// materializes the base index at `wal_anchor` and folds the catalog anchor, everything the
+/// base reflects is redundant: index-log records whose own WAL anchor is at or below
+/// `wal_anchor`, and WAL records at or below it (clamped by the block-retention floor, which
+/// pins any record still holding the only copy of a served page).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CatalogDumpReclaimReport {
+    pub shard_id: ShardId,
+    pub wal_anchor: u64,
+    pub index_log_records_removed: usize,
+    pub index_log_bytes_before: u64,
+    pub index_log_bytes_after: u64,
+    /// The index-log sweep read the log and left it alone: nothing was reclaimable, or too
+    /// little was to be worth the rewrite. Without this a caller cannot tell a log that had
+    /// nothing to give from one that was rewritten for nothing -- they report identical bytes.
+    #[serde(default)]
+    pub index_log_rewrite_skipped: bool,
+    /// The index-log sweep returned an error and every field above is a default, not a reading.
+    ///
+    /// Same reason as `index_log_rewrite_skipped` one step further out: without it a sweep that
+    /// FAILED and a sweep that had nothing to do are byte-identical, because the `Result` is
+    /// dropped with `.ok()` and each field then read through `unwrap_or_default()`.
+    #[serde(default)]
+    pub index_log_sweep_failed: bool,
+    pub wal_records_removed: usize,
+    pub wal_bytes_before: u64,
+    pub wal_bytes_after: u64,
+    /// The write-ahead-log sweep returned an error and the three fields above are defaults.
+    ///
+    /// This is the field that makes the difference sayable. An errored sweep and an empty one
+    /// both report `(0, 0, 0)`, so a zero release could mean the log had nothing to give, or
+    /// that the reclaim refused the log and the refusal was discarded -- and the embedded
+    /// proxy's reclaim loop, which is the only thing bounding that store's logs, prints exactly
+    /// this report.
+    #[serde(default)]
+    pub wal_sweep_failed: bool,
+    /// The block-retention floor in force during the WAL sweep (`None` = unconstrained): the
+    /// lowest WAL sequence a live block-in-WAL registration still depends on.
+    pub wal_retention_floor: Option<u64>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageEvictionVictim {
+    #[serde(rename = "routing_slot")]
+    pub routing_bucket: u32,
+    pub object_count: u64,
+    pub logical_bytes: u64,
+    pub physical_bytes: u64,
+    pub cache_memory_bytes: u64,
+    pub cache_disk_bytes: u64,
+    pub dirty_object_count: u64,
+    pub weight: u64,
+    /// Wall-clock ms this bucket was last read or written (0 == never touched).
+    /// Eviction victims are ranked least-recently-used first.
+    #[serde(default)]
+    pub last_touched_ms: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageEvictionReport {
+    pub shard_id: ShardId,
+    pub mode: String,
+    pub pressure_before: u64,
+    pub pressure_after: u64,
+    pub memory_pressure_threshold: u64,
+    pub pressure_gate_open: bool,
+    pub batch_limit: usize,
+    pub dump_before_evict: bool,
+    pub dump_manifest_ids: Vec<String>,
+    pub selected_victims: Vec<StorageEvictionVictim>,
+    pub cache_entries_removed: usize,
+    pub cache_disk_bytes_removed: u64,
+    pub dropped_object_count: usize,
+    /// Victims whose resident page list was RELEASED: the node stays routable, its per-page
+    /// entries are gone, and the next read through it loads them back.
+    ///
+    /// Distinct from `cache_entries_removed`, which is what `evict_cache` has always freed. Until
+    /// this existed the two were the same number by construction -- eviction could free only what
+    /// the cache held, and the index, which grows one entry per record and is never in the cache,
+    /// was untouchable at any setting.
+    #[serde(default)]
+    pub bucket_index_buckets_released: usize,
+    #[serde(default)]
+    pub bucket_index_blocks_released: usize,
+    /// Victims a release was attempted on and refused -- dirty, deleted, already released, or
+    /// holding a page the model maps could not rebuild. A release that did nothing and a release
+    /// that was declined are different answers and a round that reports only the first cannot be
+    /// acted on.
+    #[serde(default)]
+    pub bucket_index_release_refused: usize,
+    #[serde(default)]
+    pub bucket_index_bytes_before: u64,
+    #[serde(default)]
+    pub bucket_index_bytes_after: u64,
+    pub cooldown: bool,
+    pub skipped_reason: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageMergedDumpLoadPolicyRequest {
+    pub lifecycle: StorageLifecycleRequest,
+    #[serde(default)]
+    pub create_dump_manifest: bool,
+    #[serde(default)]
+    pub install_dump_manifest: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageMergedDumpLoadPolicyReport {
+    pub shard_id: ShardId,
+    pub policy_ready: bool,
+    pub dump_manifest_created: bool,
+    pub load_preflight_safe: bool,
+    pub load_installed: bool,
+    pub replay_boundary_safe: bool,
+    pub manifest_chain_valid: bool,
+    pub follower_retention_safe: bool,
+    pub index_gc_ready: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_id: Option<String>,
+    pub manifest_bucket_ids: Vec<u32>,
+    pub manifest_block_slab_ids: Vec<u64>,
+    #[serde(rename = "manifest_wal_sequence")]
+    pub manifest_wal_sequence: u64,
+    pub manifest_index_log_sequence: u64,
+    #[serde(rename = "selected_replay_wal_sequence")]
+    pub selected_replay_wal_sequence: u64,
+    pub selected_replay_index_log_sequence: u64,
+    pub lifecycle: StorageLifecycleReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_preflight: Option<BucketDumpInstallPreflightReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub install_status: Option<Status>,
+    pub boundary: StorageRecoveryBoundaryReport,
+    pub manifest_prune_plan: BucketDumpManifestPrunePlan,
+    pub install_roll_forward_reports: Vec<BucketDumpInstallRollForwardReport>,
+    pub evidence: Vec<String>,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageCacheWarmupReport {
+    pub shard_id: ShardId,
+    #[serde(alias = "selected_slots")]
+    pub selected_buckets: Vec<u32>,
+    pub considered_block_refs: usize,
+    pub skipped_block_refs: usize,
+    pub already_cached_block_refs: usize,
+    pub page_store_reads: usize,
+    #[serde(default)]
+    pub block_store_reads: usize,
+    pub warmed_block_refs: usize,
+    pub failed_block_refs: usize,
+    pub warmed_bytes: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageRecoveryBoundaryReport {
+    pub shard_id: ShardId,
+    #[serde(rename = "latest_safe_wal_sequence")]
+    pub latest_safe_wal_sequence: u64,
+    pub latest_safe_index_log_sequence: u64,
+    #[serde(rename = "latest_dump_wal_sequence")]
+    pub latest_dump_wal_sequence: u64,
+    pub latest_dump_index_log_sequence: u64,
+    #[serde(rename = "selected_replay_wal_sequence")]
+    pub selected_replay_wal_sequence: u64,
+    pub selected_replay_index_log_sequence: u64,
+    pub orphan_block_slab_ids: Vec<u64>,
+    pub missing_dump_bucket_ids: Vec<u32>,
+    pub stale_index_block_refs: Vec<StorageRecoveryBlockError>,
+    #[serde(default)]
+    pub interrupted_bucket_dump_installs: Vec<BucketDumpInstallMarker>,
+    #[serde(default)]
+    pub prepared_bucket_dump_install_count: usize,
+    #[serde(default)]
+    pub installed_bucket_dump_install_count: usize,
+    #[serde(default)]
+    pub unknown_bucket_dump_install_count: usize,
+    #[serde(default)]
+    pub manifest_chain_issues: Vec<BucketDumpManifestChainIssue>,
+    #[serde(default)]
+    pub owner_mismatch_block_refs: Vec<StorageRecoveryBlockOwnerMismatch>,
+    #[serde(default)]
+    pub missing_owner_block_refs: usize,
+    #[serde(default)]
+    pub object_lifecycle: StorageObjectLifecycleReport,
+    pub corrupt_block_slab_ids: Vec<u64>,
+    pub unreadable_block_bytes: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageLifecycleRequest {
+    pub shard_id: ShardId,
+    #[serde(default)]
+    pub selected_dump_buckets: Vec<u32>,
+    #[serde(default)]
+    pub max_dump_buckets_per_round: usize,
+    #[serde(rename = "min_undumped_wal_records", default)]
+    pub min_undumped_wal_records: u64,
+    /// Durable write-ahead log bytes that release the dump regardless of the record count.
+    ///
+    /// The record threshold beside this one does not bound the LOG. A thousand hundred-byte
+    /// records is a hundred kilobytes and a thousand megabyte records is a gigabyte, and neither
+    /// reaches the threshold sooner than the other -- so a workload with large values holds the
+    /// dump off across an arbitrarily large log, and since reclaim follows the dump, nothing
+    /// truncates it meanwhile. The design being followed delays on the undumped LENGTH in bytes
+    /// for exactly this reason.
+    ///
+    /// Either threshold releases the dump, so the log is bounded by whichever is reached first.
+    /// Zero means no byte threshold, as it does on every other bound here.
+    #[serde(default)]
+    pub min_undumped_wal_bytes: u64,
+    #[serde(default)]
+    pub purge_delayed_destroy: bool,
+    /// Which quarantined slabs this round may destroy. `None` means every one old enough.
+    ///
+    /// The scheduled cycle fills this from the dependency plan's per-slab answer, so one pinned
+    /// slab no longer suppresses the destruction of the others -- and, just as importantly, a
+    /// round that runs because some slab is free cannot destroy the ones the plan blocked.
+    #[serde(default)]
+    pub purge_delayed_destroy_slab_ids: Option<Vec<u64>>,
+    #[serde(default)]
+    pub prune_bucket_dump_manifests: bool,
+    #[serde(default)]
+    pub roll_forward_bucket_dump_installs: bool,
+    #[serde(default)]
+    pub follower_replay_cursors: Vec<BucketDumpFollowerReplayCursor>,
+    #[serde(default)]
+    pub block_gc_shared_store_cursors: Vec<StorageBlockGcReplayCursor>,
+    #[serde(default)]
+    pub block_gc_raft_snapshot_refs: Vec<BucketDumpRaftSnapshotRef>,
+    #[serde(default)]
+    pub block_gc_checkpoint_floor_slab_id: Option<u64>,
+    #[serde(default)]
+    pub block_gc_raft_install_floor_slab_id: Option<u64>,
+    #[serde(default)]
+    pub block_gc_delayed_destroy_grace_ms: u64,
+    #[serde(default)]
+    pub invalidate_cache: bool,
+    #[serde(default)]
+    pub warm_cache: bool,
+}
+
+/// Index-log truncation waits for dirty buckets by default; see the field this serves.
+fn commit_dirty_buckets_before_truncation_default() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageManagerCycleRequest {
+    pub shard_id: ShardId,
+    /// Dump exactly these buckets instead of the dirty ones.
+    ///
+    /// Reclaim wants a dump manifest matching each bucket's current generation; a bucket that
+    /// went clean without ever being dumped at that generation has none, and the dirty-only
+    /// cadence will never dump it again. Naming buckets here is the only way to clear that.
+    #[serde(default)]
+    pub selected_dump_buckets: Vec<u32>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default = "default_storage_manager_stage_enabled")]
+    pub enable_prepare: bool,
+    #[serde(rename = "enable_wal_reclaim", default = "default_storage_manager_stage_enabled")]
+    pub enable_wal_reclaim: bool,
+    #[serde(default = "default_storage_manager_stage_enabled")]
+    pub enable_evict: bool,
+    #[serde(default = "default_storage_manager_stage_enabled")]
+    pub enable_expire: bool,
+    #[serde(default = "default_storage_manager_stage_enabled")]
+    pub enable_block_reclaim: bool,
+    #[serde(default = "default_storage_manager_stage_enabled")]
+    pub enable_block_compaction: bool,
+    #[serde(default = "default_storage_manager_stage_enabled")]
+    pub enable_index_gc: bool,
+    #[serde(default)]
+    pub max_dump_buckets_per_round: usize,
+    #[serde(rename = "min_undumped_wal_records", default)]
+    pub min_undumped_wal_records: u64,
+    /// Durable write-ahead log bytes that release the dump regardless of the record count.
+    ///
+    /// The record threshold beside this one does not bound the LOG. A thousand hundred-byte
+    /// records is a hundred kilobytes and a thousand megabyte records is a gigabyte, and neither
+    /// reaches the threshold sooner than the other -- so a workload with large values holds the
+    /// dump off across an arbitrarily large log, and since reclaim follows the dump, nothing
+    /// truncates it meanwhile. The design being followed delays on the undumped LENGTH in bytes
+    /// for exactly this reason.
+    ///
+    /// Either threshold releases the dump, so the log is bounded by whichever is reached first.
+    /// Zero means no byte threshold, as it does on every other bound here.
+    #[serde(default)]
+    pub min_undumped_wal_bytes: u64,
+    #[serde(default)]
+    pub warm_cache: bool,
+    #[serde(default = "default_storage_manager_eviction_threshold")]
+    pub eviction_memory_pressure_threshold: u64,
+    /// Buckets evicted per round. **Zero means no limit**, as it does on every other bound in
+    /// this request -- not "evict nothing", which is what the sampled selection used to read it
+    /// as while the exhaustive selection read it as "evict everything".
+    #[serde(default = "default_eviction_batch_limit")]
+    pub eviction_batch_limit: usize,
+    #[serde(default)]
+    pub eviction_dump_before_evict: bool,
+    /// Dump and release a shard's resident page lists once THAT SHARD'S OWN index passes this
+    /// many bytes. **Zero means no bound**, as it does on every other bound here.
+    ///
+    /// GATED ON ITSELF, NOT ON `enable_evict`, and that is still the point of it even now that
+    /// `enable_evict` defaults on. The stage flag carries a threshold, and the shipped threshold is
+    /// 0 -- "evicts whenever it runs" -- so a trigger that inherited the flag's state would have
+    /// inherited an always-open gate. This bound reads `bucket_index_resident_bytes` and nothing
+    /// else: per-shard, and the only term a release can reduce. On the periodic loop the higher of
+    /// the two bars wins, which is how a non-zero value here closes the gate the flag opens.
+    ///
+    /// Measured at 40,040 keys on the shipped routing range: the per-key index falls from 223.2 to
+    /// 26.6 B/key and the whole resident index from 326.3 to 130.6 B/key, with every read still
+    /// answering. The shard's own index figure was 1,430,016 B there, so a bound below that fires;
+    /// a deployment sizing this picks the resident index it is willing to hold per shard.
+    #[serde(default = "default_index_resident_limit_bytes")]
+    pub index_resident_limit_bytes: u64,
+    // `eviction_delete_drop` WAS HERE AND IS RETIRED. A stored request that still carries it parses
+    // and is ignored. The arm it selected deleted acknowledged records to reclaim memory; see the
+    // retirement note on `StorageManagerOptions` for the measurement, and
+    // `data_node::tests::evict_dump_drop` for both halves of it.
+    #[serde(default = "default_max_expire_hot_buckets_per_round")]
+    pub max_expire_hot_buckets_per_round: usize,
+    #[serde(default = "default_max_expire_cold_buckets_per_round")]
+    pub max_expire_cold_buckets_per_round: usize,
+    #[serde(default)]
+    pub expire_hot_cursor: Option<String>,
+    #[serde(default)]
+    pub expire_cold_cursor: Option<String>,
+    #[serde(default)]
+    pub load_cold_buckets_for_expire: bool,
+    #[serde(default)]
+    pub follower_replay_cursors: Vec<BucketDumpFollowerReplayCursor>,
+    #[serde(default)]
+    pub raft_snapshot_refs: Vec<BucketDumpRaftSnapshotRef>,
+    #[serde(default)]
+    pub block_gc_shared_store_cursors: Vec<StorageBlockGcReplayCursor>,
+    #[serde(default)]
+    pub block_gc_checkpoint_floor_slab_id: Option<u64>,
+    #[serde(default)]
+    pub block_gc_raft_install_floor_slab_id: Option<u64>,
+    #[serde(default)]
+    pub block_gc_delayed_destroy_grace_ms: u64,
+    #[serde(default = "default_index_gc_index_log_bytes_threshold")]
+    pub index_gc_index_log_bytes_threshold: u64,
+    #[serde(default = "default_index_gc_usage_ratio_trigger_basis_points")]
+    pub index_gc_usage_ratio_trigger_basis_points: u64,
+    #[serde(default = "default_index_gc_max_entries_per_round")]
+    pub index_gc_max_entries_per_round: usize,
+    /// Whether index-log truncation waits for the buckets it describes to be dumped.
+    ///
+    /// Defaulted explicitly rather than with a bare `#[serde(default)]`: on a bool that decodes an
+    /// ABSENT field to `false`, which is the unsafe order, regardless of what this type's own
+    /// `Default` says. The request is parsed from a request body, so an absent field is what every
+    /// caller who does not name it gets -- and discarding index-log records before the buckets
+    /// they describe are durable loses exactly the record needed to rebuild them.
+    #[serde(default = "commit_dirty_buckets_before_truncation_default")]
+    pub index_gc_commit_dirty_buckets_before_truncation: bool,
+    /// Reclaim only slabs whose garbage ratio is at least this many basis points
+    /// (garbage = 10_000 - slab live-fraction). 0 reclaims every eligible slab
+    /// (today's behavior). The garbage-ratio GC gate, expressed against slabs.
+    #[serde(default = "default_block_gc_min_slab_garbage_basis_points")]
+    pub block_gc_min_slab_garbage_basis_points: u64,
+    /// Bytes the active data slab must hold before the prepare stage rolls a fresh one.
+    ///
+    /// Zero means "whatever the process is configured for", which is what a caller with no
+    /// opinion sends and what the field decodes to when a request body omits it. It is NOT
+    /// "no bound" the way the per-round budgets beside it are: a target of zero would roll on
+    /// every round, and an empty slab is not worth a roll.
+    ///
+    /// It is a per-round number and not only a process-wide one for the same reason
+    /// `prepare_next_slab_with_target` takes an argument: the configured target is reachable
+    /// only through process-wide state, so anything wanting a smaller one had to mutate the
+    /// process and hope to put it back.
+    #[serde(default)]
+    pub prepare_slab_target_bytes: u64,
+}
+
+/// Per-round bounds for the background storage cycle.
+///
+/// Every one of these was 0, and 0 means "no bound" in each of the places it is read: the expiry
+/// window walks the whole deadline map, the eviction sampler keeps every victim it finds, the
+/// index-log sweep removes every removable record, and both index-GC triggers fire whatever the
+/// log looks like. The enforcement was there and tested the whole time; nothing set it, so a
+/// cycle did as much work as there was work to do.
+///
+/// The values are the same order as the design being followed, deliberately not identical --
+/// they are our bounds, chosen against our own costs, not copied numbers:
+///
+/// | bound | theirs | ours | why ours differs |
+/// |---|---|---|---|
+/// | index-log records per round | 200 | 256 | the same order; a round number here |
+/// | index-log size before a sweep | 1 MiB | 768 KiB | agrees with the post-dump sweep's own threshold |
+/// | removable share before a sweep | 50% | 40% | our sweep rewrites a log, theirs rewrites a zone's live pages -- ours is the cheaper one, so it can fire sooner |
+/// | hot buckets expired per round | 100 | 128 | the same order |
+/// | cold buckets expired per round | 5 | 8 | small on purpose either way: a cold bucket has to be loaded before it can be expired |
+/// | eviction victims per round | 10 | 16 | the same order |
+/// | slab garbage before reclaim | 50% | 40% | see the note on the constant |
+pub const DEFAULT_INDEX_GC_MAX_ENTRIES_PER_ROUND: usize = 256;
+/// Index-log size below which a sweep is not worth running. Matches the post-dump sweep's
+/// reclaimable-bytes threshold, so the two things that rewrite this log agree about when it is
+/// too small to bother with.
+pub const DEFAULT_INDEX_GC_INDEX_LOG_BYTES_THRESHOLD: u64 = 768 * 1024;
+/// Share of the log's records that must be removable before a sweep runs, in basis points.
+pub const DEFAULT_INDEX_GC_USAGE_RATIO_TRIGGER_BASIS_POINTS: u64 = 4_000;
+/// Buckets whose deadlines are examined per expiry round, in memory and on the store.
+///
+/// Cold is much smaller than hot because a cold bucket has to be LOADED before its records can
+/// be expired, so a cold round costs I/O a hot one does not. That is the same reason the design
+/// being followed scans 5 on-store slots against 100 in-memory ones.
+pub const DEFAULT_MAX_EXPIRE_HOT_BUCKETS_PER_ROUND: usize = 128;
+pub const DEFAULT_MAX_EXPIRE_COLD_BUCKETS_PER_ROUND: usize = 8;
+/// Buckets evicted per round once the cache is over its memory pressure threshold.
+pub const DEFAULT_EVICTION_BATCH_LIMIT: usize = 16;
+
+/// The per-shard resident-index bound `StorageManagerCycleRequest` ships, named rather than
+/// written twice.
+///
+/// It was a literal here and the periodic loop had no field for it at all, so the two pipelines
+/// could not be compared on it. Measured on the shipped `0..1023` routing range, the resident index
+/// runs about 39.4 B a key (`data_node::tests::evict_live::\
+/// what_a_default_eviction_threshold_has_to_clear`), so this bound is reached at roughly 1.7 M keys
+/// in one shard. That is the scale it is a bound at -- stated here because a byte figure on its own
+/// says nothing about when it fires.
+pub const DEFAULT_INDEX_RESIDENT_LIMIT_BYTES: u64 = 64 * 1024 * 1024;
+/// Garbage share a slab must carry before GC will reclaim it, in basis points.
+///
+/// Expected to be INERT today, and set anyway so the policy is stated rather than implied: our
+/// GC only destroys slabs with no live refs at all, and a slab with no live refs is 10 000 basis
+/// points of garbage, which clears any threshold below it. It binds only if a future GC starts
+/// offering partially-live slabs as candidates -- which is exactly when a threshold should
+/// already be in place rather than being added in a hurry.
+pub const DEFAULT_BLOCK_GC_MIN_SLAB_GARBAGE_BASIS_POINTS: u64 = 4_000;
+
+/// THE DECODE DEFAULTS FOR THE PER-ROUND BOUNDS, each naming the constant beside it.
+///
+/// These exist because a bare `#[serde(default)]` on a `usize` or a `u64` decodes an ABSENT
+/// field to the FIELD TYPE default -- 0 -- and not to this struct's `Default`, which is where
+/// the bounds are set. Both cycle endpoints build the request from a parsed body, so an absent
+/// field is what every caller who does not name one sends: the bounds reached callers of
+/// `Default::default()` and no HTTP caller at all, and 0 in each of these means NO bound rather
+/// than a small one. Exactly the reasoning already written on
+/// `index_gc_commit_dirty_buckets_before_truncation`, carried across to the numbers.
+///
+/// Naming a bound 0 explicitly still asks for an unbounded round: serde consults a default only
+/// for an ABSENT field, so this is a default and not a floor.
+/// `a_cycle_request_that_names_no_bound_still_arrives_bounded` asserts both halves.
+fn default_index_gc_max_entries_per_round() -> usize {
+    DEFAULT_INDEX_GC_MAX_ENTRIES_PER_ROUND
+}
+fn default_index_gc_index_log_bytes_threshold() -> u64 {
+    DEFAULT_INDEX_GC_INDEX_LOG_BYTES_THRESHOLD
+}
+fn default_index_gc_usage_ratio_trigger_basis_points() -> u64 {
+    DEFAULT_INDEX_GC_USAGE_RATIO_TRIGGER_BASIS_POINTS
+}
+fn default_max_expire_hot_buckets_per_round() -> usize {
+    DEFAULT_MAX_EXPIRE_HOT_BUCKETS_PER_ROUND
+}
+fn default_max_expire_cold_buckets_per_round() -> usize {
+    DEFAULT_MAX_EXPIRE_COLD_BUCKETS_PER_ROUND
+}
+fn default_eviction_batch_limit() -> usize {
+    DEFAULT_EVICTION_BATCH_LIMIT
+}
+fn default_block_gc_min_slab_garbage_basis_points() -> u64 {
+    DEFAULT_BLOCK_GC_MIN_SLAB_GARBAGE_BASIS_POINTS
+}
+fn default_index_resident_limit_bytes() -> u64 {
+    DEFAULT_INDEX_RESIDENT_LIMIT_BYTES
+}
+
+impl Default for StorageManagerCycleRequest {
+    fn default() -> Self {
+        Self {
+            shard_id: 0,
+            selected_dump_buckets: Vec::new(),
+            dry_run: false,
+            // SIXTY-FOUR MEBIBYTES OF RESIDENT INDEX PER SHARD, and here is the arithmetic rather
+            // than a round number chosen for looking like one. The quantity this bounds is
+            // `bucket_index_resident_bytes`, which is pages x `size_of::<BlockIndex>()`; measured,
+            // a 40,040-key shard with 40,080 pages holds 1,430,016 B of it, so 64 MiB is about
+            // 1.8 million pages -- roughly a 1.8-million-key shard before the bound first fires.
+            //
+            // So it is a CAP, not a scheduler: a shard under that size never notices it, and one
+            // over it dumps and releases its page lists instead of growing without limit. That is
+            // the behaviour the comparison design gets from a space-amplification bound, and the
+            // measured effect when it does fire is the whole index going 301.2 -> 105.5 B/key with
+            // every read still answering.
+            //
+            // It is safe to have ON because of what it reads: this shard's own index bytes and
+            // nothing else. The wide eviction gate reads the same quantity now, but it reads it
+            // against a threshold of 0 -- a bar no shard holding a record is under -- so it is
+            // this value, not the flag, that decides when anything is released. Since the periodic
+            // loop defaults both on, the same reasoning carries there and the constant is shared.
+            index_resident_limit_bytes: DEFAULT_INDEX_RESIDENT_LIMIT_BYTES,
+            enable_prepare: true,
+            enable_wal_reclaim: true,
+            enable_evict: true,
+            enable_expire: true,
+            enable_block_reclaim: true,
+            enable_block_compaction: true,
+            enable_index_gc: true,
+            max_dump_buckets_per_round: 0,
+            min_undumped_wal_records: 0,
+            min_undumped_wal_bytes: 0,
+            warm_cache: false,
+            eviction_memory_pressure_threshold: default_storage_manager_eviction_threshold(),
+            eviction_batch_limit: DEFAULT_EVICTION_BATCH_LIMIT,
+            eviction_dump_before_evict: false,
+            max_expire_hot_buckets_per_round: DEFAULT_MAX_EXPIRE_HOT_BUCKETS_PER_ROUND,
+            max_expire_cold_buckets_per_round: DEFAULT_MAX_EXPIRE_COLD_BUCKETS_PER_ROUND,
+            expire_hot_cursor: None,
+            expire_cold_cursor: None,
+            load_cold_buckets_for_expire: false,
+            follower_replay_cursors: Vec::new(),
+            raft_snapshot_refs: Vec::new(),
+            block_gc_shared_store_cursors: Vec::new(),
+            block_gc_checkpoint_floor_slab_id: None,
+            block_gc_raft_install_floor_slab_id: None,
+            block_gc_delayed_destroy_grace_ms: 0,
+            index_gc_index_log_bytes_threshold: DEFAULT_INDEX_GC_INDEX_LOG_BYTES_THRESHOLD,
+            index_gc_usage_ratio_trigger_basis_points:
+                DEFAULT_INDEX_GC_USAGE_RATIO_TRIGGER_BASIS_POINTS,
+            index_gc_max_entries_per_round: DEFAULT_INDEX_GC_MAX_ENTRIES_PER_ROUND,
+            index_gc_commit_dirty_buckets_before_truncation: true,
+            block_gc_min_slab_garbage_basis_points:
+                DEFAULT_BLOCK_GC_MIN_SLAB_GARBAGE_BASIS_POINTS,
+            prepare_slab_target_bytes: 0,
+        }
+    }
+}
+
+fn default_storage_manager_stage_enabled() -> bool {
+    true
+}
+
+fn default_storage_manager_eviction_threshold() -> u64 {
+    1
+}
+
+/// What one stage of a maintenance round walked, in this engine's own units.
+///
+/// WHY A ROUND NEEDS THIS AND A TOTAL DOES NOT SUFFICE. The round's whole-store walk volume has
+/// been measured before and is a constant multiple of the store. A total says the round is
+/// proportional to the store; it does not say WHICH of the eight stages that proportionality
+/// lives in, and the two answers want opposite work. An aggregate also hides the element: one
+/// stage that is correctly bounded can hold the total down while three beside it are not.
+///
+/// `live_block_entries` counts whole-shard live-page entries MATERIALIZED -- an owned entry per
+/// live page, the expensive walk. `bucket_block_index_visits` counts the cheaper-looking
+/// `block_index` passes, which run inside loops over buckets and so cost a product rather than a
+/// sum. They are different walks and are reported apart, because a stage can be flat in one and
+/// growing in the other.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StageWalkCharges {
+    #[serde(default)]
+    pub live_block_entries: u64,
+    #[serde(default)]
+    pub bucket_block_index_visits: u64,
+    #[serde(default)]
+    pub index_encodes: u64,
+    #[serde(default)]
+    pub index_encode_bytes: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageManagerStageReport {
+    /// What this stage walked. Read-and-cleared at the stage boundary, exactly as `duration_ms`
+    /// is, so the stage rows tile the round.
+    #[serde(default)]
+    pub walk: StageWalkCharges,
+    pub stage: String,
+    pub enabled: bool,
+    pub applied: bool,
+    pub skipped: bool,
+    pub reason: String,
+    #[serde(default)]
+    pub last_run_unix_ms: u64,
+    #[serde(default)]
+    pub duration_ms: u64,
+    #[serde(default)]
+    pub skipped_reason: String,
+    #[serde(default)]
+    pub errors: Vec<String>,
+    #[serde(default)]
+    pub pressure_signal: String,
+    #[serde(default)]
+    pub pressure_score: u64,
+    #[serde(default)]
+    pub pressure_threshold: u64,
+    #[serde(default)]
+    pub pressure_triggered: bool,
+    #[serde(default)]
+    pub candidate_count: usize,
+    #[serde(default)]
+    pub skipped_count: usize,
+    #[serde(default)]
+    pub before_bytes: u64,
+    #[serde(default)]
+    pub after_bytes: u64,
+    #[serde(default)]
+    pub live_bytes: u64,
+    #[serde(default)]
+    pub stale_bytes: u64,
+    #[serde(default)]
+    #[serde(alias = "selected_slots")]
+    pub selected_buckets: Vec<u32>,
+    #[serde(default)]
+    pub selected_block_slab_ids: Vec<u64>,
+    #[serde(default)]
+    pub dirty_bucket_count: usize,
+    #[serde(rename = "undumped_wal_records", default)]
+    pub undumped_wal_records: u64,
+    #[serde(default)]
+    #[serde(rename = "dumped_slot_count")]
+    pub dumped_bucket_count: usize,
+    #[serde(default)]
+    pub wal_records_removed: usize,
+    #[serde(default)]
+    pub index_log_records_removed: usize,
+    /// How many pages this stage moved out of the log and into the block store.
+    ///
+    /// Separate from `wal_records_removed`: this counts what had to become durable ELSEWHERE
+    /// before any record could be removed at all, because a page still living only inside a
+    /// record pins the retention floor to that record's sequence.
+    #[serde(default)]
+    pub wal_resident_blocks_materialised: usize,
+    #[serde(default)]
+    pub retain_from_wal_sequence: u64,
+    #[serde(default)]
+    pub retain_from_index_log_sequence: u64,
+    #[serde(default)]
+    pub expired_records_removed: usize,
+    #[serde(default)]
+    pub cache_entries_removed: usize,
+    #[serde(default)]
+    pub cache_disk_bytes_removed: u64,
+    #[serde(default)]
+    pub eviction_pressure_before: u64,
+    #[serde(default)]
+    pub eviction_pressure_after: u64,
+    #[serde(default)]
+    pub eviction_cooldown: bool,
+    /// Buckets whose resident block list the evict stage RELEASED this round, and buckets it tried
+    /// and was refused.
+    ///
+    /// Carried here because this is the stage report that gets exported. The eviction report has
+    /// held these three numbers since the release path landed, and the periodic scheduler throws
+    /// that report away -- so a release and a round that refused every candidate reached an
+    /// operator as the same thing: a resident-bytes gauge that did or did not move. A gauge that
+    /// did not move cannot distinguish "nothing needed releasing" from "every candidate was
+    /// refused", which is the distinction worth paging on.
+    #[serde(default)]
+    pub eviction_buckets_released: usize,
+    #[serde(default)]
+    pub eviction_blocks_released: usize,
+    #[serde(default)]
+    pub eviction_release_refused: usize,
+    #[serde(default)]
+    pub dropped_object_count: usize,
+    #[serde(default)]
+    pub block_slabs_reclaimed: usize,
+    #[serde(default)]
+    pub block_bytes_reclaimed: u64,
+    #[serde(default)]
+    pub bytes_reclaimed: u64,
+    #[serde(default)]
+    pub blocks_compacted: usize,
+    #[serde(default)]
+    pub manifest_pruned_count: usize,
+    #[serde(default)]
+    pub install_roll_forward_count: usize,
+    #[serde(default)]
+    pub compacted_block_slab_id: Option<u64>,
+    #[serde(default)]
+    pub rewritten_block_refs: usize,
+    #[serde(default)]
+    pub wal_floor_sequence: u64,
+    #[serde(default)]
+    pub index_log_floor_sequence: u64,
+    #[serde(default)]
+    pub retention_blockers: usize,
+    #[serde(default)]
+    pub pressure_before: u64,
+    #[serde(default)]
+    pub pressure_after: u64,
+    #[serde(default)]
+    pub metrics_bucket_count: usize,
+    #[serde(default)]
+    pub metrics_block_ref_count: u64,
+    /// The slab the prepare stage rolled to, or `None` when it did not roll.
+    ///
+    /// `applied` on this stage says the stage RAN; this says whether it did anything, and the
+    /// two are different answers. The stage is a no-op on the overwhelming majority of rounds,
+    /// so reporting only the first makes a prepare that never rolls look exactly like one that
+    /// rolls every round.
+    #[serde(default)]
+    pub prepared_block_slab_id: Option<u64>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageManagerPressureSignals {
+    pub dirty_bucket_count: usize,
+    pub undumped_wal_records: u64,
+    pub wal_bytes: u64,
+    pub index_log_bytes: u64,
+    pub stale_block_bytes: u64,
+    pub live_block_bytes: u64,
+    pub block_slab_stale_density_basis_points: u64,
+    pub memory_cache_bytes: u64,
+    pub disk_cache_bytes: u64,
+    /// Resident bucket-index bytes: nodes PLUS per-page entries -- the figure a release actually
+    /// moves, not the node-only `bucket_index_resident_bytes_floor`, which cannot.
+    ///
+    /// Every memory term beside it is a CACHE term, and the bucket index is in none of them. It is
+    /// counted into `total_pressure_score` and reported on the `evict` stage, and it is NOT folded
+    /// into `memory_cache_pressure_score`: that one is re-measured after the cache is warmed, by
+    /// subtracting itself out of the total and adding the warmed cache back, and an index term
+    /// hidden inside it would be subtracted away by that arithmetic and never returned.
+    #[serde(default)]
+    pub bucket_index_resident_bytes: u64,
+    pub memory_cache_pressure_score: u64,
+    /// Whether the round that produced this snapshot walked the shard's live pages.
+    ///
+    /// The walk is conditional: a round with no dirty slot skips it (see
+    /// `StorageLifecyclePlan::bucket_summaries`). Every figure in this snapshot that is derived
+    /// from it then reads 0 WITHOUT ANYTHING HAVING BEEN COUNTED, and a 0 of that kind is not a
+    /// measurement of zero. This flag is what separates the two, and it is exported beside them.
+    ///
+    /// It matters most for `expired_bucket_object_scan_debt`, which has two producers that do not
+    /// mean the same thing: the data_node runtime fills it from the walk's slot count, while the
+    /// engine's own cycle fills it from `shard.expires_at_ms.len()` and never touched the walk.
+    /// On the first path a 0 with this flag false means "not counted"; on the second the flag says
+    /// nothing about that field and only qualifies the slot and page figures.
+    #[serde(default)]
+    pub live_block_summaries_measured: bool,
+    pub expired_bucket_object_scan_debt: usize,
+    #[serde(alias = "delayed_destroy_segment_count")]
+    pub delayed_destroy_slab_count: usize,
+    pub delayed_destroy_bytes: u64,
+    pub follower_cursor_retention_blockers: usize,
+    pub raft_snapshot_retention_blockers: usize,
+    pub compaction_debt_model_count: usize,
+    pub compaction_debt_score: u64,
+    pub total_pressure_score: u64,
+}
+
+pub type StorageManagerPressureSnapshot = StorageManagerPressureSignals;
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageManagerCycleReport {
+    pub shard_id: ShardId,
+    /// How long the whole round took. The per-stage `duration_ms` values are each stage's own
+    /// time and tile this; they used to all be a copy of this number.
+    #[serde(default)]
+    pub duration_ms: u64,
+    pub dry_run: bool,
+    pub native_stage_order: Vec<String>,
+    pub completed: bool,
+    pub production_parity_slice: bool,
+    #[serde(default)]
+    pub pressure_snapshot: StorageManagerPressureSnapshot,
+    #[serde(default)]
+    pub pressure_signals: StorageManagerPressureSignals,
+    pub stages: Vec<StorageManagerStageReport>,
+    pub plan: StorageLifecyclePlan,
+    #[serde(default)]
+    pub merged_dump_load_policy: StorageMergedDumpLoadPolicyReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_report: Option<StorageLifecycleReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expiry_report: Option<ShardExpirySweepReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_report: Option<ShardCompactionReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wal_reclaim_report: Option<StorageWalReclaimReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_gc_report: Option<StorageIndexGcReport>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eviction_report: Option<StorageEvictionReport>,
+    #[serde(default)]
+    pub block_gc_dependency_plan: StorageBlockGcDependencyPlan,
+    #[serde(default)]
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageDataStructureApiParityReport {
+    pub shard_id: ShardId,
+    pub ready: bool,
+    pub bucket_object_block_authority_ready: bool,
+    pub bucket_store_layout_api_ready: bool,
+    pub object_manager_runtime_api_ready: bool,
+    pub block_address_api_ready: bool,
+    #[serde(alias = "block_store_segment_api_ready")]
+    pub block_store_slab_api_ready: bool,
+    pub stream_backed_slab_api_ready: bool,
+    pub legacy_block_slab_aliases_ready: bool,
+    pub storage_manager_phase_api_ready: bool,
+    pub storage_manager_pressure_api_ready: bool,
+    pub storage_manager_merged_dump_load_api_ready: bool,
+    pub bucket_count: usize,
+    pub page_index_count: usize,
+    pub block_index_count: u64,
+    pub stream_slab_count: u64,
+    pub stream_record_count: u64,
+    pub storage_manager_stage_order: Vec<String>,
+    pub blockers: Vec<String>,
+    pub evidence: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageManagerLoopRequest {
+    pub shard_id: ShardId,
+    #[serde(default)]
+    pub apply: bool,
+    #[serde(default)]
+    pub expire_records: bool,
+    #[serde(alias = "compact_pages", default)]
+    pub compact_blocks: bool,
+    #[serde(default)]
+    pub lifecycle: StorageLifecycleRequest,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageManagerLoopPhaseReport {
+    pub phase: String,
+    pub attempted: bool,
+    pub applied: bool,
+    pub evidence: Vec<String>,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageManagerLoopReport {
+    pub shard_id: ShardId,
+    pub loop_ready: bool,
+    pub phases: Vec<StorageManagerLoopPhaseReport>,
+    pub lifecycle: StorageLifecycleReport,
+    pub expiry_sweep: ShardExpirySweepReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<ShardCompactionReport>,
+    pub evidence: Vec<String>,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageProductionReadinessPolicy {
+    #[serde(default)]
+    pub max_dirty_buckets: Option<usize>,
+    #[serde(default)]
+    pub max_stale_block_slabs: Option<usize>,
+    #[serde(default)]
+    pub max_orphan_block_slabs: Option<usize>,
+    #[serde(rename = "max_undumped_wal_records", default)]
+    pub max_undumped_wal_records: Option<u64>,
+    #[serde(default)]
+    pub require_bucket_dump_manifest: bool,
+    #[serde(default)]
+    pub block_on_warnings: bool,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageProductionReadinessRequest {
+    pub shard_id: ShardId,
+    #[serde(default)]
+    pub policy: StorageProductionReadinessPolicy,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageProductionReadinessReport {
+    pub shard_id: ShardId,
+    #[serde(default)]
+    pub policy: StorageProductionReadinessPolicy,
+    pub production_ready: bool,
+    pub blockers: Vec<String>,
+    pub warnings: Vec<String>,
+    pub dirty_bucket_count: usize,
+    pub stale_block_slab_count: usize,
+    pub orphan_block_slab_count: usize,
+    #[serde(rename = "undumped_wal_records", default)]
+    pub undumped_wal_records: u64,
+    pub corrupt_block_slab_count: usize,
+    pub unreadable_block_ref_count: usize,
+    pub owner_mismatch_block_ref_count: usize,
+    pub missing_owner_block_ref_count: u64,
+    pub reused_object_id_conflict_count: u64,
+    pub interrupted_bucket_dump_install_count: usize,
+    #[serde(default)]
+    pub prepared_bucket_dump_install_count: usize,
+    #[serde(default)]
+    pub installed_bucket_dump_install_count: usize,
+    #[serde(default)]
+    pub unknown_bucket_dump_install_count: usize,
+    pub bucket_dump_manifest_count: usize,
+    pub cache_memory_bytes: u64,
+    pub cache_disk_bytes: u64,
+    #[serde(default)]
+    pub block_store_bytes_written: u64,
+    pub boundary: StorageRecoveryBoundaryReport,
+    pub object_lifecycle: StorageObjectLifecycleReport,
+    #[serde(default)]
+    #[serde(alias = "segment_integrity")]
+    pub slab_integrity: StorageSlabIntegrityReport,
+    #[serde(default)]
+    pub log_compatibility: StorageLogCompatibilityReport,
+    #[serde(default)]
+    pub block_format_compatibility: StorageBlockFormatCompatibilityReport,
+    #[serde(rename = "feature_block_layout", default)]
+    pub feature_block_layout: StorageFeatureBlockLayoutReport,
+    pub feature_block_layout_mismatch_count: usize,
+    pub corrupt_feature_block_count: usize,
+}
+
+/// The log numbers a maintenance round actually reads -- without the walk that counts records.
+///
+/// `StorageLogCompatibilityReport` answers these same figures and six more besides, two of which
+/// are `wal_records` and `index_log_records`. Each of those is a `record_count()`, and a
+/// `record_count()` reads the WHOLE log and decodes every record in it. Both pressure sites asked
+/// for the full report and read only the bytes, so every maintenance round decoded the write-ahead
+/// log end to end -- and the index log after it -- for two numbers it then discarded. On a small
+/// store that is a few hundred kilobytes and invisible; it grows with the retained log, and the
+/// round it runs on is the same round that reclaims, so a log that is not draining makes its own
+/// maintenance more expensive.
+///
+/// Same fields, same sources, same values as the report it is taken from. This is that report with
+/// the counting left out, not a second opinion about the log.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageLogPressureReport {
+    pub shard_id: ShardId,
+    pub wal_last_sequence: u64,
+    pub index_log_last_sequence: u64,
+    pub wal_bytes: u64,
+    pub index_log_bytes: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageLogCompatibilityReport {
+    pub shard_id: ShardId,
+    /// Current writer payload format. Older JSON records remain readable.
+    /// Outcome items are enabled by default; commands are retained where recovery needs them.
+    #[serde(rename = "wal_format")]
+    pub wal_format: String,
+    pub index_log_format: String,
+    #[serde(default)]
+    pub compatibility_mode: String,
+    #[serde(default)]
+    pub migration_required: bool,
+    #[serde(default)]
+    pub native_reader_supported: bool,
+    #[serde(default)]
+    pub native_writer_supported: bool,
+    #[serde(default)]
+    pub golden_conversion_required: bool,
+    pub rust_native_replay_safe: bool,
+    pub native_binary_compatible: bool,
+    #[serde(rename = "wal_last_sequence")]
+    pub wal_last_sequence: u64,
+    pub index_log_last_sequence: u64,
+    #[serde(rename = "wal_records")]
+    pub wal_records: usize,
+    pub index_log_records: usize,
+    #[serde(rename = "wal_bytes")]
+    pub wal_bytes: u64,
+    pub index_log_bytes: u64,
+    pub compatibility_gaps: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageBlockFormatCompatibilityReport {
+    pub shard_id: ShardId,
+    pub block_format: String,
+    pub rust_envelope_version: u8,
+    #[serde(default)]
+    pub compatibility_mode: String,
+    #[serde(default)]
+    pub migration_required: bool,
+    #[serde(default)]
+    pub native_block_header_reader_supported: bool,
+    #[serde(default)]
+    pub native_block_header_writer_supported: bool,
+    #[serde(default)]
+    pub golden_conversion_required: bool,
+    pub rust_native_read_safe: bool,
+    pub native_block_header_compatible: bool,
+    pub checksum_protected: bool,
+    pub object_ids_embedded: bool,
+    pub routing_buckets_embedded: bool,
+    pub compression_supported: bool,
+    pub active_slabs: u64,
+    pub sealed_slabs: u64,
+    pub delayed_destroy_slabs: u64,
+    pub live_physical_bytes: u64,
+    pub reclaimable_physical_bytes: u64,
+    pub block_store_writes: u64,
+    pub block_store_bytes_written: u64,
+    pub logical_bytes_written: u64,
+    pub compressed_records_written: u64,
+    pub compatibility_gaps: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageCacheBucketSummary {
+    #[serde(rename = "routing_slot")]
+    pub routing_bucket: u32,
+    pub entry_count: usize,
+    pub memory_bytes: u64,
+    pub disk_bytes: u64,
+    #[serde(default)]
+    pub pinned_entries: usize,
+    #[serde(default)]
+    pub pinned_bytes: u64,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageCacheInspectionReport {
+    pub shard_id: ShardId,
+    pub stats: CacheStats,
+    pub entries: Vec<CacheEntryInfo>,
+    pub bucket_summaries: Vec<StorageCacheBucketSummary>,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageCacheInvalidateBucketRequest {
+    pub shard_id: ShardId,
+    #[serde(rename = "routing_slot")]
+    pub routing_bucket: u32,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoldenCaseReport {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GoldenCorpusReport {
+    pub corpus: String,
+    pub total_cases: usize,
+    pub passed_cases: usize,
+    pub failed_cases: usize,
+    pub cases: Vec<GoldenCaseReport>,
+}
+
+impl GoldenCorpusReport {
+    pub fn passed(&self) -> bool {
+        self.failed_cases == 0 && self.total_cases == self.passed_cases
+    }
+}
+
+
+#[cfg(test)]
+mod manifest_field_name_tests {
+    use super::{BucketStorageSummary, SummaryNamed};
+
+    /// The writer this replaced: the derive, with the long names it emitted.
+    ///
+    /// Kept as the specification. A hand-written writer that produced a DIFFERENT document under
+    /// the default would change every manifest silently, which is the one thing this change must
+    /// not do -- the whole point is that nothing moves until an operator asks.
+    #[derive(serde::Serialize)]
+    struct Derived {
+        #[serde(rename = "routing_slot")]
+        routing_bucket: u32,
+        object_count: u64,
+        block_ref_count: u64,
+        logical_bytes: u64,
+        physical_bytes: u64,
+        dirty_object_count: u64,
+        dirty_generation: u64,
+        last_dump_sequence: u64,
+        block_slab_ids: Vec<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        last_compacted_slab: Option<u64>,
+    }
+
+    fn derived_of(summary: &BucketStorageSummary) -> Derived {
+        Derived {
+            routing_bucket: summary.routing_bucket,
+            object_count: summary.object_count,
+            block_ref_count: summary.block_ref_count,
+            logical_bytes: summary.logical_bytes,
+            physical_bytes: summary.physical_bytes,
+            dirty_object_count: summary.dirty_object_count,
+            dirty_generation: summary.dirty_generation,
+            last_dump_sequence: summary.last_dump_sequence,
+            block_slab_ids: summary.block_slab_ids.clone(),
+            last_compacted_slab: summary.last_compacted_slab,
+        }
+    }
+
+    fn cases() -> Vec<(&'static str, BucketStorageSummary)> {
+        let full = BucketStorageSummary {
+            routing_bucket: 8539,
+            object_count: 12,
+            block_ref_count: 34,
+            logical_bytes: 4096,
+            physical_bytes: 8192,
+            dirty_object_count: 3,
+            dirty_generation: 77,
+            last_dump_sequence: 909,
+            block_slab_ids: vec![1, 2, 3],
+            last_compacted_slab: Some(5),
+        };
+        let mut no_slab = full.clone();
+        no_slab.last_compacted_slab = None;
+        let mut empty_slabs = full.clone();
+        empty_slabs.block_slab_ids = Vec::new();
+        vec![
+            ("fully populated", full),
+            ("no compacted band", no_slab),
+            ("no slab ids", empty_slabs),
+            ("all defaults", BucketStorageSummary::default()),
+        ]
+    }
+
+    /// Off by default: the long spelling is byte for byte what the derive produced.
+    #[test]
+    fn the_default_spelling_is_unchanged() {
+        for (label, summary) in cases() {
+            let ours = serde_json::to_vec(&SummaryNamed(&summary, false)).expect("ours");
+            let theirs = serde_json::to_vec(&derived_of(&summary)).expect("theirs");
+            assert_eq!(
+                String::from_utf8_lossy(&ours),
+                String::from_utf8_lossy(&theirs),
+                "default spelling changed for {label}"
+            );
+        }
+    }
+
+    /// The short spelling reads back as the same summary, because every reader learned the
+    /// aliases first. This is the property that makes the switch safe to turn on.
+    #[test]
+    fn the_short_spelling_round_trips() {
+        for (label, summary) in cases() {
+            let short = serde_json::to_vec(&SummaryNamed(&summary, true)).expect("short");
+            let back: BucketStorageSummary =
+                serde_json::from_slice(&short).unwrap_or_else(|err| {
+                    panic!("short form did not parse for {label}: {err}");
+                });
+            assert_eq!(back, summary, "short form lost something for {label}");
+
+            // And the long form still reads, so a directory holding both loads either way.
+            let long = serde_json::to_vec(&SummaryNamed(&summary, false)).expect("long");
+            let back_long: BucketStorageSummary =
+                serde_json::from_slice(&long).expect("long form parses");
+            assert_eq!(back_long, summary, "long form lost something for {label}");
+        }
+    }
+
+    /// The writer emits the short spelling, and nothing can ask it not to.
+    ///
+    /// Every other test here names the spelling explicitly through `serialize_named`, so all of
+    /// them would pass whichever one `Serialize` chose. This is the only test that exercises the
+    /// choice `Serialize` actually makes, which is why it asserts the BYTES rather than a
+    /// setting -- there is no longer a setting to read.
+    #[test]
+    fn the_default_is_now_the_short_spelling() {
+        let written = serde_json::to_vec(&BucketStorageSummary::default()).expect("serialize");
+        let text = String::from_utf8_lossy(&written);
+        assert!(
+            text.contains("\"rs\""),
+            "the default write should use the short names, got {text}"
+        );
+        assert!(
+            !text.contains("routing_slot"),
+            "the default write should not use the long names, got {text}"
+        );
+    }
+
+    /// And it is actually smaller -- the reason for the change.
+    #[test]
+    fn the_short_spelling_is_smaller() {
+        let summary = cases()
+            .into_iter()
+            .find(|(label, _)| *label == "fully populated")
+            .expect("the populated case")
+            .1;
+        let long = serde_json::to_vec(&SummaryNamed(&summary, false)).expect("long");
+        let short = serde_json::to_vec(&SummaryNamed(&summary, true)).expect("short");
+        let saved = 100.0 * (long.len() - short.len()) as f64 / long.len() as f64;
+        println!(
+            "  MANIFEST one summary: long {} B, short {} B, saved {saved:.1}%",
+            long.len(),
+            short.len()
+        );
+        assert!(
+            short.len() < long.len(),
+            "short {} is not smaller than long {}",
+            short.len(),
+            long.len()
+        );
+        // A saving this small would mean the names were not what cost the bytes.
+        assert!(saved > 25.0, "expected the names to be worth more than 25%, got {saved:.1}%");
+    }
+}
