@@ -50,3 +50,56 @@ pub fn read_command(reader: &mut impl BufRead) -> io::Result<Option<Vec<Vec<u8>>
     trim_crlf(&mut first);
     if first.is_empty() {
         return Ok(Some(Vec::new()));
+    }
+    if first[0] != b'*' {
+        return Ok(Some(split_inline(&first)));
+    }
+    let count = parse_prefixed_number(&first, b'*')?;
+    let mut args = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut len_line = Vec::new();
+        reader.read_until(b'\n', &mut len_line)?;
+        trim_crlf(&mut len_line);
+        let len = parse_prefixed_number(&len_line, b'$')?;
+        let mut value = vec![0; len + 2];
+        reader.read_exact(&mut value)?;
+        if &value[len..] != b"\r\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad bulk string terminator",
+            ));
+        }
+        value.truncate(len);
+        args.push(value);
+    }
+    Ok(Some(args))
+}
+
+fn parse_prefixed_number(line: &[u8], prefix: u8) -> io::Result<usize> {
+    if !line.starts_with(&[prefix]) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "unexpected RESP prefix",
+        ));
+    }
+    std::str::from_utf8(&line[1..])
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "bad RESP length"))
+}
+
+fn split_inline(line: &[u8]) -> Vec<Vec<u8>> {
+    String::from_utf8_lossy(line)
+        .split_whitespace()
+        .map(|part| part.as_bytes().to_vec())
+        .collect()
+}
+
+fn trim_crlf(value: &mut Vec<u8>) {
+    while value
+        .last()
+        .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+    {
+        value.pop();
+    }
+}
