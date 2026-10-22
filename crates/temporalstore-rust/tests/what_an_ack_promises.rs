@@ -261,3 +261,266 @@ fn carried_since(root: &Path, before: &HashSet<u64>) -> Carried {
 /// measured window opens. Nothing the setup appended is counted.
 fn measure(shape: Shape) -> Carried {
     let dir = tempfile::tempdir().expect("tempdir");
+    let root = dir.path();
+    let engine = open_engine(root);
+    engine.load_shard(1);
+
+    for command in upsert_workload(0) {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command,
+        });
+        assert!(
+            response.status.ok,
+            "setup write failed: {}",
+            response.status.message
+        );
+    }
+    if !shape.synchronous {
+        let applied = engine.set_config(SetConfigRequest {
+            shard_id: 1,
+            config: Config {
+                version: 2,
+                async_storage: true,
+                ..Config::default()
+            },
+        });
+        assert!(applied.ok, "set_config(async_storage) failed: {applied:?}");
+    }
+
+    let before = log_ids(root);
+
+    let commands = if shape.upsert {
+        // A key range the setup did not touch, so these are fresh writes rather than overwrites.
+        upsert_workload(100)
+    } else {
+        removal_workload(0)
+    };
+    if shape.batched {
+        let response = engine.batch_execute(BatchExecuteRequest {
+            shard_id: 1,
+            commands,
+        });
+        assert!(
+            response.status.ok,
+            "batch write failed: {}",
+            response.status.message
+        );
+    } else {
+        for command in commands {
+            let response = engine.execute(ExecuteRequest {
+                shard_id: 1,
+                command,
+            });
+            assert!(
+                response.status.ok,
+                "measured write failed: {}",
+                response.status.message
+            );
+        }
+    }
+    carried_since(root, &before)
+}
+
+/// Walk every cell and PRINT the table.
+///
+/// Printed as well as asserted. A guard that only says "still zero" cannot be read by the next
+/// person deciding what an ack promises, and that is who this file is for.
+fn walk() -> Vec<(Shape, Carried)> {
+    let measured: Vec<(Shape, Carried)> = SHAPES
+        .iter()
+        .map(|shape| (*shape, measure(*shape)))
+        .collect();
+    println!();
+    println!("WHAT A RECORD CARRIES, PER WRITE SHAPE, AT THE SHIPPED DEFAULTS");
+    println!(
+        "{:<27} {:>7} {:>9} {:>7} {:>6} {:>7} {:>8} {:>9} {:>6} {:>11}",
+        "shape",
+        "records",
+        "operation",
+        "results",
+        "bytes",
+        "removal",
+        "deadline",
+        "addr-only",
+        "blocks",
+        "no-way-back"
+    );
+    for (shape, counts) in &measured {
+        println!(
+            "{:<27} {:>7} {:>9} {:>7} {:>6} {:>7} {:>8} {:>9} {:>6} {:>11}",
+            shape.label,
+            counts.records,
+            counts.records_with_an_operation,
+            counts.results,
+            counts.results_carrying_bytes,
+            counts.results_stating_a_removal,
+            counts.results_stating_a_deadline,
+            counts.results_naming_only_an_address,
+            counts.blocks_in_the_record,
+            counts.results_with_no_way_back
+        );
+    }
+    println!();
+    measured
+}
+
+#[test]
+fn the_walk_reaches_every_cell_and_every_cell_appends_records() {
+    let measured = walk();
+    // FIXTURE REGIME FOR THE WHOLE FILE, AND IT GOES FIRST. Every claim below is about eight
+    // cells, and a walk that quietly measured seven of them would agree with all of them.
+    assert_eq!(
+        measured.len(),
+        8,
+        "the walk must reach all eight cells, reached {}",
+        measured.len()
+    );
+    for (shape, counts) in &measured {
+        assert!(
+            counts.records > 0,
+            "cell {} appended NO records, so nothing measured about it means anything",
+            shape.label.trim()
+        );
+    }
+}
+
+#[test]
+fn no_cell_leaves_an_acked_result_with_no_way_back() {
+    let measured = walk();
+    // Regime: there are results to be about. A walk whose cells recorded nothing would pass the
+    // conclusion below by having nothing to fail on. A SUM rather than a count per cell: while the
+    // batch rule asked whether the batch had staged any page, the asynchronous batched removal cell
+    // recorded no results at all -- it took `append_batch_atomic` and wrote the operations
+    // instead -- so a per-cell clause here would have had to carve that cell out. It now records
+    // twelve, like its synchronous twin, but the sum stays because a cell legitimately CAN record
+    // only operations and `an_operation_or_a_statement_covers_every_record` is what covers that.
+    let results: usize = measured.iter().map(|(_, c)| c.results).sum();
+    assert!(
+        results > 0,
+        "the walk recorded no results at all, so a zero below says nothing"
+    );
+    // THE CONCLUSION, and the one number the durability decision turns on. A result with no
+    // operation to re-run, no page in its record, and nothing stated in itself, names a
+    // block-store address and nothing else -- and under the single-barrier default that address
+    // can be bytes the ack never made durable.
+    for (shape, counts) in &measured {
+        assert_eq!(
+            counts.results_with_no_way_back,
+            0,
+            "cell {} left {} of {} acked results with NO way back: no operation, no page in the \
+             record, and nothing stated in the result itself",
+            shape.label.trim(),
+            counts.results_with_no_way_back,
+            counts.results
+        );
+    }
+}
+
+#[test]
+fn an_upsert_carries_its_block_inside_the_record() {
+    let measured = walk();
+    // Regime: four upsert cells.
+    let upserts: Vec<&(Shape, Carried)> =
+        measured.iter().filter(|(shape, _)| shape.upsert).collect();
+    assert_eq!(
+        upserts.len(),
+        4,
+        "there are four upsert cells, found {}",
+        upserts.len()
+    );
+    // THE CONCLUSION: the bytes travel in the record, and there are at least as many pages as
+    // there are results that state nothing but an address. This is the column the durability note
+    // omitted, and it is why the recovery suite rebuilds every acked key from the log alone.
+    //
+    // The regime clause that would belong first here -- "each of these cells recorded an
+    // address-only result at all" -- is NOT placed above it, because the same change that empties
+    // the page column empties that one too, and a clause behind an overlapping one can never be
+    // reached by its own plant. It is asserted on its own in
+    // `an_upsert_records_results_that_name_only_an_address`.
+    for (shape, counts) in &upserts {
+        assert!(
+            counts.blocks_in_the_record >= counts.results_naming_only_an_address,
+            "upsert cell {} carries {} pages for {} results that name only an address, so some \
+             acked value can only be rebuilt from an address the ack did not make durable",
+            shape.label.trim(),
+            counts.blocks_in_the_record,
+            counts.results_naming_only_an_address
+        );
+    }
+}
+
+#[test]
+fn an_upsert_records_results_that_name_only_an_address() {
+    let measured = walk();
+    // The cell count is asserted by `an_upsert_carries_its_block_inside_the_record` and is not
+    // repeated here. Two clauses asserting one fact cannot be planted apart, and the plant that
+    // moves the upsert count moves the removal count with it -- the two are complementary over
+    // one partition, so neither can fail alone.
+    let upserts: Vec<&(Shape, Carried)> =
+        measured.iter().filter(|(shape, _)| shape.upsert).collect();
+    // What makes the carried page LOAD-BEARING rather than spare. A build whose results all
+    // carried their own bytes would satisfy `an_upsert_carries_its_block_inside_the_record` without
+    // any page mattering, so that test would stop being about anything.
+    for (shape, counts) in &upserts {
+        assert!(
+            counts.results_naming_only_an_address > 0,
+            "upsert cell {} recorded {} results and none of them names only an address, so a \
+             carried page is no longer what makes this cell recoverable",
+            shape.label.trim(),
+            counts.results
+        );
+    }
+}
+
+#[test]
+fn a_removal_carries_no_block() {
+    let measured = walk();
+    // Regime: four removal cells.
+    let removals: Vec<&(Shape, Carried)> =
+        measured.iter().filter(|(shape, _)| !shape.upsert).collect();
+    assert_eq!(
+        removals.len(),
+        4,
+        "there are four removal cells, found {}",
+        removals.len()
+    );
+    // These are the cells the limiting rule is about, and this is what makes them so. A removal
+    // cell that carried a page would be an upsert wearing the wrong label, and would satisfy
+    // `an_operation_or_a_statement_covers_every_record` for the wrong reason.
+    for (shape, counts) in &removals {
+        assert_eq!(
+            counts.blocks_in_the_record,
+            0,
+            "removal cell {} carried {} pages, so it is not the no-page cell it is labelled",
+            shape.label.trim(),
+            counts.blocks_in_the_record
+        );
+    }
+}
+
+#[test]
+fn an_operation_or_a_statement_covers_every_record() {
+    let measured = walk();
+    // The cell count is asserted by `a_removal_carries_no_block` and is not repeated here, for the
+    // reason given there.
+    let removals: Vec<&(Shape, Carried)> =
+        measured.iter().filter(|(shape, _)| !shape.upsert).collect();
+    // AN ACCOUNTING IDENTITY, not a threshold. With no page to carry, a removal cell is
+    // recoverable one of exactly two ways: EVERY result states itself, or EVERY record kept its
+    // operation. "At least one result states itself" would be a maximum over one member, and a
+    // cell that lost eleven of twelve removals would satisfy it.
+    for (shape, counts) in &removals {
+        let stated = counts.results_stating_themselves();
+        assert!(
+            stated == counts.results || counts.every_record_kept_its_operation(),
+            "removal cell {}: {} of {} results state themselves and {} of {} records kept an \
+             operation, so some acked removal is neither stated nor re-runnable",
+            shape.label.trim(),
+            stated,
+            counts.results,
+            counts.records_with_an_operation,
+            counts.records
+        );
+    }
+}

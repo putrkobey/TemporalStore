@@ -44,3 +44,189 @@ impl BlockStore {
         self.append_block_of_object(bytes, object_id, routing_bucket, 0)
     }
 
+    /// Append one block, saying which block of its object it is.
+    ///
+    /// The index is the caller's to know, because the caller is what holds the object: a block
+    /// id is a position INSIDE an object here, not a number handed out across the whole store.
+    /// That is what makes the id small, and it is what removes the store-wide counter -- and
+    /// the walk that used to recover the counter by reading every block header in every slab.
+    pub fn append_block_of_object(
+        &self,
+        bytes: &[u8],
+        object_id: Option<u64>,
+        routing_bucket: Option<u32>,
+        block_ordinal: u32,
+    ) -> Result<ElementEntry, BlockStoreError> {
+        let mut inner = self.inner.lock().expect("block store lock poisoned");
+        std::fs::create_dir_all(&inner.root)?;
+        let slab_target_bytes = effective_block_slab_target_bytes();
+        let block_id = u64::from(block_ordinal);
+        // ENCODED ONCE, INCLUDING ACROSS A ROLL. This used to re-encode the whole record after
+        // rolling, to restamp the slab id it was landing in -- a slab id `encode_block_record`
+        // then discarded, so the second call re-ran zstd over the same payload and produced
+        // byte-identical bytes. Measured on this box at load 1.92, release build, 1,244-byte
+        // soak-corpus payload compressing to a 418-byte record: 5,277 ns per encode against
+        // 16,237 ns per append, and one roll per 2,568,760 appends at the shipped 1 GiB slab
+        // target -- 1.3e-7 of append time, which is noise by any measure. It is removed because
+        // it re-encoded for a field nothing keeps, not because it cost anything.
+        let record =
+            encode_block_record(bytes, block_id, object_id, routing_bucket, inner.options)?;
+        if should_roll_before_append(
+            inner.write_offset,
+            record.bytes.len() as u64,
+            slab_target_bytes,
+        ) {
+            roll_slab_inner(&mut inner)?;
+        }
+        let path = slab_path(&inner.root, inner.block_slab_id);
+        let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+        // CHECKED, NOT SATURATED. The slab target is capped so `write_offset` fits in the
+        // address word's low half, but the cap binds what a store may be CONFIGURED with, not
+        // what a slab file on disk already is: a slab grown past 4 GiB under an older, uncapped
+        // target is recovered into `write_offset` verbatim (`read.rs` sets it from the file's
+        // length), and the very next append would record an offset that does not fit. Refusing
+        // the write turns that into a failed append; truncating it would turn it into a page
+        // that reads back as a different page.
+        let address = ElementEntry::try_from_parts(inner.block_slab_id, inner.write_offset, record.bytes.len() as u64, Some(block_id), object_id)?;
+        file.write_all(&record.bytes)?;
+        file.flush()?;
+        // Two INDEPENDENT relaxations:
+        //  * `defer_data_sync` skips this record's data-page fdatasync. UNSAFE on the live
+        //    path: the served index references pages by (slab,offset,page_id) and recovery
+        //    may skip WAL replay when the index anchor is current, leaving dangling refs to
+        //    an un-synced page (verified data loss under SIGKILL). Only bulk backfill --
+        //    which pins the replay anchor and re-drives the whole chunk -- may defer it.
+        //  * `defer_manifest` defers the per-record extent-manifest persist (write-tmp +
+        //    fsync + rename EVERY record -- barriers 5/6) to sync_durable()/slab-seal. SAFE
+        //    even with pages kept durable: the manifest is slab/GC metadata reconstructed
+        //    by reconcile-on-open from the durable page records, never a read dependency.
+        let defer_data_sync = bulk_relaxed_durability() || block_wal_single_barrier();
+        let defer_manifest = bulk_relaxed_durability() || block_wal_only_sync();
+        if !defer_data_sync {
+            file.sync_data()?;
+        }
+        inner.write_offset += address.length();
+        let block_slab_id = inner.block_slab_id;
+        let write_offset = inner.write_offset;
+        upsert_slab_after_append(
+            &mut inner.slabs,
+            block_slab_id,
+            write_offset,
+            record.logical_len as u64,
+            block_id,
+        );
+        if defer_manifest {
+            inner.relaxed_dirty = true;
+        } else {
+            inner.persist_slab_manifest_counted()?;
+        }
+        inner.stats.writes += 1;
+        inner.stats.bytes_written += address.length();
+        inner.stats.logical_bytes_written += record.logical_len as u64;
+        if record.compression == BlockRecordCompression::Zstd {
+            inner.stats.compressed_records_written += 1;
+            inner.stats.compression_bytes_saved +=
+                record.logical_len.saturating_sub(record.stored_len) as u64;
+        }
+        Ok(address)
+    }
+
+    pub fn append_batch_with_block_metadata(
+        &self,
+        records: Vec<BlockAppendRecord<'_>>,
+    ) -> Result<Vec<ElementEntry>, BlockStoreError> {
+        let mut inner = self.inner.lock().expect("block store lock poisoned");
+        if records.is_empty() {
+            return Ok(Vec::new());
+        }
+        std::fs::create_dir_all(&inner.root)?;
+        let slab_target_bytes = effective_block_slab_target_bytes();
+        let mut file = None::<std::fs::File>;
+        let mut addresses = Vec::with_capacity(records.len());
+        let mut writes = 0u64;
+        let mut bytes_written = 0u64;
+        let mut logical_bytes_written = 0u64;
+        let mut compressed_records_written = 0u64;
+        let mut compression_bytes_saved = 0u64;
+
+        for (bytes, object_id, routing_bucket, block_ordinal) in records {
+            let block_id = u64::from(block_ordinal);
+            // Encoded once, including across a roll -- see the note on the single-record path.
+            let record =
+                encode_block_record(bytes, block_id, object_id, routing_bucket, inner.options)?;
+            if should_roll_before_append(
+                inner.write_offset,
+                record.bytes.len() as u64,
+                slab_target_bytes,
+            ) {
+                if let Some(mut current) = file.take() {
+                    current.flush()?;
+                    current.sync_data()?;
+                }
+                roll_slab_inner(&mut inner)?;
+            }
+            if file.is_none() {
+                let path = slab_path(&inner.root, inner.block_slab_id);
+                file = Some(OpenOptions::new().create(true).append(true).open(path)?);
+            }
+            // Checked, not saturated -- see the single-record path.
+            let address = ElementEntry::try_from_parts(inner.block_slab_id, inner.write_offset, record.bytes.len() as u64, Some(block_id), object_id)?;
+            if let Some(current) = file.as_mut() {
+                current.write_all(&record.bytes)?;
+            }
+            inner.write_offset += address.length();
+            let block_slab_id = inner.block_slab_id;
+            let write_offset = inner.write_offset;
+            upsert_slab_after_append(
+                &mut inner.slabs,
+                block_slab_id,
+                write_offset,
+                record.logical_len as u64,
+                block_id,
+            );
+            writes = writes.saturating_add(1);
+            bytes_written = bytes_written.saturating_add(address.length());
+            logical_bytes_written = logical_bytes_written.saturating_add(record.logical_len as u64);
+            if record.compression == BlockRecordCompression::Zstd {
+                compressed_records_written = compressed_records_written.saturating_add(1);
+                compression_bytes_saved = compression_bytes_saved
+                    .saturating_add(record.logical_len.saturating_sub(record.stored_len) as u64);
+            }
+            addresses.push(address);
+        }
+        // The batch already amortizes the data barrier across all its records (one
+        // sync_data for the whole batch). Under the single-barrier default both the data-page
+        // fdatasync and the extent-manifest persist are deferred (the manifest is reconciled on
+        // open); base-only recovery re-derives every post-dump page by WAL replay, so a
+        // never-fsync'd page is rebuilt, never left dangling. Under the TS_WAL_LEGACY_RECOVERY
+        // escape hatch both barriers stay synchronous on the live path (delta-fold recovery).
+        let defer_data_sync = bulk_relaxed_durability() || block_wal_single_barrier();
+        let defer_manifest = bulk_relaxed_durability() || block_wal_only_sync();
+        if let Some(mut current) = file {
+            current.flush()?;
+            if !defer_data_sync {
+                current.sync_data()?;
+            }
+        }
+        if defer_manifest {
+            inner.relaxed_dirty = true;
+        } else {
+            inner.persist_slab_manifest_counted()?;
+        }
+        inner.stats.writes = inner.stats.writes.saturating_add(writes);
+        inner.stats.bytes_written = inner.stats.bytes_written.saturating_add(bytes_written);
+        inner.stats.logical_bytes_written = inner
+            .stats
+            .logical_bytes_written
+            .saturating_add(logical_bytes_written);
+        inner.stats.compressed_records_written = inner
+            .stats
+            .compressed_records_written
+            .saturating_add(compressed_records_written);
+        inner.stats.compression_bytes_saved = inner
+            .stats
+            .compression_bytes_saved
+            .saturating_add(compression_bytes_saved);
+        Ok(addresses)
+    }
+}
