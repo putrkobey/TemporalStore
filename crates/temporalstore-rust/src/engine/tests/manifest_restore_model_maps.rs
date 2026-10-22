@@ -68,3 +68,74 @@ fn write_corpus(engine: &TemporalEngine) {
                 field: format!("f{index}"),
                 value: format!("hash-value-{index}").into_bytes(),
             },
+        });
+        assert!(response.status.ok, "HSET f{index}: {response:?}");
+    }
+    for index in 0..STRING_KEYS {
+        let response = engine.execute(ExecuteRequest {
+            shard_id: SHARD,
+            command: Command::StringSet {
+                key: format!("s{index}"),
+                value: format!("string-value-{index}").into_bytes(),
+            },
+        });
+        assert!(response.status.ok, "SET s{index}: {response:?}");
+    }
+}
+
+#[test]
+fn a_manifest_restore_on_the_default_recovery_arm_keeps_the_blocks_only_the_index_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let blocks = dir.path().join("blocks");
+    let indexes = dir.path().join("indexes");
+
+    let engine =
+        TemporalEngine::with_local_dirs(1 << 20, dir.path().join("cache-a"), &blocks, &indexes);
+    engine.load_shard(SHARD);
+    write_corpus(&engine);
+
+    // DENOMINATOR, asserted as two halves rather than one total: a restore that loses every hash
+    // field and every string alike would still satisfy a single "some data came back" test.
+    assert_eq!(
+        readable_hash_fields(&engine),
+        HASH_FIELDS,
+        "VACUITY: the live engine must serve all {HASH_FIELDS} hash fields before a restore can \
+         be said to have lost any"
+    );
+    assert_eq!(
+        readable_strings(&engine),
+        STRING_KEYS,
+        "VACUITY: the live engine must serve all {STRING_KEYS} strings"
+    );
+
+    let manifest = engine
+        .create_bucket_dump_manifest(SHARD, Vec::new())
+        .expect("dump manifest");
+    assert!(
+        manifest.wal_sequence > 0,
+        "VACUITY: a manifest anchored at 0 would not beat the base watermark, so the recovery arm \
+         under test would never be entered"
+    );
+    drop(engine);
+
+    // A fresh engine over the SAME pages + index dirs, the way a restart arrives. No base index
+    // file was ever materialized (no unload, no compaction), so the base watermark is 0 and the
+    // durable manifest above is newer -- which is the arm being measured.
+    let restarted =
+        TemporalEngine::with_local_dirs(1 << 20, dir.path().join("cache-b"), &blocks, &indexes);
+    restarted.load_shard(SHARD);
+
+    let strings_after = readable_strings(&restarted);
+    let hashes_after = readable_hash_fields(&restarted);
+    assert_eq!(
+        strings_after, STRING_KEYS,
+        "CONTROL: the restore lost serialized model-map state too ({strings_after} of \
+         {STRING_KEYS} strings), so this is not about the unserialized maps"
+    );
+    assert_eq!(
+        hashes_after, HASH_FIELDS,
+        "the restore served {hashes_after} of {HASH_FIELDS} hash fields while serving \
+         {strings_after} of {STRING_KEYS} strings: the manifest's index named every hash page, \
+         and the ownership rebuild dropped the ones no serialized model map could re-supply"
+    );
+}
