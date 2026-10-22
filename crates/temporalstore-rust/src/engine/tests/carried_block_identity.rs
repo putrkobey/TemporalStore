@@ -584,3 +584,589 @@ fn a_wal_resident_address_carries_no_ordinal_to_read_back() {
         let mut resident = 0usize;
         let mut with_ordinal = 0usize;
         let mut durable = 0usize;
+        for bucket in shard.bucket_index.bucket_map.values() {
+            for block in bucket.block_index.values() {
+                if block.deleted || block.model_id.as_str() != "hash" {
+                    continue;
+                }
+                if crate::wal_record::is_wal_resident(block.address.block_slab_id()) {
+                    resident += 1;
+                    if block.address.block_id().is_some() {
+                        with_ordinal += 1;
+                    }
+                } else {
+                    durable += 1;
+                }
+            }
+        }
+        (resident, with_ordinal, durable)
+    };
+
+    println!("\n=== can the READ side see a page ordinal? ===");
+    println!("  hash pages, WAL-resident            {resident}");
+    println!("  ...of which carry an ordinal        {with_ordinal}");
+    println!("  hash pages with a durable address   {durable}");
+
+    assert!(
+        resident > 0,
+        "NOT EXERCISED: {resident} WAL-resident hash pages, so \"none carry an ordinal\" would be \
+         true of an empty set. {durable} pages took the durable arm instead"
+    );
+    assert_eq!(
+        with_ordinal, 0,
+        "{with_ordinal} of {resident} WAL-resident addresses carry an ordinal. If that is no \
+         longer zero, the asynchronous arm of `append_value_inner` has stopped passing `None` for \
+         `block_id` and the argument in this module's header needs re-measuring rather than \
+         re-reading"
+    );
+    println!(
+        "  VERDICT: {with_ordinal}/{resident}. The writer HAS an ordinal at stage time; the reader \
+         has none at read time, on exactly the path a carried page is served from."
+    );
+}
+
+// =================================================================================================
+// 4. WHAT THE RECORD GREW.
+// =================================================================================================
+
+/// BYTES PER STAGED PAGE, ON THE WIRE AND ON DISK, AT TWO CORPUS SIZES.
+///
+/// TWO FIGURES, BECAUSE THEY ARE NOT THE SAME NUMBER AND ONLY ONE OF THEM IS PER PAGE.
+///
+///   * THE WIRE COST is what the field occupies in the protobuf body of one staged page, read
+///     from the writer's own length function rather than from a second copy of the rule -- the
+///     same function that RESERVES the buffer the writer fills, so a figure here that disagreed
+///     with the writer would be a record written into the wrong number of bytes.
+///   * THE DISK COST is what the framed, zstd-compressed record actually grows by. It is
+///     SUBLINEAR in the page count and gets cheaper the more pages a record carries, because the
+///     element name repeats and that is exactly what a compressor removes. Reporting only the
+///     wire cost would overstate what this change costs a real log; reporting only the disk cost
+///     would hide that the field is per page.
+///
+/// `ALLOC_CHUNK_BYTES` is a FLOOR above the request rather than an equality (#1969 measured a
+/// request of 104 landing in 128), so the chunk is reported beside the request and never instead
+/// of it.
+///
+/// THE CONTROL IS THE COMPONENT-LESS PAGE. A whole-object page's component is `None`, the writer
+/// skips the field entirely, and the record is byte-identical to one written before the field
+/// existed. It must report +0.00% on BOTH figures -- and its exercised bytes are asserted non-zero
+/// first, because a control that encoded nothing reports +0.00% for the wrong reason.
+///
+/// rust-internal: encodes records in memory, no store and no external surface
+#[test]
+fn what_an_element_named_block_adds_to_the_record() {
+    use crate::wal::{encode_wal_line_for_test, WriteAheadLogRecord};
+
+    fn block_of(i: usize, component: Option<&str>, payload: usize) -> StagedBlock {
+        StagedBlock {
+            object_id: stable_block_object_id(1, "hash", "hk"),
+            component: component.map(std::sync::Arc::from),
+            bytes: vec![b'v'; payload]
+                .into_iter()
+                .chain(format!("{i:04}").into_bytes())
+                .collect(),
+        }
+    }
+
+    fn record_of(blocks: usize, component: Option<&str>, payload: usize) -> WriteAheadLogRecord {
+        WriteAheadLogRecord {
+            shard_id: 1,
+            sequence: 7,
+            command: Some(Command::StringGet {
+                key: "carrier".to_string(),
+            }),
+            metadata: None,
+            staged_blocks: (0..blocks).map(|i| block_of(i, component, payload)).collect(),
+            outcomes: Vec::new(),
+        }
+    }
+
+    fn disk_len(record: &WriteAheadLogRecord) -> usize {
+        encode_wal_line_for_test(record)
+            .expect("the record encodes")
+            .len()
+    }
+
+    // The writer's own measurement, for ONE page. `implied_object_id` is `None` here because a
+    // record carrying many pages never elides an object id -- which is precisely the record shape
+    // this whole module is about.
+    fn wire_len(component: Option<&str>, payload: usize) -> usize {
+        crate::raft::wal_proto::staged_block_body_len(&block_of(0, component, payload), None)
+    }
+
+    println!("\n=== what the element identity adds to a carried page ===");
+    println!("  pages  element        wire B/page  chunk B   disk bare  disk named  disk B/page   share");
+    let mut wire_rows: Vec<(&str, i64)> = Vec::new();
+    let mut disk_rows: Vec<(usize, &str, f64)> = Vec::new();
+    for blocks in [25usize, 200usize] {
+        for (label, component) in [("hash field f7", Some("f7")), ("CONTROL: none", None)] {
+            let wire = wire_len(component, 32) as i64 - wire_len(None, 32) as i64;
+            let bare = disk_len(&record_of(blocks, None, 32));
+            let named = disk_len(&record_of(blocks, component, 32));
+            let delta = named as i64 - bare as i64;
+            let per_block = delta as f64 / blocks as f64;
+            let chunk = crate::alloc_probe::documented_glibc_chunk(wire.unsigned_abs() as usize);
+            let share = 100.0 * delta as f64 / bare as f64;
+            println!(
+                "  {blocks:>5}  {label:<13} {wire:>11} {chunk:>8} {bare:>11} {named:>11} \
+                 {per_block:>11.2} {share:>6.2}%"
+            );
+            assert!(
+                bare > 0 && named > 0,
+                "NOT EXERCISED: encoded {bare} and {named} bytes at {blocks} pages; a zero-byte \
+                 encode reports every delta below as +0.00%"
+            );
+            wire_rows.push((label, wire));
+            disk_rows.push((blocks, label, per_block));
+        }
+    }
+
+    // THE CONTROL, on both figures. A component-less page cannot be moved by adding a component
+    // field to the page, because the writer never emits the field for it.
+    for (label, wire) in &wire_rows {
+        if label.starts_with("CONTROL") {
+            assert_eq!(
+                *wire, 0,
+                "the control's WIRE cost moved by {wire} B/page. A page whose component is `None` \
+                 skips the field entirely"
+            );
+        }
+    }
+    for (blocks, label, per_block) in &disk_rows {
+        if label.starts_with("CONTROL") {
+            assert_eq!(
+                *per_block, 0.0,
+                "the control's DISK cost moved by {per_block:.2} B/page at {blocks} pages. A record \
+                 carrying no components must be byte-identical to one written before this field"
+            );
+        }
+    }
+
+    // The WIRE cost is per page, so it cannot depend on how many pages the record holds. The disk
+    // cost deliberately can, and the two assertions below are what keep the two apart.
+    let named_wire: Vec<i64> = wire_rows
+        .iter()
+        .filter(|(l, _)| l.starts_with("hash"))
+        .map(|(_, w)| *w)
+        .collect();
+    assert_eq!(
+        named_wire[0], named_wire[1],
+        "the element field costs {} wire bytes per page at one corpus size and {} at the other. \
+         It is a per-page field",
+        named_wire[0], named_wire[1]
+    );
+    assert!(
+        named_wire[0] > 0,
+        "the element field reported {} wire bytes per page. This change makes records BIGGER; a \
+         non-positive figure means the encoder is not writing the field at all",
+        named_wire[0]
+    );
+
+    let small = disk_rows
+        .iter()
+        .find(|(p, l, _)| *p == 25 && l.starts_with("hash"))
+        .expect("small row")
+        .2;
+    let large = disk_rows
+        .iter()
+        .find(|(p, l, _)| *p == 200 && l.starts_with("hash"))
+        .expect("large row")
+        .2;
+    assert!(
+        small > 0.0 && large > 0.0,
+        "the disk cost came back non-positive ({small:.2}, {large:.2}); the field must cost \
+         SOMETHING on disk or it is not being written"
+    );
+    assert!(
+        large < small,
+        "the disk cost was {small:.2} B/page at 25 pages and {large:.2} at 200. The element name \
+         repeats across a record's pages and a compressor removes repetition, so the larger \
+         record must pay LESS per page -- if it does not, the payload is no longer compressing \
+         and this figure is measuring something else"
+    );
+    assert!(
+        large < named_wire[0] as f64,
+        "the disk cost per page ({large:.2}) is not below the wire cost ({}), so the record is \
+         not being compressed and the two figures are measuring the same thing",
+        named_wire[0]
+    );
+    println!(
+        "  VERDICT: a two-character element name costs {} bytes on the WIRE per carried page, \
+         identical at both corpus sizes, and {small:.2} -> {large:.2} B/page ON DISK as the record \
+         grows from 25 pages to 200. The control is unchanged on both.",
+        named_wire[0]
+    );
+}
+
+/// THE ALLOCATIONS, which a byte count cannot see. The log is on the write path.
+///
+/// `stage` is charged to `CarriedBlock`, and this change adds the component's own copy to that same
+/// class deliberately -- it is a cost of carrying the page, and charging it elsewhere would let it
+/// disappear from the class that exists to measure exactly this.
+///
+/// The control is the same staging with no component: it must add no allocation at all, because
+/// `None.map(Arc::from)` allocates nothing.
+///
+/// rust-internal: stages pages into the thread-local buffer, no store and no external surface
+#[cfg(feature = "alloc-probe")]
+#[test]
+fn what_an_element_named_block_allocates_when_it_is_staged() {
+    use crate::alloc_probe::{AllocClass, ClassSpan};
+    const BLOCKS: usize = 200;
+
+    let measure = |component: Option<&str>| -> (u64, u64) {
+        crate::engine::block_in_wal::begin_write();
+        let span = ClassSpan::open();
+        for _ in 0..BLOCKS {
+            crate::engine::block_in_wal::stage(7, component, &[b'v'; 32]);
+        }
+        let counts = span
+            .close()
+            .expect("built with `alloc-probe`, so the ledger is a measurement");
+        let row = counts.classes.row(AllocClass::CarriedBlock);
+        let _ = crate::engine::block_in_wal::take_staged();
+        (row.allocs, row.alloc_bytes)
+    };
+
+    let (bare_allocs, bare_bytes) = measure(None);
+    let (named_allocs, named_bytes) = measure(Some("f7"));
+
+    println!("\n=== carried_block allocations for {BLOCKS} staged pages ===");
+    println!("  element          allocs   bytes   allocs/page   B/page");
+    for (label, allocs, bytes) in [
+        ("CONTROL: none", bare_allocs, bare_bytes),
+        ("hash field f7", named_allocs, named_bytes),
+    ] {
+        println!(
+            "  {label:<15} {allocs:>7} {bytes:>7} {:>13.2} {:>8.2}",
+            allocs as f64 / BLOCKS as f64,
+            bytes as f64 / BLOCKS as f64
+        );
+    }
+
+    assert!(
+        bare_allocs >= BLOCKS as u64,
+        "NOT EXERCISED: {bare_allocs} allocations for {BLOCKS} staged pages; the page copy alone is \
+         one each, so a smaller figure means the staging did not run"
+    );
+    assert!(
+        named_allocs > bare_allocs,
+        "naming the element added {} allocations over {BLOCKS} pages. An `Arc<str>` from a `&str` \
+         copies the characters, so it cannot be free -- a zero here means the field is not being \
+         filled",
+        named_allocs as i64 - bare_allocs as i64
+    );
+    println!(
+        "  VERDICT: +{:.2} allocations and +{:.2} bytes per carried page for a two-character \
+         element name.",
+        (named_allocs - bare_allocs) as f64 / BLOCKS as f64,
+        (named_bytes - bare_bytes) as f64 / BLOCKS as f64
+    );
+}
+
+// =================================================================================================
+// 5. PAGES PER RECORD -- THE REASON ANY OF THIS MATTERS.
+// =================================================================================================
+
+/// HOW MANY PAGES ONE RECORD CARRIES. HISTOGRAM, NEVER A MEAN.
+///
+/// A record holding one page has no ambiguity to resolve, so the whole finding rests on records
+/// holding several. `append_batch_as_one_record` is the engine's default path for a batch that
+/// produced outcomes, so the many-page record is the NORMAL shape for exactly the container writes
+/// this concerns rather than a corner case.
+///
+/// Read off the written log rather than predicted from the batch size: a record is what the log
+/// says it is.
+///
+/// rust-internal: scans the shard's own log, no external surface
+#[test]
+fn how_many_blocks_one_record_carries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+    seed_hash_containers(&engine);
+    seed_routed_strings(&engine);
+
+    let mut sizes: Vec<usize> = Vec::new();
+    let mut carried_blocks = 0usize;
+    let (records, truncated) = engine
+        .wal_store
+        .scan_decoded(1, 0, u64::MAX, u64::MAX)
+        .expect("the log scans");
+    assert!(
+        !truncated,
+        "the scan stopped early, so the histogram below is of a PREFIX of the log rather \
+         than of it"
+    );
+    for (_log_id, record) in &records {
+        if !record.staged_blocks.is_empty() {
+            carried_blocks += record.staged_blocks.len();
+            sizes.push(record.staged_blocks.len());
+        }
+    }
+    sizes.sort();
+
+    println!("\n=== pages per record, over the whole seeded log ===");
+    println!("  records carrying pages  pages  p50  p90  p99  MAX  records with >1 page");
+    let multi = sizes.iter().filter(|size| **size > 1).count();
+    assert!(
+        !sizes.is_empty(),
+        "DENOMINATOR: no record in this log carries a page, so every figure below is vacuous"
+    );
+    println!(
+        "  {:>22} {carried_blocks:>6} {:>4} {:>4} {:>4} {:>4} {multi:>21}",
+        sizes.len(),
+        percentile(&sizes, 50.0),
+        percentile(&sizes, 90.0),
+        percentile(&sizes, 99.0),
+        sizes.last().copied().unwrap_or(0),
+    );
+    assert!(
+        multi > 0,
+        "every one of {} records carries exactly one page, so no record in this fixture has two \
+         pages to tell apart and the finding this module is about cannot arise in it",
+        sizes.len()
+    );
+    assert!(
+        sizes.last().copied().unwrap_or(0) > 1,
+        "the largest record in this log carries {} page(s)",
+        sizes.last().copied().unwrap_or(0)
+    );
+    println!(
+        "  VERDICT: {multi} of {} page-carrying records hold more than one page, MAX {}.",
+        sizes.len(),
+        sizes.last().copied().unwrap_or(0)
+    );
+}
+
+// =================================================================================================
+// 6. THE GUARANTEE THE RECORD MAKES IS NOT WEAKENED.
+// =================================================================================================
+
+/// THE RECORD STILL CARRIES EVERY PAGE, AND EVERY PAGE STILL ROUND-TRIPS THROUGH THE WIRE.
+///
+/// This is the refusal condition the mandate named: if the record could not carry an element
+/// identity without weakening what a carried record guarantees, the change does not ship. The
+/// guarantee is that a record may state its results and drop the operation only when the blocks
+/// those results name survive a crash -- and a carried block survives because it IS the record.
+/// This change ADDS to what the record says; the test below is what says so rather than asserting
+/// it in prose.
+///
+/// Driven through the real encoder, both arms of it: the binary payload the engine writes today,
+/// and the JSON payload a record written before the binary encoder still uses. A field that
+/// round-tripped through one and not the other would be a record that decodes differently
+/// depending on when it was written, which is the same class of fault as not carrying it at all.
+///
+/// rust-internal: encodes and decodes records in memory, no external surface
+#[test]
+fn every_carried_block_keeps_its_bytes_and_gains_an_element_through_both_encoders() {
+    use crate::wal::{decode_wal_line, encode_wal_line_for_test, WriteAheadLogRecord};
+
+    // Deliberately mixed: named elements, a whole-object page, and an EMPTY element name. The
+    // empty one is not decoration -- `put_len_delimited` skips an empty payload, so an encoder
+    // that reused it here would turn `Some("")` into `None` and make an element page read as its
+    // key's whole-object page.
+    let blocks: Vec<StagedBlock> = [
+        (Some("f0"), b"zero".to_vec()),
+        (Some("f1"), b"one".to_vec()),
+        (None, b"whole object".to_vec()),
+        (Some(""), b"empty element name".to_vec()),
+    ]
+    .into_iter()
+    .map(|(component, bytes)| StagedBlock {
+        object_id: stable_block_object_id(1, "hash", "hk"),
+        component: component.map(std::sync::Arc::from),
+        bytes,
+    })
+    .collect();
+
+    let record = WriteAheadLogRecord {
+        shard_id: 1,
+        sequence: 11,
+        command: Some(Command::StringGet {
+            key: "carrier".to_string(),
+        }),
+        metadata: None,
+        staged_blocks: blocks.clone(),
+        outcomes: Vec::new(),
+    };
+
+    let encoded = encode_wal_line_for_test(&record).expect("the record encodes");
+    assert!(
+        encoded.len() > 40,
+        "NOT EXERCISED: the record encoded to {} bytes; a short encode would make every \
+         round-trip assertion below trivially true",
+        encoded.len()
+    );
+    let decoded = decode_wal_line(&encoded).expect("the record decodes");
+
+    println!("\n=== every carried page round-trips, bytes AND element ===");
+    println!("  page  element        bytes in  bytes out  element out");
+    assert_eq!(
+        decoded.staged_blocks.len(),
+        blocks.len(),
+        "the record carried {} pages in and {} out. This change may only ADD to what a record \
+         says; a page that does not come back is the refusal condition",
+        blocks.len(),
+        decoded.staged_blocks.len()
+    );
+    for (i, (before, after)) in blocks.iter().zip(decoded.staged_blocks.iter()).enumerate() {
+        println!(
+            "  {i:>4}  {:<13} {:>9} {:>10}  {:?}",
+            format!("{:?}", before.component.as_deref()),
+            before.bytes.len(),
+            after.bytes.len(),
+            after.component.as_deref()
+        );
+        assert_eq!(
+            before.bytes, after.bytes,
+            "page {i}'s BYTES did not survive the round trip. That is the guarantee this record \
+             exists to make and nothing about naming its element may touch it"
+        );
+        assert_eq!(
+            before.component, after.component,
+            "page {i}'s element came back as {:?} rather than {:?}. `Some(\"\")` and `None` are \
+             different pages, and an encoder that merges them re-creates the ambiguity this \
+             change removes",
+            after.component.as_deref(),
+            before.component.as_deref()
+        );
+        assert_eq!(
+            before.object_id, after.object_id,
+            "page {i}'s object id did not survive the round trip"
+        );
+    }
+    println!("  VERDICT: {} pages in, {} out, bytes and elements identical. Nothing the record guaranteed was traded away.", blocks.len(), decoded.staged_blocks.len());
+}
+
+// =================================================================================================
+// 7. CARRIED OVER FROM #2011, UNCHANGED, BECAUSE IT STILL HOLDS.
+// =================================================================================================
+//
+// #2011 -- the refutation this PR answers -- established that a hash page's FIELD NAME is
+// independently recoverable, which is what made a component-free identity worth pursuing at all.
+// Nothing here changes that, so the measurement is carried over verbatim rather than rewritten: it
+// asks a different question from every test above, and re-deriving a figure that still holds would
+// only risk changing what it measures.
+//
+// Its three companions in that module are superseded above and are NOT carried over, each for a
+// reason the module itself gave:
+//
+//   * `a_component_free_identity_collapses_every_page_of_one_key_onto_one_number` measured one
+//     grouping; `the_element_beside_the_id_makes_every_block_of_a_batch_reachable` measures that
+//     grouping AND the one this change introduces, off ONE population, and keeps its 96.00% row.
+//   * `two_carried_pages_sharing_an_object_id_serve_one_anothers_bytes` asserted 1/2. That is now
+//     2/2 for two pages of DIFFERENT elements, and its 1/2 survives as the NEGATIVE CONTROL arm of
+//     the first test above, where two pages sharing BOTH terms still collapse.
+//   * `a_carried_page_carries_no_ordinal_so_a_fourth_key_term_cannot_reach_the_record` asserted
+//     `StagedBlock` has exactly two fields, and said in its own words: "If an ordinal has been
+//     added, the WAL wire format has moved and the argument in this module needs RE-MEASURING
+//     rather than re-reading." It has moved, and `a_wal_resident_address_carries_no_ordinal_to_read_back`
+//     is that re-measurement -- on the read side, which is where the ordinal actually fails.
+
+/// A HASH PAGE'S FIELD NAME IS HELD BESIDE THE ID, NOT INSIDE IT, AND SURVIVES A RELOAD.
+///
+/// THE SOURCE MOVED AND THE CLAIM DID NOT. This read the name off the page entry:
+/// "`BlockIndex::component: Option<Arc<str>>` is its own `#[serde]` field, written to the index and
+/// read back from it. `bucket_index_component_block_addresses(shard, model_id, object_key)` ... takes
+/// NO component and returns `(page.component.clone(), page.address.clone())` off the entry." That
+/// field is gone and the walk recovered 0 of 25 names.
+///
+/// The name is recovered from `shard.hashes` instead, and the claim is the same one: it is held
+/// BESIDE the id rather than inside it, and it survives an unload/load. The map is durable --
+/// `#[serde(default)]` on `ShardState`, with `sets`, `zsets` and `lists` beside it -- so this is
+/// still a measurement across the DISK copy and not a reading of process state: the engine is
+/// unloaded and loaded, and what comes back comes back from the index snapshot on disk.
+///
+/// THE SECOND ARM IS DELETED AS A TAUTOLOGY, AND THAT IS WORTH MORE THAN FIXING IT. It read:
+///
+///     let free_ids: BTreeSet<u64> =
+///         pairs.iter().map(|_| stable_block_object_id(1, "hash", &key)).collect();
+///     assert_eq!(free_ids.len(), 1, ...);
+///
+/// The closure IGNORES its item and returns the same value for every page, so the set has one
+/// element for any non-empty input and the assertion could only ever fail on an EMPTY one. It was a
+/// real measurement when the id was computed from the element name -- then two pages of one key
+/// genuinely produced two ids, and collapsing them to one was the thing being shown.
+/// `stable_block_object_id` takes no element at all now, so "every page of this key carries one id"
+/// is a property of its SIGNATURE and not something a fixture can observe. The only content in that
+/// assertion was its emptiness check, which is kept as an explicit page-count floor with its own
+/// message.
+///
+/// rust-internal: drives the engine's own unload/load cycle, no external surface
+#[test]
+fn a_hash_blocks_field_name_is_held_beside_the_id_and_survives_a_component_free_identity() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+    seed_hash_containers(&engine);
+
+    let written: BTreeSet<String> = (0..MEMBERS_PER_KEY).map(|f| format!("f{f}")).collect();
+    assert_eq!(
+        written.len(),
+        MEMBERS_PER_KEY,
+        "DENOMINATOR: the seed writes {} distinct field names, not {MEMBERS_PER_KEY}",
+        written.len()
+    );
+
+    engine.unload_shard(1);
+    load_on(&engine);
+
+    println!("\n=== hash field names recovered after a reload, per key ===");
+    println!("  key        pages  names recovered");
+    let mut total_recovered = 0usize;
+    for k in 0..CONTAINER_KEYS {
+        let key = format!("h{k}");
+        let (blocks, recovered) = {
+            let shards = engine.shards.read().expect("engine lock poisoned");
+            let shard = shards.get(&1).expect("shard 1 is loaded");
+            let named = super::BlockObjects::of(&shard.bucket_index);
+            let blocks = shard
+                .bucket_index
+                .bucket_map
+                .values()
+                .flat_map(|bucket| {
+                    bucket
+                        .block_index
+                        .iter()
+                        .map(move |(handle, block)| (bucket.routing_bucket, *handle, block))
+                })
+                .filter(|(routing_bucket, handle, block)| {
+                    !block.deleted
+                        && block.model_id.as_str() == "hash"
+                        && &**named.at(*routing_bucket, *handle) == key
+                })
+                .count();
+            let recovered: BTreeSet<String> = shard
+                .hashes
+                .get(&key)
+                .map(|fields| fields.keys().map(|name| name.to_string()).collect())
+                .unwrap_or_default();
+            (blocks, recovered)
+        };
+        println!("  {key:<10} {blocks:>5}  {:>15}", recovered.len());
+        assert!(
+            blocks > 0,
+            "DENOMINATOR: key {key} holds no live page entries after the reload, so a full set of \
+             recovered names below would be saying nothing about pages"
+        );
+        assert_eq!(
+            recovered, written,
+            "key {key} recovered {} of {MEMBERS_PER_KEY} field names after a reload -- the field \
+             name is NOT independently recoverable and the change is sunk here",
+            recovered.len()
+        );
+        total_recovered += recovered.len();
+    }
+    assert_eq!(
+        total_recovered,
+        CONTAINER_KEYS * MEMBERS_PER_KEY,
+        "{total_recovered} field names recovered across {CONTAINER_KEYS} keys, not {}",
+        CONTAINER_KEYS * MEMBERS_PER_KEY
+    );
+    println!(
+        "  VERDICT: {total_recovered}/{} field names recovered across an unload/load cycle, from \
+         the durable resident map rather than from a page entry. The field name SURVIVES.",
+        CONTAINER_KEYS * MEMBERS_PER_KEY
+    );
+}
