@@ -418,3 +418,1265 @@
       it and never on a timer: the read walks the record log, and a panel refreshing itself would
       put that walk on a schedule for as long as this tab stayed open.</p>
     <div class="actions">
+      <button id="auditBtn" class="secondary">Load audit records</button>
+    </div>
+    <div id="auditRecording" class="msg" role="status" aria-live="polite"></div>
+    <div id="auditMsg" class="msg" role="status" aria-live="polite"></div>
+    <div class="tablewrap">
+      <table id="auditTable" style="display:none">
+        <thead><tr>
+          <th>when</th><th>action</th><th>status</th><th>key</th><th>asked for</th>
+        </tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+
+  </section>
+
+  <footer>
+    MatrixArk API Key Portal · served at <code>GET /v1/admin/portal</code>. Endpoints used:
+    <code>/api/admin/create_api_key</code>, <code>/api/admin/list_api_keys</code>,
+    <code>/api/admin/rotate_api_key</code>, <code>/api/admin/revoke_api_key</code>,
+    <code>/v1/admin/api_key_usage</code>, <code>/v1/admin/audit</code>. Key crypto and the usage
+    meter are unchanged backend primitives.
+  </footer>
+</main>
+
+<script>
+/* Helpers every page may call, placed before the page's own script.
+
+   This one lived in the nav block, which is emitted AFTER the page script. Three pages
+   called it from their own script and read as working, because a browser runs both blocks
+   before anyone clicks anything. The cost only showed when something ran a page's script on
+   its own: the call threw, the browse path caught it along with everything else, and the
+   screen said "Could not reach the gateway" about a gateway it had never asked. A helper
+   that is shared is defined where every caller can already see it. */
+  window.__matrixarkCopyText = function (text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text).then(
+          function () { return true; }, function () { return false; });
+      }
+    } catch (e) { /* falls through to the failure below */ }
+    return Promise.resolve(false);
+  };
+
+  window.__matrixarkWhy = function (body, fallback) {
+    body = body || {};
+    var text = body.detail || body.error || fallback;
+    if (body.required && body.required.length) {
+      text += " — this needs " + [].concat(body.required).join(" or ");
+    }
+    /* A backend failure now answers with a sentence that deliberately says nothing about the
+       inside of the deployment, and a token naming the log entry that does. Showing the token is
+       the whole point of it: without it the reader has a polite sentence and no way to get any
+       further, and an operator has a log they cannot tie to the report. */
+    if (body.incident) {
+      text += " — incident " + body.incident;
+    }
+    return text;
+  };
+
+  window.__matrixarkNeverArrived = function (e) {
+    /* True when the request never left. A status means it did leave and was answered, and any
+       other throw happened here, with the answer already in hand. The messages fetch itself
+       produces are a short known set; anything else is this page's own. */
+    if (typeof e === "number") { return false; }
+    var text = e && e.message ? String(e.message) : (e == null ? "" : String(e));
+    return !text
+      || /failed to fetch|networkerror|load failed|network request failed|the network connection was lost/i.test(text);
+  };
+
+  window.__matrixarkConnState = function (e) {
+    /* What the connection strip should say about this failure, as [state, words].
+
+       Three cases, not two. A first version asked only whether the request arrived and called
+       everything that did a fault in the page -- so a 404 or a 500, which is the deployment
+       answering, turned the strip amber. It showed up the moment the page was opened with
+       nothing behind it: every fetch came back 404 and the strip blamed the page. */
+    if (window.__matrixarkNeverArrived(e)) { return ["down", "gateway unreachable"]; }
+    if (typeof e === "number") { return ["live", "connected"]; }
+    return ["warn", "this page could not show the answer"];
+  };
+
+  window.__matrixarkWhyFailed = function (e, failure) {
+    /* A rejection carrying a status is the deployment answering. A rejection from fetch itself is
+       the request never leaving. A throw after the answer arrived is THIS PAGE failing to show
+       what it was given -- and that used to read "Could not reach the gateway", about a gateway
+       that had just answered.
+
+       The last two are told apart by the message fetch produces, which is one of a short known
+       set. Where it is not recognised the page repeats what it caught rather than guessing: an
+       unfamiliar message shown as it came is still more than a sentence about the network. */
+    if (typeof e === "number") {
+      return (failure || window.__matrixarkFailure)(e);
+    }
+    if (window.__matrixarkNeverArrived(e)) {
+      return "Could not reach the gateway.";
+    }
+    var text = e && e.message ? String(e.message) : String(e);
+    return "The gateway answered, but this page could not show it \u2014 " + text
+      + ". That is a fault in this page, not in the deployment.";
+  };
+
+  window.__matrixarkFailure = function (status, overrides) {
+    if (overrides && overrides[status]) { return overrides[status]; }
+    if (status === 401) { return "This key was not accepted."; }
+    if (status === 403) { return "This key lacks the scope for that call."; }
+    if (status === 413) { return "That request is larger than this deployment accepts."; }
+    if (status === 429) { return "Rate limited — the edge is throttling this key."; }
+    if (status === 502) { return "The gateway could not reach the storage behind it."; }
+    if (status === 503) { return "The gateway is not ready to serve this yet."; }
+    if (status === 504) { return "The backend did not answer in time."; }
+    return "The gateway answered " + status + ".";
+  };
+
+  window.__matrixarkTrace = (function () {
+    /* The last calls this page made, newest last. Bounded: a portal tab is left open for days and
+       an unbounded list of every request is a leak that only shows on the busiest deployment. */
+    var calls = [], LIMIT = 60;
+    var listeners = [];
+
+    function note(entry) {
+      calls.push(entry);
+      if (calls.length > LIMIT) { calls.shift(); }
+      for (var i = 0; i < listeners.length; i++) {
+        try { listeners[i](calls.length); } catch (e) { /* a listener must not break a request */ }
+      }
+    }
+
+    var original = typeof window.fetch === "function" ? window.fetch : null;
+    if (original) {
+      window.fetch = function (input, init) {
+        var at = Date.now();
+        var method = String((init && init.method) || (input && input.method) || "GET").toUpperCase();
+        var url = String((input && input.url) || input || "");
+        return original.apply(this, arguments).then(function (response) {
+          /* Untouched. Reading the body here to pull out an incident token would consume it and
+             hand the caller an empty one -- breaking the panels this exists to help diagnose. */
+          note({ at: at, ms: Date.now() - at, method: method, url: url, status: response.status });
+          return response;
+        }, function (err) {
+          /* Status 0 is "never answered", which is a different row from a 500 and has to read as
+             one. The message is the browser's own; it is what tells a blocked request from a
+             refused one. */
+          note({ at: at, ms: Date.now() - at, method: method, url: url, status: 0,
+                 detail: (err && err.message) ? String(err.message) : String(err) });
+          throw err;
+        });
+      };
+    }
+
+    return {
+      calls: function () { return calls.slice(); },
+      onChange: function (fn) { if (typeof fn === "function") { listeners.push(fn); } },
+      note: note
+    };
+  }());
+
+  window.__matrixarkWhen = function (ms) {
+    /* 0 is "no timestamp" here, not the epoch: the catalog site this replaces read
+       `ms ? ... : dash`, and a record with no time would otherwise date to 1970. */
+    if (!ms) { return "—"; }
+    var at = new Date(Number(ms));
+    if (isNaN(at.getTime())) { return "—"; }
+    try { return at.toLocaleString(undefined, { timeZoneName: "short" }); }
+    catch (e) { return at.toLocaleString(); }
+  };
+</script>
+<script>
+/* Tabs, for every portal page whose body declares a tablist.
+ *
+ * Shared rather than per page. The explore page had the only copy and this is the second caller;
+ * two copies of a behaviour that looks identical is how they stop being identical.
+ *
+ * Click alone is not enough for role="tablist". Someone arriving on the selected tab expects the
+ * arrow keys to move between them -- that is what the role announces -- and roving tabindex is
+ * what makes those arrows the way through rather than one more thing to tab past.
+ */
+(function () {
+  "use strict";
+
+  window.wireTabs = function (onShow) {
+    var tabs = Array.prototype.slice.call(document.querySelectorAll(".tabs button"));
+    if (!tabs.length) { return; }
+
+    function show(button) {
+      tabs.forEach(function (b) {
+        var selected = b === button;
+        b.setAttribute("aria-selected", String(selected));
+        b.tabIndex = selected ? 0 : -1;
+      });
+      Array.prototype.forEach.call(document.querySelectorAll(".pane"), function (pane) {
+        pane.hidden = pane.id !== "pane-" + button.dataset.pane;
+      });
+      if (typeof onShow === "function") { onShow(button.dataset.pane); }
+    }
+
+    tabs.forEach(function (button, index) {
+      button.addEventListener("click", function () { show(button); });
+      button.addEventListener("keydown", function (event) {
+        var next = null;
+        if (event.key === "ArrowRight") { next = tabs[(index + 1) % tabs.length]; }
+        else if (event.key === "ArrowLeft") { next = tabs[(index - 1 + tabs.length) % tabs.length]; }
+        else if (event.key === "Home") { next = tabs[0]; }
+        else if (event.key === "End") { next = tabs[tabs.length - 1]; }
+        if (!next) { return; }
+        event.preventDefault();
+        show(next);
+        next.focus();
+      });
+    });
+
+    /* A fragment can name something inside a pane that is not showing.
+     *
+     * The live strip does exactly that from every page: "/v1/admin/setup#encoding" is a div inside
+     * the Settings pane, "#traffic" one inside Checks, and both panes load hidden. The browser
+     * scrolls to a fragment once, at load, and a hidden element is nowhere to scroll to -- so the
+     * badge arrived at the page, the default tab came up, and the state it was reporting on was not
+     * on screen. Nothing said so; the link worked in the only sense a link can be said to work.
+     *
+     * Which pane holds the target is the page's business, not this helper's, so it is read off the
+     * element rather than listed here: any fragment naming anything inside any pane opens it. */
+    function fromHash(hash) {
+      var name;
+      try { name = decodeURIComponent((hash || "").replace(/^#/, "")); }
+      catch (error) { name = (hash || "").replace(/^#/, ""); }
+      if (!name) { return false; }
+      var target = document.getElementById(name);
+      var pane = target && target.closest ? target.closest(".pane") : null;
+      if (!pane) { return false; }
+      var button = document.getElementById("tab-" + pane.id.replace(/^pane-/, ""));
+      if (!button) { return false; }
+      show(button);
+      /* The pane was hidden when the browser did its own scrolling, so it did not scroll. */
+      if (target.scrollIntoView) { target.scrollIntoView(); }
+      return true;
+    }
+
+    /* Clicking "#traffic" while already on this page changes no document, so nothing reloads and
+       the only signal is this event. That is the strip's own page -- the case most likely to be
+       reached and the one where doing nothing looks most like a dead control. */
+    if (window.addEventListener) {
+      window.addEventListener("hashchange", function () {
+        fromHash(window.location && window.location.hash);
+      });
+    }
+
+    var already = tabs.filter(function (b) {
+      return b.getAttribute("aria-selected") === "true";
+    });
+    if (!fromHash(window.location && window.location.hash)) {
+      show(already[0] || tabs[0]);
+    }
+  };
+
+  /* Show a pane from code. Needed whenever one pane's control writes into another's: without
+     it the change lands somewhere the person cannot see, and any instruction about what to do
+     next refers to a part of the page that is not on screen. */
+  window.showTab = function (pane) {
+    var button = document.getElementById("tab-" + pane);
+    if (button) { button.click(); }
+  };
+
+  /* Put a count on a tab. A pane that is hidden cannot report anything itself, and the case that
+     matters is a form with unsaved changes in it. */
+  window.markTab = function (pane, badge) {
+    var button = document.getElementById("tab-" + pane);
+    if (!button) { return; }
+    button.setAttribute("data-badge", badge ? String(badge) : "");
+  };
+}());
+</script>
+<script>
+"use strict";
+(function () {
+  var SS = window.sessionStorage;
+  var LS = window.localStorage;
+  var $ = function (id) { return document.getElementById(id); };
+
+  // ---- connection state (key in sessionStorage; non-secret config in localStorage) -------------
+  function loadConn() {
+    $("adminKey").value = SS.getItem("mtx_admin_key") || "";
+    $("mgmtBase").value = LS.getItem("mtx_mgmt_base") || "";
+    $("gwBase").value = LS.getItem("mtx_gw_base") || "";
+    $("ctxAccount").value = LS.getItem("mtx_ctx_account") || "";
+    $("ctxTenant").value = LS.getItem("mtx_ctx_tenant") || "";
+    reflectStatus();
+  }
+  function saveConn() {
+    SS.setItem("mtx_admin_key", $("adminKey").value.trim());
+    LS.setItem("mtx_mgmt_base", $("mgmtBase").value.trim().replace(/\/+$/, ""));
+    LS.setItem("mtx_gw_base", $("gwBase").value.trim().replace(/\/+$/, ""));
+    LS.setItem("mtx_ctx_account", $("ctxAccount").value.trim());
+    LS.setItem("mtx_ctx_tenant", $("ctxTenant").value.trim());
+    reflectStatus();
+    setInlineMsg("connMsg", "Saved.");
+  }
+  function setInlineMsg(id, text) {
+    var el = $(id); el.textContent = text;
+    setTimeout(function () { if (el.textContent === text) el.textContent = ""; }, 2500);
+  }
+  function reflectStatus() {
+    var has = !!(SS.getItem("mtx_admin_key") || "").trim();
+    $("connDot").className = "statusdot" + (has ? " on" : "");
+  }
+  function adminKey() { return (SS.getItem("mtx_admin_key") || "").trim(); }
+  function mgmtBase() { return LS.getItem("mtx_mgmt_base") || ""; }
+  function gwBase() { return LS.getItem("mtx_gw_base") || ""; }
+  function ctxAccount() { return (LS.getItem("mtx_ctx_account") || "").trim(); }
+  function ctxTenant() { return (LS.getItem("mtx_ctx_tenant") || "").trim(); }
+
+  function showMsg(id, kind, text) {
+    var el = $(id);
+    el.className = "msg show " + kind;
+    el.textContent = text;
+  }
+  function hideMsg(id) { var el = $(id); el.className = "msg"; el.textContent = ""; }
+
+  function fmtTime(ms) {
+    ms = Number(ms || 0);
+    if (!ms) return "—";
+    try { return new Date(ms).toISOString().replace("T", " ").replace(".000Z", "Z"); }
+    catch (e) { return String(ms); }
+  }
+
+  // ---- HTTP: always sends the admin bearer; returns parsed JSON or throws ----------------------
+  function apiFetch(base, path, method, body) {
+    var key = adminKey();
+    if (!key) return Promise.reject(new Error("Paste an admin API key in the Connection panel first."));
+    var headers = { "Authorization": "Bearer " + key };
+    var opts = { method: method, headers: headers };
+    if (body !== undefined && body !== null) {
+      headers["Content-Type"] = "application/json";
+      opts.body = JSON.stringify(body);
+    }
+    return fetch((base || "") + path, opts).then(function (resp) {
+      return resp.text().then(function (txt) {
+        var data = {};
+        try { data = txt ? JSON.parse(txt) : {}; } catch (e) { data = { raw: txt }; }
+        if (!resp.ok) {
+          var detail = data.error || data.detail || ("HTTP " + resp.status);
+          /* A refusal for want of a scope names the scope, and that name is exactly what has to
+             be ticked in the Scopes box. Dropping it left "insufficient_scope" on screen and the
+             operator guessing at the one thing the answer already contained. */
+          if (typeof detail === "string" && data.required && data.required.length) {
+            detail += " — this needs " + [].concat(data.required).join(" or ");
+          }
+          var err = new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+          err.status = resp.status; err.data = data;
+          throw err;
+        }
+        return data;
+      });
+    });
+  }
+  // /api/admin/* tool routes wrap the tool output as {status, tool, result}.
+  function unwrap(data) { return (data && data.result !== undefined) ? data.result : data; }
+
+  function splitList(s) {
+    return (s || "").split(",").map(function (x) { return x.trim(); }).filter(Boolean);
+  }
+
+  /* One copier for the three things worth copying, reporting what actually happened. The inline
+     version this replaces said "Copied" whether or not a clipboard existed, and never looked at
+     the promise writeText returns -- so a rejected write (an insecure origin, an unfocused
+     document, a denied permission) also read as "Copied". That is a small annoyance for a curl
+     command and the entire loss for a key shown once.
+
+     It says so on the button rather than in the message area, because that area carries the
+     reason a key was not created and overwriting it would hide one failure with another. */
+  function copyText(text, buttonId, done) {
+    var button = $(buttonId);
+    if (!button) { return; }
+    var restore = button.textContent;
+    function settled(ok) {
+      button.textContent = ok ? done : "Copy failed";
+      window.setTimeout(function () { button.textContent = restore; }, 1400);
+    }
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(function () { settled(true); },
+                                                 function () { settled(false); });
+        return;
+      }
+    } catch (e) { /* falls through to the failure path below */ }
+    /* No clipboard API at all -- an http:// origin, which a self-hosted portal often is. The text
+       is on the page either way, so saying the copy failed beats a button that does nothing. */
+    settled(false);
+  }
+  /* The scope catalogue runs in a later script block with its own scope. */
+  window.__matrixarkCopy = copyText;
+
+  // ---- create ----------------------------------------------------------------------------------
+  function createKey() {
+    hideMsg("createMsg");
+    var out = $("createKeyOut"); out.className = "keyout"; out.textContent = "";
+    var scopes = splitList($("ckScopes").value);
+    if (!scopes.length) { showMsg("createMsg", "err", "At least one scope is required."); return; }
+    var args = {
+      tenant_id: $("ckTenant").value.trim() || ctxTenant(),
+      account_id: $("ckAccount").value.trim() || ctxAccount(),
+      scopes: scopes,
+      role: $("ckRole").value.trim() || "service",
+      key_prefix: $("ckPrefix").value.trim() || "sk_live"
+    };
+    var display = $("ckDisplay").value.trim(); if (display) args.display_name = display;
+    var users = splitList($("ckUsers").value); if (users.length) args.allowed_user_ids = users;
+    var quota = parseInt($("ckQuota").value, 10);
+    if (!isNaN(quota) && quota > 0) args.request_quota = quota;
+    var win = parseInt($("ckWindow").value, 10);
+    if (!isNaN(win) && win > 0) args.quota_window = win;
+    if (!args.tenant_id) { showMsg("createMsg", "err", "Tenant ID is required (set one here or in Connection)."); return; }
+
+    var btn = $("createBtn"); btn.disabled = true;
+    apiFetch(mgmtBase(), "/api/admin/create_api_key", "POST", args)
+      .then(function (data) {
+        var r = unwrap(data);
+        out.className = "keyout show";
+        /* Offered only when there is a key to copy. The server can answer without one, and this
+           page renders "(not returned)" for that -- a button there would put that string on the
+           clipboard and look like it had worked. */
+        var secret = r.api_key || "";
+        out.innerHTML = "<div>api_key_id: <strong>" + escapeHtml(r.api_key_id || "") + "</strong></div>" +
+          "<div style='margin-top:6px'>api_key: " + escapeHtml(secret || "(not returned)") +
+          (secret ? " <button type='button' class='mini' id='copyNewKey'>Copy key</button>" : "") +
+          "</div>" +
+          "<div class='warn-line'>Copy this key now — it is shown only once. MatrixArk stores only its hash.</div>";
+        if (secret) {
+          /* The secret alone: sweeping up the id or the warning gives a clipboard that fails when
+             pasted into a config file, later and somewhere else. */
+          $("copyNewKey").addEventListener("click", function () {
+            copyText(secret, "copyNewKey", "Copied");
+          });
+        }
+        showMsg("createMsg", "ok", "Created " + (r.api_key_id || "key") + ".");
+        listKeys();
+      })
+      .catch(function (e) { showMsg("createMsg", "err", "Create failed: " + e.message); })
+      .then(function () { btn.disabled = false; });
+  }
+
+  // ---- list ------------------------------------------------------------------------------------
+  function listKeys() {
+    hideMsg("listMsg");
+    var args = {
+      account_id: ctxAccount() || undefined,
+      tenant_id: ctxTenant() || undefined,
+      include_revoked: $("inclRevoked").checked,
+      limit: 100
+    };
+    apiFetch(mgmtBase(), "/api/admin/list_api_keys", "POST", args)
+      .then(function (data) {
+        var r = unwrap(data);
+        var keys = (r && r.api_keys) || [];
+        renderKeys(keys);
+        if (!keys.length) showMsg("listMsg", "ok", "No keys for this account/tenant.");
+      })
+      .catch(function (e) { showMsg("listMsg", "err", "List failed: " + e.message); });
+  }
+
+  /* context:forget destroys a tenant's memory and admin:* can mint more keys; both deserve to be
+     visible without reading the row. */
+  function scopeChips(scopes) {
+    if (!scopes || !scopes.length) { return "<span class='scope-none'>none</span>"; }
+    return scopes.slice().sort().map(function (s) {
+      var cls = "scope-chip";
+      if (s === "context:forget") { cls += " destructive"; }
+      else if (s.indexOf("admin:") === 0) { cls += " admin"; }
+      return "<span class='" + cls + "'>" + escapeHtml(s) + "</span>";
+    }).join("");
+  }
+
+  function renderKeys(keys) {
+    var tb = $("keysTable").querySelector("tbody");
+    tb.innerHTML = "";
+    keys.forEach(function (k) {
+      var tr = document.createElement("tr");
+      var status = k.status || "";
+      var quota = (k.request_quota ? k.request_quota : "∞") +
+        (k.quota_window ? (" / " + k.quota_window + "s") : "");
+      tr.innerHTML =
+        "<td class='mono'>" + escapeHtml(k.api_key_id || "") + "</td>" +
+        "<td>" + escapeHtml(k.tenant_id || ctxTenant() || "") + "</td>" +
+        "<td>" + scopeChips(k.scopes) + "</td>" +
+        "<td>" + escapeHtml(quota) + "</td>" +
+        "<td><span class='pill " + escapeHtml(status) + "'>" + escapeHtml(status) + "</span></td>" +
+        "<td>" + fmtTime(k.created_at_ms) + "</td>" +
+        "<td>" + fmtTime(k.last_used_at_ms) + "</td>" +
+        "<td>" + (k.usage_count || 0) + "</td>" +
+        "<td></td>";
+      var actions = tr.lastChild;
+      if (status === "active") {
+        var rot = mkBtn("Rotate", "mini secondary", function () { rotateKey(k.api_key_id); });
+        var rev = mkBtn("Revoke", "mini danger", function () { revokeKey(k.api_key_id); });
+        actions.appendChild(rot); actions.appendChild(document.createTextNode(" ")); actions.appendChild(rev);
+      } else {
+        actions.textContent = "—";
+      }
+      tb.appendChild(tr);
+    });
+    $("keysTable").style.display = keys.length ? "" : "none";
+  }
+
+  function rotateKey(id) {
+    if (!id) return;
+    /* Revoke asks and this did not, though it revokes the key too -- and it is the button that
+       looks safer of the two, sitting next to it in the same row. */
+    if (!window.confirm("Rotate " + id + "? A replacement is issued and this key stops working "
+                        + "immediately, so anything still using it will be rejected until you "
+                        + "update it.")) { return; }
+    apiFetch(mgmtBase(), "/api/admin/rotate_api_key", "POST", { api_key_id: id })
+      .then(function (data) {
+        var r = unwrap(data);
+        var out = $("createKeyOut");
+        out.className = "keyout show";
+        /* Rotation shows a secret on the same terms as creation, so it gets the same button. */
+        var rotated = r.api_key || "";
+        out.innerHTML = "<div>Rotated " + escapeHtml(id) + " → <strong>" + escapeHtml(r.api_key_id || "") + "</strong></div>" +
+          "<div style='margin-top:6px'>new api_key: " + escapeHtml(rotated || "(not returned)") +
+          (rotated ? " <button type='button' class='mini' id='copyRotatedKey'>Copy key</button>" : "") +
+          "</div>" +
+          "<div class='warn-line'>Copy the new key now — shown only once.</div>";
+        if (rotated) {
+          $("copyRotatedKey").addEventListener("click", function () {
+            copyText(rotated, "copyRotatedKey", "Copied");
+          });
+        }
+        showMsg("listMsg", "ok", "Rotated " + id + ".");
+        listKeys();
+      })
+      .catch(function (e) { showMsg("listMsg", "err", "Rotate failed: " + e.message); });
+  }
+
+  function revokeKey(id) {
+    if (!id) return;
+    if (!window.confirm("Revoke " + id + "? Requests using it will be rejected.")) return;
+    apiFetch(mgmtBase(), "/api/admin/revoke_api_key", "POST", { api_key_id: id })
+      .then(function () { showMsg("listMsg", "ok", "Revoked " + id + "."); listKeys(); })
+      .catch(function (e) { showMsg("listMsg", "err", "Revoke failed: " + e.message); });
+  }
+
+  // ---- usage -----------------------------------------------------------------------------------
+  /* What the deployment is doing with audit records right now.
+   *
+   * An empty table means two entirely different things -- nothing happened, or nothing was kept --
+   * and the default is the second. Without this the panel would reassure somebody who is recording
+   * nothing, which is the failure the endpoint's `recording` field exists to prevent. */
+  function sayRecording(mode) {
+    var el = $("auditRecording");
+    if (mode === "off" || !mode) {
+      el.innerHTML = '<div class="msg warn">Nothing is being recorded. Audit records are ' +
+        'discarded before they reach storage, including every refusal — so an empty list below ' +
+        'is not evidence that nothing happened. Turn it on under <strong>Audit trail</strong> on ' +
+        'the <a href="/v1/admin/setup">Setup</a> page; it needs a restart to take effect ' +
+        'everywhere.</div>';
+      return;
+    }
+    el.innerHTML = '<div class="msg ok">Recording: <span class="mono">' + escapeHtml(mode) +
+      "</span>.</div>";
+  }
+
+  function auditDetail(row) {
+    var d = row.details || {};
+    var asked = [];
+    if (d.requested_tenant_id) { asked.push("tenant " + d.requested_tenant_id); }
+    if (d.requested_account_id) { asked.push("account " + d.requested_account_id); }
+    if (!asked.length && d.count !== undefined) { asked.push(d.count + " records"); }
+    return asked.join(", ");
+  }
+
+  function loadAudit() {
+    hideMsg("auditMsg");
+    apiFetch(gwBase(), "/v1/admin/audit", "GET")
+      .then(function (data) {
+        var rows = (data && data.audit_logs) || [];
+        sayRecording(data && data.recording);
+        var tb = $("auditTable").querySelector("tbody");
+        tb.innerHTML = "";
+        rows.forEach(function (r) {
+          var tr = document.createElement("tr");
+          var denied = r.status === "denied";
+          tr.innerHTML =
+            "<td>" + fmtTime(r.created_at_ms) + "</td>" +
+            "<td class='mono'>" + escapeHtml(r.action || "") + "</td>" +
+            '<td><span class="pill ' + (denied ? "failed" : "completed") + '">' +
+              escapeHtml(r.status || "") + "</span></td>" +
+            "<td class='mono'>" + escapeHtml(r.api_key_id || "") + "</td>" +
+            "<td>" + escapeHtml(auditDetail(r)) + "</td>";
+          tb.appendChild(tr);
+        });
+        $("auditTable").style.display = rows.length ? "" : "none";
+        if (!rows.length && data && data.recording && data.recording !== "off") {
+          showMsg("auditMsg", "ok", "Nothing recorded yet.");
+        }
+      })
+      .catch(function (e) { showMsg("auditMsg", "err", "Audit read failed: " + e.message); });
+  }
+
+  function loadUsage() {
+    hideMsg("usageMsg");
+    apiFetch(gwBase(), "/v1/admin/api_key_usage", "GET")
+      .then(function (data) {
+        var usage = (data && data.usage) || [];
+        var tb = $("usageTable").querySelector("tbody");
+        tb.innerHTML = "";
+        usage.forEach(function (u) {
+          var tr = document.createElement("tr");
+          tr.innerHTML =
+            "<td class='mono'>" + escapeHtml(u.api_key_hash || "") + "</td>" +
+            "<td>" + escapeHtml(u.tenant_id || "") + "</td>" +
+            "<td>" + escapeHtml(u.account_id || "") + "</td>" +
+            "<td>" + (u.total || 0) + "</td>" +
+            "<td>" + (u.ingest || 0) + "</td>" +
+            "<td>" + (u.retrieve || 0) + "</td>" +
+            "<td>" + (u.other || 0) + "</td>" +
+            "<td>" + (u.bytes || 0) + "</td>" +
+            "<td>" + fmtTime(u.last_used_at_ms) + "</td>";
+          tb.appendChild(tr);
+        });
+        $("usageTable").style.display = usage.length ? "" : "none";
+        /* The meter is per PROCESS. With more than one worker these totals are one worker's
+           share, and a key used only through another worker is absent -- which reads exactly like
+           a key nobody used. Said on both the empty and the populated case, because the empty one
+           is the more misleading of the two. */
+        var workers = Number(data && data.workers) || 1;
+        var share = workers > 1
+          ? " These are one worker's counters and this deployment runs " + workers
+            + ": a key used through another worker is not counted here."
+          : "";
+        if (!usage.length) {
+          showMsg("usageMsg", "ok",
+                  "No usage recorded yet (enforced mode only)." + share);
+        } else if (share) {
+          showMsg("usageMsg", "ok", share.replace(/^ /, ""));
+        }
+      })
+      .catch(function (e) { showMsg("usageMsg", "err", "Usage read failed: " + e.message); });
+  }
+
+  // ---- helpers ---------------------------------------------------------------------------------
+  function mkBtn(text, cls, onclick) {
+    var b = document.createElement("button");
+    b.textContent = text; b.className = cls; b.onclick = onclick; return b;
+  }
+  function escapeHtml(s) {
+    return String(s === undefined || s === null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+  }
+
+  // ---- wire up ---------------------------------------------------------------------------------
+  $("saveConn").onclick = saveConn;
+  $("overridesBtn").onclick = loadOverrides;
+  $("clearKey").onclick = function () { SS.removeItem("mtx_admin_key"); $("adminKey").value = ""; reflectStatus(); setInlineMsg("connMsg", "Key cleared."); };
+  $("adminKey").addEventListener("change", function () { SS.setItem("mtx_admin_key", $("adminKey").value.trim()); reflectStatus(); });
+  $("createBtn").onclick = createKey;
+  $("listBtn").onclick = listKeys;
+  $("inclRevoked").onchange = listKeys;
+  $("usageBtn").onclick = loadUsage;
+  $("auditBtn").onclick = loadAudit;
+  loadConn();
+})();
+
+  /* ---------- policy overrides ---------- */
+  /* Per-tenant telemetry deliberately does not exist: /v1/metrics carries no tenant identity, so
+     that it stays safe to scrape without credentials. That is why this view lives on this
+     admin-gated page rather than a dashboard panel -- the same reason per-key usage does. */
+  function renderOverrides(payload) {
+    var tb = $("overridesTable").querySelector("tbody");
+    tb.innerHTML = "";
+    var rows = [];
+    (payload.tenants || []).forEach(function (t) {
+      rows.push({ id: t.tenant, level: "tenant", settings: t.settings || {} });
+    });
+    (payload.users || []).forEach(function (u) {
+      rows.push({ id: u.key, level: "user", settings: u.settings || {} });
+    });
+    if (!rows.length) {
+      tb.innerHTML = "<tr><td colspan='3' class='hint'>No overrides. Every identity in this " +
+        "tenant resolves the deployment defaults.</td></tr>";
+      return;
+    }
+    rows.forEach(function (row) {
+      var names = Object.keys(row.settings).sort();
+      var shown = names.map(function (n) {
+        return escapeHtml(n) + "=" + escapeHtml(String(row.settings[n]));
+      }).join(", ");
+      var tr = document.createElement("tr");
+      tr.innerHTML =
+        "<td class='mono'>" + escapeHtml(row.id || "") + "</td>" +
+        "<td>" + escapeHtml(row.level) + "</td>" +
+        "<td class='mono'>" + shown + "</td>";
+      tb.appendChild(tr);
+    });
+  }
+
+  function loadOverrides() {
+    var msg = $("overridesMsg");
+    msg.textContent = "Loading...";
+    /* A GATEWAY endpoint, so it takes the gateway base and the admin key from the Connection
+       panel, the same way loadCatalog does. apiFetch() targets the management base and would send
+       this to the wrong host. */
+    var key = ($("adminKey") || {}).value || "";
+    var base = ($("gwBase") || {}).value || "";
+    if (!key.trim()) {
+      msg.textContent = "Paste an admin API key in the Connection panel first.";
+      return;
+    }
+    fetch((base || "") + "/v1/admin/policy?overrides=1",
+          { headers: { Authorization: "Bearer " + key.trim() } })
+      .then(function (r) {
+        if (!r.ok) { throw new Error("HTTP " + r.status); }
+        return r.json();
+      })
+      .then(function (payload) {
+        renderOverrides(payload);
+        var n = (payload.tenants || []).length + (payload.users || []).length;
+        msg.textContent = n
+          ? (n + (n === 1 ? " identity" : " identities") + " with settings of their own")
+          : "No overrides in this tenant.";
+      })
+      .catch(function (err) {
+        msg.textContent = "Could not read overrides: " + err.message;
+      });
+  }
+
+
+  window.wireTabs();
+</script>
+<script>
+/* ---------- scope catalogue ---------- */
+/* Served from /v1/admin/scopes so the descriptions live next to the map the backend gates with,
+   rather than in a copy on this page that nobody updates when a scope is added. */
+(function () {
+  "use strict";
+  var CATALOG = [], PRESETS = [];
+  function el(id) { return document.getElementById(id); }
+  function esc(s) {
+    return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+    });
+  }
+  function selected() {
+    return Array.prototype.filter.call(
+      document.querySelectorAll("#scopeList input[type=checkbox]"), function (c) {
+        return c.checked;
+      }).map(function (c) { return c.value; });
+  }
+  function syncFromBoxes() { el("ckScopes").value = selected().join(","); }
+  function syncToBoxes() {
+    var want = {};
+    el("ckScopes").value.split(",").forEach(function (s) {
+      s = s.trim();
+      if (s) { want[s] = true; }
+    });
+    Array.prototype.forEach.call(document.querySelectorAll("#scopeList input[type=checkbox]"),
+      function (c) { c.checked = !!want[c.value]; });
+  }
+  function render() {
+    el("scopePresets").innerHTML = PRESETS.map(function (p) {
+      return '<button type="button" data-preset="' + esc(p.id) + '"><b>' + esc(p.label) +
+        "</b><span>" + esc(p.detail) + "</span></button>";
+    }).join("") || '<span class="hint">No presets available.</span>';
+    el("scopeList").innerHTML = CATALOG.map(function (s) {
+      var risky = s.scope === "context:forget" || s.scope.indexOf("admin:") === 0;
+      return '<label class="' + (risky ? "danger-scope" : "") + '">' +
+        '<input type="checkbox" value="' + esc(s.scope) + '"><span><b>' + esc(s.label) +
+        ' <code>' + esc(s.scope) + "</code></b><em>" + esc(s.detail) + "</em></span></label>";
+    }).join("");
+    syncToBoxes();
+  }
+  function loadCatalog() {
+    var key = (el("adminKey") || {}).value || "";
+    var base = (el("gwBase") || {}).value || "";
+    fetch((base || "") + "/v1/admin/scopes",
+          { headers: key ? { Authorization: "Bearer " + key.trim() } : {} })
+      .then(function (r) { return r.ok ? r.json() : Promise.reject(r.status); })
+      .then(function (d) { CATALOG = d.scopes || []; PRESETS = d.presets || []; render(); })
+      .catch(function () {
+        el("scopePresets").innerHTML = '<span class="hint">Enter an admin key to load the ' +
+          "scope catalogue. You can still type scopes below.</span>";
+      });
+  }
+  document.addEventListener("click", function (ev) {
+    var button = ev.target.closest ? ev.target.closest("[data-preset]") : null;
+    if (!button) { return; }
+    ev.preventDefault();
+    var preset = PRESETS.filter(function (p) { return p.id === button.dataset.preset; })[0];
+    if (!preset) { return; }
+    el("ckScopes").value = preset.scopes.join(",");
+    syncToBoxes();
+  });
+  document.addEventListener("change", function (ev) {
+    if (ev.target && ev.target.closest && ev.target.closest("#scopeList")) { syncFromBoxes(); }
+  });
+  el("ckScopes").addEventListener("input", syncToBoxes);
+  var adminKey = el("adminKey");
+  if (adminKey) { adminKey.addEventListener("change", loadCatalog); }
+  var save = el("saveConn");
+  if (save) { save.addEventListener("click", function () { setTimeout(loadCatalog, 50); }); }
+
+  /* ---------- copy as curl ---------- */
+  /* The portal is often the first place someone meets this API; handing them the exact request it
+     just made is the cheapest documentation there is. The key is deliberately left as a shell
+     variable rather than pasted in, so a copied command is not a copied credential. */
+  var copy = el("copyCurl");
+  if (copy) {
+    copy.addEventListener("click", function () {
+      var payload = {
+        tenant_id: (el("ckTenant") || {}).value || (el("ctxTenant") || {}).value || "",
+        account_id: (el("ckAccount") || {}).value || (el("ctxAccount") || {}).value || "",
+        scopes: el("ckScopes").value.split(",").map(function (s) { return s.trim(); })
+          .filter(Boolean),
+        role: (el("ckRole") || {}).value || "service",
+        display_name: (el("ckDisplay") || {}).value || ""
+      };
+      var text = "curl -sX POST " + (((el("mgmtBase") || {}).value) || location.origin) +
+        "/api/admin/create_api_key \\\n" +
+        "  -H \"Authorization: Bearer $MATRIXARK_ADMIN_KEY\" \\\n" +
+        "  -H 'Content-Type: application/json' \\\n  -d '" +
+        JSON.stringify(payload) + "'\n";
+      window.__matrixarkCopy(text, "copyCurl", "Copied");
+    });
+  }
+
+  loadCatalog();
+}());
+</script>
+<script>
+/* One copy helper for every page. It resolves true when the text reached the clipboard and false
+   when it did not: no clipboard API at all (an http:// origin, which a self-hosted portal often
+   is), a denied permission, a document that is not focused.
+
+   Callers must report what they are handed. Announcing "copied" without looking -- which every
+   caller here used to do -- is worse than saying nothing, because the reader stops trying and
+   walks away with an empty clipboard.
+
+   Its own IIFE, ahead of the strip's: the strip returns immediately on a page that has none, and
+   a copier defined after that line would not exist on those pages. */
+(function () {
+  "use strict";
+  /* Why a request was refused, in the words the edge used. A scope refusal answers
+     {"error": "insufficient_scope", "required": ["admin:api_key"]}, and showing the code alone
+     leaves the operator guessing at the one thing the answer already contained -- and the scope
+     name is exactly the string to tick when issuing the key.
+
+     `detail` still wins where there is one: it names the setting and the reason. The scope is
+     appended to that rather than replacing it. */
+  /* One way to render an absolute time, and it names the clock.
+   *
+   * Four places showed a timestamp with toLocaleString() and none said which zone it was in, while
+   * the records they describe -- a configuration write, an audit entry, a stored memory -- carry
+   * the GATEWAY's time. Correlating a portal timestamp with a server log was guesswork, and on a
+   * browser whose clock is off (which the setup page can now measure and say) it was wrong as well
+   * as ambiguous.
+   *
+   * `timeZoneName: "short"` rather than the IANA name: "GMT+1" beside the time reads at a glance
+   * where "Europe/London" pushes the useful part off the end of a table cell. Falls back to the
+   * bare local string on a runtime without it, which is no worse than what was there before. */
+
+
+  /* One sentence per gateway status, for every page.
+   *
+   * Three pages had a map of their own and each carried a different subset. Ingestion -- the page
+   * that uploads files -- was the one with no sentence for 413, so an upload refused for size
+   * read as "The gateway answered 413." on precisely the panel where the cause was obvious to
+   * everyone but the reader. The four pages with no map at all said that about every status.
+   *
+   * `overrides` is for what a page genuinely knows better: a file rather than a request, an
+   * import conflict only ingestion can produce. Everything else is answered once, here, so the
+   * next status added does not have to be added in four places to be true in four places.
+   *
+   * This is the FALLBACK. A refusal that carries a body is explained by __matrixarkWhy from what
+   * the gateway said; this is what the reader gets when there is nothing but a number.
+   */
+
+}());
+
+/* The shared live strip. One stream per page: a page that runs its own (Setup, Overview) claims
+   window.__matrixarkLive and calls window.__matrixarkLiveFrame instead of opening a second. */
+(function () {
+  "use strict";
+  var strip = document.getElementById("liveStrip");
+  if (!strip) { return; }
+  var seg = {
+    enc: document.getElementById("liveEnc"),
+    imp: document.getElementById("liveImp"),
+    req: document.getElementById("liveReq"),
+    warn: document.getElementById("liveWarn"),
+    node: document.getElementById("liveNode"),
+    waiting: document.getElementById("liveWaiting")
+  };
+  var dot = document.getElementById("liveDot");
+  /* Any page can watch the frames this page is already receiving. The alternative -- each panel
+     opening its own stream -- costs the gateway a task per panel to show one deployment's state. */
+  var watchers = [];
+  window.__matrixarkOnFrame = function (callback) {
+    if (typeof callback === "function") { watchers.push(callback); }
+  };
+  /* This script is emitted AFTER the page's own -- deliberately, so a page running its own stream
+     can claim it before this one decides whether to open a second. The cost of that ordering was
+     that a page registering at its top level called a function that did not exist yet, and two
+     did: the catalog stopped re-listing when the store grew, and nothing looked wrong.
+
+     So pages push to a queue. Whatever is waiting is drained here, and the queue is then replaced
+     by an object whose `push` IS the registration, so a page loading later goes through the same
+     call and nothing has to know which script ran first. */
+  (window.__matrixarkFrameQueue || []).forEach(window.__matrixarkOnFrame);
+  window.__matrixarkFrameQueue = { push: window.__matrixarkOnFrame };
+
+  function n(value) {
+    return Number(value || 0).toLocaleString();
+  }
+  function show(el, html, cls) {
+    if (!el) { return; }
+    /* Reset the class on the way out too: a segment hidden while it was warning would come back
+       still coloured for a state that has passed. */
+    el.className = "live-seg" + (html != null && cls ? " " + cls : "");
+    if (html == null) { el.hidden = true; return; }
+    el.hidden = false;
+    el.innerHTML = html;
+  }
+
+  function plural(count, word) {
+    return "<b>" + n(count) + "</b> " + word + (Number(count) === 1 ? "" : "s");
+  }
+
+  /* Rendered only from a frame that arrived. Zeros drawn before the first frame would describe a
+     quiet healthy deployment for one that is not answering. */
+  function render(frame) {
+    strip.hidden = false;
+    var e = frame.embedding || null;
+    if (e && e.total) {
+      show(seg.enc, e.pending
+        ? "<b>" + n(e.pending) + "</b> waiting to embed"
+        : "<b>" + n(e.total) + "</b> embedded",
+        e.pending ? "busy" : "");
+    } else if (e) {
+      show(seg.enc, "<b>0</b> stored");
+    } else {
+      /* Absent, not zero: the backend could not be asked. "0 waiting" here would be the
+         reassuring answer to a question nobody managed to ask. */
+      show(seg.enc, "encoding <b>unknown</b>", "warn");
+    }
+
+    var imports = frame.imports || {};
+    var active = (imports.active || [])[0];
+    if (active) {
+      var done = (active.done || 0) + (active.failed || 0);
+      show(seg.imp, "importing <b>" + n(done) + "</b> of " + n(active.total || 0), "busy");
+    } else if (imports.retryable) {
+      show(seg.imp, "<b>" + n(imports.retryable) + "</b> to retry", "warn");
+    } else {
+      show(seg.imp, null);
+    }
+
+    var t = frame.traffic || {};
+    show(seg.req, plural(t.total_requests, "request") +
+      (t.total_errors ? ", <b>" + n(t.total_errors) + "</b> failed" : ""),
+      t.total_errors ? "warn" : "");
+
+    show(seg.warn, frame.warnings ? plural(frame.warnings, "warning") : null, "warn");
+
+    /* Written and not in effect: the deployment is running something other than what the Setup
+       page describes. Absent when there is none, the way the warning segment behaves -- a strip
+       that always says "0 awaiting restart" is a place people stop looking. */
+    show(seg.waiting,
+         frame.settings_waiting
+           ? plural(frame.settings_waiting, "setting") + " awaiting restart"
+           : null,
+         "warn");
+
+    /* Only when it is NOT ok, the way the warning segment already behaves. A strip that always
+       says "datanode: ok" is one people stop reading, and absent means nothing has looked yet --
+       which is not the same as reachable, so that shows nothing either.
+
+       Matched against the two states rather than escaped and interpolated: this block has no esc()
+       (it defines n, show and plural and nothing else), so calling one would have thrown inside
+       render, which the caller wraps in a catch that ignores -- failing in total silence. A closed
+       set of expected values is also stricter than escaping: a server sending something
+       unexpected renders nothing rather than rendering it safely. */
+    show(seg.node,
+      frame.datanode === "unreachable" ? "datanode <b>unreachable</b>"
+        : (frame.datanode === "erroring" ? "datanode <b>erroring</b>" : null),
+      "warn");
+
+    watchers.forEach(function (callback) {
+      /* One panel throwing must not stop the others, or the strip, from updating. */
+      try { callback(frame); } catch (err) { /* a watcher's problem, not the strip's */ }
+    });
+  }
+
+  window.__matrixarkLiveFrame = function (frame) {
+    if (frame) { render(frame); dot.className = "live-dot"; }
+  };
+  window.__matrixarkLiveState = function (state) {
+    dot.className = "live-dot" + (state === "live" ? "" : (state === "down" ? " down" : " stale"));
+  };
+
+  /* A page with its own stream feeds the strip; only pages without one connect here. */
+  if (window.__matrixarkLive) { return; }
+  window.__matrixarkLive = "strip";
+
+  /* Nothing arrives to announce that nothing is arriving, so noticing needs a timer. Three ticks
+     of the gateway's OWN cadence: one missed tick is scheduling, two is a slow one, three is not
+     arriving. The number is not written here -- it is whatever the gateway last said. */
+  function watchQuiet() {
+    if (!tickMs || !blockAt || !controller) { return; }
+    var quiet = Date.now() - blockAt;
+    if (quiet > tickMs * 3 && dot.className.indexOf("stale") < 0) {
+      dot.className = "live-dot stale";
+      dot.title = "no update for " + Math.round(quiet / 1000) + "s";
+    }
+  }
+  quietTimer = setInterval(watchQuiet, 1000);
+  window.addEventListener("pagehide", function () {
+    if (quietTimer) { clearInterval(quietTimer); quietTimer = null; }
+  });
+
+  function key() {
+    var el = document.getElementById("key");
+    if (el && el.value.trim()) { return el.value.trim(); }
+    try { return sessionStorage.getItem("matrixark_admin_key") || ""; } catch (e) { return ""; }
+  }
+
+  var controller = null, backoff = 1000, buffer = "";
+  /* When anything last arrived, and the gateway's own cadence off its frames.
+     The strip is the one element on every page, and it said "live" whenever the socket was open --
+     so a gateway that stopped producing frames left every page green. The page-side client learned
+     this in mx#1189; the strip runs its own client, because five of the seven pages never load the
+     other one, so it has to learn it too. `TheTwoClientsAgreeTest` in
+     test_matrixark_the_strip_notices_a_quiet_stream_too is what stops the two rules drifting
+     apart: both must read tick_s off the frame, both must stamp on every block rather than on
+     frames, and neither may write the interval down. */
+  var blockAt = 0, tickMs = 0, quietTimer = null;
+  /* Set when the gateway says it is closing on purpose, cleared by the reopen it
+     causes. A planned recycle and a gateway that stopped answering look identical
+     from here without it, and only one of them is      one of them is worth telling anybody about. */
+  var planned = false;
+  /* When the current connection was established; see the floor in the reopen above. */
+  var openedAt = 0;
+  /* Set the first time this deployment refuses an anonymous read. Until then there is
+     no reason to assume a key is needed; afterwards there is no reason to ask again
+     without one. */
+  var wantsKey = false;
+
+  function open() {
+    /* The drop below aborts the request; the abort rejects the fetch; the catch schedules another
+       open(). Without this the connection came back one backoff later with the tab still hidden,
+       so the rule this file states was true for about a second at a time. Left null so the
+       visibility handler's `!controller` test is what brings it back. */
+    if (document.hidden) { controller = null; return; }
+    var k = key();
+    /* No key is not the same as no access: on the developer default the gateway answers every
+       admin route anonymously, and refusing to ask left the strip dark on the deployment somebody
+       is most likely to be looking at first. So the first attempt goes out without one.
+
+       Once a deployment has refused, this is the old behaviour exactly -- watch for a key and
+       make no request until there is one. One 401 per page load, never a loop. */
+    if (!k && wantsKey) { setTimeout(open, 2000); return; }
+    controller = new AbortController();
+    fetch("/v1/admin/events", {
+      headers: k ? { Authorization: "Bearer " + k } : {},
+      signal: controller.signal
+    }).then(function (r) {
+      if (r.status === 401 || r.status === 403) { wantsKey = true; }
+      if (!r.ok || !r.body) { throw new Error("stream " + r.status); }
+      dot.className = "live-dot";
+      backoff = 1000;
+      openedAt = Date.now();
+      var reader = r.body.getReader(), decoder = new TextDecoder();
+      function pump() {
+        return reader.read().then(function (chunk) {
+          if (chunk.done) {
+            /* Closed on purpose once the stream reached its maximum age. Reconnect at once and
+               leave the dot alone: this is the gateway keeping its own rule, not one that stopped
+               answering, and marking it stale every ten minutes teaches people to ignore the
+               one signal the strip has. */
+            var kept = planned && (Date.now() - openedAt) > 1000;
+            planned = false;
+            if (kept) { controller = null; backoff = 1000; open(); return; }
+            throw new Error("stream ended");
+          }
+          buffer += decoder.decode(chunk.value, { stream: true });
+          var parts = buffer.split("\n\n");
+          buffer = parts.pop();
+          parts.forEach(function (block) {
+            /* Every block, keepalives included: when nothing has changed the gateway sends a
+               keepalive instead of a frame, so silence on an idle deployment is HEALTHY and only
+               nothing-at-all is not. */
+            blockAt = Date.now();
+            if (dot.className.indexOf("stale") >= 0) {
+              dot.className = "live-dot";
+              dot.title = "live";
+            }
+            /* Read the label. A goodbye carries a data line of its own, and rendering it as a
+               frame empties every segment of the strip -- on all five pages that read the stream
+               through here, every ten minutes. */
+            var name = "", payload = null;
+            block.split("\n").forEach(function (line) {
+              if (line.indexOf("event:") === 0) { name = line.slice(6).trim(); }
+              else if (line.indexOf("data:") === 0) { payload = line.slice(5).trim(); }
+            });
+            if (name === "bye") {
+              planned = true;
+              /* The strip has no message line, so the reason goes where a reader can still get at
+                 it: the dot's own title. A goodbye that is a fault leaves the dot down rather than
+                 letting the next keepalive clear it back to live. */
+              try {
+                var why = JSON.parse(payload || "{}");
+                if (why.reason && why.reason !== "stream_max_age") {
+                  dot.className = "live-dot down";
+                  dot.title = "the stream failed on the gateway"
+                    + (why.incident ? " \u2014 incident " + why.incident : "");
+                }
+              } catch (e) { /* an older gateway says goodbye with no body */ }
+              return;
+            }
+            if (name !== "status" || !payload) { return; }
+            try {
+              var frame = JSON.parse(payload);
+              /* The gateway states its cadence on every frame. Without one -- an older gateway --
+                 nothing is claimed about a quiet stream. */
+              if (typeof frame.tick_s === "number" && frame.tick_s > 0) {
+                tickMs = frame.tick_s * 1000;
+              }
+              render(frame);
+            } catch (err) { /* ignore */ }
+          });
+          return pump();
+        });
+      }
+      return pump();
+    }).catch(function () {
+      /* Refused for want of a key: not stale. Stale means a gateway that was answering has
+         stopped, and a deployment waiting for somebody to paste a key is not in trouble. */
+      if (wantsKey && !key()) {
+        controller = null;
+        setTimeout(open, 2000);
+        return;
+      }
+      dot.className = "live-dot stale";
+      setTimeout(open, backoff);
+      backoff = Math.min(backoff * 2, 30000);  /* a gateway that is down must not be hammered */
+    });
+  }
+
+  /* A hidden tab holds a connection open for nobody. Drop it, reconnect on return. */
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden && controller) { controller.abort(); controller = null; }
+    else if (!document.hidden && !controller) { open(); }
+  });
+  window.addEventListener("pagehide", function () { if (controller) { controller.abort(); } });
+  open();
+}());
+
+/* A fragment can name something that is folded away.
+ *
+ * The key portal answers "where does the first one come from" in a <details>, shut by default
+ * because it is a question somebody has once. The pages that ask for a key link straight at it --
+ * and a link to a closed <details> arrives with the answer still folded up, which is the dead end
+ * the block was written to remove, reached by a different road. Browsers disagree about expanding
+ * it; this does not depend on which one is reading.
+ */
+(function () {
+  "use strict";
+
+  function reveal() {
+    /* Every harness that runs this file stubs a window, and most have no location on it --
+       the same shape a page gets before navigation has settled. Nothing to reveal, not a crash. */
+    var hash = (window.location && window.location.hash) || "";
+    var name;
+    try { name = decodeURIComponent(hash.replace(/^#/, "")); }
+    catch (error) { name = hash.replace(/^#/, ""); }
+    if (!name) { return false; }
+    var target = document.getElementById(name);
+    if (!target) { return false; }
+    var opened = false;
+    /* From the target itself: the fragment usually names the <details>, not something inside it. */
+    for (var node = target; node; node = node.parentNode) {
+      if (node.tagName === "DETAILS" && !node.open) { node.open = true; opened = true; }
+    }
+    /* The browser scrolled before this ran, to a target that was folded up. */
+    if (opened && target.scrollIntoView) { target.scrollIntoView(); }
+    return opened;
+  }
+
+  reveal();
+  if (window.addEventListener) { window.addEventListener("hashchange", reveal); }
+}());
+
+/* ---------- what this page asked, and what came back ----------
+ *
+ * Every panel here is drawn from a call, and the only evidence one was made was whether the panel
+ * filled in. When something is wrong the first question is which request failed and what it
+ * answered -- and the only way to find out was the browser's own developer tools, which is a fine
+ * answer for whoever wrote the page and no answer at all for an operator looking at a deployment
+ * they did not build.
+ *
+ * Folded away until asked for: this is a debugging surface, not part of the page's job. */
+(function () {
+  var button = document.getElementById("liveCalls");
+  var panel = document.getElementById("callLog");
+  var rows = document.getElementById("callLogRows");
+  if (!button || !panel || !rows || !window.__matrixarkTrace) { return; }
+
+  function esc(s) {
+    return String(s).replace(/[&<>"]/g, function (c) {
+      return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c];
+    });
+  }
+
+  /* The path, not the whole URL. Every one of these is this deployment, so the origin is the same
+     on every row and spends the width that the query -- which is what differs -- needs. */
+  function shorten(url) {
+    try {
+      var parsed = new URL(String(url), location.href);
+      return parsed.pathname + (parsed.search || "");
+    } catch (e) { return String(url); }
+  }
+
+  function label(n) {
+    button.hidden = !n;
+    button.textContent = n === 1 ? "1 call" : n + " calls";
+  }
+
+  function render() {
+    var calls = window.__matrixarkTrace.calls();
+    if (!calls.length) {
+      rows.innerHTML = '<tr><td colspan="4">Nothing asked yet.</td></tr>';
+      return;
+    }
+    /* Newest first: the call somebody is trying to explain is the one they just made. */
+    rows.innerHTML = calls.slice().reverse().map(function (c) {
+      /* A status of 0 is "never answered", which is a different row from a 500 and reads as one.
+         The browser's own message is what separates a blocked request from a refused one. */
+      var answered = c.status ? String(c.status) : (c.detail || "never answered");
+      return '<tr class="' + (!c.status || c.status >= 400 ? "bad" : "") + '"><td>'
+        + esc(window.__matrixarkWhen ? window.__matrixarkWhen(c.at) : c.at)
+        + '</td><td class="mono">' + esc(c.method + " " + shorten(c.url))
+        + "</td><td>" + esc(answered)
+        + "</td><td>" + esc(c.ms + " ms") + "</td></tr>";
+    }).join("");
+  }
+
+  button.addEventListener("click", function () {
+    var show = panel.hidden;
+    panel.hidden = !show;
+    button.setAttribute("aria-expanded", show ? "true" : "false");
+    if (show) { render(); }
+  });
+
+  window.__matrixarkTrace.onChange(function (n) {
+    label(n);
+    /* Only while it is open. Rebuilding a hidden table on every request is work nobody asked for
+       on a page that is left open for days. */
+    if (!panel.hidden) { render(); }
+  });
+  label(window.__matrixarkTrace.calls().length);
+}());
+</script>
+</body>
+</html>
