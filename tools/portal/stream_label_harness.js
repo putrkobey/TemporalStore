@@ -113,3 +113,119 @@ function driveLiveStream(connections) {
 function driveStrip(connections) {
   const marker = page.indexOf("/* The shared live strip.");
   if (marker < 0) { throw new Error("the strip script is not on this page"); }
+  const scriptStart = page.lastIndexOf("<script>", marker) + "<script>".length;
+  const source = page.slice(scriptStart, page.indexOf("</script>", scriptStart));
+
+  const els = {};
+  ["liveStrip", "liveEnc", "liveImp", "liveReq", "liveWarn", "liveDot", "liveNode",
+   "liveWaiting", "key"].forEach((id) => {
+    els[id] = { id, hidden: true, innerHTML: "", className: "", value: "",
+                addEventListener() {}, setAttribute() {}, removeAttribute() {} };
+  });
+
+  let opened = 0;
+  const clock = makeClock();
+  const win = {
+    document: { getElementById: (id) => els[id] || null, addEventListener() {}, hidden: false },
+    addEventListener() {},
+    setTimeout: () => 0,
+    sessionStorage: { getItem: () => "" },
+    Number, JSON, String, Math, Date: clock.Date,
+    TextDecoder,
+    AbortController: function () { this.signal = {}; this.abort = function () {}; },
+    fetch: function () {
+      const plan = connections[Math.min(opened, connections.length - 1)];
+      opened += 1;
+      return Promise.resolve({
+        ok: true, status: 200,
+        body: { getReader: () => reader(clock, plan.blocks,
+                                        { lastFor: plan.lastFor, thenHang: plan.thenHang }) },
+      });
+    },
+  };
+  win.window = win;
+
+  const run = new Function("window", "document", "setTimeout", "sessionStorage", "fetch",
+                           "AbortController", "TextDecoder", "Date", source);
+  run(win, win.document, win.setTimeout, win.sessionStorage, win.fetch,
+      win.AbortController, win.TextDecoder, clock.Date);
+  return { els, opened: () => opened };
+}
+
+/* ---- the checks ------------------------------------------------------------------------------ */
+function settle(times, fn) {
+  if (times <= 0) { return fn(); }
+  setImmediate(() => settle(times - 1, fn));
+}
+
+const longLived = { blocks: [RETRY, STATUS, KEEPALIVE, UNKNOWN, GOODBYE], lastFor: 600000 };
+const shortLived = { blocks: [RETRY, STATUS, GOODBYE], lastFor: 0 };
+const droppedWithoutAWord = { blocks: [RETRY, STATUS], lastFor: 600000 };
+/* Whatever comes after the connection under test just stays open. */
+const staysOpen = { blocks: [RETRY, STATUS], lastFor: 600000, thenHang: true };
+
+/* Only two pages run their own stream; the other five read through the strip. Skipped rather than
+   quietly passed, so a page that lost its reader cannot look like a page that never had one. */
+const hasLiveStream = extractLiveStream() !== null;
+const planned = hasLiveStream ? driveLiveStream([longLived, staysOpen]) : null;
+const tooSoon = hasLiveStream ? driveLiveStream([shortLived, staysOpen]) : null;
+const unannounced = hasLiveStream ? driveLiveStream([droppedWithoutAWord, staysOpen]) : null;
+const strip = driveStrip([longLived, staysOpen]);
+const stripUnannounced = driveStrip([droppedWithoutAWord, staysOpen]);
+const stripTooSoon = driveStrip([shortLived, staysOpen]);
+
+settle(12, () => {
+  if (!hasLiveStream) {
+    console.log("skip liveStream is not on this page; it reads through the strip");
+  } else {
+    /* Non-vacuous first: every check below is about what did NOT arrive, and all of them pass
+       against a reader that was never given anything. */
+    ok("the reader was given a frame to deliver", planned.frames.length >= 1,
+       JSON.stringify(planned.frames));
+
+    ok("a status frame reaches the frame handler",
+       planned.frames.some((f) => f && f.warnings === 3));
+    ok("a goodbye does not reach the frame handler",
+       !planned.frames.some((f) => f && f.reason === "stream_max_age"),
+       JSON.stringify(planned.frames));
+    ok("a keepalive does not reach the frame handler",
+       planned.frames.every((f) => f && f.warnings !== undefined));
+    ok("an event this page does not know does not reach the frame handler",
+       !planned.frames.some((f) => f && f.warnings === 99),
+       JSON.stringify(planned.frames));
+
+    ok("a planned close is not reported as a fault",
+       !planned.states.some((s) => s.indexOf("retrying") === 0),
+       JSON.stringify(planned.states));
+    ok("a planned close reconnects", planned.opened() > 1, "opened " + planned.opened());
+
+    ok("a close with no goodbye is still reported as a fault",
+       unannounced.states.some((s) => s.indexOf("retrying") === 0),
+       JSON.stringify(unannounced.states));
+
+    ok("a goodbye within a second of connecting does not reconnect at once",
+       tooSoon.opened() === 1, "opened " + tooSoon.opened());
+    ok("a goodbye within a second of connecting backs off instead",
+       tooSoon.states.some((s) => s.indexOf("retrying") === 0),
+       JSON.stringify(tooSoon.states));
+  }
+
+  /* The strip, which is the reader the other five pages use. */
+  ok("the strip drew the frame it was given", strip.els.liveWarn.innerHTML.indexOf("3") >= 0,
+     JSON.stringify(strip.els.liveWarn));
+  ok("the strip did not render the goodbye over it",
+     strip.els.liveWarn.innerHTML.indexOf("3") >= 0 && strip.els.liveWarn.hidden === false,
+     JSON.stringify(strip.els.liveWarn));
+  ok("a planned close leaves the strip's dot alone",
+     strip.els.liveDot.className.indexOf("stale") < 0,
+     JSON.stringify(strip.els.liveDot.className));
+  ok("a planned close reconnects the strip", strip.opened() > 1, "opened " + strip.opened());
+  ok("a close with no goodbye still marks the strip stale",
+     stripUnannounced.els.liveDot.className.indexOf("stale") >= 0,
+     JSON.stringify(stripUnannounced.els.liveDot.className));
+  ok("a strip goodbye within a second of connecting does not reconnect at once",
+     stripTooSoon.opened() === 1, "opened " + stripTooSoon.opened());
+
+  console.log(failures ? "\n" + failures + " failure(s)" : "\nall good");
+  process.exit(failures ? 1 : 0);
+});
