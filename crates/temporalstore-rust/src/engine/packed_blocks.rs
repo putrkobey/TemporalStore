@@ -205,3 +205,627 @@ pub(super) fn trim_timestamped_series(
 
 pub(super) fn append_timestamped_kv_blocks(
     cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    kind: &str,
+    key: &str,
+    points: Vec<FeaturePoint>,
+    routing_bucket: u32,
+    async_storage: bool,
+    promote_sync_writes: bool,
+    first_block_ordinal: u32,
+) -> Result<Vec<(u64, ElementEntry)>, BlockStoreError> {
+    append_timestamped_kv_blocks_inner(
+        cache,
+        block_store,
+        shard_id,
+        kind,
+        key,
+        points,
+        routing_bucket,
+        async_storage,
+        promote_sync_writes,
+        None,
+        first_block_ordinal,
+    )
+}
+
+/// Same, for a series whose index entry is keyed by something other than the stored timestamp.
+///
+/// The caller passes the key its map will actually use, so the recorded item can name the entry
+/// the write created. Without it a record states where a page landed and not what it became.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn append_timestamped_kv_blocks_keyed(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    kind: &str,
+    key: &str,
+    points: Vec<FeaturePoint>,
+    routing_bucket: u32,
+    async_storage: bool,
+    promote_sync_writes: bool,
+    identity: u64,
+    first_block_ordinal: u32,
+) -> Result<Vec<(u64, ElementEntry)>, BlockStoreError> {
+    append_timestamped_kv_blocks_inner(
+        cache,
+        block_store,
+        shard_id,
+        kind,
+        key,
+        points,
+        routing_bucket,
+        async_storage,
+        promote_sync_writes,
+        Some(identity),
+        first_block_ordinal,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_timestamped_kv_blocks_inner(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    kind: &str,
+    key: &str,
+    points: Vec<FeaturePoint>,
+    routing_bucket: u32,
+    async_storage: bool,
+    promote_sync_writes: bool,
+    identity: Option<u64>,
+    first_block_ordinal: u32,
+) -> Result<Vec<(u64, ElementEntry)>, BlockStoreError> {
+    let object_id = stable_block_object_id(shard_id, kind, key);
+    let mut refs = Vec::new();
+    let chunks = chunk_timestamped_kv_points(points);
+    if !async_storage {
+        let mut chunk_points = Vec::with_capacity(chunks.len());
+        let mut encoded_blocks = Vec::with_capacity(chunks.len());
+        for chunk in chunks {
+            encoded_blocks.push(encode_feature_block(&chunk));
+            chunk_points.push(chunk);
+        }
+        // Hand the store a slice of each page instead of a clone of it. The page is kept anyway,
+        // for the cache put below, so the clone was a second full copy of a JSON page -- and a
+        // page is several times its payload, because a value is written as decimal numbers.
+        let writes: Vec<crate::block_store::BlockAppendRecord<'_>> = encoded_blocks
+            .iter()
+            .enumerate()
+            .map(|(chunk, packed)| {
+                (
+                    packed.as_slice(),
+                    Some(object_id),
+                    Some(routing_bucket),
+                    first_block_ordinal.saturating_add(chunk as u32),
+                )
+            })
+            .collect();
+        // Carry these pages in this write's record, the way `append_value` does for a single
+        // page. This writer batches straight to the block store, so it never staged anything: a
+        // synchronous feature write's record named an address and carried nothing, and because it
+        // carried nothing the record kept its operation instead. After a crash that loses the
+        // un-fsynced block -- which the single barrier permits -- replay installed the outcomes,
+        // the outcomes named a block that was never written, and the read had nothing to fall back
+        // to. The whole series came back empty.
+        for packed in &encoded_blocks {
+            super::block_in_wal::stage(object_id, None, packed.as_slice());
+        }
+        let addresses = block_store.append_batch_with_block_metadata(writes)?;
+        if addresses.len() != chunk_points.len() {
+            return Err(BlockStoreError::Io(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "batch page append returned fewer addresses than chunks",
+            )));
+        }
+        for ((chunk, packed), address) in chunk_points.into_iter().zip(encoded_blocks).zip(addresses)
+        {
+            if promote_sync_writes {
+                cache.put_memory_only(
+                    CacheKey::page_with_slot(
+                        shard_id,
+                        address.block_slab_id(),
+                        address.offset(),
+                        address.length(),
+                        Some(routing_bucket),
+                    ),
+                    packed,
+                );
+            }
+            refs.extend(
+                chunk
+                    .into_iter()
+                    .map(|point| (point.timestamp_ms, address.clone())),
+            );
+        }
+        stage_timestamped_outcomes(shard_id, kind, key, routing_bucket, &refs, identity);
+        return Ok(refs);
+    }
+
+    for chunk in chunks {
+        let packed = encode_feature_block(&chunk);
+        let address = append_value(
+            cache,
+            block_store,
+            shard_id,
+            &packed,
+            Some(object_id),
+            // `None`, matching `stable_block_object_id(shard_id, kind, key)` at the
+            // top of this function: a packed series page is not an ELEMENT of anything.
+            None,
+            Some(routing_bucket),
+            async_storage,
+        )?;
+        refs.extend(
+            chunk
+                .into_iter()
+                .map(|point| (point.timestamp_ms, address.clone())),
+        );
+    }
+    stage_timestamped_outcomes(shard_id, kind, key, routing_bucket, &refs, identity);
+    Ok(refs)
+}
+
+pub(super) fn chunk_timestamped_kv_points(points: Vec<FeaturePoint>) -> Vec<Vec<FeaturePoint>> {
+    // One point is always exactly one page, so measuring it is wasted work. The split below fires
+    // only when `current` is non-empty, which a lone point never is, so its encoded length is
+    // computed and never read -- and computing it is a FULL `serde_json` serialisation of the
+    // point, the same work `encode_feature_block` is about to do again on the way to the page.
+    //
+    // A page carries its value as a `Vec<u8>`, which serde_json writes as an array of decimal
+    // numbers, so that measurement costs several times the value it measures. Every context write
+    // path -- summary, event, index, audit, child, compression -- passes exactly one point.
+    if points.len() == 1 {
+        return vec![points];
+    }
+    let mut chunks = Vec::new();
+    let mut current = Vec::new();
+    let empty_block_len = empty_feature_block_encoded_len();
+    let mut current_encoded_len = empty_block_len;
+    let block_target_bytes = context_block_target_bytes();
+
+    for point in points {
+        let point_encoded_len = feature_point_encoded_len(&point);
+        let next_encoded_len = current_encoded_len
+            .saturating_add(point_encoded_len)
+            .saturating_add(if current.is_empty() { 0 } else { 1 });
+        if next_encoded_len > block_target_bytes && !current.is_empty() {
+            chunks.push(current);
+            current = Vec::new();
+            current_encoded_len = empty_block_len;
+        }
+        current_encoded_len = current_encoded_len
+            .saturating_add(point_encoded_len)
+            .saturating_add(if current.is_empty() { 0 } else { 1 });
+        current.push(point);
+    }
+
+    if !current.is_empty() {
+        chunks.push(current);
+    }
+    chunks
+}
+
+#[cfg(test)]
+pub(super) fn decode_feature_block(bytes: &[u8]) -> Option<Vec<FeaturePoint>> {
+    match decode_feature_block_strict(bytes) {
+        PackedFeatureBlockDecode::Packed(points) => Some(points),
+        PackedFeatureBlockDecode::Legacy | PackedFeatureBlockDecode::Corrupt(_) => None,
+    }
+}
+
+pub(super) fn decode_feature_block_strict(bytes: &[u8]) -> PackedFeatureBlockDecode {
+    if let Some(payload) = bytes.strip_prefix(FEATURE_BLOCK_BINARY_MAGIC) {
+        return decode_binary_feature_block(payload);
+    }
+    if let Some(payload) = bytes.strip_prefix(FEATURE_BLOCK_MAGIC) {
+        // A page written before the byte format. Kept so a store that already exists keeps
+        // reading; nothing writes this shape any more, and this arm goes when those stores do.
+        return match serde_json::from_slice::<PackedFeatureBlock>(payload) {
+            Ok(block) if block.version == 1 => PackedFeatureBlockDecode::Packed(block.points),
+            Ok(block) => PackedFeatureBlockDecode::Corrupt(format!(
+                "unsupported packed feature page version {}",
+                block.version
+            )),
+            Err(err) => PackedFeatureBlockDecode::Corrupt(format!(
+                "invalid packed feature page payload: {err}"
+            )),
+        };
+    }
+    PackedFeatureBlockDecode::Legacy
+}
+
+/// Read a byte-format page, checking every declared length against what is actually there.
+///
+/// A torn page declares a length it does not have. Sizing a buffer from a declared length is what
+/// once turned a corrupt tail into an aborted process, so nothing here is allocated until the
+/// bytes behind it have been counted.
+fn decode_binary_feature_block(payload: &[u8]) -> PackedFeatureBlockDecode {
+    let Some((count_bytes, mut rest)) = split_at_checked(payload, 4) else {
+        return PackedFeatureBlockDecode::Corrupt(
+            "packed feature page ends before its point count".to_string(),
+        );
+    };
+    let count = u32::from_le_bytes([count_bytes[0], count_bytes[1], count_bytes[2], count_bytes[3]])
+        as usize;
+    // The smallest a point can be is its own header, so a count that could not fit in the
+    // remaining bytes is a torn or forged page -- and this is checked BEFORE reserving for it.
+    if count.saturating_mul(FEATURE_POINT_HEADER_BYTES) > rest.len() {
+        return PackedFeatureBlockDecode::Corrupt(format!(
+            "packed feature page declares {count} points but holds {} bytes",
+            rest.len()
+        ));
+    }
+    let mut points = Vec::with_capacity(count);
+    for index in 0..count {
+        let Some((header, tail)) = split_at_checked(rest, FEATURE_POINT_HEADER_BYTES) else {
+            return PackedFeatureBlockDecode::Corrupt(format!(
+                "packed feature page ends inside the header of point {index}"
+            ));
+        };
+        let timestamp_ms = u64::from_le_bytes([
+            header[0], header[1], header[2], header[3], header[4], header[5], header[6], header[7],
+        ]);
+        let length = u32::from_le_bytes([header[8], header[9], header[10], header[11]]) as usize;
+        let Some((value, tail)) = split_at_checked(tail, length) else {
+            return PackedFeatureBlockDecode::Corrupt(format!(
+                "point {index} declares {length} bytes and the page has {}",
+                tail.len()
+            ));
+        };
+        points.push(FeaturePoint {
+            timestamp_ms,
+            value: value.to_vec(),
+        });
+        rest = tail;
+    }
+    if !rest.is_empty() {
+        return PackedFeatureBlockDecode::Corrupt(format!(
+            "packed feature page has {} bytes after its last point",
+            rest.len()
+        ));
+    }
+    PackedFeatureBlockDecode::Packed(points)
+}
+
+/// `split_at` that returns `None` instead of panicking when the slice is too short.
+fn split_at_checked(bytes: &[u8], at: usize) -> Option<(&[u8], &[u8])> {
+    if bytes.len() < at {
+        return None;
+    }
+    Some(bytes.split_at(at))
+}
+
+pub(super) fn read_feature_point(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    timestamp_ms: u64,
+    address: &ElementEntry,
+    // WHICH PAGE, stated by the caller. A packed series page holds many points and is not an
+    // element of its object, so the element half is `None` -- but the OBJECT half cannot be
+    // recovered here: this function is handed an address and a timestamp, and neither names a key.
+    // See [`BlockIdentity`] for why it is the terms rather than an id that cross.
+    identity: BlockIdentity<'_>,
+    routing_bucket: Option<u32>,
+) -> Option<FeaturePoint> {
+    let bytes = read_block_bytes(cache, block_store, shard_id, address, identity, routing_bucket)?;
+    match decode_feature_block_strict(&bytes) {
+        PackedFeatureBlockDecode::Packed(points) => points
+            .into_iter()
+            .find(|point| point.timestamp_ms == timestamp_ms),
+        PackedFeatureBlockDecode::Legacy => Some(FeaturePoint {
+            timestamp_ms,
+            value: bytes,
+        }),
+        PackedFeatureBlockDecode::Corrupt(_) => None,
+    }
+}
+
+pub(super) fn read_feature_point_cold(
+    block_store: &BlockStore,
+    timestamp_ms: u64,
+    address: &ElementEntry,
+) -> Option<FeaturePoint> {
+    let bytes = read_block_bytes_cold(block_store, address)?;
+    match decode_feature_block_strict(&bytes) {
+        PackedFeatureBlockDecode::Packed(points) => points
+            .into_iter()
+            .find(|point| point.timestamp_ms == timestamp_ms),
+        PackedFeatureBlockDecode::Legacy => Some(FeaturePoint {
+            timestamp_ms,
+            value: bytes,
+        }),
+        PackedFeatureBlockDecode::Corrupt(_) => None,
+    }
+}
+
+pub(super) fn read_feature_point_cached(
+    cache: &MultiLayerCache,
+    block_store: &BlockStore,
+    shard_id: ShardId,
+    timestamp_ms: u64,
+    address: &ElementEntry,
+    // WHICH PAGE, stated by the caller. A packed series page holds many points and is not an
+    // element of its object, so the element half is `None` -- but the OBJECT half cannot be
+    // recovered here: this function is handed an address and a timestamp, and neither names a key.
+    // See [`BlockIdentity`] for why it is the terms rather than an id that cross.
+    identity: BlockIdentity<'_>,
+    packed_block_cache: &mut HashMap<ElementEntry, Option<Vec<FeaturePoint>>>,
+    routing_bucket: Option<u32>,
+) -> Option<FeaturePoint> {
+    if let Some(points) = packed_block_cache.get(address) {
+        return points
+            .as_ref()
+            .and_then(|points| {
+                points
+                    .iter()
+                    .find(|point| point.timestamp_ms == timestamp_ms)
+            })
+            .cloned();
+    }
+
+    let bytes = read_block_bytes(cache, block_store, shard_id, address, identity, routing_bucket)?;
+    match decode_feature_block_strict(&bytes) {
+        PackedFeatureBlockDecode::Packed(points) => {
+            let selected = points
+                .iter()
+                .find(|point| point.timestamp_ms == timestamp_ms)
+                .cloned();
+            packed_block_cache.insert(address.clone(), Some(points));
+            selected
+        }
+        PackedFeatureBlockDecode::Legacy => Some(FeaturePoint {
+            timestamp_ms,
+            value: bytes,
+        }),
+        PackedFeatureBlockDecode::Corrupt(_) => {
+            packed_block_cache.insert(address.clone(), None);
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod block_encoding_tests {
+    use super::*;
+    use crate::types::FeaturePoint;
+
+    /// What the page format costs to write and to read, measured on the code that ships.
+    ///
+    /// A page was JSON, and a value is a `Vec<u8>`, which JSON writes as an array of decimal
+    /// numbers. That is paid twice per page -- once encoding, once decoding -- on every write and
+    /// every read that misses the cache, and it is the half of this change that compression cannot
+    /// give back: bytes the encoder never writes are bytes the compressor never reads.
+    ///
+    /// Reports rather than asserts a threshold: a timing assertion on shared hardware is a flake
+    /// generator, and the correctness of both paths is pinned by the tests above.
+    #[test]
+    fn what_the_block_format_costs() {
+        use std::time::Instant;
+
+        let value: Vec<u8> = (0..400u32).map(|i| (i % 251) as u8).collect();
+        let points = vec![FeaturePoint { timestamp_ms: 1_789_007_622_131, value }];
+        let rounds = 20_000;
+
+        // Warm both paths so the first does not pay for what the second reuses.
+        let _ = encode_feature_block(&points);
+        let owned = PackedFeatureBlock { version: 1, points: points.to_vec() };
+        let _ = serde_json::to_vec(&owned).expect("serialises");
+
+        let started = Instant::now();
+        let mut json_bytes = 0usize;
+        for _ in 0..rounds {
+            let owned = PackedFeatureBlock { version: 1, points: points.to_vec() };
+            let mut block = FEATURE_BLOCK_MAGIC.to_vec();
+            block.append(&mut serde_json::to_vec(&owned).expect("serialises"));
+            json_bytes = block.len();
+        }
+        let json_encode_ns = started.elapsed().as_nanos();
+
+        let started = Instant::now();
+        let mut binary_bytes = 0usize;
+        for _ in 0..rounds {
+            binary_bytes = encode_feature_block(&points).len();
+        }
+        let binary_encode_ns = started.elapsed().as_nanos();
+
+        let owned = PackedFeatureBlock { version: 1, points: points.to_vec() };
+        let mut json_block = FEATURE_BLOCK_MAGIC.to_vec();
+        json_block.append(&mut serde_json::to_vec(&owned).expect("serialises"));
+        let binary_block = encode_feature_block(&points);
+
+        let started = Instant::now();
+        for _ in 0..rounds {
+            assert!(matches!(
+                decode_feature_block_strict(&json_block),
+                PackedFeatureBlockDecode::Packed(_)
+            ));
+        }
+        let json_decode_ns = started.elapsed().as_nanos();
+
+        let started = Instant::now();
+        for _ in 0..rounds {
+            assert!(matches!(
+                decode_feature_block_strict(&binary_block),
+                PackedFeatureBlockDecode::Packed(_)
+            ));
+        }
+        let binary_decode_ns = started.elapsed().as_nanos();
+
+        let saved = |before: u128, after: u128| {
+            if before == 0 { 0.0 } else { (before as f64 - after as f64) / before as f64 * 100.0 }
+        };
+        println!(
+            "  page of one 400 B point: {json_bytes} B as JSON, {binary_bytes} B as bytes"
+        );
+        println!(
+            "  encode x{rounds}: json {json_encode_ns} ns, bytes {binary_encode_ns} ns, {:.1}% saved",
+            saved(json_encode_ns, binary_encode_ns)
+        );
+        println!(
+            "  decode x{rounds}: json {json_decode_ns} ns, bytes {binary_decode_ns} ns, {:.1}% saved",
+            saved(json_decode_ns, binary_decode_ns)
+        );
+    }
+
+    fn fixtures() -> Vec<Vec<FeaturePoint>> {
+        vec![
+            vec![],
+            vec![FeaturePoint { timestamp_ms: 0, value: vec![] }],
+            vec![FeaturePoint { timestamp_ms: 7, value: vec![0, 1, 2, 254, 255] }],
+            vec![FeaturePoint { timestamp_ms: u64::MAX, value: vec![0xff; 3] }],
+            vec![
+                FeaturePoint { timestamp_ms: 1, value: vec![b'a'; 300] },
+                FeaturePoint { timestamp_ms: 2, value: vec![0u8; 300] },
+            ],
+        ]
+    }
+
+    /// Every shape a page can take must come back exactly as it went in.
+    #[test]
+    fn the_block_round_trips_every_shape() {
+        for points in fixtures() {
+            let encoded = encode_feature_block(&points);
+            assert_eq!(
+                decode_feature_block(&encoded).as_deref(),
+                Some(points.as_slice()),
+                "a page of {} point(s) did not decode back",
+                points.len()
+            );
+        }
+    }
+
+    /// A page written before the byte format still reads.
+    ///
+    /// Stores exist that were written as JSON. Nothing writes that shape now, and this is what
+    /// lets those stores keep serving until they are gone.
+    #[test]
+    fn a_block_written_as_json_still_reads() {
+        for points in fixtures() {
+            let owned = PackedFeatureBlock { version: 1, points: points.to_vec() };
+            let mut json_block = FEATURE_BLOCK_MAGIC.to_vec();
+            json_block.append(&mut serde_json::to_vec(&owned).expect("owned page serialises"));
+            assert_eq!(
+                decode_feature_block(&json_block).as_deref(),
+                Some(points.as_slice()),
+                "a JSON page of {} point(s) stopped reading",
+                points.len()
+            );
+        }
+    }
+
+    /// A torn page is reported, never trusted, and never sizes a buffer from what it claims.
+    ///
+    /// A declared length that the file does not have is what turned a corrupt tail into an aborted
+    /// process once already. Every prefix of a real page is fed in here: each must either decode
+    /// to exactly the points that survived or say it is corrupt, and none may panic.
+    #[test]
+    fn a_torn_block_is_reported_not_trusted() {
+        let points = vec![
+            FeaturePoint { timestamp_ms: 11, value: vec![b'x'; 40] },
+            FeaturePoint { timestamp_ms: 12, value: vec![b'y'; 40] },
+        ];
+        let whole = encode_feature_block(&points);
+        for cut in 0..whole.len() {
+            match decode_feature_block_strict(&whole[..cut]) {
+                PackedFeatureBlockDecode::Corrupt(_) => {}
+                // A prefix shorter than the magic cannot claim to be one of our pages.
+                PackedFeatureBlockDecode::Legacy => assert!(
+                    cut < FEATURE_BLOCK_BINARY_MAGIC.len(),
+                    "a truncation at {cut} was read as an unframed page"
+                ),
+                PackedFeatureBlockDecode::Packed(got) => panic!(
+                    "a page truncated at {cut} decoded as {} point(s)",
+                    got.len()
+                ),
+            }
+        }
+
+        // And a page that claims more points than it carries is refused rather than reserved for.
+        let mut lying = encode_feature_block(&points);
+        let count_at = FEATURE_BLOCK_BINARY_MAGIC.len();
+        lying[count_at..count_at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(matches!(
+            decode_feature_block_strict(&lying),
+            PackedFeatureBlockDecode::Corrupt(_)
+        ));
+    }
+
+    /// The payload is stored once, not four times over.
+    ///
+    /// JSON wrote a `Vec<u8>` as an array of decimal numbers, so a page was 3.6x its payload and
+    /// 4.3x for a small one. This pins the new shape at the payload plus a fixed header, which is
+    /// the whole point of the change and the thing a future edit could quietly undo.
+    #[test]
+    fn a_block_is_no_longer_several_times_its_payload() {
+        for payload_len in [48usize, 400, 4096] {
+            let points = vec![FeaturePoint {
+                timestamp_ms: 1_789_007_622_131,
+                value: vec![7u8; payload_len],
+            }];
+            let encoded = encode_feature_block(&points);
+            let overhead = encoded.len() - payload_len;
+            assert_eq!(
+                overhead,
+                FEATURE_BLOCK_HEADER_BYTES + FEATURE_POINT_HEADER_BYTES,
+                "a {payload_len} B payload should cost a fixed header, not a multiple"
+            );
+
+            // Against what it used to cost, so the comparison is in the test rather than a note.
+            let owned = PackedFeatureBlock { version: 1, points: points.to_vec() };
+            let json_len = FEATURE_BLOCK_MAGIC.len()
+                + serde_json::to_vec(&owned).expect("serialises").len();
+            // At least halved. A small payload saves less than a large one because the
+            // header is the same 23 bytes either way: 48 B costs 71 B against 168 B as JSON,
+            // while 4 KiB costs 4,119 B against roughly four times that.
+            assert!(
+                encoded.len() * 2 < json_len,
+                "{payload_len} B payload: {} B now against {json_len} B as JSON, which is not the \
+                 saving this change exists for",
+                encoded.len()
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod single_point_chunking_tests {
+    use super::*;
+    use crate::types::FeaturePoint;
+
+    fn point(ts: u64, len: usize) -> FeaturePoint {
+        FeaturePoint { timestamp_ms: ts, value: vec![b'v'; len] }
+    }
+
+    #[test]
+    fn a_lone_point_chunks_exactly_as_the_general_path_would() {
+        // The short circuit above returns early for one point. It is only correct because the
+        // split fires solely when `current` is non-empty, which a lone point never is -- so this
+        // pins the three cases that would catch it being wrong.
+
+        // 1. One point -> one chunk holding it, however large. A page target cannot split a point.
+        for len in [0usize, 8, 64_000] {
+            let chunks = chunk_timestamped_kv_points(vec![point(1, len)]);
+            assert_eq!(chunks.len(), 1, "one point must make one chunk (len {len})");
+            assert_eq!(chunks[0].len(), 1, "the chunk must hold the point (len {len})");
+            assert_eq!(chunks[0][0].timestamp_ms, 1, "and it must be THAT point (len {len})");
+            assert_eq!(chunks[0][0].value.len(), len, "with its value intact (len {len})");
+        }
+
+        // 2. Two small points still share one page -- so the early return is not what produced
+        //    the single chunk above, and this test can tell the two apart.
+        let together = chunk_timestamped_kv_points(vec![point(1, 8), point(2, 8)]);
+        assert_eq!(together.len(), 1, "two small points share a page");
+        assert_eq!(together[0].len(), 2, "and both are in it");
+
+        // 3. Two points too big to share DO split, which is the behaviour the short circuit must
+        //    not have disabled for the multi-point path.
+        let target = context_block_target_bytes();
+        let split = chunk_timestamped_kv_points(vec![point(1, target), point(2, target)]);
+        assert_eq!(split.len(), 2, "two oversized points must not share a page");
+        assert_eq!(split[0][0].timestamp_ms, 1, "order is preserved across the split");
+        assert_eq!(split[1][0].timestamp_ms, 2, "order is preserved across the split");
+    }
+}

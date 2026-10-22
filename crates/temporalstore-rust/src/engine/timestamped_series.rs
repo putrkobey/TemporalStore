@@ -269,3 +269,547 @@ where
     }
     // COLLECTED BEFORE THE REMOVAL BELOW, AND THAT ORDER IS LOAD-BEARING: a write that empties
     // the series takes its key out of the map, and the surviving set the collecting caller wants
+    // is the one from before that happened -- which for an emptied series is empty anyway, and
+    // for every other write is the series still there.
+    let live = if collect_live {
+        series.addresses().cloned().collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    if series.is_empty() {
+        map.remove(for_removal.borrow());
+    }
+    live
+}
+
+/// As above, for a map whose key this call has to allocate.
+///
+/// The kind dispatch in `lifecycle` walks maps keyed by `String`, which owns its characters and so
+/// cannot share one: there is nothing for a caller to hand in, and making each of its six arms
+/// spell the allocation would say the same thing six times. Kept as its own door so that a map which CAN
+/// share does not reach the allocating path by accident -- which is exactly how the generic helper
+/// came to defeat sharing in the first place.
+pub(super) fn set_point_for_owned_key<K, S>(
+    map: &mut std::collections::HashMap<K, S>,
+    object_key: &str,
+    at: u64,
+    address: Option<ElementEntry>,
+) -> Vec<ElementEntry>
+where
+    K: std::hash::Hash + Eq + std::borrow::Borrow<str> + Clone + for<'a> From<&'a str>,
+    S: TimestampedSeriesWrite,
+{
+    set_point_and_collect_live(map, K::from(object_key), at, address)
+}
+
+// =================================================================================================
+// THE OWNED SORTED ARRAY, AND WHY A SECOND REPRESENTATION EARNS ITS PLACE
+// =================================================================================================
+
+/// One object's timestamped page addresses, held as ONE OWNED SORTED ARRAY instead of a B-tree.
+///
+/// # WHAT IT REPLACES, AND WHAT THAT COSTS TODAY
+///
+/// The representation above -- `BTreeMap<u64, ElementEntry>` behind a `HashMap` key -- allocates a
+/// 280-byte root node before a single element byte is stored, and it pays that per key. Measured
+/// in this tree at one element: **312 B in 4 allocations for the B-tree against 48 B in 2 for this
+/// array** (`Vec` header 24 B, buffer 24 B for one 24-byte pair), and the owning field itself is a
+/// thin pointer at eight bytes rather than a 24-byte `BTreeMap` header. Those are two different
+/// components and are reported as two numbers, never one standing in for the other.
+///
+/// The access pattern is what makes the array the right shape and not a compromise: these series
+/// are append-mostly, read by one instant or walked whole. An array appends in amortised O(1),
+/// binary-searches in O(log N), and walks in order with no pointer chasing. Nothing here ranges
+/// over a sub-interval of a series -- the time-windowed context reads range over
+/// `context_event_timeline` and resolve single instants into the series -- so the ordered-range
+/// strength of a B-tree is not being given up.
+///
+/// # SORTED IS AN INVARIANT, NOT A CONVENTION
+///
+/// [`TimestampedSeries::points`] promises ascending order and its callers depend on it for a
+/// stored image. So every insert lands by binary search and every removal preserves order; the
+/// array is never sorted lazily and there is no "needs sorting" state for a reader to meet. The
+/// test over this type drives out-of-order and duplicate inserts and asserts the walk is ascending
+/// after each one, because an invariant that only holds on sorted input is not an invariant.
+///
+/// # THE SAME PAYLOAD TYPE THE OBJECT SLOT CARRIES
+///
+/// `ObjectSlot` already holds `Option<Box<Vec<(u64, ElementEntry)>>>` as its owned element array,
+/// and this is deliberately that same type rather than a parallel one. When a map moves under the
+/// consolidated object map its series becomes the payload of a slot with no change of
+/// representation, and the assert below is what keeps the two from drifting apart in the meantime.
+///
+/// # NOT SERIALIZED, AND THAT IS WHY NO FORMAT STAMP IS OWED
+///
+/// There is no `Serialize`/`Deserialize` here at all. A map adopting this representation keeps its
+/// stored image in a compatibility field under the wire key it has always had, and the array is
+/// rebuilt from that field by a decode fold. A serde impl on this type would be the thing that
+/// turned an adoption into a format change, so its absence is load-bearing rather than an omission.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct OwnedTimestampedSeries {
+    /// `None` and an empty array mean the same thing to every reader here, and `None` is what this
+    /// type produces: an emptied series drops its allocation rather than keeping a zero-length
+    /// buffer, so a map that filled and drained does not hold one `Vec` header per key forever.
+    points: Option<Box<Vec<(u64, ElementEntry)>>>,
+}
+
+/// EIGHT BYTES, PINNED AS AN EQUALITY. An inequality against the B-tree header it replaces would
+/// pass at every width below 24.
+const _: () = assert!(std::mem::size_of::<OwnedTimestampedSeries>() == 8);
+const _: () = assert!(std::mem::align_of::<OwnedTimestampedSeries>() == 8);
+
+/// Where exact growth stops and `Vec`'s doubling takes over, in points.
+///
+/// EIGHT, AND IT IS THE SAME EIGHT `HashFieldMap` USES. Both types are sorted owned arrays standing
+/// in for a per-key map, both pay a recopy to hold capacity equal to length, and the bound on that
+/// recopy is what the threshold buys: at most seven pairs, 168 bytes. Above it the saving is a
+/// shrinking fraction of a buffer that is already amortised, and the recopy is not.
+const EXACT_GROWTH_BELOW: usize = 8;
+
+/// THE WIDTH IS PINNED AGAINST THE SPELLING THE SLOT USES -- and this assert is stated for exactly
+/// what it checks, which is less than "the two cannot drift". It compares this type against the
+/// payload type written out in full; it does NOT read `ObjectSlot`, so a change on the slot's side
+/// would not fire HERE. What fires there is the slot's own assert, which pins the same payload at
+/// eight. The two together hold both ends at eight, and neither on its own proves the types are the
+/// same type.
+const _: () = assert!(
+    std::mem::size_of::<OwnedTimestampedSeries>()
+        == std::mem::size_of::<Option<Box<Vec<(u64, ElementEntry)>>>>()
+);
+
+impl OwnedTimestampedSeries {
+    /// How many points the array holds.
+    pub(super) fn len(&self) -> usize {
+        self.points.as_ref().map_or(0, |points| points.len())
+    }
+
+    /// Whether it holds none -- true both for an absent array and, defensively, for an empty one,
+    /// so a reader never has to know which of the two this type is in.
+    pub(super) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// How many heap allocations this series is currently holding. Reported SEPARATELY from its
+    /// byte footprint and never folded into it: the win of the array over the B-tree is two
+    /// numbers, bytes and allocation count, and one of them standing in for the other is how a
+    /// footprint claim gets published wrong.
+    pub(super) fn allocation_count(&self) -> usize {
+        match self.points.as_ref() {
+            // The boxed `Vec` is one allocation for its header; the buffer is a second, and only
+            // once there is something in it. A `Vec` at capacity 0 has no buffer.
+            None => 0,
+            Some(points) if points.capacity() == 0 => 1,
+            Some(_) => 2,
+        }
+    }
+
+    /// Where an instant sits, or where it would be inserted.
+    fn locate(&self, at: u64) -> Result<usize, usize> {
+        match self.points.as_ref() {
+            None => Err(0),
+            Some(points) => points.binary_search_by_key(&at, |(instant, _)| *instant),
+        }
+    }
+
+    /// The address recorded at one instant, if any.
+    pub(super) fn get(&self, at: &u64) -> Option<&ElementEntry> {
+        let index = self.locate(*at).ok()?;
+        self.points.as_ref().map(|points| &points[index].1)
+    }
+
+    /// Whether an instant is recorded. Spelled out because the maps adopting this type are read by
+    /// membership as often as by value, and `get(..).is_some()` at a call site reads as a value
+    /// fetch that was thrown away.
+    pub(super) fn contains_key(&self, at: &u64) -> bool {
+        self.locate(*at).is_ok()
+    }
+
+    /// Record an address at one instant, replacing whatever was there, and hand back what it
+    /// replaced.
+    ///
+    /// SORT ORDER IS MAINTAINED HERE rather than fixed up later: the insert position comes from the
+    /// same binary search that answers `get`, so the array is ordered after every call whatever
+    /// order the caller writes in.
+    pub(super) fn insert(&mut self, at: u64, address: ElementEntry) -> Option<ElementEntry> {
+        match self.locate(at) {
+            Ok(index) => {
+                let points = self
+                    .points
+                    .as_mut()
+                    .expect("a located index means the array exists");
+                Some(std::mem::replace(&mut points[index].1, address))
+            }
+            Err(index) => {
+                let points = self.points.get_or_insert_with(|| Box::new(Vec::new()));
+                // EXACT CAPACITY WHILE THE SERIES IS SHORT, AMORTISED ONCE IT IS NOT.
+                //
+                // `Vec`'s first allocation is capacity FOUR, so a one-point series holds 24 bytes
+                // of payload in a 96-byte buffer. That is 72 bytes of nothing per key, and the
+                // one-point key is the common case in a series map whose occupancy is bimodal --
+                // a handful of fixed indexes holding thousands, plus one per hash holding one.
+                //
+                // WHY NOT A BOXED SLICE, WHICH WOULD BE EXACT BY CONSTRUCTION. `Box<[T]>` is a fat
+                // pointer: it would take this type from eight bytes to sixteen, and -- the reason
+                // that is not merely a trade -- it carries no spare capacity, so EVERY append
+                // reallocates and copies the whole array. That is quadratic in total copying for a
+                // series appended to n times, and `context_events` occupancy is lifetime event
+                // count per node, with no bound. Exactness is worth having where the series is
+                // short and not worth buying with a realloc per append where it is long.
+                //
+                // So the threshold: below it, grow to exactly what is needed, which costs one
+                // recopy of at most EXACT_GROWTH_BELOW - 1 pairs; at or above it, `Vec`'s doubling
+                // takes over untouched. Same policy and same threshold as `HashFieldMap`, which
+                // arrived at it from the same measurement rather than by being copied.
+                if points.len() < EXACT_GROWTH_BELOW && points.len() == points.capacity() {
+                    points.reserve_exact(1);
+                }
+                points.insert(index, (at, address));
+                None
+            }
+        }
+    }
+
+    /// Forget the point at one instant, if any.
+    ///
+    /// AN EMPTIED ARRAY DROPS ITS ALLOCATION. A map that filled and drained would otherwise hold a
+    /// `Vec` header per key for the life of the shard, which is exactly the per-key constant cost
+    /// this representation exists to remove.
+    pub(super) fn remove(&mut self, at: &u64) -> Option<ElementEntry> {
+        let index = self.locate(*at).ok()?;
+        let points = self
+            .points
+            .as_mut()
+            .expect("a located index means the array exists");
+        let (_, address) = points.remove(index);
+        if points.is_empty() {
+            self.points = None;
+        }
+        Some(address)
+    }
+
+    /// Every point, ascending.
+    pub(super) fn iter(&self) -> impl DoubleEndedIterator<Item = (&u64, &ElementEntry)> {
+        self.points
+            .as_deref()
+            .map_or(&[][..], |points| points.as_slice())
+            .iter()
+            .map(|(at, address)| (at, address))
+    }
+
+    /// Every point, ascending, with the address mutable. The instant is handed over as a shared
+    /// borrow because a walker able to change it could silently reorder the array.
+    pub(super) fn iter_mut(&mut self) -> impl Iterator<Item = (&u64, &mut ElementEntry)> {
+        self.points
+            .as_deref_mut()
+            .map_or(&mut [][..], |points| points.as_mut_slice())
+            .iter_mut()
+            .map(|(at, address)| (&*at, address))
+    }
+
+    /// Every instant, ascending. The compression policy reads these without their addresses.
+    pub(super) fn keys(&self) -> impl DoubleEndedIterator<Item = &u64> {
+        self.iter().map(|(at, _)| at)
+    }
+
+    /// Every address, ascending by instant.
+    pub(super) fn values(&self) -> impl DoubleEndedIterator<Item = &ElementEntry> {
+        self.iter().map(|(_, address)| address)
+    }
+
+    /// The B-tree view of this series, for the reporting and capture paths whose own output shape
+    /// is a `BTreeMap` and which must not change because the representation behind them did.
+    pub(super) fn to_btree(&self) -> BTreeMap<u64, ElementEntry> {
+        self.iter()
+            .map(|(at, address)| (*at, address.clone()))
+            .collect()
+    }
+}
+
+/// Built from the B-tree it replaces, which is what a decode fold has in hand. Ascending already,
+/// so this is a copy and not a sort -- but the invariant does not depend on that being true, since
+/// [`OwnedTimestampedSeries::insert`] places by search either way.
+impl From<&BTreeMap<u64, ElementEntry>> for OwnedTimestampedSeries {
+    fn from(series: &BTreeMap<u64, ElementEntry>) -> Self {
+        if series.is_empty() {
+            return Self::default();
+        }
+        Self {
+            points: Some(Box::new(
+                series
+                    .iter()
+                    .map(|(at, address)| (*at, address.clone()))
+                    .collect(),
+            )),
+        }
+    }
+}
+
+impl From<BTreeMap<u64, ElementEntry>> for OwnedTimestampedSeries {
+    fn from(series: BTreeMap<u64, ElementEntry>) -> Self {
+        if series.is_empty() {
+            return Self::default();
+        }
+        Self {
+            points: Some(Box::new(series.into_iter().collect())),
+        }
+    }
+}
+
+impl From<&OwnedTimestampedSeries> for BTreeMap<u64, ElementEntry> {
+    fn from(series: &OwnedTimestampedSeries) -> Self {
+        series.to_btree()
+    }
+}
+
+impl TimestampedSeries for OwnedTimestampedSeries {
+    fn len(&self) -> usize {
+        OwnedTimestampedSeries::len(self)
+    }
+
+    /// TWO BINARY SEARCHES AND A SLICE -- the implementation the trait's own doc predicts for a
+    /// sorted array, rather than a concession to the tree this replaces. Each bound is resolved
+    /// once against the array, so a window costs O(log N) and then one pass over the points
+    /// inside it and nothing per point outside it.
+    ///
+    /// AND THE TYPE DOC ABOVE SAYS NOTHING RANGES OVER A SERIES, WHICH WAS TRUE WHEN WRITTEN AND
+    /// IS NOT A REASON TO LEAVE THIS UNIMPLEMENTED. The trait grew this method because the first
+    /// kind to migrate read a window immediately; a representation that answered "no caller needs
+    /// it" would be the seam narrowing to whatever the current tenant happens to do.
+    fn range(
+        &self,
+        bounds: impl std::ops::RangeBounds<u64>,
+    ) -> impl DoubleEndedIterator<Item = (u64, &ElementEntry)> {
+        let points: &[(u64, ElementEntry)] =
+            self.points.as_deref().map_or(&[], |points| points.as_slice());
+        let start = match bounds.start_bound() {
+            std::ops::Bound::Unbounded => 0,
+            std::ops::Bound::Included(at) => points.partition_point(|(instant, _)| instant < at),
+            std::ops::Bound::Excluded(at) => points.partition_point(|(instant, _)| instant <= at),
+        };
+        let end = match bounds.end_bound() {
+            std::ops::Bound::Unbounded => points.len(),
+            std::ops::Bound::Included(at) => points.partition_point(|(instant, _)| instant <= at),
+            std::ops::Bound::Excluded(at) => points.partition_point(|(instant, _)| instant < at),
+        };
+        // An inverted or empty window yields nothing rather than panicking on the slice index,
+        // which is what `BTreeMap::range` does for the bounds it accepts.
+        points[start..end.max(start)]
+            .iter()
+            .map(|(at, address)| (*at, address))
+    }
+
+    fn get(&self, at: u64) -> Option<&ElementEntry> {
+        OwnedTimestampedSeries::get(self, &at)
+    }
+
+    fn addresses(&self) -> impl Iterator<Item = &ElementEntry> {
+        self.values()
+    }
+
+    fn points(&self) -> impl Iterator<Item = (u64, &ElementEntry)> {
+        self.iter().map(|(at, address)| (*at, address))
+    }
+
+    fn points_mut(&mut self) -> impl Iterator<Item = (u64, &mut ElementEntry)> {
+        self.iter_mut().map(|(at, address)| (*at, address))
+    }
+}
+
+impl TimestampedSeriesWrite for OwnedTimestampedSeries {
+    fn set(&mut self, at: u64, address: ElementEntry) {
+        self.insert(at, address);
+    }
+
+    fn clear(&mut self, at: u64) {
+        self.remove(&at);
+    }
+}
+
+#[cfg(test)]
+mod a_short_series_does_not_hold_a_buffer_it_is_not_using {
+    use super::{OwnedTimestampedSeries, EXACT_GROWTH_BELOW};
+    use crate::block_store::ElementEntry;
+
+    /// Capacity equals length below the threshold, and does NOT at it -- a BRACKETING PAIR.
+    ///
+    /// The first half alone would pass if exact growth were applied at every length, which is the
+    /// shape this deliberately does not have: it would buy a realloc per append for a series with
+    /// no bound on its occupancy. The second half is what makes the threshold a threshold, so a
+    /// change that quietly extended exactness upward reddens here instead of showing up as a
+    /// throughput regression nothing in this crate measures.
+    #[test]
+    fn the_threshold_is_exact_and_not_merely_an_upper_bound() {
+        let mut series = OwnedTimestampedSeries::default();
+
+        for point in 1..=EXACT_GROWTH_BELOW {
+            series.insert(point as u64, ElementEntry::default());
+            let held = series.points.as_ref().expect("a written series has a buffer");
+            assert_eq!(
+                held.len(),
+                point,
+                "insert {point} did not land"
+            );
+            assert_eq!(
+                held.capacity(),
+                held.len(),
+                "at {point} points, below the threshold of {EXACT_GROWTH_BELOW}, the buffer holds \
+                 spare capacity: len {} capacity {}",
+                held.len(),
+                held.capacity()
+            );
+        }
+
+        // One past the threshold: `Vec`'s doubling takes over and capacity must OVERSHOOT.
+        series.insert(EXACT_GROWTH_BELOW as u64 + 1, ElementEntry::default());
+        let held = series.points.as_ref().expect("a written series has a buffer");
+        assert_eq!(held.len(), EXACT_GROWTH_BELOW + 1);
+        assert!(
+            held.capacity() > held.len(),
+            "at {} points, AT OR ABOVE the threshold, growth should be amortised and capacity \
+             should overshoot -- it is {}, equal to the length, so exact growth did not stop \
+             where it was supposed to",
+            held.len(),
+            held.capacity()
+        );
+    }
+
+    /// What the spare capacity cost, in the allocator's own units.
+    ///
+    /// `chunk(req) = max(32, align16(req + 8))` for glibc, which is what production uses -- the
+    /// crate's only `#[global_allocator]` is behind `cfg(all(test, feature = "alloc-probe"))`, so
+    /// the chunk model is the production model and not a test artefact.
+    ///
+    /// A pair is 24 bytes: an eight-byte instant and a sixteen-byte entry, both pinned elsewhere
+    /// and re-derived here rather than assumed.
+    #[test]
+    fn a_one_point_series_no_longer_pays_for_four() {
+        fn chunk(request: usize) -> usize {
+            let rounded = (request + 8 + 15) / 16 * 16;
+            if rounded < 32 {
+                32
+            } else {
+                rounded
+            }
+        }
+
+        let pair = std::mem::size_of::<(u64, ElementEntry)>();
+        assert_eq!(pair, 24, "a point is an instant plus an entry");
+
+        let mut series = OwnedTimestampedSeries::default();
+        series.insert(1, ElementEntry::default());
+        let held = series.points.as_ref().expect("a written series has a buffer");
+
+        let now = chunk(pair * held.capacity());
+        let before = chunk(pair * 4); // `Vec`'s first allocation, which is what this replaced
+        assert_eq!(held.capacity(), 1, "a one-point series should hold one point's worth");
+        assert!(
+            now < before,
+            "the exact buffer ({now} B) should be smaller than the capacity-four one ({before} B)"
+        );
+        println!(
+            "  one-point series buffer: {before} B at capacity 4 -> {now} B exact, {} B saved",
+            before - now
+        );
+
+        // THE WHOLE CURVE, NOT ONE POINT, because the saving decays to nothing by the threshold
+        // and a single figure invites quoting the best cell as the result. `Vec`'s doubling from
+        // capacity four goes 4, 8, 16, so the old buffer is flat across each doubling band while
+        // the exact one steps every point -- which is why the saving is sawtoothed rather than
+        // monotone, and why n=1 is the best case and n=4 and n=8 the worst.
+        println!("  points   exact B   capacity-4 doubling B   saved");
+        let mut worst = usize::MAX;
+        for points in 1..=EXACT_GROWTH_BELOW {
+            let mut series = OwnedTimestampedSeries::default();
+            for point in 1..=points {
+                series.insert(point as u64, ElementEntry::default());
+            }
+            let held = series.points.as_ref().expect("a written series has a buffer");
+            assert_eq!(held.capacity(), points, "exact growth should hold capacity at length");
+            // What `Vec` alone would have held: 4, then doubling, which is the shape this replaced.
+            let mut doubling = 4;
+            while doubling < points {
+                doubling *= 2;
+            }
+            let exact_bytes = chunk(pair * points);
+            let doubling_bytes = chunk(pair * doubling);
+            let saved = doubling_bytes - exact_bytes;
+            worst = worst.min(saved);
+            println!(
+                "  {points:>6}   {exact_bytes:>7}   {doubling_bytes:>21}   {saved:>5}"
+            );
+        }
+        assert_eq!(
+            worst, 0,
+            "the saving should reach zero somewhere below the threshold -- where length meets a              doubling boundary the two shapes agree, and a non-zero worst case here would mean              this comparison is not modelling `Vec`'s growth"
+        );
+    }
+
+    /// An emptied series still drops its buffer. Exact growth touches the insert path only, and
+    /// this is the property on the remove path that it could have broken by accident.
+    #[test]
+    fn emptying_a_series_still_releases_the_buffer() {
+        let mut series = OwnedTimestampedSeries::default();
+        series.insert(7, ElementEntry::default());
+        assert!(series.points.is_some());
+        series.remove(&7);
+        assert!(
+            series.points.is_none(),
+            "an emptied series must drop its allocation rather than keep a zero-length buffer"
+        );
+    }
+}
+
+/// Serialize a map of owned arrays in the B-TREE SHAPE IT HAS ALWAYS HAD ON THE WIRE.
+///
+/// # WHY THIS EXISTS RATHER THAN A COMPATIBILITY FIELD
+///
+/// [`OwnedTimestampedSeries`] carries no `Serialize`/`Deserialize`, on purpose, so the usual way
+/// for a map to adopt it is a second field under the old wire key plus a decode fold -- which is a
+/// FORMAT change, with an old image and a new one to keep straight. A map whose stored shape is
+/// `{key: {timestamp: address}}` does not need that: the array holds exactly the same pairs in
+/// exactly the same order, so it can be written AS that object and read back from it. The image is
+/// byte-identical before and after, which is the whole point -- no stamp is owed, no fold runs, and
+/// an older binary reads a newer image.
+///
+/// THE WRITE ALLOCATES NOTHING. `collect_map` is handed the array's own iterator, so a dump does
+/// not build a temporary `BTreeMap` per series on the way out. Going through `to_btree()` would
+/// have been shorter and would have put one allocation per series into every dump.
+pub(super) mod as_btree_maps {
+    use super::{ElementEntry, OwnedTimestampedSeries};
+    use std::collections::{BTreeMap, HashMap};
+
+    struct AsStoredMap<'a>(&'a OwnedTimestampedSeries);
+
+    impl serde::Serialize for AsStoredMap<'_> {
+        fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: serde::Serializer,
+        {
+            serializer.collect_map(self.0.iter())
+        }
+    }
+
+    pub(in crate::engine) fn serialize<S>(
+        map: &HashMap<std::sync::Arc<str>, OwnedTimestampedSeries>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.collect_map(map.iter().map(|(key, series)| (key, AsStoredMap(series))))
+    }
+
+    pub(in crate::engine) fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> Result<HashMap<std::sync::Arc<str>, OwnedTimestampedSeries>, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let stored: HashMap<std::sync::Arc<str>, BTreeMap<u64, ElementEntry>> =
+            serde::Deserialize::deserialize(deserializer)?;
+        Ok(stored
+            .into_iter()
+            .map(|(key, series)| (key, OwnedTimestampedSeries::from(series)))
+            .collect())
+    }
+}
