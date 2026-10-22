@@ -24,3 +24,29 @@ impl Client {
 
     pub fn smembers(&self, key: &str) -> Result<Vec<String>> {
         let key = cstring(key)?;
+        let mut out = CStringArray {
+            count: 0,
+            values: ptr::null_mut(),
+        };
+        let mut error: *mut c_char = ptr::null_mut();
+        let code = unsafe { temporalstore_smembers(self.raw, key.as_ptr(), &mut out, &mut error) };
+        check(code, error)?;
+        let values = if out.values.is_null() {
+            Vec::new()
+        } else {
+            let slice = unsafe { std::slice::from_raw_parts(out.values, out.count) };
+            slice
+                .iter()
+                .filter_map(|value| {
+                    if value.is_null() {
+                        None
+                    } else {
+                        Some(unsafe { CStr::from_ptr(*value).to_string_lossy().into_owned() })
+                    }
+                })
+                .collect()
+        };
+        unsafe { temporalstore_string_array_free(&mut out) };
+        Ok(values)
+    }
+}

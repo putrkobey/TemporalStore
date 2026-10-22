@@ -638,3 +638,643 @@ fn where_an_object_keys_characters_are_written_in_the_durable_index() {
     walk("", object, &reading, 0, &mut paths);
     let deep_total = paths.len();
     let mut deep: Vec<(&String, &usize)> = paths.iter().filter(|(_, count)| **count > 0).collect();
+    deep.sort_by(|left, right| right.1.cmp(left.1));
+    println!();
+    println!("================ EVERY STRUCT-SHAPED PATH THAT HOLDS ONE ================");
+    println!(
+        "  {deep_total} path(s) walked, {} of them holding a key instance",
+        deep.len()
+    );
+    println!("  {:<54} {:>12} {:>14}", "path", "instances", "per object");
+    for (path, count) in deep.iter() {
+        println!(
+            "  {path:<54} {count:>12} {:>14.3}",
+            **count as f64 / reading.keys as f64
+        );
+    }
+
+    // ---- ONE PAGE INDEX, SPLIT INTO ITS MAP KEYS AND ITS FIELDS BY SUBTRACTION ----
+    //
+    // THE SPLIT IS A DIFFERENCE BETWEEN TWO MEASURED TOTALS, not a reading of either one's name: a
+    // map's instances are its keys' plus its values', and the values are counted directly, so the
+    // keys' share is what is left. That is the only way to price a map KEY, which no walk over
+    // values can see.
+    let slot_index = object
+        .get("slot_index")
+        .expect("the core index is written under `slot_index`");
+    let bucket_map = slot_index
+        .as_object()
+        .expect("the core index writes an object")
+        .get("bucket_map")
+        .expect("the core index writes `bucket_map`")
+        .as_object()
+        .expect("the bucket map writes an object");
+    assert_eq!(
+        bucket_map.len(),
+        reading.buckets,
+        "[CLAUSE part-sum] the written bucket map holds {} node(s) against {} resident",
+        bucket_map.len(),
+        reading.buckets
+    );
+
+    let mut node_counts: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut block_key_instances = 0usize;
+    let mut block_field_instances = 0usize;
+    // THE COMPOSITE AROUND THE CHARACTERS, counted beside them. A page entry is filed under a
+    // COMPOSED name -- the kind, the object key and five address terms -- so the key's characters
+    // are only part of what naming the page costs. A change replacing the key with a fixed-width
+    // stand-in would move the whole composite, not just the characters inside it, and a report
+    // counting only the characters would understate it.
+    let mut block_name_bytes = 0usize;
+    let mut block_name_key_chars = 0usize;
+    for node in bucket_map.values() {
+        *node_counts.entry(reading.instances_in(node)).or_default() += 1;
+        let block_index = node
+            .as_object()
+            .expect("a bucket node writes an object")
+            .get("page_index")
+            .expect("a bucket node writes `block_index`");
+        let in_whole_map = reading.instances_in(block_index);
+        let blocks = block_index
+            .as_object()
+            .expect("the page index writes an object");
+        let in_values: usize = blocks.values().map(|entry| reading.instances_in(entry)).sum();
+        assert!(
+            in_whole_map >= in_values,
+            "[CLAUSE part-sum] a page index holds {in_whole_map} instance(s) while its entries \
+             alone hold {in_values}, so the map's own serialization is not its keys plus its \
+             values and the subtraction below is not a split"
+        );
+        for name in blocks.keys() {
+            block_name_bytes += serde_json::to_vec(name).expect("a name serializes").len();
+            block_name_key_chars += instances(
+                name.as_bytes(),
+                reading.width,
+                reading.ordinals,
+                reading.shape,
+            ) * reading.width;
+        }
+        block_field_instances += in_values;
+        block_key_instances += in_whole_map - in_values;
+        // THE CHARACTERS MOVED RATHER THAN LEFT, PER BUCKET. The entry's copy is gone, so a page
+        // index's whole count must now be its KEYS' count -- asserted here, bucket by bucket,
+        // because a total asserted once could be satisfied by some buckets holding a field copy and
+        // others holding no key at all.
+        assert_eq!(
+            in_whole_map, in_whole_map - in_values,
+            "[CLAUSE the-entry-holds-no-copy] a page index holds {in_whole_map} key instance(s) of \
+             which {in_values} are inside its ENTRIES, so this bucket's entries still carry a copy \
+             of the object key"
+        );
+    }
+    println!();
+    println!("================ INSIDE THE BUCKET MAP ================");
+    println!("  {:>12} {:>14}", "instances", "bucket nodes");
+    for (count, nodes) in node_counts.iter() {
+        println!("  {count:>12} {nodes:>14}");
+    }
+    println!(
+        "  page-entry MAP KEYS       {block_key_instances:>8} instance(s), {:.3} per object",
+        block_key_instances as f64 / reading.keys as f64
+    );
+    println!(
+        "  page-entry `object_key`   {block_field_instances:>8} instance(s), {:.3} per object",
+        block_field_instances as f64 / reading.keys as f64
+    );
+    assert!(
+        block_key_instances > 0,
+        "[CLAUSE each-term-nonzero] the page-entry map keys hold no key characters, so this term \
+         is a zero that would have been absorbed into another"
+    );
+    // AND THIS TERM IS NOW EXACTLY ZERO, WHICH IS A SUBJECT CHANGE AND NOT A RELAXED CLAUSE.
+    //
+    // It read `block_field_instances > 0` under `each-term-nonzero`, and it FAILED on the first
+    // suite run after the page entry stopped writing its own copy of the object key -- which is
+    // how the removal was confirmed to have landed where this module says the copy lived. The
+    // clause is INVERTED rather than deleted: the term has to be zero now, and a non-zero here
+    // would mean the field came back.
+    //
+    // THE NON-ZERO DISCIPLINE MOVES ONTO THE IDENTITY BESIDE IT. A term asserted zero says nothing
+    // about whether the characters are still durable, so the two statements that carry the weight
+    // are that the map KEYS hold them (asserted above) and that the page index's instances are now
+    // ENTIRELY in its keys -- the characters moved, they did not leave the index.
+    assert_eq!(
+        0, block_field_instances,
+        "[CLAUSE the-entry-holds-no-copy] the page entries hold {block_field_instances} instance(s) \
+         of an object key's characters. `object_key` left the entry at \
+         `SHARD_INDEX_FORMAT_VERSION` 27 because the composite key the entry is filed under \
+         already spells it, so a copy on the entry means the field has come back"
+    );
+    println!(
+        "  page-entry names          {block_name_bytes:>8} B in all, {:.2} B/object as written",
+        block_name_bytes as f64 / reading.keys as f64
+    );
+    println!(
+        "    of which the object key's characters are {block_name_key_chars} B ({:.1}%); the rest \
+         is the kind and the five address terms the composite also names",
+        100.0 * block_name_key_chars as f64 / block_name_bytes as f64
+    );
+    assert!(
+        block_name_key_chars > 0 && block_name_key_chars < block_name_bytes,
+        "[CLAUSE each-term-nonzero] the page-entry names are {block_name_bytes} B of which \
+         {block_name_key_chars} B are key characters -- a share of none says the composite does not \
+         name the object, a share of all says it names nothing else, and neither matches a \
+         composed name"
+    );
+
+    // ---- AND THE SAME COUNT ON THE PRODUCTION PAYLOAD ----
+    let in_msgpack = instances(
+        &reading.msgpack,
+        reading.width,
+        reading.ordinals,
+        reading.shape,
+    );
+    assert_eq!(
+        in_msgpack, whole,
+        "[CLAUSE production-payload] the JSON stream holds {whole} key instance(s) and the \
+         msgpack payload the default codec actually writes holds {in_msgpack} -- the count is a \
+         property of the index's content and must not depend on which codec renders it"
+    );
+
+    println!();
+    println!("================ THE ANSWER ================");
+    println!(
+        "  ONE OBJECT KEY'S CHARACTERS ARE WRITTEN {copies} TIME(S) PER OBJECT, on the JSON \
+         stream and on the msgpack payload alike."
+    );
+    println!(
+        "  At a {}-byte key that is {} B/object of key characters, against json_stream {:.2} \
+         B/object = {:.2}%.",
+        reading.width,
+        copies * reading.width,
+        reading.json.len() as f64 / reading.keys as f64,
+        100.0 * (copies * reading.width) as f64
+            / (reading.json.len() as f64 / reading.keys as f64)
+    );
+    println!();
+}
+
+// =================================================================================================
+
+/// WHAT ONE BYTE OF AN OBJECT KEY COSTS THE DURABLE INDEX, ON EACH OF THE THREE DENOMINATORS.
+///
+/// One conclusion: the marginal cost of key width, measured by VARYING the width rather than by
+/// attributing bytes -- which is why it is the one figure that may legitimately be taken on the
+/// compressed container.
+///
+/// THE EXACT CLAUSE AND THE TOLERANT ONE ARE BOTH HERE, AND THE EXACT ONE IS NOT DERIVED FROM THE
+/// TOLERANT ONE. The census count at each width is an integer and must be the SAME integer at every
+/// width and in both shapes -- that is exact. The fitted slope is a float over a store whose bucket
+/// occupancy moves a little with the key text, so it carries a tolerance; a tolerance wide enough
+/// to survive that movement is wider than some drifts worth catching, so it is a cross-check on the
+/// exact clause and never a substitute for it.
+///
+/// AND THE CONTAINER IS ASSERTED ON THE SCATTERED SHAPE ONLY. The padded shape's keys share a
+/// constant run and a sequential ordinal, so the frame compresses them to nearly nothing and its
+/// slope is a property of the fixture. It is printed as the lower bound and carries no assertion;
+/// the scattered shape carries it.
+#[test]
+fn what_one_byte_of_an_object_key_costs_the_durable_index() {
+    let mut counts: BTreeMap<usize, Vec<String>> = BTreeMap::new();
+    let mut fits: Vec<(KeyShape, f64, f64, f64, usize, usize, usize)> = Vec::new();
+
+    for shape in [KeyShape::Padded, KeyShape::Scattered] {
+        let readings: Vec<Reading> = WIDTHS
+            .into_iter()
+            .map(|width| reading_at(CENSUS_KEYS, width, shape))
+            .collect();
+        println!();
+        println!(
+            "================ THE WIDTH SWEEP, {} OBJECTS, {} KEYS ================",
+            readings[0].keys,
+            shape.label()
+        );
+        println!(
+            "  {:>8} {:>10} {:>14} {:>16} {:>14} {:>12}",
+            "width", "buckets", "json_stream", "msgpack_stream", "container", "instances"
+        );
+        for reading in readings.iter() {
+            let copies = reading.copies();
+            counts
+                .entry(copies)
+                .or_default()
+                .push(format!("{} w{}", shape.label(), reading.width));
+            println!(
+                "  {:>8} {:>10} {:>14} {:>16} {:>14} {:>12}",
+                reading.width,
+                reading.buckets,
+                reading.json.len(),
+                reading.msgpack.len(),
+                reading.container,
+                copies
+            );
+        }
+        let first = &readings[0];
+        let last = &readings[readings.len() - 1];
+        let span = (last.width - first.width) as f64 * first.keys as f64;
+        fits.push((
+            shape,
+            (last.json.len() as f64 - first.json.len() as f64) / span,
+            (last.msgpack.len() as f64 - first.msgpack.len() as f64) / span,
+            (last.container as f64 - first.container as f64) / span,
+            last.width,
+            last.json.len() / last.keys,
+            last.container / last.keys,
+        ));
+    }
+
+    // ---- THE EXACT CLAUSE ----
+    assert_eq!(
+        counts.len(),
+        1,
+        "[CLAUSE width-count-stable] the per-object instance count is not one number across the \
+         sweep -- {counts:?} -- so the index stores a key a number of times that depends on how \
+         long the key is or on what it spells, and no single slope describes it"
+    );
+    let copies = *counts.keys().next().expect("one count");
+
+    println!();
+    println!("================ WHAT ONE KEY BYTE COSTS, PER OBJECT ================");
+    println!(
+        "  {:<12} {:>16} {:>18} {:>16}",
+        "key shape", "json_stream", "msgpack_stream", "container"
+    );
+    for (shape, json_slope, msgpack_slope, container_slope, _, _, _) in fits.iter() {
+        println!(
+            "  {:<12} {json_slope:>16.3} {msgpack_slope:>18.3} {container_slope:>16.3}",
+            shape.label()
+        );
+    }
+    println!(
+        "  the census counts {copies} instance(s) per object, so the two content columns are the \
+         same quantity reached a second way; the container column is a DERIVATIVE on a compressed \
+         frame and names no field"
+    );
+
+    for (shape, json_slope, msgpack_slope, container_slope, width, json_per, container_per) in
+        fits.iter()
+    {
+        assert!(
+            (json_slope - copies as f64).abs() < 0.25,
+            "[CLAUSE derivative-agrees] with {} keys the JSON stream grows {json_slope:.3} B per \
+             key byte per object while the census counts {copies} instance(s) per object -- two \
+             independent methods on the same quantity disagree, so one of them is measuring \
+             something else",
+            shape.label()
+        );
+        assert!(
+            (msgpack_slope - copies as f64).abs() < 0.25,
+            "[CLAUSE derivative-agrees] with {} keys the msgpack payload grows \
+             {msgpack_slope:.3} B per key byte per object against a census of {copies}",
+            shape.label()
+        );
+        println!();
+        println!(
+            "  {} keys at width {width}: key characters {} B/object against json_stream \
+             {json_per} B/object = {:.1}%",
+            shape.label(),
+            copies * width,
+            100.0 * (copies * width) as f64 / *json_per as f64
+        );
+        println!(
+            "    shipped {container_per} B/object; the width-dependent part of it is \
+             {:.2} B/object = {:.1}% -- a DERIVATIVE, stated as such",
+            container_slope * *width as f64,
+            100.0 * container_slope * *width as f64 / *container_per as f64
+        );
+        if *shape == KeyShape::Scattered {
+            assert!(
+                *container_slope > 0.5,
+                "[CLAUSE scattered-container] with keys that share no structure the shipped \
+                 container grows only {container_slope:.3} B per key byte per object -- a stream \
+                 storing the characters {copies} time(s) cannot compress unrelated keys away this \
+                 well, so this is a measurement fault rather than a finding"
+            );
+        } else {
+            println!(
+                "    NOT ASSERTED for the padded shape: a constant run plus a sequential ordinal \
+                 compresses, so this end is a lower bound set by the fixture."
+            );
+        }
+    }
+    println!();
+}
+
+// =================================================================================================
+
+/// THE PER-OBJECT INDEX COST OVER A SWEPT STORE, AND THE KEY'S SHARE OF IT AT THE PUBLISHED WIDTH.
+///
+/// One conclusion: the slope and the constant of each of the three totals, at the key width the
+/// published per-key figures were taken at, so the key's share is quoted against the same surface
+/// those figures were -- together with the byte partition that says what the rest of the slope is.
+///
+/// A PER-KEY FIGURE OVER A HASH TABLE IS A SAWTOOTH, so this fits a slope over a swept range rather
+/// than dividing one reading, and it prints every point it fitted.
+#[test]
+fn the_per_object_index_cost_and_the_keys_share_of_it() {
+    let shape = KeyShape::Padded;
+    let readings: Vec<Reading> = SIZES
+        .into_iter()
+        .map(|keys| reading_at(keys, PUBLISHED_WIDTH, shape))
+        .collect();
+
+    println!();
+    println!(
+        "================ THE STORE SWEEP AT THE PUBLISHED {PUBLISHED_WIDTH}-BYTE KEY, {} KEYS \
+         ================",
+        shape.label()
+    );
+    println!(
+        "  {:>8} {:>10} {:>14} {:>16} {:>14} {:>12}",
+        "objects", "buckets", "json_stream", "msgpack_stream", "container", "instances"
+    );
+    let mut counts: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for reading in readings.iter() {
+        let copies = reading.copies();
+        counts.entry(copies).or_default().push(reading.keys);
+        println!(
+            "  {:>8} {:>10} {:>14} {:>16} {:>14} {:>12}",
+            reading.keys,
+            reading.buckets,
+            reading.json.len(),
+            reading.msgpack.len(),
+            reading.container,
+            copies
+        );
+    }
+    assert_eq!(
+        counts.len(),
+        1,
+        "[CLAUSE size-count-stable] the per-object instance count moves with the store size \
+         ({counts:?}), so it is not a per-object property and the share below has no single value"
+    );
+    let copies = *counts.keys().next().expect("one count");
+
+    let small = &readings[0];
+    let large = &readings[readings.len() - 1];
+    let span = (large.keys - small.keys) as f64;
+    let fit = |small_bytes: usize, large_bytes: usize| -> (f64, f64) {
+        let slope = (large_bytes as f64 - small_bytes as f64) / span;
+        (slope, small_bytes as f64 - slope * small.keys as f64)
+    };
+    let (json_slope, json_constant) = fit(small.json.len(), large.json.len());
+    let (msgpack_slope, msgpack_constant) = fit(small.msgpack.len(), large.msgpack.len());
+    let (container_slope, container_constant) = fit(small.container, large.container);
+
+    println!();
+    println!("================ THE SLOPE AND THE CONSTANT ================");
+    println!(
+        "  json_stream      slope={json_slope:>8.2} B/object  constant={json_constant:>10.0} B"
+    );
+    println!(
+        "  msgpack_stream   slope={msgpack_slope:>8.2} B/object  \
+         constant={msgpack_constant:>10.0} B"
+    );
+    println!(
+        "  container        slope={container_slope:>8.2} B/object  \
+         constant={container_constant:>10.0} B   (COMPRESSED -- names no field)"
+    );
+    assert!(
+        json_slope > 0.0 && msgpack_slope > 0.0 && container_slope > 0.0,
+        "[CLAUSE slope-positive] a total that does not grow with the store contradicts the \
+         per-object cost this measurement exists to decompose: json {json_slope:.2}, msgpack \
+         {msgpack_slope:.2}, container {container_slope:.2}"
+    );
+
+    let key_bytes = (copies * PUBLISHED_WIDTH) as f64;
+    println!();
+    println!("================ THE KEY'S SHARE AT THE PUBLISHED WIDTH ================");
+    println!(
+        "  {copies} instance(s) x {PUBLISHED_WIDTH} B = {key_bytes:.0} B/object of key characters"
+    );
+    println!(
+        "  against json_stream    {json_slope:.2} B/object  = {:.2}%",
+        100.0 * key_bytes / json_slope
+    );
+    println!(
+        "  against msgpack_stream {msgpack_slope:.2} B/object  = {:.2}%",
+        100.0 * key_bytes / msgpack_slope
+    );
+    println!(
+        "  the container's share is NOT computed here: a byte figure on a compressed frame cannot \
+         name a field, and the only legitimate figure for it is the width DERIVATIVE, which \
+         `what_one_byte_of_an_object_key_costs_the_durable_index` takes on two key shapes."
+    );
+
+    // ---- AND WHERE THE REST OF THE BYTES ARE, ON THE ONE STREAM THAT PARTITIONS EXACTLY ----
+    //
+    // A JSON object is its entries plus two braces and the commas between them, so a per-part byte
+    // figure here is EXACT, and the identity below is what says no byte went unnamed. This sits
+    // beside the instance counts rather than instead of them: "how many bytes are the key" is only
+    // answerable against a total whose other terms are named too, and a share quoted against a
+    // short denominator is the recorded way this goes wrong.
+    let object = large.object();
+    let entry_bytes = |name: &str, value: &serde_json::Value| -> usize {
+        serde_json::to_vec(name).expect("a name serializes").len()
+            + 1
+            + serde_json::to_vec(value).expect("a value serializes").len()
+    };
+    let mut parts: Vec<(String, usize, usize)> = object
+        .iter()
+        .map(|(name, value)| (name.clone(), entry_bytes(name, value), large.instances_in(value)))
+        .collect();
+    let named: usize = parts.iter().map(|(_, bytes, _)| *bytes).sum();
+    let punctuation = 2 + object.len().saturating_sub(1);
+    assert_eq!(
+        large.json.len(),
+        named + punctuation,
+        "[CLAUSE part-sum] the per-part byte partition sums to {named} + {punctuation} \
+         punctuation against a {}-byte stream, so some bytes are unattributed and every share \
+         quoted above would be taken against a short denominator",
+        large.json.len()
+    );
+    parts.sort_by(|left, right| right.1.cmp(&left.1));
+    println!();
+    println!(
+        "================ WHERE THE BYTES ARE AT {} OBJECTS (json_stream) ================",
+        large.keys
+    );
+    println!(
+        "  {} top-level part(s) partition {} B exactly; the rows below are those holding a key \
+         instance or more than 64 B",
+        parts.len(),
+        large.json.len()
+    );
+    println!(
+        "  {:<34} {:>14} {:>12} {:>12} {:>14}",
+        "part", "bytes", "B/object", "% stream", "key instances"
+    );
+    for (name, bytes, found) in parts.iter() {
+        if *bytes <= 64 && *found == 0 {
+            continue;
+        }
+        println!(
+            "  {name:<34} {bytes:>14} {:>12.2} {:>11.2}% {found:>14}",
+            *bytes as f64 / large.keys as f64,
+            100.0 * *bytes as f64 / large.json.len() as f64
+        );
+    }
+    println!();
+}
+
+
+// =================================================================================================
+
+/// THE SAME QUESTION ON THE SHIPPED ROUTING RANGE, WHERE THE BUCKET TERMS AMORTISE.
+///
+/// One conclusion: the key's share of the per-object cost on `0..1023`, beside the same share on the
+/// range `load_shard` leaves behind -- because the two differ by enough that a figure quoted without
+/// its range is not a figure.
+///
+/// THE REGIME IS ASSERTED, NOT ASSUMED. An arm that exists to measure amortisation and silently
+/// fails to produce any is a probe that never entered the regime it is arguing about, and its number
+/// would read as a result. So the first clause here refuses a fixture in which no bucket holds more
+/// than one object.
+#[test]
+fn the_keys_share_of_the_per_object_cost_on_the_shipped_routing_range() {
+    let shape = KeyShape::Padded;
+    let readings: Vec<Reading> = SIZES
+        .into_iter()
+        .map(|keys| reading_on(keys, PUBLISHED_WIDTH, shape, Some(SHIPPED_END_BUCKET)))
+        .collect();
+
+    println!();
+    println!(
+        "================ THE STORE SWEEP ON 0..{SHIPPED_END_BUCKET}, {PUBLISHED_WIDTH}-BYTE \
+         {} KEYS ================",
+        shape.label()
+    );
+    println!(
+        "  {:>8} {:>10} {:>12} {:>14} {:>16} {:>14} {:>11}",
+        "objects", "buckets", "obj/bucket", "json_stream", "msgpack_stream", "container",
+        "instances"
+    );
+    let mut counts: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
+    for reading in readings.iter() {
+        let copies = reading.copies();
+        counts.entry(copies).or_default().push(reading.keys);
+        println!(
+            "  {:>8} {:>10} {:>12.2} {:>14} {:>16} {:>14} {:>11}",
+            reading.keys,
+            reading.buckets,
+            reading.keys as f64 / reading.buckets as f64,
+            reading.json.len(),
+            reading.msgpack.len(),
+            reading.container,
+            copies
+        );
+    }
+
+    // ---- THE REGIME CLAUSE FIRST: this arm exists for amortisation, so it must have some ----
+    let large = &readings[readings.len() - 1];
+    assert!(
+        large.buckets < large.keys,
+        "[CLAUSE amortised-regime] the shipped-range fixture put {} object(s) in {} bucket(s), so \
+         no bucket holds more than one and this arm is measuring the same regime as the unbounded \
+         one -- the amortisation it exists to price never happened",
+        large.keys,
+        large.buckets
+    );
+    assert_eq!(
+        counts.len(),
+        1,
+        "[CLAUSE size-count-stable] the per-object instance count moves with the store size \
+         ({counts:?}) on the shipped range, so it is not a per-object property here either"
+    );
+    let copies = *counts.keys().next().expect("one count");
+
+    let small = &readings[0];
+    let span = (large.keys - small.keys) as f64;
+    let fit = |small_bytes: usize, large_bytes: usize| -> (f64, f64) {
+        let slope = (large_bytes as f64 - small_bytes as f64) / span;
+        (slope, small_bytes as f64 - slope * small.keys as f64)
+    };
+    let (json_slope, json_constant) = fit(small.json.len(), large.json.len());
+    let (msgpack_slope, msgpack_constant) = fit(small.msgpack.len(), large.msgpack.len());
+    let (container_slope, container_constant) = fit(small.container, large.container);
+
+    println!();
+    println!("================ THE SLOPE AND THE CONSTANT ON THE SHIPPED RANGE ================");
+    println!(
+        "  json_stream      slope={json_slope:>8.2} B/object  constant={json_constant:>10.0} B"
+    );
+    println!(
+        "  msgpack_stream   slope={msgpack_slope:>8.2} B/object  \
+         constant={msgpack_constant:>10.0} B"
+    );
+    println!(
+        "  container        slope={container_slope:>8.2} B/object  \
+         constant={container_constant:>10.0} B   (COMPRESSED -- names no field)"
+    );
+    assert!(
+        json_slope > 0.0 && msgpack_slope > 0.0,
+        "[CLAUSE slope-positive] a content total that does not grow with the store contradicts \
+         the per-object cost this arm decomposes: json {json_slope:.2}, msgpack {msgpack_slope:.2}"
+    );
+
+    let key_bytes = (copies * PUBLISHED_WIDTH) as f64;
+    println!();
+    println!("================ THE KEY'S SHARE, BY RANGE ================");
+    println!(
+        "  {copies} instance(s) x {PUBLISHED_WIDTH} B = {key_bytes:.0} B/object of key characters, \
+         on either range -- the COUNT does not depend on the range, only the TOTAL it is a share of"
+    );
+    println!(
+        "  on 0..{SHIPPED_END_BUCKET}: json_stream {json_slope:.2} B/object = {:.2}%, \
+         msgpack_stream {msgpack_slope:.2} B/object = {:.2}%",
+        100.0 * key_bytes / json_slope,
+        100.0 * key_bytes / msgpack_slope
+    );
+    println!(
+        "  the unbounded range is measured by \
+         `the_per_object_index_cost_and_the_keys_share_of_it`; read the two together or neither."
+    );
+
+    // ---- AND THE BYTE PARTITION, SO THE SMALLER TOTAL'S TERMS ARE NAMED TOO ----
+    let object = large.object();
+    let entry_bytes = |name: &str, value: &serde_json::Value| -> usize {
+        serde_json::to_vec(name).expect("a name serializes").len()
+            + 1
+            + serde_json::to_vec(value).expect("a value serializes").len()
+    };
+    let mut parts: Vec<(String, usize, usize)> = object
+        .iter()
+        .map(|(name, value)| (name.clone(), entry_bytes(name, value), large.instances_in(value)))
+        .collect();
+    let named: usize = parts.iter().map(|(_, bytes, _)| *bytes).sum();
+    let punctuation = 2 + object.len().saturating_sub(1);
+    assert_eq!(
+        large.json.len(),
+        named + punctuation,
+        "[CLAUSE part-sum] the per-part byte partition sums to {named} + {punctuation} \
+         punctuation against a {}-byte stream on the shipped range",
+        large.json.len()
+    );
+    parts.sort_by(|left, right| right.1.cmp(&left.1));
+    println!();
+    println!(
+        "================ WHERE THE BYTES ARE AT {} OBJECTS ON 0..{SHIPPED_END_BUCKET} \
+         ================",
+        large.keys
+    );
+    println!(
+        "  {} top-level part(s) partition {} B exactly",
+        parts.len(),
+        large.json.len()
+    );
+    println!(
+        "  {:<34} {:>14} {:>12} {:>12} {:>14}",
+        "part", "bytes", "B/object", "% stream", "key instances"
+    );
+    for (name, bytes, found) in parts.iter() {
+        if *bytes <= 64 && *found == 0 {
+            continue;
+        }
+        println!(
+            "  {name:<34} {bytes:>14} {:>12.2} {:>11.2}% {found:>14}",
+            *bytes as f64 / large.keys as f64,
+            100.0 * *bytes as f64 / large.json.len() as f64
+        );
+    }
+    println!();
+}
