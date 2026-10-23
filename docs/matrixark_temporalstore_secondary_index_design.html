@@ -69,3 +69,74 @@ ctxidx:{tenant_hash}:event_time_bucket:{bucket_ms}:{scope_hash}</code></pre>
 <h2>Why Too Many Indexes Hurt</h2>
 <ul>
   <li>More writes per event or resource chunk.</li>
+  <li>More pages/blocks to compact and cache.</li>
+  <li>More prefix scans and index intersections during retrieval.</li>
+  <li>More debug/audit noise.</li>
+  <li>More duplicated strings if index names are stored as text in exported records.</li>
+  <li>Worse ingestion p95 when PDFs or repos generate many keywords.</li>
+</ul>
+<h2>Production Target</h2>
+<pre><code>Context data model = timestamped series
+Secondary filters = declared compact fields or native posting families
+Query = time range + scope + filter predicates + top-k/candidate cap</code></pre>
+<p>The serving API should look like:</p>
+<pre><code>matrixark_scan_candidates(
+  scope_key,
+  node_hashes,
+  data_models=["event", "entity", "resource_chunk", "skill_section"],
+  time_range,
+  filters={
+    "source_type": ["message", "resource"],
+    "event_type": ["approval", "deadline"],
+    "resource_type": ["pdf", "md"],
+    "entity_type": ["owner", "decision"],
+    "keyword_id": [123, 456]
+  },
+  limit
+)</code></pre>
+<p>and eventually <code>matrixark_retrieve_context_pack(...)</code>, so Python sends the query plan and receives a compact candidate list or finished ContextPack.</p>
+<h2>Recommended Context Index Families</h2>
+<pre><code>source_type
+event_type
+entity_type
+resource_type
+unit_kind
+skill_trigger
+skill_tool
+keyword_id
+relative_path_hash
+visibility_scope</code></pre>
+<p>Do not create unbounded indexes for every arbitrary string. Keywords should be normalized to a capped dictionary and written as <code>keyword_id</code>, not long repeated strings.</p>
+<h2>How Filtering Should Work</h2>
+<p>For the query <code>Who approved the Project Aurora GPU request?</code>, query understanding can produce:</p>
+<pre><code>{
+  "query_type": "current_state",
+  "filters": {
+    "event_type": ["approval"],
+    "entity_type": ["resource_decision", "approval_state"],
+    "source_type": ["message", "resource"],
+    "keyword_id": ["gpu", "aurora", "approved"]
+  },
+  "temporal_window": {"mode": "latest"}
+}</code></pre>
+<p>Native retrieval then enforces scope, scores L0/L1 nodes, applies compact filters before reading/scoring too many rows, scores surviving events/entities/chunks/skills, and packs selected evidence into the ContextPack.</p>
+<h2>What To Change From Today</h2>
+<ol>
+  <li>Keep <code>ContextEvent</code> timestamp-keyed by ingestion time.</li>
+  <li>Keep <code>ContextIndexRef</code> as a native internal posting/ref mechanism, not a verbose serving data model.</li>
+  <li>Stop exporting every index ref into ContextPack/debug pages by default.</li>
+  <li>Cap index fanout per object and per resource import.</li>
+  <li>Add a native conformance candidate scan API that applies scope and filter predicates before returning rows.</li>
+  <li>Move keyword indexing to dictionary ids.</li>
+  <li>Keep detailed index decisions in sampled audit/debug records only when debugging is enabled.</li>
+</ol>
+<h2>Compatibility Plan</h2>
+<ol>
+  <li>Keep writing existing <code>ContextIndexRef</code> families and current query behavior.</li>
+  <li>Add and Rust <code>matrixark_scan_candidates</code> and map query-understanding filters to native field ids.</li>
+  <li>Store field/value ids rather than repeated strings and hide <code>ContextIndexRef</code> from serving ContextPacks.</li>
+  <li>Keep verbose <code>context_index</code> export only under debug/audit sampling.</li>
+</ol>
+</main>
+</body>
+</html>
