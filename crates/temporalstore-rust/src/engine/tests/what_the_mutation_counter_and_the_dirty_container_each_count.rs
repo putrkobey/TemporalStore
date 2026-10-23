@@ -104,3 +104,110 @@ fn what_the_mutation_counter_and_the_dirty_container_each_count() {
             .iter()
             .filter(|(_bucket, node)| node.dirty())
             .map(|(bucket, _node)| *bucket)
+            .collect();
+        (
+            shard.dirty_objects.len(),
+            dirty.len(),
+            shard.bucket_index.bucket_map.len(),
+        )
+    };
+
+    println!();
+    println!(
+        "  {DISTINCT_KEYS} distinct keys, {WRITES_PER_KEY} writes each = {} writes issued",
+        DISTINCT_KEYS * WRITES_PER_KEY
+    );
+    println!();
+    println!("    object mutations since the dump (a SCALAR in the log) {mutations:>8}");
+    println!("    log records since the dump      (two SEQUENCES)      {log_records:>8}");
+    println!("    distinct dirty objects          (the CONTAINER)      {distinct_dirty_objects:>8}");
+    println!("    dirty buckets                   (one FLAG each)      {dirty_buckets:>8}");
+    println!("    buckets in the map                                   {bucket_total:>8}");
+    println!();
+
+    // ---- THE FIXTURE HAS TO REACH THE REGIME WHERE THE TWO COULD DIFFER, asserted first and one
+    // ---- clause at a time: a probe that never enters the contested regime agrees with whatever
+    // ---- it is asked.
+    assert!(
+        mutations > 0,
+        "[clause: regime_counter_moved] the log recorded 0 object mutations, so the scalar never \
+         moved and comparing it against anything says nothing"
+    );
+    assert!(
+        distinct_dirty_objects > 0,
+        "[clause: regime_container_filled] the dirty container holds nothing, so there is no \
+         count to compare the scalar against"
+    );
+    assert!(
+        mutations > distinct_dirty_objects as u64,
+        "[clause: regime_mutations_exceed_objects] {mutations} mutation(s) against \
+         {distinct_dirty_objects} distinct dirty object(s), so this fixture did NOT write any key \
+         more than once and the two counts coincide by construction. The comparison below cannot \
+         tell a mutation count from an object count -- raise WRITES_PER_KEY"
+    );
+
+    // ---- AND THE CONCLUSIONS, one per block.
+
+    // THE TWO COUNT DIFFERENT THINGS, and the factor is the figure that matters: it is the ratio a
+    // replacement would be wrong by, and it is set by how much the writer batches, not by anything
+    // this store could correct for.
+    assert_ne!(
+        mutations, distinct_dirty_objects as u64,
+        "[clause: counter_is_not_the_object_count] the mutation counter and the distinct-dirty-object \
+         count have become the same number ({mutations}), so this fixture no longer separates them \
+         and nothing here establishes that one cannot stand in for the other"
+    );
+    println!(
+        "    the mutation counter reads {mutations} where the container holds \
+         {distinct_dirty_objects} distinct object(s): a factor of {:.2}x, set by how much the \
+         writer batches",
+        mutations as f64 / distinct_dirty_objects as f64
+    );
+
+    // THE DIRTY-BUCKET VIEW IS O(BUCKETS) AND BOUNDED BY THE ROUTING RANGE, which is what makes
+    // the presence question cheap to answer per bucket while the count is not.
+    assert!(
+        dirty_buckets <= bucket_total,
+        "[clause: dirty_buckets_bounded_by_the_map] {dirty_buckets} dirty bucket(s) in a map of \
+         {bucket_total}, which cannot happen: the dirty view is a flag per bucket and is bounded \
+         by the map holding them"
+    );
+    assert!(
+        (bucket_total as u32) <= END_ROUTING_BUCKET + 1,
+        "[clause: dirty_buckets_bounded_by_the_range] the map holds {bucket_total} bucket(s) on a \
+         routing range of {}, so the per-bucket view is not bounded by the range after all",
+        END_ROUTING_BUCKET + 1
+    );
+
+    // AND THE CADENCE ALREADY READS THE SCALAR, NOT THE CONTAINER. Two plans over the SAME shard
+    // state, differing only in the configured threshold: one above the mutation count, one at 0.
+    // The container is identical across both, so a predicate consulting it could not tell them
+    // apart.
+    let delayed = engine.storage_lifecycle_plan(crate::StorageLifecycleRequest {
+        shard_id: 1,
+        min_undumped_wal_records: log_records.saturating_add(1_000),
+        min_undumped_wal_bytes: u64::MAX,
+        ..Default::default()
+    });
+    let released = engine.storage_lifecycle_plan(crate::StorageLifecycleRequest {
+        shard_id: 1,
+        min_undumped_wal_records: 0,
+        ..Default::default()
+    });
+    println!(
+        "    threshold above the count -> dump_delayed {}   threshold 0 -> dump_delayed {}",
+        delayed.dump_delayed, released.dump_delayed
+    );
+    assert!(
+        delayed.dump_delayed,
+        "[clause: cadence_waits_below_the_threshold] with the record threshold set \
+         {} above the {log_records} undumped record(s) the dump was NOT delayed, so the cadence is \
+         not reading the undumped-record scalar it is configured against",
+        1_000
+    );
+    assert!(
+        !released.dump_delayed,
+        "[clause: cadence_releases_at_no_threshold] with no record threshold configured the dump \
+         was still delayed, so the cadence is holding on something other than its scalars"
+    );
+}
