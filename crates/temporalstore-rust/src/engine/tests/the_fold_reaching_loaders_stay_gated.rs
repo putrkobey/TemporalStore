@@ -357,3 +357,362 @@ fn wal_single_barrier_else_lines() -> (usize, usize) {
              census can no longer tell which branch reaches a fold-aware loader. Re-derive the \
              gating before changing this test.",
             open + 1,
+            line.trim(),
+            index + 1
+        );
+    }
+    let else_line = else_line.unwrap_or_else(|| {
+        panic!(
+            "the `if wal_single_barrier()` at lifecycle.rs:{} has no `}} else {{` at its own \
+             indentation, so there is no else-branch for the fold-aware loader to sit in",
+            open + 1
+        )
+    });
+
+    for (index, line) in lines.iter().enumerate().skip(else_line + 1) {
+        if !at_same_indent(line) {
+            continue;
+        }
+        let trimmed = line.trim();
+        assert!(
+            trimmed == "};" || trimmed == "}",
+            "the `wal_single_barrier()` else-branch does not close with a brace at its own \
+             indentation; line {} is {trimmed:?}. Re-derive the gating before changing this test.",
+            index + 1
+        );
+        return (else_line + 1, index + 1);
+    }
+    panic!(
+        "the `wal_single_barrier()` else-branch opened at lifecycle.rs:{} and never closed at its \
+         own indentation",
+        else_line + 1
+    );
+}
+
+/// EVERY PRODUCTION CALLER OF A FOLD-REACHING LOADER SITS BEHIND THE FLAG GATE.
+#[test]
+fn every_production_caller_of_a_fold_reaching_loader_is_flag_gated() {
+    let sites = fold_reaching_call_sites();
+    assert!(
+        !sites.is_empty(),
+        "the census found NO call site of either fold-reaching loader. That is not a clean bill \
+         of health -- the matcher has stopped matching. The loaders are {FOLD_REACHING_CALLS:?} \
+         and they are called from `engine/engine_lifecycle.rs` at least twice."
+    );
+
+    let (else_start, else_end) = wal_single_barrier_else_lines();
+    let lifecycle = src_root().join("engine").join("lifecycle.rs");
+
+    let mut production = Vec::new();
+    let mut undetermined = Vec::new();
+    let mut test_sites = 0usize;
+    for site in &sites {
+        match site.test_only {
+            Some(true) => test_sites += 1,
+            Some(false) => production.push(site),
+            None => undetermined.push(site),
+        }
+    }
+
+    assert!(
+        undetermined.is_empty(),
+        "a fold-reaching call site could not be classified as production or test, and an \
+         unclassified site FAILS rather than passing: {undetermined:#?}. Classify it by its \
+         `#[cfg(test)]` -- on the function, or on the `mod` declaration that reaches its file -- \
+         and then decide whether it belongs in GATED_PRODUCTION_FUNCTIONS."
+    );
+
+    for site in &production {
+        assert!(
+            GATED_PRODUCTION_FUNCTIONS.contains(&site.function.as_str()),
+            "A NEW PRODUCTION CALLER OF A FOLD-REACHING LOADER: `{}` at {}:{}.\n\n\
+             WHAT THIS MEANS. The index-log fold runs \
+             `apply_key_state_field(&mut shard.context_nodes, ...)`, and the fold DOES deliver a \
+             `context_nodes` entry -- `the_third_door_stays_shut` measures it. The only reason \
+             that is not a live route is that no shipped configuration reaches a fold-aware \
+             loader unless `TS_WAL_LEGACY_RECOVERY` is set. A caller outside that gate RE-OPENS \
+             door 3.\n\n\
+             WHAT DEPENDS ON IT. The `context_nodes` verdict of NOT REMOVABLE (#2148, #2151) \
+             rests on this, and so does any further object-keyed map removal that is justified \
+             by the same closure. #2152 established the two halves -- the fold delivers, the \
+             shipped arm never asks.\n\n\
+             WHAT TO DO. If the new caller is behind the flag gate, add its function to \
+             GATED_PRODUCTION_FUNCTIONS with the argument for why. If it is NOT, door 3 is open \
+             and the maps that depend on its closure must be re-examined before this test is \
+             changed.",
+            site.function,
+            site.file.display(),
+            site.line
+        );
+
+        // THE GATING, WHICH IS THE LOAD-BEARING HALF.
+        if site.function == "load_shard_with" {
+            assert!(
+                site.file == lifecycle,
+                "`load_shard_with` has moved out of lifecycle.rs ({}), so the brace-matched gate \
+                 range no longer covers its call site",
+                site.file.display()
+            );
+            assert!(
+                site.line > else_start && site.line < else_end,
+                "the fold-aware load in `load_shard_with` is at lifecycle.rs:{} which is OUTSIDE \
+                 the `wal_single_barrier()` else-branch (lines {}..{}). On the single-barrier \
+                 default that call now runs, which means the index-log fold runs, which means \
+                 `context_nodes` key-states are applied on a shipped recovery path. Door 3 is \
+                 open.",
+                site.line,
+                else_start,
+                else_end
+            );
+        }
+    }
+
+    // `install_latest_manifest_if_newer_on_load` is gated by its CALLERS, not by its own body.
+    let indirect_callers = production_callers_of("install_latest_manifest_if_newer_on_load");
+    assert!(
+        !indirect_callers.is_empty(),
+        "no production caller of `install_latest_manifest_if_newer_on_load` was found, so the \
+         matcher has stopped matching rather than the function having become unreachable"
+    );
+    for (file, line, function) in &indirect_callers {
+        assert!(
+            *file == lifecycle && *line > else_start && *line < else_end,
+            "`install_latest_manifest_if_newer_on_load` is called from production at {}:{} (in \
+             `{function}`), OUTSIDE the `wal_single_barrier()` else-branch (lines {else_start}..\
+             {else_end}). That function holds a fold-aware load, so this caller reaches the \
+             index-log fold on a path a deployment takes, and door 3 is open.",
+            file.display(),
+            line
+        );
+    }
+
+    println!(
+        "  fold-reaching call sites: {} total, {} test-gated, {} production; gate else-branch \
+         lines {}..{}",
+        sites.len(),
+        test_sites,
+        production.len(),
+        else_start,
+        else_end
+    );
+    // The count, reported and cross-checked but NOT the load-bearing claim: a swap of a gated
+    // caller for an un-gated one leaves it unchanged, which is why the gating is asserted above.
+    assert_eq!(
+        2,
+        production.len(),
+        "the number of production callers of a fold-reaching loader moved. This is the weaker \
+         half of this test -- the gating above is what matters -- but a change here means the \
+         enumeration in #2152's follow-up is stale and the body of whatever removal depends on it \
+         is quoting a number that is no longer true."
+    );
+}
+
+/// Production call sites of `name`, as (file, line, enclosing function).
+fn production_callers_of(name: &str) -> Vec<(PathBuf, usize, String)> {
+    let root = src_root();
+    let mut files = Vec::new();
+    collect_rs(&root, &mut files);
+    let needle = format!(".{name}(");
+    let mut out = Vec::new();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        for (index, line) in lines.iter().enumerate() {
+            if line.trim_start().starts_with("//") || !contains_outside_string(line, &needle) {
+                continue;
+            }
+            let mut function = String::from("<none>");
+            let mut decl_index = None;
+            for back in (0..index).rev() {
+                let candidate = lines[back].trim_start();
+                if is_fn_decl(candidate) {
+                    function = fn_name(candidate);
+                    decl_index = Some(back);
+                    break;
+                }
+            }
+            let mut local_gate = false;
+            if let Some(decl) = decl_index {
+                let mut back = decl;
+                while back > 0 {
+                    back -= 1;
+                    let above = lines[back].trim();
+                    if above == "#[cfg(test)]" {
+                        local_gate = true;
+                        break;
+                    }
+                    if !above.starts_with("#[") && !above.starts_with("//") && !above.is_empty() {
+                        break;
+                    }
+                }
+            }
+            if local_gate || module_chain_is_test_gated(&file) == Some(true) {
+                continue;
+            }
+            out.push((file.clone(), index + 1, function));
+        }
+    }
+    out
+}
+
+/// THE SET OF FOLD-REACHING WRAPPERS IS CLOSED AT TWO.
+///
+/// `load_index_inner` takes `fold_deltas`, and this fails if a third wrapper starts passing
+/// `true` -- which would be a fold-reaching entry point the census above does not look at, and
+/// therefore a hole in exactly the shape that made the first version of this enumeration
+/// incomplete.
+#[test]
+fn the_only_fold_reaching_loaders_are_the_two_this_census_knows_about() {
+    let path = src_root().join("engine").join("persistence.rs");
+    let text = std::fs::read_to_string(&path).expect("persistence.rs is readable");
+    let lines: Vec<&str> = text.lines().collect();
+
+    let mut passing_true = Vec::new();
+    for (index, line) in lines.iter().enumerate() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || !contains_outside_string(line, "load_index_inner(") {
+            continue;
+        }
+        if !line.contains("true") {
+            continue;
+        }
+        // The wrapper this call sits in.
+        let mut function = String::from("<none>");
+        for back in (0..index).rev() {
+            let candidate = lines[back].trim_start();
+            if is_fn_decl(candidate) {
+                function = fn_name(candidate);
+                break;
+            }
+        }
+        passing_true.push(function);
+    }
+    passing_true.sort();
+    passing_true.dedup();
+
+    assert_eq!(
+        vec!["load_index", "load_index_checked"],
+        passing_true,
+        "the set of wrappers passing `fold_deltas: true` to `load_index_inner` has changed. The \
+         census in this file only looks at `load_index` and `load_index_checked`, so a third \
+         fold-reaching wrapper is a caller set nobody is checking -- which is precisely the hole \
+         that made the first version of this enumeration incomplete (it asked about \
+         `load_index_checked` alone and missed `load_index`). Add the new wrapper to \
+         FOLD_REACHING_CALLS and re-derive its callers."
+    );
+}
+
+/// WHAT THE FLAG'S READER DOES WITH WHAT AN OPERATOR MIGHT ACTUALLY WRITE.
+///
+/// Door 3's closure holds while `TS_WAL_LEGACY_RECOVERY` is off, so "off" has to mean off for
+/// every spelling of it. The dangerous direction for a DEFAULT-ON flag is a value meant to keep it
+/// on that reads as off; for this default-OFF flag it is the reverse -- a value meant to turn it
+/// off, or a typo, that reads as ON and silently puts the fold back on the recovery path.
+///
+/// This drives `parse_bool`, which is pure, and `env_bool` through a variable name that appears
+/// NOWHERE ELSE in the crate. The real flag name is deliberately not touched: `env_bool` reads the
+/// process environment, which is shared, and setting `TS_WAL_LEGACY_RECOVERY` here would change
+/// the recovery arm of every test running beside this one.
+#[test]
+fn no_spelling_of_off_turns_the_legacy_recovery_flag_on() {
+    use crate::env_flag::{env_bool, parse_bool};
+
+    for off in [
+        "0", " 0", "0 ", "\t0\n", "false", "FALSE", "False", "off", "OFF", "Off", "no", "NO",
+    ] {
+        assert_eq!(
+            Some(false),
+            parse_bool(off),
+            "`{off:?}` is a spelling of OFF and must parse as false"
+        );
+    }
+    for on in ["1", " 1", "true", "TRUE", "yes", "on", "ON", "On"] {
+        assert_eq!(
+            Some(true),
+            parse_bool(on),
+            "`{on:?}` is a spelling of ON and must parse as true"
+        );
+    }
+    // Outside the vocabulary: `None`, so the caller's own default decides. For this flag the
+    // default is `false`, so every unrecognised value leaves the fold unreachable -- the safe
+    // direction, and the one that matters here.
+    for unknown in ["", " ", "2", "-1", "wat", "ofc", "truthy", "0.0"] {
+        assert_eq!(
+            None,
+            parse_bool(unknown),
+            "`{unknown:?}` is outside the boolean vocabulary and must parse as None, so the \
+             caller's default decides rather than a guess"
+        );
+    }
+
+    // And the same through `env_bool`, on a name of this test's own so nothing else is disturbed.
+    const PROBE: &str = "TS_FOLD_CENSUS_PROBE_4071";
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            std::env::remove_var(PROBE);
+        }
+    }
+    let _restore = Restore;
+
+    std::env::remove_var(PROBE);
+    assert!(
+        !env_bool(PROBE, false),
+        "unset must fall back to the default, which for the legacy-recovery flag is off"
+    );
+    for (value, expected) in [
+        ("0", false),
+        (" 0", false),
+        ("off", false),
+        ("FALSE", false),
+        ("", false),
+        ("2", false),
+        ("wat", false),
+        ("1", true),
+        (" 1", true),
+        ("on", true),
+        ("TRUE", true),
+    ] {
+        std::env::set_var(PROBE, value);
+        assert_eq!(
+            expected,
+            env_bool(PROBE, false),
+            "`{value:?}` read against a default of false must be {expected}"
+        );
+    }
+}
+
+/// THE MATCHER IS SELF-TESTED, because a census whose matcher has stopped matching reports a
+/// clean tree.
+#[test]
+fn the_call_site_matcher_sees_code_and_not_strings() {
+    assert!(
+        contains_outside_string("        let loaded = self.load_index(shard_id, warm);", ".load_index("),
+        "the matcher no longer sees a real call, so the census above would report no call sites \
+         at all and its emptiness check is the only thing standing between that and a pass"
+    );
+    assert!(
+        !contains_outside_string(
+            r#"const FOLD: [&str; 1] = [".load_index("];"#,
+            ".load_index("
+        ),
+        "the matcher counts its own declaration as a call site, which is what made the first run \
+         of this census refuse to classify line 59 of this very file"
+    );
+    assert!(
+        !contains_outside_string(
+            r#"        panic!("a caller of .load_index_checked( appeared");"#,
+            ".load_index_checked("
+        ),
+        "the matcher counts a loader named inside an assertion message as a call site"
+    );
+    assert!(
+        contains_outside_string(
+            r#"        foo("a note about .load_index("); self.load_index_checked(s, false);"#,
+            ".load_index_checked("
+        ),
+        "a real call later on a line that also mentions a loader in a string must still be seen"
+    );
+}

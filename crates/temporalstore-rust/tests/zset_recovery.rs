@@ -49,3 +49,106 @@ fn new_engine(root: &PathBuf) -> TemporalEngine {
         shard_uri: String::new(),
         start_routing_bucket: 0,
         end_routing_bucket: u32::MAX,
+        readonly: false,
+        table_name: String::new(),
+    });
+    assert!(loaded.status.ok, "the shard did not load: {:?}", loaded.status);
+    engine
+}
+
+fn run(engine: &TemporalEngine, command: Command) -> CommandResponse {
+    let response = engine.execute(ExecuteRequest {
+        shard_id: SHARD_ID,
+        command,
+    });
+    assert!(response.status.ok, "command failed: {:?}", response.status);
+    response.response
+}
+
+fn zadd(engine: &TemporalEngine, member: &str, score: f64) {
+    run(
+        engine,
+        Command::ZSetAdd {
+            key: "board".to_string(),
+            member: member.as_bytes().to_vec(),
+            score,
+        },
+    );
+}
+
+fn full_range(engine: &TemporalEngine) -> Vec<String> {
+    match run(
+        engine,
+        Command::ZSetRange {
+            key: "board".to_string(),
+            start: 0,
+            stop: -1,
+            rev: false,
+        },
+    ) {
+        CommandResponse::Members { members } => members
+            .into_iter()
+            .map(|member| String::from_utf8(member).expect("utf8"))
+            .collect(),
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[test]
+fn scores_and_order_survive_restart_including_a_rescore() {
+    let root = unique_root("order");
+    let _ = std::fs::remove_dir_all(&root);
+
+    {
+        let engine = new_engine(&root);
+        zadd(&engine, "alice", 10.0);
+        zadd(&engine, "bob", 20.0);
+        zadd(&engine, "carol", -3.5);
+        // The re-score that must not fork: alice moves past bob.
+        zadd(&engine, "alice", 30.0);
+        assert_eq!(
+            vec!["carol", "-3.5", "bob", "20", "alice", "30"],
+            full_range(&engine)
+        );
+    }
+
+    {
+        let engine = new_engine(&root);
+        assert_eq!(
+            vec!["carol", "-3.5", "bob", "20", "alice", "30"],
+            full_range(&engine),
+            "recovery must see the moved score exactly once -- a duplicated member here means \
+             the re-score's delete was lost"
+        );
+        match run(
+            &engine,
+            Command::ZSetCard {
+                key: "board".to_string(),
+            },
+        ) {
+            CommandResponse::Integer { value } => assert_eq!(3, value),
+            other => panic!("unexpected response: {other:?}"),
+        }
+        match run(
+            &engine,
+            Command::ZSetRemove {
+                key: "board".to_string(),
+                member: b"bob".to_vec(),
+            },
+        ) {
+            CommandResponse::Integer { value } => assert_eq!(1, value),
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    {
+        let engine = new_engine(&root);
+        assert_eq!(
+            vec!["carol", "-3.5", "alice", "30"],
+            full_range(&engine),
+            "a removed member must not resurrect on restart"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
