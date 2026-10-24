@@ -136,3 +136,417 @@ impl FlagView for BucketNode {
         BucketNode::default()
     }
 
+    fn put(&mut self, index: usize, on: bool) {
+        (accessors()[index].2)(self, on);
+    }
+
+    fn take(&self, index: usize) -> bool {
+        (accessors()[index].1)(self)
+    }
+
+    fn raw(&self) -> u8 {
+        self.flags.bits()
+    }
+}
+
+/// THE CONTROL. The same five flags in the same byte, with ONE accessor reading the wrong bit:
+/// `loading` is written to its own bit and read from `in_memory`'s.
+///
+/// This is not a hypothetical shape. It is what a mask table gets when a line is copied and the
+/// constant on it is not changed, and it is invisible to any test that sets one flag at a time
+/// and to any test that sets every flag the same way.
+#[derive(Default)]
+struct MisMaskedNode(u8);
+
+impl MisMaskedNode {
+    const READ_MASKS: [u8; 5] = [
+        BucketFlags::DIRTY,
+        BucketFlags::DELETED,
+        BucketFlags::META_LOADED,
+        // The defect, and the only line that differs from the live shape.
+        BucketFlags::IN_MEMORY,
+        BucketFlags::IN_MEMORY,
+    ];
+    const WRITE_MASKS: [u8; 5] = [
+        BucketFlags::DIRTY,
+        BucketFlags::DELETED,
+        BucketFlags::META_LOADED,
+        BucketFlags::LOADING,
+        BucketFlags::IN_MEMORY,
+    ];
+}
+
+impl FlagView for MisMaskedNode {
+    fn fresh() -> Self {
+        Self::default()
+    }
+
+    fn put(&mut self, index: usize, on: bool) {
+        let mask = Self::WRITE_MASKS[index];
+        if on {
+            self.0 |= mask;
+        } else {
+            self.0 &= !mask;
+        }
+    }
+
+    fn take(&self, index: usize) -> bool {
+        self.0 & Self::READ_MASKS[index] != 0
+    }
+
+    fn raw(&self) -> u8 {
+        self.0
+    }
+}
+
+/// Write all thirty-two states of five flags and read each one back. `Err` names the first
+/// disagreement; `Ok` means every flag answered its own question in every state.
+fn every_state_reads_back<V: FlagView>() -> Result<usize, String> {
+    let names: Vec<&str> = accessors().iter().map(|(name, _, _)| *name).collect();
+    let mut checked = 0usize;
+    for state in 0u8..32 {
+        let wanted: Vec<bool> = (0..5).map(|bit| state & (1 << bit) != 0).collect();
+        let mut view = V::fresh();
+        for (index, on) in wanted.iter().enumerate() {
+            view.put(index, *on);
+        }
+        for (index, on) in wanted.iter().enumerate() {
+            let got = view.take(index);
+            if got != *on {
+                return Err(format!(
+                    "in state {state:#07b} the flag `{}` was written {on} and read back {got}; \
+                     the flags written were {:?}",
+                    names[index], wanted
+                ));
+            }
+            checked += 1;
+        }
+        // The byte itself, so a disagreement above can be read against the masks printed by
+        // `the_five_flag_masks_are_five_distinct_single_bits`.
+        debug_assert_eq!(
+            state,
+            view.raw(),
+            "the five flags were written as state {state:#07b} and the byte holds {:#07b}",
+            view.raw()
+        );
+    }
+    Ok(checked)
+}
+
+/// EVERY FLAG READS ITS OWN BIT, IN EVERY STATE THE FIVE CAN BE IN -- AND THE CHECK THAT SAYS SO
+/// IS SHOWN FAILING ON A MIRROR THAT GETS ONE MASK WRONG.
+///
+/// The positive half is exhaustive rather than illustrative: thirty-two states, five reads each,
+/// 160 answers. Exhaustiveness is what matters here, because any two flags agree in most states
+/// and a fixture that lands in one of those cannot tell them apart.
+///
+/// The negative half is the reason to believe the positive one. `MisMaskedNode` reads `loading`
+/// through `in_memory`'s bit and is fed to the same function; if that came back `Ok`, the
+/// function would be proving nothing about the live node either.
+#[test]
+fn every_bucket_flag_is_read_through_its_own_bit_and_a_mis_masked_one_is_caught() {
+    // --- The live shape. ---
+    match every_state_reads_back::<BucketNode>() {
+        Ok(checked) => {
+            println!("\n  the live node: {checked} flag reads across 32 states, all correct");
+            assert_eq!(
+                160, checked,
+                "five flags over thirty-two states is 160 reads; this checked {checked}, so the \
+                 sweep is not covering what it says it is"
+            );
+        }
+        Err(complaint) => panic!("a bucket flag does not read its own bit: {complaint}"),
+    }
+
+    // --- The control: the same check, a mirror with one mask wrong, and it must FAIL. ---
+    let caught = every_state_reads_back::<MisMaskedNode>();
+    println!(
+        "  the mis-masked mirror: {}",
+        match &caught {
+            Ok(_) => "accepted -- the check cannot fail".to_string(),
+            Err(complaint) => format!("rejected -- {complaint}"),
+        }
+    );
+    assert!(
+        caught.is_err(),
+        "a node whose `loading` accessor reads `in_memory`'s bit passed the very check that is \
+         supposed to catch it; the check above proves nothing about the live node either"
+    );
+}
+
+// -------------------------------------------------------------------------------------------
+// 3. THE WIRE.
+// -------------------------------------------------------------------------------------------
+
+/// Set the five flags from a five-bit state, leaving every other field at its default.
+fn node_in_state(state: u8) -> BucketNode {
+    let mut node = BucketNode::default();
+    for (index, (_, _, set)) in accessors().into_iter().enumerate() {
+        set(&mut node, state & (1 << index) != 0);
+    }
+    node
+}
+
+fn flags_of(node: &BucketNode) -> Vec<bool> {
+    accessors().into_iter().map(|(_, get, _)| get(node)).collect()
+}
+
+/// ALL THIRTY-TWO FLAG STATES SURVIVE THE STORED SPELLING, AND TWO SWAPPED KEYS DO NOT DECODE
+/// THE SAME.
+///
+/// The five flags are one byte in memory and five separate boolean keys on the wire, and the
+/// hand-written `Serialize`/`Deserialize` impls are the join. That join is a second place to wire
+/// a flag to the wrong name, and a wrong wiring there is worse than a wrong mask: it survives a
+/// restart and it is written into the index.
+///
+/// The round trip is exhaustive for the same reason the accessor sweep is. The swap is the
+/// control: an index whose `loading` and `in_memory` keys are exchanged must decode to a
+/// different node, because if it decodes to the same one the two keys are not being read apart.
+#[test]
+fn every_flag_state_survives_the_stored_spelling_and_swapped_keys_do_not() {
+    for state in 0u8..32 {
+        let node = node_in_state(state);
+        // NO PAGES IN THIS FIXTURE, so there is no object to name -- and the empty list is
+        // CHECKED rather than ignored: a page it did not account for would panic.
+        let json = serde_json::to_string(&crate::engine::state::NodeNamedBy(&node, &[])).expect("a bucket node serializes");
+        let back: BucketNode = serde_json::from_str(&json).expect("a bucket node deserializes");
+        assert_eq!(
+            flags_of(&node),
+            flags_of(&back),
+            "flag state {state:#07b} did not survive the wire; it was written as {json}"
+        );
+    }
+    println!("\n  all 32 flag states round-tripped through the stored spelling");
+
+    // --- The control. Two keys exchanged in the text must land on a different node. ---
+    //
+    // State 8 sets `loading` alone, so exchanging the two keys is a real change and any decoder
+    // that reads them apart must see it.
+    let node = node_in_state(1 << 3);
+    assert!(
+        node.loading() && !node.in_memory(),
+        "the fixture for the swap must set exactly one of the two keys being exchanged"
+    );
+    let written = serde_json::to_string(&crate::engine::state::NodeNamedBy(&node, &[])).expect("a bucket node serializes");
+    let swapped = written
+        .replace("\"loading\":true", "\"loading\":\x00")
+        .replace("\"in_memory\":false", "\"in_memory\":true")
+        .replace("\"loading\":\x00", "\"loading\":false");
+    assert_ne!(
+        written, swapped,
+        "the swap did not change the text, so it cannot test anything"
+    );
+    let decoded: BucketNode = serde_json::from_str(&swapped).expect("the swapped node decodes");
+    println!("  swapped: {swapped}");
+    assert!(
+        !decoded.loading() && decoded.in_memory(),
+        "an index with `loading` and `in_memory` exchanged decoded to loading={} in_memory={}; \
+         the decoder is not reading the two keys apart",
+        decoded.loading(),
+        decoded.in_memory()
+    );
+    assert_ne!(
+        flags_of(&node),
+        flags_of(&decoded),
+        "exchanging two flag keys on the wire produced the same node; the stored spelling does \
+         not distinguish them"
+    );
+}
+
+
+// -------------------------------------------------------------------------------------------
+// 4. PRESENCE COMES FROM THE WIRE.
+// -------------------------------------------------------------------------------------------
+
+/// A NODE THAT OMITS A REQUIRED KEY IS REFUSED, AND ONE THAT OMITS AN OPTIONAL KEY IS NOT.
+///
+/// The hand-written deserializer has to reproduce the derive's two different answers to a missing
+/// key: the fields that carried `#[serde(default)]` fill in, and the six that did not are
+/// errors. The difference matters because a flag filled in with `false` is not an absent flag --
+/// it is a bucket that reads as clean, or as not resident, on the strength of a key that was
+/// never written. A store whose index is truncated mid-node would load as a valid node with
+/// plausible flags.
+///
+/// THIS TEST EXISTS BECAUSE A MUTATION SURVIVED. Replacing the refusal on `dirty` with
+/// `unwrap_or_default()` passed every other test in this module and in `per_item_byte_budget`,
+/// which is to say the rule was stated in two comments and enforced nowhere. Each of the six
+/// required keys is dropped in turn and the decode must FAIL; `deleted`, which really is
+/// optional, is dropped as the control and must SUCCEED.
+///
+/// IT WAS SEVEN. `last_dump_sequence` was required and is not, because the node no longer holds it
+/// and this engine no longer writes it -- a key an index we write does not carry cannot be one we
+/// refuse an index for omitting. It is still recognised and still decoded as a `u64` on the way in,
+/// which is a different property and is covered where the legacy spellings are.
+#[test]
+fn a_bucket_node_that_omits_a_required_key_is_refused_and_an_optional_one_is_not() {
+    let node = node_in_state(0b10101);
+    let json = serde_json::to_string(&crate::engine::state::NodeNamedBy(&node, &[])).expect("a bucket node serializes");
+
+    /// Remove one top-level key and its value from a flat JSON object.
+    fn without(json: &str, key: &str) -> String {
+        let needle = format!("\"{key}\":");
+        let at = json.find(&needle).unwrap_or_else(|| panic!("`{key}` is not in {json}"));
+        let end = json[at..]
+            .find(',')
+            .map(|offset| at + offset + 1)
+            .expect("every key under test is followed by another");
+        let mut out = String::with_capacity(json.len());
+        out.push_str(&json[..at]);
+        out.push_str(&json[end..]);
+        out
+    }
+
+    // SIX, NOT SEVEN. `last_dump_sequence` left this list because it left the node: an index this
+    // engine writes does not carry the key, so an index that omits it cannot be refused. The key
+    // is still RECOGNISED and still type-checked on the way in -- an older index carries it and
+    // must still load -- which the round-trip and legacy-read guards cover. Being recognised and
+    // being required are different things, and this list is the second one.
+    const REQUIRED: [&str; 6] = [
+        "routing_slot",
+        "dirty",
+        "meta_loaded",
+        "loading",
+        "in_memory",
+        "dirty_generation",
+    ];
+
+    println!("\n=== a node missing each required key ===");
+    for key in REQUIRED {
+        let damaged = without(&json, key);
+        assert!(
+            !damaged.contains(&format!("\"{key}\":")),
+            "the fixture for `{key}` still contains the key, so it tests nothing: {damaged}"
+        );
+        let outcome = serde_json::from_str::<BucketNode>(&damaged);
+        let complaint = match &outcome {
+            Ok(_) => "ACCEPTED".to_string(),
+            Err(error) => error.to_string(),
+        };
+        println!("  {key:<20} {complaint}");
+        assert!(
+            outcome.is_err(),
+            "a bucket node with no `{key}` decoded successfully; the field would be filled in \
+             with a zero that reads as a real answer"
+        );
+        let message = outcome.unwrap_err().to_string();
+        assert!(
+            message.contains(key),
+            "the refusal for a missing `{key}` says {message:?}, which does not name the key \
+             that is missing"
+        );
+    }
+
+    // --- THE CONTROL. `deleted` carried `#[serde(default)]` and still must. ---
+    let without_deleted = without(&json, "deleted");
+    assert!(
+        !without_deleted.contains("\"deleted\":"),
+        "the control fixture still contains the key it is supposed to drop"
+    );
+    let loaded: BucketNode =
+        serde_json::from_str(&without_deleted).expect("a node without `deleted` must still load");
+    assert!(
+        !loaded.deleted(),
+        "an absent `deleted` must default to false, not to true"
+    );
+    assert_eq!(
+        node.dirty(),
+        loaded.dirty(),
+        "dropping the optional key must not disturb the flags that were written"
+    );
+    println!("  {:<20} accepted, and defaults to false", "deleted (optional)");
+}
+
+/// A KEY THE NODE NO LONGER HOLDS IS STILL PART OF THE SHAPE.
+///
+/// `last_dump_sequence` left `BucketNode`: it was read into two reports and nothing else, and the
+/// reports take the figure from the newest dump manifest. Removing a field is easy; removing it
+/// WITHOUT loosening the way an index is read is the part that needs a guard, because the obvious
+/// implementation -- fold the key into the deserializer's `Ignore` arm -- silently drops three
+/// separate properties at once. All four are driven here:
+///
+///   1. AN INDEX THAT CARRIES IT STILL LOADS. Every index this engine has ever written carries the
+///      key, so this is the direction that must not break.
+///   2. AN INDEX THAT OMITS IT ALSO LOADS, and that is a deliberate LOOSENING: the key used to be
+///      required, and it cannot be any more, because an index this engine writes does not carry it
+///      and an index this engine writes has to load.
+///   3. THE VALUE IS STILL TYPE-CHECKED. A node stating a string where the `u64` was is refused.
+///      An `Ignore` arm would accept it.
+///   4. A SECOND STATEMENT OF IT IS STILL REFUSED, BY NAME. Two disagreeing statements of one fact
+///      must fail loudly rather than letting the later one win. An `Ignore` arm would accept both.
+///
+/// And the value goes nowhere, which is what makes this a removal rather than a field left at 0 --
+/// there is no accessor left to read it back through, so that half is the compiler's.
+#[test]
+fn a_retired_bucket_node_key_is_still_recognised_type_checked_and_refused_twice() {
+    let node = node_in_state(0b10101);
+    let written = serde_json::to_string(&crate::engine::state::NodeNamedBy(&node, &[])).expect("a bucket node serializes");
+    assert!(
+        !written.contains("last_dump_sequence"),
+        "this engine still writes a last_dump_sequence the node does not hold: {written}"
+    );
+
+    // 1. An index that carries the key -- which is every index written before this change.
+    let carried = written.replace(
+        "\"dirty_generation\":",
+        "\"last_dump_sequence\":11,\"dirty_generation\":",
+    );
+    assert_ne!(
+        written, carried,
+        "the fixture for the retired key is the same string as the new write, so nothing below is \
+         about the key"
+    );
+    let loaded: BucketNode =
+        serde_json::from_str(&carried).expect("an index carrying the retired key must still load");
+    assert_eq!(
+        node.dirty_generation, loaded.dirty_generation,
+        "the field after the retired key did not survive the load, so the key is being consumed \
+         wrongly rather than discarded"
+    );
+    assert_eq!(node.flags.bits(), loaded.flags.bits(), "the flags moved across the load");
+    println!("  carrying the retired key     loaded");
+
+    // 2. An index that omits it -- which is every index this engine writes from now on.
+    let omitted: BucketNode =
+        serde_json::from_str(&written).expect("an index omitting the retired key must load");
+    assert_eq!(node.dirty_generation, omitted.dirty_generation);
+    println!("  omitting the retired key     loaded (it is no longer required)");
+
+    // 3. The value is still decoded as a u64.
+    let wrong_type = written.replace(
+        "\"dirty_generation\":",
+        "\"last_dump_sequence\":\"eleven\",\"dirty_generation\":",
+    );
+    let outcome = serde_json::from_str::<BucketNode>(&wrong_type);
+    let complaint = match &outcome {
+        Ok(_) => "ACCEPTED".to_string(),
+        Err(error) => error.to_string(),
+    };
+    println!("  the retired key as a string  {complaint}");
+    assert!(
+        outcome.is_err(),
+        "a node stating a string where the retired key's u64 was decoded successfully; the key has \
+         been folded into an ignore arm and is no longer type-checked"
+    );
+
+    // 4. Stated twice: refused, and the refusal names the key.
+    let twice = written.replace(
+        "\"dirty_generation\":",
+        "\"last_dump_sequence\":11,\"last_dump_sequence\":12,\"dirty_generation\":",
+    );
+    let outcome = serde_json::from_str::<BucketNode>(&twice);
+    let complaint = match &outcome {
+        Ok(_) => "ACCEPTED".to_string(),
+        Err(error) => error.to_string(),
+    };
+    println!("  the retired key stated twice {complaint}");
+    assert!(
+        outcome.is_err(),
+        "a node stating the retired key twice decoded successfully; two disagreeing statements of \
+         one fact must fail loudly"
+    );
+    let message = outcome.unwrap_err().to_string();
+    assert!(
+        message.contains("last_dump_sequence"),
+        "the refusal for a repeated retired key says {message:?}, which does not name the key"
+    );
+}
