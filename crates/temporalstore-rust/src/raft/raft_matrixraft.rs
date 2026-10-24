@@ -55,3 +55,61 @@ pub use matrixraft::{
     BaselineRaftRuntimeCapabilityReport as MatrixRaftReferenceRaftRuntimeCapabilityReport,
     SemanticRequirement as MatrixRaftSemanticRequirement,
     SnapshotLifecycleEvidence as MatrixRaftSnapshotLifecycleEvidence,
+    WalLifecycleEvidence as MatrixRaftWalLifecycleEvidence,
+    WalLifecycleStatus as MatrixRaftWalLifecycleStatus,
+};
+
+impl From<&RaftDistributedReadiness> for MatrixRaftReadinessSnapshot {
+    fn from(readiness: &RaftDistributedReadiness) -> Self {
+        Self {
+            matrixraft_leader_write_authority_present: readiness
+                .matrixraft_leader_write_authority_present,
+            matrixraft_operator_observability_present: readiness
+                .matrixraft_operator_observability_present,
+            matrixraft_rpc_transport_contract_present: readiness
+                .matrixraft_rpc_transport_contract_present,
+            matrixraft_log_retention_snapshot_trigger_present: readiness
+                .matrixraft_log_retention_snapshot_trigger_present,
+            matrixraft_apply_snapshot_fence_present: readiness
+                .matrixraft_apply_snapshot_fence_present,
+            raft_storage_apply_fence_present: readiness.raft_storage_apply_fence_present,
+            matrixraft_snapshot_floor_log_matching_present: readiness
+                .matrixraft_snapshot_floor_log_matching_present,
+            matrixraft_snapshot_tail_catchup_present: readiness
+                .matrixraft_snapshot_tail_catchup_present,
+            matrixraft_compacted_entry_rejection_present: readiness
+                .matrixraft_compacted_entry_rejection_present,
+            matrixraft_metaserver_snapshot_floor_election_present: readiness
+                .matrixraft_metaserver_snapshot_floor_election_present,
+            learner_catchup_promotion_present: readiness.learner_catchup_promotion_present,
+            metaserver_membership_workflow_present: readiness
+                .metaserver_membership_workflow_present,
+        }
+    }
+}
+
+pub fn matrixraft_parity_contract() -> MatrixRaftParityContract {
+    library_matrixraft_parity_contract()
+}
+
+pub fn matrixraft_parity_report(readiness: &RaftDistributedReadiness) -> MatrixRaftParityReport {
+    let snapshot = MatrixRaftReadinessSnapshot::from(readiness);
+    library_matrixraft_parity_report(&snapshot)
+}
+
+pub fn matrixraft_parity_report_from_current_readiness() -> MatrixRaftParityReport {
+    matrixraft_parity_report(&distributed_raft_readiness())
+}
+
+pub fn matrixraft_reference_raft_runtime_capability_prometheus(
+    report: &MatrixRaftReferenceRaftRuntimeCapabilityReport,
+    labels: &[(&str, &str)],
+) -> MatrixRaftPrometheusMetricSet {
+    let mut metrics =
+        library_matrixraft_reference_raft_runtime_capability_prometheus(report, labels);
+    metrics.text = metrics
+        .text
+        .replace("rustraft", "matrixraft")
+        .replace("RustRaft", "MatrixRaft");
+    metrics
+}

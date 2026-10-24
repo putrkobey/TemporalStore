@@ -7,3 +7,12 @@ Description=TemporalStore metaserver
 After=network-online.target
 Wants=network-online.target
 
+[Service]
+Type=simple
+WorkingDirectory=/opt/temporalstore
+ExecStart=/opt/temporalstore/scripts/with_config.sh /opt/temporalstore/config/temporalstore.toml /opt/temporalstore/bin/matrixark_rust_metaserver
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
