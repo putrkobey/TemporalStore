@@ -359,3 +359,364 @@ fn the_object_index_holds_one_row_per_key_rather_than_one_per_block() {
     );
     assert_eq!(
         percentile(&per_key, 50.0),
+        1,
+        "p50 pages per key is not 1 on a fixture that is {ROUTED_KEYS} single-page keys beside \
+         {CONTAINER_KEYS} containers, so the caveat printed above would be wrong"
+    );
+    assert_eq!(
+        per_key.last().copied().unwrap_or(0),
+        MEMBERS_PER_KEY,
+        "MAX pages per key is not {MEMBERS_PER_KEY}: the container arm is what makes the \
+         collapse visible and it is not in this sample"
+    );
+}
+
+// =================================================================================================
+// 2. THE TOMBSTONE: WHERE A SHARED ID MOST EASILY BECOMES DATA LOSS.
+// =================================================================================================
+
+/// DELETING ONE ELEMENT DOES NOT TOMBSTONE THE OBJECT; DELETING ITS LAST ELEMENT DOES.
+///
+/// `mark_bucket_index_block_deleted_with` removes ONE element -- its `retain` matches on
+/// `(model_id, object_key, component)` -- and then files the ids of what it removed into
+/// `bucket.deleted_object_index`. That was exactly right while the id named a page: every page
+/// sharing a removed page's id had the same component and was removed with it, so no survivor
+/// could carry it.
+///
+/// It is WRONG the moment one id covers every element of a key, and the damage is not theoretical.
+/// `object_manager::runtime_report` asks `deleted_object_index.contains(page.object_id())` once per
+/// page, so dropping one field of a twenty-five-field hash would count all twenty-four survivors
+/// as `deleted_block_ref_count` instead of hot or cold. The fix is the same last-element condition
+/// `remove_block_entry_from_buckets` already applies to `object_index`.
+///
+/// THE FIXTURE HOLDS MANY ELEMENTS DELIBERATELY. #2016's first mutation run had its defect SURVIVE
+/// because a one-key fixture could not tell the bug from the fix, and a one-ELEMENT fixture cannot
+/// tell this one either: with a single element the first delete IS the last, and the guard is
+/// unobservable. The two arms below are the same key at two populations for exactly that reason,
+/// and the survivors are read back THROUGH THE PRODUCT to show they are not merely untombstoned
+/// but still there.
+///
+/// rust-internal: drives HashSet, HashDelete and HashGet, no external surface
+#[test]
+fn deleting_one_element_tombstones_the_object_only_at_its_last_element() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    const KEY: &str = "tomb";
+    const FIELDS: usize = 25;
+    assert!(
+        FIELDS > 1,
+        "a one-element fixture cannot tell this guard from its absence"
+    );
+    for f in 0..FIELDS {
+        write(
+            &engine,
+            Command::HashSet {
+                key: KEY.to_string(),
+                field: format!("f{f}"),
+                value: format!("v{f}").into_bytes(),
+            },
+        );
+    }
+    let object_id = stable_block_object_id(1, "hash", KEY);
+    assert_eq!(
+        live_block_count(&engine, "hash", KEY),
+        FIELDS,
+        "DENOMINATOR: the seed did not file {FIELDS} pages, so nothing below is being observed"
+    );
+    assert!(
+        !tombstone_holds(&engine, object_id),
+        "the object is tombstoned before anything was deleted"
+    );
+
+    println!("\n=== one id over {FIELDS} elements, deleted one at a time ===");
+    println!("  deleted  live pages  tombstoned");
+
+    // --- ARM 1: ONE ELEMENT OF MANY. ---
+    write(
+        &engine,
+        Command::HashDelete {
+            key: KEY.to_string(),
+            field: "f0".to_string(),
+        },
+    );
+    let after_one = live_block_count(&engine, "hash", KEY);
+    let resident_after_one = resident_fields(&engine, KEY);
+    let tombstoned_after_one = tombstone_holds(&engine, object_id);
+    println!(
+        "  {:>7}  {:>10}  {:>10}",
+        1, after_one, tombstoned_after_one
+    );
+    // THE REMOVAL IS READ OFF THE RESIDENT MAP, AND THE PAGE COUNT IS READ AS THE COST.
+    //
+    // This asserted `after_one.len() == FIELDS - 1` -- one fewer live page per deleted field -- and
+    // measured 25 for 24. The removal happened; the live ENTRY is retained on purpose. A removal
+    // reaches the index through `mark_bucket_index_block_deleted_recording`, whose `retain` cannot
+    // match a page-named entry, so it adds a tombstone and leaves the live entry standing, on the
+    // stated grounds that the page may still hold the object's other members. That is a footprint
+    // cost -- an entry per removal that nothing collects -- and NOT a membership error:
+    // `container_membership` folds by append position and the tombstone is the later page.
+    //
+    // So the membership claim is asked of `shard.hashes`, which is the authority and is what
+    // `HashLen` and `HashGetAll` answer from, and the retained entry is asserted as the cost rather
+    // than left to look like a bug nobody noticed. The arm that owns the retained entry as its own
+    // subject is `container_block_ordinal::the_ordinal_names_a_position_and_a_delete_frees_it`.
+    assert_eq!(
+        resident_after_one.len(),
+        FIELDS - 1,
+        "the resident map holds {} field(s) after one delete, not {}",
+        resident_after_one.len(),
+        FIELDS - 1
+    );
+    assert!(
+        !resident_after_one.contains("f0"),
+        "the deletion did not reach the resident map: f0 is still held. This asked the same \
+         question of the index listing and could only ever pass once that listing stopped naming \
+         elements -- the map is where the answer is"
+    );
+    // AND THE PAGE-COUNT ASSERTION BELOW IS A TRIPWIRE, NOT A DRIVEN GUARD. Widening
+    // `mark_bucket_index_block_deleted_recording`'s retain from `component.is_none()` to `true`
+    // leaves it GREEN, because for a container that retain never runs at all: `target_buckets`
+    // comes from `block_refs_for(model_id, key, component)` and a container removal resolves no
+    // bucket there. So the number below is pinned to make someone come and read this when the
+    // retirement lands, and the only thing that moves it is the retirement itself.
+    assert_eq!(
+        FIELDS, after_one,
+        "{after_one} live pages after one of {FIELDS} fields was deleted. {FIELDS} is the expected \
+         number and the cost described above: if this is {} the retirement of a vacated page's \
+         entry has been implemented, and this assertion is the one to come and restate",
+        FIELDS - 1
+    );
+    assert!(
+        !tombstoned_after_one,
+        "the object was tombstoned after ONE of {FIELDS} elements was deleted, while {} elements \
+         are still live. `object_manager::runtime_report` would count every one of them deleted",
+        resident_after_one.len()
+    );
+    // AND THE SURVIVORS STILL READ, through the product rather than off the index.
+    for f in 1..FIELDS {
+        match read(
+            &engine,
+            Command::HashGet {
+                key: KEY.to_string(),
+                field: format!("f{f}"),
+            },
+        ) {
+            crate::types::CommandResponse::Bytes { value: Some(bytes) } => assert_eq!(
+                bytes,
+                format!("v{f}").into_bytes(),
+                "f{f} served the wrong bytes after a sibling was deleted"
+            ),
+            other => panic!("f{f} did not read back after a sibling was deleted: {other:?}"),
+        }
+    }
+
+    // --- ARM 2: THE LAST ELEMENT. ---
+    for f in 1..FIELDS {
+        write(
+            &engine,
+            Command::HashDelete {
+                key: KEY.to_string(),
+                field: format!("f{f}"),
+            },
+        );
+    }
+    let after_all = live_block_count(&engine, "hash", KEY);
+    let resident_after_all = resident_fields(&engine, KEY);
+    let tombstoned_after_all = tombstone_holds(&engine, object_id);
+    println!(
+        "  {:>7}  {:>10}  {:>10}",
+        FIELDS, after_all, tombstoned_after_all
+    );
+    assert!(
+        resident_after_all.is_empty(),
+        "the resident map still holds {} field(s) after every field was deleted: {resident_after_all:?}",
+        resident_after_all.len()
+    );
+    assert_eq!(
+        0, after_all,
+        "{after_all} live pages survived deleting every field. The retained live entry a single \
+         removal leaves is deliberate while the page still holds siblings; at the LAST element \
+         there are none, and `recorded_map::remove_element` drops the live entries for exactly \
+         that reason -- so a non-zero here is that drop not firing"
+    );
+    assert!(
+        tombstoned_after_all,
+        "the object was NOT tombstoned after its LAST element went. The guard withholds the \
+         tombstone until no page carries the id; it does not remove it altogether, and \
+         withholding it forever would lose the deletion"
+    );
+    println!(
+        "  VERDICT: tombstone withheld at 1 of {FIELDS} deleted, filed at {FIELDS} of {FIELDS}."
+    );
+}
+
+// =================================================================================================
+// 3. WHAT THIS DOES NOT TOUCH, ASSERTED RATHER THAN ARGUED.
+// =================================================================================================
+
+/// HLEN IS UNMOVED, AND SO IS THE LISTING IT MUST AGREE WITH.
+///
+/// `HashLen` is `bucket_index_component_block_addresses(...).len()`, which filters on `model_id`
+/// and `object_key` and never consults the object id; and `upsert_bucket_index_block_inner`'s
+/// replacement `retain` matches `(object_key, model_id, component)`, so collapsing the id cannot
+/// merge two entries into one. That is an ARGUMENT, and #2008 (7 before, 7 after) and #2016
+/// (3->3, 2->2) both chose to assert it anyway. So does this.
+///
+/// The listing is read beside the length because a length that agrees with itself is not evidence
+/// -- #2014 landed exactly that guard after the two agreed by coincidence.
+///
+/// rust-internal: drives HashSet and HashLen, no external surface
+#[test]
+fn hash_len_and_its_listing_are_unmoved_by_a_component_free_id() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+
+    const KEY: &str = "hlen";
+    const FIELDS: i64 = 7;
+    for f in 0..FIELDS {
+        write(
+            &engine,
+            Command::HashSet {
+                key: KEY.to_string(),
+                field: format!("f{f}"),
+                value: format!("v{f}").into_bytes(),
+            },
+        );
+    }
+    // A REWRITE MUST NOT ADD AN ENTRY. This is the arm the id could plausibly have moved: two
+    // writes of one field are two pages sharing an id, and had the replacement `retain` matched on
+    // the id rather than the component, it would now also match every OTHER field of the key.
+    write(
+        &engine,
+        Command::HashSet {
+            key: KEY.to_string(),
+            field: "f0".to_string(),
+            value: b"rewritten".to_vec(),
+        },
+    );
+
+    let answered = match read(
+        &engine,
+        Command::HashLen {
+            key: KEY.to_string(),
+        },
+    ) {
+        crate::types::CommandResponse::Integer { value } => value,
+        other => panic!("HashLen answered {other:?}"),
+    };
+    let listed = live_block_count(&engine, "hash", KEY);
+    let resident = resident_fields(&engine, KEY);
+    println!(
+        "\n=== HLEN === answered {answered}, pages {listed}, resident fields {}, fields written {FIELDS}",
+        resident.len()
+    );
+    assert_eq!(
+        answered, FIELDS,
+        "HLEN answered {answered} for {FIELDS} distinct fields. The identity change must not move \
+         the entry COUNT, which is what this reader returns"
+    );
+    assert_eq!(
+        listed as i64, answered,
+        "HLEN answered {answered} and the index holds {listed} live pages. A length that does not \
+         equal its own listing is the shape #2014 caught"
+    );
+    // THE NO-DUPLICATE CLAIM, RE-ATTRIBUTED TO WHERE ELEMENT IDENTITY LIVES.
+    //
+    // This counted DISTINCT COMPONENTS in the index listing and required one per page: "the listing
+    // repeats a component, so a rewrite accumulated a second entry for one field". The entry has no
+    // element-name field, so that listing had become a run of blanks -- `live_components` pushed
+    // `String::new()` per page -- and the count was 1 against 7 rather than 7 against 7. It was not
+    // vacuous, it was simply measuring nothing that exists.
+    //
+    // The question it asked is still a real one: did the rewrite of `f0` above leave TWO live
+    // entries for one field? It is asked of the two artefacts that can answer it. `shard.hashes` is
+    // the authority for which fields exist, and the live page count is what a rewrite would inflate
+    // if it filed beside rather than superseding. Seven distinct names over seven live pages is the
+    // shape; six names over seven pages is the accumulation this exists to catch.
+    assert_eq!(
+        resident.len() as i64,
+        FIELDS,
+        "the resident map holds {} distinct field name(s) for {FIELDS} fields written, so the \
+         rewrite of f0 either lost a field or added one",
+        resident.len()
+    );
+    assert_eq!(
+        listed as i64, FIELDS,
+        "the index holds {listed} live pages for {FIELDS} distinct fields after one of them was \
+         rewritten; a rewrite that filed beside its own previous entry instead of superseding it \
+         looks exactly like this"
+    );
+}
+
+/// THE READ PATH SELECTS ON THE COMPONENT AT EVERY ARM, INCLUDING THE FIRST-MATCH FALLBACK.
+///
+/// #1964 enumerated five readers that take an ascending walk as given, and the fifth is
+/// `bucket_index_block_address`'s first-match fallback -- `.next()` over a filtered walk. A
+/// first-match selector keyed on the object id would, after this change, hand back the FIRST page
+/// of the object for EVERY element of it: precisely the failure #2011 measured inside a WAL record
+/// and #2013 closed there.
+///
+/// It does not, and this is the arm that says so from OUTSIDE the function. Every element of every
+/// key is read back through the product and must answer its own bytes. The values are distinct per
+/// `(key, field)`, so serving one page for another is detectable rather than a coincidence of
+/// equal bytes. An unload/load cycle runs first, so the answers come through the decode path
+/// rather than from a warm cache or a resident map.
+///
+/// THREE OUTCOMES, NOT TWO. A page that reads MISSING is a read fault; a page that reads ANOTHER
+/// PAGE'S BYTES is silent corruption. Folding them into one counter would let this pass at either.
+///
+/// rust-internal: drives a reload and HashGet, no external surface
+#[test]
+fn every_element_of_one_object_reads_back_its_own_bytes_after_a_reload() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = engine_on(dir.path());
+    load_on(&engine);
+    seed_hash_containers(&engine);
+
+    engine.unload_shard(1);
+    load_on(&engine);
+
+    let mut checked = 0usize;
+    let mut wrong = 0usize;
+    let mut missing = 0usize;
+    for k in 0..CONTAINER_KEYS {
+        for f in 0..MEMBERS_PER_KEY {
+            checked += 1;
+            match read(
+                &engine,
+                Command::HashGet {
+                    key: format!("h{k}"),
+                    field: format!("f{f}"),
+                },
+            ) {
+                crate::types::CommandResponse::Bytes { value: Some(bytes) } => {
+                    if bytes != format!("h{k}-f{f}-value").into_bytes() {
+                        wrong += 1;
+                    }
+                }
+                _ => missing += 1,
+            }
+        }
+    }
+    println!(
+        "\n=== every element of every key, after an unload/load ===\n  checked={checked} \
+         wrong bytes={wrong} missing={missing}"
+    );
+    assert_eq!(
+        checked,
+        CONTAINER_KEYS * MEMBERS_PER_KEY,
+        "DENOMINATOR: {checked} reads, not {}",
+        CONTAINER_KEYS * MEMBERS_PER_KEY
+    );
+    assert_eq!(
+        (wrong, missing),
+        (0, 0),
+        "{wrong} elements served another element's bytes and {missing} read as absent, over \
+         {checked}. Every element of one key now shares an object id, so a selector keyed on the \
+         id alone would serve the first page of each key {} times over",
+        MEMBERS_PER_KEY - 1
+    );
+}
