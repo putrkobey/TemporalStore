@@ -53,3 +53,59 @@ const win = {
   encodeURIComponent, decodeURIComponent, parseInt, parseFloat,
   TextDecoder: function () { this.decode = () => ""; },
   AbortController: function () { this.abort = () => {}; this.signal = {}; },
+  FileReader: function () {}, Blob: function () {},
+  URL: { createObjectURL: () => "", revokeObjectURL() {} },
+  fetch: () => new Promise(() => {})
+};
+win.window = win;
+
+const names = Object.keys(win);
+const values = names.map((k) => win[k]);
+scripts.forEach((body, index) => {
+  try { new Function(...names, body)(...values); }
+  catch (e) { console.log("FAIL script " + index + " threw at load: " + e.message); failures += 1; }
+});
+
+ok("the strip exposes a way to feed it a frame",
+   typeof win.__matrixarkLiveFrame === "function");
+
+function feed(datanode) {
+  const node = el("liveNode");
+  node.hidden = true;
+  node.innerHTML = "";
+  const frame = { ts: 1, traffic: { total_requests: 1 }, imports: {}, warnings: 0,
+                  embedding: { total: 1 } };
+  if (datanode !== undefined) { frame.datanode = datanode; }
+  win.__matrixarkLiveFrame(frame);
+  return node;
+}
+
+let seg = feed("unreachable");
+ok("an unreachable datanode is shown", !seg.hidden && /unreachable/.test(seg.innerHTML),
+   JSON.stringify({ hidden: seg.hidden, html: seg.innerHTML }));
+
+seg = feed("erroring");
+ok("an erroring datanode is shown", !seg.hidden && /erroring/.test(seg.innerHTML),
+   JSON.stringify({ hidden: seg.hidden, html: seg.innerHTML }));
+
+seg = feed("ok");
+ok("a healthy datanode takes no space", seg.hidden,
+   JSON.stringify({ hidden: seg.hidden, html: seg.innerHTML }));
+
+seg = feed(undefined);
+ok("nothing is claimed before anything has looked", seg.hidden,
+   "absent is not the same as reachable: " + JSON.stringify(seg.innerHTML));
+
+seg = feed("<img src=x onerror=alert(1)>");
+ok("an unexpected value renders nothing at all",
+   seg.hidden && seg.innerHTML.indexOf("<img") < 0,
+   "a value outside the known states reached the page: " + JSON.stringify(seg.innerHTML));
+
+/* The rest of the strip must still work while the segment does its job. */
+seg = feed("unreachable");
+const req = el("liveReq");
+ok("the other segments still render", /request/.test(req.innerHTML),
+   "render threw partway: " + JSON.stringify(req.innerHTML));
+
+console.log(failures === 0 ? "PASS" : "FAILED " + failures);
+process.exit(failures === 0 ? 0 : 1);

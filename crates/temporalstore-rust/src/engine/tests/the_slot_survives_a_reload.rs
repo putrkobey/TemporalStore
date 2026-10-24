@@ -244,3 +244,249 @@ fn an_index_written_before_this_change_loads_to_the_slots_the_old_loader_would_h
     let positional = round_trip(&filed);
     let as_the_old_writer_wrote: ObjectIndex = serde_json::from_str(
         &serde_json::to_string(&filed.sorted_ids()).expect("the old written shape serializes"),
+    )
+    .expect("loads");
+    let moved: Vec<u64> = FILED
+        .iter()
+        .copied()
+        .filter(|id| positional.slot_of(id) != as_the_old_writer_wrote.slot_of(id))
+        .collect();
+    println!("  ids whose slot differs between the two written forms: {moved:?}");
+    assert!(
+        !moved.is_empty(),
+        "every id lands in the same slot whether the array is written positionally or ascending, \
+         so the two written forms are indistinguishable and this change moves no stored shape"
+    );
+}
+
+/// A REPEATED ID IN A STORED ARRAY IS PLACEHOLDERED WHERE IT REPEATS, AND COUNTED.
+///
+/// Dropping it would shorten the array and move every id above it, which is the renumber the whole
+/// change exists to prevent -- so the first position wins, because it is the one anything already
+/// stored would be naming.
+///
+/// rust-internal: drives this crate's own serde impls, no external surface
+#[test]
+fn a_stored_array_that_names_one_object_twice_keeps_the_first_slot_and_counts_the_repeat() {
+    let before = crate::engine::state::stored_slots_repeated_an_id();
+    // Position 1 repeats what position 0 holds; position 2 is above both and must not move.
+    let doubled: Vec<Option<u64>> = vec![Some(77), Some(77), Some(42)];
+    let loaded: ObjectIndex = serde_json::from_str(
+        &serde_json::to_string(&doubled).expect("serializes"),
+    )
+    .expect("loads");
+    let after = crate::engine::state::stored_slots_repeated_an_id();
+
+    println!("\n=== a stored array naming one object twice ===");
+    println!("  stored {doubled:?} -> slot 0 {:?}, slot 1 {:?}, slot 2 {:?}", loaded.id_at(0), loaded.id_at(1), loaded.id_at(2));
+
+    assert_eq!(Some(77), loaded.id_at(0), "the FIRST slot naming the id must win");
+    assert_eq!(None, loaded.id_at(1), "the repeat must become a placeholder, not be dropped");
+    assert_eq!(
+        Some(42),
+        loaded.id_at(2),
+        "the id above the repeat moved, so the repeat was closed rather than placeholdered"
+    );
+    assert_eq!(2, loaded.object_count(), "the repeat was counted as a second object");
+    assert_eq!(3, loaded.slot_count(), "the array length changed, which renumbers");
+    assert!(
+        after > before,
+        "the repeat counter read {before} before and {after} after, so a stored array disagreeing \
+         with itself is accepted silently -- which is the reporting hole this counter exists to close"
+    );
+}
+
+/// THE DIVERGENCE COUNTER MOVES ON A PLANTED DISAGREEMENT, and this exists before any zero is read.
+///
+/// The maintenance scan used to ASSIGN the object list from the pages, so a list that disagreed was
+/// overwritten and the disagreement left no trace. "8,679 rebuilds, 0 divergences" was therefore a
+/// statement about a comparison nobody made. The scan reconciles now and counts what it reconciles
+/// -- and a counter that has never moved cannot be told from one that is not wired up, which is why
+/// the POSITIVE control comes first here and the clean arm is only meaningful after it.
+///
+/// BOTH ARMS IN ONE BODY, because the counters are process-wide: a delta taken across two `#[test]`
+/// functions cannot be attributed, and this tree has a recorded case of exactly that. Within one
+/// body nothing else is running at `--test-threads=1`, so the subtraction is sound.
+///
+/// rust-internal: drives one maintenance path and its counters, no external surface
+#[test]
+fn the_divergence_counter_moves_on_a_planted_disagreement_and_not_on_a_clean_rebuild() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        dir.path().join("indexes"),
+    );
+    assert!(
+        engine
+            .load_shard_with(crate::control::LoadShardRequest {
+                shard_id: 1,
+                table_name: "object-list-divergence".to_string(),
+                shard_uri: "local://object-list-divergence/1".to_string(),
+                start_routing_bucket: 0,
+                end_routing_bucket: 63,
+                readonly: false,
+                load_version: 1,
+                local_node_id: Some(1),
+            })
+            .status
+            .ok
+    );
+    for index in 0..60 {
+        engine.execute(ExecuteRequest {
+            shard_id: 1,
+            command: Command::StringSet {
+                key: format!("div-str-{index}"),
+                value: vec![b'v'; 48],
+            },
+        });
+    }
+
+    // THE DENOMINATOR IS REACHED, AND NOT BY THE WORKLOAD.
+    //
+    // CORRECTED FROM A FLOOR THAT FAILED, and the failure is a fact worth keeping: a plain write
+    // does NOT reach `update_bucket_layout`. The write path classifies the layout in place and
+    // skips the rescan, so sixty writes moved `rebuilds` not at all. The scan runs on the load,
+    // release and delete paths and from the flag-refresh sweep. So the floor is on a scan this
+    // test causes itself, asserted as a delta rather than as a level.
+    let seeded = engine.object_index_divergence_report();
+    println!("\n=== after the workload ===\n  {seeded:?}");
+    //
+    // AND NOT AN ABSOLUTE LEVEL. This asserted the counter read ZERO here, and that passed alone
+    // and FAILED in the suite: these counters are process-wide and monotonic, so every test that
+    // ran before this one in the same process has already moved them. A level is not attributable;
+    // only a delta taken inside this body is. Every assertion below is therefore a subtraction
+    // between two readings taken around one action.
+
+    // --- ARM 1, THE POSITIVE CONTROL: plant an id no live page names, then rebuild that bucket. ---
+    const PLANTED: u64 = 0xD15A_6E_ED_BEEF_0001u64;
+    let (routing_bucket, slots_before) = {
+        let mut shards = engine.shards.write().expect("shards lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1 loaded");
+        let routing_bucket = *shard
+            .bucket_index
+            .bucket_map
+            .iter()
+            .find(|(_, bucket)| !bucket.block_index.is_empty())
+            .expect("the workload filed at least one page")
+            .0;
+        let bucket = shard
+            .bucket_index
+            .bucket_map
+            .get_mut(&routing_bucket)
+            .expect("the bucket just found");
+        let before: Vec<Option<u64>> = (0..bucket.object_index.slot_count())
+            .map(|slot| bucket.object_index.id_at(slot))
+            .collect();
+        assert!(
+            bucket.object_index.insert(PLANTED),
+            "the planted id was already held, so this arm plants nothing"
+        );
+        (routing_bucket, before)
+    };
+
+    let before_rebuild = engine.object_index_divergence_report();
+    {
+        let mut shards = engine.shards.write().expect("shards lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1 loaded");
+        // SPLIT BY NAMING THE FIELDS, the same way every production sweep does it: the rebuild
+        // reads the object lookup and this arm holds the bucket map mutably.
+        let index = &mut shard.bucket_index;
+        let block_keys =
+            crate::engine::state::BlockKeysByPosition::from_lookup(&index.object_block_lookup);
+        let bucket = index
+            .bucket_map
+            .get_mut(&routing_bucket)
+            .expect("the planted bucket");
+        crate::engine::storage_bucket_internals::update_bucket_layout(1, bucket, &block_keys);
+    }
+    let after_plant = engine.object_index_divergence_report();
+    println!("  after the planted rebuild: {after_plant:?}");
+
+    assert_eq!(
+        before_rebuild.list_held_an_object_no_block_names + 1,
+        after_plant.list_held_an_object_no_block_names,
+        "the planted id was not counted: the counter read {} before the rebuild and {} after. A \
+         counter that does not move on a disagreement cannot certify the absence of one",
+        before_rebuild.list_held_an_object_no_block_names,
+        after_plant.list_held_an_object_no_block_names
+    );
+    let sample = after_plant
+        .last_divergence
+        .as_ref()
+        .expect("a counted divergence must name the row it found");
+    assert_eq!(
+        PLANTED, sample.object_id,
+        "the last divergence names object {} rather than the planted {PLANTED}, so the delta above \
+         could have come from any other bucket in this process",
+        sample.object_id
+    );
+    assert!(
+        after_plant.rebuilds > before_rebuild.rebuilds,
+        "the rebuild denominator did not move, so the scan that reported the divergence did not run"
+    );
+
+    // AND THE PLANTED ID IS GONE WITHOUT MOVING WHAT STAYED -- the reconcile, not an assignment.
+    {
+        let shards = engine.shards.read().expect("shards lock poisoned");
+        let shard = shards.get(&1).expect("shard 1 loaded");
+        let bucket = shard
+            .bucket_index
+            .bucket_map
+            .get(&routing_bucket)
+            .expect("the planted bucket");
+        assert_eq!(
+            None,
+            bucket.object_index.slot_of(&PLANTED),
+            "the planted id survived the reconcile"
+        );
+        let after: Vec<Option<u64>> = (0..bucket.object_index.slot_count())
+            .map(|slot| bucket.object_index.id_at(slot))
+            .collect();
+        assert_eq!(
+            slots_before, after,
+            "the reconcile left the bucket at {after:?} where it was {slots_before:?}. Removing an \
+             id it should never have held moved the ids that belonged there"
+        );
+    }
+
+    // --- ARM 2, THE NEGATIVE CONTROL: the same rebuild with nothing planted moves nothing. ---
+    let before_clean = engine.object_index_divergence_report();
+    {
+        let mut shards = engine.shards.write().expect("shards lock poisoned");
+        let shard = shards.get_mut(&1).expect("shard 1 loaded");
+        // SPLIT BY NAMING THE FIELDS, the same way every production sweep does it: the rebuild
+        // reads the object lookup and this arm holds the bucket map mutably.
+        let index = &mut shard.bucket_index;
+        let block_keys =
+            crate::engine::state::BlockKeysByPosition::from_lookup(&index.object_block_lookup);
+        let bucket = index
+            .bucket_map
+            .get_mut(&routing_bucket)
+            .expect("the planted bucket");
+        crate::engine::storage_bucket_internals::update_bucket_layout(1, bucket, &block_keys);
+    }
+    let after_clean = engine.object_index_divergence_report();
+    println!("  after a clean rebuild of the same bucket: {after_clean:?}");
+    assert!(
+        after_clean.rebuilds > before_clean.rebuilds,
+        "the clean arm's rebuild did not run, so its zero is the absence and not an agreement"
+    );
+    assert_eq!(
+        before_clean.list_held_an_object_no_block_names,
+        after_clean.list_held_an_object_no_block_names,
+        "a rebuild with nothing planted counted a divergence, so the counter moves on agreement too \
+         and arm 1 proved nothing"
+    );
+    assert_eq!(
+        before_clean.blocks_named_an_object_the_list_lacked,
+        after_clean.blocks_named_an_object_the_list_lacked,
+        "a rebuild with nothing planted found a page naming an object its list lacked"
+    );
+    println!(
+        "\n  VERDICT: the counter moved on the plant and not on the clean rebuild, over \
+         {} rebuilds",
+        after_clean.rebuilds
+    );
+}
