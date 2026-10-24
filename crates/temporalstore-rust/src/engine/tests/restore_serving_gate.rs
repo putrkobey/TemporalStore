@@ -104,3 +104,110 @@ fn a_load_that_replays_a_wal_suffix_runs_with_the_serving_gate_shut() {
     );
     let response = restarted.execute(ExecuteRequest {
         shard_id: SHARD,
+        command: Command::StringGet {
+            key: "pre-0".to_string(),
+        },
+    });
+    assert_eq!(
+        response.response,
+        CommandResponse::Bytes {
+            value: Some(b"pre-value-0".to_vec())
+        },
+        "the recovered shard must serve what it replayed"
+    );
+}
+
+/// THE INSTALL PATH, which is the one the dump-install endpoint drives against a RUNNING shard.
+/// The index swapped in describes the shard at the dump; the records written after it live only
+/// in the log until the replay underneath puts them back. The gate is what keeps that window from
+/// being served, and nothing in the crate read it on this path.
+///
+/// Installed into a restore target -- the dump's pages, a fresh index dir, the log -- because a
+/// manifest re-installed onto the shard that minted it is refused as stale by its own index-log
+/// sequence, which is not this window.
+#[test]
+fn a_dump_install_onto_a_loaded_shard_replays_with_the_serving_gate_shut() {
+    let _held = PROBE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let source_index_dir = dir.path().join("indexes");
+
+    let engine = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("cache"),
+        dir.path().join("blocks"),
+        &source_index_dir,
+    );
+    engine.load_shard(SHARD);
+    write_strings(&engine, "pre", 6);
+    let manifest = engine
+        .create_bucket_dump_manifest(SHARD, Vec::new())
+        .expect("dump manifest should persist");
+    write_strings(&engine, "post", 4);
+    engine.wal_store().flush(SHARD).expect("flush wal");
+
+    let suffix = suffix_above(&engine, manifest.wal_sequence);
+    assert!(
+        suffix > 0,
+        "VACUITY: no post-dump suffix (anchor {}), so installing onto the loaded shard has \
+         nothing to replay and the window this guards does not exist in the fixture",
+        manifest.wal_sequence
+    );
+
+    let restore_index_dir = dir.path().join("restore-indexes");
+    std::fs::create_dir_all(&restore_index_dir).unwrap();
+    copy_tree(
+        &source_index_dir.join("wals"),
+        &restore_index_dir.join("wals"),
+    );
+    let restored = TemporalEngine::with_local_dirs(
+        1024 * 1024,
+        dir.path().join("restore-cache"),
+        dir.path().join("blocks"),
+        &restore_index_dir,
+    );
+    // The already-loaded shard the install lands on.
+    restored.load_shard(SHARD);
+
+    // Cleared AFTER that load, so only the install's own replay can satisfy the assertion.
+    REPLAY_ENTERED_WITH_SERVING_GATE_SHUT.store(false, SeqCst);
+    restored
+        .install_bucket_dump_manifest(&manifest)
+        .expect("manifest should install onto the loaded restore target");
+
+    assert!(
+        REPLAY_ENTERED_WITH_SERVING_GATE_SHUT.load(SeqCst),
+        "install_bucket_dump_manifest swapped the index of a LOADED shard with serving OPEN and \
+         then replayed {suffix} WAL records into it: reads in that window answer with the \
+         post-dump records missing"
+    );
+    assert!(
+        !restored.shard_is_recovering(SHARD),
+        "a completed install must reopen serving"
+    );
+    let response = restored.execute(ExecuteRequest {
+        shard_id: SHARD,
+        command: Command::StringGet {
+            key: "post-3".to_string(),
+        },
+    });
+    assert_eq!(
+        response.response,
+        CommandResponse::Bytes {
+            value: Some(b"post-value-3".to_vec())
+        },
+        "the install must leave the post-dump suffix readable"
+    );
+}
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).expect("create copy target");
+    for entry in std::fs::read_dir(from).expect("read copy source") {
+        let entry = entry.expect("copy source entry");
+        let target = to.join(entry.file_name());
+        if entry.file_type().expect("file type").is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), &target).expect("copy file");
+        }
+    }
+}
