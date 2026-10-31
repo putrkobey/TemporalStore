@@ -30,7 +30,7 @@ tonic = { version = "0.12", default-features = false, features = ["codegen", "pr
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "=1.8.0", features = ["v4", "serde"] }
-zstd = "0.13"
+zstd = "0.14"
 
 [build-dependencies]
 protoc-bin-vendored = "3"
