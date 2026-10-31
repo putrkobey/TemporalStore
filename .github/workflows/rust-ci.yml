@@ -49,7 +49,7 @@ jobs:
     if: github.event_name == 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system build dependencies
         # librocksdb-sys (via matrixcache's rocksdb-ssd feature) runs bindgen and
@@ -91,7 +91,7 @@ jobs:
     if: github.event_name != 'push'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system build dependencies
         # librocksdb-sys (via matrixcache's rocksdb-ssd feature) runs bindgen and
@@ -283,7 +283,7 @@ jobs:
       run:
         working-directory: sdk/rust/temporalstore
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
         run: rustup toolchain install 1.88.0 --profile minimal --no-self-update && rustup default 1.88.0
