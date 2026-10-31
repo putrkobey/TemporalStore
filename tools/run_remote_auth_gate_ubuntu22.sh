@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RESULT_DIR="${RESULT_DIR:-/tmp/temporalstore-remote-auth-gate-$(date +%Y%m%d_%H%M%S)}"
 REMOTE_NAME="${REMOTE_NAME:-origin}"
-EXPECTED_REMOTE_REGEX="${EXPECTED_REMOTE_REGEX:-bjmeetsfo/TemporalStore\\.git}"
+EXPECTED_REMOTE_REGEX="${EXPECTED_REMOTE_REGEX:-putrkobey/TemporalStore\\.git}"
 REMOTE_TIMEOUT_S="${REMOTE_TIMEOUT_S:-30}"
 TEXTFILE_DIR="${TEXTFILE_DIR:-${RESULT_DIR}/metrics}"
 METRICS_FILE="${METRICS_FILE:-${TEXTFILE_DIR}/temporalstore-remote-auth.prom}"
