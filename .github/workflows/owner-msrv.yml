@@ -1,0 +1,12 @@
+name: deny
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
