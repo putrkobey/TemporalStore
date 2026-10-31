@@ -71,3 +71,4 @@ docs/benchmark_archives/**/*.jsonl
 *_trace.json
 *_trace.jsonl
 benchmarks/data-type-trace-*/
+*.profraw
