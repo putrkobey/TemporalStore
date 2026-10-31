@@ -24,7 +24,7 @@ matrixraft = { package = "matrixraft", git = "https://github.com/matrixarkai/Mat
 matrixcache = { git = "https://github.com/matrixarkai/MatrixCache.git", rev = "5434cd2000251c5813209cd76171770aba1c1afd", features = ["rocksdb-ssd"] }
 matrixobjectstore-rs = { git = "https://github.com/matrixarkai/MatrixObject.git", rev = "70bef0aecb649d2128a67c34c2082c4e7ea4f39b", optional = true }
 temporalstore-snapshot = { path = "../temporalstore-snapshot" }
-thiserror = "1"
+thiserror = "2"
 tokio = { version = "1", features = ["fs", "macros", "rt-multi-thread", "sync"] }
 tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport"] }
 tracing = "0.1"
