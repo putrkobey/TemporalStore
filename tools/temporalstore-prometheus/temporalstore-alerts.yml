@@ -264,7 +264,7 @@ groups:
           component: ci
         annotations:
           summary: "TemporalStore remote auth gate failed"
-          description: "The non-interactive git remote auth gate could not validate the bjmeetsfo/TemporalStore remote and ls-remote path."
+          description: "The non-interactive git remote auth gate could not validate the putrkobey/TemporalStore remote and ls-remote path."
 
       - alert: TemporalStoreRemoteAuthUnexpectedRemote
         expr: temporalstore_remote_auth_expected_remote_match == 0
@@ -274,7 +274,7 @@ groups:
           component: ci
         annotations:
           summary: "TemporalStore remote points at an unexpected repository"
-          description: "The remote auth gate did not match the expected bjmeetsfo/TemporalStore remote URL."
+          description: "The remote auth gate did not match the expected putrkobey/TemporalStore remote URL."
 
       - alert: TemporalStoreDependencyCacheGateFailed
         expr: temporalstore_dependency_cache_gate_pass == 0

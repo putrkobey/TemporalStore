@@ -10,8 +10,8 @@ name: Auto-approve pull requests
 # no code execution from the PR) to avoid leaking those secrets.
 #
 # It is INERT until you add the maintainer tokens as repo secrets:
-#   MAINTAINER_PAT_1  (fine-grained PAT, "Pull requests: write", as @bjmeetsfo)
-#   MAINTAINER_PAT_2  (same, as @superhaiou)
+#   MAINTAINER_PAT_1  (fine-grained PAT, "Pull requests: write", as @putrkobey)
+#   MAINTAINER_PAT_2  (same, as @putrkobey)
 #   MAINTAINER_PAT_3  (same, as the third maintainer — a GitHub *user*, not the org)
 # A maintainer cannot approve their own PR, so `|| true` tolerates that case.
 # Recommended safer alternative: request reviews (CODEOWNERS already does this) and

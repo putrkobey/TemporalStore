@@ -35,7 +35,7 @@ install_claude() {
 == Claude Code plugin ==
 This TemporalStore repo is a Claude Code marketplace. In Claude Code, run:
 
-    /plugin marketplace add bjmeetsfo/TemporalStore
+    /plugin marketplace add putrkobey/TemporalStore
     /plugin install matrixark-memory@temporalstore
 
 When enabling, set the plugin config:
